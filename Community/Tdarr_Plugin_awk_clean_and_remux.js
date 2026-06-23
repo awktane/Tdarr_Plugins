@@ -6,8 +6,9 @@ const details = () => ({
     Type: 'Video',
     Operation: 'Transcode',
     Description: `Identify and remove any data, image (MJPEG,BMP,PNG,GIF), and remux into mkv or mp4.\n\n
+                  Removes any subtitle or audio tracks that are not in the specified language(s) and optionally removes any tracks that contain SDH or commentary in their description.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n`,
-    Version: '1.2',
+    Version: '1.069420710',
     Tags: 'pre-processing,ffmpeg,video only',
     Inputs: [
         {
