@@ -90,6 +90,40 @@ const details = () => ({
                     eng,jpn`,
         },
         {
+            name: 'fill_language',
+            type: 'string',
+            defaultValue: 'eng',
+            inputUI: {
+                type: 'text',
+            },
+            tooltip: `Specify language tag/s here for the subtitle/audio tracks that are missing a language tag. Untagged or blank language subtitle tracks will be filled with this language tag.
+                \\nEspecially important if muxing to mp4 as untagged subtitle/audio tracks will cause an error
+                \\nMust follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes
+                \\nExample:\\n
+                    eng
+                \\nExample:\\n
+                    jpn`,
+        },
+          {
+            name: 'tag_title',
+            type: 'boolean',
+            defaultValue: false,
+            inputUI: {
+                type: 'dropdown',
+                options: [
+                    'false',
+                    'true',
+                ],
+            },
+            tooltip: `Specify audio tracks with no title to be tagged with the number of channels they contain.
+                \\nIgnored for mp4 as mp4 does not support title tags.
+            \\nExample:\\n
+            true
+            
+            \\nExample:\\n
+            false`,
+        },        
+        {
             name: 'del_commentary',
             type: 'boolean',
             defaultValue: false,
@@ -182,6 +216,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const recoveryDiscard = String(inputs.recovery_discard_frame) === 'true';    
     const recoveryGenpts = String(inputs.recovery_genpts) === 'true';
     const recoveryIgndts = String(inputs.recovery_igndts) === 'true';    
+    const tagTitle = String(inputs.tag_title) === 'true';    
+    const fillLanguage = (inputs.fill_language ? inputs.fill_language.toLowerCase().trim() : '');    
 
     // Set up required variables.
     let extraArguments = '';
@@ -190,6 +226,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     let convert = false;
     let totalDropped = 0;
     let subtitleStreamIndex = -1;
+    let audioStreamIndex = -1;
 
     for (let i = 0; i < file.ffProbeData.streams.length; i++) {
         try {
@@ -198,7 +235,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const ffstreamType = (ffstream.codec_type || '').toLowerCase();
 
             if(ffstreamType === 'subtitle') {
-                //Start with zero based index for subtitle streams. This is only used when converting subtitle formats.
+                //Start with zero based index for subtitle streams. This is only used when converting subtitle formats or changing metadata
                 subtitleStreamIndex++;
 
                 //First remove any subtitles that would be removed due to format as in that case language doesn't matter
@@ -221,6 +258,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //Next remove any subtitles that would be removed due to language
                 if(ffstream.tags && ffstream.tags.language && (ffstream.tags.language.trim() !== '')) {
                     let delSub = false;
+
                     //If the subtitle is a language that should be removed then remove it regardless of other settings.
                     if(!subLanguage.includes(ffstream.tags.language.trim().toLowerCase())) {
                         workDone += `${i}s(lang),`
@@ -239,6 +277,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         totalDropped++;
                         continue;
                     }
+                } else if (fillLanguage !== '') {
+                    workDone += `${i}s(+tag),`
+                    extraArguments += ` -metadata:s:s:${subtitleStreamIndex} language=${fillLanguage}`;
+                    convert = true;
+                    continue;
                 }
 
                 //Finally convert subtitles if the current subtitle stream is being kept but is in a format that is not supported by the destination container.
@@ -256,9 +299,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
             } else if(ffstreamType === 'audio') {
+                //Start with zero based index for audio streams. This is only used when changing metadata.
+                audioStreamIndex++;
+                let titleCommand = '';
+
+                //Get the title ready in case it's needed
+                if((dstContainer !== 'mp4') && ffstream.channels && (tagTitle ===true) && (!ffstream.tags || !ffstream.tags.title || ffstream.tags.title.trim() === '')) {
+                    if (ffstream.channels === 8) {
+                        titleCommand = ` -metadata:s:a:${audioStreamIndex} title="7.1"`;
+                    } else if (ffstream.channels === 6) {
+                        titleCommand = ` -metadata:s:a:${audioStreamIndex} title="5.1"`;
+                    } else if (ffstream.channels === 2) {
+                        titleCommand += ` -metadata:s:a:${audioStreamIndex} title="Stereo"`;
+                    } else if (ffstream.channels === 1) {
+                        titleCommand += ` -metadata:s:a:${audioStreamIndex} title="Mono"`;
+                    }
+                }
+
                 //Next remove any audio tracks that would be removed due to language
                 if(ffstream.tags && ffstream.tags.language && (ffstream.tags.language.trim() !== '')) {
                     let delAudio = false;
+
                     //If the subtitle is a language that should be removed then remove it regardless of other settings.
                     if(!audioLanguage.includes(ffstream.tags.language.trim().toLowerCase())) {
                         workDone += `${i}a(lang),`
@@ -277,6 +338,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         totalDropped++;
                         continue;
                     }
+                } else if (fillLanguage !== '') {
+                    workDone += `${i}a(+tag),`
+                    extraArguments += ` -metadata:s:a:${audioStreamIndex} language=${fillLanguage}`;
+                    if (titleCommand !== '') {
+                        workDone += `${i}a(+title),`
+                        extraArguments += titleCommand;
+                    }
+                    convert = true;
+                    continue;
+                }
+
+                if (titleCommand !== '') {
+                    workDone += `${i}a(+title),`
+                    extraArguments += titleCommand;
+                    convert = true;
+                    continue;
                 }
             }
 
@@ -297,6 +374,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         } catch (err) {
             // Error
+            response.infoLog += `☒Error processing stream ${i}: ${err}\n`;
+            response.processFile = false;
+            return response;
         }
     }
 
@@ -339,7 +419,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Convert file if convert variable is set to true.
     if (convert === true) {
         response.preset += `${fflags},-map 0${extraArguments} -c copy -max_muxing_queue_size 9999`;
-        response.infoLog += `☒File ${workDone} \n`
+        response.infoLog += `☑File ${workDone} \n`
         response.processFile = true;
     } else {
         response.infoLog += `☑File is already ${dstContainer} and contains no streams requiring removal or conversion.\n`;
