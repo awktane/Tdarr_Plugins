@@ -97,7 +97,7 @@ const details = () => ({
                 type: 'text',
             },
             tooltip: `Specify language tag/s here for the subtitle/audio tracks that are missing a language tag. Untagged or blank language subtitle tracks will be filled with this language tag.
-                \\nEspecially important if muxing to mp4 as untagged subtitle/audio tracks will cause an error
+                \\nEspecially important if muxing to mp4 as untagged subtitle/audio tracks will cause an error.
                 \\nMust follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes
                 \\nExample:\\n
                     eng
