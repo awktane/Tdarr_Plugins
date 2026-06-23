@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `Identify and remove any data, image (MJPEG,BMP,PNG,GIF), and remux into mkv or mp4.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n`,
-    Version: '1.069420710',
+    Version: '1.1',
     Tags: 'pre-processing,ffmpeg,video only',
     Inputs: [
         {
