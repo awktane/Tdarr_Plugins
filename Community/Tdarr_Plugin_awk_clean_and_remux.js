@@ -189,7 +189,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     let workDone = '';
     let convert = false;
     let totalDropped = 0;
-    let subtitleStreamIndex = 0;
+    let subtitleStreamIndex = -1;
 
     for (let i = 0; i < file.ffProbeData.streams.length; i++) {
         try {
@@ -198,13 +198,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const ffstreamType = (ffstream.codec_type || '').toLowerCase();
 
             if(ffstreamType === 'subtitle') {
+                //Start with zero based index for subtitle streams. This is only used when converting subtitle formats.
+                subtitleStreamIndex++;
+
                 //First remove any subtitles that would be removed due to format as in that case language doesn't matter
                 if(ffstreamCodec === 'eia_608') {
                     workDone += `${i}s,`
                     extraArguments += ` -map -0:${i}`;
                     convert = true;
                     totalDropped++;
-                    subtitleStreamIndex++;
                     continue;
                 }
 
@@ -213,7 +215,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     extraArguments += ` -map -0:${i}`;
                     convert = true;
                     totalDropped++;
-                    subtitleStreamIndex++;
                     continue;
                 }
 
@@ -236,7 +237,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         extraArguments += ` -map -0:${i}`;
                         convert = true;
                         totalDropped++;
-                        subtitleStreamIndex++;
                         continue;
                     }
                 }
@@ -246,7 +246,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     workDone += `${i}s->srt,`
                     extraArguments += ` -c:s:${subtitleStreamIndex} subrip`;
                     convert = true;
-                    subtitleStreamIndex++;
                     continue;
                 }
 
@@ -254,12 +253,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     workDone += `${i}s->mov_text,`
                     extraArguments += ` -c:s:${subtitleStreamIndex} mov_text`;
                     convert = true;
-                    subtitleStreamIndex++;
                     continue;
                 }
-
-                subtitleStreamIndex++;
-                continue;
             } else if(ffstreamType === 'audio') {
                 //Next remove any audio tracks that would be removed due to language
                 if(ffstream.tags && ffstream.tags.language && (ffstream.tags.language.trim() !== '')) {
