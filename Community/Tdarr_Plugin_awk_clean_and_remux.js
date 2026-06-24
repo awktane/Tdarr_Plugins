@@ -295,7 +295,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
                 } else if((ffstream.tags?.title ?? '') !== (ffmedia?.Title ?? ''))
                 {
-                    workDone += `☒Metadata title does not match strem title "${(ffstream.tags?.title ?? '')}" vs "${(ffmedia?.Title ?? '')}" to "${newStreamTitle}"\n`;
+                    workDone += `☒Metadata title does not match stream title "${(ffstream.tags?.title ?? '')}" vs "${(ffmedia?.Title ?? '')}" to "${newStreamTitle}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 
                 }
@@ -388,7 +388,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
                 } else if((ffstream.tags?.title ?? '') !== (ffmedia?.Title ?? ''))
                 {
-                    workDone += `☒Metadata title does not match strem title "${(ffstream.tags?.title ?? '')}" vs "${(ffmedia?.Title ?? '')}" to "${newStreamTitle}"\n`;
+                    workDone += `☒Metadata title does not match stream title "${(ffstream.tags?.title ?? '')}" vs "${(ffmedia?.Title ?? '')}" to "${newStreamTitle}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 
                 }
