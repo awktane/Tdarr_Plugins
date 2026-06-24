@@ -9,7 +9,7 @@ const details = () => ({
                   Removes any subtitle or audio tracks that are not in the specified language(s) and optionally removes any tracks that contain SDH in their description.\n\n
                   Option to modify metadata to remove metadata comments and titles.
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n`,
-    Version: '1.3',
+    Version: '1.4',
     Tags: 'pre-processing,ffmpeg,video only',
     Inputs: [
         {
@@ -96,7 +96,7 @@ const details = () => ({
                 type: 'text',
             },
             tooltip: `Specify language tag here for the subtitle/audio tracks that are missing a language tag. Blank language or und tracks will be filled with this language tag.
-                \\nEspecially important if muxing to mp4 as untagged subtitle/audio tracks will cause an error
+                \\nTakes precedence over audio_language/sub_language if track language is und for undecided
                 \\nShould follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes
                 \\nExample:\\n
                     eng
@@ -198,6 +198,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
     const audioLanguage = inputs.audio_language.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
 
+    //The titles we will replace fpr tagChannelAudioTitle
+    const tagChannelAudioTitleRegex = /\b(7\.1|6\.1|5\.1|5\.0|4\.0|2\.1|2\.0|stereo|mono)\b/i;
+
     //A few more that should come through as boolean
     const recoveryDiscard = String(inputs.recovery_discard_frame) === 'true';
     const recoveryGenpts = String(inputs.recovery_genpts) === 'true';
@@ -232,13 +235,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     for (let i = 0; i < file.ffProbeData.streams.length; i++) {
         try {
             const ffstream = file.ffProbeData.streams[i];
+            const ffmedia = file?.mediaInfo?.track?.find(t => Number(t.StreamOrder) === i);
             const ffstreamCodec = (ffstream.codec_name || '').toLowerCase();
             const ffstreamType = (ffstream.codec_type || '').toLowerCase();
+
+            //Original stream title - prefer stream title but use metadata if available. When we set tags.title both are set.
+            const streamTitle = (ffstream.tags?.title ?? (ffmedia?.Title ?? ''));
+            const streamLang = (ffstream.tags?.language ?? (ffmedia?.Language ?? '')).trim().toLowerCase().slice(0,3);
 
             //This will be added to the ffmpeg command if metadata needs to be changed. It will be built up as needed.
             let metadataCommand = '';
             let delStream = false;
-            const streamLang = (ffstream.tags?.language ?? '').trim().toLowerCase();
 
             if(ffstreamType === 'subtitle') {
                 //Start with zero based index for subtitle streams. This is only used when converting subtitle formats or changing metadata
@@ -248,10 +255,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if((ffstreamCodec === 'eia_608') || (dstContainer === 'mp4' && ['hdmv_pgs_subtitle', 'dvd_subtitle', 'xsub'].includes(ffstreamCodec)) || (dstContainer === 'mkv' && ffstreamCodec === 'mov_text')) {
                     workDone += `☒Removing stream ${i} (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
-                //Next remove any subtitles that would be removed due to language
-                } else if(streamLang && (!fillLanguage || streamLang !== 'und')) {
+                } else if ((!streamLang || (fillLanguage && streamLang === 'und'))) {
+                    workDone += `☒Language blank on subtitle stream ${i} - setting to ${fillLanguage}\n`;
+                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} 'language=${fillLanguage}'`;
+                //If the audio is a language that should be removed then remove it regardless of other settings.
+                } else {
                     //Gather all of the places where we may find the descriptive words we're looking for for delDescriptive
-                    const subtitleDescription = [ffstream.tags?.title,ffstream.tags?.description,ffstream.tags?.handler_name].filter(Boolean).join(' ').toLowerCase();
+                    const subtitleDescription = [ffstream.tags?.title,ffstream.tags?.description,ffstream.tags?.handler_name,ffmedia?.Title,ffmedia?.Description].filter(Boolean).join(' ').toLowerCase();
 
                     //If the subtitle is a language that should be removed then remove it regardless of other settings.
                     if(!subLanguage.includes(streamLang)) {
@@ -261,9 +271,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         workDone += `☒Removing SDH subtitle stream ${i} (${subtitleDescription})\n`;
                         delStream = true;
                     }
-                } else if (fillLanguage !== '') {
-                    workDone += `☒Language blank on subtitle stream ${i} - setting to ${fillLanguage}\n`;
-                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} language=${fillLanguage}`;
                 }
 
                 if(delStream === true) {
@@ -274,14 +281,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
 
-                if((metaCommentRemove === true) && ffstream.tags?.comment) {
-                    workDone += `☒Removing comment from subtitle stream ${i} "${ffstream.tags.comment}"\n`;
-                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} comment=''`;
+                if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
+                    workDone += `☒Removing comment from subtitle stream ${i} "${(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
+                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} 'comment='`;
                 }
 
-                if((metaBusyTitleRemove === true) && (ffstream.tags?.title ?? '').trim().split('.').length > 4) {
-                    workDone += `☒Removing title from subtitle stream ${i} "${(ffstream.tags?.title ?? '').trim()}"\n`;
-                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} title=''`;
+                if((metaBusyTitleRemove === true) && ((ffstream.tags?.title ?? '').trim().split('.').length > 4 || (ffmedia?.Title ?? '').trim().split('.').length > 4)) {
+                    workDone += `☒Removing title from subtitle stream ${i} "${(ffstream.tags?.title ?? '').trim()}" and "${(ffmedia?.Title ?? '').trim()}"\n`;
+                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} 'title='`;
                 }
                 
                 /* Stopped trying to convert as this almost always results in error 'Subtitle codec 94213 is not supported'
@@ -309,15 +316,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 audioStreamIndex++;
 
                 //First remove any audio tracks that need to be removed
-                if(streamLang && (!fillLanguage || streamLang !== 'und')) {
-                    //If the subtitle is a language that should be removed then remove it regardless of other settings.
-                    if(!audioLanguage.includes(streamLang)) {
+                if((!streamLang || (fillLanguage && streamLang === 'und'))) {
+                    if(fillLanguage) {
+                        workDone += `☒Language blank on audio stream ${i} - setting to ${fillLanguage}\n`;
+                        metadataCommand += ` -metadata:s:a:${audioStreamIndex} 'language=${fillLanguage}'`;
+                    }
+                //If the audio is a language that should be removed then remove it regardless of other settings.
+                } else if(!audioLanguage.includes(streamLang)) {
                         workDone += `☒Removing audio stream ${i} (${streamLang})\n`;
                         delStream = true;
-                    }
-                } else if(fillLanguage !== '') {
-                    workDone += `☒Language blank on audio stream ${i} - setting to ${fillLanguage}\n`;
-                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} language=${fillLanguage}`;
                 }
 
                 if(delStream === true) {
@@ -327,35 +334,37 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
 
-                let streamTitle = (ffstream.tags?.title ?? '').trim();
+                //Remove surrounding whitespace, single quotes and double quotes as there's no reason for them
+                let newStreamTitle = (streamTitle || '').trim().replace(/^"+|"+$/g, '').replace(/^'+|'+$/g, '');
                 
-                if((metaBusyTitleRemove === true) && streamTitle.split('.').length > 4) {
-                    streamTitle = '';
+                if((metaBusyTitleRemove === true) && newStreamTitle.split('.').length > 4) {
+                    newStreamTitle = '';
                 }
 
-                if(tagChannelAudioTitle === true && ffstream.channels && ['"7.1"','"6.1"','"5.1"','"5.0"','"4.0"','"2.1"','"2.0"','"1.0"',"7.1","6.1","5.1","5.0","4.0","2.1","2.0","1.0",'"stereo"','"mono"',"stereo","mono",""].includes(streamTitle.toLowerCase())) {
+                if(tagChannelAudioTitle === true && ffstream.channels && (!newStreamTitle || tagChannelAudioTitleRegex.test(newStreamTitle.toLowerCase()))) {
                     switch(ffstream.channels)
                     {
-                        case 8: streamTitle = '7.1'; break;
-                        case 7: streamTitle = '6.1'; break;
-                        case 6: streamTitle = '5.1'; break;
-                        case 5: streamTitle = '5.0'; break;
-                        case 4: streamTitle = '4.0'; break;
-                        case 3: streamTitle = '2.1'; break;
-                        case 2: streamTitle = 'Stereo'; break;
-                        case 1: streamTitle = 'Mono'; break;
+                        case 8: newStreamTitle = '7.1'; break;
+                        case 7: newStreamTitle = '6.1'; break;
+                        case 6: newStreamTitle = '5.1'; break;
+                        case 5: newStreamTitle = '5.0'; break;
+                        case 4: newStreamTitle = '4.0'; break;
+                        case 3: newStreamTitle = '2.1'; break;
+                        case 2: newStreamTitle = 'Stereo'; break;
+                        case 1: newStreamTitle = 'Mono'; break;
                     }
                 }
 
-                if(streamTitle !== (ffstream.tags?.title ?? ''))
+                //We trimmed the title above so if it contains newlines or spaces they'll be removed.
+                if(newStreamTitle !== streamTitle)
                 {
-                    workDone += `☒Changing title of stream ${i} from "${ffstream.tags?.title?.trim()}" to "${streamTitle}"\n`;
-                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} title='${streamTitle}'`;
+                    workDone += `☒Changing title of stream ${i} from "${streamTitle}" to "${newStreamTitle}"\n`;
+                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} 'title=${newStreamTitle.replace(/'/g, "'\\''")}'`;
                 }
 
-                if((metaCommentRemove === true) && ffstream.tags?.comment) {
-                    workDone += `☒Removing comment from audio stream ${i} "${ffstream.tags.comment}"\n`;
-                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} comment=''`;
+                if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
+                    workDone += `☒Removing comment from audio stream ${i} "${(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
+                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} 'comment='`;
                 }
                     
                 if (metadataCommand !== '') {
@@ -375,14 +384,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }            
 
-                if((metaCommentRemove === true) && ffstream.tags?.comment) {
-                    workDone += `☒Removing comment from video stream ${i} "${ffstream.tags.comment}"\n`;
-                    metadataCommand += ` -metadata:s:v:${videoStreamIndex} comment=''`;
+                if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
+                    workDone += `☒Removing comment from video stream ${i} "${ffstream.tags?.comment ?? ffmedia?.Comment ?? ''}"\n`;
+                    metadataCommand += ` -metadata:s:v:${videoStreamIndex} 'comment='`;
                 }
 
-                if((metaBusyTitleRemove === true) && (ffstream.tags?.title ?? '').trim().split('.').length > 4) {
-                    workDone += `☒Removing title from video stream ${i} "${(ffstream.tags?.title ?? '').trim()}"\n`;
-                    metadataCommand += ` -metadata:s:v:${videoStreamIndex} title=''`;
+                if((metaBusyTitleRemove === true) && ((ffstream.tags?.title ?? '').trim().split('.').length > 4 || (ffmedia?.Title ?? '').trim().split('.').length > 4)) {
+                    workDone += `☒Removing title from video stream ${i} "${(ffstream.tags?.title ?? '').trim()}" and "${(ffmedia?.Title ?? '').trim()}"\n`;
+                    metadataCommand += ` -metadata:s:v:${videoStreamIndex} 'title='`;
                 }
                 
                 if (metadataCommand !== '') {
