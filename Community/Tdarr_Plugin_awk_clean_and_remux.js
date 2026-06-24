@@ -245,7 +245,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 subtitleStreamIndex++;
 
                 //First remove any subtitles that would be removed due to format as in that case language doesn't matter
-                if((ffstreamCodec === 'eia_608') || (dstContainer === 'mp4' && ['hdmv_pgs_subtitle', 'dvd_subtitle', 'xsub'].includes(ffstreamCodec))) {
+                if((ffstreamCodec === 'eia_608') || (dstContainer === 'mp4' && ['hdmv_pgs_subtitle', 'dvd_subtitle', 'xsub'].includes(ffstreamCodec)) || (dstContainer === 'mkv' && ffstreamCodec === 'mov_text')) {
                     workDone += `☒Removing subtitle stream ${i} (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
                 //Next remove any subtitles that would be removed due to language
@@ -284,14 +284,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} title=''`;
                 }
                 
-                //Finally convert subtitles if the current subtitle stream is being kept but is in a format that is not supported by the destination container.
+                /* Stopped trying to convert as this almost always results in error 'Subtitle codec 94213 is not supported'
                 if((dstContainer === 'mkv') && (ffstreamCodec === 'mov_text')) {
                     workDone += `☒Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} to srt\n`;
                     extraArguments += ` -c:s:${subtitleStreamIndex} srt`+metadataCommand;
                     convert = true;
                     continue;
                 }
-
+                */
                 if((dstContainer === 'mp4') && ['subrip', 'srt', 'ass', 'ssa', 'webvtt'].includes(ffstreamCodec)) {
                     workDone += `☒Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} to mov_text\n`;
                     extraArguments += ` -c:s:${subtitleStreamIndex} mov_text`+metadataCommand;
