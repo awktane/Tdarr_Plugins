@@ -199,7 +199,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const audioLanguage = inputs.audio_language.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
 
     //The titles we will replace for tagChannelAudioTitle
-    const tagChannelAudioTitleRegex = /\b(7\.1|6\.1|5\.1|5\.0|4\.0|2\.1|2\.0|stereo|mono)\b/i;
+    const tagChannelAudioTitleRegex =  /^(7\.1|6\.1|5\.1|5\.0|4\.0|3\.0|2\.1|2\.0|stereo|mono)$/i;
 
     //A few more that should come through as boolean
     const recoveryDiscard = String(inputs.recovery_discard_frame) === 'true';
@@ -353,7 +353,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     newStreamTitle = '';
                 }
 
-                if(tagChannelAudioTitle === true && ffstream.channels && (!newStreamTitle || tagChannelAudioTitleRegex.test(newStreamTitle.toLowerCase()))) {
+                if(tagChannelAudioTitle === true && ffstream.channels && (!newStreamTitle || tagChannelAudioTitleRegex.test(newStreamTitle))) {
                     switch(ffstream.channels)
                     {
                         case 8: newStreamTitle = '7.1'; break;
