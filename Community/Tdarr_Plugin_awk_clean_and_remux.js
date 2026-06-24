@@ -9,7 +9,7 @@ const details = () => ({
                   Removes any subtitle or audio tracks that are not in the specified language(s) and optionally removes any tracks that contain SDH in their description.\n\n
                   Option to modify metadata to remove metadata comments and titles.
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n`,
-    Version: '1.4',
+    Version: '1.5',
     Tags: 'pre-processing,ffmpeg,video only',
     Inputs: [
         {
@@ -60,7 +60,7 @@ const details = () => ({
             },
             tooltip: `Run with the ffmpeg +igndts option to ignore DTS (Decode Timestamps has nothing to do with Dobly DTS).
                  \\nShould generally be false but can fix errors like "Non-monotonous DTS in output stream" or "DTS out of order".
-                 \\nCombining this with genpts will tell ffmpeg to completely rebuild the timestamps for the file.`,
+                 \\nWhen enabled, genpts will be forced as messing with the timestream is a daunting exercise.`,
         },
         {
             name: 'audio_language',
@@ -198,7 +198,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
     const audioLanguage = inputs.audio_language.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
 
-    //The titles we will replace fpr tagChannelAudioTitle
+    //The titles we will replace for tagChannelAudioTitle
     const tagChannelAudioTitleRegex = /\b(7\.1|6\.1|5\.1|5\.0|4\.0|2\.1|2\.0|stereo|mono)\b/i;
 
     //A few more that should come through as boolean
@@ -255,9 +255,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if((ffstreamCodec === 'eia_608') || (dstContainer === 'mp4' && ['hdmv_pgs_subtitle', 'dvd_subtitle', 'xsub'].includes(ffstreamCodec)) || (dstContainer === 'mkv' && ffstreamCodec === 'mov_text')) {
                     workDone += `☒Removing stream ${i} (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
-                } else if ((!streamLang || (fillLanguage && streamLang === 'und'))) {
+                } else if (fillLanguage && (!streamLang || streamLang === 'und')) {
                     workDone += `☒Language blank on subtitle stream ${i} - setting to ${fillLanguage}\n`;
-                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} 'language=${fillLanguage}'`;
+                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "language=${fillLanguage}"`;
                 //If the audio is a language that should be removed then remove it regardless of other settings.
                 } else {
                     //Gather all of the places where we may find the descriptive words we're looking for for delDescriptive
@@ -283,12 +283,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
                     workDone += `☒Removing comment from subtitle stream ${i} "${(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
-                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} 'comment='`;
+                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "comment="`;
                 }
 
                 if((metaBusyTitleRemove === true) && ((ffstream.tags?.title ?? '').trim().split('.').length > 4 || (ffmedia?.Title ?? '').trim().split('.').length > 4)) {
                     workDone += `☒Removing title from subtitle stream ${i} "${(ffstream.tags?.title ?? '').trim()}" and "${(ffmedia?.Title ?? '').trim()}"\n`;
-                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} 'title='`;
+                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title="`;
                 }
                 
                 /* Stopped trying to convert as this almost always results in error 'Subtitle codec 94213 is not supported'
@@ -316,11 +316,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 audioStreamIndex++;
 
                 //First remove any audio tracks that need to be removed
-                if((!streamLang || (fillLanguage && streamLang === 'und'))) {
-                    if(fillLanguage) {
-                        workDone += `☒Language blank on audio stream ${i} - setting to ${fillLanguage}\n`;
-                        metadataCommand += ` -metadata:s:a:${audioStreamIndex} 'language=${fillLanguage}'`;
-                    }
+                if (fillLanguage && (!streamLang || streamLang === 'und')) {
+                    workDone += `☒Language blank on audio stream ${i} - setting to ${fillLanguage}\n`;
+                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} "language=${fillLanguage}"`;
                 //If the audio is a language that should be removed then remove it regardless of other settings.
                 } else if(!audioLanguage.includes(streamLang)) {
                         workDone += `☒Removing audio stream ${i} (${streamLang})\n`;
@@ -348,8 +346,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         case 7: newStreamTitle = '6.1'; break;
                         case 6: newStreamTitle = '5.1'; break;
                         case 5: newStreamTitle = '5.0'; break;
-                        case 4: newStreamTitle = '4.0'; break;
-                        case 3: newStreamTitle = '2.1'; break;
+                        case 4:
+                            if((ffstream?.channel_layout ?? '').toLowerCase().includes('lfe')) {
+                                newStreamTitle = '3.1'; 
+                            } else
+                            {
+                                newStreamTitle = '4.0'; 
+                            }
+                            break;
+                        case 3:
+                            if((ffstream?.channel_layout ?? '').toLowerCase().includes('lfe')) {
+                                newStreamTitle = '2.1'; 
+                            } else
+                            {
+                                newStreamTitle = '3.0'; 
+                            }
+                            break;
                         case 2: newStreamTitle = 'Stereo'; break;
                         case 1: newStreamTitle = 'Mono'; break;
                     }
@@ -359,12 +371,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if(newStreamTitle !== streamTitle)
                 {
                     workDone += `☒Changing title of stream ${i} from "${streamTitle}" to "${newStreamTitle}"\n`;
-                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} 'title=${newStreamTitle.replace(/'/g, "'\\''")}'`;
+                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
                 }
 
                 if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
                     workDone += `☒Removing comment from audio stream ${i} "${(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
-                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} 'comment='`;
+                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} "comment="`;
                 }
                     
                 if (metadataCommand !== '') {
@@ -386,12 +398,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
                     workDone += `☒Removing comment from video stream ${i} "${ffstream.tags?.comment ?? ffmedia?.Comment ?? ''}"\n`;
-                    metadataCommand += ` -metadata:s:v:${videoStreamIndex} 'comment='`;
+                    metadataCommand += ` -metadata:s:v:${videoStreamIndex} "comment="`;
                 }
 
                 if((metaBusyTitleRemove === true) && ((ffstream.tags?.title ?? '').trim().split('.').length > 4 || (ffmedia?.Title ?? '').trim().split('.').length > 4)) {
                     workDone += `☒Removing title from video stream ${i} "${(ffstream.tags?.title ?? '').trim()}" and "${(ffmedia?.Title ?? '').trim()}"\n`;
-                    metadataCommand += ` -metadata:s:v:${videoStreamIndex} 'title='`;
+                    metadataCommand += ` -metadata:s:v:${videoStreamIndex} "title="`;
                 }
                 
                 if (metadataCommand !== '') {
@@ -440,13 +452,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //Now the file level metadata can be cleaned up if needed.
     if((metaCommentRemove === true) && file.meta?.comment) {
         workDone += `☒Removing comment from file "${file.meta.comment}"\n`;
-        extraArguments += ` -metadata comment=''`;
+        extraArguments += ` -metadata "comment="`;
         convert = true;
     }
 
     if((metaBusyTitleRemove === true) && (file.meta?.title ?? '').trim().split('.').length > 4) {
         workDone += `☒Removing title file "${(file.meta?.title ?? '').trim()}"\n`;
-        extraArguments += ` -metadata title=''`;
+        extraArguments += ` -metadata "title="`;
         convert = true;
     }
 
@@ -457,17 +469,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
 
     // Include recovery flags if requested or if the source container is known to have timestamp issues.
+    if(recoveryIgndts === true) {
+        //Igndts can cause very strange problems if genpts isn't also enabled
+        fflags += '+igndts+genpts';
+    }
+
     if (['ts', 'avi', 'mpg', 'mpeg'].includes(srcContainer)) {
-        fflags += '+genpts';
+        if(!recoveryIgndts) {
+            fflags += '+genpts';
+        }
         extraArguments = ` -avoid_negative_ts make_zero${extraArguments}`;
-    } else if (recoveryGenpts === true) {
+    } else if (recoveryGenpts === true && !recoveryIgndts) {
         fflags += '+genpts';
     }
     if(recoveryDiscard === true) {
         fflags += '+discardcorrupt';
-    }
-    if(recoveryIgndts === true) {
-        fflags += '+igndts';
     }
     if(fflags !== '') {
         fflags = `-fflags ${fflags}`;
