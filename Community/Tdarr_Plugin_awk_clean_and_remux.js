@@ -246,7 +246,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 //First remove any subtitles that would be removed due to format as in that case language doesn't matter
                 if((ffstreamCodec === 'eia_608') || (dstContainer === 'mp4' && ['hdmv_pgs_subtitle', 'dvd_subtitle', 'xsub'].includes(ffstreamCodec)) || (dstContainer === 'mkv' && ffstreamCodec === 'mov_text')) {
-                    workDone += `☒Removing subtitle stream ${i} (${ffstreamType}-${ffstreamCodec})\n`;
+                    workDone += `☒Removing stream ${i} (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
                 //Next remove any subtitles that would be removed due to language
                 } else if(streamLang && (!fillLanguage || streamLang !== 'und')) {
@@ -368,7 +368,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 videoStreamIndex++;
 
                 if (['mjpeg', 'png', 'gif', 'bmp'].includes(ffstreamCodec)) {
-                    workDone += `☒Removing image stream ${i} (${ffstreamType}-${ffstreamCodec})\n`;
+                    workDone += `☒Removing stream ${i} (${ffstreamType}-${ffstreamCodec})\n`;
                     extraArguments += ` -map -0:${i}`;
                     convert = true;
                     videoDropped++;
@@ -394,7 +394,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
             //First remove the streams we're going to delete anyways
             if ((ffstreamType === 'data') || ['data','bin_data','tmcd'].includes(ffstreamCodec)) {
-                workDone += `☒Removing data stream ${i} (${ffstreamType}-${ffstreamCodec})\n`;
+                workDone += `☒Removing stream ${i} (${ffstreamType}-${ffstreamCodec})\n`;
                 extraArguments += ` -map -0:${i}`;
                 convert = true;
                 otherDropped++;
