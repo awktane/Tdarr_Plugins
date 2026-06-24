@@ -240,7 +240,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const ffstreamType = (ffstream.codec_type || '').toLowerCase();
 
             //Original stream title - prefer stream title but use metadata if available. When we set tags.title both are set.
-            const streamTitle = (ffstream.tags?.title ?? (ffmedia?.Title ?? ''));
+            const streamTitle = (ffstream.tags?.title || ffmedia?.Title || '');
             const streamLang = (ffstream.tags?.language ?? (ffmedia?.Language ?? '')).trim().toLowerCase().slice(0,3);
 
             //This will be added to the ffmpeg command if metadata needs to be changed. It will be built up as needed.
@@ -281,14 +281,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
 
+                //Remove surrounding whitespace, single quotes and double quotes as there's no reason for them
+                let newStreamTitle = (streamTitle || '').trim().replace(/^"+|"+$/g, '').replace(/^'+|'+$/g, '');
+                
+                if((metaBusyTitleRemove === true) && newStreamTitle.split('.').length > 4) {
+                    newStreamTitle = '';
+                }
+
+                //We trimmed the title above so if it contains newlines or spaces they'll be removed. Make sure title is set at both metadata and stream levels
+                if(newStreamTitle !== streamTitle)
+                {
+                    workDone += `☒Changing title of stream ${i} from "${streamTitle}" to "${newStreamTitle}"\n`;
+                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+                } else if((ffstream.tags?.title ?? '') !== (ffmedia?.Title ?? ''))
+                {
+                    workDone += `☒Metadata title does not match strem title "${(ffstream.tags?.title ?? '')}" vs "${(ffmedia?.Title ?? '')}" to "${newStreamTitle}"\n`;
+                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+
+                }
+
                 if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
                     workDone += `☒Removing comment from subtitle stream ${i} "${(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "comment="`;
-                }
-
-                if((metaBusyTitleRemove === true) && ((ffstream.tags?.title ?? '').trim().split('.').length > 4 || (ffmedia?.Title ?? '').trim().split('.').length > 4)) {
-                    workDone += `☒Removing title from subtitle stream ${i} "${(ffstream.tags?.title ?? '').trim()}" and "${(ffmedia?.Title ?? '').trim()}"\n`;
-                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title="`;
                 }
                 
                 /* Stopped trying to convert as this almost always results in error 'Subtitle codec 94213 is not supported'
@@ -372,6 +386,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 {
                     workDone += `☒Changing title of stream ${i} from "${streamTitle}" to "${newStreamTitle}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+                } else if((ffstream.tags?.title ?? '') !== (ffmedia?.Title ?? ''))
+                {
+                    workDone += `☒Metadata title does not match strem title "${(ffstream.tags?.title ?? '')}" vs "${(ffmedia?.Title ?? '')}" to "${newStreamTitle}"\n`;
+                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+
                 }
 
                 if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
