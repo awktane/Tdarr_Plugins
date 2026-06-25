@@ -282,10 +282,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
 
                 //Remove surrounding whitespace, single quotes and double quotes as there's no reason for them
-                let newStreamTitle = (streamTitle || '').trim().replace(/^"+|"+$/g, '').replace(/^'+|'+$/g, '');
-                
-                if((metaBusyTitleRemove === true) && newStreamTitle.split('.').length > 4) {
+                let newStreamTitle = (streamTitle || '').trim().replace(/^"+|"+$/g, '').replace(/^'+|'+$/g, '');                
+                if((metaBusyTitleRemove === true) && (newStreamTitle.split('.').length > 4)) {
                     newStreamTitle = '';
+                }
+
+                //If title is as an example Stereo / Stereo reduce it to just Stereo. Avoids an infinite plugin loop situation
+                if(newStreamTitle) {
+                    const titleParts = newStreamTitle.split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
+
+                    if (titleParts.length > 1) {
+                        const firstPart = titleParts[0].toLowerCase();
+                        if(titleParts.every(tp => tp.toLowerCase() === firstPart)) {
+                            newStreamTitle = titleParts[0];
+                        }
+                    }
                 }
 
                 //We trimmed the title above so if it contains newlines or spaces they'll be removed. Make sure title is set at both metadata and stream levels
@@ -351,6 +362,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 
                 if((metaBusyTitleRemove === true) && newStreamTitle.split('.').length > 4) {
                     newStreamTitle = '';
+                }
+
+                //If title is as an example Stereo / Stereo reduce it to just Stereo. Avoids an infinite plugin loop situation
+                if(newStreamTitle) {
+                    const titleParts = newStreamTitle.split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
+
+                    if (titleParts.length > 1) {
+                        const firstPart = titleParts[0].toLowerCase();
+                        if(titleParts.every(tp => tp.toLowerCase() === firstPart)) {
+                            newStreamTitle = titleParts[0];
+                        }
+                    }
                 }
 
                 if(tagChannelAudioTitle === true && ffstream.channels && (!newStreamTitle || tagChannelAudioTitleRegex.test(newStreamTitle))) {
