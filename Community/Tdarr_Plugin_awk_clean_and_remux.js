@@ -156,7 +156,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['true', 'false'],
             },
-            tooltip: `Is the temp folder on the network? Enabling this adds a few options to reduce the number of reads/writes.
+            tooltip: `Is the temp folder on the network? Enabling this adds a ffmpeg options to reduce the number of reads/writes.
                  \\nGenerally speaking this has very little effect if the files are local instead and therefore it's enabled by default.`,
         },
     ],
