@@ -8,8 +8,9 @@ const details = () => ({
     Description: `Identify and remove any data, image (MJPEG,BMP,PNG,GIF), and remux into mkv or mp4.\n\n
                   Removes any subtitle or audio tracks that are not in the specified language(s) and optionally removes any tracks that contain SDH in their description.\n\n
                   Option to modify metadata to remove metadata comments and titles.
+                  Automatically deduplicates titles reducing "Stereo / Stereo" down to "Stereo" or "English - English" down to "English"
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n`,
-    Version: '1.5',
+    Version: '1.6',
     Tags: 'pre-processing,ffmpeg,video only',
     Inputs: [
         {
