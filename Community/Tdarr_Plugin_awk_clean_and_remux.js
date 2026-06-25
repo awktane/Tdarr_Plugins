@@ -10,7 +10,7 @@ const details = () => ({
                   Option to modify metadata to remove metadata comments and titles.
                   Automatically deduplicates titles reducing "Stereo / Stereo" down to "Stereo" or "English - English" down to "English"
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n`,
-    Version: '1.6',
+    Version: '1.7',
     Tags: 'pre-processing,ffmpeg,video only',
     Inputs: [
         {
@@ -222,7 +222,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const metaBusyTitleRemove = String(inputs.clean_metadata_busytitle) === 'true';
     const fillLanguage = (inputs.fill_language ? inputs.fill_language.toLowerCase().trim() : '');
 
-    //I went through a bunch of options and din't really find any that made a big difference. Will likely remove after more testing.
+    //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
     const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
 
     const delDescriptive = String(inputs.del_descriptive) === 'true';
@@ -249,7 +249,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     for (let i = 0; i < file.ffProbeData.streams.length; i++) {
         try {
-            const ffstream = file.ffProbeData.streams[i];
+            const ffstream = file.ffProbeData?.streams[i];
             const ffmedia = file?.mediaInfo?.track?.find(t => Number(t.StreamOrder) === i);
             const ffstreamCodec = (ffstream.codec_name || '').toLowerCase();
             const ffstreamType = (ffstream.codec_type || '').toLowerCase();
@@ -333,17 +333,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "comment="`;
                 }
                 
-                /* Stopped trying to convert as this almost always results in error 'Subtitle codec 94213 is not supported'
                 if((dstContainer === 'mkv') && (ffstreamCodec === 'mov_text')) {
                     workDone += `☒Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} to srt\n`;
-                    extraArguments += ` -c:s:${subtitleStreamIndex} srt`+metadataCommand;
+                    extraArguments += ` -c:s:s:${subtitleStreamIndex} srt`+metadataCommand;
                     convert = true;
                     continue;
                 }
-                */
+
                 if((dstContainer === 'mp4') && ['subrip', 'srt', 'ass', 'ssa', 'webvtt'].includes(ffstreamCodec)) {
                     workDone += `☒Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} to mov_text\n`;
-                    extraArguments += ` -c:s:${subtitleStreamIndex} mov_text`+metadataCommand;
+                    extraArguments += ` -c:s:s:${subtitleStreamIndex} mov_text`+metadataCommand;
                     convert = true;
                     continue;
                 }
@@ -511,14 +510,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
 
     //Now the file level metadata can be cleaned up if needed.
-    if((metaCommentRemove === true) && file.meta?.comment) {
-        workDone += `☒Removing comment from file "${file.meta.comment}"\n`;
+    if((metaCommentRemove === true) && file.ffProbeData.format?.tags?.comment) {
+        workDone += `☒Removing comment from file "${file.ffProbeData.format?.tags?.comment}"\n`;
         extraArguments += ` -metadata "comment="`;
         convert = true;
     }
 
-    if((metaBusyTitleRemove === true) && (file.meta?.title ?? '').trim().split('.').length > 4) {
-        workDone += `☒Removing title file "${(file.meta?.title ?? '').trim()}"\n`;
+    if((metaBusyTitleRemove === true) && (file.ffProbeData.format?.tags?.title ?? '').trim().split('.').length > 4) {
+        workDone += `☒Removing title from file "${(file.ffProbeData.format?.tags?.title ?? '').trim()}"\n`;
         extraArguments += ` -metadata "title="`;
         convert = true;
     }
