@@ -66,39 +66,41 @@ const details = () => ({
         {
             name: 'audio_language',
             type: 'string',
-            defaultValue: 'eng,en,und,mul,zxx,mis',
+            defaultValue: '',
             inputUI: {
                 type: 'text',
             },
-            tooltip: `Specify language tags here for the audio tracks you'd like to keep. Untagged or blank language tracks will not be removed.
-                \\nExample: (und = undefined, mul = multiple languages, zxx = no linguistic content, mis = missing language / no language code)\\n
-                    eng,en,und,mul,zxx,mis
+            tooltip: `Specify language tags here for the audio tracks you'd like to keep. If blank no tracks will be removed.
+                \\nDoes not touch tracks with no language tag unless fill_language is specified. Ensure fill_langauge is in audio_language.
+                \\nExample: English, French, and Japanese (ISO-639-2 and ISO-639-1) (und = undefined, mul = multiple languages, zxx = no linguistic content, mis = missing language / no language code)\\n
+                    en,eng,fr,fre,fra,und,mul,jpn,ja,zxx,mis
                 \\nExample:\\n
                     eng,jpn`,
         },
         {
             name: 'sub_language',
             type: 'string',
-            defaultValue: 'eng',
+            defaultValue: '',
             inputUI: {
                 type: 'text',
             },
-            tooltip: `Specify language tag/s here for the subtitle tracks you'd like to keep. Untagged or blank language subtitle tracks will not be removed.
-                \\nExample: (und = undefined, mul = multiple languages, mis = unusual language)\\n
-                    eng,en,und,mul,mis
+            tooltip: `Specify language tag/s here for the subtitle tracks you'd like to keep. If blank no tracks will be removed. Does not touch tracks with no language tag.
+                \\nDoes not touch tracks with no language tag unless fill_language is specified. Ensure fill_langauge is in audio_language.
+                \\nExample: English and French (ISO-639-2 and ISO-639-1) (und = undefined, mul = multiple languages, mis = unusual language)\\n
+                    en,eng,fr,fre,fra,und,mul,mis
                 \\nExample:\\n
                     eng,jpn`,
         },
         {
             name: 'fill_language',
             type: 'string',
-            defaultValue: 'eng',
+            defaultValue: '',
             inputUI: {
                 type: 'text',
             },
             tooltip: `Specify language tag here for the subtitle/audio tracks that are missing a language tag. Blank language or und tracks will be filled with this language tag.
                 \\nTakes precedence over audio_language/sub_language if track language is und for undecided
-                \\nShould follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes
+                \\nMust follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes
                 \\nExample:\\n
                     eng
                 \\nExample:\\n
@@ -107,10 +109,10 @@ const details = () => ({
         {
             name: 'del_descriptive',
             type: 'boolean',
-            defaultValue: true,
+            defaultValue: false,
             inputUI: {
                 type: 'dropdown',
-                options: ['true', 'false'],
+                options: ['false', 'true'],
             },
             tooltip: `Should subtitle tracks that contain the words "SDH, deaf, hearing impaired, etc" in their description be removed?`,
         },
@@ -129,10 +131,10 @@ const details = () => ({
         {
             name: 'clean_metadata_comments',
             type: 'boolean',
-            defaultValue: true,
+            defaultValue: false,
             inputUI: {
                 type: 'dropdown',
-                options: ['true','false'],
+                options: ['false','true'],
             },
             tooltip: `Should comments be removed from all streams? These are not usually shown by players and often contain unnecessary information.
                 \\nForced for mp4 as mp4 does not support title tags at the audio track or subtitle track level and will cause an error if present.`,
@@ -140,10 +142,10 @@ const details = () => ({
         {
             name: 'clean_metadata_busytitle',
             type: 'boolean',
-            defaultValue: true,
+            defaultValue: false,
             inputUI: {
                 type: 'dropdown',
-                options: ['true','false'],
+                options: ['false','true'],
             },
             tooltip: `Should audio/subtitle metadata titles be removed if they contain more than 3 periods? This removes most invalid or unnecessary titles that are added by some sources.
                 \\nExample: This.Title.Has.Too.Many.Periods would have been set to blank`,
@@ -194,22 +196,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const dstContainer = inputs.container.toLowerCase().trim();
     response.container = `.${dstContainer}`;
 
-    // Check if inputs.sub_language has been configured
-    if (!inputs.sub_language || inputs.sub_language.trim() === '') {
-        response.infoLog += '☒Subtitle language has not been configured. Leaving it blank would remove all subtitles. If intended put an invalid language code or a comma rather than leaving blank. \n';
-        response.processFile = false;
-        return response;
-    }
-    const subLanguage = inputs.sub_language.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
-
-    // Check if inputs.audio_language has been configured
-    if (!inputs.audio_language || inputs.audio_language.trim() === '') {
-        response.infoLog += '☒Audio language has not been configured. Leaving it blank would remove all audio tracks. If intended put an invalid language code or a comma rather than leaving blank. \n';
-        response.processFile = false;
-        return response;
-    }
-    const audioLanguage = inputs.audio_language.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
-
     //The titles we will replace for tagChannelAudioTitle
     const tagChannelAudioTitleRegex =  /^(7\.1|6\.1|5\.1|5\.0|4\.0|3\.0|2\.1|2\.0|stereo|mono)$/i;
 
@@ -220,7 +206,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const tagChannelAudioTitle = String(inputs.tag_channel_audio_title) === 'true';
     const metaCommentRemove = String(inputs.clean_metadata_comments) === 'true';
     const metaBusyTitleRemove = String(inputs.clean_metadata_busytitle) === 'true';
+
     const fillLanguage = (inputs.fill_language ? inputs.fill_language.toLowerCase().trim() : '');
+    const subLanguage = inputs.sub_language.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
+    const audioLanguage = inputs.audio_language.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
+
+    //Harder to cleanup than it is to fix now
+    if(fillLanguage && fillLanguage?.length !== 3)
+    {
+        response.infoLog += `☒fillLanguage is not a 3 character country string. It should follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes\n`;
+        response.processFile = false;
+        return response;
+    }
+
+    //If fillLanguage is set it should be a track that's kept
+    if(fillLanguage && (!subLanguage || !subLanguage.includes(fillLanguage)) && (!audioLanguage || !audioLanguage.includes(subLanguage)))Z
+    {
+        response.infoLog += `☒You have specified that blank tracks should be tagged as ${fillLanguage}. You have not included this language in sub_language and audio_language which indirectly will remove untagged streams.\n`;
+        response.processFile = false;
+        return response;
+    }
 
     //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
     const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
@@ -270,6 +275,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if((ffstreamCodec === 'eia_608') || (dstContainer === 'mp4' && ['hdmv_pgs_subtitle', 'dvd_subtitle', 'xsub'].includes(ffstreamCodec))) {
                     workDone += `☒Remove stream ${i} - unsupported (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
+                //Rescue any we can by filling in the language
                 } else if (fillLanguage && (!streamLang || streamLang === 'und')) {
                     workDone += `☒Language blank on stream ${i} - setting subtitle language to "${fillLanguage}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "language=${fillLanguage}"`;
@@ -279,7 +285,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const subtitleDescription = [ffstream.tags?.title,ffstream.tags?.description,ffstream.tags?.handler_name,ffmedia?.Title,ffmedia?.Description].filter(Boolean).join(' ').toLowerCase();
 
                     //If the subtitle is a language that should be removed then remove it regardless of other settings.
-                    if(!subLanguage.includes(streamLang)) {
+                    if(subLanguage && !subLanguage.includes(streamLang)) {
                         workDone += `☒Remove stream ${i} - subtitle language (${streamLang})\n`;
                         delStream = true;
                     } else if ((delDescriptive === true) && (ffstream.disposition?.hearing_impaired === 1 || descriptiveKeywords.some(keyword => subtitleDescription.includes(keyword)))) {
@@ -355,12 +361,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //Start with zero based index for audio streams. This is only used when changing metadata.
                 audioStreamIndex++;
 
-                //First remove any audio tracks that need to be removed
+                //Rescue any we can by filling in the language
                 if (fillLanguage && (!streamLang || streamLang === 'und')) {
                     workDone += `☒Language blank on audio stream ${i} - setting to "${fillLanguage}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "language=${fillLanguage}"`;
                 //If the audio is a language that should be removed then remove it regardless of other settings.
-                } else if(!audioLanguage.includes(streamLang)) {
+                } else if(audioLanguage && !audioLanguage.includes(streamLang)) {
                         workDone += `☒Remove stream ${i} - audio language (${streamLang})\n`;
                         delStream = true;
                 }
