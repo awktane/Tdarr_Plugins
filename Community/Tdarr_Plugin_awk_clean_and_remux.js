@@ -222,7 +222,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const metaBusyTitleRemove = String(inputs.clean_metadata_busytitle) === 'true';
     const fillLanguage = (inputs.fill_language ? inputs.fill_language.toLowerCase().trim() : '');
 
-    const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? '-flush_packets 0 ' : '');
+    //I went through a bunch of options and din't really find any that made a big difference. Will likely remove after more testing.
+    const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
 
     const delDescriptive = String(inputs.del_descriptive) === 'true';
     const descriptiveKeywords = [
@@ -551,7 +552,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Convert file if convert variable is set to true.
     if (convert === true) {
-        response.preset += `${fflags},-map 0${extraArguments} -c copy ${networkDataOpt}-max_muxing_queue_size 9999`;
+        response.preset += `${fflags},-map 0${extraArguments} -c copy -max_muxing_queue_size 9999${networkDataOpt}`;
         response.infoLog += workDone;
         response.processFile = true;
     } else {
