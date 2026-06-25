@@ -6,9 +6,9 @@ const details = () => ({
     Type: 'Video',
     Operation: 'Transcode',
     Description: `Identify and remove any data, image (MJPEG,BMP,PNG,GIF), and remux into mkv or mp4.\n\n
-                  Removes any subtitle or audio tracks that are not in the specified language(s) and optionally removes any tracks that contain SDH in their description.\n\n
-                  Option to modify metadata to remove metadata comments and titles.
-                  Automatically deduplicates titles reducing "Stereo / Stereo" down to "Stereo" or "English - English" down to "English"
+                  Removes any subtitle or audio tracks that are not in the specified language(s) and optionally removes any descriptive tracks with deaf/SDH in their description.\n\n
+                  Option to modify metadata to remove metadata comments and titles with too many periods.\n\n
+                  Automatically deduplicates titles reducing "Stereo / Stereo" down to "Stereo" or "English - English" down to "English".\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n`,
     Version: '1.7',
     Tags: 'pre-processing,ffmpeg,video only',
@@ -35,7 +35,7 @@ const details = () => ({
                 options: ['false', 'true'],
             },
             tooltip: `Run with the ffmpeg +discardcorrupt options to drop any corrupt frames from the file.
-                 \\nShould generally be false as it may cause a small loss of video/audio but may allow a damaged file to be processed.
+                 \\nShould generally be false as it may cause a small blips of video/audio but may allow a damaged file to be processed.
                  \\nMay cause problems with timestamps which may require +genpts and/or +igndts to fix.`,
         },
         {
@@ -59,7 +59,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['false', 'true'],
             },
-            tooltip: `Run with the ffmpeg +igndts option to ignore DTS (Decode Timestamps has nothing to do with Dobly DTS).
+            tooltip: `Run with the ffmpeg +igndts option to ignore DTS (Decode Timestamps - has nothing to do with Dobly DTS).
                  \\nShould generally be false but can fix errors like "Non-monotonous DTS in output stream" or "DTS out of order".
                  \\nWhen enabled, genpts will be forced as messing with the timestream is a daunting exercise.`,
         },
@@ -112,7 +112,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['true', 'false'],
             },
-            tooltip: `Should subtitle tracks that contain the word "SDH" in their description be removed? (Subtitles for the Deaf and Hard of hearing)`,
+            tooltip: `Should subtitle tracks that contain the words "SDH, deaf, hearing impaired, etc" in their description be removed?`,
         },
         {
             name: 'tag_channel_audio_title',
@@ -387,13 +387,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (titleParts.length > 1) {
                         const firstPart = titleParts[0].toLowerCase();
                         if(titleParts.every(tp => tp.toLowerCase() === firstPart)) {
-                            newStreamTitle = titleParts[0];
                             workDone += `☒Title deduplication. Changing handler to SoundHandler to avoid metadata causing plugin loop.\n`;
                             metadataCommand += ` -metadata:s:a:${audioStreamIndex} "handler_name=SoundHandler"`;
+                            newStreamTitle = titleParts[0];
                         }
                     }
                 }
 
+                //Get the channel count string ready. Some assumptions are made but should handle most correctly.
                 if(tagChannelAudioTitle === true && ffstream.channels && (!newStreamTitle || tagChannelAudioTitleRegex.test(newStreamTitle))) {
                     switch(ffstream.channels)
                     {
@@ -422,7 +423,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     }
                 }
 
-                //We trimmed the title above so if it contains newlines or spaces they'll be removed.
+                //We trimmed the title above so if it contains newlines or spaces they'll be removed. Ensure they are escaped before passing it to the command line.
                 if(newStreamTitle !== streamTitle)
                 {
                     workDone += `☒Changing title of stream ${i} from "${streamTitle}" to "${newStreamTitle}"\n`;
@@ -431,7 +432,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 {
                     workDone += `☒Metadata title does not match stream title "${(ffstream.tags?.title ?? '')}" vs "${(ffmedia?.Title ?? '')}" to "${newStreamTitle}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
-
                 }
 
                 if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
