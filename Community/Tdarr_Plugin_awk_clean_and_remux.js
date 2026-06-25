@@ -267,7 +267,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 subtitleStreamIndex++;
 
                 //First remove any subtitles that would be removed due to format as in that case language doesn't matter
-                if((ffstreamCodec === 'eia_608') || (dstContainer === 'mp4' && ['hdmv_pgs_subtitle', 'dvd_subtitle', 'xsub'].includes(ffstreamCodec)) || (dstContainer === 'mkv' && ffstreamCodec === 'mov_text')) {
+                if((ffstreamCodec === 'eia_608') || (dstContainer === 'mp4' && ['hdmv_pgs_subtitle', 'dvd_subtitle', 'xsub'].includes(ffstreamCodec))) {
                     workDone += `☒Removing stream ${i} (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
                 } else if (fillLanguage && (!streamLang || streamLang === 'und')) {
