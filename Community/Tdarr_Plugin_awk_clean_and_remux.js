@@ -148,6 +148,17 @@ const details = () => ({
             tooltip: `Should audio/subtitle metadata titles be removed if they contain more than 3 periods? This removes most invalid or unnecessary titles that are added by some sources.
                 \\nExample: This.Title.Has.Too.Many.Periods would have been set to blank`,
         },
+        {
+            name: 'temp_on_network',
+            type: 'boolean',
+            defaultValue: true,
+            inputUI: {
+                type: 'dropdown',
+                options: ['true', 'false'],
+            },
+            tooltip: `Is the temp folder on the network? Enabling this adds a few options to reduce the number of reads/writes.
+                 \\nGenerally speaking this has very little effect if the files are local instead and therefore it's enabled by default.`,
+        },
     ],
 });
 
@@ -210,6 +221,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const metaCommentRemove = String(inputs.clean_metadata_comments) === 'true';
     const metaBusyTitleRemove = String(inputs.clean_metadata_busytitle) === 'true';
     const fillLanguage = (inputs.fill_language ? inputs.fill_language.toLowerCase().trim() : '');
+
+    const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? '-flush_packets 0 ' : '');
 
     const delDescriptive = String(inputs.del_descriptive) === 'true';
     const descriptiveKeywords = [
@@ -296,7 +309,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         const firstPart = titleParts[0].toLowerCase();
                         if(titleParts.every(tp => tp.toLowerCase() === firstPart)) {
                             newStreamTitle = titleParts[0];
-                            workDone += `☒Title deduplication hit. Changing handler to SubtitleHandler to avoid tag oddness\n`;
+                            workDone += `☒Title deduplication. Changing handler to SubtitleHandler to avoid metadata causing plugin loop.\n`;
                             metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "handler_name=SubtitleHandler"`;
                         }
                     }
@@ -375,7 +388,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         const firstPart = titleParts[0].toLowerCase();
                         if(titleParts.every(tp => tp.toLowerCase() === firstPart)) {
                             newStreamTitle = titleParts[0];
-                            workDone += `☒Title deduplication hit. Changing handler to SoundHandler to avoid tag oddness\n`;
+                            workDone += `☒Title deduplication. Changing handler to SoundHandler to avoid metadata causing plugin loop.\n`;
                             metadataCommand += ` -metadata:s:a:${audioStreamIndex} "handler_name=SoundHandler"`;
                         }
                     }
@@ -538,7 +551,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Convert file if convert variable is set to true.
     if (convert === true) {
-        response.preset += `${fflags},-map 0${extraArguments} -c copy -max_muxing_queue_size 9999`;
+        response.preset += `${fflags},-map 0${extraArguments} -c copy ${networkDataOpts}-max_muxing_queue_size 9999`;
         response.infoLog += workDone;
         response.processFile = true;
     } else {
