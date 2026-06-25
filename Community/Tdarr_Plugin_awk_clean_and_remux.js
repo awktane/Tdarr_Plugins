@@ -217,7 +217,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         'closed caption',
         'closed captions',
         'deaf',
-        '(cc)',
     ];
 
     // Set up required variables.
