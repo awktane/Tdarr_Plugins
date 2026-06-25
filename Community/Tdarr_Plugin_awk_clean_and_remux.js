@@ -296,6 +296,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         const firstPart = titleParts[0].toLowerCase();
                         if(titleParts.every(tp => tp.toLowerCase() === firstPart)) {
                             newStreamTitle = titleParts[0];
+                            workDone += `☒Title deduplication hit. Changing handler to SubtitleHandler to avoid tag oddness\n`;
+                            metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "handler_name=SubtitleHandler"`;
                         }
                     }
                 }
@@ -373,6 +375,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         const firstPart = titleParts[0].toLowerCase();
                         if(titleParts.every(tp => tp.toLowerCase() === firstPart)) {
                             newStreamTitle = titleParts[0];
+                            workDone += `☒Title deduplication hit. Changing handler to SoundHandler to avoid tag oddness\n`;
+                            metadataCommand += ` -metadata:s:a:${audioStreamIndex} "handler_name=SoundHandler"`;
                         }
                     }
                 }
