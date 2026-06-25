@@ -71,7 +71,7 @@ const details = () => ({
                 type: 'text',
             },
             tooltip: `Specify language tags here for the audio tracks you'd like to keep. If blank no tracks will be removed.
-                \\nDoes not touch tracks with no language tag unless fill_language is specified. Ensure fill_language is in audio_language.
+                \\nStreams with no language tag are treated as though they had fill_language as their language or "und" if fill_language isn't set
                 \\nThis list should include both two character and three character codes as this will successfully catch values like en, eng, en-US, en_US, and en.US
                 \\nExample: English, French, and Japanese (ISO-639-2 and ISO-639-1) (und = undefined, mul = multiple languages, zxx = no linguistic content, mis = missing language / no language code)\\n
                     en,eng,fr,fre,fra,und,mul,jpn,ja,zxx,mis
@@ -86,7 +86,7 @@ const details = () => ({
                 type: 'text',
             },
             tooltip: `Specify language tag/s here for the subtitle tracks you'd like to keep. If blank no tracks will be removed. Does not touch tracks with no language tag.
-                \\nDoes not touch tracks with no language tag unless fill_language is specified. Ensure fill_lanuage is in sub_language.
+                \\nStreams with no language tag are treated as though they had fill_language as their language or "und" if fill_language isn't set
                 \\nThis list should include both two character and three character codes as this will successfully catch values like en, eng, en-US, en_US, and en.US
                 \\nExample: English and French (ISO-639-2 and ISO-639-1) (und = undefined, mul = multiple languages, mis = unusual language)\\n
                     en,eng,fr,fre,fra,und,mul,mis
@@ -287,9 +287,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 } else {
                     //Gather all of the places where we may find the descriptive words we're looking for for delDescriptive
                     const subtitleDescription = [ffstream.tags?.title,ffstream.tags?.description,ffstream.tags?.handler_name,ffmedia?.Title,ffmedia?.Description].filter(Boolean).join(' ').toLowerCase();
+                    let workLang = (!streamLang ? (fillLanguage ? fillLanguage : 'und') : streamLang);
 
                     //If the subtitle is a language that should be removed then remove it regardless of other settings.
-                    if(subLanguage.length > 0 && !subLanguage.includes(streamLang) && !subLanguage.includes(streamLang.replace(/[-_.].*$/, ''))) {
+                    if(subLanguage.length > 0 && !subLanguage.includes(workLang) && !subLanguage.includes(workLang.replace(/[-_.].*$/, ''))) {
                         workDone += `☒Remove stream ${i} - subtitle language (${streamLang})\n`;
                         delStream = true;
                     } else if ((delDescriptive === true) && (ffstream.disposition?.hearing_impaired === 1 || descriptiveKeywords.some(keyword => subtitleDescription.includes(keyword)))) {
@@ -372,13 +373,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 audioStreamIndex++;
 
                 //Rescue any we can by filling in the language
+                let workLang = (!streamLang ? (fillLanguage ? fillLanguage : 'und') : streamLang);
                 if (fillLanguage && (!streamLang || streamLang === 'und')) {
                     workDone += `☒Language blank on audio stream ${i} - setting to "${fillLanguage}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "language=${fillLanguage}"`;
                 //If the audio is a language that should be removed then remove it regardless of other settings.
-                } else if(audioLanguage.length > 0 && !audioLanguage.includes(streamLang) && !audioLanguage.includes(streamLang.replace(/[-_.].*$/, ''))) {
-                        workDone += `☒Remove stream ${i} - audio language (${streamLang})\n`;
-                        delStream = true;
+                } else if(audioLanguage.length > 0 && !audioLanguage.includes(workLang) && !audioLanguage.includes(workLang.replace(/[-_.].*$/, ''))) {
+                    workDone += `☒Remove stream ${i} - audio language (${streamLang})\n`;
+                    delStream = true;
                 }
 
                 if(delStream === true) {
