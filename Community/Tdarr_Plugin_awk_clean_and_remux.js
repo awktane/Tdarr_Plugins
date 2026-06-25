@@ -335,14 +335,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 
                 if((dstContainer === 'mkv') && (ffstreamCodec === 'mov_text')) {
                     workDone += `☒Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} to srt\n`;
-                    extraArguments += metadataCommand+` -c:s:s:${subtitleStreamIndex} srt`;
+                    extraArguments += metadataCommand+` -c:s:${subtitleStreamIndex} srt`;
                     convert = true;
                     continue;
                 }
 
                 if((dstContainer === 'mp4') && ['subrip', 'srt', 'ass', 'ssa', 'webvtt'].includes(ffstreamCodec)) {
                     workDone += `☒Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} to mov_text\n`;
-                    extraArguments += metadataCommand+` -c:s:s:${subtitleStreamIndex} mov_text`;
+                    extraArguments += metadataCommand+` -c:s:${subtitleStreamIndex} mov_text`;
                     convert = true;
                     continue;
                 }
