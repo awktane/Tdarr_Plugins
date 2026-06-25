@@ -551,7 +551,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Convert file if convert variable is set to true.
     if (convert === true) {
-        response.preset += `${fflags},-map 0${extraArguments} -c copy ${networkDataOpts}-max_muxing_queue_size 9999`;
+        response.preset += `${fflags},-map 0${extraArguments} -c copy ${networkDataOpt}-max_muxing_queue_size 9999`;
         response.infoLog += workDone;
         response.processFile = true;
     } else {
