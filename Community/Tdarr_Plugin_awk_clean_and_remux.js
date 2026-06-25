@@ -71,7 +71,7 @@ const details = () => ({
                 type: 'text',
             },
             tooltip: `Specify language tags here for the audio tracks you'd like to keep. If blank no tracks will be removed.
-                \\nDoes not touch tracks with no language tag unless fill_language is specified. Ensure fill_langauge is in audio_language.
+                \\nDoes not touch tracks with no language tag unless fill_language is specified. Ensure fill_language is in audio_language.
                 \\nThis list should include both two character and three character codes as this will successfully catch values like en, eng, en-US, en_US, and en.US
                 \\nExample: English, French, and Japanese (ISO-639-2 and ISO-639-1) (und = undefined, mul = multiple languages, zxx = no linguistic content, mis = missing language / no language code)\\n
                     en,eng,fr,fre,fra,und,mul,jpn,ja,zxx,mis
@@ -86,7 +86,7 @@ const details = () => ({
                 type: 'text',
             },
             tooltip: `Specify language tag/s here for the subtitle tracks you'd like to keep. If blank no tracks will be removed. Does not touch tracks with no language tag.
-                \\nDoes not touch tracks with no language tag unless fill_language is specified. Ensure fill_langauge is in sub_language.
+                \\nDoes not touch tracks with no language tag unless fill_language is specified. Ensure fill_lanuage is in sub_language.
                 \\nThis list should include both two character and three character codes as this will successfully catch values like en, eng, en-US, en_US, and en.US
                 \\nExample: English and French (ISO-639-2 and ISO-639-1) (und = undefined, mul = multiple languages, mis = unusual language)\\n
                     en,eng,fr,fre,fra,und,mul,mis
@@ -150,6 +150,7 @@ const details = () => ({
                 options: ['false','true'],
             },
             tooltip: `Should audio/subtitle metadata titles be removed if they contain more than 3 periods? This removes most invalid or unnecessary titles that are added by some sources.
+                \\nNote this also checks the handler_name for the same thing.
                 \\nExample: This.Title.Has.Too.Many.Periods would have been set to blank`,
         },
         {
@@ -216,7 +217,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //Harder to cleanup than it is to fix now
     if(fillLanguage && fillLanguage.length !== 3)
     {
-        response.infoLog += `☒fillLanguage is not a 3 character country string. It should follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes\n`;
+        response.infoLog += `☒fillLanguage is not a 3 character ISO-639-2 language code. It should follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes\n`;
         response.processFile = false;
         return response;
     }
@@ -224,7 +225,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //If fillLanguage is set it should be a track that's kept
     if(fillLanguage && ((subLanguage.length > 0 && !subLanguage.includes(fillLanguage)) || (audioLanguage.length > 0 && !audioLanguage.includes(fillLanguage))))
     {
-        response.infoLog += `☒You have specified that blank tracks should be tagged as ${fillLanguage}. You have not included this language in sub_language and audio_language which indirectly will remove untagged streams.\n`;
+        response.infoLog += `☒You have specified that blank tracks should be tagged as ${fillLanguage}. You have not included it in audio_language/sub_language which indirectly will remove untagged streams.\n`;
         response.processFile = false;
         return response;
     }
@@ -268,6 +269,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             //This will be added to the ffmpeg command if metadata needs to be changed. It will be built up as needed.
             let metadataCommand = '';
             let delStream = false;
+            let setHandler = false;
 
             if(ffstreamType === 'subtitle') {
                 //Start with zero based index for subtitle streams. This is only used when converting subtitle formats or changing metadata
@@ -319,6 +321,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         if(titleParts.every(tp => tp.toLowerCase() === firstPart)) {
                             workDone += `☒Title deduplication. Changing handler to SubtitleHandler to avoid metadata causing plugin loop.\n`;
                             metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "handler_name=SubtitleHandler"`;
+                            setHandler = true;
                             newStreamTitle = titleParts[0];
                         }
                     }
@@ -333,6 +336,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 {
                     workDone += `☒Change title of stream ${i} (subtitle) - Found "${(ffstream.tags?.title ?? '')}" and "${(ffmedia?.Title ?? '')}" change to "${newStreamTitle}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+                }
+
+                if((metaBusyTitleRemove === true) && !setHandler && (ffstream.tags?.handler_name ?? '').trim().split('.').length > 4) {
+                    workDone += `☒Resetting handler_name from stream ${i} (subtitle) "${(ffstream.tags?.handler_name ?? '').trim()}" to "SubtitleHandler"\n`;
+                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "handler_name=SubtitleHandler"`;
                 }
 
                 if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
@@ -396,6 +404,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         if(titleParts.every(tp => tp.toLowerCase() === firstPart)) {
                             workDone += `☒Title deduplication. Changing handler to SoundHandler to avoid metadata causing plugin loop.\n`;
                             metadataCommand += ` -metadata:s:a:${audioStreamIndex} "handler_name=SoundHandler"`;
+                            setHandler = true;
                             newStreamTitle = titleParts[0];
                         }
                     }
@@ -441,6 +450,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
                 }
 
+                if((metaBusyTitleRemove === true) && !setHandler && (ffstream.tags?.handler_name ?? '').trim().split('.').length > 4) {
+                    workDone += `☒Resetting handler_name from stream ${i} (audio) "${(ffstream.tags?.handler_name ?? '').trim()}" to "SoundHandler"\n`;
+                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} "handler_name=SoundHandler"`;
+                }
+
                 if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
                     workDone += `☒Remove comment from audio stream ${i} (audio) "${(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "comment="`;
@@ -463,14 +477,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }            
 
-                if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
+                if(metaCommentRemove === true && (ffstream.tags?.comment || ffmedia?.Comment)) {
                     workDone += `☒Remove comment from stream ${i} (video) "${ffstream.tags?.comment ?? ffmedia?.Comment ?? ''}"\n`;
                     metadataCommand += ` -metadata:s:v:${videoStreamIndex} "comment="`;
                 }
 
-                if((metaBusyTitleRemove === true) && ((ffstream.tags?.title ?? '').trim().split('.').length > 4 || (ffmedia?.Title ?? '').trim().split('.').length > 4)) {
+                if(metaBusyTitleRemove === true && ((ffstream.tags?.title ?? '').trim().split('.').length > 4 || (ffmedia?.Title ?? '').trim().split('.').length > 4)) {
                     workDone += `☒Remove title from stream ${i} (video) "${(ffstream.tags?.title ?? '').trim()}" and "${(ffmedia?.Title ?? '').trim()}"\n`;
                     metadataCommand += ` -metadata:s:v:${videoStreamIndex} "title="`;
+                }
+
+                if(metaBusyTitleRemove === true && !setHandler && (ffstream.tags?.handler_name ?? '').trim().split('.').length > 4) {
+                    workDone += `☒Resetting handler_name from stream ${i} (video) "${(ffstream.tags?.handler_name ?? '').trim()}" to "VideoHandler"\n`;
+                    metadataCommand += ` -metadata:s:v:${videoStreamIndex} "handler_name=VideoHandler"`;
                 }
                 
                 if (metadataCommand !== '') {
@@ -480,7 +499,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }                
             }
 
-            //First remove the streams we're going to delete anyways
+            //Remove data streams
             if ((ffstreamType === 'data') || ['data','bin_data','tmcd'].includes(ffstreamCodec)) {
                 workDone += `☒Remove stream ${i} - data stream (${ffstreamType}-${ffstreamCodec})\n`;
                 extraArguments += ` -map -0:${i}`;
