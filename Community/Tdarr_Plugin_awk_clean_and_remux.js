@@ -335,14 +335,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 
                 if((dstContainer === 'mkv') && (ffstreamCodec === 'mov_text')) {
                     workDone += `☒Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} to srt\n`;
-                    extraArguments += ` -c:s:s:${subtitleStreamIndex} srt`+metadataCommand;
+                    extraArguments += metadataCommand+` -c:s:s:${subtitleStreamIndex} srt`;
                     convert = true;
                     continue;
                 }
 
                 if((dstContainer === 'mp4') && ['subrip', 'srt', 'ass', 'ssa', 'webvtt'].includes(ffstreamCodec)) {
                     workDone += `☒Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} to mov_text\n`;
-                    extraArguments += ` -c:s:s:${subtitleStreamIndex} mov_text`+metadataCommand;
+                    extraArguments += metadataCommand+` -c:s:s:${subtitleStreamIndex} mov_text`;
                     convert = true;
                     continue;
                 }
@@ -551,7 +551,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Convert file if convert variable is set to true.
     if (convert === true) {
-        response.preset += `${fflags},-map 0${extraArguments} -c copy -max_muxing_queue_size 9999${networkDataOpt}`;
+        response.preset += `${fflags},-map 0 -c copy${extraArguments} -max_muxing_queue_size 9999${networkDataOpt}`;
         response.infoLog += workDone;
         response.processFile = true;
     } else {
