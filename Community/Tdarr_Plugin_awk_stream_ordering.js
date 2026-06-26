@@ -27,7 +27,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['descending', 'ascending'],
             },
-            tooltip: `Audio channel ordering preference - streams are ordered by channel then bitrate. Generally descending is recommended as media players will downgrade by moving dowen the list.
+            tooltip: `Audio channel ordering preference - streams are ordered by channel then bitrate. Generally descending is recommended.
                 \\nExample: ascending\\n
                     2.0,5.1
                 \\nExample: descending\\n
@@ -41,7 +41,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['descending', 'ascending'],
             },
-            tooltip: `Audio bitrate ordering preference - streams are ordered by channel then bitrate. Generally descending is recommended as media players will downgrade by moving down the list.
+            tooltip: `Audio bitrate ordering preference - streams are ordered by channel then bitrate. Generally descending is recommended.
                 \\nExample: ascending\\n
                     128k,640k
                 \\nExample: descending\\n
