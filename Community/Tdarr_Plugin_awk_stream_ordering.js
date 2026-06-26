@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then channels and quality, then commentary, etc) -> Subtitles (forced first, by language, sdh, etc) -> Data -> Attachments.\n`,
-    Version: '1.042069',
+    Version: '1.1',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -123,7 +123,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         streamTitle.includes('cast') ||
                         streamTitle.includes('crew'),
 
-            descriptive: streamTitle.includes('description') ||
+            descriptive:  ffstream?.disposition?.visual_impaired === 1 ||
+                          streamTitle.includes('description') ||
                           streamTitle.includes('descriptive') ||
                           streamTitle.includes('dvs') ||
                           streamTitle.includes('narration'),
