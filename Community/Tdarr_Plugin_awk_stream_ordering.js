@@ -22,12 +22,12 @@ const details = () => ({
         {
             name: 'channel_order',
             type: 'string',
-            defaultValue: 'ascending',
+            defaultValue: 'descending',
             inputUI: {
                 type: 'dropdown',
-                options: ['ascending', 'descending'],
+                options: ['descending', 'ascending'],
             },
-            tooltip: `Audio channel ordering preference - streams are ordered by channel then bitrate
+            tooltip: `Audio channel ordering preference - streams are ordered by channel then bitrate. Generally descending is recommended as media players will downgrade by moving dowen the list.
                 \\nExample: ascending\\n
                     2.0,5.1
                 \\nExample: descending\\n
@@ -36,12 +36,12 @@ const details = () => ({
         {
             name: 'bitrate_order',
             type: 'string',
-            defaultValue: 'ascending',
+            defaultValue: 'descending',
             inputUI: {
                 type: 'dropdown',
-                options: ['ascending', 'descending'],
+                options: ['descending', 'ascending'],
             },
-            tooltip: `Audio bitrate ordering preference - streams are ordered by channel then bitrate
+            tooltip: `Audio bitrate ordering preference - streams are ordered by channel then bitrate. Generally descending is recommended as media players will downgrade by moving down the list.
                 \\nExample: ascending\\n
                     128k,640k
                 \\nExample: descending\\n
@@ -128,11 +128,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                           streamTitle.includes('dvs') ||
                           streamTitle.includes('narration'),
 
-            sdh: streamTitle.includes('sdh') ||
+            sdh: ffstream?.disposition?.hearing_impaired === 1 ||
+                 streamTitle.includes('sdh') ||
                  streamTitle.includes('hearing impaired') ||
                  streamTitle.includes('deaf'),
 
-            signs: streamTitle.includes('signs') ||
+            signs: ffstream?.disposition?.karaoke === 1 ||
+                   streamTitle.includes('signs') ||
                    streamTitle.includes('songs'),
 
             mjpeg: (ffstream.codec_name || '').trim().toLowerCase() === 'mjpeg',
