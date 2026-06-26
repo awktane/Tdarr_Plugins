@@ -93,7 +93,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         preset: '',
         handBrakeMode: false,
         FFmpegMode: true,
-        reQueueAfter: false,
         container: `.${file.container}`,
         infoLog: '',
     };
@@ -243,14 +242,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
 
     if (!changed) {
-        response.infoLog += '☑ Streams already in desired order.\n';
+        response.infoLog += '☑Streams already in desired order.\n';
         return response;
     }
 
     response.processFile = true;
     response.reQueueAfter = true;
     response.preset = `,${ffmpegMap} -c copy -max_muxing_queue_size 9999${networkDataOpt}`;
-    response.infoLog += '☒ Reordered streams (smart ordering applied)\n';
+    response.infoLog += '☒Streams are not in the correct order. (${ffmpegMap})\n';
 
     return response;
 };
