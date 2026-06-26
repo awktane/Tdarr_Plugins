@@ -263,7 +263,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             //This will be added to the ffmpeg command if metadata needs to be changed. It will be built up as needed.
             let metadataCommand = '';
             let delStream = false;
-            let setHandler = false;
 
             if(ffstreamType === 'subtitle') {
                 //Start with zero based index for subtitle streams. This is only used when converting subtitle formats or changing metadata
@@ -313,23 +312,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (titleParts.length > 1) {
                         const firstPart = titleParts[0].toLowerCase();
                         if(titleParts.every(tp => tp.toLowerCase() === firstPart)) {
-                            workDone += `☒Title deduplication. Changing handler to SubtitleHandler to avoid metadata causing plugin loop.\n`;
-                            metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "handler_name=SubtitleHandler"`;
-                            setHandler = true;
                             newStreamTitle = titleParts[0];
                         }
                     }
-
-                    //If we try to fix the title last round then it's possible only the media tag will exhibit problems because of the heandler_name. Check it as well.
-                    const backupTitleParts = (ffmedia?.Title ?? '').split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
-                    if (!setHandler && backupTitleParts.length > 1) {
-                        const backupFirstPart = backupTitleParts[0].toLowerCase();
-                        if(backupTitleParts.every(tp => tp.toLowerCase() === backupFirstPart)) {
-                            workDone += `☒Title deduplication in media tag. Changing handler to SubtitleHandler to avoid metadata causing plugin loop.\n`;
-                            metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "handler_name=SubtitleHandler"`;
-                            setHandler = true;
-                        }
-                    }                    
                 }
 
                 //We trimmed the title above so if it contains newlines or spaces they'll be removed. Make sure title is set at both metadata and stream levels
@@ -343,8 +328,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
                 }
 
-                if((metaBusyTitleRemove === true) && !setHandler && (ffstream.tags?.handler_name ?? '').trim().split('.').length > 4) {
-                    workDone += `☒Resetting handler_name from stream ${i} (subtitle) "${(ffstream.tags?.handler_name ?? '').trim()}" to "SubtitleHandler"\n`;
+                //The set_handler isn't needed at all for mkv and can cause some oddness with the title
+                if(dstContainer === 'mkv' && ffstream.tags?.handler_name) {
+                    workDone += `☒Wiping handler_name tag from ${i} (subtitle) "${ffstream.tags?.handler_name}"\n`;
+                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "handler_name="`;
+                } else if(dstContainer === 'mp4' && ffstream.tags?.handler_name !== 'SubtitleHandler') {
+                    workDone += `☒Setting handler_name tag from ${i} (subtitle) to SubtitleHandler "${ffstream.tags?.handler_name}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "handler_name=SubtitleHandler"`;
                 }
 
@@ -406,25 +395,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const titleParts = newStreamTitle.split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
                     if (titleParts.length > 1) {
                         const firstPart = titleParts[0].toLowerCase();
-                        if(titleParts.every(tp => tp.toLowerCase() === firstPart)) {
-                            workDone += `☒Title deduplication. Changing handler to SoundHandler to avoid metadata causing plugin loop.\n`;
-                            metadataCommand += ` -metadata:s:a:${audioStreamIndex} "handler_name=SoundHandler"`;
-                            setHandler = true;
+                        if(titleParts.every(tp => tp.toLowerCase() === firstPart))
                             newStreamTitle = titleParts[0];
-                        }
                     }
-
-                    //If we try to fix the title last round then it's possible only the media tag will exhibit problems because of the heandler_name. Check it as well.
-                    const backupTitleParts = (ffmedia?.Title ?? '').split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
-                    if (!setHandler && backupTitleParts.length > 1) {
-                        const backupFirstPart = backupTitleParts[0].toLowerCase();
-                        if(backupTitleParts.every(tp => tp.toLowerCase() === backupFirstPart)) {
-                            workDone += `☒Title deduplication in media tag. Changing handler to SubtitleHandler to avoid metadata causing plugin loop.\n`;
-                            metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "handler_name=SubtitleHandler"`;
-                            setHandler = true;
-                        }
-                    }
-
                 }
 
                 //Get the channel count string ready. Some assumptions are made but should handle most correctly.
@@ -467,8 +440,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
                 }
 
-                if((metaBusyTitleRemove === true) && !setHandler && (ffstream.tags?.handler_name ?? '').trim().split('.').length > 4) {
-                    workDone += `☒Resetting handler_name from stream ${i} (audio) "${(ffstream.tags?.handler_name ?? '').trim()}" to "SoundHandler"\n`;
+                //The set_handler isn't needed at all for mkv and can cause some oddness with the title
+                if(dstContainer === 'mkv' && ffstream.tags?.handler_name) {
+                    workDone += `☒Wiping handler_name tag from ${i} (audio) "${ffstream.tags?.handler_name}"\n`;
+                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} "handler_name="`;
+                } else if(dstContainer === 'mp4' && ffstream.tags?.handler_name !== 'SoundHandler') {
+                    workDone += `☒Setting handler_name tag from ${i} (audio) to SoundHandler "${ffstream.tags?.handler_name}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "handler_name=SoundHandler"`;
                 }
 
@@ -504,8 +481,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:v:${videoStreamIndex} "title="`;
                 }
 
-                if(metaBusyTitleRemove === true && !setHandler && (ffstream.tags?.handler_name ?? '').trim().split('.').length > 4) {
-                    workDone += `☒Resetting handler_name from stream ${i} (video) "${(ffstream.tags?.handler_name ?? '').trim()}" to "VideoHandler"\n`;
+                //The set_handler isn't needed at all for mkv and can cause some oddness with the title
+                if(dstContainer === 'mkv' && ffstream.tags?.handler_name) {
+                    workDone += `☒Wiping handler_name tag from ${i} as it can cause problems for titles in mkv (video) "${ffstream.tags?.handler_name}"\n`;
+                    metadataCommand += ` -metadata:s:v:${videoStreamIndex} "handler_name="`;
+                } else if(dstContainer === 'mp4' && ffstream.tags?.handler_name !== 'VideoHandler') {
+                    workDone += `☒Setting handler_name tag from ${i} (video) to VideoHandler "${ffstream.tags?.handler_name}"\n`;
                     metadataCommand += ` -metadata:s:v:${videoStreamIndex} "handler_name=VideoHandler"`;
                 }
                 
