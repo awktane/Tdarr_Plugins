@@ -173,7 +173,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         handBrakeMode: false,
         container: `.${file.container}`,
         FFmpegMode: true,
-        reQueueAfter: false,
         infoLog: '',
     };
 
