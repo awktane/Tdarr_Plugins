@@ -3,7 +3,7 @@ const details = () => ({
     id: 'Tdarr_Plugin_awk_clean_and_remux',
     Stage: 'Pre-processing',
     Name: 'Remove streams and metadata then remux file if necessary. Optionally attempt to recover damaged files.',
-    Type: 'Video',
+    Type: 'Any',
     Operation: 'Transcode',
     Description: `Identify and remove any data, image (MJPEG,BMP,PNG,GIF), and remux into mkv or mp4.\n\n
                   Removes any subtitle or audio tracks that are not in the specified language(s) and optionally removes any descriptive tracks with deaf/SDH in their description.\n\n
@@ -11,7 +11,7 @@ const details = () => ({
                   Automatically deduplicates titles reducing "Stereo / Stereo" down to "Stereo" or "English - English" down to "English".\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n`,
     Version: '1.7',
-    Tags: 'pre-processing,ffmpeg,video only',
+    Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
             name: 'container',
@@ -67,9 +67,7 @@ const details = () => ({
             name: 'audio_language',
             type: 'string',
             defaultValue: '',
-            inputUI: {
-                type: 'text',
-            },
+            inputUI: { type: 'text' },
             tooltip: `Specify language tags here for the audio tracks you'd like to keep. If blank no tracks will be removed.
                 \\nStreams with no language tag are treated as though they had fill_language as their language or "und" if fill_language isn't set
                 \\nThis list should include both two character and three character codes as this will successfully catch values like en, eng, en-US, en_US, and en.US
@@ -82,9 +80,7 @@ const details = () => ({
             name: 'sub_language',
             type: 'string',
             defaultValue: '',
-            inputUI: {
-                type: 'text',
-            },
+            inputUI: { type: 'text' },
             tooltip: `Specify language tag/s here for the subtitle tracks you'd like to keep. If blank no tracks will be removed. Does not touch tracks with no language tag.
                 \\nStreams with no language tag are treated as though they had fill_language as their language or "und" if fill_language isn't set
                 \\nThis list should include both two character and three character codes as this will successfully catch values like en, eng, en-US, en_US, and en.US
@@ -97,9 +93,7 @@ const details = () => ({
             name: 'fill_language',
             type: 'string',
             defaultValue: '',
-            inputUI: {
-                type: 'text',
-            },
+            inputUI: { type: 'text' },
             tooltip: `Specify language tag here for the subtitle/audio tracks that are missing a language tag. Blank language or und tracks will be filled with this language tag.
                 \\nTakes precedence over audio_language/sub_language if track language is und for undecided
                 \\nMust follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes
@@ -172,6 +166,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const lib = require('../methods/lib')();
     // eslint-disable-next-line @typescript-eslint/no-unused-vars,no-param-reassign
     inputs = lib.loadDefaultValues(inputs, details);
+
     const response = {
         processFile: false,
         preset: '',
@@ -237,9 +232,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const descriptiveKeywords = [
         'sdh',
         'hearing impaired',
-        'closed caption',
-        'closed captions',
         'deaf',
+        'descriptive'
     ];
 
     // Set up required variables.
@@ -316,7 +310,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //If title is as an example Stereo / Stereo reduce it to just Stereo. Avoids an infinite plugin loop situation
                 if(newStreamTitle) {
                     const titleParts = newStreamTitle.split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
-
                     if (titleParts.length > 1) {
                         const firstPart = titleParts[0].toLowerCase();
                         if(titleParts.every(tp => tp.toLowerCase() === firstPart)) {
@@ -326,6 +319,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             newStreamTitle = titleParts[0];
                         }
                     }
+
+                    //If we try to fix the title last round then it's possible only the media tag will exhibit problems because of the heandler_name. Check it as well.
+                    const backupTitleParts = (ffmedia?.Title ?? '').split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
+                    if (!setHandler && backupTitleParts.length > 1) {
+                        const backupFirstPart = backupTitleParts[0].toLowerCase();
+                        if(backupTitleParts.every(tp => tp.toLowerCase() === backupFirstPart)) {
+                            workDone += `☒Title deduplication in media tag. Changing handler to SubtitleHandler to avoid metadata causing plugin loop.\n`;
+                            metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "handler_name=SubtitleHandler"`;
+                            setHandler = true;
+                        }
+                    }                    
                 }
 
                 //We trimmed the title above so if it contains newlines or spaces they'll be removed. Make sure title is set at both metadata and stream levels
@@ -400,7 +404,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //If title is as an example Stereo / Stereo reduce it to just Stereo. Avoids an infinite plugin loop situation
                 if(newStreamTitle) {
                     const titleParts = newStreamTitle.split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
-
                     if (titleParts.length > 1) {
                         const firstPart = titleParts[0].toLowerCase();
                         if(titleParts.every(tp => tp.toLowerCase() === firstPart)) {
@@ -410,6 +413,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             newStreamTitle = titleParts[0];
                         }
                     }
+
+                    //If we try to fix the title last round then it's possible only the media tag will exhibit problems because of the heandler_name. Check it as well.
+                    const backupTitleParts = (ffmedia?.Title ?? '').split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
+                    if (!setHandler && backupTitleParts.length > 1) {
+                        const backupFirstPart = backupTitleParts[0].toLowerCase();
+                        if(backupTitleParts.every(tp => tp.toLowerCase() === backupFirstPart)) {
+                            workDone += `☒Title deduplication in media tag. Changing handler to SubtitleHandler to avoid metadata causing plugin loop.\n`;
+                            metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "handler_name=SubtitleHandler"`;
+                            setHandler = true;
+                        }
+                    }
+
                 }
 
                 //Get the channel count string ready. Some assumptions are made but should handle most correctly.
