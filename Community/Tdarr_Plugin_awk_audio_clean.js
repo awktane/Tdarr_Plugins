@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.069420710',
+    Version: '1.069420711',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -88,6 +88,19 @@ const details = () => ({
             },
             tooltip: `Specify codec for newly created stereo tracks.`,
         },        
+        {
+            name: 'stereo_downmix',
+            type: 'string',
+            defaultValue: 'dialogue',
+            inputUI: {
+                type: 'dropdown',
+                options: ['default','dialogue'],
+            },
+            tooltip: `Method used when creating stereo (2.0) tracks from surround sources.
+                \\nIf default  - ffmpeg's built in downmix (-ac 2). Simple, but the auto leveling can sound quiet with buried dialogue.
+                \\nIf dialogue - applies a Lo/Ro downmix matrix (center kept at -3 dB, LFE dropped) so dialogue stays clear and the overall level stays up.
+                \\nFalls back to default automatically for unusual layouts such as quad, 2.1, and 3.0.`,
+        },
         {
             name: 'force_codec',
             type: 'string',
@@ -293,6 +306,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const preserveTitle = String(inputs.preserve_title).trim();
     const forceCodec = String(inputs.force_codec).trim();
     const stereoCodec = String(inputs.stereo_codec).trim();
+    const stereoDownmix = String(inputs.stereo_downmix).trim();
     const surroundCodec = String(inputs.surround_codec).trim();
 
     if(!['false','replace','true'].includes(downmixToSix)) {
@@ -317,6 +331,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
     if(!['ac3','aac'].includes(stereoCodec)) {
         response.infoLog += `☒Somehow invalid stereoCodec option provided. Check your settings!\n`;
+        response.processFile = false;
+        return response;
+    }
+    if(!['default','dialogue'].includes(stereoDownmix)) {
+        response.infoLog += `☒Somehow invalid stereoDownmix option provided. Check your settings!\n`;
         response.processFile = false;
         return response;
     }
@@ -483,6 +502,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const escTitle = (t) => t.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 
+    // Lo/Ro stereo downmix matrices (positional channel refs, standard ffmpeg channel order).
+    // Center is kept at -3 dB so dialogue stays clear; LFE is dropped to avoid mud. Returns
+    // null for layouts we cannot safely map positionally, so callers fall back to -ac 2.
+    const downmixMatrix = (srcStream) => {
+        const ch = Number(srcStream?.channels) || 0;
+        switch (ch) {
+            // 5.0 : FL FR FC BL BR
+            case 5: return 'pan=stereo|FL=c0+0.707*c2+0.707*c3|FR=c1+0.707*c2+0.707*c4';
+            // 5.1 : FL FR FC LFE BL BR  (drop LFE c3)
+            case 6: return 'pan=stereo|FL=c0+0.707*c2+0.707*c4|FR=c1+0.707*c2+0.707*c5';
+            // 6.1 : FL FR FC LFE BC SL SR  (drop LFE c3, fold BC c4 to both)
+            case 7: return 'pan=stereo|FL=c0+0.707*c2+0.5*c4+0.707*c5|FR=c1+0.707*c2+0.5*c4+0.707*c6';
+            // 7.1 : FL FR FC LFE BL BR SL SR  (drop LFE c3)
+            case 8: return 'pan=stereo|FL=c0+0.707*c2+0.5*c4+0.5*c6|FR=c1+0.707*c2+0.5*c5+0.5*c7';
+            default: return null;
+        }
+    };
+
+    // Channel/filter snippet for a new or replaced stereo track.
+    const stereoArg = (idx, srcStream) => {
+        const matrix = (stereoDownmix === 'dialogue') ? downmixMatrix(srcStream) : null;
+        return matrix ? ` -filter:a:${idx} "${matrix}"` : ` -ac:a:${idx} 2`;
+    };
+
     // With downmixSingle, only the first (highest-quality) stream is used as a downmix source.
     // forceCodec is also limited to that one track for consistency.
     const streamsToProcess = downmixSingle ? workStreams.slice(0, 1) : workStreams;
@@ -521,13 +564,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 if (downmixToTwo === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
                     workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch to stereo ${stereoCodec} in place\n`;
-                    extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec} -ac:a:${outputAudioIdx} 2 -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                    extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${streamLang}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     convert = true;
                 } else if (downmixToTwo === 'true' && !hasCreated2ch) {
                     workDone += `☒Stream ${ffstream.index}: Adding stereo ${stereoCodec} downmix from ${ffstream.channels}ch\n`;
-                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec} -ac:a:${newStreamOutputIdx} 2 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${streamLang}"`;
                     newStreamOutputIdx++;
                     convert = true;
