@@ -291,7 +291,65 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         return info.score - penalty;
     }
-    
+
+    // Resolve a stream's codec_name through the same alias/variant logic used in audioQuality,
+    // without the response.infoLog side-effects.
+    const resolveCodec = (stream) => {
+        let codec = (stream?.codec_name || '').toLowerCase().trim();
+        for (const [prefix, replacement] of codecAliases) {
+            if (codec.startsWith(prefix)) { codec = replacement; break; }
+        }
+        if (codec === 'dca') codec = 'dts';
+        if (codec === 'dts') {
+            const longName = (stream?.codec_long_name || '').toLowerCase();
+            if (longName.includes('master')) return 'dtsma';
+            if (longName.includes('high resolution')) return 'dtshr';
+            if (longName.includes('express')) return 'dtsexpress';
+        } else if (codec === 'eac3' && ((stream?.codec_long_name || '').toLowerCase().includes('atmos') || (stream?.tags?.title || '').toLowerCase().includes('atmos'))) {
+            return 'eac3atmos';
+        }
+        return codec;
+    };
+
+    // Transparent (full-quality) rates in bps per output codec.
+    // Surround values are for 6ch; other channel counts scale proportionally.
+    const codecTransparentRates = {
+        ac3:  { stereo: 192000, surround: 640000 },
+        eac3: { stereo: 256000, surround: 640000 },
+        aac:  { stereo: 192000, surround: 384000 },
+    };
+
+    // Returns a bitrate string like "448k" appropriate for the given codec and channel count.
+    // Lossless (or unknown-bitrate) sources get the full transparent rate.
+    // Lossy sources are capped at their bitrate (scaled for channel count changes) so a
+    // low-quality source does not get a wastefully high target rate.
+    const getTargetBitrate = (targetCodec, targetChannels, srcStream) => {
+        const rates = codecTransparentRates[targetCodec] ?? { stereo: 160000, surround: 384000 };
+        const isStereo = targetChannels <= 2;
+        const transparentTarget = isStereo
+            ? rates.stereo
+            : Math.round(rates.surround * targetChannels / 6);
+
+        const srcBitrate = Number(srcStream?.bit_rate || 0);
+        const srcInfo = codecInfo[resolveCodec(srcStream)];
+        const srcIsLossless = srcInfo?.lossless ?? false;
+
+        let target;
+        if (srcIsLossless || srcBitrate <= 0) {
+            target = transparentTarget;
+        } else {
+            const srcChannels = Number(srcStream?.channels || 2);
+            const channelRatio = Math.min(targetChannels / Math.max(srcChannels, 1), 1.0);
+            const scaledSrc = Math.round(srcBitrate * channelRatio);
+            target = Math.min(scaledSrc, transparentTarget);
+        }
+
+        const minRate = codecInfo[targetCodec]?.minimum ?? 64000;
+        target = Math.max(target, minRate);
+
+        return `${Math.round(target / 1000)}k`;
+    };
+
     const response = {
         processFile: false,
         preset: '',
@@ -632,15 +690,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const sixMode = (downmixToSix === 'replace' && isProtected) ? 'true' : downmixToSix;
 
                 if (sixMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
-                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch to 6ch ${surroundCodec} in place\n`;
-                    extraArguments += ` -c:a:${outputAudioIdx} ${surroundCodec} -ac:a:${outputAudioIdx} 6 -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                    const bitrate6 = getTargetBitrate(surroundCodec, 6, ffstream);
+                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch to 6ch ${surroundCodec} at ${bitrate6} in place\n`;
+                    extraArguments += ` -c:a:${outputAudioIdx} ${surroundCodec} -b:a:${outputAudioIdx} ${bitrate6} -ac:a:${outputAudioIdx} 6 -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${streamLang}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     created6chLangs.add(ffstreamLangKey);
                     convert = true;
                 } else if (sixMode === 'true') {
-                    workDone += `☒Stream ${ffstream.index}: Adding 6ch ${surroundCodec} downmix from ${ffstream.channels}ch\n`;
-                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${surroundCodec} -ac:a:${newStreamOutputIdx} 6 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                    const bitrate6 = getTargetBitrate(surroundCodec, 6, ffstream);
+                    workDone += `☒Stream ${ffstream.index}: Adding 6ch ${surroundCodec} at ${bitrate6} downmix from ${ffstream.channels}ch\n`;
+                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${surroundCodec} -b:a:${newStreamOutputIdx} ${bitrate6} -ac:a:${newStreamOutputIdx} 6 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${streamLang}"`;
                     newStreamOutputIdx++;
                     created6chLangs.add(ffstreamLangKey);
@@ -658,15 +718,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const twoMode = (downmixToTwo === 'replace' && isProtected) ? 'true' : downmixToTwo;
 
                 if (twoMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
-                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch to stereo ${stereoCodec} in place\n`;
-                    extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                    const bitrate2 = getTargetBitrate(stereoCodec, 2, ffstream);
+                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch to stereo ${stereoCodec} at ${bitrate2} in place\n`;
+                    extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec} -b:a:${outputAudioIdx} ${bitrate2}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${streamLang}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     created2chLangs.add(ffstreamLangKey);
                     convert = true;
                 } else if (twoMode === 'true') {
-                    workDone += `☒Stream ${ffstream.index}: Adding stereo ${stereoCodec} downmix from ${ffstream.channels}ch\n`;
-                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                    const bitrate2 = getTargetBitrate(stereoCodec, 2, ffstream);
+                    workDone += `☒Stream ${ffstream.index}: Adding stereo ${stereoCodec} at ${bitrate2} downmix from ${ffstream.channels}ch\n`;
+                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec} -b:a:${newStreamOutputIdx} ${bitrate2}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${streamLang}"`;
                     newStreamOutputIdx++;
                     created2chLangs.add(ffstreamLangKey);
