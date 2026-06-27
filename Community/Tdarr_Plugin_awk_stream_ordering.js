@@ -5,8 +5,8 @@ const details = () => ({
     Name: 'Re-order streams video, audio, subtitle, then anything else',
     Type: 'Any',
     Operation: 'Transcode',
-    Description: `Reorders streams into a clean layout: Video -> Audio (by language, then channels and quality, then commentary, etc) -> Subtitles (forced first, by language, sdh, etc) -> Data -> Attachments.\n`,
-    Version: '1.1',
+    Description: `Reorders streams into a clean layout: Video -> Audio (by language, then channels and quality, then commentary, etc) -> Subtitles (forced first, by language, sdh, etc) -> Attachments -> Data\n`,
+    Version: '1.2',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -67,7 +67,8 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['false', 'true'],
             },
-            tooltip: 'Should we put the default audio first? It is often inaccurate depending on the file source.',
+            tooltip: `Should we put the default audio first?
+                \\nThe default tag can be inaccurate depending on the file source. If enabled a default track will sort above anything in preferred_languages`,
         },
         {
             name: 'temp_on_network',
@@ -97,24 +98,35 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         infoLog: '',
     };
 
-    // VIDEO -> AUDIO -> SUBTITLE -> OTHER
+    if(!['descending', 'ascending'].includes(inputs.channel_order)) {
+        response.infoLog += '☒channel_order has not been configured, please configure required options.\n';
+        response.processFile = false;
+        return response;
+    }
+    if(!['descending', 'ascending'].includes(inputs.bitrate_order)) {
+        response.infoLog += '☒bitrate_order has not been configured, please configure required options.\n';
+        response.processFile = false;
+        return response;
+    }
+
+    // VIDEO -> AUDIO -> SUBTITLE -> ATTACHMENT -> DATA -> OTHER?
     const streamOrder = { video: 0, audio: 1, subtitle: 2 , attachment: 3, data: 4};
-    const preferredLanguages = inputs.preferred_languages.toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
+    const preferredLanguages = (inputs.preferred_languages || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
     const sdhFirst = String(inputs.sdh_first) === 'true';
     const defaultAudioFirst = String(inputs.default_audio_first) === 'true';
 
     //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
     const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
 
-    // collect the other languages from file
+    //Collect the other languages from file
     const languageOrder = new Set(preferredLanguages);
     const streams = [];
     for (let i = 0; i < file.ffProbeData.streams.length; i++) {
         const ffstream = file.ffProbeData.streams[i];
         const streamTitle = (ffstream.tags?.title || '').trim().toLowerCase();
-        const streamLang = (ffstream.tags?.language || 'und').trim().toLowerCase();
+        const streamLang = (ffstream.tags?.language?.trim() || 'und').toLowerCase();
         const streamLangShort = streamLang.replace(/[-_.].*$/, '');
-
+                
         //Add it to the list of languages if we don't have it or the two letter code that starts it if like en-US
         if (!languageOrder.has(streamLang) && !languageOrder.has(streamLangShort)) {
             preferredLanguages.push(streamLang);
@@ -134,11 +146,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             default: ffstream?.disposition?.default === 1,
 
             // simple classification (no helper functions)
-            commentary: streamTitle.includes('commentary') ||
-                        streamTitle.includes('director') ||
-                        streamTitle.includes('producer') ||
-                        streamTitle.includes('cast') ||
-                        streamTitle.includes('crew'),
+            commentary: ffstream?.disposition?.comment === 1 ||
+                        streamTitle.includes('commentary') ||
+                        streamTitle.includes('producer'),
 
             descriptive:  ffstream?.disposition?.visual_impaired === 1 ||
                           streamTitle.includes('description') ||
@@ -159,76 +169,75 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         });
     }
 
+    const getLangRank = (lang, shortlang) => {
+        let idx = preferredLanguages.indexOf(lang);
+        if (idx === -1) idx = preferredLanguages.indexOf(shortlang);
+        return idx === -1 ? 999 : idx;
+    };
+
     //Sort the streams
     streams.sort((a, b) => {
-        //First by stream type
+        //Stream Type
         const aOrder = streamOrder[a.type] ?? 99;
         const bOrder = streamOrder[b.type] ?? 99;
 
-        if (aOrder !== bOrder) {
+        if (aOrder !== bOrder)
             return aOrder - bOrder;
-        }
 
-        //Next comes video (but mjpeg goes last)
+        //Video (but mjpeg goes last)
         if (a.type === 'video') {
-            if (a.mjpeg !== b.mjpeg) {
+            if (a.mjpeg !== b.mjpeg)
                 return a.mjpeg ? 1 : -1;
-            }
-        //audio
+        //Audio
         } else if(a.type === 'audio') {
-            //override
+            //Override
             if(defaultAudioFirst && (a.default !== b.default))
                 return a.default ? -1 : 1;
 
-            // language priority
-            let aLang = preferredLanguages.indexOf(a.lang);
-            let bLang = preferredLanguages.indexOf(b.lang);
+            //Language priority
+            const aRank = getLangRank(a.lang, a.shortlang);
+            const bRank = getLangRank(b.lang, b.shortlang);
+            if (aRank !== bRank)
+                return aRank - bRank;
 
-            if(aLang === -1) aLang = preferredLanguages.indexOf(a.shortlang);
-            if(bLang === -1) bLang = preferredLanguages.indexOf(b.shortlang);
+            //A commentary stream could be descriptive but it would still be a commentary
+            const aRole = a.commentary ? 2 : (a.descriptive ? 1 : 0);
+            const bRole = b.commentary ? 2 : (b.descriptive ? 1 : 0);
+            if (aRole !== bRole)
+                return aRole - bRole;
 
-            const aRank = aLang === -1 ? 999 : aLang;
-            const bRank = bLang === -1 ? 999 : bLang;
-            if (aRank !== bRank) return aRank - bRank;
-
-            const aRole = a.commentary ? 1 : (a.descriptive ? 2 : 0);
-            const bRole = b.commentary ? 1 : (b.descriptive ? 2 : 0);
-            if (aRole !== bRole) return aRole - bRole;
-
-            // channel ordering
-            if (a.channels !== b.channels) {
+            //Channel ordering
+            if (a.channels !== b.channels)
                 return (inputs.channel_order === 'descending' ? b.channels - a.channels : a.channels - b.channels);
-            }
 
-            if (a.bitrate !== b.bitrate) {
+            //Quality
+            if (a.bitrate !== b.bitrate)
                 return (inputs.bitrate_order === 'descending' ? b.bitrate - a.bitrate : a.bitrate - b.bitrate);
-            }
-        //subtitles
+        //Subtitles
         } else if (a.type === 'subtitle') {
-            //override
-            if(sdhFirst && (a.sdh !== b.sdh))
-                return a.sdh ? -1 : 1;
-
-            // forced first
+            //Forced always first
             if (a.forced !== b.forced)
                 return a.forced ? -1 : 1;
 
-            let aLang = preferredLanguages.indexOf(a.lang);
-            let bLang = preferredLanguages.indexOf(b.lang);
+            //Override
+            if(sdhFirst && (a.sdh !== b.sdh))
+                return a.sdh ? -1 : 1;
 
-            if(aLang === -1) aLang = preferredLanguages.indexOf(a.shortlang);
-            if(bLang === -1) bLang = preferredLanguages.indexOf(b.shortlang);
+            //Language
+            const aRank = getLangRank(a.lang, a.shortlang);
+            const bRank = getLangRank(b.lang, b.shortlang);
 
-            const aRank = aLang === -1 ? 999 : aLang;
-            const bRank = bLang === -1 ? 999 : bLang;
+            if (aRank !== bRank)
+                return aRank - bRank;
 
-            if (aRank !== bRank) return aRank - bRank;
-
-            const aRole = a.sdh ? 1 : (a.signs ? 2 : 0);
-            const bRole = b.sdh ? 1 : (b.signs ? 2 : 0);
-            if (aRole !== bRole) return aRole - bRole;
+            //Normal, signs, SDH, commentary - sdhFirst flag overrides SDH position above
+            const aRole = a.commentary ? 3 : (a.sdh ? 2 : (a.signs ? 1 : 0));
+            const bRole = b.commentary ? 3 : (b.sdh ? 2 : (b.signs ? 1 : 0));
+            if (aRole !== bRole)
+                return aRole - bRole;
         }
 
+        //Next would be attachments and data but the order of these aren't important
         return a.index - b.index;
     });
 
@@ -249,7 +258,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     response.processFile = true;
     response.reQueueAfter = true;
     response.preset = `,${ffmpegMap} -c copy -max_muxing_queue_size 9999${networkDataOpt}`;
-    response.infoLog += '☒Streams are not in the correct order. (${ffmpegMap})\n';
+    response.infoLog += `☒Streams are not in the correct order. (${ffmpegMap})\n`;
 
     return response;
 };
