@@ -62,7 +62,7 @@ const details = () => ({
             defaultValue: 'ac3',
             inputUI: {
                 type: 'dropdown',
-                options: ['ac3','aac'],
+                options: ['ac3','eac3','aac'],
             },
             tooltip: `Specify codec for newly created surround tracks.`,
         },
@@ -136,6 +136,122 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // eslint-disable-next-line @typescript-eslint/no-unused-vars,no-param-reassign
     inputs = lib.loadDefaultValues(inputs, details);
 
+    //Codecs and some values to help us score the quality so that we can pick the best track - some of these formats are not supported by ffmpeg yet (ac4)
+    const codecInfo = {
+        // Lossless
+        pcm:        { score: 100, lossless: true },
+        flac:       { score: 100, lossless: true },
+        alac:       { score: 100, lossless: true },
+        wavpack:    { score: 100, lossless: true },
+        ape:        { score: 100, lossless: true },
+        tak:        { score: 100, lossless: true },
+        tta:        { score: 100, lossless: true },
+        mlp:        { score: 99,  lossless: true },
+
+        // Dolby family
+        truehd:     { score: 99,  lossless: true },
+        dtsma:      { score: 98,  lossless: true },
+        dtshr:      { score: 94,  minimum: 1000000, transparent: 3000000 },
+        dts:        { score: 91,  minimum: 768000,  transparent: 1509000 },
+        eac3atmos:  { score: 90,  minimum: 256000,  transparent: 768000 },
+        dtsexpress: { score: 80,  minimum: 128000,  transparent: 384000 },
+        
+        // Modern multichannel codecs
+        ac4:        { score: 90,  minimum: 128000,  transparent: 384000 },
+        eac3:       { score: 89,  minimum: 192000,  transparent: 640000 },
+        mpegh3d:    { score: 89,  minimum: 192000,  transparent: 512000 },
+
+        // Modern general-purpose codecs
+        opus:       { score: 89,  minimum: 64000,   transparent: 192000 },
+        aac:        { score: 87,  minimum: 96000,   transparent: 256000 },
+        vorbis:     { score: 86,  minimum: 128000,  transparent: 256000 },
+
+        // Legacy but still excellent
+        ac3:        { score: 84,  minimum: 192000,  transparent: 640000 },
+        atrac:      { score: 83,  minimum: 96000,   transparent: 192000 },
+        wma:        { score: 82,  minimum: 96000,   transparent: 192000 },
+        mpc:        { score: 82,  minimum: 128000,  transparent: 220000 },
+
+        // Older codecs
+        mp3:        { score: 78,  minimum: 128000,  transparent: 320000 },
+        mp2:        { score: 73,  minimum: 128000,  transparent: 256000 },
+        adpcm:      { score: 60,  minimum: 128000,  transparent: 256000 },
+        cook:       { score: 58,  minimum: 64000,   transparent: 128000 }
+    };
+    const codecAliases = [
+        ['pcm_',   'pcm'],
+        ['adpcm',  'adpcm'],
+        ['wmav',   'wma'],
+        ['atrac',  'atrac'],
+    ];
+    const unknownCodecs = new Set();
+
+    // Audio quality scoring 
+    const audioQuality = (stream) => {
+        let codec = (stream?.codec_name || '').toLowerCase().trim();
+        const longName = (stream.codec_long_name || '').toLowerCase().trim();
+
+        for (const [prefix, replacement] of codecAliases) {
+            if (codec.startsWith(prefix)) {
+                codec = replacement;
+                break;
+            }
+        }
+
+        //Do this first as there's no harm checking for additional info in the longName
+        if(codec === 'dca')
+            codec = 'dts';
+
+        //bit of an exception for DTS Core and DTS-HD MA
+        if (codec === 'dts') {
+            if (longName.includes('master'))
+                codec = 'dtsma';
+            else if (longName.includes('high resolution'))
+                codec = 'dtshr';
+            else if (longName.includes('express'))
+                codec = 'dtsexpress';
+        //We scored atmos a little higher than typical eac3
+        } else if((codec === 'eac3') && longName.includes('atmos'))
+            codec = 'eac3atmos';            
+
+        //Check if we can't identify the codec. If we can't then notify once per codec
+        if(!(codec in codecInfo) && !unknownCodecs.has(codec)) {
+            unknownCodecs.add(codec);
+            response.infoLog += `☒Stream ${stream.index}: Unknown audio codec "${codec}", using generic quality weighting.\n`;
+        }
+
+        //This is a pretty weak way to score an unknown codec
+        const info = codecInfo[codec] ?? { score: 70, minimum: 128000, transparent: 320000 };
+
+        //Get the variables ready for scoring
+        const bitrate = Number(stream.bit_rate || 0);
+        const channelScale = Math.pow((Math.max(2, Number(stream?.channels ?? 2))) / 2, 0.65);
+        const minimum = info.minimum * channelScale;
+        const transparent = info.transparent * channelScale;
+        const maxPenalty = 18;
+        let penalty = maxPenalty;
+
+        // Lossless codecs are already "perfect"
+        if (info.lossless)
+            return info.score;
+
+        // Invalid bitrate
+        if (bitrate <= 0) {
+            response.infoLog += `☒Stream ${stream.index}: Invalid bitrate, assuming nominal quality.\n`;
+            return info.score;
+        }
+
+        //Score the track
+        if (bitrate > minimum) {
+            if (bitrate >= transparent)
+                penalty = 0;
+            else
+                penalty = maxPenalty * (1 - ((bitrate - minimum) / (transparent - minimum)));
+        }
+
+        return info.score - penalty;
+    }
+    
     const response = {
         processFile: false,
         preset: '',
@@ -172,7 +288,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return response;
     }
     if(!['false','replace','true'].includes(downmixToTwo)) {
-        response.infoLog += `☒Somehow invalid downmixToSix option provided. Check your settings!\n`;
+        response.infoLog += `☒Somehow invalid downmixToStereo option provided. Check your settings!\n`;
         response.processFile = false;
         return response;
     }
@@ -191,7 +307,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.processFile = false;
         return response;
     }
-    if(!['ac3','aac'].includes(surroundCodec)) {
+    if(!['ac3','eac3','aac'].includes(surroundCodec)) {
         response.infoLog += `☒Somehow invalid forceCodec option provided. Check your settings!\n`;
         response.processFile = false;
         return response;
@@ -201,7 +317,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     let extraArguments = '';
     let workDone = '';
     let convert = false;
-    let audioStreamIndex = -1;
 
     //We really only care about the audio streams
     let audioStreams = file.ffProbeData.streams.filter(stream => (stream?.codec_type ?? '').trim().toLowerCase() === 'audio');
@@ -217,20 +332,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             disposition.comment === 1 || 
             disposition.visual_impaired === 1 ||
             disposition.karaoke === 1 ||
-            title.includes('commentary') || 
-            title.includes('director') || 
-            title.includes('producer') || 
-            title.includes('cast') || 
-            title.includes('crew') || 
-            title.includes('description') || 
-            title.includes('descriptive') || 
-            title.includes('dvs') || 
-            title.includes('narration') || 
-            title.includes('signs') || 
+            title.includes('commentary') ||
+            title.includes('producer') ||
+            title.includes('description') ||
+            title.includes('descriptive') ||
+            title.includes('dvs') ||
+            title.includes('narration') ||
+            title.includes('signs') ||
             title.includes('songs'));
     };
+
     //Add secondary track flag and the cleaned language to each track
-    audioStreams = audioStreams.map(item => ({...item, isTdarrSecondaryTrack: isSecondaryTrack(item), isTdarrCleanLang: String((item.tags?.language || 'und').trim().toLowerCase().replace(/[-_.].*$/, ''))}));
+    audioStreams = audioStreams.map(item => ({...item,
+                        isTdarrSecondaryTrack: isSecondaryTrack(item),
+                        isTdarrCleanLang: String((item.tags?.language || 'und').trim().toLowerCase().replace(/[-_.].*$/, '')),
+                        isTdarrQuality: audioQuality(item)
+                    }));
 
     //Remove tracks considered secondary if we shouldn't pay attention to them
     if(downmixSecondary !== true)
@@ -253,53 +370,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return true;
     }
     audioStreams = audioStreams.filter(stream => channelMatch(stream));
-
-    //Let's now order by codec and quality
-    const codecInfo = {
-        pcm:      { score: 100, max: 9000000 },
-        flac:     { score: 99,  max: 5000000 },
-        truehd:   { score: 98,  max: 8000000 },
-        alac:     { score: 97,  max: 5000000 },
-        mlp:      { score: 96,  max: 6000000 },
-        wavpack:  { score: 96, max: 6000000 },
-        dts:      { score: 90,  max: 6000000 },
-        eac3:     { score: 80,  max: 1024000 },
-        opus:     { score: 79,  max: 512000 },
-        aac:      { score: 78,  max: 640000 },
-        vorbis:   { score: 77,  max: 500000 },
-        ac3:      { score: 75,  max: 640000 },
-        mp2:      { score: 70,  max: 384000 },
-        mp3:      { score: 65,  max: 320000 },
-    };
-
-    const unknownCodecs = new Set();
-    function audioQuality(stream) {
-        let codec = (stream?.codec_name ?? '').toLowerCase().trim();
-        const bitrate = Number(stream.bit_rate || 0);
-
-        if(codec.startsWith('pcm_'))
-            codec = 'pcm';
-
-        if (!(codec in codecInfo) && !unknownCodecs.has(codec)) {
-            unknownCodecs.add(codec);
-            response.infoLog += `☒ Unknown audio codec "${codec}" using default quality weighting.\n`;
-        }
-
-        //bit of an exception for DTS Core and DTS-HD MA
-        if (codec === 'dts') {
-            const longName = (stream.codec_long_name || '').toLowerCase().trim();
-
-            if (longName.includes('master'))
-                return 98 + bitrate / 6000000;
-
-            if (longName.includes('high resolution'))
-                return 94 + bitrate / 3000000;
-        }
-
-        //Pull the score
-        const info = codecInfo[codec] || { score: 50, max: 2000000 };
-        return info.score + bitrate / info.max;
-    }
     
     audioStreams.sort((a, b) => {
         // language priority
@@ -322,8 +392,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return b.channels - a.channels;
         }
 
-        const aQuality = audioQuality(a);
-        const bQuality = audioQuality(b);
+        const aQuality = a.isTdarrQuality;
+        const bQuality = b.isTdarrQuality;
         if(aQuality !== bQuality) return bQuality - aQuality;
 
         return a.index - b.index;
