@@ -539,7 +539,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         convert = true;
     }
 
-    // Include recovery flags if requested or if the source container is known to have timestamp issues.
+    //Include recovery flags if requested or if the source container is known to have timestamp issues.
 
     //Igndts can cause very strange problems if genpts isn't also enabled
     if(recoveryIgndts === true) 
@@ -557,7 +557,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if(fflags !== '') 
         fflags = `-fflags ${fflags}`;
 
-    // Convert file if convert variable is set to true.
+    //Convert file if convert variable is set to true.
     if (convert === true) {
         response.preset += `${fflags},-map 0 -c copy${extraArguments} -max_muxing_queue_size 9999${networkDataOpt}`;
         response.infoLog += workDone;
