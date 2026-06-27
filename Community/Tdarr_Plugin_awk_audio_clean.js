@@ -534,10 +534,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Tracks which input audio indices have already received a -c:a:N assignment so we don't emit conflicting codec directives for the same stream.
     const modifiedAudioIdx = new Set();
 
+    // Prefer channel_layout (e.g. '3.1', '2.1', '4.0') over channel count alone, since
+    // multiple layouts share the same count (3ch = 2.1 or 3.0; 4ch = 3.1, 4.0, or quad).
+    // Strip parenthesised variants like '5.1(side)' → '5.1' for label purposes.
+    const chLabel = (stream) => {
+        const layout = (stream?.channel_layout || '').toLowerCase().replace(/\(.*\)$/, '').trim();
+        const ch = Number(stream?.channels ?? 0);
+        const byLayout = {
+            'mono': 'Mono', 'stereo': 'Stereo', 'downmix': 'Stereo',
+            '2.1': '2.1', '3.0': '3.0', '3.1': '3.1',
+            'quad': 'Quad', '4.0': '4.0', '4.1': '4.1',
+            '5.0': '5.0', '5.1': '5.1',
+            '6.0': '6.0', '6.1': '6.1',
+            '7.0': '7.0', '7.1': '7.1',
+        };
+        const byCount = { 8: '7.1', 7: '6.1', 6: '5.1', 5: '5.0', 4: '4.0', 3: '3.0', 2: 'Stereo', 1: 'Mono' };
+        return byLayout[layout] ?? byCount[ch] ?? `${ch}ch`;
+    };
+
     // Build the title for a new or replaced track.
-    const chLabel = { 8: '7.1', 7: '6.1', 6: '5.1', 5: '5.0', 4: '4.0', 3: '3.0', 2: 'Stereo', 1: 'Mono' };
     const buildTitle = (srcStream, targetLabel) => {
-        const srcLabel = chLabel[srcStream.channels ?? 0] ?? `${srcStream.channels}ch`;
+        const srcLabel = chLabel(srcStream);
         const origTitle = (srcStream.tags?.title || '').trim();
         if (preserveTitle === 'false') return targetLabel;
         if (preserveTitle === 'source') return `${srcLabel} -> ${targetLabel}`;
@@ -553,16 +570,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Returns null for layouts we cannot safely map positionally, so callers fall back to -ac 2.
     //
     // Verified channel layouts and worked examples:
+    //   2.1 (FL FR LFE) returns null: dropping LFE and keeping FL/FR is identical to -ac 2, no pan needed.
+    //   3.0 (FL FR FC)  returns null: no surround channels and no LFE, -ac 2 handles it fine.
     //   3.1  FL FR FC LFE          FL=0.3,FR=0.3,FC=1.0,LFE=1.0 → L=1.007, R=1.007  (centre folds in, LFE dropped)
     //   4.0  FL FR FC BC           FL=1.0,FR=0.0,FC=0.5,BC=0.6  → L=1.654, R=0.654  (BC split evenly to both sides)
     //   5.0  FL FR FC BL BR        FL=1.0,FR=0.0,FC=0.5,BL=0.8  → L=1.920, R=0.354
     //   5.1  FL FR FC LFE BL BR    FL=1.0,FR=0.0,FC=0.5,LFE=1.0,BL=0.8 → L=1.920, R=0.354  (LFE dropped)
     //   6.1  FL FR FC LFE BC SL SR FL=1.0,FR=0.0,FC=0.5,LFE=1.0,BC=0.6,SL=0.8 → L=2.220, R=0.654
     //   7.1  FL FR FC LFE BL BR SL SR FL=1.0,FR=0.0,FC=0.5,LFE=1.0,BL=0.8,SL=0.6 → L=2.054, R=0.354
-    //
-    // 2.1 (FL FR LFE) returns null: dropping LFE and keeping FL/FR is identical to -ac 2, no pan needed.
-    // 3.0 (FL FR FC) returns null: no surround channels and no LFE, -ac 2 handles it fine.
-    // quad/quad(side) return null: no centre channel to preserve, -ac 2 is equivalent.
     const downmixMatrix = (srcStream) => {
         const ch = Number(srcStream?.channels) || 0;
 
