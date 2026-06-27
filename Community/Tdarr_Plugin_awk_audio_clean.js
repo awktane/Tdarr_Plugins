@@ -407,7 +407,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if(stream.channels > 6 && (downmixToSix === 'false') && (downmixToTwo === 'false') && (forceCodec === 'true' && ((stream?.codec_name ?? '').trim().toLowerCase() === surroundCodec)))
             return false;
         //3-7 channel
-        else if(stream.channels > 2 && (downmixToTwo === 'false') && (['true','6below'].includes(forceCodec) && ((stream?.codec_name ?? '').trim().toLowerCase() === surroundCodec)))
+        else if(stream.channels > 2 && stream.channels <= 6 && (downmixToTwo === 'false') && (['true','6below'].includes(forceCodec) && ((stream?.codec_name ?? '').trim().toLowerCase() === surroundCodec)))
             return false;
         if((stream.channels <= 2) && ['true','6below','2below'].includes(forceCodec) && ((stream?.codec_name ?? '').trim().toLowerCase() === stereoCodec))
             return false;
@@ -507,7 +507,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     convert = true;
                 } else if (downmixToSix === 'true' && !hasCreated6ch) {
                     workDone += `☒Stream ${ffstream.index}: Adding 6ch ${surroundCodec} downmix from ${ffstream.channels}ch\n`;
-                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${surroundCodec} -ac 6 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${surroundCodec} -ac:a:${newStreamOutputIdx} 6 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${streamLang}"`;
                     newStreamOutputIdx++;
                     convert = true;
@@ -527,7 +527,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     convert = true;
                 } else if (downmixToTwo === 'true' && !hasCreated2ch) {
                     workDone += `☒Stream ${ffstream.index}: Adding stereo ${stereoCodec} downmix from ${ffstream.channels}ch\n`;
-                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec} -ac 2 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec} -ac:a:${newStreamOutputIdx} 2 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${streamLang}"`;
                     newStreamOutputIdx++;
                     convert = true;
