@@ -6,9 +6,10 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Identify and remove any data, image (MJPEG,BMP,PNG,GIF), and remux into mkv or mp4.\n\n
-                  Removes any subtitle or audio tracks that are not in the specified language(s) and optionally removes any descriptive tracks with deaf/SDH in their description.\n\n
+                  Removes any subtitle or audio tracks that are not in the specified language(s) and optionally removes with deaf/SDH in their description.\n\n
                   Option to modify metadata to remove metadata comments and titles with too many periods.\n\n
                   Automatically deduplicates titles reducing "Stereo / Stereo" down to "Stereo" or "English - English" down to "English".\n\n
+                  Removes unsupported image based subtitles during remux.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n`,
     Version: '1.7',
     Tags: 'pre-processing,ffmpeg,configurable',
@@ -24,7 +25,7 @@ const details = () => ({
             tooltip: `Specify output container of file
                 \\nAny streams that are not supported by the output container will be removed.
                \\nmkv will also remove eia_608.
-               \\nmp4 will also remove eia_608 and hdmv_pgs_subtitle. Genpts may be required to fix timestamps.`,
+               \\nmp4 will also remove eia_608, hdmv_pgs_subtitle, dvd_subtitle, and xsub. Genpts may be required to fix timestamps.`,
         },
         {
             name: 'recovery_discard_frame',
@@ -59,9 +60,9 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['false', 'true'],
             },
-            tooltip: `Run with the ffmpeg +igndts option to ignore DTS (Decode Timestamps - has nothing to do with Dobly DTS).
+            tooltip: `Run with the ffmpeg +igndts option to ignore DTS (Decode Timestamps - has nothing to do with Dolby DTS).
                  \\nShould generally be false but can fix errors like "Non-monotonous DTS in output stream" or "DTS out of order".
-                 \\nWhen enabled, genpts will be forced as messing with the timestream is a daunting exercise.`,
+                 \\nWhen enabled genpts will be automatically enabled even if false is specified as messing with the timestream is a daunting exercise.`,
         },
         {
             name: 'audio_language',
@@ -103,7 +104,7 @@ const details = () => ({
                     jpn`,
         },
         {
-            name: 'del_descriptive',
+            name: 'del_deaf',
             type: 'boolean',
             defaultValue: false,
             inputUI: {
@@ -132,8 +133,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['false','true'],
             },
-            tooltip: `Should comments be removed from all streams? These are not usually shown by players and often contain unnecessary information.
-                \\nForced for mp4 as mp4 does not support title tags at the audio track or subtitle track level and will cause an error if present.`,
+            tooltip: `Should comments be removed from all streams? These are not usually shown by players and often contain unnecessary information.`,
         },
         {
             name: 'clean_metadata_busytitle',
@@ -193,7 +193,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const dstContainer = inputs.container.toLowerCase().trim();
     response.container = `.${dstContainer}`;
 
-    //The titles we will replace for tagChannelAudioTitle
+    //The titles we will replace for tagChannelAudioTitle - include 2.0 to allow us to overwrite that with stereo
     const tagChannelAudioTitleRegex =  /^(7\.1|6\.1|5\.1|5\.0|4\.0|3\.1|3\.0|2\.1|2\.0|stereo|mono)$/i;
 
     //A few more that should come through as boolean
@@ -216,10 +216,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return response;
     }
 
-    //If fillLanguage is set it should be a track that's kept
-    if(fillLanguage && ((subLanguage.length > 0 && !subLanguage.includes(fillLanguage)) || (audioLanguage.length > 0 && !audioLanguage.includes(fillLanguage))))
+    //If fillLanguage is set it should be a track that's kept (checked per-type so one type can legitimately exclude it)
+    if(fillLanguage && subLanguage.length > 0 && !subLanguage.includes(fillLanguage))
     {
-        response.infoLog += `☒You have specified that blank tracks should be tagged as ${fillLanguage}. You have not included it in audio_language/sub_language which indirectly will remove untagged streams.\n`;
+        response.infoLog += `☒You have specified that blank tracks should be tagged as ${fillLanguage}. You have not included it in sub_language which indirectly will remove untagged subtitle streams.\n`;
+        response.processFile = false;
+        return response;
+    }
+    if(fillLanguage && audioLanguage.length > 0 && !audioLanguage.includes(fillLanguage))
+    {
+        response.infoLog += `☒You have specified that blank tracks should be tagged as ${fillLanguage}. You have not included it in audio_language which indirectly will remove untagged audio streams.\n`;
         response.processFile = false;
         return response;
     }
@@ -227,13 +233,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
     const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
 
-    const delDescriptive = String(inputs.del_descriptive) === 'true';
-    const descriptiveKeywords = [
+    const delDeaf = String(inputs.del_deaf) === 'true';
+    const deafKeywords = [
         'sdh',
         'hearing impaired',
-        'deaf',
-        'descriptive'
+        'deaf'
     ];
+
+    //Clean up titles - Remove surrounding whitespace, single quotes and double quotes as there's no reason for them & wipes title as specified by busyTitleRemove
+    function cleanStreamTitle(rawTitle, busyTitleRemove) {
+        let title = (rawTitle || '').trim().replace(/^["']+|["']+$/g, '');
+        if (busyTitleRemove && title.split('.').length > 4) return '';
+        if (title) {
+            const parts = title.split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
+            if (parts.length === 1) return parts[0];
+            if (parts.length > 1 && parts.every(p => p.toLowerCase() === parts[0].toLowerCase()))
+                return parts[0];
+        }
+        return title;
+    }    
 
     // Set up required variables.
     let extraArguments = '';
@@ -243,7 +261,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     let subtitleDropped = 0;
     let audioDropped = 0;
     let videoDropped = 0;
-    let otherDropped = 0;
     let subtitleStreamIndex = -1;
     let audioStreamIndex = -1;
     let videoStreamIndex = -1;
@@ -258,6 +275,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             //Original stream title - prefer stream title but use metadata if available. When we set tags.title both are set.
             const streamTitle = (ffstream.tags?.title || ffmedia?.Title || '');
             const streamLang = (ffstream.tags?.language ?? (ffmedia?.Language ?? '')).trim().toLowerCase();
+            let workLang = streamLang || 'und';
 
             //This will be added to the ffmpeg command if metadata needs to be changed. It will be built up as needed.
             let metadataCommand = '';
@@ -271,21 +289,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if((ffstreamCodec === 'eia_608') || (dstContainer === 'mp4' && ['hdmv_pgs_subtitle', 'dvd_subtitle', 'xsub'].includes(ffstreamCodec))) {
                     workDone += `☒Remove stream ${i} - unsupported (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
-                //Rescue any we can by filling in the language
-                } else if (fillLanguage && (!streamLang || streamLang === 'und')) {
-                    workDone += `☒Language blank on stream ${i} - setting subtitle language to "${fillLanguage}"\n`;
-                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "language=${fillLanguage}"`;
-                //If the audio is a language that should be removed then remove it regardless of other settings.
                 } else {
-                    //Gather all of the places where we may find the descriptive words we're looking for for delDescriptive
+                    //Rescue any we can by filling in the language before deciding whether to remove it
+                    if (fillLanguage && (!streamLang || streamLang === 'und')) {
+                        workDone += `☒Language blank on stream ${i} - setting subtitle language to "${fillLanguage}"\n`;
+                        metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "language=${fillLanguage}"`;
+                        workLang = fillLanguage;
+                    }
+
+                    //Gather all of the places where we may find the deaf identification words we're looking for for delDeaf
                     const subtitleDescription = [ffstream.tags?.title,ffstream.tags?.description,ffstream.tags?.handler_name,ffmedia?.Title,ffmedia?.Description].filter(Boolean).join(' ').toLowerCase();
-                    let workLang = (!streamLang ? (fillLanguage ? fillLanguage : 'und') : streamLang);
 
                     //If the subtitle is a language that should be removed then remove it regardless of other settings.
                     if(subLanguage.length > 0 && !subLanguage.includes(workLang) && !subLanguage.includes(workLang.replace(/[-_.].*$/, ''))) {
                         workDone += `☒Remove stream ${i} - subtitle language (${streamLang})\n`;
                         delStream = true;
-                    } else if ((delDescriptive === true) && (ffstream.disposition?.hearing_impaired === 1 || descriptiveKeywords.some(keyword => subtitleDescription.includes(keyword)))) {
+                    } else if ((delDeaf === true) && (ffstream.disposition?.hearing_impaired === 1 || deafKeywords.some(keyword => subtitleDescription.includes(keyword)))) {
                         workDone += `☒Remove stream ${i} - SDH (${subtitleDescription})\n`;
                         delStream = true;
                     }
@@ -296,25 +315,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     extraArguments += ` -map -0:${i}`;
                     convert = true;
                     subtitleDropped++;
+                    subtitleStreamIndex--;
                     continue;
                 }
 
-                //Remove surrounding whitespace, single quotes and double quotes as there's no reason for them
-                let newStreamTitle = (streamTitle || '').trim().replace(/^"+|"+$/g, '').replace(/^'+|'+$/g, '');                
-                if((metaBusyTitleRemove === true) && (newStreamTitle.split('.').length > 4)) {
-                    newStreamTitle = '';
-                }
-
-                //If title is as an example Stereo / Stereo reduce it to just Stereo. Avoids an infinite plugin loop situation
-                if(newStreamTitle) {
-                    const titleParts = newStreamTitle.split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
-                    if (titleParts.length > 1) {
-                        const firstPart = titleParts[0].toLowerCase();
-                        if(titleParts.every(tp => tp.toLowerCase() === firstPart)) {
-                            newStreamTitle = titleParts[0];
-                        }
-                    }
-                }
+                //Remove surrounding whitespace, single quotes and double quotes as there's no reason for them. Clear the title if metaBusyTitleRemove conditions are met
+                let newStreamTitle = cleanStreamTitle(streamTitle, metaBusyTitleRemove);
 
                 //We trimmed the title above so if it contains newlines or spaces they'll be removed. Make sure title is set at both metadata and stream levels
                 if(newStreamTitle !== streamTitle)
@@ -365,7 +371,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 audioStreamIndex++;
 
                 //Rescue any we can by filling in the language
-                let workLang = (!streamLang ? (fillLanguage ? fillLanguage : 'und') : streamLang);
                 if (fillLanguage && (!streamLang || streamLang === 'und')) {
                     workDone += `☒Language blank on audio stream ${i} - setting to "${fillLanguage}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "language=${fillLanguage}"`;
@@ -379,25 +384,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     extraArguments += ` -map -0:${i}`;
                     convert = true;
                     audioDropped++;
+                    audioStreamIndex--;
                     continue;
                 }
 
-                //Remove surrounding whitespace, single quotes and double quotes as there's no reason for them
-                let newStreamTitle = (streamTitle || '').trim().replace(/^"+|"+$/g, '').replace(/^'+|'+$/g, '');
-                
-                if((metaBusyTitleRemove === true) && newStreamTitle.split('.').length > 4) {
-                    newStreamTitle = '';
-                }
-
-                //If title is as an example Stereo / Stereo reduce it to just Stereo. Avoids an infinite plugin loop situation
-                if(newStreamTitle) {
-                    const titleParts = newStreamTitle.split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
-                    if (titleParts.length > 1) {
-                        const firstPart = titleParts[0].toLowerCase();
-                        if(titleParts.every(tp => tp.toLowerCase() === firstPart))
-                            newStreamTitle = titleParts[0];
-                    }
-                }
+                //Remove surrounding whitespace, single quotes and double quotes as there's no reason for them. Clear the title if metaBusyTitleRemove conditions are met
+                let newStreamTitle = cleanStreamTitle(streamTitle, metaBusyTitleRemove);
 
                 //Get the channel count string ready. Some assumptions are made but should handle most correctly.
                 if(tagChannelAudioTitle === true && ffstream.channels && (!newStreamTitle || tagChannelAudioTitleRegex.test(newStreamTitle))) {
@@ -467,6 +459,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     extraArguments += ` -map -0:${i}`;
                     convert = true;
                     videoDropped++;
+                    videoStreamIndex--;
                     continue;
                 }            
 
@@ -494,18 +487,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     convert = true;
                     continue;
                 }                
-            }
-
-            //Remove data streams
-            if ((ffstreamType === 'data') || ['data','bin_data','tmcd'].includes(ffstreamCodec)) {
+            } else if(ffstreamType === 'attachment' && ['mjpeg', 'png', 'gif', 'bmp', 'none'].includes(ffstreamCodec)) {
+                workDone += `☒Remove stream ${i} - attachment stream (${ffstreamType}-${ffstreamCodec})\n`;
+                extraArguments += ` -map -0:${i}`;
+                convert = true;
+                continue;
+            } else if ((ffstreamType === 'data') || ['data','bin_data','tmcd'].includes(ffstreamCodec)) {
                 workDone += `☒Remove stream ${i} - data stream (${ffstreamType}-${ffstreamCodec})\n`;
                 extraArguments += ` -map -0:${i}`;
                 convert = true;
-                otherDropped++;
                 continue;
             }
 
-            //The only other type of stream currently supported by ffmpeg is attachment which we will leave untouched. It's generally used for fonts and cover art so the metadata may be useful. If it needs to be removed then it can be done with a separate plugin.
+            //The only other type of stream currently supported by ffmpeg is attachment which we will leave untouched. It's generally used for fonts (ass/ssa subtitles) and cover art so the metadata may be useful. If it needs to be removed then it can be done with a separate plugin.
         } catch (err) {
             // Error
             response.infoLog += `☒Error processing stream ${i}: ${err}\n`;
@@ -514,20 +508,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
     }
 
-    if(videoStreamIndex > -1 && videoDropped >= (videoStreamIndex + 1)) {
+    if(videoDropped > 0 && videoStreamIndex === -1) {
         response.infoLog += `☒Removing specified streams would leave the file without any video streams. Check to make sure file contains valid streams. \n`;
         response.processFile = false;
         return response;
     }
 
-    if(audioStreamIndex > -1 && audioDropped >= (audioStreamIndex + 1)) {
+    if(audioDropped > 0 && audioStreamIndex === -1) {
         response.infoLog += `☒Removing specified streams would leave the file without any audio streams. Check to make sure file contains valid streams. \n`;
-        response.processFile = false;
-        return response;
-    }
-
-    if((videoDropped + audioDropped + subtitleDropped + otherDropped) >= file.ffProbeData.streams.length) {
-        response.infoLog += `☒Removing specified streams would leave the file empty. Check to make sure file contains valid streams. \n`;
         response.processFile = false;
         return response;
     }
@@ -552,25 +540,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
 
     // Include recovery flags if requested or if the source container is known to have timestamp issues.
-    if(recoveryIgndts === true) {
-        //Igndts can cause very strange problems if genpts isn't also enabled
+
+    //Igndts can cause very strange problems if genpts isn't also enabled
+    if(recoveryIgndts === true) 
         fflags += '+igndts+genpts';
-    }
 
     if (['ts', 'avi', 'mpg', 'mpeg'].includes(srcContainer)) {
-        if(!recoveryIgndts) {
+        if(!recoveryIgndts)
             fflags += '+genpts';
-        }
         extraArguments = ` -avoid_negative_ts make_zero${extraArguments}`;
-    } else if (recoveryGenpts === true && !recoveryIgndts) {
+    } else if (recoveryGenpts === true && !recoveryIgndts) 
         fflags += '+genpts';
-    }
-    if(recoveryDiscard === true) {
+
+    if(recoveryDiscard === true) 
         fflags += '+discardcorrupt';
-    }
-    if(fflags !== '') {
+    if(fflags !== '') 
         fflags = `-fflags ${fflags}`;
-    }
 
     // Convert file if convert variable is set to true.
     if (convert === true) {
