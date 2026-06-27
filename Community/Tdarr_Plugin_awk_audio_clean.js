@@ -249,8 +249,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             else if (longName.includes('express'))
                 codec = 'dtsexpress';
         //We scored atmos a little higher than typical eac3
-        } else if((codec === 'eac3') && longName.includes('atmos'))
-            codec = 'eac3atmos';            
+        // codec_long_name rarely says "atmos" so also check the stream title tag
+        } else if (codec === 'eac3') {
+            const streamTitle = (stream.tags?.title || '').toLowerCase();
+            if (longName.includes('atmos') || streamTitle.includes('atmos'))
+                codec = 'eac3atmos';
+        }
 
         //Check if we can't identify the codec. If we can't then notify once per codec
         if(!(codec in codecInfo) && !unknownCodecs.has(codec)) {
@@ -273,10 +277,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (info.lossless)
             return info.score;
 
-        // Invalid bitrate
+        // Invalid bitrate — return midpoint rather than full score to avoid
+        // preferring an unknown-bitrate lossy track over a scored one.
         if (bitrate <= 0) {
             response.infoLog += `☒Stream ${stream.index}: Invalid bitrate, assuming nominal quality.\n`;
-            return info.score;
+            return info.score - (maxPenalty / 2);
         }
 
         //Score the track
@@ -321,7 +326,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const stereoCodec = String(inputs.stereo_codec).trim();
     const stereoDownmix = String(inputs.stereo_downmix).trim();
     const surroundCodec = String(inputs.surround_codec).trim();
-    const keepBestSurroundSafe = String(inputs.keep_best_surround_safe) === 'true';
+    const keepBestSurroundSafe = String(inputs.keep_best_surround_safe).trim();
 
     if(!['false','replace','true'].includes(downmixToSix)) {
         response.infoLog += `☒Somehow invalid downmixToSix option provided. Check your settings!\n`;
@@ -405,15 +410,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // keep_best_surround_safe: protect the best track per language. (based on setting of keep_best_surround_safe quality vs channel)
     // Protected tracks are never removed or force-transcoded, and a 'replace' downmix on them becomes an 'add' so the pristine source survives.
     const protectedIndices = new Set();
-    if (keepBestSurroundSafe) {
+    if (keepBestSurroundSafe !== 'false') {
         const bestByLang = new Map();
+        const qualityFirst = keepBestSurroundSafe === 'quality';
         for (const s of candidateStreams) {
             const cur = bestByLang.get(s.isTdarrCleanLang);
-            if (!cur
-                || s.channels > cur.channels
-                || (s.channels === cur.channels && s.isTdarrQuality > cur.isTdarrQuality)
-                || (s.channels === cur.channels && s.isTdarrQuality === cur.isTdarrQuality && s.index < cur.index))
+            if (!cur) {
                 bestByLang.set(s.isTdarrCleanLang, s);
+                continue;
+            }
+            const better = qualityFirst
+                ? s.isTdarrQuality > cur.isTdarrQuality
+                  || (s.isTdarrQuality === cur.isTdarrQuality && s.channels > cur.channels)
+                  || (s.isTdarrQuality === cur.isTdarrQuality && s.channels === cur.channels && s.index < cur.index)
+                : s.channels > cur.channels
+                  || (s.channels === cur.channels && s.isTdarrQuality > cur.isTdarrQuality)
+                  || (s.channels === cur.channels && s.isTdarrQuality === cur.isTdarrQuality && s.index < cur.index);
+            if (better) bestByLang.set(s.isTdarrCleanLang, s);
         }
         for (const s of bestByLang.values()) protectedIndices.add(s.index);
     }
