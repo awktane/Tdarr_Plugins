@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.2',
+    Version: '1.3',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -250,11 +250,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 codec = 'dtsexpress';
         //We scored atmos a little higher than typical eac3
         // codec_long_name rarely says "atmos" so also check the stream title tag
-        } else if (codec === 'eac3') {
-            const streamTitle = (stream.tags?.title || '').toLowerCase();
-            if (longName.includes('atmos') || streamTitle.includes('atmos'))
-                codec = 'eac3atmos';
-        }
+        } else if (codec === 'eac3' && (longName.includes('atmos') || (stream.tags?.title || '').toLowerCase().includes('atmos')))
+            codec = 'eac3atmos';
 
         //Check if we can't identify the codec. If we can't then notify once per codec
         if(!(codec in codecInfo) && !unknownCodecs.has(codec)) {
