@@ -5,7 +5,7 @@ const details = () => ({
     Name: 'Clean up the audio streams based on language, channels, and quality',
     Type: 'Audio',
     Operation: 'Transcode',
-    Description: `This plugin can cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
+    Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
     Version: '1.069420710',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
@@ -57,6 +57,18 @@ const details = () => ({
             tooltip: `Should commentary, visual impaired tracks, etc be queued for downmixing? This would normally be false`,
         },
         {
+            name: 'remove_duplicates',
+            type: 'boolean',
+            defaultValue: 'false',
+            inputUI: {
+                type: 'dropdown',
+                options: ['false','true'],
+            },
+            tooltip: `Remove lower quality audio streams that share the same language, channel count, and general track type (primary vs secondary/commentary).
+                \\nThe highest quality stream in each group is kept; the rest are removed.
+                \\nNote: language matching uses the base language code (e.g. "en" matches en-US and en-CA).`,
+        },
+        {
             name: 'surround_codec',
             type: 'string',
             defaultValue: 'ac3',
@@ -87,7 +99,7 @@ const details = () => ({
             tooltip: `Transcode all tracks to the codecs specified in surround_codec and stereo_codec
                 \\nIf false  - Codecs will be left as is and those two settings will only apply to new tracks
                 \\nIf 6below - Streams with six or fewer channels will be transcoded to the corrected codec
-                \\nIf 2below - Streams with six or fewer channels will be transcoded to the corrected codec
+                \\nIf 2below - Streams with two or fewer channels will be transcoded to the corrected codec
                 \\nIf true   - All streams will be transcoded to the new codec`,
         },                
         {
@@ -276,6 +288,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const downmixToTwo = String(inputs.downmix_to_stereo).trim();
     const downmixSingle = String(inputs.downmix_single) === 'true';
     const downmixSecondary = String(inputs.downmix_secondary) === 'true';
+    const removeDuplicates = String(inputs.remove_duplicates) === 'true';
     const downmixLanguage = String(inputs.downmix_language).toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
     const preserveTitle = String(inputs.preserve_title).trim();
     const forceCodec = String(inputs.force_codec).trim();
@@ -308,12 +321,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return response;
     }
     if(!['ac3','eac3','aac'].includes(surroundCodec)) {
-        response.infoLog += `☒Somehow invalid forceCodec option provided. Check your settings!\n`;
+        response.infoLog += `☒Somehow invalid surroundCodec option provided. Check your settings!\n`;
         response.processFile = false;
         return response;
     }
 
-    // Set up required variables.
     let extraArguments = '';
     let workDone = '';
     let convert = false;
@@ -349,15 +361,47 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         isTdarrQuality: audioQuality(item)
                     }));
 
-    //Remove tracks considered secondary if we shouldn't pay attention to them
-    if(downmixSecondary !== true)
-        audioStreams = audioStreams.filter(stream => !stream.isTdarrSecondaryTrack);
+    // candidateStreams: language+secondary filtered but NOT channelMatch filtered.
+    // Used for duplicate detection and as the pool for workStreams.
+    let candidateStreams = audioStreams;
+    if (downmixSecondary !== true)
+        candidateStreams = candidateStreams.filter(stream => !stream.isTdarrSecondaryTrack);
+    if (downmixLanguage.length !== 0)
+        candidateStreams = candidateStreams.filter(stream => downmixLanguage.includes(stream.isTdarrCleanLang));
 
-    //Remove tracks not in a language we're paying attention to
-    if(downmixLanguage.length !== 0)
-        audioStreams = audioStreams.filter(stream => downmixLanguage.includes(stream.isTdarrCleanLang));
+    // Identify lower-quality duplicates: group by (lang, channels, primary/secondary).
+    // Within each group, keep only the highest quality stream and mark the rest for removal.
+    const streamsToRemove = new Set();
+    if (removeDuplicates) {
+        const seen = new Map();
+        const byQuality = [...candidateStreams].sort((a, b) => b.isTdarrQuality - a.isTdarrQuality || a.index - b.index);
+        for (const s of byQuality) {
+            const key = `${s.isTdarrCleanLang}|${s.channels}|${s.isTdarrSecondaryTrack}`;
+            if (seen.has(key)) {
+                streamsToRemove.add(s.index);
+                workDone += `☒Stream ${s.index}: Removing duplicate (lower quality ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang})\n`;
+            } else {
+                seen.set(key, s);
+            }
+        }
+    }
 
-    //Remove any tracks that we won't use based on channel count, etc. This may leave some extra (ex: 5.1 & 4.0 when we're only looking to downmix a 2 channel) but is good for a first pass
+    // inputAudioIdxMap: 0-based audio-type index within the INPUT file (for -map 0:a:N).
+    // outputAudioIdxMap: 0-based audio-type index within the OUTPUT (for -c:a:N and -metadata:s:a:N).
+    // These differ when removeDuplicates removes streams, since -map 0:a:N always references input.
+    const inputAudioIdxMap = new Map();
+    const outputAudioIdxMap = new Map();
+    let inputAudioCounter = 0;
+    let totalOutputAudioBeforeNew = 0;
+    for (const stream of file.ffProbeData.streams) {
+        if ((stream?.codec_type || '').trim().toLowerCase() === 'audio') {
+            inputAudioIdxMap.set(stream.index, inputAudioCounter++);
+            if (!streamsToRemove.has(stream.index))
+                outputAudioIdxMap.set(stream.index, totalOutputAudioBeforeNew++);
+        }
+    }
+
+    //Remove any tracks that we won't use based on channel count, etc.
     const channelMatch = (stream) => {
         //8 channel
         if(stream.channels > 6 && (downmixToSix === 'false') && (downmixToTwo === 'false') && (forceCodec === 'true' && ((stream?.codec_name ?? '').trim().toLowerCase() === surroundCodec)))
@@ -368,10 +412,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if((stream.channels <= 2) && ['true','6below','2below'].includes(forceCodec) && ((stream?.codec_name ?? '').trim().toLowerCase() === stereoCodec))
             return false;
         return true;
-    }
-    audioStreams = audioStreams.filter(stream => channelMatch(stream));
-    
-    audioStreams.sort((a, b) => {
+    };
+
+    // workStreams: surviving candidates that still need codec work (downmix or force codec).
+    let workStreams = candidateStreams
+        .filter(s => !streamsToRemove.has(s.index))
+        .filter(s => channelMatch(s));
+
+    workStreams.sort((a, b) => {
         // language priority
         let aLang = downmixLanguage.indexOf((a.tags?.language || 'und').trim().toLowerCase());
         let bLang = downmixLanguage.indexOf((b.tags?.language || 'und').trim().toLowerCase());
@@ -388,9 +436,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (aRole !== bRole) return aRole - bRole;
 
         // channel ordering
-        if (a.channels !== b.channels) {
+        if (a.channels !== b.channels)
             return b.channels - a.channels;
-        }
 
         const aQuality = a.isTdarrQuality;
         const bQuality = b.isTdarrQuality;
@@ -399,27 +446,116 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return a.index - b.index;
     });
 
-    //Now remove any tracks we won't need for transcoding
-
-    if (audioStreams.length === 0) {
-        response.infoLog += '☑ No primary or configured language audio tracks found to manipulate.\n';
+    if (workStreams.length === 0 && streamsToRemove.size === 0) {
+        response.infoLog += '☑ No audio tracks require changes.\n';
         return response;
     }
 
-    for (let i = 0; i < audioStreams.length; i++) {
+    // Seed extraArguments with removal exclusions before any codec args.
+    if (streamsToRemove.size > 0) {
+        for (const idx of streamsToRemove)
+            extraArguments += ` -map -0:${idx}`;
+        convert = true;
+    }
+
+    // New streams added via -map are numbered after all surviving original audio streams.
+    let newStreamOutputIdx = totalOutputAudioBeforeNew;
+
+    // For 'true' (add) mode, create at most one downmix per channel tier across all iterations.
+    let hasCreated6ch = false;
+    let hasCreated2ch = false;
+
+    // Tracks which input audio indices have already received a -c:a:N assignment so we
+    // don't emit conflicting codec directives for the same stream.
+    const modifiedAudioIdx = new Set();
+
+    // Build the title for a new or replaced track.
+    const chLabel = { 8: '7.1', 7: '6.1', 6: '5.1', 5: '5.0', 4: '4.0', 3: '3.0', 2: 'Stereo', 1: 'Mono' };
+    const buildTitle = (srcStream, targetLabel) => {
+        const srcLabel = chLabel[srcStream.channels ?? 0] ?? `${srcStream.channels}ch`;
+        const origTitle = (srcStream.tags?.title || '').trim();
+        if (preserveTitle === 'false') return targetLabel;
+        if (preserveTitle === 'source') return `${srcLabel} -> ${targetLabel}`;
+        if (!origTitle) return targetLabel;
+        const escapedLabel = targetLabel.replace(/\./g, '\\.');
+        if (new RegExp(`(?:^|[^0-9.])${escapedLabel}$`).test(origTitle)) return origTitle;
+        return `${origTitle} - ${targetLabel}`;
+    };
+    const escTitle = (t) => t.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+
+    // With downmixSingle, only the first (highest-quality) stream is used as a downmix source.
+    // forceCodec is also limited to that one track for consistency.
+    const streamsToProcess = downmixSingle ? workStreams.slice(0, 1) : workStreams;
+
+    for (let i = 0; i < streamsToProcess.length; i++) {
         try {
-                audioStreamIndex++;
-                const ffstream = audioStreams[i];
-                const ffstreamCodec = (ffstream.codec_name || '').toLowerCase();
-                const streamTitle = (ffstream.tags?.title  || '');
-                const streamLang = (ffstream.tags?.language ?? '').trim().toLowerCase();
+            const ffstream = streamsToProcess[i];
+            const ffstreamCodec = (ffstream.codec_name || '').toLowerCase();
+            const streamLang = (ffstream.tags?.language || '').trim().toLowerCase();
+            const outputAudioIdx = outputAudioIdxMap.get(ffstream.index);
+            const srcAudioIdx = inputAudioIdxMap.get(ffstream.index);
 
+            // ---- DOWNMIX TO 6 CHANNELS ----
+            if (downmixToSix !== 'false' && ffstream.channels > 6) {
+                const newTitle = escTitle(buildTitle(ffstream, '5.1'));
 
-            
+                if (downmixToSix === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
+                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch to 6ch ${surroundCodec} in place\n`;
+                    extraArguments += ` -c:a:${outputAudioIdx} ${surroundCodec} -ac:a:${outputAudioIdx} 6 -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                    if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${streamLang}"`;
+                    modifiedAudioIdx.add(outputAudioIdx);
+                    convert = true;
+                } else if (downmixToSix === 'true' && !hasCreated6ch) {
+                    workDone += `☒Stream ${ffstream.index}: Adding 6ch ${surroundCodec} downmix from ${ffstream.channels}ch\n`;
+                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${surroundCodec} -ac 6 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                    if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${streamLang}"`;
+                    newStreamOutputIdx++;
+                    convert = true;
+                    hasCreated6ch = true;
+                }
+            }
 
-            //The only other type of stream currently supported by ffmpeg is attachment which we will leave untouched. It's generally used for fonts and cover art so the metadata may be useful. If it needs to be removed then it can be done with a separate plugin.
+            // ---- DOWNMIX TO 2 CHANNELS ----
+            if (downmixToTwo !== 'false' && ffstream.channels > 2) {
+                const newTitle = escTitle(buildTitle(ffstream, '2.0'));
+
+                if (downmixToTwo === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
+                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch to stereo ${stereoCodec} in place\n`;
+                    extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec} -ac:a:${outputAudioIdx} 2 -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                    if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${streamLang}"`;
+                    modifiedAudioIdx.add(outputAudioIdx);
+                    convert = true;
+                } else if (downmixToTwo === 'true' && !hasCreated2ch) {
+                    workDone += `☒Stream ${ffstream.index}: Adding stereo ${stereoCodec} downmix from ${ffstream.channels}ch\n`;
+                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec} -ac 2 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                    if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${streamLang}"`;
+                    newStreamOutputIdx++;
+                    convert = true;
+                    hasCreated2ch = true;
+                }
+            }
+
+            // ---- FORCE CODEC ----
+            if (forceCodec !== 'false' && !modifiedAudioIdx.has(outputAudioIdx)) {
+                const isStereo = ffstream.channels <= 2;
+                const targetCodec = isStereo ? stereoCodec : surroundCodec;
+
+                if (ffstreamCodec !== targetCodec) {
+                    const shouldForce =
+                        forceCodec === 'true' ||
+                        (forceCodec === '6below' && !isStereo && ffstream.channels <= 6) ||
+                        (forceCodec === '6below' && isStereo) ||
+                        (forceCodec === '2below' && isStereo);
+
+                    if (shouldForce) {
+                        workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstreamCodec} to ${targetCodec}\n`;
+                        extraArguments += ` -c:a:${outputAudioIdx} ${targetCodec}`;
+                        modifiedAudioIdx.add(outputAudioIdx);
+                        convert = true;
+                    }
+                }
+            }
         } catch (err) {
-            // Error
             response.infoLog += `☒Error processing stream ${i}: ${err}\n`;
             response.processFile = false;
             return response;
@@ -429,7 +565,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Convert file if convert variable is set to true.
     if (convert === true) {
-        response.preset += `,-map 0 -c:v copy -c:s copy${extraArguments} -max_muxing_queue_size 9999${networkDataOpt}`;
+        response.preset += `,-map 0 -c:v copy -c:a copy -c:s copy${extraArguments} -max_muxing_queue_size 9999${networkDataOpt}`;
         response.infoLog += workDone;
         response.processFile = true;
     } else {
