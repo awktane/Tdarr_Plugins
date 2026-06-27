@@ -29,21 +29,21 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['descending', 'ascending'],
             },
-            tooltip: `Audio channel ordering preference - streams are ordered by channel then bitrate. Generally descending is recommended.
+            tooltip: `Audio channel ordering preference - streams are ordered by channel then rating of codec/bitrate. Generally descending is recommended.
                 \\nExample: ascending\\n
                     2.0,5.1
                 \\nExample: descending\\n
                     5.1,2.0`
         },
         {
-            name: 'bitrate_order',
+            name: 'quality_order',
             type: 'string',
             defaultValue: 'descending',
             inputUI: {
                 type: 'dropdown',
                 options: ['descending', 'ascending'],
             },
-            tooltip: `Audio bitrate ordering preference - streams are ordered by channel then bitrate. Generally descending is recommended.
+            tooltip: `Audio quality ordering preference - streams are ordered by channel then rating of codec/bitrate. Generally descending is recommended.
                 \\nExample: ascending\\n
                     128k,640k
                 \\nExample: descending\\n
@@ -89,6 +89,122 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const lib = require('../methods/lib')();
     inputs = lib.loadDefaultValues(inputs, details);
 
+    //Codecs and some values to help us score the quality so that we can pick the best track - some of these formats are not supported by ffmpeg yet (ac4)
+    const codecInfo = {
+        // Lossless
+        pcm:        { score: 100, lossless: true },
+        flac:       { score: 100, lossless: true },
+        alac:       { score: 100, lossless: true },
+        wavpack:    { score: 100, lossless: true },
+        ape:        { score: 100, lossless: true },
+        tak:        { score: 100, lossless: true },
+        tta:        { score: 100, lossless: true },
+        mlp:        { score: 99,  lossless: true },
+
+        // Dolby family
+        truehd:     { score: 99,  lossless: true },
+        dtsma:      { score: 98,  lossless: true },
+        dtshr:      { score: 94,  minimum: 1000000, transparent: 3000000 },
+        dts:        { score: 91,  minimum: 768000,  transparent: 1509000 },
+        eac3atmos:  { score: 90,  minimum: 256000,  transparent: 768000 },
+        dtsexpress: { score: 80,  minimum: 128000,  transparent: 384000 },
+        
+        // Modern multichannel codecs
+        ac4:        { score: 90,  minimum: 128000,  transparent: 384000 },
+        eac3:       { score: 89,  minimum: 192000,  transparent: 640000 },
+        mpegh3d:    { score: 89,  minimum: 192000,  transparent: 512000 },
+
+        // Modern general-purpose codecs
+        opus:       { score: 89,  minimum: 64000,   transparent: 192000 },
+        aac:        { score: 87,  minimum: 96000,   transparent: 256000 },
+        vorbis:     { score: 86,  minimum: 128000,  transparent: 256000 },
+
+        // Legacy but still excellent
+        ac3:        { score: 84,  minimum: 192000,  transparent: 640000 },
+        atrac:      { score: 83,  minimum: 96000,   transparent: 192000 },
+        wma:        { score: 82,  minimum: 96000,   transparent: 192000 },
+        mpc:        { score: 82,  minimum: 128000,  transparent: 220000 },
+
+        // Older codecs
+        mp3:        { score: 78,  minimum: 128000,  transparent: 320000 },
+        mp2:        { score: 73,  minimum: 128000,  transparent: 256000 },
+        adpcm:      { score: 60,  minimum: 128000,  transparent: 256000 },
+        cook:       { score: 58,  minimum: 64000,   transparent: 128000 }
+    };
+    const codecAliases = [
+        ['pcm_',   'pcm'],
+        ['adpcm',  'adpcm'],
+        ['wmav',   'wma'],
+        ['atrac',  'atrac'],
+    ];
+    const unknownCodecs = new Set();
+
+    // Audio quality scoring 
+    const audioQuality = (stream) => {
+        let codec = (stream?.codec_name || '').toLowerCase().trim();
+        const longName = (stream.codec_long_name || '').toLowerCase().trim();
+
+        for (const [prefix, replacement] of codecAliases) {
+            if (codec.startsWith(prefix)) {
+                codec = replacement;
+                break;
+            }
+        }
+
+        //Do this first as there's no harm checking for additional info in the longName
+        if(codec === 'dca')
+            codec = 'dts';
+
+        //bit of an exception for DTS Core and DTS-HD MA
+        if (codec === 'dts') {
+            if (longName.includes('master'))
+                codec = 'dtsma';
+            else if (longName.includes('high resolution'))
+                codec = 'dtshr';
+            else if (longName.includes('express'))
+                codec = 'dtsexpress';
+        //We scored atmos a little higher than typical eac3
+        } else if((codec === 'eac3') && longName.includes('atmos'))
+            codec = 'eac3atmos';            
+
+        //Check if we can't identify the codec. If we can't then notify once per codec
+        if(!(codec in codecInfo) && !unknownCodecs.has(codec)) {
+            unknownCodecs.add(codec);
+            response.infoLog += `☒Stream ${stream.index}: Unknown audio codec "${codec}", using generic quality weighting.\n`;
+        }
+
+        //This is a pretty weak way to score an unknown codec
+        const info = codecInfo[codec] ?? { score: 70, minimum: 128000, transparent: 320000 };
+
+        //Get the variables ready for scoring
+        const bitrate = Number(stream.bit_rate || 0);
+        const channelScale = Math.pow((Math.max(2, Number(stream?.channels ?? 2))) / 2, 0.65);
+        const minimum = info.minimum * channelScale;
+        const transparent = info.transparent * channelScale;
+        const maxPenalty = 18;
+        let penalty = maxPenalty;
+
+        // Lossless codecs are already "perfect"
+        if (info.lossless)
+            return info.score;
+
+        // Invalid bitrate
+        if (bitrate <= 0) {
+            response.infoLog += `☒Stream ${stream.index}: Invalid bitrate, assuming nominal quality.\n`;
+            return info.score;
+        }
+
+        //Score the track
+        if (bitrate > minimum) {
+            if (bitrate >= transparent)
+                penalty = 0;
+            else
+                penalty = maxPenalty * (1 - ((bitrate - minimum) / (transparent - minimum)));
+        }
+
+        return info.score - penalty;
+    }
+    
     const response = {
         processFile: false,
         preset: '',
@@ -103,8 +219,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.processFile = false;
         return response;
     }
-    if(!['descending', 'ascending'].includes(inputs.bitrate_order)) {
-        response.infoLog += '☒bitrate_order has not been configured, please configure required options.\n';
+    if(!['descending', 'ascending'].includes(inputs.quality_order)) {
+        response.infoLog += '☒quality_order has not been configured, please configure required options.\n';
         response.processFile = false;
         return response;
     }
@@ -142,7 +258,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             shortlang: streamLangShort,
             channels: ffstream?.channels || 0,
             forced: ffstream?.disposition?.forced === 1,
-            bitrate: Number(ffstream?.bit_rate || 0),
+            audioquality: audioQuality(ffstream),
             default: ffstream?.disposition?.default === 1,
 
             // simple classification (no helper functions)
@@ -211,8 +327,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return (inputs.channel_order === 'descending' ? b.channels - a.channels : a.channels - b.channels);
 
             //Quality
-            if (a.bitrate !== b.bitrate)
-                return (inputs.bitrate_order === 'descending' ? b.bitrate - a.bitrate : a.bitrate - b.bitrate);
+            if (a.audioquality !== b.audioquality)
+                return (inputs.quality_order === 'descending' ? b.audioquality - a.audioquality : a.audioquality - b.audioquality);
         //Subtitles
         } else if (a.type === 'subtitle') {
             //Forced always first
