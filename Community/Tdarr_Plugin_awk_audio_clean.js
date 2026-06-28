@@ -69,11 +69,12 @@ const details = () => ({
                 options: ['false','true'],
             },
             tooltip: `Should commentary, visual impaired tracks, and other secondary tracks be downmixed to stereo? Unlike the primary downmix options, each surround secondary track is transcoded in place to stereo independently — one stereo per secondary track, preserving all of them. This would normally be false.
+                \nThese tracks are never protected by keep_best_surround_safe, so an enabled secondary downmix always transcodes them in place.
                 \\n=====
                 \\nActions
                 \\n=====
                 \\nIf false - secondary tracks are left untouched
-                \\nIf true  - each secondary track with more than 2 channels is transcoded in place to a stereo stereo_codec track (using the stereo_downmix matrix). A protected best source is added rather than replaced.`,
+                \\nIf true  - each secondary track with more than 2 channels is transcoded in place to a stereo stereo_codec track (using the stereo_downmix matrix).`,
         },
         {
             name: 'remove_duplicates',
@@ -691,25 +692,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Secondary tracks (commentary, VI, etc.) and lang-secondary tracks (unlisted language) get the stereo-only path and never trigger the primary downmix (downmix_to_six/two).
             if (ffstream.isTdarrSecondaryTrack || ffstream.isTdarrLangSecondary) {
             // ---- SECONDARY: DOWNMIX TO STEREO ----
-            // Each secondary surround track is transcoded in place independently — one stereo per secondary track, preserving all of them. A protected best source is never
-            // replaced in place, so it gets a new stereo stream added alongside it instead.
-            if (downmixSecondaryStereo !== 'false' && ffstream.channels > 2) {
+            // Each secondary surround track is transcoded in place independently — one stereo per secondary track, preserving all of them. keep_best_surround_safe never protects
+            // secondary or lang-secondary tracks (they are excluded from protectedIndices), so there is no protected-source case here: an enabled secondary downmix always transcodes in place.
+            if (downmixSecondaryStereo !== 'false' && ffstream.channels > 2 && !modifiedAudioIdx.has(outputAudioIdx)) {
                 const newTitle = escTitle(buildTitle(ffstream, '2.0'));
-                const addInstead = isProtected;
-
-                if (!addInstead && !modifiedAudioIdx.has(outputAudioIdx)) {
-                    workDone += `☒Stream ${ffstream.index}: Transcoding secondary ${ffstream.channels}ch to stereo ${stereoCodec} in place\n`;
-                    extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
-                    if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
-                    modifiedAudioIdx.add(outputAudioIdx);
-                    convert = true;
-                } else if (addInstead) {
-                    workDone += `☒Stream ${ffstream.index}: Adding secondary stereo ${stereoCodec} downmix from ${ffstream.channels}ch (protected source kept)\n`;
-                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
-                    if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escTitle(streamLang)}"`;
-                    newStreamOutputIdx++;
-                    convert = true;
-                }
+                workDone += `☒Stream ${ffstream.index}: Transcoding secondary ${ffstream.channels}ch to stereo ${stereoCodec} in place\n`;
+                extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
+                modifiedAudioIdx.add(outputAudioIdx);
+                convert = true;
             }
             } else {
             /*-=-=-= DOWNMIX TO 6 CHANNELS =-=-=-*/
