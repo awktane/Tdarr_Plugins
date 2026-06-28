@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.13.0',
+    Version: '1.14.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -694,6 +694,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const ffstreamLangKey = ffstream.isTdarrCleanLang;
             const isProtected = protectedIndices.has(ffstream.index);
 
+            // Human-readable source bitrate for the operation log, e.g. " @ 640 kb/s". Falls back to
+            // " @ unknown bitrate" when the stream carries no bit_rate (common for transcoded sources),
+            // so the message is still clear about which track was used.
+            const srcBitrate = Number(ffstream.bit_rate || 0);
+            const srcRateStr = srcBitrate > 0 ? `${Math.round(srcBitrate / 1000)} kb/s` : 'unknown bitrate';
+
             // Secondary tracks (commentary, VI, etc.) and lang-secondary tracks (unlisted language) get the stereo-only path and never trigger the primary downmix (downmix_to_six/two).
             if (ffstream.isTdarrSecondaryTrack || ffstream.isTdarrLangSecondary) {
             // ---- SECONDARY: DOWNMIX TO STEREO ----
@@ -701,7 +707,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // secondary or lang-secondary tracks (they are excluded from protectedIndices), so there is no protected-source case here: an enabled secondary downmix always transcodes in place.
             if (downmixSecondaryStereo !== 'false' && ffstream.channels > 2 && !modifiedAudioIdx.has(outputAudioIdx)) {
                 const newTitle = escTitle(buildTitle(ffstream, '2.0'));
-                workDone += `☒Stream ${ffstream.index}: Transcoding secondary ${ffstream.channels}ch to stereo ${stereoCodec} in place\n`;
+                workDone += `☒Stream ${ffstream.index}: Transcoding secondary ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr}) to stereo ${stereoCodec} in place\n`;
                 extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                 if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
                 modifiedAudioIdx.add(outputAudioIdx);
@@ -716,14 +722,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const sixMode = (downmixToSix === 'replace' && isProtected) ? 'true' : downmixToSix;
 
                 if (sixMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
-                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch to 6ch ${surroundCodec} in place\n`;
+                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr}) to 6ch ${surroundCodec} in place\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${surroundCodec} -ac:a:${outputAudioIdx} 6 -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     created6chLangs.add(ffstreamLangKey);
                     convert = true;
                 } else if (sixMode === 'true') {
-                    workDone += `☒Stream ${ffstream.index}: Adding 6ch ${surroundCodec} downmix from ${ffstream.channels}ch\n`;
+                    workDone += `☒Stream ${ffstream.index}: Adding 6ch ${surroundCodec} downmix from ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr})\n`;
                     extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${surroundCodec} -ac:a:${newStreamOutputIdx} 6 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escTitle(streamLang)}"`;
                     newStreamOutputIdx++;
@@ -742,14 +748,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const twoMode = (downmixToTwo === 'replace' && isProtected) ? 'true' : downmixToTwo;
 
                 if (twoMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
-                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch to stereo ${stereoCodec} in place\n`;
+                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr}) to stereo ${stereoCodec} in place\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     created2chLangs.add(ffstreamLangKey);
                     convert = true;
                 } else if (twoMode === 'true' || (twoMode === 'replace' && modifiedAudioIdx.has(outputAudioIdx))) {
-                    workDone += `☒Stream ${ffstream.index}: Adding stereo ${stereoCodec} downmix from ${ffstream.channels}ch\n`;
+                    workDone += `☒Stream ${ffstream.index}: Adding stereo ${stereoCodec} downmix from ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr})\n`;
                     extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escTitle(streamLang)}"`;
                     newStreamOutputIdx++;
@@ -778,7 +784,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (shouldForce && ffstream.channels > targetMaxCh) {
                         workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodec} - ${ffstream.channels}ch exceeds the ${targetMaxCh}ch limit for ${targetCodec}. Enable downmix_to_six to reduce channels first.\n`;
                     } else if (shouldForce) {
-                        workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstreamCodec} to ${targetCodec}\n`;
+                        workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstreamCodec} to ${targetCodec} (${ffstream.channels}ch @ ${srcRateStr})\n`;
                         extraArguments += ` -c:a:${outputAudioIdx} ${targetCodec}`;
                         modifiedAudioIdx.add(outputAudioIdx);
                         convert = true;
