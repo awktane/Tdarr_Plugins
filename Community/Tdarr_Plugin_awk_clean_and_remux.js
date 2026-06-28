@@ -12,7 +12,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Non-image attachment streams (e.g. embedded fonts for ASS/SSA subtitles) are intentionally left untouched.\n\n`,
-    Version: '1.8',
+    Version: '1.9',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -241,13 +241,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         'deaf'
     ];
 
-    // Escape a metadata value for embedding inside a double-quoted ffmpeg -metadata argument.
-    // Handles backslashes, double quotes, and strips control characters (including newlines and
-    // null bytes) that could break the command string or be used for injection via crafted file metadata.
+    // Sanitize a metadata value before embedding it inside a double-quoted ffmpeg -metadata
+    // argument (e.g. -metadata:s:a:0 "title=...").
+    //
+    // Tdarr does NOT pass the preset through a shell — it splits the string into an argv array
+    // (quote-aware) and hands it to child_process.spawn. That means shell metacharacters
+    // ($ ` ; | etc.) are inert: they reach ffmpeg as literal bytes and become harmless metadata
+    // text. The ONLY injection vector is breaking out of the quoted value to inject a new ffmpeg
+    // ARGUMENT — which requires a double quote (to close the wrapper) or a control character.
+    //
+    // Tdarr's tokenizer strips quotes and has no documented backslash-escape convention, so
+    // backslash-escaping a double quote can't be relied on. Instead we remove the breakout
+    // characters outright: double quotes and backslashes (neither is ever legitimately needed
+    // in a stream title or language tag), plus all control characters. What remains can contain
+    // spaces and any other printable text safely, because Tdarr keeps the quoted value intact.
     const escMeta = (value) => String(value || '')
-        .replace(/[\x00-\x1f\x7f]/g, '')   // strip control characters including newlines, null bytes
-        .replace(/\\/g, '\\\\')              // escape backslashes before quotes
-        .replace(/"/g, '\\"');               // escape double quotes
+        .replace(/[\x00-\x1f\x7f]/g, '')   // strip control characters (newlines, null bytes, etc.)
+        .replace(/[\\"]/g, '');             // remove backslashes and double quotes (argument-breakout chars)
 
     //Clean up titles - Remove surrounding whitespace, single quotes and double quotes as there's no reason for them & wipes title as specified by busyTitleRemove
     function cleanStreamTitle(rawTitle, busyTitleRemove) {
