@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then channels and quality, then commentary, etc) -> Subtitles (forced first, by language, sdh, etc) -> Attachments -> Data\n`,
-    Version: '1.3',
+    Version: '1.4',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -252,16 +252,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             languageOrder.add(streamLang);
         }
 
+        const streamType = (ffstream.codec_type || '').trim().toLowerCase();
+
         streams.push({
             index: i,
             stream: ffstream,
-            type: (ffstream.codec_type || '').trim().toLowerCase(),
+            type: streamType,
             title: streamTitle,
             lang: streamLang,
             shortlang: streamLangShort,
             channels: ffstream?.channels || 0,
             forced: ffstream?.disposition?.forced === 1,
-            audioquality: audioQuality(ffstream),
+            // Only score audio streams — scoring video/subtitle/data would spam the log with
+            // bogus "unknown codec"/"invalid bitrate" notices and serves no purpose since the
+            // quality value is only used to sort audio.
+            audioquality: streamType === 'audio' ? audioQuality(ffstream) : 0,
             default: ffstream?.disposition?.default === 1,
 
             // simple classification (no helper functions)
