@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then channels and quality, then commentary, etc) -> Subtitles (forced first, by language, sdh, etc) -> Attachments -> Data\n`,
-    Version: '1.4.0',
+    Version: '1.4.1',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -90,6 +90,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const lib = require('../methods/lib')();
     inputs = lib.loadDefaultValues(inputs, details);
 
+    const response = {
+        processFile: false,
+        preset: '',
+        handBrakeMode: false,
+        FFmpegMode: true,
+        container: `.${file.container}`,
+        infoLog: '',
+    };
+
     //Codecs and some values to help us score the quality so that we can pick the best track - some of these formats are not supported by ffmpeg yet (ac4)
     const codecInfo = {
         // Lossless
@@ -139,15 +148,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['atrac',  'atrac'],
     ];
     const unknownCodecs = new Set();
-
-    const response = {
-        processFile: false,
-        preset: '',
-        handBrakeMode: false,
-        FFmpegMode: true,
-        container: `.${file.container}`,
-        infoLog: '',
-    };
 
     // Audio quality scoring — must be declared after response so infoLog is available
     const audioQuality = (stream) => {
