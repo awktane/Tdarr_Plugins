@@ -9,10 +9,10 @@ const details = () => ({
                   Removes any subtitle or audio tracks that are not in the specified language(s) and optionally removes with deaf/SDH in their description.\n\n
                   Option to modify metadata to remove metadata comments and titles with too many periods.\n\n
                   Automatically deduplicates titles reducing "Stereo / Stereo" down to "Stereo" or "English - English" down to "English".\n\n
-                  Removes unsupported image based subtitles during remux.\n\n
+                  Removes unsupported image based subtitles during remux. Converts mov_text and webvtt to srt when remuxing to mkv for maximum player compatibility.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Non-image attachment streams (e.g. embedded fonts for ASS/SSA subtitles) are intentionally left untouched.\n\n`,
-    Version: '1.9',
+    Version: '2.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -25,7 +25,7 @@ const details = () => ({
             },
             tooltip: `Specify output container of file
                 \\nAny streams that are not supported by the output container will be removed.
-               \\nmkv will also remove eia_608.
+               \\nmkv will also remove eia_608 and convert mov_text and webvtt subtitles to srt.
                \\nmp4 will also remove eia_608, hdmv_pgs_subtitle, dvd_subtitle, and xsub. Genpts may be required to fix timestamps.`,
         },
         {
@@ -369,7 +369,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "comment="`;
                 }
                 
-                if((dstContainer === 'mkv') && (ffstreamCodec === 'mov_text')) {
+                if((dstContainer === 'mkv') && ['mov_text', 'webvtt'].includes(ffstreamCodec)) {
                     workDone += `☒Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} subtitle to srt\n`;
                     extraArguments += metadataCommand+` -c:s:${subtitleStreamIndex} srt`;
                     convert = true;
