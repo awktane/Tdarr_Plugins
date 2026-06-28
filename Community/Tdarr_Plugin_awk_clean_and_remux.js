@@ -12,7 +12,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text and webvtt to srt when remuxing to mkv for maximum player compatibility.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Non-image attachment streams (e.g. embedded fonts for ASS/SSA subtitles) are intentionally left untouched.\n\n`,
-    Version: '1.10.0',
+    Version: '1.10.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -392,12 +392,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //Start with zero based index for audio streams. This is only used when changing metadata.
                 audioStreamIndex++;
 
-                //Rescue any we can by filling in the language
+                //Rescue any we can by filling in the language before deciding whether to remove it
                 if (fillLanguage && (!streamLang || streamLang === 'und')) {
                     workDone += `☒Language blank on audio stream ${i} - setting to "${fillLanguage}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "language=${escMeta(fillLanguage)}"`;
+                    workLang = fillLanguage;
+                }
+
                 //If the audio is a language that should be removed then remove it regardless of other settings.
-                } else if(audioLanguage.length > 0 && !audioLanguage.includes(workLang) && !audioLanguage.includes(workLang.replace(/[-_.].*$/, ''))) {
+                if(audioLanguage.length > 0 && !audioLanguage.includes(workLang) && !audioLanguage.includes(workLang.replace(/[-_.].*$/, ''))) {
                     workDone += `☒Remove stream ${i} - audio language (${streamLang})\n`;
                     delStream = true;
                 }
