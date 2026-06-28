@@ -10,8 +10,9 @@ const details = () => ({
                   Option to modify metadata to remove metadata comments and titles with too many periods.\n\n
                   Automatically deduplicates titles reducing "Stereo / Stereo" down to "Stereo" or "English - English" down to "English".\n\n
                   Removes unsupported image based subtitles during remux.\n\n
-                  Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n`,
-    Version: '1.7',
+                  Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
+                  Non-image attachment streams (e.g. embedded fonts for ASS/SSA subtitles) are intentionally left untouched.\n\n`,
+    Version: '1.8',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -240,6 +241,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         'deaf'
     ];
 
+    // Escape a metadata value for embedding inside a double-quoted ffmpeg -metadata argument.
+    // Handles backslashes, double quotes, and strips control characters (including newlines and
+    // null bytes) that could break the command string or be used for injection via crafted file metadata.
+    const escMeta = (value) => String(value || '')
+        .replace(/[\x00-\x1f\x7f]/g, '')   // strip control characters including newlines, null bytes
+        .replace(/\\/g, '\\\\')              // escape backslashes before quotes
+        .replace(/"/g, '\\"');               // escape double quotes
+
     //Clean up titles - Remove surrounding whitespace, single quotes and double quotes as there's no reason for them & wipes title as specified by busyTitleRemove
     function cleanStreamTitle(rawTitle, busyTitleRemove) {
         let title = (rawTitle || '').trim().replace(/^["']+|["']+$/g, '');
@@ -247,6 +256,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (title) {
             const parts = title.split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
             if (parts.length === 1) return parts[0];
+            // When all parts are the same word (case-insensitive), deduplicate to the first occurrence.
+            // "First part wins" is intentional: it preserves the original casing from the leading segment
+            // (e.g. "Stereo / stereo" → "Stereo", "ENGLISH - English" → "ENGLISH").
             if (parts.length > 1 && parts.every(p => p.toLowerCase() === parts[0].toLowerCase()))
                 return parts[0];
         }
@@ -293,7 +305,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     //Rescue any we can by filling in the language before deciding whether to remove it
                     if (fillLanguage && (!streamLang || streamLang === 'und')) {
                         workDone += `☒Language blank on stream ${i} - setting subtitle language to "${fillLanguage}"\n`;
-                        metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "language=${fillLanguage}"`;
+                        metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "language=${escMeta(fillLanguage)}"`;
                         workLang = fillLanguage;
                     }
 
@@ -326,11 +338,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if(newStreamTitle !== streamTitle)
                 {
                     workDone += `☒Change title of stream ${i} (subtitle) from "${streamTitle}" to "${newStreamTitle}"\n`;
-                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${escMeta(newStreamTitle)}"`;
                 } else if((ffstream.tags?.title ?? '') !== (ffmedia?.Title ?? ''))
                 {
                     workDone += `☒Change title of stream ${i} (subtitle) - Found "${(ffstream.tags?.title ?? '')}" and "${(ffmedia?.Title ?? '')}" change to "${newStreamTitle}"\n`;
-                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${escMeta(newStreamTitle)}"`;
                 }
 
                 //The set_handler isn't needed at all for mkv and can cause some oddness with the title
@@ -373,7 +385,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //Rescue any we can by filling in the language
                 if (fillLanguage && (!streamLang || streamLang === 'und')) {
                     workDone += `☒Language blank on audio stream ${i} - setting to "${fillLanguage}"\n`;
-                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} "language=${fillLanguage}"`;
+                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} "language=${escMeta(fillLanguage)}"`;
                 //If the audio is a language that should be removed then remove it regardless of other settings.
                 } else if(audioLanguage.length > 0 && !audioLanguage.includes(workLang) && !audioLanguage.includes(workLang.replace(/[-_.].*$/, ''))) {
                     workDone += `☒Remove stream ${i} - audio language (${streamLang})\n`;
@@ -424,11 +436,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if(newStreamTitle !== streamTitle)
                 {
                     workDone += `☒Change title of stream ${i} (audio) from "${streamTitle}" to "${newStreamTitle}"\n`;
-                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${escMeta(newStreamTitle)}"`;
                 } else if((ffstream.tags?.title ?? '') !== (ffmedia?.Title ?? ''))
                 {
                     workDone += `☒Change title of stream ${i} (audio) - Found "${(ffstream.tags?.title ?? '')}" and "${(ffmedia?.Title ?? '')}" change to "${newStreamTitle}"\n`;
-                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${newStreamTitle.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${escMeta(newStreamTitle)}"`;
                 }
 
                 //The set_handler isn't needed at all for mkv and can cause some oddness with the title
