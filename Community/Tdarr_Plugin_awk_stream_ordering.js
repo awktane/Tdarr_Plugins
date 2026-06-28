@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then channels and quality, then commentary, etc) -> Subtitles (forced first, by language, sdh, etc) -> Attachments -> Data\n`,
-    Version: '1.4',
+    Version: '1.4.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
