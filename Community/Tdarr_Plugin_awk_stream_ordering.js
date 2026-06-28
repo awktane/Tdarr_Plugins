@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/signs/sdh/commentary) -> Attachments -> Data\n`,
-    Version: '1.5.0',
+    Version: '1.6.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -395,8 +395,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const codec = s.stream.codec_name || 'unknown';
             const ch = s.channels ? `${s.channels}ch` : '';
             const lang = s.lang !== 'und' ? s.lang : '';
+            // Measured bitrate from the probe (this plugin runs after any transcode, so it's a real
+            // value). Shown as kbps; omitted when the stream carries no bit_rate so the entry stays clean.
+            const bitrate = Number(s.stream.bit_rate || 0);
+            const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
             const role = s.commentary ? '/commentary' : (s.descriptive ? '/description' : '');
-            return `[audio:${[lang, ch, codec].filter(Boolean).join(' ')}${role}]`;
+            return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${role}]`;
         } else if (s.type === 'subtitle') {
             const lang = s.lang !== 'und' ? s.lang : '';
             const role = s.commentary ? '/commentary' : (s.sdh ? '/sdh' : (s.signs ? '/signs' : ''));
@@ -409,7 +413,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     response.processFile = true;
     response.reQueueAfter = true;
     response.preset = `,${ffmpegMap} -c copy -max_muxing_queue_size 9999${networkDataOpt}`;
-    response.infoLog += `☒Streams are not in the correct order.\n☒New order: ${orderSummary}\n☒Map:${ffmpegMap}\n`;
+    response.infoLog += `☒Streams are not in the correct order.\n☒New order: ${orderSummary}\n`;
 
     return response;
 };
