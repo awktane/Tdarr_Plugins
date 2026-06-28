@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.12.2',
+    Version: '1.12.3',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -94,7 +94,7 @@ const details = () => ({
                 \\nIf clean results will be as seen below - assuming downmix_to_six is replace, downmix_to_stereo is replace, downmix_language is set to 'eng,en', force_codec is set to 'all', downmix_secondary_stereo is true, keep_best_surround_safe is false
                 \\nExample:\\n
                 5.1 english aac (from 7.1 flac), 2.0 french aac (from truehd track), 2.0 english aac (from ac3 track), 2.0 english aac commentary (from 5.1 commentary)
-                \\nIf tru results will be as seen below - assuming default options
+                \\nIf true results will be as seen below - assuming default options
                 \\nExample:\\n
                 22.2 english mpegh3d, 7.1 english flac, 5.1 french aac, 2.0 french truehd, 2.0 english ac3, 5.1 english aac commentary
                 \\nIf false results will be as seen below 
@@ -250,7 +250,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     ];
     const unknownCodecs = new Set();
 
-    // Audio quality scoring 
+    // Audio quality scoring — must be declared after response so infoLog is available
     const audioQuality = (stream) => {
         let codec = (stream?.codec_name || '').toLowerCase().trim();
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
@@ -274,7 +274,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 codec = 'dtshr';
             else if (longName.includes('express'))
                 codec = 'dtsexpress';
-        //If we notice it's atmos bump it higher than eac3 because of the extra features - codec_long_name rarely says "atmos" so also check the stream title tag
+        //We scored atmos a little higher than typical eac3 - codec_long_name rarely says "atmos" so also check the stream title tag
         } else if (codec === 'eac3' && (longName.includes('atmos') || (stream.tags?.title || '').toLowerCase().includes('atmos')))
             codec = 'eac3atmos';
 
