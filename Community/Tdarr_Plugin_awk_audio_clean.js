@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.9.2',
+    Version: '1.10.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -104,9 +104,9 @@ const details = () => ({
             defaultValue: 'aac',
             inputUI: {
                 type: 'dropdown',
-                options: ['aac','eac3','ac3'],
+                options: ['aac','eac3','ac3','opus'],
             },
-            tooltip: `Specify codec for newly created surround tracks. Note that both AC3 and EAC3 are limited to 6 channels by ffmpeg's encoder, so tracks with more than 6 channels will not be transcoded to either even if force_codec is applied.`,
+            tooltip: `Specify codec for newly created surround tracks. Note that both AC3 and EAC3 are limited to 6 channels by ffmpeg's encoder, so tracks with more than 6 channels will not be transcoded to either even if force_codec is applied. Opus supports up to 8 channels.`,
         },
         {
             name: 'stereo_codec',
@@ -114,9 +114,9 @@ const details = () => ({
             defaultValue: 'aac',
             inputUI: {
                 type: 'dropdown',
-                options: ['aac','ac3'],
+                options: ['aac','eac3','ac3','opus'],
             },
-            tooltip: `Specify codec for newly created stereo tracks.`,
+            tooltip: `Specify codec for newly created stereo tracks. AAC and Opus are the most compatible choices for modern media servers and clients. EAC3 is useful for Dolby branding on compatible devices. AC3 is the most broadly compatible legacy choice.`,
         },        
         {
             name: 'force_codec',
@@ -358,12 +358,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.processFile = false;
         return response;
     }
-    if(!['ac3','eac3','aac'].includes(surroundCodec)) {
+    if(!['ac3','eac3','aac','opus'].includes(surroundCodec)) {
         response.infoLog += `☒Somehow invalid surroundCodec option provided. Check your settings!\n`;
         response.processFile = false;
         return response;
     }
-    if(!['ac3','aac'].includes(stereoCodec)) {
+    if(!['ac3','eac3','aac','opus'].includes(stereoCodec)) {
         response.infoLog += `☒Somehow invalid stereoCodec option provided. Check your settings!\n`;
         response.processFile = false;
         return response;
@@ -798,8 +798,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // ---- FORCE CODEC ----
             // Skip protected best tracks UNLESS force_codec is 'all' — per keep_best_surround_safe,
             // the protected track can only be touched when force_codec is 'all'. Also skip when the
-            // source has more channels than the target codec supports (ac3/eac3 max 6ch in ffmpeg's
-            // encoder) to avoid an ffmpeg encode failure.
+            // source has more channels than the target codec supports (ac3/eac3 max 6ch, opus/aac max 8ch
+            // in ffmpeg's encoder) to avoid an ffmpeg encode failure.
             if (forceCodec !== 'false' && !modifiedAudioIdx.has(outputAudioIdx) && (!isProtected || forceCodec === 'all')) {
                 const isStereo = ffstream.channels <= 2;
                 const targetCodec = isStereo ? stereoCodec : surroundCodec;
@@ -811,7 +811,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         (forceCodec === '6below' && isStereo) ||
                         (forceCodec === '2below' && isStereo);
 
-                    const targetMaxCh = ({ ac3: 6, eac3: 6, aac: 8 })[targetCodec] ?? 8;
+                    const targetMaxCh = ({ ac3: 6, eac3: 6, aac: 8, opus: 8 })[targetCodec] ?? 8;
 
                     if (shouldForce && ffstream.channels > targetMaxCh) {
                         workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodec} - ${ffstream.channels}ch exceeds the ${targetMaxCh}ch limit for ${targetCodec}. Enable downmix_to_six to reduce channels first.\n`;
