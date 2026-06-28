@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/signs/sdh/commentary) -> Attachments -> Data\n`,
-    Version: '1.7.0',
+    Version: '1.8.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -199,15 +199,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (info.lossless)
             return info.score;
 
-        // No stream-level bitrate reported — return midpoint rather than full score to
-        // avoid preferring an unknown-bitrate lossy track over a scored one. This is
-        // expected for freshly-transcoded tracks (aac, opus, ac3, eac3, etc.), where the
-        // muxer often omits per-stream bitrate; it is only worth attention for source
-        // codecs that normally carry one (dts, ac3 from disc, etc.).
+        // No stream-level bitrate reported. For codecs we know how to encode (aac, opus, ac3, eac3)
+        // we can estimate quality from the bitrate we would target for this channel count instead of a
+        // blind midpoint — freshly-transcoded tracks routinely omit per-stream bitrate. For source
+        // codecs that normally carry a bitrate (dts, ac3 from disc, etc.) we log once and use the midpoint.
         if (bitrate <= 0) {
-            const transcodeOutputs = new Set(['aac', 'opus', 'ac3', 'eac3', 'mp3', 'flac', 'vorbis']);
-            if (!transcodeOutputs.has(codec))
-                response.infoLog += `☒Stream ${stream.index}: No bitrate reported for ${codec}, assuming nominal quality.\n`;
+            // Per-channel target bitrate (bps) for our encodable output codecs. Kept inline so this
+            // scoring function stays self-contained and byte-for-byte identical across plugins.
+            const ch = Math.max(1, Number(stream?.channels ?? 2));
+            const targets = {
+                aac:  { 1: 128000, 2: 256000, 3: 320000, 4: 384000, 5: 448000, 6: 512000, 7: 576000, 8: 640000 },
+                opus: { 1: 128000, 2: 192000, 3: 256000, 4: 320000, 5: 320000, 6: 384000, 7: 448000, 8: 448000 },
+                ac3:  { 1: 192000, 2: 224000, 3: 320000, 4: 384000, 5: 448000, 6: 640000 },
+                eac3: { 1: 192000, 2: 224000, 3: 320000, 4: 384000, 5: 448000, 6: 640000 },
+            };
+            const tbl = targets[codec];
+            if (tbl) {
+                const estBps = tbl[Math.min(ch, codec === 'ac3' || codec === 'eac3' ? 6 : 8)] ?? 0;
+                const estPenalty = estBps > minimum
+                    ? (estBps >= transparent ? 0 : maxPenalty * (1 - ((estBps - minimum) / (transparent - minimum))))
+                    : maxPenalty;
+                return info.score - estPenalty;
+            }
+            response.infoLog += `☒Stream ${stream.index}: No bitrate reported for ${codec}, assuming nominal quality.\n`;
             return info.score - (maxPenalty / 2);
         }
 
