@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.3',
+    Version: '1.4',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -191,7 +191,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         dtsma:      { score: 98,  lossless: true },
         dtshr:      { score: 94,  minimum: 1000000, transparent: 3000000 },
         dts:        { score: 91,  minimum: 768000,  transparent: 1509000 },
-        eac3atmos:  { score: 90,  minimum: 256000,  transparent: 768000 },
+        eac3atmos:  { score: 92,  minimum: 256000,  transparent: 768000 },
         dtsexpress: { score: 80,  minimum: 128000,  transparent: 384000 },
         
         // Modern multichannel codecs
@@ -291,65 +291,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         return info.score - penalty;
     }
-
-    // Resolve a stream's codec_name through the same alias/variant logic used in audioQuality,
-    // without the response.infoLog side-effects.
-    const resolveCodec = (stream) => {
-        let codec = (stream?.codec_name || '').toLowerCase().trim();
-        for (const [prefix, replacement] of codecAliases) {
-            if (codec.startsWith(prefix)) { codec = replacement; break; }
-        }
-        if (codec === 'dca') codec = 'dts';
-        if (codec === 'dts') {
-            const longName = (stream?.codec_long_name || '').toLowerCase();
-            if (longName.includes('master')) return 'dtsma';
-            if (longName.includes('high resolution')) return 'dtshr';
-            if (longName.includes('express')) return 'dtsexpress';
-        } else if (codec === 'eac3' && ((stream?.codec_long_name || '').toLowerCase().includes('atmos') || (stream?.tags?.title || '').toLowerCase().includes('atmos'))) {
-            return 'eac3atmos';
-        }
-        return codec;
-    };
-
-    // Transparent (full-quality) rates in bps per output codec.
-    // Surround values are for 6ch; other channel counts scale proportionally.
-    const codecTransparentRates = {
-        ac3:  { stereo: 192000, surround: 640000 },
-        eac3: { stereo: 256000, surround: 640000 },
-        aac:  { stereo: 192000, surround: 384000 },
-    };
-
-    // Returns a bitrate string like "448k" appropriate for the given codec and channel count.
-    // Lossless (or unknown-bitrate) sources get the full transparent rate.
-    // Lossy sources are capped at their bitrate (scaled for channel count changes) so a
-    // low-quality source does not get a wastefully high target rate.
-    const getTargetBitrate = (targetCodec, targetChannels, srcStream) => {
-        const rates = codecTransparentRates[targetCodec] ?? { stereo: 160000, surround: 384000 };
-        const isStereo = targetChannels <= 2;
-        const transparentTarget = isStereo
-            ? rates.stereo
-            : Math.round(rates.surround * targetChannels / 6);
-
-        const srcBitrate = Number(srcStream?.bit_rate || 0);
-        const srcInfo = codecInfo[resolveCodec(srcStream)];
-        const srcIsLossless = srcInfo?.lossless ?? false;
-
-        let target;
-        if (srcIsLossless || srcBitrate <= 0) {
-            target = transparentTarget;
-        } else {
-            const srcChannels = Number(srcStream?.channels || 2);
-            const channelRatio = Math.min(targetChannels / Math.max(srcChannels, 1), 1.0);
-            const scaledSrc = Math.round(srcBitrate * channelRatio);
-            target = Math.min(scaledSrc, transparentTarget);
-        }
-
-        const minRate = codecInfo[targetCodec]?.minimum ?? 64000;
-        target = Math.max(target, minRate);
-
-        return `${Math.round(target / 1000)}k`;
-    };
-
+    
     const response = {
         processFile: false,
         preset: '',
@@ -488,14 +430,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Languages that already have a primary stereo track, so downmix_to_stereo can honour
     // "create a 2 channel track only if one doesn't exist".
+    // Uses isTdarrCleanLang (normalised short code, e.g. 'en' for 'en-US') to match the same
+    // key used by created2chLangs and ffstreamLangKey — preventing redundant stereo creation
+    // when the existing track is tagged with a regional variant like en-US.
     const existingStereoLangs = new Set(audioStreams.filter(s => s.channels === 2 && !s.isTdarrSecondaryTrack).map(s => s.isTdarrCleanLang));
 
     // Identify lower-quality duplicates: group by (lang, channels, primary/secondary).
     // Within each group, keep only the highest quality stream and mark the rest for removal.
+    // Note: deduplication runs across ALL audio streams regardless of downmix_language or
+    // downmix_secondary, since those settings govern transcoding candidates, not what's a
+    // genuine duplicate. A duplicate TrueHD in a non-preferred language is still a duplicate.
     const streamsToRemove = new Set();
     if (removeDuplicates) {
         const seen = new Map();
-        const byQuality = [...candidateStreams].sort((a, b) => b.isTdarrQuality - a.isTdarrQuality || a.index - b.index);
+        const byQuality = [...audioStreams].sort((a, b) => b.isTdarrQuality - a.isTdarrQuality || a.index - b.index);
         for (const s of byQuality) {
             const key = `${s.isTdarrCleanLang}|${s.channels}|${s.isTdarrSecondaryTrack}`;
             if (seen.has(key)) {
@@ -618,21 +566,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (new RegExp(`(?:^|[^0-9.])${escapedLabel}$`).test(origTitle)) return origTitle;
         return `${origTitle} - ${targetLabel}`;
     };
-    const escTitle = (t) => t.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    // Escape a title value for embedding inside a double-quoted ffmpeg -metadata argument.
+    // Strips control characters (newlines, null bytes, etc.) that could break the command string
+    // or be used for injection via crafted file metadata, then escapes backslashes and quotes.
+    const escTitle = (t) => String(t || '')
+        .replace(/[\x00-\x1f\x7f]/g, '')   // strip control characters including newlines, null bytes
+        .replace(/\\/g, '\\\\')              // escape backslashes before quotes
+        .replace(/"/g, '\\"');               // escape double quotes
 
     // Lo/Ro stereo downmix matrices using ffmpeg's standard positional channel order.
     // Center is kept at -3 dB (0.707) so dialogue stays clear; LFE is dropped to avoid mud.
     // Returns null for layouts we cannot safely map positionally, so callers fall back to -ac 2.
     //
-    // Verified channel layouts and worked examples:
+    // All matrices are peak-normalized: each coefficient is divided by the maximum possible
+    // sum for that channel (worst-case all inputs simultaneously at full scale). This prevents
+    // clipping on loud content without cutting the overall perceived volume — real program
+    // material rarely hits all channels at full simultaneously, so typical levels are unaffected.
+    //
+    // Verified channel layouts and worked examples (raw → normalized):
     //   2.1 (FL FR LFE) returns null: dropping LFE and keeping FL/FR is identical to -ac 2, no pan needed.
     //   3.0 (FL FR FC)  returns null: no surround channels and no LFE, -ac 2 handles it fine.
-    //   3.1  FL FR FC LFE          FL=0.3,FR=0.3,FC=1.0,LFE=1.0 → L=1.007, R=1.007  (centre folds in, LFE dropped)
-    //   4.0  FL FR FC BC           FL=1.0,FR=0.0,FC=0.5,BC=0.6  → L=1.654, R=0.654  (BC split evenly to both sides)
-    //   5.0  FL FR FC BL BR        FL=1.0,FR=0.0,FC=0.5,BL=0.8  → L=1.920, R=0.354
-    //   5.1  FL FR FC LFE BL BR    FL=1.0,FR=0.0,FC=0.5,LFE=1.0,BL=0.8 → L=1.920, R=0.354  (LFE dropped)
-    //   6.1  FL FR FC LFE BC SL SR FL=1.0,FR=0.0,FC=0.5,LFE=1.0,BC=0.6,SL=0.8 → L=2.220, R=0.654
-    //   7.1  FL FR FC LFE BL BR SL SR FL=1.0,FR=0.0,FC=0.5,LFE=1.0,BL=0.8,SL=0.6 → L=2.054, R=0.354
+    //   3.1  FL FR FC LFE          raw peak L=R=1.707 → norm /1.707 ≈ 0.586*c0+0.414*c2
+    //   4.0  FL FR FC BC           raw peak L=1.707,R=1.207 → norm by L peak /1.707
+    //   5.0  FL FR FC BL BR        raw peak L=2.414,R=1.414 → norm by L peak /2.414
+    //   5.1  FL FR FC LFE BL BR    raw peak L=2.414,R=1.414 → norm by L peak /2.414  (LFE dropped)
+    //   6.1  FL FR FC LFE BC SL SR raw peak L=2.914,R=1.914 → norm by L peak /2.914
+    //   7.1  FL FR FC LFE BL BR SL SR raw peak L=2.914,R=1.914 → norm by L peak /2.914
     const downmixMatrix = (srcStream) => {
         const ch = Number(srcStream?.channels) || 0;
 
@@ -641,23 +600,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (ch === 4) {
             const layout = (srcStream?.channel_layout || '').toLowerCase();
             if (layout === '3.1')
-                // 3.1 : FL FR FC LFE  (drop LFE c3)
-                return 'pan=stereo|FL=c0+0.707*c2|FR=c1+0.707*c2';
+                // 3.1 : FL FR FC LFE  (drop LFE c3); peak = 1+0.707 = 1.707
+                return 'pan=stereo|FL=0.586*c0+0.414*c2|FR=0.586*c1+0.414*c2';
             if (layout === '4.0')
-                // 4.0 : FL FR FC BC  (no LFE; BC c3 split evenly to both sides)
-                return 'pan=stereo|FL=c0+0.707*c2+0.5*c3|FR=c1+0.707*c2+0.5*c3';
+                // 4.0 : FL FR FC BC  (no LFE; BC c3 split evenly); peak L = 1+0.707+0.5 = 2.207
+                return 'pan=stereo|FL=0.453*c0+0.320*c2+0.227*c3|FR=0.453*c1+0.320*c2+0.227*c3';
             return null;
         }
 
         switch (ch) {
-            // 5.0 : FL FR FC BL BR
-            case 5: return 'pan=stereo|FL=c0+0.707*c2+0.707*c3|FR=c1+0.707*c2+0.707*c4';
-            // 5.1 : FL FR FC LFE BL BR  (drop LFE c3)
-            case 6: return 'pan=stereo|FL=c0+0.707*c2+0.707*c4|FR=c1+0.707*c2+0.707*c5';
-            // 6.1 : FL FR FC LFE BC SL SR  (drop LFE c3, fold BC c4 to both)
-            case 7: return 'pan=stereo|FL=c0+0.707*c2+0.5*c4+0.707*c5|FR=c1+0.707*c2+0.5*c4+0.707*c6';
-            // 7.1 : FL FR FC LFE BL BR SL SR  (drop LFE c3)
-            case 8: return 'pan=stereo|FL=c0+0.707*c2+0.5*c4+0.5*c6|FR=c1+0.707*c2+0.5*c5+0.5*c7';
+            // 5.0 : FL FR FC BL BR; peak L = 1+0.707+0.707 = 2.414
+            case 5: return 'pan=stereo|FL=0.414*c0+0.293*c2+0.293*c3|FR=0.414*c1+0.293*c2+0.293*c4';
+            // 5.1 : FL FR FC LFE BL BR  (drop LFE c3); peak L = 1+0.707+0.707 = 2.414
+            case 6: return 'pan=stereo|FL=0.414*c0+0.293*c2+0.293*c4|FR=0.414*c1+0.293*c2+0.293*c5';
+            // 6.1 : FL FR FC LFE BC SL SR  (drop LFE c3, fold BC c4 to both); peak L = 1+0.707+0.5+0.707 = 2.914
+            case 7: return 'pan=stereo|FL=0.343*c0+0.243*c2+0.172*c4+0.243*c5|FR=0.343*c1+0.243*c2+0.172*c4+0.243*c6';
+            // 7.1 : FL FR FC LFE BL BR SL SR  (drop LFE c3); peak L = 1+0.707+0.5+0.707 = 2.914
+            case 8: return 'pan=stereo|FL=0.343*c0+0.243*c2+0.172*c4+0.172*c6|FR=0.343*c1+0.243*c2+0.172*c5+0.172*c7';
             default: return null;
         }
     };
@@ -679,6 +638,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const streamLang = (ffstream.tags?.language || '').trim().toLowerCase();
             const outputAudioIdx = outputAudioIdxMap.get(ffstream.index);
             const srcAudioIdx = inputAudioIdxMap.get(ffstream.index);
+
+            // Guard: if either index is missing the stream wasn't tracked correctly — skip rather than
+            // emitting a broken argument like -c:a:undefined which ffmpeg will reject with a cryptic error.
+            if (outputAudioIdx === undefined || srcAudioIdx === undefined) {
+                response.infoLog += `☒Stream ${ffstream.index}: Could not resolve audio index mapping, skipping.\n`;
+                continue;
+            }
+
             const ffstreamLangKey = ffstream.isTdarrCleanLang;
             const isProtected = protectedIndices.has(ffstream.index);
 
@@ -690,18 +657,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const sixMode = (downmixToSix === 'replace' && isProtected) ? 'true' : downmixToSix;
 
                 if (sixMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
-                    const bitrate6 = getTargetBitrate(surroundCodec, 6, ffstream);
-                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch to 6ch ${surroundCodec} at ${bitrate6} in place\n`;
-                    extraArguments += ` -c:a:${outputAudioIdx} ${surroundCodec} -b:a:${outputAudioIdx} ${bitrate6} -ac:a:${outputAudioIdx} 6 -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
-                    if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${streamLang}"`;
+                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch to 6ch ${surroundCodec} in place\n`;
+                    extraArguments += ` -c:a:${outputAudioIdx} ${surroundCodec} -ac:a:${outputAudioIdx} 6 -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                    if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     created6chLangs.add(ffstreamLangKey);
                     convert = true;
                 } else if (sixMode === 'true') {
-                    const bitrate6 = getTargetBitrate(surroundCodec, 6, ffstream);
-                    workDone += `☒Stream ${ffstream.index}: Adding 6ch ${surroundCodec} at ${bitrate6} downmix from ${ffstream.channels}ch\n`;
-                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${surroundCodec} -b:a:${newStreamOutputIdx} ${bitrate6} -ac:a:${newStreamOutputIdx} 6 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
-                    if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${streamLang}"`;
+                    workDone += `☒Stream ${ffstream.index}: Adding 6ch ${surroundCodec} downmix from ${ffstream.channels}ch\n`;
+                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${surroundCodec} -ac:a:${newStreamOutputIdx} 6 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                    if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escTitle(streamLang)}"`;
                     newStreamOutputIdx++;
                     created6chLangs.add(ffstreamLangKey);
                     convert = true;
@@ -718,18 +683,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const twoMode = (downmixToTwo === 'replace' && isProtected) ? 'true' : downmixToTwo;
 
                 if (twoMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
-                    const bitrate2 = getTargetBitrate(stereoCodec, 2, ffstream);
-                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch to stereo ${stereoCodec} at ${bitrate2} in place\n`;
-                    extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec} -b:a:${outputAudioIdx} ${bitrate2}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
-                    if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${streamLang}"`;
+                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch to stereo ${stereoCodec} in place\n`;
+                    extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                    if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     created2chLangs.add(ffstreamLangKey);
                     convert = true;
                 } else if (twoMode === 'true') {
-                    const bitrate2 = getTargetBitrate(stereoCodec, 2, ffstream);
-                    workDone += `☒Stream ${ffstream.index}: Adding stereo ${stereoCodec} at ${bitrate2} downmix from ${ffstream.channels}ch\n`;
-                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec} -b:a:${newStreamOutputIdx} ${bitrate2}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
-                    if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${streamLang}"`;
+                    workDone += `☒Stream ${ffstream.index}: Adding stereo ${stereoCodec} downmix from ${ffstream.channels}ch\n`;
+                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                    if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escTitle(streamLang)}"`;
                     newStreamOutputIdx++;
                     created2chLangs.add(ffstreamLangKey);
                     convert = true;
