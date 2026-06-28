@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then channels and quality, then commentary, etc) -> Subtitles (forced first, by language, sdh, etc) -> Attachments -> Data\n`,
-    Version: '1.4.2',
+    Version: '1.4.3',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -19,7 +19,7 @@ const details = () => ({
                  \\nThis list should include both two character and three character codes as this will successfully catch values like en, eng, en-US, en_US, and en.US.
                  \\nIf two character is provided in the list then languages formatted like en-US will be treated as en
                  \\nExample: (channel_order ascending and preferred_languages eng,jpn)\\n
-                 \\nA file containing ger 2.0,fre 2.0,eng 2.0,jpn 2.0,eng 5.1,jpn 5.1 would be reordered eng 5.1,eng 2.0,jpn 5.1,jpn 2.0,ger 2.0,fre 2.0`,
+                 A file containing ger 2.0,fre 2.0,eng 2.0,jpn 2.0,eng 5.1,jpn 5.1 would be reordered eng 5.1,eng 2.0,jpn 5.1,jpn 2.0,ger 2.0,fre 2.0`,
         },
         {
             name: 'channel_order',
@@ -30,10 +30,10 @@ const details = () => ({
                 options: ['descending', 'ascending'],
             },
             tooltip: `Audio channel ordering preference - streams are ordered by channel then rating of codec/bitrate. Generally descending is recommended.
-                \\nExample: ascending\\n
-                    2.0,5.1
-                \\nExample: descending\\n
-                    5.1,2.0`
+                \\nExample:\\n
+                    ascending: 2.0,5.1
+                \\nExample:\\n
+                    descending: 5.1,2.0`
         },
         {
             name: 'quality_order',
@@ -44,10 +44,10 @@ const details = () => ({
                 options: ['descending', 'ascending'],
             },
             tooltip: `Audio quality ordering preference - streams are ordered by channel then rating of codec/bitrate. Generally descending is recommended.
-                \\nExample: ascending\\n
-                    128k,640k
-                \\nExample: descending\\n
-                    640k,128k`
+                \\nExample:\\n
+                    ascending: 128k,640k
+                \\nExample:\\n
+                    descending: 640k,128k`
         },
         {
             name: 'sdh_first',
