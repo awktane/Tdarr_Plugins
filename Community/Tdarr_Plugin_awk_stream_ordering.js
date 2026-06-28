@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/signs/sdh/commentary) -> Attachments -> Data\n`,
-    Version: '1.6.0',
+    Version: '1.7.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -203,11 +203,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // avoid preferring an unknown-bitrate lossy track over a scored one. This is
         // expected for freshly-transcoded tracks (aac, opus, ac3, eac3, etc.), where the
         // muxer often omits per-stream bitrate; it is only worth attention for source
-        // codecs that normally carry one.
+        // codecs that normally carry one (dts, ac3 from disc, etc.).
         if (bitrate <= 0) {
             const transcodeOutputs = new Set(['aac', 'opus', 'ac3', 'eac3', 'mp3', 'flac', 'vorbis']);
-            const expected = transcodeOutputs.has(codec) ? ' (normal for transcoded tracks)' : '';
-            response.infoLog += `☒Stream ${stream.index}: No bitrate reported, assuming nominal quality.${expected}\n`;
+            if (!transcodeOutputs.has(codec))
+                response.infoLog += `☒Stream ${stream.index}: No bitrate reported for ${codec}, assuming nominal quality.\n`;
             return info.score - (maxPenalty / 2);
         }
 
