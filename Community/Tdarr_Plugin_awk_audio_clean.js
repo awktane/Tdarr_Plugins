@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.4',
+    Version: '1.5',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -589,39 +589,66 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Verified channel layouts and worked examples (raw → normalized):
     //   2.1 (FL FR LFE) returns null: dropping LFE and keeping FL/FR is identical to -ac 2, no pan needed.
     //   3.0 (FL FR FC)  returns null: no surround channels and no LFE, -ac 2 handles it fine.
-    //   3.1  FL FR FC LFE          raw peak L=R=1.707 → norm /1.707 ≈ 0.586*c0+0.414*c2
-    //   4.0  FL FR FC BC           raw peak L=1.707,R=1.207 → norm by L peak /1.707
-    //   5.0  FL FR FC BL BR        raw peak L=2.414,R=1.414 → norm by L peak /2.414
-    //   5.1  FL FR FC LFE BL BR    raw peak L=2.414,R=1.414 → norm by L peak /2.414  (LFE dropped)
-    //   6.1  FL FR FC LFE BC SL SR raw peak L=2.914,R=1.914 → norm by L peak /2.914
-    //   7.1  FL FR FC LFE BL BR SL SR raw peak L=2.914,R=1.914 → norm by L peak /2.914
+    //   3.1  FL FR FC LFE                     raw peak L=R=1.707       → norm /1.707 ≈ 0.586*c0+0.414*c2
+    //   4.0  FL FR FC BC                      raw peak L=2.207,R=1.707 → norm by L peak /2.207
+    //   5.0  FL FR FC BL BR                   raw peak L=2.414         → norm /2.414
+    //   5.1  FL FR FC LFE BL BR (drop LFE)    raw peak L=2.414         → norm /2.414
+    //   5.1(side) FL FR FC LFE SL SR          identical positional indices to 5.1, same matrix
+    //   6.1       FL FR FC LFE BC SL SR       raw peak L=2.914         → norm /2.914
+    //   6.1(back) FL FR FC LFE BL BR BC       raw peak L=2.914         → norm /2.914
+    //   6.1(front) FL FR LFE FLC FRC SL SR    no FC; FLC/FRC as front  raw peak L=2.414 → norm /2.414
+    //   7.1           FL FR FC LFE BL BR SL SR                  raw peak L=2.707 → norm /2.707
+    //   7.1(wide)     FL FR FC LFE BL BR FLC FRC (FLC/FRC full) raw peak L=3.121 → norm /3.121
+    //   7.1(wide-side) FL FR FC LFE FLC FRC SL SR               raw peak L=3.121 → norm /3.121
     const downmixMatrix = (srcStream) => {
         const ch = Number(srcStream?.channels) || 0;
+        const layoutFull = (srcStream?.channel_layout || '').toLowerCase().trim();
+        const layout = layoutFull.replace(/\(.*\)$/, '').trim();
 
-        // 4-channel layouts need a layout check: 3.1 (FL FR FC LFE) and 4.0 (FL FR FC BC)
-        // are both 4ch but have different channel positions and require different matrices.
+        // 4-channel layouts: 3.1 (FL FR FC LFE) and 4.0 (FL FR FC BC) share the same count
+        // but have different channel positions and require different matrices.
         if (ch === 4) {
-            const layout = (srcStream?.channel_layout || '').toLowerCase();
             if (layout === '3.1')
                 // 3.1 : FL FR FC LFE  (drop LFE c3); peak = 1+0.707 = 1.707
                 return 'pan=stereo|FL=0.586*c0+0.414*c2|FR=0.586*c1+0.414*c2';
             if (layout === '4.0')
-                // 4.0 : FL FR FC BC  (no LFE; BC c3 split evenly); peak L = 1+0.707+0.5 = 2.207
+                // 4.0 : FL FR FC BC  (BC c3 split to both sides); peak L = 1+0.707+0.5 = 2.207
                 return 'pan=stereo|FL=0.453*c0+0.320*c2+0.227*c3|FR=0.453*c1+0.320*c2+0.227*c3';
             return null;
         }
 
-        switch (ch) {
+        if (ch === 5)
             // 5.0 : FL FR FC BL BR; peak L = 1+0.707+0.707 = 2.414
-            case 5: return 'pan=stereo|FL=0.414*c0+0.293*c2+0.293*c3|FR=0.414*c1+0.293*c2+0.293*c4';
-            // 5.1 : FL FR FC LFE BL BR  (drop LFE c3); peak L = 1+0.707+0.707 = 2.414
-            case 6: return 'pan=stereo|FL=0.414*c0+0.293*c2+0.293*c4|FR=0.414*c1+0.293*c2+0.293*c5';
-            // 6.1 : FL FR FC LFE BC SL SR  (drop LFE c3, fold BC c4 to both); peak L = 1+0.707+0.5+0.707 = 2.914
-            case 7: return 'pan=stereo|FL=0.343*c0+0.243*c2+0.172*c4+0.243*c5|FR=0.343*c1+0.243*c2+0.172*c4+0.243*c6';
-            // 7.1 : FL FR FC LFE BL BR SL SR  (drop LFE c3, back+side surrounds folded at 0.5 each); peak L = 1+0.707+0.5+0.5 = 2.707
-            case 8: return 'pan=stereo|FL=0.369*c0+0.261*c2+0.185*c4+0.185*c6|FR=0.369*c1+0.261*c2+0.185*c5+0.185*c7';
-            default: return null;
+            return 'pan=stereo|FL=0.414*c0+0.293*c2+0.293*c3|FR=0.414*c1+0.293*c2+0.293*c4';
+
+        if (ch === 6)
+            // 5.1      : FL FR FC LFE BL BR  (c0..c5) — LFE c3 dropped; peak L = 1+0.707+0.707 = 2.414
+            // 5.1(side): FL FR FC LFE SL SR  (c0..c5) — same positional indices, identical matrix
+            return 'pan=stereo|FL=0.414*c0+0.293*c2+0.293*c4|FR=0.414*c1+0.293*c2+0.293*c5';
+
+        if (ch === 7) {
+            // 6.1(back) : FL FR FC LFE BL BR BC  (c0..c6) — BL c4, BR c5, BC c6 shared; peak L = 1+0.707+0.707+0.5 = 2.914
+            if (layoutFull === '6.1(back)')
+                return 'pan=stereo|FL=0.343*c0+0.243*c2+0.243*c4+0.172*c6|FR=0.343*c1+0.243*c2+0.243*c5+0.172*c6';
+            // 6.1(front): FL FR LFE FLC FRC SL SR  (c0..c6) — no FC; FLC c3, FRC c4 as front; SL c5, SR c6; peak L = 1+0.707+0.707 = 2.414
+            if (layoutFull === '6.1(front)')
+                return 'pan=stereo|FL=0.414*c0+0.293*c3+0.293*c5|FR=0.414*c1+0.293*c4+0.293*c6';
+            // 6.1 (default): FL FR FC LFE BC SL SR  (c0..c6) — BC c4 shared, SL c5, SR c6; peak L = 1+0.707+0.5+0.707 = 2.914
+            return 'pan=stereo|FL=0.343*c0+0.243*c2+0.172*c4+0.243*c5|FR=0.343*c1+0.243*c2+0.172*c4+0.243*c6';
         }
+
+        if (ch === 8) {
+            // 7.1(wide)     : FL FR FC LFE BL BR FLC FRC  (c0..c7) — FLC c6, FRC c7 are front-of-center (full weight); peak L = 1+0.707+0.707+0.707 = 3.121
+            if (layoutFull === '7.1(wide)')
+                return 'pan=stereo|FL=0.320*c0+0.227*c2+0.227*c4+0.227*c6|FR=0.320*c1+0.227*c2+0.227*c5+0.227*c7';
+            // 7.1(wide-side): FL FR FC LFE FLC FRC SL SR  (c0..c7) — FLC c4, FRC c5 front-of-center; SL c6, SR c7; peak L = 1+0.707+0.707+0.5 = 2.914
+            if (layoutFull === '7.1(wide-side)')
+                return 'pan=stereo|FL=0.343*c0+0.243*c2+0.243*c4+0.172*c6|FR=0.343*c1+0.243*c2+0.243*c5+0.172*c7';
+            // 7.1 (default) : FL FR FC LFE BL BR SL SR  (c0..c7) — back+side at 0.5 each; peak L = 1+0.707+0.5+0.5 = 2.707
+            return 'pan=stereo|FL=0.369*c0+0.261*c2+0.185*c4+0.185*c6|FR=0.369*c1+0.261*c2+0.185*c5+0.185*c7';
+        }
+
+        return null;
     };
 
     // Channel/filter snippet for a new or replaced stereo track.
