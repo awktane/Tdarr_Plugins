@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.9.1',
+    Version: '1.9.2',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -316,16 +316,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
     
     //Check our inputs
+    const downmixLanguage = String(inputs.downmix_language).toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
     const downmixToSix = String(inputs.downmix_to_six).trim();
     const downmixToTwo = String(inputs.downmix_to_stereo).trim();
     const downmixSecondaryStereo = String(inputs.downmix_secondary_stereo).trim();
     const removeDuplicates = String(inputs.remove_duplicates).trim();
-    const downmixLanguage = String(inputs.downmix_language).toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
     const preserveTitle = String(inputs.preserve_title).trim();
     const forceCodec = String(inputs.force_codec).trim();
+    const surroundCodec = String(inputs.surround_codec).trim();
     const stereoCodec = String(inputs.stereo_codec).trim();
     const stereoDownmix = String(inputs.stereo_downmix_method).trim();
-    const surroundCodec = String(inputs.surround_codec).trim();
     const keepBestSurroundSafe = String(inputs.keep_best_surround_safe).trim();
 
     if(!['false','replace','true'].includes(downmixToSix)) {
@@ -343,6 +343,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.processFile = false;
         return response;
     }
+    if(!['false','clean','true'].includes(removeDuplicates)) {
+        response.infoLog += `☒Somehow invalid removeDuplicates option provided. Check your settings!\n`;
+        response.processFile = false;
+        return response;
+    }
     if(!['false','source','true'].includes(preserveTitle)) {
         response.infoLog += `☒Somehow invalid preserveTitle option provided. Check your settings!\n`;
         response.processFile = false;
@@ -350,16 +355,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
     if(!['false','6below','2below','all'].includes(forceCodec)) {
         response.infoLog += `☒Somehow invalid forceCodec option provided. Check your settings!\n`;
-        response.processFile = false;
-        return response;
-    }
-    if(!['false','clean','true'].includes(removeDuplicates)) {
-        response.infoLog += `☒Somehow invalid removeDuplicates option provided. Check your settings!\n`;
-        response.processFile = false;
-        return response;
-    }
-    if(!['false','quality','channel'].includes(keepBestSurroundSafe)) {
-        response.infoLog += `☒Somehow invalid keepBestSurroundSafe option provided. Check your settings!\n`;
         response.processFile = false;
         return response;
     }
@@ -375,6 +370,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
     if(!['default','dialogue'].includes(stereoDownmix)) {
         response.infoLog += `☒Somehow invalid stereoDownmix option provided. Check your settings!\n`;
+        response.processFile = false;
+        return response;
+    }
+    if(!['false','quality','channel'].includes(keepBestSurroundSafe)) {
+        response.infoLog += `☒Somehow invalid keepBestSurroundSafe option provided. Check your settings!\n`;
         response.processFile = false;
         return response;
     }
