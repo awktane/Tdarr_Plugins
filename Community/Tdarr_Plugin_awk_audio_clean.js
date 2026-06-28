@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.9.0',
+    Version: '1.9.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -178,6 +178,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // eslint-disable-next-line @typescript-eslint/no-unused-vars,no-param-reassign
     inputs = lib.loadDefaultValues(inputs, details);
 
+    const response = {
+        processFile: false,
+        preset: '',
+        handBrakeMode: false,
+        container: `.${file.container}`,
+        FFmpegMode: true,
+        infoLog: '',
+    };
+
     //Codecs and some values to help us score the quality so that we can pick the best track - some of these formats are not supported by ffmpeg yet (ac4)
     const codecInfo = {
         // Lossless
@@ -227,15 +236,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['atrac',  'atrac'],
     ];
     const unknownCodecs = new Set();
-
-    const response = {
-        processFile: false,
-        preset: '',
-        handBrakeMode: false,
-        container: `.${file.container}`,
-        FFmpegMode: true,
-        infoLog: '',
-    };
 
     // Audio quality scoring 
     const audioQuality = (stream) => {
