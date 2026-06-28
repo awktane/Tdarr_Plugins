@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.14.0',
+    Version: '1.15.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -303,11 +303,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // avoid preferring an unknown-bitrate lossy track over a scored one. This is
         // expected for freshly-transcoded tracks (aac, opus, ac3, eac3, etc.), where the
         // muxer often omits per-stream bitrate; it is only worth attention for source
-        // codecs that normally carry one.
+        // codecs that normally carry one (dts, ac3 from disc, etc.).
         if (bitrate <= 0) {
             const transcodeOutputs = new Set(['aac', 'opus', 'ac3', 'eac3', 'mp3', 'flac', 'vorbis']);
-            const expected = transcodeOutputs.has(codec) ? ' (normal for transcoded tracks)' : '';
-            response.infoLog += `☒Stream ${stream.index}: No bitrate reported, assuming nominal quality.${expected}\n`;
+            if (!transcodeOutputs.has(codec))
+                response.infoLog += `☒Stream ${stream.index}: No bitrate reported for ${codec}, assuming nominal quality.\n`;
             return info.score - (maxPenalty / 2);
         }
 
