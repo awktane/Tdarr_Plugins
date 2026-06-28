@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.15.0',
+    Version: '1.17.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -250,6 +250,89 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     ];
     const unknownCodecs = new Set();
 
+    // AC3/EAC3 valid CBR presets in bps (ffmpeg rounds to these internally; we snap explicitly
+    // so the logged/targeted rate matches what ffmpeg actually produces).
+    const ac3Presets = [32000, 40000, 48000, 56000, 64000, 80000, 96000, 112000, 128000,
+                        160000, 192000, 224000, 256000, 320000, 384000, 448000, 512000, 576000, 640000];
+
+    // Per-channel-count target bitrate (bps) for our four encodable output codecs. These sit at or
+    // comfortably above the transparent threshold from the codecInfo scoring table (scaled by channel
+    // count), and serve as the FLOOR for a transcode — the actual target is max(thisTable, source).
+    //
+    // AC3 / EAC3 — CBR fixed-preset. Targets: mono 192k, stereo 224k, 3ch 320k, 4ch 384k, 5ch 448k, 6ch 640k.
+    //              (640k is the Blu-ray 5.1 standard and the AC3/EAC3 codec ceiling.)
+    // AAC — CBR (native AAC VBR is experimental in ffmpeg). mono 128k, stereo 256k, 3ch 320k, 4ch 384k,
+    //              5ch 448k, 6ch 512k, 7ch 576k, 8ch 640k.
+    // Opus — true VBR (-vbr on), -b:a is the target average. More efficient than AAC so targets are lower:
+    //              mono 128k, stereo 192k, 3ch 256k, 4ch 320k, 5ch 320k, 6ch 384k, 7ch 448k, 8ch 448k.
+    const targetTable = (codec, channels) => {
+        const ch = Math.max(1, Number(channels) || 1);
+        if (codec === 'aac') {
+            const t = { 1: 128000, 2: 256000, 3: 320000, 4: 384000, 5: 448000, 6: 512000, 7: 576000, 8: 640000 };
+            return t[Math.min(ch, 8)] ?? 640000;
+        }
+        if (codec === 'opus') {
+            const t = { 1: 128000, 2: 192000, 3: 256000, 4: 320000, 5: 320000, 6: 384000, 7: 448000, 8: 448000 };
+            return t[Math.min(ch, 8)] ?? 448000;
+        }
+        if (codec === 'ac3' || codec === 'eac3') {
+            const t = { 1: 192000, 2: 224000, 3: 320000, 4: 384000, 5: 448000, 6: 640000 };
+            return t[Math.min(ch, 6)] ?? 640000;
+        }
+        return 0;
+    };
+
+    // Per-codec ceiling (bps) so a lossless or very-high-bitrate source (e.g. TrueHD ~4 Mbps) can't drag
+    // the transcode target absurdly high. AC3/EAC3 cap at their hard 640k limit. AAC/Opus cap generously
+    // per channel — well above transparent for any real content, but bounded.
+    const codecCeiling = (codec, channels) => {
+        const ch = Math.max(1, Number(channels) || 1);
+        if (codec === 'ac3' || codec === 'eac3') return 640000;
+        if (codec === 'aac')  return Math.min(ch, 8) * 160000;   // ~160k/ch ceiling (stereo 320k, 5.1 960k, 7.1 1.28M)
+        if (codec === 'opus') return Math.min(ch, 8) * 128000;   // opus is efficient; 128k/ch is already very high
+        return 0;
+    };
+
+    // Resolve the final target bitrate (bps) for a transcode: floor at the per-channel table target, raise
+    // to the source bitrate when the source is known and higher (never throw away quality we can cheaply
+    // keep), then clamp to the codec ceiling. For AC3/EAC3 the result is snapped UP to the nearest valid
+    // preset so the requested rate is one ffmpeg actually honours.
+    const resolveBitrate = (codec, channels, srcBps = 0) => {
+        let bps = targetTable(codec, channels);
+        if (bps <= 0) return 0;
+        const src = Number(srcBps) || 0;
+        if (src > bps) bps = src;
+        bps = Math.min(bps, codecCeiling(codec, channels));
+        if (codec === 'ac3' || codec === 'eac3') {
+            // snap up to nearest valid preset >= bps (fall back to highest preset if above all)
+            bps = ac3Presets.find(p => p >= bps) ?? ac3Presets[ac3Presets.length - 1];
+        }
+        return bps;
+    };
+
+    // Build the full ffmpeg encoder argument string for a transcode to one of our output codecs.
+    // Opus uses true VBR (-vbr on) with -b:a as the target average and max compression_level for quality.
+    // AAC/AC3/EAC3 use CBR via -b:a (AAC VBR is experimental; AC3/EAC3 are CBR-only fixed-preset codecs).
+    // Returns '' for codecs we don't bitrate-manage. srcBps lets the target honour a higher source rate.
+    const encoderArgs = (codec, channels, srcBps = 0) => {
+        const bps = resolveBitrate(codec, channels, srcBps);
+        if (bps <= 0) return '';
+        if (codec === 'opus')
+            return ` -vbr on -compression_level 10 -b:a ${bps / 1000}k`;
+        return ` -b:a ${bps / 1000}k`;
+    };
+
+    // Per-codec audio argument string scoped to a specific output stream index (e.g. -b:a:2 instead of -b:a).
+    // ffmpeg accepts the stream-qualified forms; we use them so each track gets its own settings when a
+    // single command touches several. Mirrors encoderArgs but with :idx suffixes.
+    const encoderArgsIdx = (codec, channels, idx, srcBps = 0) => {
+        const bps = resolveBitrate(codec, channels, srcBps);
+        if (bps <= 0) return '';
+        if (codec === 'opus')
+            return ` -vbr on -compression_level:a:${idx} 10 -b:a:${idx} ${bps / 1000}k`;
+        return ` -b:a:${idx} ${bps / 1000}k`;
+    };
+
     // Audio quality scoring — must be declared after response so infoLog is available
     const audioQuality = (stream) => {
         let codec = (stream?.codec_name || '').toLowerCase().trim();
@@ -299,15 +382,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (info.lossless)
             return info.score;
 
-        // No stream-level bitrate reported — return midpoint rather than full score to
-        // avoid preferring an unknown-bitrate lossy track over a scored one. This is
-        // expected for freshly-transcoded tracks (aac, opus, ac3, eac3, etc.), where the
-        // muxer often omits per-stream bitrate; it is only worth attention for source
-        // codecs that normally carry one (dts, ac3 from disc, etc.).
+        // No stream-level bitrate reported. For codecs we know how to encode (aac, opus, ac3, eac3)
+        // we can estimate quality from the bitrate we would target for this channel count instead of a
+        // blind midpoint — freshly-transcoded tracks routinely omit per-stream bitrate. For source
+        // codecs that normally carry a bitrate (dts, ac3 from disc, etc.) we log once and use the midpoint.
         if (bitrate <= 0) {
-            const transcodeOutputs = new Set(['aac', 'opus', 'ac3', 'eac3', 'mp3', 'flac', 'vorbis']);
-            if (!transcodeOutputs.has(codec))
-                response.infoLog += `☒Stream ${stream.index}: No bitrate reported for ${codec}, assuming nominal quality.\n`;
+            // Per-channel target bitrate (bps) for our encodable output codecs. Kept inline so this
+            // scoring function stays self-contained and byte-for-byte identical across plugins.
+            const ch = Math.max(1, Number(stream?.channels ?? 2));
+            const targets = {
+                aac:  { 1: 128000, 2: 256000, 3: 320000, 4: 384000, 5: 448000, 6: 512000, 7: 576000, 8: 640000 },
+                opus: { 1: 128000, 2: 192000, 3: 256000, 4: 320000, 5: 320000, 6: 384000, 7: 448000, 8: 448000 },
+                ac3:  { 1: 192000, 2: 224000, 3: 320000, 4: 384000, 5: 448000, 6: 640000 },
+                eac3: { 1: 192000, 2: 224000, 3: 320000, 4: 384000, 5: 448000, 6: 640000 },
+            };
+            const tbl = targets[codec];
+            if (tbl) {
+                const estBps = tbl[Math.min(ch, codec === 'ac3' || codec === 'eac3' ? 6 : 8)] ?? 0;
+                const estPenalty = estBps > minimum
+                    ? (estBps >= transparent ? 0 : maxPenalty * (1 - ((estBps - minimum) / (transparent - minimum))))
+                    : maxPenalty;
+                return info.score - estPenalty;
+            }
+            response.infoLog += `☒Stream ${stream.index}: No bitrate reported for ${codec}, assuming nominal quality.\n`;
             return info.score - (maxPenalty / 2);
         }
 
@@ -694,11 +791,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const ffstreamLangKey = ffstream.isTdarrCleanLang;
             const isProtected = protectedIndices.has(ffstream.index);
 
-            // Human-readable source bitrate for the operation log, e.g. " @ 640 kb/s". Falls back to
-            // " @ unknown bitrate" when the stream carries no bit_rate (common for transcoded sources),
-            // so the message is still clear about which track was used.
+            // Human-readable source bitrate for the operation log. Falls back to the known
+            // target bitrate for our own output codecs (common for freshly-transcoded tracks
+            // where the muxer omits per-stream bitrate), or 'unknown bitrate' otherwise.
             const srcBitrate = Number(ffstream.bit_rate || 0);
-            const srcRateStr = srcBitrate > 0 ? `${Math.round(srcBitrate / 1000)} kb/s` : 'unknown bitrate';
+            const srcRateStr = srcBitrate > 0
+                ? `${Math.round(srcBitrate / 1000)} kb/s`
+                : (() => {
+                    const tb = targetTable(ffstreamCodec, ffstream.channels);
+                    return tb > 0 ? `~${tb / 1000} kb/s` : 'unknown bitrate';
+                })();
 
             // Secondary tracks (commentary, VI, etc.) and lang-secondary tracks (unlisted language) get the stereo-only path and never trigger the primary downmix (downmix_to_six/two).
             if (ffstream.isTdarrSecondaryTrack || ffstream.isTdarrLangSecondary) {
@@ -707,8 +809,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // secondary or lang-secondary tracks (they are excluded from protectedIndices), so there is no protected-source case here: an enabled secondary downmix always transcodes in place.
             if (downmixSecondaryStereo !== 'false' && ffstream.channels > 2 && !modifiedAudioIdx.has(outputAudioIdx)) {
                 const newTitle = escTitle(buildTitle(ffstream, '2.0'));
-                workDone += `☒Stream ${ffstream.index}: Transcoding secondary ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr}) to stereo ${stereoCodec} in place\n`;
-                extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                // Downmix changes channel count, so the source bitrate isn't a comparable floor — use the table target for 2ch only.
+                const dstBitArg = encoderArgsIdx(stereoCodec, 2, outputAudioIdx);
+                const dstBitStr = resolveBitrate(stereoCodec, 2);
+                workDone += `☒Stream ${ffstream.index}: Transcoding secondary ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr}) to stereo ${stereoCodec} @ ${dstBitStr / 1000} kb/s in place\n`;
+                extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${dstBitArg}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                 if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
                 modifiedAudioIdx.add(outputAudioIdx);
                 convert = true;
@@ -722,15 +827,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const sixMode = (downmixToSix === 'replace' && isProtected) ? 'true' : downmixToSix;
 
                 if (sixMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
-                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr}) to 6ch ${surroundCodec} in place\n`;
-                    extraArguments += ` -c:a:${outputAudioIdx} ${surroundCodec} -ac:a:${outputAudioIdx} 6 -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                    const dstBitArg = encoderArgsIdx(surroundCodec, 6, outputAudioIdx);
+                    const dstBitStr = resolveBitrate(surroundCodec, 6);
+                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr}) to 6ch ${surroundCodec} @ ${dstBitStr / 1000} kb/s in place\n`;
+                    extraArguments += ` -c:a:${outputAudioIdx} ${surroundCodec}${dstBitArg} -ac:a:${outputAudioIdx} 6 -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     created6chLangs.add(ffstreamLangKey);
                     convert = true;
                 } else if (sixMode === 'true') {
-                    workDone += `☒Stream ${ffstream.index}: Adding 6ch ${surroundCodec} downmix from ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr})\n`;
-                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${surroundCodec} -ac:a:${newStreamOutputIdx} 6 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                    const dstBitArg = encoderArgsIdx(surroundCodec, 6, newStreamOutputIdx);
+                    const dstBitStr = resolveBitrate(surroundCodec, 6);
+                    workDone += `☒Stream ${ffstream.index}: Adding 6ch ${surroundCodec} @ ${dstBitStr / 1000} kb/s downmix from ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr})\n`;
+                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${surroundCodec}${dstBitArg} -ac:a:${newStreamOutputIdx} 6 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escTitle(streamLang)}"`;
                     newStreamOutputIdx++;
                     created6chLangs.add(ffstreamLangKey);
@@ -748,15 +857,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const twoMode = (downmixToTwo === 'replace' && isProtected) ? 'true' : downmixToTwo;
 
                 if (twoMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
-                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr}) to stereo ${stereoCodec} in place\n`;
-                    extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                    const dstBitArg = encoderArgsIdx(stereoCodec, 2, outputAudioIdx);
+                    const dstBitStr = resolveBitrate(stereoCodec, 2);
+                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr}) to stereo ${stereoCodec} @ ${dstBitStr / 1000} kb/s in place\n`;
+                    extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${dstBitArg}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     created2chLangs.add(ffstreamLangKey);
                     convert = true;
                 } else if (twoMode === 'true' || (twoMode === 'replace' && modifiedAudioIdx.has(outputAudioIdx))) {
-                    workDone += `☒Stream ${ffstream.index}: Adding stereo ${stereoCodec} downmix from ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr})\n`;
-                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                    const dstBitArg = encoderArgsIdx(stereoCodec, 2, newStreamOutputIdx);
+                    const dstBitStr = resolveBitrate(stereoCodec, 2);
+                    workDone += `☒Stream ${ffstream.index}: Adding stereo ${stereoCodec} @ ${dstBitStr / 1000} kb/s downmix from ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr})\n`;
+                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec}${dstBitArg}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escTitle(streamLang)}"`;
                     newStreamOutputIdx++;
                     created2chLangs.add(ffstreamLangKey);
@@ -784,8 +897,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (shouldForce && ffstream.channels > targetMaxCh) {
                         workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodec} - ${ffstream.channels}ch exceeds the ${targetMaxCh}ch limit for ${targetCodec}. Enable downmix_to_six to reduce channels first.\n`;
                     } else if (shouldForce) {
-                        workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstreamCodec} to ${targetCodec} (${ffstream.channels}ch @ ${srcRateStr})\n`;
-                        extraArguments += ` -c:a:${outputAudioIdx} ${targetCodec}`;
+                        // Same channel count, codec swap only — honour the source bitrate as a floor so a
+                        // high-bitrate source isn't needlessly degraded (capped at the codec ceiling inside resolveBitrate).
+                        const dstBitArg = encoderArgsIdx(targetCodec, ffstream.channels, outputAudioIdx, srcBitrate);
+                        const dstBitStr = resolveBitrate(targetCodec, ffstream.channels, srcBitrate);
+                        workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstreamCodec} to ${targetCodec} @ ${dstBitStr / 1000} kb/s (${ffstream.channels}ch @ ${srcRateStr})\n`;
+                        extraArguments += ` -c:a:${outputAudioIdx} ${targetCodec}${dstBitArg}`;
                         modifiedAudioIdx.add(outputAudioIdx);
                         convert = true;
                     }
