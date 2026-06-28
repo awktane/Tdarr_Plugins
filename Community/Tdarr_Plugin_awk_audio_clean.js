@@ -137,9 +137,9 @@ const details = () => ({
                 options: ['false','source','true'],
             },
             tooltip: `Specify whether downmixed tracks should preserve the original track title.
-                \\nWhen false the stream title will contain a description of the transcode (e.g. "2.0" or "5.1").
-                \\nWhen source the stream title will contain where the track came from based on channel count (e.g. "5.1 -> 2.0")
-                \\nWhen true the stream title will contain the title of the original track with the new channel count at the end (e.g. "E-AC-3 Atmos 5.1 - 2.0")`,
+                \\nWhen false  - the stream title is just the new channel count (e.g. "2.0" or "5.1").
+                \\nWhen source - the stream title shows the source and new channel count separated by -> (e.g. "5.1 -> 2.0").
+                \\nWhen true   - the original track title is kept and the new channel count is appended with -> (e.g. if the source title is "E-AC-3 Atmos 5.1", the result is "E-AC-3 Atmos 5.1 -> 2.0"). Falls back to false behaviour if the source track has no title.`,
         },
         {
             name: 'stereo_downmix',
@@ -564,7 +564,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!origTitle) return targetLabel;
         const escapedLabel = targetLabel.replace(/\./g, '\\.');
         if (new RegExp(`(?:^|[^0-9.])${escapedLabel}$`).test(origTitle)) return origTitle;
-        return `${origTitle} - ${targetLabel}`;
+        return `${origTitle} -> ${targetLabel}`;
     };
     // Sanitize a value before embedding it inside a double-quoted ffmpeg -metadata argument.
     // Tdarr splits the preset into an argv array (no shell) and feeds it to spawn, so shell
