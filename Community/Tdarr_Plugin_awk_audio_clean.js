@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.17.0',
+    Version: '1.17.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -588,7 +588,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (seen.has(key)) {
                 if (protectedIndices.has(s.index)) continue;
                 streamsToRemove.add(s.index);
-                workDone += `☒Stream ${s.index}: Removing duplicate (lower quality ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang})\n`;
+                // Show the removed track's bitrate and the kept track's for contrast — duplicates are
+                // decided by quality score (largely bitrate-driven), so this makes the choice transparent.
+                const kept = seen.get(key);
+                const rmRate = Number(s.bit_rate || 0) > 0 ? ` @ ${Math.round(Number(s.bit_rate) / 1000)} kb/s` : '';
+                const keptRate = Number(kept.bit_rate || 0) > 0 ? ` @ ${Math.round(Number(kept.bit_rate) / 1000)} kb/s` : '';
+                workDone += `☒Stream ${s.index}: Removing duplicate (lower quality ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang}${rmRate}) - keeping stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate})\n`;
             } else
                 seen.set(key, s);
         }
@@ -895,7 +900,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const targetMaxCh = ({ ac3: 6, eac3: 6, aac: 8, opus: 8 })[targetCodec] ?? 8;
 
                     if (shouldForce && ffstream.channels > targetMaxCh) {
-                        workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodec} - ${ffstream.channels}ch exceeds the ${targetMaxCh}ch limit for ${targetCodec}. Enable downmix_to_six to reduce channels first.\n`;
+                        workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodec} - ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr}) exceeds the ${targetMaxCh}ch limit for ${targetCodec}. Enable downmix_to_six to reduce channels first.\n`;
                     } else if (shouldForce) {
                         // Same channel count, codec swap only — honour the source bitrate as a floor so a
                         // high-bitrate source isn't needlessly degraded (capped at the codec ceiling inside resolveBitrate).
