@@ -12,7 +12,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text and webvtt to srt when remuxing to mkv for maximum player compatibility.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Non-image attachment streams (e.g. embedded fonts for ASS/SSA subtitles) are intentionally left untouched.\n\n`,
-    Version: '1.10.2',
+    Version: '1.11.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -285,6 +285,44 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     let subtitleStreamIndex = -1;
     let audioStreamIndex = -1;
     let videoStreamIndex = -1;
+
+    // Summarise the ORIGINAL streams in the same bracket format used by the stream-ordering plugin's
+    // "New order" line. This plugin runs first and before any removal, so it captures the file exactly
+    // as it arrived. Reading this log alongside the stream-ordering log shows where a file came from and
+    // where it ended up. Detection mirrors the other plugin (disposition flags first, then title keywords)
+    // so the two summaries line up; bitrate is the measured probe value shown as kbps, omitted when absent.
+    const origSummary = file.ffProbeData.streams.map((s) => {
+        const type = (s.codec_type || '').trim().toLowerCase();
+        const codec = (s.codec_name || 'unknown').trim().toLowerCase();
+        const title = (s.tags?.title || '').trim().toLowerCase();
+        const disp = s.disposition || {};
+        if (type === 'video') {
+            return `[video:${codec}]`;
+        } else if (type === 'audio') {
+            const ch = s.channels ? `${s.channels}ch` : '';
+            const langRaw = (s.tags?.language || 'und').trim().toLowerCase();
+            const lang = langRaw !== 'und' ? langRaw : '';
+            const bitrate = Number(s.bit_rate || 0);
+            const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
+            const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
+            const descriptive = disp.visual_impaired === 1 || title.includes('description')
+                || title.includes('descriptive') || title.includes('dvs') || title.includes('narration');
+            const role = commentary ? '/commentary' : (descriptive ? '/description' : '');
+            return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${role}]`;
+        } else if (type === 'subtitle') {
+            const langRaw = (s.tags?.language || 'und').trim().toLowerCase();
+            const lang = langRaw !== 'und' ? langRaw : '';
+            const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
+            const sdh = disp.hearing_impaired === 1 || title.includes('sdh')
+                || title.includes('hearing impaired') || title.includes('deaf');
+            const signs = disp.karaoke === 1 || title.includes('signs') || title.includes('songs');
+            const role = commentary ? '/commentary' : (sdh ? '/sdh' : (signs ? '/signs' : ''));
+            const forced = disp.forced === 1 ? '/forced' : '';
+            return `[sub:${[lang].filter(Boolean).join(' ')}${forced}${role}]`;
+        }
+        return `[${type || 'unknown'}]`;
+    }).join(' ');
+    response.infoLog += `☒Original streams: ${origSummary}\n`;
 
     for (let i = 0; i < file.ffProbeData.streams.length; i++) {
         try {
