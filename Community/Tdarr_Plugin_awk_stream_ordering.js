@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then channels and quality, then commentary, etc) -> Subtitles (forced first, by language, sdh, etc) -> Attachments -> Data\n`,
-    Version: '1.2',
+    Version: '1.3',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -67,8 +67,9 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['false', 'true'],
             },
-            tooltip: `Should we put the default audio first?
-                \\nThe default tag can be inaccurate depending on the file source. If enabled a default track will sort above anything in preferred_languages`,
+            tooltip: `Should we put the default audio first within its language group?
+                \\nThe default tag can be inaccurate depending on the file source. If enabled, a default track will sort above other tracks of the same language.
+                \\nNote: language priority is always respected first — a default German track will not sort above a non-default English track when English is preferred.`,
         },
         {
             name: 'temp_on_network',
@@ -106,7 +107,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         dtsma:      { score: 98,  lossless: true },
         dtshr:      { score: 94,  minimum: 1000000, transparent: 3000000 },
         dts:        { score: 91,  minimum: 768000,  transparent: 1509000 },
-        eac3atmos:  { score: 90,  minimum: 256000,  transparent: 768000 },
+        eac3atmos:  { score: 92,  minimum: 256000,  transparent: 768000 },
         dtsexpress: { score: 80,  minimum: 128000,  transparent: 384000 },
         
         // Modern multichannel codecs
@@ -139,7 +140,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     ];
     const unknownCodecs = new Set();
 
-    // Audio quality scoring 
+    const response = {
+        processFile: false,
+        preset: '',
+        handBrakeMode: false,
+        FFmpegMode: true,
+        container: `.${file.container}`,
+        infoLog: '',
+    };
+
+    // Audio quality scoring — must be declared after response so infoLog is available
     const audioQuality = (stream) => {
         let codec = (stream?.codec_name || '').toLowerCase().trim();
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
@@ -164,8 +174,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             else if (longName.includes('express'))
                 codec = 'dtsexpress';
         //We scored atmos a little higher than typical eac3
-        } else if((codec === 'eac3') && longName.includes('atmos'))
-            codec = 'eac3atmos';            
+        // codec_long_name rarely says "atmos" so also check the stream title tag
+        } else if (codec === 'eac3' && (longName.includes('atmos') || (stream.tags?.title || '').toLowerCase().includes('atmos')))
+            codec = 'eac3atmos';
 
         //Check if we can't identify the codec. If we can't then notify once per codec
         if(!(codec in codecInfo) && !unknownCodecs.has(codec)) {
@@ -188,10 +199,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (info.lossless)
             return info.score;
 
-        // Invalid bitrate
+        // Invalid bitrate — return midpoint rather than full score to avoid
+        // preferring an unknown-bitrate lossy track over a scored one.
         if (bitrate <= 0) {
             response.infoLog += `☒Stream ${stream.index}: Invalid bitrate, assuming nominal quality.\n`;
-            return info.score;
+            return info.score - (maxPenalty / 2);
         }
 
         //Score the track
@@ -204,15 +216,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         return info.score - penalty;
     }
-    
-    const response = {
-        processFile: false,
-        preset: '',
-        handBrakeMode: false,
-        FFmpegMode: true,
-        container: `.${file.container}`,
-        infoLog: '',
-    };
 
     if(!['descending', 'ascending'].includes(inputs.channel_order)) {
         response.infoLog += '☒channel_order has not been configured, please configure required options.\n';
@@ -306,15 +309,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return a.mjpeg ? 1 : -1;
         //Audio
         } else if(a.type === 'audio') {
-            //Override
-            if(defaultAudioFirst && (a.default !== b.default))
-                return a.default ? -1 : 1;
-
-            //Language priority
+            //Language priority first — defaultAudioFirst is a tiebreaker within the same language,
+            //not a global override. A default German track should not sort above a non-default English track.
             const aRank = getLangRank(a.lang, a.shortlang);
             const bRank = getLangRank(b.lang, b.shortlang);
             if (aRank !== bRank)
                 return aRank - bRank;
+
+            //Within the same language group, honour the default flag if requested.
+            //The default tag can be inaccurate depending on the file source.
+            if(defaultAudioFirst && (a.default !== b.default))
+                return a.default ? -1 : 1;
 
             //A commentary stream could be descriptive but it would still be a commentary
             const aRole = a.commentary ? 2 : (a.descriptive ? 1 : 0);
@@ -371,10 +376,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return response;
     }
 
+    // Build a human-readable summary of the new stream order for easier debugging
+    const orderSummary = streams.map(s => {
+        if (s.type === 'video') {
+            const codec = s.stream.codec_name || 'unknown';
+            return `[video:${codec}]`;
+        } else if (s.type === 'audio') {
+            const codec = s.stream.codec_name || 'unknown';
+            const ch = s.channels ? `${s.channels}ch` : '';
+            const lang = s.lang !== 'und' ? s.lang : '';
+            const role = s.commentary ? '/commentary' : (s.descriptive ? '/description' : '');
+            return `[audio:${[lang, ch, codec].filter(Boolean).join(' ')}${role}]`;
+        } else if (s.type === 'subtitle') {
+            const lang = s.lang !== 'und' ? s.lang : '';
+            const role = s.commentary ? '/commentary' : (s.sdh ? '/sdh' : (s.signs ? '/signs' : ''));
+            const forced = s.forced ? '/forced' : '';
+            return `[sub:${[lang].filter(Boolean).join(' ')}${forced}${role}]`;
+        }
+        return `[${s.type}]`;
+    }).join(' ');
+
     response.processFile = true;
     response.reQueueAfter = true;
     response.preset = `,${ffmpegMap} -c copy -max_muxing_queue_size 9999${networkDataOpt}`;
-    response.infoLog += `☒Streams are not in the correct order. (${ffmpegMap})\n`;
+    response.infoLog += `☒Streams are not in the correct order.\n☒New order: ${orderSummary}\n☒Map:${ffmpegMap}\n`;
 
     return response;
 };
