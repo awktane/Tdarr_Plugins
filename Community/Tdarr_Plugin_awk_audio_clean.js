@@ -566,13 +566,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (new RegExp(`(?:^|[^0-9.])${escapedLabel}$`).test(origTitle)) return origTitle;
         return `${origTitle} - ${targetLabel}`;
     };
-    // Escape a title value for embedding inside a double-quoted ffmpeg -metadata argument.
-    // Strips control characters (newlines, null bytes, etc.) that could break the command string
-    // or be used for injection via crafted file metadata, then escapes backslashes and quotes.
+    // Sanitize a value before embedding it inside a double-quoted ffmpeg -metadata argument.
+    // Tdarr splits the preset into an argv array (no shell) and feeds it to spawn, so shell
+    // metacharacters are inert — the only injection vector is breaking out of the quoted value
+    // to inject a new ffmpeg argument, which needs a double quote or control character. Tdarr's
+    // tokenizer strips quotes with no reliable backslash-escape convention, so we remove the
+    // breakout characters (double quotes, backslashes) and control characters outright rather
+    // than escape them. Spaces and other printable text are safe inside the kept quoted value.
     const escTitle = (t) => String(t || '')
-        .replace(/[\x00-\x1f\x7f]/g, '')   // strip control characters including newlines, null bytes
-        .replace(/\\/g, '\\\\')              // escape backslashes before quotes
-        .replace(/"/g, '\\"');               // escape double quotes
+        .replace(/[\x00-\x1f\x7f]/g, '')   // strip control characters (newlines, null bytes, etc.)
+        .replace(/[\\"]/g, '');             // remove backslashes and double quotes (argument-breakout chars)
 
     // Lo/Ro stereo downmix matrices using ffmpeg's standard positional channel order.
     // Center is kept at -3 dB (0.707) so dialogue stays clear; LFE is dropped to avoid mud.
@@ -615,8 +618,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             case 6: return 'pan=stereo|FL=0.414*c0+0.293*c2+0.293*c4|FR=0.414*c1+0.293*c2+0.293*c5';
             // 6.1 : FL FR FC LFE BC SL SR  (drop LFE c3, fold BC c4 to both); peak L = 1+0.707+0.5+0.707 = 2.914
             case 7: return 'pan=stereo|FL=0.343*c0+0.243*c2+0.172*c4+0.243*c5|FR=0.343*c1+0.243*c2+0.172*c4+0.243*c6';
-            // 7.1 : FL FR FC LFE BL BR SL SR  (drop LFE c3); peak L = 1+0.707+0.5+0.707 = 2.914
-            case 8: return 'pan=stereo|FL=0.343*c0+0.243*c2+0.172*c4+0.172*c6|FR=0.343*c1+0.243*c2+0.172*c5+0.172*c7';
+            // 7.1 : FL FR FC LFE BL BR SL SR  (drop LFE c3, back+side surrounds folded at 0.5 each); peak L = 1+0.707+0.5+0.5 = 2.707
+            case 8: return 'pan=stereo|FL=0.369*c0+0.261*c2+0.185*c4+0.185*c6|FR=0.369*c1+0.261*c2+0.185*c5+0.185*c7';
             default: return null;
         }
     };
