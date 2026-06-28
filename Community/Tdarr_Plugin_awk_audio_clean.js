@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.8.1',
+    Version: '1.9.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -61,12 +61,11 @@ const details = () => ({
             defaultValue: 'false',
             inputUI: {
                 type: 'dropdown',
-                options: ['false','replace','true'],
+                options: ['false','true'],
             },
-            tooltip: `Should commentary, visual impaired tracks, etc be downmixed to stereo? Unlike the primary downmix options these tracks are only ever downmixed to stereo. This would normally be false.
-                \\nIf false   - secondary tracks are left untouched
-                \\nIf replace - each secondary track with more than 2 channels is transcoded in place to a stereo stereo_codec track (using the stereo_downmix matrix)
-                \\nIf true    - a new stereo track is added from each secondary surround track and the original is also kept. force_codec still applies to the retained track`,
+            tooltip: `Should commentary, visual impaired tracks, and other secondary tracks be downmixed to stereo? Unlike the primary downmix options, each surround secondary track is transcoded in place to stereo independently — one stereo per secondary track, preserving all of them. This would normally be false.
+                \\nIf false - secondary tracks are left untouched
+                \\nIf true  - each secondary track with more than 2 channels is transcoded in place to a stereo stereo_codec track (using the stereo_downmix matrix). A protected best source is added rather than replaced.`,
         },
         {
             name: 'remove_duplicates',
@@ -80,8 +79,8 @@ const details = () => ({
                 \\nExample: A track with the following audio streams 22.2 english mpegh3d, 7.1 english aac, 7.1 english flac, 5.1 french aac, 2.0 french truehd, 2.0 french aac, 2.0 english ac3, 2.0 english mp3, 5.1 english aac commentary
                 \\nIf false - none are removed
                 \\nIf clean - assuming downmix_to_stereo is true, downmix_language is set to 'eng,en', keep_best_surround_safe is set to 'quality', force_codec is set to '6below', downmix_secondary_stereo is true
-                \\n- 7.1 english flac (orig), 5.1 french aac (orig), 2.0 french aac (from truehd track), 2.0 english aac (from ac3), 5.1 english aac commentary (orig), 2.0 english aac commentary (from 5.1 commentary)
-                \\nIf clean - assuming downmix_to_six is replace, downmix_to_stereo is replace, downmix_language is set to 'eng,en', force_codec is set to 'all', downmix_secondary_stereo is replace, keep_best_surround_safe is false
+                \\n- 7.1 english flac (orig), 5.1 french aac (orig), 2.0 french aac (from truehd track), 2.0 english aac (from ac3), 5.1 english aac commentary (orig->stereo), 2.0 english aac commentary (from 5.1 commentary)
+                \\nIf clean - assuming downmix_to_six is replace, downmix_to_stereo is replace, downmix_language is set to 'eng,en', force_codec is set to 'all', downmix_secondary_stereo is true, keep_best_surround_safe is false
                 \\n- 5.1 english aac (from 7.1 flac), 2.0 french aac (from truehd track), 2.0 english aac (from ac3 track), 2.0 english aac commentary (from 5.1 commentary)
                 \\nIf true - with default options
                 \\n- 22.2 english mpegh3d, 7.1 english flac, 5.1 french aac, 2.0 french truehd, 2.0 english ac3, 5.1 english aac commentary`,
@@ -229,6 +228,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     ];
     const unknownCodecs = new Set();
 
+    const response = {
+        processFile: false,
+        preset: '',
+        handBrakeMode: false,
+        container: `.${file.container}`,
+        FFmpegMode: true,
+        infoLog: '',
+    };
+
     // Audio quality scoring 
     const audioQuality = (stream) => {
         let codec = (stream?.codec_name || '').toLowerCase().trim();
@@ -296,15 +304,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         return info.score - penalty;
     }
-    
-    const response = {
-        processFile: false,
-        preset: '',
-        handBrakeMode: false,
-        container: `.${file.container}`,
-        FFmpegMode: true,
-        infoLog: '',
-    };
 
     // Check if file is a video. If it isn't then exit plugin.
     if (file.fileMedium !== 'video') {
@@ -339,7 +338,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.processFile = false;
         return response;
     }
-    if(!['false','replace','true'].includes(downmixSecondaryStereo)) {
+    if(!['false','true'].includes(downmixSecondaryStereo)) {
         response.infoLog += `☒Somehow invalid downmixSecondaryStereo option provided. Check your settings!\n`;
         response.processFile = false;
         return response;
@@ -483,7 +482,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const byQuality = [...audioStreams].sort((a, b) => b.isTdarrQuality - a.isTdarrQuality || a.index - b.index);
         for (const s of byQuality) {
             const tier = removeDuplicates === 'clean' ? (s.channels > 2 ? 'surround' : 'stereo') : s.channels;
-            const key = `${s.isTdarrCleanLang}|${tier}|${s.isTdarrSecondaryTrack || s.isTdarrLangSecondary}`;
+            // Group only by the genuine commentary/VI marker (isTdarrSecondaryTrack), NOT by
+            // lang-secondary. A foreign-language MAIN track and a foreign-language COMMENTARY
+            // track share the same language and channel count but are different content — keying
+            // on lang-secondary would collapse them together and wrongly delete the commentary.
+            const key = `${s.isTdarrCleanLang}|${tier}|${s.isTdarrSecondaryTrack}`;
             if (seen.has(key)) {
                 if (protectedIndices.has(s.index)) continue;
                 streamsToRemove.add(s.index);
@@ -719,20 +722,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // get the stereo-only path and never trigger the primary downmix (downmix_to_six/two).
             if (ffstream.isTdarrSecondaryTrack || ffstream.isTdarrLangSecondary) {
             // ---- SECONDARY: DOWNMIX TO STEREO ----
-            // Each secondary surround track is handled individually (no per-language dedup and no
-            // "skip if a stereo already exists" check). A protected best source: 'replace' becomes 'add'.
+            // Each secondary surround track is transcoded in place independently — one stereo
+            // per secondary track, preserving all of them. A protected best source is never
+            // replaced in place, so it gets a new stereo stream added alongside it instead.
             if (downmixSecondaryStereo !== 'false' && ffstream.channels > 2) {
                 const newTitle = escTitle(buildTitle(ffstream, '2.0'));
-                const secMode = (downmixSecondaryStereo === 'replace' && isProtected) ? 'true' : downmixSecondaryStereo;
+                const addInstead = isProtected;
 
-                if (secMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
+                if (!addInstead && !modifiedAudioIdx.has(outputAudioIdx)) {
                     workDone += `☒Stream ${ffstream.index}: Transcoding secondary ${ffstream.channels}ch to stereo ${stereoCodec} in place\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     convert = true;
-                } else if (secMode === 'true') {
-                    workDone += `☒Stream ${ffstream.index}: Adding secondary stereo ${stereoCodec} downmix from ${ffstream.channels}ch\n`;
+                } else if (addInstead) {
+                    workDone += `☒Stream ${ffstream.index}: Adding secondary stereo ${stereoCodec} downmix from ${ffstream.channels}ch (protected source kept)\n`;
                     extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escTitle(streamLang)}"`;
                     newStreamOutputIdx++;
