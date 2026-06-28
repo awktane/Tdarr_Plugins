@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.12.1',
+    Version: '1.12.2',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -86,8 +86,8 @@ const details = () => ({
             tooltip: `If true then one track is allowed per channel count, language, and type (commentary, descriptive, etc). The highest quality stream in each group is kept and the rest are removed. Any stream newly created by downmix_to_six or downmix_to_stereo would also be kept.
                 \\nAssuming the example stream below
                 \\nExample:\\n
-                22.2 english mpegh3d, 7.1 english aac, 7.1 english flac, 5.1 french aac, 2.0 french truehd, 2.0 french aac, 2.0 english ac3, 2.0 english mp3, 5.1 english aac commentary\\n
-                If clean results will be as seen below - assuming downmix_to_stereo is true, downmix_language is set to 'eng,en', keep_best_surround_safe is set to 'quality', force_codec is set to '6below', downmix_secondary_stereo is true
+                22.2 english mpegh3d, 7.1 english aac, 7.1 english flac, 5.1 french aac, 2.0 french truehd, 2.0 french aac, 2.0 english ac3, 2.0 english mp3, 5.1 english aac commentary
+                \\nIf clean results will be as seen below - assuming downmix_to_stereo is true, downmix_language is set to 'eng,en', keep_best_surround_safe is set to 'quality', force_codec is set to '6below', downmix_secondary_stereo is true
                 \\nExample:\\n
                 7.1 english flac (orig), 5.1 french aac (orig), 2.0 french aac (from truehd track), 2.0 english aac (from ac3), 5.1 english aac commentary (orig->stereo), 2.0 english aac commentary (from 5.1 commentary)
                 \\nIf clean results will be as seen below - assuming downmix_to_six is replace, downmix_to_stereo is replace, downmix_language is set to 'eng,en', force_codec is set to 'all', downmix_secondary_stereo is true, keep_best_surround_safe is false
@@ -145,7 +145,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['false','6below','2below','all'],
             },
-            tooltip: `Transcode all tracks to the codecs specified in surround_codec and stereo_codec depending on their channel count
+            tooltip: `Transcode all tracks to the codecs specified in surround_codec and stereo_codec depending on their channel count. Note streams with more channels than supported by the codec will not be transcoded.
                 \\n=====
                 \\nActions
                 \\n=====
@@ -273,8 +273,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 codec = 'dtshr';
             else if (longName.includes('express'))
                 codec = 'dtsexpress';
-        //We scored atmos a little higher than typical eac3
-        // codec_long_name rarely says "atmos" so also check the stream title tag
+        //If we notice it's atmos bump it higher than eac3 because of the extra features - codec_long_name rarely says "atmos" so also check the stream title tag
         } else if (codec === 'eac3' && (longName.includes('atmos') || (stream.tags?.title || '').toLowerCase().includes('atmos')))
             codec = 'eac3atmos';
 
@@ -315,13 +314,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         return info.score - penalty;
-    }
-
-    // Check if file is a video. If it isn't then exit plugin.
-    if (file.fileMedium !== 'video') {
-        response.infoLog += '☒File is not a video. \n';
-        response.processFile = false;
-        return response;
     }
 
     //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
@@ -396,6 +388,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return response;
     }
 
+    // Check if file is a video. If it isn't then exit plugin.
+    if (file.fileMedium !== 'video') {
+        response.infoLog += '☒File is not a video. \n';
+        response.processFile = false;
+        return response;
+    }
+
     const isSecondaryTrack = (stream) => {
         const title = String(stream.tags?.title || '').toLowerCase();
         const disposition = stream.disposition || {};
@@ -419,8 +418,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return {...item,
             isTdarrSecondaryTrack: isSecondaryTrack(item),
             // Language-secondary: track language is not in downmixLanguage (when the list is non-empty).
-            // These tracks follow the secondary path (downmix_secondary_stereo, force_codec) but are
-            // excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo).
+            // These tracks follow the secondary path (downmix_secondary_stereo, force_codec) but are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo).
             isTdarrLangSecondary: downmixLanguage.length > 0 && !downmixLanguage.includes(cleanLang),
             isTdarrCleanLang: cleanLang,
             isTdarrQuality: audioQuality(item)
@@ -428,21 +426,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     });
 
     // candidateStreams: the pool for workStreams and keep_best_surround_safe.
-    // Lang-secondary tracks (unlisted language) are included here so force_codec and
-    // downmix_secondary_stereo can act on them. They are excluded from the primary downmix
-    // paths (downmix_to_six, downmix_to_stereo) in the processing loop below.
-    // Secondary and lang-secondary tracks are only dropped from the pool when there is
-    // genuinely nothing to do with them: downmix_secondary_stereo is false AND force_codec is
-    // false. When force_codec is set they stay so the force-codec path can standardize their
-    // codec too (e.g. force_codec='all' must touch every track, including commentary and
-    // unlisted-language tracks).
+    // Lang-secondary tracks (unlisted language) are included here so force_codec and downmix_secondary_stereo can act on them.
+    // They are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo) in the processing loop below.
+    // Secondary and lang-secondary tracks are only dropped from the pool when there is genuinely nothing to do with them: downmix_secondary_stereo is false AND force_codec is false.
+    // When force_codec is set they stay so the force-codec path can standardize their codec too (e.g. force_codec='all' must touch every track, including commentary and unlisted-language tracks).
     let candidateStreams = audioStreams;
     if (downmixSecondaryStereo === 'false' && forceCodec === 'false')
         candidateStreams = candidateStreams.filter(stream => !stream.isTdarrSecondaryTrack && !stream.isTdarrLangSecondary);
 
     // keep_best_surround_safe: protect the best track per language among preferred-language primary tracks.
-    // Lang-secondary and disposition-secondary tracks are excluded — protecting a non-preferred-language
-    // track or a commentary track serves no purpose and would prevent force_codec from touching it.
+    // Lang-secondary and disposition-secondary tracks are excluded — protecting a non-preferred-language track or a commentary track serves no purpose and would prevent force_codec from touching it.
     const protectedIndices = new Set();
     if (keepBestSurroundSafe !== 'false') {
         const bestByLang = new Map();
@@ -466,40 +459,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         for (const s of bestByLang.values()) protectedIndices.add(s.index);
     }
 
-    // Languages that already have a primary stereo track, so downmix_to_stereo can honour
-    // "create a 2 channel track only if one doesn't exist".
-    // Uses isTdarrCleanLang (normalised short code, e.g. 'en' for 'en-US') to match the same
-    // key used by created2chLangs and ffstreamLangKey — preventing redundant stereo creation
-    // when the existing track is tagged with a regional variant like en-US.
+    // Languages that already have a primary stereo track, so downmix_to_stereo can honour "create a 2 channel track only if one doesn't exist".
+    // Uses isTdarrCleanLang (normalised short code, e.g. 'en' for 'en-US') to match the same key used by created2chLangs and ffstreamLangKey — preventing redundant stereo creation when the existing track is tagged with a regional variant like en-US.
     const existingStereoLangs = new Set(audioStreams.filter(s => s.channels === 2 && !s.isTdarrSecondaryTrack && !s.isTdarrLangSecondary).map(s => s.isTdarrCleanLang));
 
-    // Languages that already have a primary 5.1/6ch track, so downmix_to_six can honour
-    // "create a 5.1 track only if one doesn't exist". Mirrors existingStereoLangs.
+    // Languages that already have a primary 5.1/6ch track, so downmix_to_six can honour "create a 5.1 track only if one doesn't exist". Mirrors existingStereoLangs.
     // Channels > 4 && <= 6 covers 5.0 and 5.1 without catching 4.0/4.1 or 7.1 sources.
     const existingSixLangs = new Set(audioStreams.filter(s => s.channels > 4 && s.channels <= 6 && !s.isTdarrSecondaryTrack && !s.isTdarrLangSecondary).map(s => s.isTdarrCleanLang));
 
-    // Identify lower-quality duplicates. Within each group keep only the highest quality stream
-    // and mark the rest for removal. The grouping key depends on the mode:
-    //   'true'  - group by (lang, exact channel count, primary/secondary): one track per distinct
-    //             channel count survives (e.g. a 7.1, a 5.1 and a 2.0 of the same language are all kept).
-    //   'clean' - group by (lang, surround-vs-stereo tier, primary/secondary): collapses every
-    //             surround variant of a language down to a single best surround plus a single best
-    //             stereo, for a more predictable layout. Downmix targets created later are unaffected
-    //             since they don't exist in audioStreams yet.
-    // Note: deduplication runs across ALL audio streams regardless of downmix_language or
-    // downmix_secondary_stereo, since those settings govern transcoding candidates, not what's a
-    // genuine duplicate. A duplicate TrueHD in a non-preferred language is still a duplicate.
-    // Protected (keep_best_surround_safe) tracks are never removed.
+    // Identify lower-quality duplicates. Within each group keep only the highest quality stream and mark the rest for removal. The grouping key depends on the mode:
+    //   'true'  - group by (lang, exact channel count, primary/secondary): one track per distinct channel count survives (e.g. a 7.1, a 5.1 and a 2.0 of the same language are all kept).
+    //   'clean' - group by (lang, surround-vs-stereo tier, primary/secondary): collapses every surround variant of a language down to a single best surround plus a single best
+    //             stereo, for a more predictable layout. Downmix targets created later are unaffected since they don't exist in audioStreams yet.
+    // Note: deduplication runs across ALL audio streams regardless of downmix_language or downmix_secondary_stereo, since those settings govern transcoding candidates, not what's a
+    // genuine duplicate. A duplicate in a non-preferred language is still a duplicate. Protected (keep_best_surround_safe) tracks are never outright removed.
     const streamsToRemove = new Set();
     if (removeDuplicates === 'true' || removeDuplicates === 'clean') {
         const seen = new Map();
         const byQuality = [...audioStreams].sort((a, b) => b.isTdarrQuality - a.isTdarrQuality || a.index - b.index);
         for (const s of byQuality) {
             const tier = removeDuplicates === 'clean' ? (s.channels > 2 ? 'surround' : 'stereo') : s.channels;
-            // Group only by the genuine commentary/VI marker (isTdarrSecondaryTrack), NOT by
-            // lang-secondary. A foreign-language MAIN track and a foreign-language COMMENTARY
-            // track share the same language and channel count but are different content — keying
-            // on lang-secondary would collapse them together and wrongly delete the commentary.
+            // Group only by the genuine commentary/VI marker (isTdarrSecondaryTrack), NOT by lang-secondary. A foreign-language MAIN track and a foreign-language COMMENTARY
+            // track share the same language and channel count but are different content — keying on lang-secondary would collapse them together and wrongly delete the commentary.
             const key = `${s.isTdarrCleanLang}|${tier}|${s.isTdarrSecondaryTrack}`;
             if (seen.has(key)) {
                 if (protectedIndices.has(s.index)) continue;
@@ -592,12 +573,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Tracks which input audio indices have already received a -c:a:N assignment so we don't emit conflicting codec directives for the same stream.
     const modifiedAudioIdx = new Set();
 
-    // Build the title for a new or replaced track. The original track title is always
-    // preserved and the new channel count is appended with -> (e.g. a source titled
-    // "E-AC-3 Atmos 5.1" downmixed to stereo becomes "E-AC-3 Atmos 5.1 -> 2.0"). This keeps
-    // role words like "Commentary"/"Director's Commentary" visible after a downmix. When the
-    // source has no title the new channel count alone is used (e.g. "2.0"). If the title
-    // already ends in the target label (not preceded by a digit/dot, so "5.1" won't match
+    // Build the title for a new or replaced track. The original track title is always preserved and the new channel count is appended with -> (e.g. a source titled
+    // "E-AC-3 Atmos 5.1" downmixed to stereo becomes "E-AC-3 Atmos 5.1 -> 2.0"). This keeps role words like "Commentary"/"Director's Commentary" visible after a downmix. When the
+    // source has no title the new channel count alone is used (e.g. "2.0"). If the title already ends in the target label (not preceded by a digit/dot, so "5.1" won't match
     // "15.1") it is returned unchanged to avoid "... 2.0 -> 2.0".
     const buildTitle = (srcStream, targetLabel) => {
         const origTitle = (srcStream.tags?.title || '').trim();
@@ -606,47 +584,41 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (new RegExp(`(?:^|[^0-9.])${escapedLabel}$`).test(origTitle)) return origTitle;
         return `${origTitle} -> ${targetLabel}`;
     };
-    // Sanitize a value before embedding it inside a double-quoted ffmpeg -metadata argument.
-    // Tdarr splits the preset into an argv array (no shell) and feeds it to spawn, so shell
-    // metacharacters are inert — the only injection vector is breaking out of the quoted value
-    // to inject a new ffmpeg argument, which needs a double quote or control character. Tdarr's
-    // tokenizer strips quotes with no reliable backslash-escape convention, so we remove the
-    // breakout characters (double quotes, backslashes) and control characters outright rather
+    // Sanitize a value before embedding it inside a double-quoted ffmpeg -metadata argument. Tdarr splits the preset into an argv array (no shell) and feeds it to spawn, so shell
+    // metacharacters are inert — the only injection vector is breaking out of the quoted value to inject a new ffmpeg argument, which needs a double quote or control character. Tdarr's
+    // tokenizer strips quotes with no reliable backslash-escape convention, so we remove the breakout characters (double quotes, backslashes) and control characters outright rather
     // than escape them. Spaces and other printable text are safe inside the kept quoted value.
     const escTitle = (t) => String(t || '')
-        .replace(/[\x00-\x1f\x7f]/g, '')   // strip control characters (newlines, null bytes, etc.)
+        .replace(/[\x00-\x1f\x7f]/g, '')    // strip control characters (newlines, null bytes, etc.)
         .replace(/[\\"]/g, '');             // remove backslashes and double quotes (argument-breakout chars)
 
     // Lo/Ro stereo downmix matrices using ffmpeg's standard positional channel order.
     // Center is kept at -3 dB (0.707) so dialogue stays clear; LFE is dropped to avoid mud.
     // Returns null for layouts we cannot safely map positionally, so callers fall back to -ac 2.
     //
-    // All matrices are peak-normalized: each coefficient is divided by the maximum possible
-    // sum for that channel (worst-case all inputs simultaneously at full scale). This prevents
-    // clipping on loud content without cutting the overall perceived volume — real program
-    // material rarely hits all channels at full simultaneously, so typical levels are unaffected.
+    // All matrices are peak-normalized: each coefficient is divided by the maximum possible sum for that channel (worst-case all inputs simultaneously at full scale). This prevents
+    // clipping on loud content without cutting the overall perceived volume — real program material rarely hits all channels at full simultaneously, so typical levels are unaffected.
     //
     // Verified channel layouts and worked examples (raw → normalized):
     //   2.1 (FL FR LFE) returns null: dropping LFE and keeping FL/FR is identical to -ac 2, no pan needed.
     //   3.0 (FL FR FC)  returns null: no surround channels and no LFE, -ac 2 handles it fine.
-    //   3.1  FL FR FC LFE                     raw peak L=R=1.707       → norm /1.707 ≈ 0.586*c0+0.414*c2
-    //   4.0  FL FR FC BC                      raw peak L=2.207,R=1.707 → norm by L peak /2.207
-    //   5.0  FL FR FC BL BR                   raw peak L=2.414         → norm /2.414
-    //   5.1  FL FR FC LFE BL BR (drop LFE)    raw peak L=2.414         → norm /2.414
-    //   5.1(side) FL FR FC LFE SL SR          identical positional indices to 5.1, same matrix
-    //   6.1       FL FR FC LFE BC SL SR       raw peak L=2.914         → norm /2.914
-    //   6.1(back) FL FR FC LFE BL BR BC       raw peak L=2.914         → norm /2.914
-    //   6.1(front) FL FR LFE FLC FRC SL SR    no FC; FLC/FRC as front  raw peak L=2.414 → norm /2.414
-    //   7.1           FL FR FC LFE BL BR SL SR                  raw peak L=2.707 → norm /2.707
-    //   7.1(wide)     FL FR FC LFE BL BR FLC FRC (FLC/FRC full) raw peak L=3.121 → norm /3.121
-    //   7.1(wide-side) FL FR FC LFE FLC FRC SL SR               raw peak L=3.121 → norm /3.121
+    //   3.1  FL FR FC LFE                                       raw peak L=R=1.707       - norm /1.707 ≈ 0.586*c0+0.414*c2
+    //   4.0  FL FR FC BC                                        raw peak L=2.207,R=1.707 - norm by L peak /2.207
+    //   5.0  FL FR FC BL BR                                     raw peak L=2.414         - norm /2.414
+    //   5.1  FL FR FC LFE BL BR (drop LFE)                      raw peak L=2.414         - norm /2.414
+    //   5.1(side) FL FR FC LFE SL SR                            identical positional indices to 5.1, same matrix
+    //   6.1       FL FR FC LFE BC SL SR                         raw peak L=2.914         - norm /2.914
+    //   6.1(back) FL FR FC LFE BL BR BC                         raw peak L=2.914         - norm /2.914
+    //   6.1(front) FL FR LFE FLC FRC SL SR                      raw peak L=2.414         - norm /2.414 (no FC; FLC/FRC as front)
+    //   7.1           FL FR FC LFE BL BR SL SR                  raw peak L=2.707         - norm /2.707
+    //   7.1(wide)     FL FR FC LFE BL BR FLC FRC (FLC/FRC full) raw peak L=3.121         - norm /3.121
+    //   7.1(wide-side) FL FR FC LFE FLC FRC SL SR               raw peak L=3.121         - norm /3.121
     const downmixMatrix = (srcStream) => {
         const ch = Number(srcStream?.channels) || 0;
         const layoutFull = (srcStream?.channel_layout || '').toLowerCase().trim();
         const layout = layoutFull.replace(/\(.*\)$/, '').trim();
 
-        // 4-channel layouts: 3.1 (FL FR FC LFE) and 4.0 (FL FR FC BC) share the same count
-        // but have different channel positions and require different matrices.
+        // 4-channel layouts: 3.1 (FL FR FC LFE) and 4.0 (FL FR FC BC) share the same count but have different channel positions and require different matrices.
         if (ch === 4) {
             if (layout === '3.1')
                 // 3.1 : FL FR FC LFE  (drop LFE c3); peak = 1+0.707 = 1.707
@@ -707,8 +679,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const outputAudioIdx = outputAudioIdxMap.get(ffstream.index);
             const srcAudioIdx = inputAudioIdxMap.get(ffstream.index);
 
-            // Guard: if either index is missing the stream wasn't tracked correctly — skip rather than
-            // emitting a broken argument like -c:a:undefined which ffmpeg will reject with a cryptic error.
+            // Guard: if either index is missing the stream wasn't tracked correctly — skip rather than emitting a broken argument like -c:a:undefined which ffmpeg will reject with a cryptic error.
             if (outputAudioIdx === undefined || srcAudioIdx === undefined) {
                 response.infoLog += `☒Stream ${ffstream.index}: Could not resolve audio index mapping, skipping.\n`;
                 continue;
@@ -717,12 +688,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const ffstreamLangKey = ffstream.isTdarrCleanLang;
             const isProtected = protectedIndices.has(ffstream.index);
 
-            // Secondary tracks (commentary, VI, etc.) and lang-secondary tracks (unlisted language)
-            // get the stereo-only path and never trigger the primary downmix (downmix_to_six/two).
+            // Secondary tracks (commentary, VI, etc.) and lang-secondary tracks (unlisted language) get the stereo-only path and never trigger the primary downmix (downmix_to_six/two).
             if (ffstream.isTdarrSecondaryTrack || ffstream.isTdarrLangSecondary) {
             // ---- SECONDARY: DOWNMIX TO STEREO ----
-            // Each secondary surround track is transcoded in place independently — one stereo
-            // per secondary track, preserving all of them. A protected best source is never
+            // Each secondary surround track is transcoded in place independently — one stereo per secondary track, preserving all of them. A protected best source is never
             // replaced in place, so it gets a new stereo stream added alongside it instead.
             if (downmixSecondaryStereo !== 'false' && ffstream.channels > 2) {
                 const newTitle = escTitle(buildTitle(ffstream, '2.0'));
@@ -743,9 +712,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
             }
             } else {
-            // ---- DOWNMIX TO 6 CHANNELS ----
-            // One 6ch per language, from its best >6ch source. A protected best source is
-            // never replaced in place, so 'replace' becomes 'add' for it.
+            /*-=-=-= DOWNMIX TO 6 CHANNELS =-=-=-*/
+            // One 6ch per language, from its best >6ch source. A protected best source is never replaced in place, so 'replace' becomes 'add' for it.
             if (downmixToSix !== 'false' && ffstream.channels > 6 && !created6chLangs.has(ffstreamLangKey)
                 && !existingSixLangs.has(ffstreamLangKey)) {
                 const newTitle = escTitle(buildTitle(ffstream, '5.1'));
@@ -768,17 +736,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
             }
 
-            // ---- DOWNMIX TO 2 CHANNELS ----
-            // One stereo per language, from its best >2ch source, only when the language
-            // has no primary stereo already. Protected best source: 'replace' becomes 'add'.
-            // When 'replace' is requested but downmix_to_six already consumed this same source
-            // in place (single >6ch source, both downmixes enabled), the in-place slot is taken,
-            // so we fall back to ADDING a stereo from the original input. The user enabled
-            // downmix_to_stereo expecting a 2.0 in the output, so a lone 7.1 with both downmixes
+            /*-=-=-= DOWNMIX TO 2 CHANNELS =-=-=-*/
+            // One stereo track per language, from its best >2ch source, only when the language has no primary stereo already. Protected best source: 'replace' becomes 'add'.
+            // When 'replace' is requested but downmix_to_six already consumed this same source in place (single >6ch source, both downmixes enabled), the in-place slot is taken,
+            // so we fall back to ADDING a stereo from the original input. The user enabled downmix_to_stereo expecting a 2.0 in the output, so a lone 7.1 with both downmixes
             // on yields a 5.1 and a 2.0 rather than silently dropping the stereo.
-            if (downmixToTwo !== 'false' && ffstream.channels > 2
-                && !created2chLangs.has(ffstreamLangKey)
-                && !existingStereoLangs.has(ffstreamLangKey)) {
+            if (downmixToTwo !== 'false' && ffstream.channels > 2 && !created2chLangs.has(ffstreamLangKey) && !existingStereoLangs.has(ffstreamLangKey)) {
                 const newTitle = escTitle(buildTitle(ffstream, '2.0'));
                 const twoMode = (downmixToTwo === 'replace' && isProtected) ? 'true' : downmixToTwo;
 
@@ -800,11 +763,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
             }
 
-            // ---- FORCE CODEC ----
-            // Skip protected best tracks UNLESS force_codec is 'all' — per keep_best_surround_safe,
-            // the protected track can only be touched when force_codec is 'all'. Also skip when the
-            // source has more channels than the target codec supports (ac3/eac3 max 6ch, opus/aac max 8ch
-            // in ffmpeg's encoder) to avoid an ffmpeg encode failure.
+            /*-=-=-= FORCE CODEC =-=-=-*/
+            // Skip protected best tracks UNLESS force_codec is 'all' — per keep_best_surround_safe, the protected track can only be touched when force_codec is 'all'. Also skip when the
+            // source has more channels than the target codec supports (ac3/eac3 max 6ch, opus/aac max 8ch in ffmpeg's encoder) to avoid an ffmpeg encode failure.
             if (forceCodec !== 'false' && !modifiedAudioIdx.has(outputAudioIdx) && (!isProtected || forceCodec === 'all')) {
                 const isStereo = ffstream.channels <= 2;
                 const targetCodec = isStereo ? stereoCodec : surroundCodec;
