@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then channels and quality, then commentary, etc) -> Subtitles (forced first, by language, sdh, etc) -> Attachments -> Data\n`,
-    Version: '1.4.1',
+    Version: '1.4.2',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -68,7 +68,8 @@ const details = () => ({
                 options: ['false', 'true'],
             },
             tooltip: `Should we put the default audio first within its language group?
-                \\nThe default tag can be inaccurate depending on the file source. If enabled, a default track will sort above other tracks of the same language.
+                \\nLeave this false unless you specifically know you want it. The default disposition flag is frequently wrong or arbitrary depending on the file source, and when enabled it sorts ABOVE role — a track flagged default will be placed above the main/descriptive/commentary ordering within its language. A mis-flagged default commentary track would therefore sort above the main feature audio.
+                \\nOnly enable this if your files have a reliably-set default flag and you understand you are sorting on a potentially arbitrary tag.
                 \\nNote: language priority is always respected first — a default German track will not sort above a non-default English track when English is preferred.`,
         },
         {
