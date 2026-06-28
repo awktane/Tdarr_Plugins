@@ -12,7 +12,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text and webvtt to srt when remuxing to mkv for maximum player compatibility.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Non-image attachment streams (e.g. embedded fonts for ASS/SSA subtitles) are intentionally left untouched.\n\n`,
-    Version: '1.10.1',
+    Version: '1.10.2',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -23,10 +23,12 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['mkv', 'mp4'],
             },
-            tooltip: `Specify output container of file
-                \\nAny streams that are not supported by the output container will be removed.
-               \\nmkv will also remove eia_608 and convert mov_text and webvtt subtitles to srt.
-               \\nmp4 will also remove eia_608, hdmv_pgs_subtitle, dvd_subtitle, and xsub. Genpts may be required to fix timestamps.`,
+            tooltip: `Specify output container of file. Any streams that are not supported by the output container will be removed.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nmkv will also remove eia_608 and convert mov_text and webvtt subtitles to srt.
+                \\nmp4 will also remove eia_608, hdmv_pgs_subtitle, dvd_subtitle, and xsub. Genpts may be required to fix timestamps.`,
         },
         {
             name: 'recovery_discard_frame',
@@ -37,8 +39,8 @@ const details = () => ({
                 options: ['false', 'true'],
             },
             tooltip: `Run with the ffmpeg +discardcorrupt options to drop any corrupt frames from the file.
-                 \\nShould generally be false as it may cause a small blips of video/audio but may allow a damaged file to be processed.
-                 \\nMay cause problems with timestamps which may require +genpts and/or +igndts to fix.`,
+                 \\nShould generally be false as it may cause a small blips of video/audio if there is damage but may still allow a damaged file to be processed.
+                 \\nMay also cause problems with timestamps which may require +genpts and/or +igndts to fix.`,
         },
         {
             name: 'recovery_genpts',
@@ -61,7 +63,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['false', 'true'],
             },
-            tooltip: `Run with the ffmpeg +igndts option to ignore DTS (Decode Timestamps - has nothing to do with Dolby DTS).
+            tooltip: `Run with the ffmpeg +igndts option to ignore DTS (Decode Time Stamps - has nothing to do with Dolby DTS).
                  \\nShould generally be false but can fix errors like "Non-monotonous DTS in output stream" or "DTS out of order".
                  \\nWhen enabled genpts will be automatically enabled even if false is specified as messing with the timestream is a daunting exercise.`,
         },
@@ -73,8 +75,9 @@ const details = () => ({
             tooltip: `Specify language tags here for the audio tracks you'd like to keep. If blank no tracks will be removed.
                 \\nStreams with no language tag are treated as though they had fill_language as their language or "und" if fill_language isn't set
                 \\nThis list should include both two character and three character codes as this will successfully catch values like en, eng, en-US, en_US, and en.US
-                \\nExample: English, French, and Japanese (ISO-639-2 and ISO-639-1) (und = undefined, mul = multiple languages, zxx = no linguistic content, mis = missing language / no language code)\\n
+                \\nExample: 
                     en,eng,fr,fre,fra,und,mul,jpn,ja,zxx,mis
+                    \\nEnglish, French, and Japanese (ISO-639-2 and ISO-639-1) (und = undefined, mul = multiple languages, zxx = no linguistic content, mis = missing language / no language code)
                 \\nExample:\\n
                     en,eng,und`,
         },
@@ -112,7 +115,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['false', 'true'],
             },
-            tooltip: `Should subtitle tracks that contain the words "SDH, deaf, hearing impaired, etc" in their description be removed?`,
+            tooltip: `Should subtitle tracks that contain the words "SDH, deaf, hearing impaired, etc" in their description be deleted?`,
         },
         {
             name: 'tag_channel_audio_title',
@@ -146,7 +149,8 @@ const details = () => ({
             },
             tooltip: `Should audio/subtitle metadata titles be removed if they contain more than 3 periods? This removes most invalid or unnecessary titles that are added by some sources.
                 \\nNote this also checks the handler_name for the same thing.
-                \\nExample: This.Title.Has.Too.Many.Periods would have been set to blank`,
+                \\nExample:\\n
+                This.Title.Has.Too.Many.Periods would have title set to blank`,
         },
         {
             name: 'temp_on_network',
@@ -177,19 +181,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         infoLog: '',
     };
 
-    // Check if file is a video. If it isn't then exit plugin.
-    if (file.fileMedium !== 'video') {
-        response.infoLog += '☒File is not a video. \n';
-        response.processFile = false;
-        return response;
-    }
-
-    // Check if inputs.container has been configured. If it hasn't then exit plugin. Shouldn't happen. Doesn't hurt to check.
-    if (!inputs.container || inputs.container === '') {
-        response.infoLog += '☒Container has not been configured, please configure required options. \n';
-        response.processFile = false;
-        return response;
-    }
     const srcContainer = file.container.toLowerCase().trim();
     const dstContainer = inputs.container.toLowerCase().trim();
     response.container = `.${dstContainer}`;
@@ -241,19 +232,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         'deaf'
     ];
 
-    // Sanitize a metadata value before embedding it inside a double-quoted ffmpeg -metadata
-    // argument (e.g. -metadata:s:a:0 "title=...").
+    // Sanitize a metadata value before embedding it inside a double-quoted ffmpeg -metadata argument (e.g. -metadata:s:a:0 "title=...").
     //
-    // Tdarr does NOT pass the preset through a shell — it splits the string into an argv array
-    // (quote-aware) and hands it to child_process.spawn. That means shell metacharacters
-    // ($ ` ; | etc.) are inert: they reach ffmpeg as literal bytes and become harmless metadata
-    // text. The ONLY injection vector is breaking out of the quoted value to inject a new ffmpeg
+    // Tdarr does NOT pass the preset through a shell — it splits the string into an argv array (quote-aware) and hands it to child_process.spawn. That means shell metacharacters
+    // ($ ` ; | etc.) are inert: they reach ffmpeg as literal bytes and become harmless metadata text. The ONLY injection vector is breaking out of the quoted value to inject a new ffmpeg
     // ARGUMENT — which requires a double quote (to close the wrapper) or a control character.
     //
-    // Tdarr's tokenizer strips quotes and has no documented backslash-escape convention, so
-    // backslash-escaping a double quote can't be relied on. Instead we remove the breakout
-    // characters outright: double quotes and backslashes (neither is ever legitimately needed
-    // in a stream title or language tag), plus all control characters. What remains can contain
+    // Tdarr's tokenizer strips quotes and has no documented backslash-escape convention, so backslash-escaping a double quote can't be relied on. Instead we remove the breakout
+    // characters outright: double quotes and backslashes (neither is ever legitimately needed in a stream title or language tag), plus all control characters. What remains can contain
     // spaces and any other printable text safely, because Tdarr keeps the quoted value intact.
     const escMeta = (value) => String(value || '')
         .replace(/[\x00-\x1f\x7f]/g, '')   // strip control characters (newlines, null bytes, etc.)
@@ -267,13 +253,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const parts = title.split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
             if (parts.length === 1) return parts[0];
             // When all parts are the same word (case-insensitive), deduplicate to the first occurrence.
-            // "First part wins" is intentional: it preserves the original casing from the leading segment
-            // (e.g. "Stereo / stereo" → "Stereo", "ENGLISH - English" → "ENGLISH").
+            // "First part wins" is intentional: it preserves the original casing from the leading segment (e.g. "Stereo / stereo" → "Stereo", "ENGLISH - English" → "ENGLISH").
             if (parts.length > 1 && parts.every(p => p.toLowerCase() === parts[0].toLowerCase()))
                 return parts[0];
         }
         return title;
     }    
+
+    // Check if file is a video. If it isn't then exit plugin.
+    if (file.fileMedium !== 'video') {
+        response.infoLog += '☒File is not a video. \n';
+        response.processFile = false;
+        return response;
+    }
+
+    // Check if inputs.container has been configured. If it hasn't then exit plugin. Shouldn't happen. Doesn't hurt to check.
+    if (!inputs.container || inputs.container === '') {
+        response.infoLog += '☒Container has not been configured, please configure required options. \n';
+        response.processFile = false;
+        return response;
+    }
 
     // Set up required variables.
     let extraArguments = '';
