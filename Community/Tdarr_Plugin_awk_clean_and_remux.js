@@ -12,7 +12,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.13.5',
+    Version: '1.13.6',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -357,15 +357,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const bitrate = Number(s.bit_rate || 0);
             const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
             const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
-            const descriptive = disp.visual_impaired === 1 || title.includes('description')
-                || title.includes('descriptive') || title.includes('dvs') || title.includes('narration');
+            const descriptive = disp.visual_impaired === 1 || title.includes('description') || title.includes('descriptive') || title.includes('dvs') || title.includes('narration');
             const role = commentary ? '/commentary' : (descriptive ? '/description' : '');
             return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${role}]`;
         }
         if (type === 'subtitle') {
             const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
-            const sdh = disp.hearing_impaired === 1 || title.includes('sdh')
-                || title.includes('hearing impaired') || title.includes('deaf');
+            const sdh = disp.hearing_impaired === 1 || title.includes('sdh') || title.includes('hearing impaired') || title.includes('deaf');
             const signs = disp.karaoke === 1 || title.includes('signs') || title.includes('songs');
             const role = commentary ? '/commentary' : (sdh ? '/sdh' : (signs ? '/signs' : ''));
             const forced = disp.forced === 1 ? '/forced' : '';
