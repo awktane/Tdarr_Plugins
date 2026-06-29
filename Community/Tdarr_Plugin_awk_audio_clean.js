@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.20.1',
+    Version: '1.20.2',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -424,11 +424,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // are inert and reach ffmpeg as literal metadata bytes. The only injection vector is breaking out of
     // the quoted value to inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper)
     // or a control character. Tdarr's tokenizer strips quotes with no reliable backslash-escape convention,
-    // so rather than escape we remove the breakout characters (double quotes, backslashes) and all control
-    // characters outright. Spaces and any other printable text remain safe inside the kept quoted value.
+    // so we substitute rather than strip: backslash → forward-slash (readable, inert), double-quote →
+    // single-quote (safe inside the quoted value; preserves titles like "Director's Cut" and "AC3/Stereo"),
+    // control characters → space (avoids fusing words that a bare delete would join).
     const escMeta = (value) => String(value || '')
-        .replace(/[\x00-\x1f\x7f]/g, '')   // strip control characters (newlines, null bytes, etc.)
-        .replace(/[\\"]/g, '');            // remove backslashes and double quotes (argument-breakout chars)
+        .replace(/[\x00-\x1f\x7f]/g, ' ')  // control characters (newlines, null bytes, etc.) → space
+        .replace(/\\/g, '/')               // backslash → forward-slash (inert, readable)
+        .replace(/"/g, "'");               // double-quote → single-quote (safe inside the quoted value)
 
     // =====================================================================
     // END SHARED BLOCK
@@ -500,19 +502,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             bps = ac3Presets.find(p => p >= bps) ?? ac3Presets[ac3Presets.length - 1];
         }
         return bps;
-    };
-
-    // Build the full ffmpeg encoder argument string for a transcode to one of our output codecs.
-    // Opus uses true VBR (-vbr on) with -b:a as the target average and max compression_level for quality.
-    // AAC/AC3/EAC3 use CBR via -b:a (AAC VBR is experimental; AC3/EAC3 are CBR-only fixed-preset codecs).
-    // Returns '' for codecs we don't bitrate-manage. srcBps lets the target honour a higher source rate.
-    // Note: this unscoped form is not called directly — all transcode paths use encoderArgsIdx instead.
-    const encoderArgs = (codec, channels, srcBps = 0) => {
-        const bps = resolveBitrate(codec, channels, srcBps);
-        if (bps <= 0) return '';
-        if (codec === 'opus')
-            return ` -vbr on -compression_level 10 -b:a ${bps / 1000}k`;
-        return ` -b:a ${bps / 1000}k`;
     };
 
     // Per-codec audio argument string scoped to a specific output stream index (e.g. -b:a:2 instead of -b:a).
@@ -1175,6 +1164,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Convert file if convert variable is set to true.
     if (convert === true) {
+        // Dispositions (default flag) are intentionally left untouched. ffmpeg copies the source
+        // stream's disposition onto mapped/transcoded outputs, so a downmix_to_stereo track created
+        // from a default-flagged surround source will also carry the default flag — two tracks marked
+        // default. This is acceptable: the tracks are near-identical content at different channel counts,
+        // and most players handle multiple default flags without issue. Removing or reassigning the default
+        // flag is a separate concern outside this plugin's scope.
         response.preset += `,-map 0 -c copy${extraArguments} -max_muxing_queue_size 9999${networkDataOpt}`;
         response.infoLog += workDone;
         response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;
