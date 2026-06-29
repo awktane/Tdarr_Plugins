@@ -12,7 +12,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.13.7',
+    Version: '1.13.8',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -378,11 +378,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // are inert and reach ffmpeg as literal metadata bytes. The only injection vector is breaking out of
     // the quoted value to inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper)
     // or a control character. Tdarr's tokenizer strips quotes with no reliable backslash-escape convention,
-    // so rather than escape we remove the breakout characters (double quotes, backslashes) and all control
-    // characters outright. Spaces and any other printable text remain safe inside the kept quoted value.
+    // so we substitute rather than strip: backslash → forward-slash (readable, inert), double-quote →
+    // single-quote (safe inside the quoted value; preserves titles like "Director's Cut" and "AC3/Stereo"),
+    // control characters → space (avoids fusing words that a bare delete would join).
     const escMeta = (value) => String(value || '')
-        .replace(/[\x00-\x1f\x7f]/g, '')   // strip control characters (newlines, null bytes, etc.)
-        .replace(/[\\"]/g, '');            // remove backslashes and double quotes (argument-breakout chars)
+        .replace(/[\x00-\x1f\x7f]/g, ' ')  // control characters (newlines, null bytes, etc.) → space
+        .replace(/\\/g, '/')               // backslash → forward-slash (inert, readable)
+        .replace(/"/g, "'");               // double-quote → single-quote (safe inside the quoted value)
 
     // =====================================================================
     // END SHARED BLOCK
@@ -415,7 +417,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     let videoStreamIndex = -1;
 
     // Predicted-output tracking for the closing summary line (does not affect the ffmpeg preset).
-    // removedIndices: input stream positions dropped via -map -0:i.
+    // removedIndices: input stream positions dropped via -map -0:ffstream.index.
     // subCodecOverride: input stream position -> converted subtitle codec ('srt' / 'mov_text').
     const removedIndices = new Set();
     const subCodecOverride = new Map();
@@ -486,8 +488,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 if(delStream === true) {
                     //Deleting the stream so including metadataCommand will cause problems
-                    extraArguments += ` -map -0:${i}`;
-                    removedIndices.add(i);
+                    extraArguments += ` -map -0:${ffstream.index}`;
+                    removedIndices.add(ffstream.index);
                     convert = true;
                     subtitleDropped++;
                     subtitleStreamIndex--;
@@ -528,7 +530,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if((dstContainer === 'mkv') && ffstreamCodec === 'mov_text') {
                     workDone += `☐Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} subtitle to srt\n`;
                     extraArguments += metadataCommand+` -c:s:${subtitleStreamIndex} srt`;
-                    subCodecOverride.set(i, 'srt');
+                    subCodecOverride.set(ffstream.index, 'srt');
                     convert = true;
                     continue;
                 }
@@ -539,7 +541,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if((dstContainer === 'mp4') && ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'text'].includes(ffstreamCodec)) {
                     workDone += `☐Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} subtitle to mov_text\n`;
                     extraArguments += metadataCommand+` -c:s:${subtitleStreamIndex} mov_text`;
-                    subCodecOverride.set(i, 'mov_text');
+                    subCodecOverride.set(ffstream.index, 'mov_text');
                     convert = true;
                     continue;
                 }
@@ -567,8 +569,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
 
                 if(delStream === true) {
-                    extraArguments += ` -map -0:${i}`;
-                    removedIndices.add(i);
+                    extraArguments += ` -map -0:${ffstream.index}`;
+                    removedIndices.add(ffstream.index);
                     convert = true;
                     audioDropped++;
                     audioStreamIndex--;
@@ -643,8 +645,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 if (['mjpeg', 'png', 'gif', 'bmp'].includes(ffstreamCodec)) {
                     workDone += `☐Remove stream ${i} - image stream (${ffstreamType}-${ffstreamCodec})\n`;
-                    extraArguments += ` -map -0:${i}`;
-                    removedIndices.add(i);
+                    extraArguments += ` -map -0:${ffstream.index}`;
+                    removedIndices.add(ffstream.index);
                     convert = true;
                     videoDropped++;
                     videoStreamIndex--;
@@ -679,14 +681,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const kind = attachmentKind(ffstream);
                 if (kind === 'image') {
                     workDone += `☐Remove stream ${i} - cover-art attachment (${ffstreamType}-${ffstreamCodec})\n`;
-                    extraArguments += ` -map -0:${i}`;
-                    removedIndices.add(i);
+                    extraArguments += ` -map -0:${ffstream.index}`;
+                    removedIndices.add(ffstream.index);
                     convert = true;
                     continue;
                 }
                 if (kind === 'font') {
                     // Defer: keep or drop is decided after the loop based on whether a styled subtitle survives.
-                    deferredFontIndices.push(i);
+                    deferredFontIndices.push(ffstream.index);
                     continue;
                 }
                 // 'other' - unidentifiable attachment, leave it untouched (see attachmentKind).
@@ -714,9 +716,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // gates this to mkv. The source codec is read from ffProbeData (it is still 'ass'/'ssa' there even
     // when converted), which is why the mkv gate — not just the survivor check — is required.
     if (deferredFontIndices.length > 0) {
-        const fontsNeeded = dstContainer === 'mkv' && file.ffProbeData.streams.some((s, idx) =>
+        const fontsNeeded = dstContainer === 'mkv' && file.ffProbeData.streams.some(s =>
             (s.codec_type || '').toLowerCase() === 'subtitle'
-            && !removedIndices.has(idx)
+            && !removedIndices.has(s.index)
             && ['ass', 'ssa'].includes((s.codec_name || '').toLowerCase()));
 
         if (!fontsNeeded) {
@@ -784,7 +786,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.preset += `${fflags},-map 0 -c copy${extraArguments} -max_muxing_queue_size 9999${networkDataOpt}`;
         response.infoLog += workDone;
         const outSummary = file.ffProbeData.streams
-            .map((s, idx) => ({ s: { ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate }, idx }))
+            .map(s => ({ s: { ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate }, idx: s.index }))
             .filter(({ idx }) => !removedIndices.has(idx))
             .map(({ s, idx }) => (subCodecOverride.has(idx) ? { ...s, codec_name: subCodecOverride.get(idx) } : s))
             .map(summariseStream).join('');
