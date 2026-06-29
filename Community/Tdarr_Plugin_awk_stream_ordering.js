@@ -322,11 +322,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // are inert and reach ffmpeg as literal metadata bytes. The only injection vector is breaking out of
     // the quoted value to inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper)
     // or a control character. Tdarr's tokenizer strips quotes with no reliable backslash-escape convention,
-    // so rather than escape we remove the breakout characters (double quotes, backslashes) and all control
-    // characters outright. Spaces and any other printable text remain safe inside the kept quoted value.
+    // so we substitute rather than strip: backslash → forward-slash (readable, inert), double-quote →
+    // single-quote (safe inside the quoted value; preserves titles like "Director's Cut" and "AC3/Stereo"),
+    // control characters → space (avoids fusing words that a bare delete would join).
     const escMeta = (value) => String(value || '')
-        .replace(/[\x00-\x1f\x7f]/g, '')   // strip control characters (newlines, null bytes, etc.)
-        .replace(/[\\"]/g, '');            // remove backslashes and double quotes (argument-breakout chars)
+        .replace(/[\x00-\x1f\x7f]/g, ' ')  // control characters (newlines, null bytes, etc.) → space
+        .replace(/\\/g, '/')               // backslash → forward-slash (inert, readable)
+        .replace(/"/g, "'");               // double-quote → single-quote (safe inside the quoted value)
 
     // =====================================================================
     // END SHARED BLOCK
@@ -377,7 +379,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const streamType = (ffstream.codec_type || '').trim().toLowerCase();
 
         streams.push({
-            index: i,
+            index: ffstream.index,
             stream: enrichedStream,
             type: streamType,
             title: streamTitle,
@@ -390,11 +392,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             audioquality: streamType === 'audio' ? audioQuality(enrichedStream) : 0,
             default: ffstream?.disposition?.default === 1,
 
-            // Role classification via the shared classifiers (disposition flag first, then title keywords).
-            commentary:  isCommentary(ffstream),
-            descriptive: isDescriptive(ffstream),
-            sdh:         isSdh(ffstream),
-            signs:       isSigns(ffstream),
+            // simple classification (no helper functions)
+            commentary: ffstream?.disposition?.comment === 1 ||
+                        streamTitle.includes('commentary') ||
+                        streamTitle.includes('producer'),
+
+            descriptive:  ffstream?.disposition?.visual_impaired === 1 ||
+                          streamTitle.includes('description') ||
+                          streamTitle.includes('descriptive') ||
+                          streamTitle.includes('dvs') ||
+                          streamTitle.includes('narration'),
+
+            sdh: ffstream?.disposition?.hearing_impaired === 1 ||
+                 streamTitle.includes('sdh') ||
+                 streamTitle.includes('hearing impaired') ||
+                 streamTitle.includes('deaf'),
+
+            signs: ffstream?.disposition?.karaoke === 1 ||
+                   streamTitle.includes('signs') ||
+                   streamTitle.includes('songs'),
 
             mjpeg: (ffstream.codec_name || '').trim().toLowerCase() === 'mjpeg',
         });
