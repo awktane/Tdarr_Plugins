@@ -200,6 +200,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         infoLog: '',
     };
 
+    // =====================================================================
+    // SHARED BLOCK — keep byte-for-byte identical across all awk plugins
+    // that use audio quality scoring. Functions: codecInfo, codecAliases,
+    // unknownCodecs, audioQuality, resolveStreamBitrate, summariseStream.
+    // clean_and_remux carries only resolveStreamBitrate + summariseStream.
+    // =====================================================================
+
     //Codecs and some values to help us score the quality so that we can pick the best track - some of these formats are not supported by ffmpeg yet (ac4)
     const codecInfo = {
         // Lossless
@@ -249,95 +256,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['atrac',  'atrac'],
     ];
     const unknownCodecs = new Set();
-
-    // AC3/EAC3 valid CBR presets in bps (ffmpeg rounds to these internally; we snap explicitly
-    // so the logged/targeted rate matches what ffmpeg actually produces).
-    const ac3Presets = [32000, 40000, 48000, 56000, 64000, 80000, 96000, 112000, 128000,
-                        160000, 192000, 224000, 256000, 320000, 384000, 448000, 512000, 576000, 640000];
-
-    // Per-channel-count target bitrate (bps) for our four encodable output codecs. These sit at or
-    // comfortably above the transparent threshold from the codecInfo scoring table (scaled by channel
-    // count), and serve as the FLOOR for a transcode — the actual target is max(thisTable, source).
-    //
-    // AC3 / EAC3 — CBR fixed-preset. Targets: mono 192k, stereo 224k, 3ch 320k, 4ch 384k, 5ch 448k, 6ch 640k.
-    //              (640k is the Blu-ray 5.1 standard and the AC3/EAC3 codec ceiling.)
-    // AAC — CBR (native AAC VBR is experimental in ffmpeg). mono 128k, stereo 256k, 3ch 320k, 4ch 384k,
-    //              5ch 448k, 6ch 512k, 7ch 576k, 8ch 640k.
-    // Opus — true VBR (-vbr on), -b:a is the target average. More efficient than AAC so targets are lower:
-    //              mono 128k, stereo 192k, 3ch 256k, 4ch 320k, 5ch 320k, 6ch 384k, 7ch 448k, 8ch 448k.
-    const targetTable = (codec, channels) => {
-        const ch = Math.max(1, Number(channels) || 1);
-        if (codec === 'aac') {
-            const t = { 1: 128000, 2: 256000, 3: 320000, 4: 384000, 5: 448000, 6: 512000, 7: 576000, 8: 640000 };
-            return t[Math.min(ch, 8)] ?? 640000;
-        }
-        if (codec === 'opus') {
-            const t = { 1: 128000, 2: 192000, 3: 256000, 4: 320000, 5: 320000, 6: 384000, 7: 448000, 8: 448000 };
-            return t[Math.min(ch, 8)] ?? 448000;
-        }
-        if (codec === 'ac3' || codec === 'eac3') {
-            const t = { 1: 192000, 2: 224000, 3: 320000, 4: 384000, 5: 448000, 6: 640000 };
-            return t[Math.min(ch, 6)] ?? 640000;
-        }
-        return 0;
-    };
-
-    // Per-codec ceiling (bps) so a lossless or very-high-bitrate source (e.g. TrueHD ~4 Mbps) can't drag
-    // the transcode target absurdly high. AC3/EAC3 cap at their hard 640k limit. AAC/Opus cap generously
-    // per channel — well above transparent for any real content, but bounded.
-    const codecCeiling = (codec, channels) => {
-        const ch = Math.max(1, Number(channels) || 1);
-        // AC3/EAC3 cap at their hard 640k codec limit. AAC and Opus scale per channel. These only ever
-        // apply to tracks at or below each codec's channel maximum (the force/downmix paths block higher
-        // counts before encoding), but the per-channel form stays correct regardless of channel count.
-        // Opus's ceiling (128k/ch) is deliberately half of ffmpeg's hard libopus limit (256k/ch), so a
-        // resolved Opus target can never be rejected by the encoder. AAC 160k/ch is generous but bounded.
-        if (codec === 'ac3' || codec === 'eac3') return 640000;
-        if (codec === 'aac')  return ch * 160000;   // 160k/ch (stereo 320k, 5.1 960k, 7.1 1.28M)
-        if (codec === 'opus') return ch * 128000;   // 128k/ch — half of libopus's 256k/ch hard maximum
-        return 0;
-    };
-
-    // Resolve the final target bitrate (bps) for a transcode: floor at the per-channel table target, raise
-    // to the source bitrate when the source is known and higher (never throw away quality we can cheaply
-    // keep), then clamp to the codec ceiling. For AC3/EAC3 the result is snapped UP to the nearest valid
-    // preset so the requested rate is one ffmpeg actually honours.
-    const resolveBitrate = (codec, channels, srcBps = 0) => {
-        let bps = targetTable(codec, channels);
-        if (bps <= 0) return 0;
-        const src = Number(srcBps) || 0;
-        if (src > bps) bps = src;
-        bps = Math.min(bps, codecCeiling(codec, channels));
-        if (codec === 'ac3' || codec === 'eac3') {
-            // snap up to nearest valid preset >= bps (fall back to highest preset if above all)
-            bps = ac3Presets.find(p => p >= bps) ?? ac3Presets[ac3Presets.length - 1];
-        }
-        return bps;
-    };
-
-    // Build the full ffmpeg encoder argument string for a transcode to one of our output codecs.
-    // Opus uses true VBR (-vbr on) with -b:a as the target average and max compression_level for quality.
-    // AAC/AC3/EAC3 use CBR via -b:a (AAC VBR is experimental; AC3/EAC3 are CBR-only fixed-preset codecs).
-    // Returns '' for codecs we don't bitrate-manage. srcBps lets the target honour a higher source rate.
-    // Note: this unscoped form is not called directly — all transcode paths use encoderArgsIdx instead.
-    const encoderArgs = (codec, channels, srcBps = 0) => {
-        const bps = resolveBitrate(codec, channels, srcBps);
-        if (bps <= 0) return '';
-        if (codec === 'opus')
-            return ` -vbr on -compression_level 10 -b:a ${bps / 1000}k`;
-        return ` -b:a ${bps / 1000}k`;
-    };
-
-    // Per-codec audio argument string scoped to a specific output stream index (e.g. -b:a:2 instead of -b:a).
-    // ffmpeg accepts the stream-qualified forms; we use them so each track gets its own settings when a
-    // single command touches several. Mirrors encoderArgs but with :idx suffixes.
-    const encoderArgsIdx = (codec, channels, idx, srcBps = 0) => {
-        const bps = resolveBitrate(codec, channels, srcBps);
-        if (bps <= 0) return '';
-        if (codec === 'opus')
-            return ` -vbr:a:${idx} on -compression_level:a:${idx} 10 -b:a:${idx} ${bps / 1000}k`;
-        return ` -b:a:${idx} ${bps / 1000}k`;
-    };
 
     // Audio quality scoring — must be declared after response so infoLog is available
     const audioQuality = (stream) => {
@@ -481,6 +399,99 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (type === 'data')
             return `[data:${codec}]`;
         return `[${type || 'unknown'}:${codec}]`;
+    };
+
+    // =====================================================================
+    // END SHARED BLOCK
+    // =====================================================================
+
+    // AC3/EAC3 valid CBR presets in bps (ffmpeg rounds to these internally; we snap explicitly
+    // so the logged/targeted rate matches what ffmpeg actually produces).
+    const ac3Presets = [32000, 40000, 48000, 56000, 64000, 80000, 96000, 112000, 128000,
+                        160000, 192000, 224000, 256000, 320000, 384000, 448000, 512000, 576000, 640000];
+
+    // Per-channel-count target bitrate (bps) for our four encodable output codecs. These sit at or
+    // comfortably above the transparent threshold from the codecInfo scoring table (scaled by channel
+    // count), and serve as the FLOOR for a transcode — the actual target is max(thisTable, source).
+    //
+    // AC3 / EAC3 — CBR fixed-preset. Targets: mono 192k, stereo 224k, 3ch 320k, 4ch 384k, 5ch 448k, 6ch 640k.
+    //              (640k is the Blu-ray 5.1 standard and the AC3/EAC3 codec ceiling.)
+    // AAC — CBR (native AAC VBR is experimental in ffmpeg). mono 128k, stereo 256k, 3ch 320k, 4ch 384k,
+    //              5ch 448k, 6ch 512k, 7ch 576k, 8ch 640k.
+    // Opus — true VBR (-vbr on), -b:a is the target average. More efficient than AAC so targets are lower:
+    //              mono 128k, stereo 192k, 3ch 256k, 4ch 320k, 5ch 320k, 6ch 384k, 7ch 448k, 8ch 448k.
+    const targetTable = (codec, channels) => {
+        const ch = Math.max(1, Number(channels) || 1);
+        if (codec === 'aac') {
+            const t = { 1: 128000, 2: 256000, 3: 320000, 4: 384000, 5: 448000, 6: 512000, 7: 576000, 8: 640000 };
+            return t[Math.min(ch, 8)] ?? 640000;
+        }
+        if (codec === 'opus') {
+            const t = { 1: 128000, 2: 192000, 3: 256000, 4: 320000, 5: 320000, 6: 384000, 7: 448000, 8: 448000 };
+            return t[Math.min(ch, 8)] ?? 448000;
+        }
+        if (codec === 'ac3' || codec === 'eac3') {
+            const t = { 1: 192000, 2: 224000, 3: 320000, 4: 384000, 5: 448000, 6: 640000 };
+            return t[Math.min(ch, 6)] ?? 640000;
+        }
+        return 0;
+    };
+
+    // Per-codec ceiling (bps) so a lossless or very-high-bitrate source (e.g. TrueHD ~4 Mbps) can't drag
+    // the transcode target absurdly high. AC3/EAC3 cap at their hard 640k limit. AAC/Opus cap generously
+    // per channel — well above transparent for any real content, but bounded.
+    const codecCeiling = (codec, channels) => {
+        const ch = Math.max(1, Number(channels) || 1);
+        // AC3/EAC3 cap at their hard 640k codec limit. AAC and Opus scale per channel. These only ever
+        // apply to tracks at or below each codec's channel maximum (the force/downmix paths block higher
+        // counts before encoding), but the per-channel form stays correct regardless of channel count.
+        // Opus's ceiling (128k/ch) is deliberately half of ffmpeg's hard libopus limit (256k/ch), so a
+        // resolved Opus target can never be rejected by the encoder. AAC 160k/ch is generous but bounded.
+        if (codec === 'ac3' || codec === 'eac3') return 640000;
+        if (codec === 'aac')  return ch * 160000;   // 160k/ch (stereo 320k, 5.1 960k, 7.1 1.28M)
+        if (codec === 'opus') return ch * 128000;   // 128k/ch — half of libopus's 256k/ch hard maximum
+        return 0;
+    };
+
+    // Resolve the final target bitrate (bps) for a transcode: floor at the per-channel table target, raise
+    // to the source bitrate when the source is known and higher (never throw away quality we can cheaply
+    // keep), then clamp to the codec ceiling. For AC3/EAC3 the result is snapped UP to the nearest valid
+    // preset so the requested rate is one ffmpeg actually honours.
+    const resolveBitrate = (codec, channels, srcBps = 0) => {
+        let bps = targetTable(codec, channels);
+        if (bps <= 0) return 0;
+        const src = Number(srcBps) || 0;
+        if (src > bps) bps = src;
+        bps = Math.min(bps, codecCeiling(codec, channels));
+        if (codec === 'ac3' || codec === 'eac3') {
+            // snap up to nearest valid preset >= bps (fall back to highest preset if above all)
+            bps = ac3Presets.find(p => p >= bps) ?? ac3Presets[ac3Presets.length - 1];
+        }
+        return bps;
+    };
+
+    // Build the full ffmpeg encoder argument string for a transcode to one of our output codecs.
+    // Opus uses true VBR (-vbr on) with -b:a as the target average and max compression_level for quality.
+    // AAC/AC3/EAC3 use CBR via -b:a (AAC VBR is experimental; AC3/EAC3 are CBR-only fixed-preset codecs).
+    // Returns '' for codecs we don't bitrate-manage. srcBps lets the target honour a higher source rate.
+    // Note: this unscoped form is not called directly — all transcode paths use encoderArgsIdx instead.
+    const encoderArgs = (codec, channels, srcBps = 0) => {
+        const bps = resolveBitrate(codec, channels, srcBps);
+        if (bps <= 0) return '';
+        if (codec === 'opus')
+            return ` -vbr on -compression_level 10 -b:a ${bps / 1000}k`;
+        return ` -b:a ${bps / 1000}k`;
+    };
+
+    // Per-codec audio argument string scoped to a specific output stream index (e.g. -b:a:2 instead of -b:a).
+    // ffmpeg accepts the stream-qualified forms; we use them so each track gets its own settings when a
+    // single command touches several. Mirrors encoderArgs but with :idx suffixes.
+    const encoderArgsIdx = (codec, channels, idx, srcBps = 0) => {
+        const bps = resolveBitrate(codec, channels, srcBps);
+        if (bps <= 0) return '';
+        if (codec === 'opus')
+            return ` -vbr:a:${idx} on -compression_level:a:${idx} 10 -b:a:${idx} ${bps / 1000}k`;
+        return ` -b:a:${idx} ${bps / 1000}k`;
     };
 
     //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
