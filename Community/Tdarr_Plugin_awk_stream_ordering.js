@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/signs/sdh/commentary) -> Attachments -> Data\n`,
-    Version: '1.9.0',
+    Version: '1.9.1',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -99,6 +99,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         container: `.${file.container}`,
         infoLog: '',
     };
+
+    // =====================================================================
+    // SHARED BLOCK — keep byte-for-byte identical across all awk plugins
+    // that use audio quality scoring. Functions: codecInfo, codecAliases,
+    // unknownCodecs, audioQuality, resolveStreamBitrate, summariseStream.
+    // clean_and_remux carries only resolveStreamBitrate + summariseStream.
+    // =====================================================================
 
     //Codecs and some values to help us score the quality so that we can pick the best track - some of these formats are not supported by ffmpeg yet (ac4)
     const codecInfo = {
@@ -293,6 +300,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return `[data:${codec}]`;
         return `[${type || 'unknown'}:${codec}]`;
     };
+
+    // =====================================================================
+    // END SHARED BLOCK
+    // =====================================================================
 
     if(!['descending', 'ascending'].includes(inputs.channel_order)) {
         response.infoLog += '☒channel_order has not been configured, please configure required options.\n';
