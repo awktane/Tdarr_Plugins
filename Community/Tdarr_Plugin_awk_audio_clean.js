@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.17.1',
+    Version: '1.17.2',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -287,9 +287,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // per channel — well above transparent for any real content, but bounded.
     const codecCeiling = (codec, channels) => {
         const ch = Math.max(1, Number(channels) || 1);
+        // AC3/EAC3 cap at their hard 640k codec limit. AAC and Opus scale per channel. These only ever
+        // apply to tracks at or below each codec's channel maximum (the force/downmix paths block higher
+        // counts before encoding), but the per-channel form stays correct regardless of channel count.
+        // Opus's ceiling (128k/ch) is deliberately half of ffmpeg's hard libopus limit (256k/ch), so a
+        // resolved Opus target can never be rejected by the encoder. AAC 160k/ch is generous but bounded.
         if (codec === 'ac3' || codec === 'eac3') return 640000;
-        if (codec === 'aac')  return Math.min(ch, 8) * 160000;   // ~160k/ch ceiling (stereo 320k, 5.1 960k, 7.1 1.28M)
-        if (codec === 'opus') return Math.min(ch, 8) * 128000;   // opus is efficient; 128k/ch is already very high
+        if (codec === 'aac')  return ch * 160000;   // 160k/ch (stereo 320k, 5.1 960k, 7.1 1.28M)
+        if (codec === 'opus') return ch * 128000;   // 128k/ch — half of libopus's 256k/ch hard maximum
         return 0;
     };
 
