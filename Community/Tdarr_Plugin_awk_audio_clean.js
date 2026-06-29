@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.19.0',
+    Version: '1.19.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -280,7 +280,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const profile       = (stream.profile || '').toLowerCase().trim();
         const commercial    = ((file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === stream.index)?.Format_Commercial_IfAny || '').toLowerCase();
         if (codec === 'dts') {
-            if      (longName.includes('master')         || profile.includes('hd ma')  || commercial.includes('master'))
+            if      (longName.includes('master')          || profile.includes('hd ma')  || commercial.includes('master'))
                 codec = 'dtsma';
             else if (longName.includes('high resolution') || profile.includes('hra')    || commercial.includes('high resolution'))
                 codec = 'dtshr';
@@ -380,15 +380,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const bitrate = Number(s.bit_rate || 0);
             const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
             const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
-            const descriptive = disp.visual_impaired === 1 || title.includes('description')
-                || title.includes('descriptive') || title.includes('dvs') || title.includes('narration');
+            const descriptive = disp.visual_impaired === 1 || title.includes('description') || title.includes('descriptive') || title.includes('dvs') || title.includes('narration');
             const role = commentary ? '/commentary' : (descriptive ? '/description' : '');
             return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${role}]`;
         }
         if (type === 'subtitle') {
             const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
-            const sdh = disp.hearing_impaired === 1 || title.includes('sdh')
-                || title.includes('hearing impaired') || title.includes('deaf');
+            const sdh = disp.hearing_impaired === 1 || title.includes('sdh') || title.includes('hearing impaired') || title.includes('deaf');
             const signs = disp.karaoke === 1 || title.includes('signs') || title.includes('songs');
             const role = commentary ? '/commentary' : (sdh ? '/sdh' : (signs ? '/signs' : ''));
             const forced = disp.forced === 1 ? '/forced' : '';
