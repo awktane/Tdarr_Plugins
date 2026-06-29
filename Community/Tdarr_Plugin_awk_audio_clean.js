@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.18.5',
+    Version: '1.18.6',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -425,6 +425,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return info.score - penalty;
     }
 
+    // Resolve the best available bitrate (bps) for a stream: ffprobe first, mediaInfo fallback.
+    // ffprobe cannot read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA
+    // in MP4/M4V), but mediaInfo decodes the substream headers and usually has it. Returns 0 if neither
+    // source has a value. Used to enrich stream objects before summariseStream or audioQuality sees them.
+    const resolveStreamBitrate = (ffstream) => {
+        const ffBitrate = Number(ffstream.bit_rate || 0);
+        if (ffBitrate > 0) return ffBitrate;
+        const ffmedia = (file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === ffstream.index);
+        return Number(ffmedia?.BitRate || 0);
+    };
+
     // Build a single bracket token summarising one ffprobe stream for the input/output summary lines.
     // Shared verbatim across all three awk plugins — keep byte-for-byte identical when editing.
     // Shows: video codec; audio lang/channels/codec/bitrate(+role); subtitle lang/codec(+forced/role);
@@ -533,7 +544,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     let convert = false;
 
     // Input summary — the streams exactly as they arrived, before any audio work.
-    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(summariseStream).join('')}\n`;
+    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream({ ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate })).join('')}\n`;
 
     //We really only care about the audio streams
     let audioStreams = file.ffProbeData.streams.filter(stream => (stream?.codec_type ?? '').trim().toLowerCase() === 'audio');
@@ -569,13 +580,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //Add secondary track flag and the cleaned language to each track
     audioStreams = audioStreams.map(item => {
         const cleanLang = String((item.tags?.language || 'und').trim().toLowerCase().replace(/[-_.].*$/, ''));
-        return {...item,
+        // Enrich with mediaInfo bitrate before audioQuality scoring so that formats like DTS-HD MA
+        // (which ffprobe can't read a bitrate for in MP4/M4V containers) score and display correctly.
+        const enrichedItem = { ...item, bit_rate: resolveStreamBitrate(item) || item.bit_rate };
+        return { ...enrichedItem,
             isTdarrSecondaryTrack: isSecondaryTrack(item),
             // Language-secondary: track language is not in downmixLanguage (when the list is non-empty).
             // These tracks follow the secondary path (downmix_secondary_stereo, force_codec) but are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo).
             isTdarrLangSecondary: downmixLanguage.length > 0 && !downmixLanguage.includes(cleanLang),
             isTdarrCleanLang: cleanLang,
-            isTdarrQuality: audioQuality(item)
+            isTdarrQuality: audioQuality(enrichedItem)
         };
     });
 
