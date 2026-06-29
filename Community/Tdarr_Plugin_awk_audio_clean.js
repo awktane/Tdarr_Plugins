@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.18.2',
+    Version: '1.18.3',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -424,6 +424,48 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return info.score - penalty;
     }
 
+    // Build a single bracket token summarising one ffprobe stream for the input/output summary lines.
+    // Shared verbatim across all three awk plugins — keep byte-for-byte identical when editing.
+    // Shows: video codec; audio lang/channels/codec/bitrate(+role); subtitle lang/codec(+forced/role);
+    // data and attachment codec. Role/forced detection mirrors the sorting logic (disposition flags
+    // first, then title keywords) so every plugin's summary lines up. subrip is shown as srt to match
+    // the friendlier name used when this pipeline converts subtitles.
+    const summariseStream = (s) => {
+        const type = (s.codec_type || '').trim().toLowerCase();
+        let codec = (s.codec_name || 'unknown').trim().toLowerCase();
+        if (codec === 'subrip') codec = 'srt';
+        const title = (s.tags?.title || '').trim().toLowerCase();
+        const disp = s.disposition || {};
+        const langRaw = (s.tags?.language || 'und').trim().toLowerCase();
+        const lang = langRaw !== 'und' ? langRaw : '';
+        if (type === 'video')
+            return `[video:${codec}]`;
+        if (type === 'audio') {
+            const ch = s.channels ? `${s.channels}ch` : '';
+            const bitrate = Number(s.bit_rate || 0);
+            const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
+            const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
+            const descriptive = disp.visual_impaired === 1 || title.includes('description')
+                || title.includes('descriptive') || title.includes('dvs') || title.includes('narration');
+            const role = commentary ? '/commentary' : (descriptive ? '/description' : '');
+            return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${role}]`;
+        }
+        if (type === 'subtitle') {
+            const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
+            const sdh = disp.hearing_impaired === 1 || title.includes('sdh')
+                || title.includes('hearing impaired') || title.includes('deaf');
+            const signs = disp.karaoke === 1 || title.includes('signs') || title.includes('songs');
+            const role = commentary ? '/commentary' : (sdh ? '/sdh' : (signs ? '/signs' : ''));
+            const forced = disp.forced === 1 ? '/forced' : '';
+            return `[sub:${[lang, codec].filter(Boolean).join(' ')}${forced}${role}]`;
+        }
+        if (type === 'attachment')
+            return `[attach:${codec}]`;
+        if (type === 'data')
+            return `[data:${codec}]`;
+        return `[${type || 'unknown'}:${codec}]`;
+    };
+
     //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
     const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
     
@@ -502,6 +544,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.processFile = false;
         return response;
     }
+
+    // Input summary — the streams exactly as they arrived, before any audio work.
+    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(summariseStream).join('')}\n`;
 
     const isSecondaryTrack = (stream) => {
         const title = String(stream.tags?.title || '').toLowerCase();
@@ -598,7 +643,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const kept = seen.get(key);
                 const rmRate = Number(s.bit_rate || 0) > 0 ? ` @ ${Math.round(Number(s.bit_rate) / 1000)} kb/s` : '';
                 const keptRate = Number(kept.bit_rate || 0) > 0 ? ` @ ${Math.round(Number(kept.bit_rate) / 1000)} kb/s` : '';
-                workDone += `☒Stream ${s.index}: Removing duplicate (lower quality ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang}${rmRate}) - keeping stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate})\n`;
+                workDone += `☐Stream ${s.index}: Removing duplicate (lower quality ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang}${rmRate}) - keeping stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate})\n`;
             } else
                 seen.set(key, s);
         }
@@ -685,6 +730,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Tracks which input audio indices have already received a -c:a:N assignment so we don't emit conflicting codec directives for the same stream.
     const modifiedAudioIdx = new Set();
+
+    // Predicted-output tracking for the closing summary line (does not affect the ffmpeg preset).
+    // outputAudioOverride: outputAudioIdx -> {codec, channels, bps} for in-place transcodes/downmixes.
+    // appendedAudio: streams added via -map 0:a:N (downmix 'true'/add), appended after all originals.
+    const outputAudioOverride = new Map();
+    const appendedAudio = [];
 
     // Build the title for a new or replaced track. The original track title is always preserved and the new channel count is appended with -> (e.g. a source titled
     // "E-AC-3 Atmos 5.1" downmixed to stereo becomes "E-AC-3 Atmos 5.1 -> 2.0"). This keeps role words like "Commentary"/"Director's Commentary" visible after a downmix. When the
@@ -849,10 +900,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // Downmix changes channel count, so the source bitrate isn't a comparable floor — use the table target for 2ch only.
                 const dstBitArg = encoderArgsIdx(stereoCodec, 2, outputAudioIdx);
                 const dstBitStr = resolveBitrate(stereoCodec, 2);
-                workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${stereoCodec} stereo @ ${dstBitStr / 1000} kb/s (secondary)\n`;
+                workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${stereoCodec} stereo @ ${dstBitStr / 1000} kb/s (secondary)\n`;
                 extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${dstBitArg}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                 if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
                 modifiedAudioIdx.add(outputAudioIdx);
+                outputAudioOverride.set(outputAudioIdx, { codec: stereoCodec, channels: 2, bps: dstBitStr });
                 convert = true;
             }
             } else {
@@ -866,19 +918,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (sixMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
                     const dstBitArg = encoderArgsIdx(surroundCodec, 6, outputAudioIdx);
                     const dstBitStr = resolveBitrate(surroundCodec, 6);
-                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s\n`;
+                    workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${surroundCodec}${dstBitArg} -ac:a:${outputAudioIdx} 6 -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
+                    outputAudioOverride.set(outputAudioIdx, { codec: surroundCodec, channels: 6, bps: dstBitStr });
                     created6chLangs.add(ffstreamLangKey);
                     convert = true;
                 } else if (sixMode === 'true') {
                     const dstBitArg = encoderArgsIdx(surroundCodec, 6, newStreamOutputIdx);
                     const dstBitStr = resolveBitrate(surroundCodec, 6);
-                    workDone += `☒Stream ${ffstream.index}: Adding ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
+                    workDone += `☐Stream ${ffstream.index}: Adding ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
                     extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${surroundCodec}${dstBitArg} -ac:a:${newStreamOutputIdx} 6 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escTitle(streamLang)}"`;
                     newStreamOutputIdx++;
+                    appendedAudio.push({ srcStream: ffstream, codec: surroundCodec, channels: 6, bps: dstBitStr });
                     created6chLangs.add(ffstreamLangKey);
                     convert = true;
                 }
@@ -896,19 +950,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (twoMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
                     const dstBitArg = encoderArgsIdx(stereoCodec, 2, outputAudioIdx);
                     const dstBitStr = resolveBitrate(stereoCodec, 2);
-                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${stereoCodec} stereo @ ${dstBitStr / 1000} kb/s\n`;
+                    workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${stereoCodec} stereo @ ${dstBitStr / 1000} kb/s\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${dstBitArg}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
+                    outputAudioOverride.set(outputAudioIdx, { codec: stereoCodec, channels: 2, bps: dstBitStr });
                     created2chLangs.add(ffstreamLangKey);
                     convert = true;
                 } else if (twoMode === 'true' || (twoMode === 'replace' && modifiedAudioIdx.has(outputAudioIdx))) {
                     const dstBitArg = encoderArgsIdx(stereoCodec, 2, newStreamOutputIdx);
                     const dstBitStr = resolveBitrate(stereoCodec, 2);
-                    workDone += `☒Stream ${ffstream.index}: Adding ${stereoCodec} stereo @ ${dstBitStr / 1000} kb/s from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
+                    workDone += `☐Stream ${ffstream.index}: Adding ${stereoCodec} stereo @ ${dstBitStr / 1000} kb/s from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
                     extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec}${dstBitArg}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escTitle(streamLang)}"`;
                     newStreamOutputIdx++;
+                    appendedAudio.push({ srcStream: ffstream, codec: stereoCodec, channels: 2, bps: dstBitStr });
                     created2chLangs.add(ffstreamLangKey);
                     convert = true;
                 }
@@ -938,9 +994,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         // high-bitrate source isn't needlessly degraded (capped at the codec ceiling inside resolveBitrate).
                         const dstBitArg = encoderArgsIdx(targetCodec, ffstream.channels, outputAudioIdx, srcBitrate);
                         const dstBitStr = resolveBitrate(targetCodec, ffstream.channels, srcBitrate);
-                        workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${targetCodec} ${ffstream.channels}ch @ ${dstBitStr / 1000} kb/s\n`;
+                        workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${targetCodec} ${ffstream.channels}ch @ ${dstBitStr / 1000} kb/s\n`;
                         extraArguments += ` -c:a:${outputAudioIdx} ${targetCodec}${dstBitArg}`;
                         modifiedAudioIdx.add(outputAudioIdx);
+                        outputAudioOverride.set(outputAudioIdx, { codec: targetCodec, channels: ffstream.channels, bps: dstBitStr });
                         convert = true;
                     }
                 }
@@ -953,10 +1010,31 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
 
 
+    // Build the predicted output stream summary for the closing log line. Audio streams keep their
+    // original codec unless an in-place override was recorded; removed duplicates are dropped; newly
+    // created downmix tracks are appended (matching ffmpeg's -map 0 then -map 0:a:N ordering).
+    const buildOutputSummary = () => {
+        const tokens = [];
+        for (const s of file.ffProbeData.streams) {
+            if ((s?.codec_type || '').trim().toLowerCase() === 'audio') {
+                if (streamsToRemove.has(s.index)) continue;
+                const ov = outputAudioOverride.get(outputAudioIdxMap.get(s.index));
+                tokens.push(ov
+                    ? summariseStream({ ...s, codec_name: ov.codec, channels: ov.channels, bit_rate: ov.bps })
+                    : summariseStream(s));
+            } else
+                tokens.push(summariseStream(s));
+        }
+        for (const a of appendedAudio)
+            tokens.push(summariseStream({ ...a.srcStream, codec_name: a.codec, channels: a.channels, bit_rate: a.bps }));
+        return tokens.join('');
+    };
+
     // Convert file if convert variable is set to true.
     if (convert === true) {
         response.preset += `,-map 0 -c copy${extraArguments} -max_muxing_queue_size 9999${networkDataOpt}`;
         response.infoLog += workDone;
+        response.infoLog += `☑Output streams: ${buildOutputSummary()}\n`;
         response.processFile = true;
     } else {
         if (workDone) response.infoLog += workDone;
