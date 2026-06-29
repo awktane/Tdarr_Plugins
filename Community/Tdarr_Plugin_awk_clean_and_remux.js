@@ -12,7 +12,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text and webvtt to srt when remuxing to mkv for maximum player compatibility.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Non-image attachment streams (e.g. embedded fonts for ASS/SSA subtitles) are intentionally left untouched.\n\n`,
-    Version: '1.12.0',
+    Version: '1.12.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -237,25 +237,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return response;
     }
 
-    // If fill_language is set and more than one stream of the same type has no language tag, they will
-    // all receive the same language — but they may actually be different languages. If fail_langs_blank
-    // is true, abort so the user can tag them manually and requeue. If false, processing continues and
-    // the fill_language assignments are logged as normal by the stream loop below.
+    // If fill_language is set and more than one stream of the same type has no language tag, they will all receive the same language — but they may actually be different languages. If fail_langs_blank
+    // is true, abort so the user can tag them manually and requeue. If false, processing continues and the fill_language assignments are logged as normal by the stream loop below.
     if (fillLanguage && failLangsBlank) {
         const streams = file.ffProbeData.streams || [];
-        const untaggedAudio = streams.filter(s =>
-            (s?.codec_type || '').toLowerCase() === 'audio' &&
-            (!s?.tags?.language || s.tags.language.trim().toLowerCase() === 'und')).length;
-        const untaggedSubs = streams.filter(s =>
-            (s?.codec_type || '').toLowerCase() === 'subtitle' &&
-            (!s?.tags?.language || s.tags.language.trim().toLowerCase() === 'und')).length;
+        const untaggedAudio = streams.filter(s => (s?.codec_type || '').toLowerCase() === 'audio' && (!s?.tags?.language || s.tags.language.trim().toLowerCase() === 'und')).length;
         if (untaggedAudio > 1) {
-            response.infoLog += `☒${untaggedAudio} audio streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue.\n`;
+            response.infoLog += `☒${untaggedAudio} audio streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue or set fail_langs_blank to false.\n`;
             response.processFile = false;
             return response;
         }
+        const untaggedSubs =  streams.filter(s =>(s?.codec_type || '').toLowerCase() === 'subtitle' && (!s?.tags?.language || s.tags.language.trim().toLowerCase() === 'und')).length;
         if (untaggedSubs > 1) {
-            response.infoLog += `☒${untaggedSubs} subtitle streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue.\n`;
+            response.infoLog += `☒${untaggedSubs} subtitle streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue or set fail_langs_blank to false.\n`;
             response.processFile = false;
             return response;
         }
