@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/signs/sdh/commentary) -> Attachments -> Data\n`,
-    Version: '1.9.4',
+    Version: '1.9.5',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -151,6 +151,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         adpcm:      { score: 60,  minimum: 128000,  transparent: 256000 },
         cook:       { score: 58,  minimum: 64000,   transparent: 128000 }
     };
+    //Any codec starting with the first term will return the second term. This is to compound things like wmav1 and wmav2 into wma as en example.
     const codecAliases = [
         ['pcm_',   'pcm'],
         ['adpcm',  'adpcm'],
