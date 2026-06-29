@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.17.2',
+    Version: '1.18.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -705,75 +705,102 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .replace(/[\x00-\x1f\x7f]/g, '')    // strip control characters (newlines, null bytes, etc.)
         .replace(/[\\"]/g, '');             // remove backslashes and double quotes (argument-breakout chars)
 
-    // Lo/Ro stereo downmix matrices using ffmpeg's standard positional channel order.
-    // Center is kept at -3 dB (0.707) so dialogue stays clear; LFE is dropped to avoid mud.
-    // Returns null for layouts we cannot safely map positionally, so callers fall back to -ac 2.
+    // Lo/Ro stereo downmix matrices, generated from each source layout's exact channel order.
     //
-    // All matrices are peak-normalized: each coefficient is divided by the maximum possible sum for that channel (worst-case all inputs simultaneously at full scale). This prevents
-    // clipping on loud content without cutting the overall perceived volume — real program material rarely hits all channels at full simultaneously, so typical levels are unaffected.
+    // WHY layout-keyed and not channel-count-keyed: several standard layouts share a channel count but
+    // order their channels differently (e.g. 6 channels can be 5.1, 5.1(side), 6.0, 6.0(front), or
+    // hexagonal). A count-based matrix would silently mis-route — dropping the wrong channel as "LFE" or
+    // panning a back-center where a surround belongs — producing audio that sounds wrong without any error.
+    // So we resolve the EXACT layout to its canonical channel list and build the matrix from speaker roles.
+    // Any layout we don't have a verified channel list for returns null, and the caller falls back to
+    // ffmpeg's safe built-in -ac 2 downmix rather than risk a confidently-wrong custom matrix.
     //
-    // Verified channel layouts and worked examples (raw → normalized):
-    //   2.1 (FL FR LFE) returns null: dropping LFE and keeping FL/FR is identical to -ac 2, no pan needed.
-    //   3.0 (FL FR FC)  returns null: no surround channels and no LFE, -ac 2 handles it fine.
-    //   3.1  FL FR FC LFE                                       raw peak L=R=1.707       - norm /1.707 ≈ 0.586*c0+0.414*c2
-    //   4.0  FL FR FC BC                                        raw peak L=2.207,R=1.707 - norm by L peak /2.207
-    //   5.0  FL FR FC BL BR                                     raw peak L=2.414         - norm /2.414
-    //   5.1  FL FR FC LFE BL BR (drop LFE)                      raw peak L=2.414         - norm /2.414
-    //   5.1(side) FL FR FC LFE SL SR                            identical positional indices to 5.1, same matrix
-    //   6.1       FL FR FC LFE BC SL SR                         raw peak L=2.914         - norm /2.914
-    //   6.1(back) FL FR FC LFE BL BR BC                         raw peak L=2.914         - norm /2.914
-    //   6.1(front) FL FR LFE FLC FRC SL SR                      raw peak L=2.414         - norm /2.414 (no FC; FLC/FRC as front)
-    //   7.1           FL FR FC LFE BL BR SL SR                  raw peak L=2.707         - norm /2.707
-    //   7.1(wide)     FL FR FC LFE BL BR FLC FRC (FLC/FRC full) raw peak L=3.121         - norm /3.121
-    //   7.1(wide-side) FL FR FC LFE FLC FRC SL SR               raw peak L=3.121         - norm /3.121
+    // Downmix rules (standard Lo/Ro): FL/FR kept full; FC at -3 dB (0.707) into both so dialogue stays
+    // clear; LFE dropped (avoids mud); back/side/wide channels at -3 dB to their own side; any centered
+    // channel (FC, BC) split equally to both sides. Coefficients are then PEAK-NORMALIZED — divided by the
+    // worst-case sum for that output — so loud content can't clip, while typical material (which never hits
+    // every channel at full simultaneously) keeps its level.
+    //
+    // Canonical ffmpeg channel lists per layout (verified against ffmpeg-utils "Channel Layout" docs).
+    // Position in the array is the cN index used by the pan filter.
+    const CANON_LAYOUTS = {
+        '3.1':            ['FL', 'FR', 'FC', 'LFE'],
+        '4.0':            ['FL', 'FR', 'FC', 'BC'],
+        '5.0':            ['FL', 'FR', 'FC', 'BL', 'BR'],
+        '5.0(side)':      ['FL', 'FR', 'FC', 'SL', 'SR'],
+        '5.1':            ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR'],
+        '5.1(side)':      ['FL', 'FR', 'FC', 'LFE', 'SL', 'SR'],
+        '6.1':            ['FL', 'FR', 'FC', 'LFE', 'BC', 'SL', 'SR'],
+        '6.1(back)':      ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'BC'],
+        '6.1(front)':     ['FL', 'FR', 'LFE', 'FLC', 'FRC', 'SL', 'SR'],
+        '7.1':            ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'SL', 'SR'],
+        '7.1(wide)':      ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'FLC', 'FRC'],
+        '7.1(wide-side)': ['FL', 'FR', 'FC', 'LFE', 'FLC', 'FRC', 'SL', 'SR'],
+    };
+
+    // Per-speaker contribution (pre-normalization) to the L and R downmix outputs.
+    // Centered channels (FC, BC) contribute equally to both; left-side channels contribute only to L,
+    // right-side only to R; LFE contributes nothing. Values are the standard Lo/Ro gains.
+    const SPEAKER_GAINS = {
+        FL:  { L: 1.0,   R: 0     },
+        FR:  { L: 0,     R: 1.0   },
+        FC:  { L: 0.707, R: 0.707 },
+        LFE: { L: 0,     R: 0     },
+        BL:  { L: 0.707, R: 0     },
+        BR:  { L: 0,     R: 0.707 },
+        SL:  { L: 0.707, R: 0     },
+        SR:  { L: 0,     R: 0.707 },
+        FLC: { L: 0.707, R: 0     },
+        FRC: { L: 0,     R: 0.707 },
+        BC:  { L: 0.5,   R: 0.5   },
+    };
+
+    // Build a peak-normalized pan=stereo matrix string for a known canonical layout, or null if the layout
+    // contributes no surround/center content (pure FL/FR or FL/FR/LFE), where -ac 2 is already correct.
+    const buildPanMatrix = (channelList) => {
+        const termsL = [];
+        const termsR = [];
+        let peakL = 0;
+        let peakR = 0;
+        let hasNonFront = false; // any channel beyond FL/FR/LFE that needs explicit panning
+
+        channelList.forEach((spk, i) => {
+            const g = SPEAKER_GAINS[spk];
+            if (!g) return; // unknown speaker name — skip (shouldn't happen for canonical layouts)
+            if (spk !== 'FL' && spk !== 'FR' && spk !== 'LFE') hasNonFront = true;
+            if (g.L > 0) { peakL += g.L; }
+            if (g.R > 0) { peakR += g.R; }
+        });
+
+        // No surround/center to fold in (e.g. 2.1 = FL FR LFE, or stereo) — let -ac 2 handle it.
+        if (!hasNonFront) return null;
+        if (peakL <= 0 || peakR <= 0) return null;
+
+        channelList.forEach((spk, i) => {
+            const g = SPEAKER_GAINS[spk];
+            if (!g) return;
+            // Floor to 3 decimals (truncate, not round) so the summed coefficients can never exceed the
+            // normalized 1.0 ceiling — rounding up could push the sum to 1.001 and clip on full-scale content.
+            if (g.L > 0) termsL.push(`${(Math.floor((g.L / peakL) * 1000) / 1000).toFixed(3)}*c${i}`);
+            if (g.R > 0) termsR.push(`${(Math.floor((g.R / peakR) * 1000) / 1000).toFixed(3)}*c${i}`);
+        });
+
+        return `pan=stereo|FL=${termsL.join('+')}|FR=${termsR.join('+')}`;
+    };
+
+    // Resolve a source stream to its canonical layout key, then to a verified pan matrix (or null).
+    // We normalize the ffmpeg channel_layout string (lowercased, trimmed). If the file reports no layout
+    // or an unrecognized one, we return null so the caller uses ffmpeg's safe -ac 2 downmix.
     const downmixMatrix = (srcStream) => {
-        const ch = Number(srcStream?.channels) || 0;
         const layoutFull = (srcStream?.channel_layout || '').toLowerCase().trim();
-        const layout = layoutFull.replace(/\(.*\)$/, '').trim();
-
-        // 4-channel layouts: 3.1 (FL FR FC LFE) and 4.0 (FL FR FC BC) share the same count but have different channel positions and require different matrices.
-        if (ch === 4) {
-            if (layout === '3.1')
-                // 3.1 : FL FR FC LFE  (drop LFE c3); peak = 1+0.707 = 1.707
-                return 'pan=stereo|FL=0.586*c0+0.414*c2|FR=0.586*c1+0.414*c2';
-            if (layout === '4.0')
-                // 4.0 : FL FR FC BC  (BC c3 split to both sides); peak L = 1+0.707+0.5 = 2.207
-                return 'pan=stereo|FL=0.453*c0+0.320*c2+0.227*c3|FR=0.453*c1+0.320*c2+0.227*c3';
-            return null;
-        }
-
-        if (ch === 5)
-            // 5.0 : FL FR FC BL BR; peak L = 1+0.707+0.707 = 2.414
-            return 'pan=stereo|FL=0.414*c0+0.293*c2+0.293*c3|FR=0.414*c1+0.293*c2+0.293*c4';
-
-        if (ch === 6)
-            // 5.1      : FL FR FC LFE BL BR  (c0..c5) — LFE c3 dropped; peak L = 1+0.707+0.707 = 2.414
-            // 5.1(side): FL FR FC LFE SL SR  (c0..c5) — same positional indices, identical matrix
-            return 'pan=stereo|FL=0.414*c0+0.293*c2+0.293*c4|FR=0.414*c1+0.293*c2+0.293*c5';
-
-        if (ch === 7) {
-            // 6.1(back) : FL FR FC LFE BL BR BC  (c0..c6) — BL c4, BR c5, BC c6 shared; peak L = 1+0.707+0.707+0.5 = 2.914
-            if (layoutFull === '6.1(back)')
-                return 'pan=stereo|FL=0.343*c0+0.243*c2+0.243*c4+0.172*c6|FR=0.343*c1+0.243*c2+0.243*c5+0.172*c6';
-            // 6.1(front): FL FR LFE FLC FRC SL SR  (c0..c6) — no FC; FLC c3, FRC c4 as front; SL c5, SR c6; peak L = 1+0.707+0.707 = 2.414
-            if (layoutFull === '6.1(front)')
-                return 'pan=stereo|FL=0.414*c0+0.293*c3+0.293*c5|FR=0.414*c1+0.293*c4+0.293*c6';
-            // 6.1 (default): FL FR FC LFE BC SL SR  (c0..c6) — BC c4 shared, SL c5, SR c6; peak L = 1+0.707+0.5+0.707 = 2.914
-            return 'pan=stereo|FL=0.343*c0+0.243*c2+0.172*c4+0.243*c5|FR=0.343*c1+0.243*c2+0.172*c4+0.243*c6';
-        }
-
-        if (ch === 8) {
-            // 7.1(wide)     : FL FR FC LFE BL BR FLC FRC  (c0..c7) — FLC c6, FRC c7 are front-of-center (full weight); peak L = 1+0.707+0.707+0.707 = 3.121
-            if (layoutFull === '7.1(wide)')
-                return 'pan=stereo|FL=0.320*c0+0.227*c2+0.227*c4+0.227*c6|FR=0.320*c1+0.227*c2+0.227*c5+0.227*c7';
-            // 7.1(wide-side): FL FR FC LFE FLC FRC SL SR  (c0..c7) — FLC c4, FRC c5 front-of-center; SL c6, SR c7; peak L = 1+0.707+0.707+0.5 = 2.914
-            if (layoutFull === '7.1(wide-side)')
-                return 'pan=stereo|FL=0.343*c0+0.243*c2+0.243*c4+0.172*c6|FR=0.343*c1+0.243*c2+0.243*c5+0.172*c7';
-            // 7.1 (default) : FL FR FC LFE BL BR SL SR  (c0..c7) — back+side at 0.5 each; peak L = 1+0.707+0.5+0.5 = 2.707
-            return 'pan=stereo|FL=0.369*c0+0.261*c2+0.185*c4+0.185*c6|FR=0.369*c1+0.261*c2+0.185*c5+0.185*c7';
-        }
-
-        return null;
+        if (!layoutFull) return null;
+        // ffmpeg layout names are already lowercase-stable (e.g. "5.1(side)"); match directly.
+        const channelList = CANON_LAYOUTS[layoutFull];
+        if (!channelList) return null;
+        // Sanity: the reported channel count should match the canonical list length; if a file lies about
+        // its layout vs channel count, fall back to the safe path rather than emit a mismatched matrix.
+        if (Number(srcStream?.channels) !== channelList.length) return null;
+        return buildPanMatrix(channelList);
     };
 
     // Channel/filter snippet for a new or replaced stereo track.
