@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.18.6',
+    Version: '1.19.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -355,16 +355,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if(codec === 'dca')
             codec = 'dts';
 
-        //bit of an exception for DTS Core and DTS-HD MA
+        // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" which contains none of the
+        // subtype keywords, so longName alone cannot distinguish DTS-HD MA/HR/Express from DTS Core in those
+        // containers. Check profile next (e.g. "DTS-HD MA", "DTS-HD HRA", "DTS Express") then fall back to
+        // mediaInfo's Format_Commercial_IfAny (e.g. "DTS-HD Master Audio") which decodes the substream header.
+        const profile       = (stream.profile || '').toLowerCase().trim();
+        const commercial    = ((file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === stream.index)?.Format_Commercial_IfAny || '').toLowerCase();
         if (codec === 'dts') {
-            if (longName.includes('master'))
+            if      (longName.includes('master')         || profile.includes('hd ma')  || commercial.includes('master'))
                 codec = 'dtsma';
-            else if (longName.includes('high resolution'))
+            else if (longName.includes('high resolution') || profile.includes('hra')    || commercial.includes('high resolution'))
                 codec = 'dtshr';
-            else if (longName.includes('express'))
+            else if (longName.includes('express')         || profile.includes('express')|| commercial.includes('express'))
                 codec = 'dtsexpress';
-        //We scored atmos a little higher than typical eac3 - codec_long_name rarely says "atmos" so also check the stream title tag
-        } else if (codec === 'eac3' && (longName.includes('atmos') || (stream.tags?.title || '').toLowerCase().includes('atmos')))
+        // codec_long_name rarely says "atmos"; also check the stream title tag and mediaInfo commercial name.
+        } else if (codec === 'eac3' && (longName.includes('atmos') || (stream.tags?.title || '').toLowerCase().includes('atmos') || commercial.includes('atmos')))
             codec = 'eac3atmos';
 
         //Check if we can't identify the codec. If we can't then notify once per codec
