@@ -322,7 +322,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const isCommentary  = (s) => s.disposition?.comment === 1
         || ['commentary', 'producer'].some(k => streamTitleLower(s).includes(k));
     const isDescriptive = (s) => s.disposition?.visual_impaired === 1
-        || ['description', 'descriptive', 'dvs', 'narration'].some(k => streamTitleLower(s).includes(k));
+        || ['descriptive', 'dvs', 'narration'].some(k => streamTitleLower(s).includes(k));
     const isSdh         = (s) => s.disposition?.hearing_impaired === 1
         || ['sdh', 'hearing impaired', 'deaf'].some(k => streamTitleLower(s).includes(k));
     const isSigns       = (s) => s.disposition?.karaoke === 1
