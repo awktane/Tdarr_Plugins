@@ -9,10 +9,10 @@ const details = () => ({
                   Removes any subtitle or audio tracks that are not in the specified language(s) and optionally removes with deaf/SDH in their description.\n\n
                   Option to modify metadata to remove metadata comments and titles with too many periods.\n\n
                   Automatically deduplicates titles reducing "Stereo / Stereo" down to "Stereo" or "English - English" down to "English".\n\n
-                  Removes unsupported image based subtitles during remux. Converts mov_text and webvtt to srt when remuxing to mkv for maximum player compatibility.\n\n
+                  Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
-                  Non-image attachment streams (e.g. embedded fonts for ASS/SSA subtitles) are intentionally left untouched.\n\n`,
-    Version: '1.12.3',
+                  Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
+    Version: '1.13.3',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -27,8 +27,8 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nmkv will also remove eia_608 and convert mov_text and webvtt subtitles to srt.
-                \\nmp4 will also remove eia_608, hdmv_pgs_subtitle, dvd_subtitle, and xsub. Genpts may be required to fix timestamps.`,
+                \\nmkv will also remove eia_608, ttml, and any other non-muxable subtitle formats. mov_text is converted to srt for compatibility.
+                \\nmp4 will also remove image-based subtitles (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle, xsub), broadcast-only subtitles (dvb_teletext, arib_caption, eia_608), ttml, and hdmv_text_subtitle. Text-based subtitles (subrip, srt, ass, ssa, webvtt, text) are converted to mov_text. Genpts may be required to fix timestamps.`,
         },
         {
             name: 'recovery_discard_frame',
@@ -86,7 +86,7 @@ const details = () => ({
             type: 'string',
             defaultValue: '',
             inputUI: { type: 'text' },
-            tooltip: `Specify language tag/s here for the subtitle tracks you'd like to keep. If blank no tracks will be removed. Does not touch tracks with no language tag.
+            tooltip: `Specify language tag/s here for the subtitle tracks you'd like to keep. If blank no tracks will be removed.
                 \\nStreams with no language tag are treated as though they had fill_language as their language or "und" if fill_language isn't set
                 \\nThis list should include both two character and three character codes as this will successfully catch values like en, eng, en-US, en_US, and en.US
                 \\nExample: English and French (ISO-639-2 and ISO-639-1) (und = undefined, mul = multiple languages, mis = unusual language)\\n
@@ -215,6 +215,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const audioLanguage = inputs.audio_language.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
     const failLangsBlank = String(inputs.fail_langs_blank) === 'true';
 
+    //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
+    const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
+
     //Harder to cleanup than it is to fix now
     if(fillLanguage && fillLanguage.length !== 3)
     {
@@ -255,8 +258,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
     }
 
-    //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
-    const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
 
     const delDeaf = String(inputs.del_deaf) === 'true';
     const deafKeywords = [
@@ -277,6 +278,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const escMeta = (value) => String(value || '')
         .replace(/[\x00-\x1f\x7f]/g, '')   // strip control characters (newlines, null bytes, etc.)
         .replace(/[\\"]/g, '');             // remove backslashes and double quotes (argument-breakout chars)
+
+    // Classify an attachment stream so we only ever remove things we can positively identify:
+    //   'image' - cover art / poster (mjpeg/png/gif/bmp, image/* mimetype, or an image filename). Always removed.
+    //   'font'  - an embedded font (ttf/otf codec, a font mimetype, or a font filename extension). Removed ONLY
+    //             when nothing in the output uses it (no surviving ASS/SSA subtitle). This is the key fix:
+    //             on older ffmpeg builds fonts report codec_name 'none'/'unknown', so we identify by filename
+    //             and mimetype as well as codec, and never delete a font while a styled subtitle still needs it.
+    //   'other' - anything we cannot positively identify (a bare 'none'/'unknown' with no font/image signal).
+    //             Left completely untouched — it could be anything, so deleting it is never safe to assume.
+    const attachmentKind = (s) => {
+        const codec = (s.codec_name || '').trim().toLowerCase();
+        const mime  = (s.tags?.mimetype || '').trim().toLowerCase();
+        const fname = (s.tags?.filename || '').trim().toLowerCase();
+        const ext   = fname.includes('.') ? fname.slice(fname.lastIndexOf('.') + 1) : '';
+        if (['mjpeg', 'png', 'gif', 'bmp'].includes(codec) || mime.startsWith('image/')
+            || ['jpg', 'jpeg', 'png', 'gif', 'bmp', 'webp'].includes(ext))
+            return 'image';
+        const fontMime = mime.includes('font') || mime.includes('truetype')
+            || mime.includes('opentype') || mime.includes('sfnt');
+        if (['ttf', 'otf'].includes(codec) || fontMime
+            || ['ttf', 'otf', 'ttc', 'otc', 'pfb', 'pfa', 'woff', 'woff2', 'eot'].includes(ext))
+            return 'font';
+        return 'other';
+    };
 
     //Clean up titles - Remove surrounding whitespace, single quotes and double quotes as there's no reason for them & wipes title as specified by busyTitleRemove
     function cleanStreamTitle(rawTitle, busyTitleRemove) {
@@ -367,6 +392,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const removedIndices = new Set();
     const subCodecOverride = new Map();
 
+    // Font attachments whose removal is deferred until after the main loop, when we know which subtitle
+    // streams survive. Decided here (not inline) because an attachment can appear before its subtitles in
+    // the file, so we cannot know whether a styled subtitle survives at the moment we reach the attachment.
+    const deferredFontIndices = [];
+
     // Summarise the input streams exactly as they arrived, before any removal/remux, using the shared
     // bracket helper. This plugin runs first, so this captures the file as received; reading it alongside
     // the stream-ordering plugin's output line shows where a file came from and where it ended up.
@@ -393,8 +423,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //Start with zero based index for subtitle streams. This is only used when converting subtitle formats or changing metadata
                 subtitleStreamIndex++;
 
-                //First remove any subtitles that would be removed due to format as in that case language doesn't matter
-                if((ffstreamCodec === 'eia_608') || (dstContainer === 'mp4' && ['hdmv_pgs_subtitle', 'dvd_subtitle', 'xsub'].includes(ffstreamCodec))) {
+                //First remove any subtitles that would be removed due to format as in that case language doesn't matter.
+                // eia_608: closed-caption data embedded in video bitstream, not a real subtitle stream — always drop.
+                // ttml: ffmpeg has no working encoder or muxer path for ttml; drop for both containers.
+                // dvb_teletext, arib_caption, hdmv_text_subtitle: decode-only, no encoder, no mp4 muxer support — drop for mp4.
+                //   hdmv_text_subtitle copies into mkv fine so it is only in the mp4 list.
+                // Image-based (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle, xsub): no encoder, mp4 rejects them — drop for mp4.
+                const alwaysDrop   = ['eia_608', 'ttml'];
+                const mp4OnlyDrop  = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub',
+                                      'dvb_teletext', 'arib_caption', 'hdmv_text_subtitle'];
+                if (alwaysDrop.includes(ffstreamCodec) || (dstContainer === 'mp4' && mp4OnlyDrop.includes(ffstreamCodec))) {
                     workDone += `☐Remove stream ${i} - unsupported (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
                 } else {
@@ -456,7 +494,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "comment="`;
                 }
                 
-                if((dstContainer === 'mkv') && ['mov_text', 'webvtt'].includes(ffstreamCodec)) {
+                // mkv: mov_text is a QuickTime-only format that most players won't render in mkv — convert to srt.
+                //      All other subtitle codecs (subrip, ass, ssa, webvtt, hdmv_pgs_subtitle, dvd_subtitle,
+                //      dvb_subtitle, xsub, hdmv_text_subtitle, text) are natively supported by the mkv muxer.
+                if((dstContainer === 'mkv') && ffstreamCodec === 'mov_text') {
                     workDone += `☐Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} subtitle to srt\n`;
                     extraArguments += metadataCommand+` -c:s:${subtitleStreamIndex} srt`;
                     subCodecOverride.set(i, 'srt');
@@ -464,7 +505,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
 
-                if((dstContainer === 'mp4') && ['subrip', 'srt', 'ass', 'ssa', 'webvtt'].includes(ffstreamCodec)) {
+                // mp4: only mov_text is natively supported. All text-based subtitle codecs must be converted.
+                //      text is a raw UTF-8 codec that ffmpeg normalises to subrip on mux, but handle explicitly
+                //      for defensive coverage in case it ever appears as a distinct stream codec_name.
+                if((dstContainer === 'mp4') && ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'text'].includes(ffstreamCodec)) {
                     workDone += `☐Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} subtitle to mov_text\n`;
                     extraArguments += metadataCommand+` -c:s:${subtitleStreamIndex} mov_text`;
                     subCodecOverride.set(i, 'mov_text');
@@ -603,12 +647,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     convert = true;
                     continue;
                 }                
-            } else if(ffstreamType === 'attachment' && ['mjpeg', 'png', 'gif', 'bmp', 'none'].includes(ffstreamCodec)) {
-                workDone += `☐Remove stream ${i} - attachment stream (${ffstreamType}-${ffstreamCodec})\n`;
-                extraArguments += ` -map -0:${i}`;
-                removedIndices.add(i);
-                convert = true;
-                continue;
+            } else if(ffstreamType === 'attachment') {
+                const kind = attachmentKind(ffstream);
+                if (kind === 'image') {
+                    workDone += `☐Remove stream ${i} - cover-art attachment (${ffstreamType}-${ffstreamCodec})\n`;
+                    extraArguments += ` -map -0:${i}`;
+                    removedIndices.add(i);
+                    convert = true;
+                    continue;
+                }
+                if (kind === 'font') {
+                    // Defer: keep or drop is decided after the loop based on whether a styled subtitle survives.
+                    deferredFontIndices.push(i);
+                    continue;
+                }
+                // 'other' - unidentifiable attachment, leave it untouched (see attachmentKind).
             } else if ((ffstreamType === 'data') || ['data','bin_data','tmcd'].includes(ffstreamCodec)) {
                 workDone += `☐Remove stream ${i} - data stream (${ffstreamType}-${ffstreamCodec})\n`;
                 extraArguments += ` -map -0:${i}`;
@@ -617,12 +670,35 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 continue;
             }
 
-            //The only other type of stream currently supported by ffmpeg is attachment which we will leave untouched. It's generally used for fonts (ass/ssa subtitles) and cover art so the metadata may be useful. If it needs to be removed then it can be done with a separate plugin.
+            //Any other stream type (e.g. an unrecognised attachment classified as 'other') is left untouched. If it needs to be removed it can be done with a separate plugin.
         } catch (err) {
             // Error
             response.infoLog += `☒Error processing stream ${i}: ${err}\n`;
             response.processFile = false;
             return response;
+        }
+    }
+
+    // Resolve deferred font attachments now that subtitle removals are final. Embedded fonts are only
+    // consumed by styled text subtitles (ASS/SSA). Keep the fonts if any such subtitle survives in the
+    // output; otherwise they are orphaned and removed. mp4 output never keeps fonts: ASS/SSA are converted
+    // to mov_text (which needs no fonts) and mp4 cannot carry font attachments anyway, so dstContainer
+    // gates this to mkv. The source codec is read from ffProbeData (it is still 'ass'/'ssa' there even
+    // when converted), which is why the mkv gate — not just the survivor check — is required.
+    if (deferredFontIndices.length > 0) {
+        const fontsNeeded = dstContainer === 'mkv' && file.ffProbeData.streams.some((s, idx) =>
+            (s.codec_type || '').toLowerCase() === 'subtitle'
+            && !removedIndices.has(idx)
+            && ['ass', 'ssa'].includes((s.codec_name || '').toLowerCase()));
+
+        if (!fontsNeeded) {
+            for (const i of deferredFontIndices) {
+                const fname = (file.ffProbeData.streams[i]?.tags?.filename || '').trim();
+                workDone += `☐Remove stream ${i} - orphaned font attachment (no ASS/SSA subtitle uses it)${fname ? ` "${fname}"` : ''}\n`;
+                extraArguments += ` -map -0:${i}`;
+                removedIndices.add(i);
+                convert = true;
+            }
         }
     }
 
