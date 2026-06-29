@@ -780,7 +780,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .filter(({ idx }) => !removedIndices.has(idx))
             .map(({ s, idx }) => (subCodecOverride.has(idx) ? { ...s, codec_name: subCodecOverride.get(idx) } : s))
             .map(summariseStream).join('');
-        response.infoLog += `☑Output streams: ${outSummary}\n`;
+        response.infoLog += `☑Expected results: ${outSummary}\n`;
         response.processFile = true;
     } else {
         response.infoLog += `☑File is already ${dstContainer} and contains no streams requiring removal or conversion.\n`;
