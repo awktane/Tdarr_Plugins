@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/signs/sdh/commentary) -> Attachments -> Data\n`,
-    Version: '1.9.3',
+    Version: '1.9.4',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -101,10 +101,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     // =====================================================================
-    // SHARED BLOCK — keep byte-for-byte identical across all awk plugins
-    // that use audio quality scoring. Functions: codecInfo, codecAliases,
-    // unknownCodecs, audioQuality, resolveStreamBitrate, summariseStream.
-    // clean_and_remux carries only resolveStreamBitrate + summariseStream.
+    // SHARED BLOCK — keep byte-for-byte identical across all awk plugins.
+    // Audio plugins (audio_clean, stream_ordering) carry the whole block:
+    //   codecInfo, codecAliases, unknownCodecs, resolveCodecName, audioQuality,
+    //   the role/forced classifiers, resolveStreamBitrate, summariseStream, escMeta.
+    // clean_and_remux carries only the classifiers, resolveStreamBitrate,
+    // summariseStream, and escMeta (the codec-scoring half is audio-only).
     // =====================================================================
 
     //Codecs and some values to help us score the quality so that we can pick the best track - some of these formats are not supported by ffmpeg yet (ac4)
@@ -157,8 +159,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     ];
     const unknownCodecs = new Set();
 
-    // Audio quality scoring — must be declared after response so infoLog is available
-    const audioQuality = (stream) => {
+    // Resolve an ffprobe stream to its canonical codec key used by codecInfo. Applies the alias prefixes,
+    // maps dca->dts, then refines DTS into its HD MA / HR / Express subtype and eac3 into eac3atmos.
+    // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" — none of the subtype keywords
+    // — so longName alone can't distinguish the subtypes there; we also check the stream profile
+    // (e.g. "DTS-HD MA", "DTS-HD HRA", "DTS Express") and fall back to mediaInfo's Format_Commercial_IfAny
+    // (e.g. "DTS-HD Master Audio"), which decodes the substream header. Atmos rarely shows in long_name, so
+    // eac3 also checks the title tag and the commercial name. Shared by audioQuality and losslessSource.
+    const resolveCodecName = (stream) => {
         let codec = (stream?.codec_name || '').toLowerCase().trim();
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
 
@@ -170,15 +178,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         //Do this first as there's no harm checking for additional info in the longName
-        if(codec === 'dca')
+        if (codec === 'dca')
             codec = 'dts';
 
-        // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" which contains none of the
-        // subtype keywords, so longName alone cannot distinguish DTS-HD MA/HR/Express from DTS Core in those
-        // containers. Check profile next (e.g. "DTS-HD MA", "DTS-HD HRA", "DTS Express") then fall back to
-        // mediaInfo's Format_Commercial_IfAny (e.g. "DTS-HD Master Audio") which decodes the substream header.
-        const profile       = (stream.profile || '').toLowerCase().trim();
-        const commercial    = ((file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === stream.index)?.Format_Commercial_IfAny || '').toLowerCase();
+        const profile    = (stream.profile || '').toLowerCase().trim();
+        const commercial = ((file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === stream.index)?.Format_Commercial_IfAny || '').toLowerCase();
         if (codec === 'dts') {
             if      (longName.includes('master')          || profile.includes('hd ma')  || commercial.includes('master'))
                 codec = 'dtsma';
@@ -186,9 +190,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 codec = 'dtshr';
             else if (longName.includes('express')         || profile.includes('express')|| commercial.includes('express'))
                 codec = 'dtsexpress';
-        // codec_long_name rarely says "atmos"; also check the stream title tag and mediaInfo commercial name.
         } else if (codec === 'eac3' && (longName.includes('atmos') || (stream.tags?.title || '').toLowerCase().includes('atmos') || commercial.includes('atmos')))
             codec = 'eac3atmos';
+
+        return codec;
+    };
+
+    // Audio quality scoring — must be declared after response so infoLog is available
+    const audioQuality = (stream) => {
+        const codec = resolveCodecName(stream);
 
         //Check if we can't identify the codec. If we can't then notify once per codec
         if(!(codec in codecInfo) && !unknownCodecs.has(codec)) {
@@ -248,6 +258,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return info.score - penalty;
     }
 
+    // Stream role/forced classifiers — shared verbatim across all three awk plugins. Each takes a raw
+    // ffprobe stream and returns a boolean from the disposition flag first, then title keywords, exactly
+    // as the sorting and summary logic expects. Consolidated here so summariseStream, the stream-ordering
+    // sort keys, and audio_clean's secondary-track detection all read from one definition.
+    const streamTitleLower = (s) => (s.tags?.title || '').trim().toLowerCase();
+    const isCommentary  = (s) => s.disposition?.comment === 1
+        || ['commentary', 'producer'].some(k => streamTitleLower(s).includes(k));
+    const isDescriptive = (s) => s.disposition?.visual_impaired === 1
+        || ['description', 'descriptive', 'dvs', 'narration'].some(k => streamTitleLower(s).includes(k));
+    const isSdh         = (s) => s.disposition?.hearing_impaired === 1
+        || ['sdh', 'hearing impaired', 'deaf'].some(k => streamTitleLower(s).includes(k));
+    const isSigns       = (s) => s.disposition?.karaoke === 1
+        || ['signs', 'songs'].some(k => streamTitleLower(s).includes(k));
+
     // Resolve the best available bitrate (bps) for a stream: ffprobe first, mediaInfo fallback.
     // ffprobe cannot read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA
     // in MP4/M4V), but mediaInfo decodes the substream headers and usually has it. Returns 0 if neither
@@ -263,14 +287,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Shared verbatim across all three awk plugins — keep byte-for-byte identical when editing.
     // Shows: video codec; audio lang/channels/codec/bitrate(+role); subtitle lang/codec(+forced/role);
     // data and attachment codec. Role/forced detection mirrors the sorting logic (disposition flags
-    // first, then title keywords) so every plugin's summary lines up. subrip is shown as srt to match
-    // the friendlier name used when this pipeline converts subtitles.
+    // first, then title keywords, via the shared classifiers) so every plugin's summary lines up. subrip
+    // is shown as srt to match the friendlier name used when this pipeline converts subtitles.
     const summariseStream = (s) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
         if (codec === 'subrip') codec = 'srt';
-        const title = (s.tags?.title || '').trim().toLowerCase();
-        const disp = s.disposition || {};
         const langRaw = (s.tags?.language || 'und').trim().toLowerCase();
         const lang = langRaw !== 'und' ? langRaw : '';
         if (type === 'video')
@@ -279,17 +301,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const ch = s.channels ? `${s.channels}ch` : '';
             const bitrate = Number(s.bit_rate || 0);
             const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
-            const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
-            const descriptive = disp.visual_impaired === 1 || title.includes('description') || title.includes('descriptive') || title.includes('dvs') || title.includes('narration');
-            const role = commentary ? '/commentary' : (descriptive ? '/description' : '');
+            const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : '');
             return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${role}]`;
         }
         if (type === 'subtitle') {
-            const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
-            const sdh = disp.hearing_impaired === 1 || title.includes('sdh') || title.includes('hearing impaired') || title.includes('deaf');
-            const signs = disp.karaoke === 1 || title.includes('signs') || title.includes('songs');
-            const role = commentary ? '/commentary' : (sdh ? '/sdh' : (signs ? '/signs' : ''));
-            const forced = disp.forced === 1 ? '/forced' : '';
+            const role = isCommentary(s) ? '/commentary' : (isSdh(s) ? '/sdh' : (isSigns(s) ? '/signs' : ''));
+            const forced = s.disposition?.forced === 1 ? '/forced' : '';
             return `[sub:${[lang, codec].filter(Boolean).join(' ')}${forced}${role}]`;
         }
         if (type === 'attachment')
@@ -298,6 +315,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return `[data:${codec}]`;
         return `[${type || 'unknown'}:${codec}]`;
     };
+
+    // Sanitize a value before embedding it inside a double-quoted ffmpeg -metadata argument (e.g.
+    // -metadata:s:a:0 "title=..."). Tdarr does NOT pass the preset through a shell — it splits the string
+    // into a quote-aware argv array and hands it to child_process.spawn, so shell metacharacters ($ ` ; |)
+    // are inert and reach ffmpeg as literal metadata bytes. The only injection vector is breaking out of
+    // the quoted value to inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper)
+    // or a control character. Tdarr's tokenizer strips quotes with no reliable backslash-escape convention,
+    // so rather than escape we remove the breakout characters (double quotes, backslashes) and all control
+    // characters outright. Spaces and any other printable text remain safe inside the kept quoted value.
+    const escMeta = (value) => String(value || '')
+        .replace(/[\x00-\x1f\x7f]/g, '')   // strip control characters (newlines, null bytes, etc.)
+        .replace(/[\\"]/g, '');            // remove backslashes and double quotes (argument-breakout chars)
 
     // =====================================================================
     // END SHARED BLOCK
@@ -361,25 +390,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             audioquality: streamType === 'audio' ? audioQuality(enrichedStream) : 0,
             default: ffstream?.disposition?.default === 1,
 
-            // simple classification (no helper functions)
-            commentary: ffstream?.disposition?.comment === 1 ||
-                        streamTitle.includes('commentary') ||
-                        streamTitle.includes('producer'),
-
-            descriptive:  ffstream?.disposition?.visual_impaired === 1 ||
-                          streamTitle.includes('description') ||
-                          streamTitle.includes('descriptive') ||
-                          streamTitle.includes('dvs') ||
-                          streamTitle.includes('narration'),
-
-            sdh: ffstream?.disposition?.hearing_impaired === 1 ||
-                 streamTitle.includes('sdh') ||
-                 streamTitle.includes('hearing impaired') ||
-                 streamTitle.includes('deaf'),
-
-            signs: ffstream?.disposition?.karaoke === 1 ||
-                   streamTitle.includes('signs') ||
-                   streamTitle.includes('songs'),
+            // Role classification via the shared classifiers (disposition flag first, then title keywords).
+            commentary:  isCommentary(ffstream),
+            descriptive: isDescriptive(ffstream),
+            sdh:         isSdh(ffstream),
+            signs:       isSigns(ffstream),
 
             mjpeg: (ffstream.codec_name || '').trim().toLowerCase() === 'mjpeg',
         });
