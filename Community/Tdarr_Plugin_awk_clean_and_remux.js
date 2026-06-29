@@ -12,7 +12,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text and webvtt to srt when remuxing to mkv for maximum player compatibility.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Non-image attachment streams (e.g. embedded fonts for ASS/SSA subtitles) are intentionally left untouched.\n\n`,
-    Version: '1.11.0',
+    Version: '1.12.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -108,6 +108,20 @@ const details = () => ({
                     jpn`,
         },
         {
+            name: 'fail_langs_blank',
+            type: 'boolean',
+            defaultValue: true,
+            inputUI: {
+                type: 'dropdown',
+                options: ['true', 'false'],
+            },
+            tooltip: `If fill_language is set and more than one audio or subtitle stream has no language tag, should processing be aborted?
+                \\nWhen multiple streams share the same blank language tag, fill_language assigns them all the same language. They may actually be different languages — the only way to know is by listening.
+                \\nSubsequent plugins may then treat them as duplicates and remove one, causing silent content loss (e.g. deleting the only Japanese track because it was tagged the same as English).
+                \\nIf true  - processing is aborted and the file is sent to the error queue. Tag the streams manually and requeue.
+                \\nIf false - the fill_language assignment is logged as normal and processing continues.`,
+        },        
+        {
             name: 'del_deaf',
             type: 'boolean',
             defaultValue: false,
@@ -199,6 +213,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const fillLanguage = (inputs.fill_language ? inputs.fill_language.toLowerCase().trim() : '');
     const subLanguage = inputs.sub_language.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
     const audioLanguage = inputs.audio_language.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
+    const failLangsBlank = String(inputs.fail_langs_blank) === 'true';
 
     //Harder to cleanup than it is to fix now
     if(fillLanguage && fillLanguage.length !== 3)
@@ -220,6 +235,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.infoLog += `☒You have specified that blank tracks should be tagged as ${fillLanguage}. You have not included it in audio_language which indirectly will remove untagged audio streams.\n`;
         response.processFile = false;
         return response;
+    }
+
+    // If fill_language is set and more than one stream of the same type has no language tag, they will
+    // all receive the same language — but they may actually be different languages. If fail_langs_blank
+    // is true, abort so the user can tag them manually and requeue. If false, processing continues and
+    // the fill_language assignments are logged as normal by the stream loop below.
+    if (fillLanguage && failLangsBlank) {
+        const streams = file.ffProbeData.streams || [];
+        const untaggedAudio = streams.filter(s =>
+            (s?.codec_type || '').toLowerCase() === 'audio' &&
+            (!s?.tags?.language || s.tags.language.trim().toLowerCase() === 'und')).length;
+        const untaggedSubs = streams.filter(s =>
+            (s?.codec_type || '').toLowerCase() === 'subtitle' &&
+            (!s?.tags?.language || s.tags.language.trim().toLowerCase() === 'und')).length;
+        if (untaggedAudio > 1) {
+            response.infoLog += `☒${untaggedAudio} audio streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue.\n`;
+            response.processFile = false;
+            return response;
+        }
+        if (untaggedSubs > 1) {
+            response.infoLog += `☒${untaggedSubs} subtitle streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue.\n`;
+            response.processFile = false;
+            return response;
+        }
     }
 
     //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
