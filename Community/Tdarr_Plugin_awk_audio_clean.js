@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.19.1',
+    Version: '1.19.3',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1042,17 +1042,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Build the predicted output stream summary for the closing log line. Audio streams keep their
     // original codec unless an in-place override was recorded; removed duplicates are dropped; newly
     // created downmix tracks are appended (matching ffmpeg's -map 0 then -map 0:a:N ordering).
+    // All streams are enriched with resolveStreamBitrate before summariseStream, matching the input
+    // summary line — so untouched tracks (e.g. a copied stereo track) show their bitrate correctly.
     const buildOutputSummary = () => {
         const tokens = [];
         for (const s of file.ffProbeData.streams) {
+            const enriched = { ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate };
             if ((s?.codec_type || '').trim().toLowerCase() === 'audio') {
                 if (streamsToRemove.has(s.index)) continue;
                 const ov = outputAudioOverride.get(outputAudioIdxMap.get(s.index));
                 tokens.push(ov
-                    ? summariseStream({ ...s, codec_name: ov.codec, channels: ov.channels, bit_rate: ov.bps })
-                    : summariseStream(s));
+                    ? summariseStream({ ...enriched, codec_name: ov.codec, channels: ov.channels, bit_rate: ov.bps })
+                    : summariseStream(enriched));
             } else
-                tokens.push(summariseStream(s));
+                tokens.push(summariseStream(enriched));
         }
         for (const a of appendedAudio)
             tokens.push(summariseStream({ ...a.srcStream, codec_name: a.codec, channels: a.channels, bit_rate: a.bps }));
