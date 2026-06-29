@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/signs/sdh/commentary) -> Attachments -> Data\n`,
-    Version: '1.9.1',
+    Version: '1.9.3',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -180,7 +180,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const profile       = (stream.profile || '').toLowerCase().trim();
         const commercial    = ((file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === stream.index)?.Format_Commercial_IfAny || '').toLowerCase();
         if (codec === 'dts') {
-            if      (longName.includes('master')         || profile.includes('hd ma')  || commercial.includes('master'))
+            if      (longName.includes('master')          || profile.includes('hd ma')  || commercial.includes('master'))
                 codec = 'dtsma';
             else if (longName.includes('high resolution') || profile.includes('hra')    || commercial.includes('high resolution'))
                 codec = 'dtshr';
@@ -280,15 +280,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const bitrate = Number(s.bit_rate || 0);
             const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
             const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
-            const descriptive = disp.visual_impaired === 1 || title.includes('description')
-                || title.includes('descriptive') || title.includes('dvs') || title.includes('narration');
+            const descriptive = disp.visual_impaired === 1 || title.includes('description') || title.includes('descriptive') || title.includes('dvs') || title.includes('narration');
             const role = commentary ? '/commentary' : (descriptive ? '/description' : '');
             return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${role}]`;
         }
         if (type === 'subtitle') {
             const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
-            const sdh = disp.hearing_impaired === 1 || title.includes('sdh')
-                || title.includes('hearing impaired') || title.includes('deaf');
+            const sdh = disp.hearing_impaired === 1 || title.includes('sdh') || title.includes('hearing impaired') || title.includes('deaf');
             const signs = disp.karaoke === 1 || title.includes('signs') || title.includes('songs');
             const role = commentary ? '/commentary' : (sdh ? '/sdh' : (signs ? '/signs' : ''));
             const forced = disp.forced === 1 ? '/forced' : '';
@@ -358,8 +356,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             shortlang: streamLangShort,
             channels: ffstream?.channels || 0,
             forced: ffstream?.disposition?.forced === 1,
-            // Only score audio streams — scoring video/subtitle/data would spam the log with
-            // bogus "unknown codec"/"invalid bitrate" notices and serves no purpose since the
+            // Only score audio streams — scoring video/subtitle/data would spam the log with bogus "unknown codec"/"invalid bitrate" notices and serves no purpose since the
             // quality value is only used to sort audio.
             audioquality: streamType === 'audio' ? audioQuality(enrichedStream) : 0,
             default: ffstream?.disposition?.default === 1,
