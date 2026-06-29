@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.18.0',
+    Version: '1.18.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -849,7 +849,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // Downmix changes channel count, so the source bitrate isn't a comparable floor — use the table target for 2ch only.
                 const dstBitArg = encoderArgsIdx(stereoCodec, 2, outputAudioIdx);
                 const dstBitStr = resolveBitrate(stereoCodec, 2);
-                workDone += `☒Stream ${ffstream.index}: Transcoding secondary ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr}) to stereo ${stereoCodec} @ ${dstBitStr / 1000} kb/s in place\n`;
+                workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${stereoCodec} stereo @ ${dstBitStr / 1000} kb/s (secondary)\n`;
                 extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${dstBitArg}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                 if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
                 modifiedAudioIdx.add(outputAudioIdx);
@@ -866,7 +866,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (sixMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
                     const dstBitArg = encoderArgsIdx(surroundCodec, 6, outputAudioIdx);
                     const dstBitStr = resolveBitrate(surroundCodec, 6);
-                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr}) to 6ch ${surroundCodec} @ ${dstBitStr / 1000} kb/s in place\n`;
+                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${surroundCodec}${dstBitArg} -ac:a:${outputAudioIdx} 6 -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
@@ -875,7 +875,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 } else if (sixMode === 'true') {
                     const dstBitArg = encoderArgsIdx(surroundCodec, 6, newStreamOutputIdx);
                     const dstBitStr = resolveBitrate(surroundCodec, 6);
-                    workDone += `☒Stream ${ffstream.index}: Adding 6ch ${surroundCodec} @ ${dstBitStr / 1000} kb/s downmix from ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr})\n`;
+                    workDone += `☒Stream ${ffstream.index}: Adding ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
                     extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${surroundCodec}${dstBitArg} -ac:a:${newStreamOutputIdx} 6 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escTitle(streamLang)}"`;
                     newStreamOutputIdx++;
@@ -896,7 +896,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (twoMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
                     const dstBitArg = encoderArgsIdx(stereoCodec, 2, outputAudioIdx);
                     const dstBitStr = resolveBitrate(stereoCodec, 2);
-                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr}) to stereo ${stereoCodec} @ ${dstBitStr / 1000} kb/s in place\n`;
+                    workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${stereoCodec} stereo @ ${dstBitStr / 1000} kb/s\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${dstBitArg}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
@@ -905,7 +905,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 } else if (twoMode === 'true' || (twoMode === 'replace' && modifiedAudioIdx.has(outputAudioIdx))) {
                     const dstBitArg = encoderArgsIdx(stereoCodec, 2, newStreamOutputIdx);
                     const dstBitStr = resolveBitrate(stereoCodec, 2);
-                    workDone += `☒Stream ${ffstream.index}: Adding stereo ${stereoCodec} @ ${dstBitStr / 1000} kb/s downmix from ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr})\n`;
+                    workDone += `☒Stream ${ffstream.index}: Adding ${stereoCodec} stereo @ ${dstBitStr / 1000} kb/s from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
                     extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec}${dstBitArg}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escTitle(streamLang)}"`;
                     newStreamOutputIdx++;
@@ -932,13 +932,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const targetMaxCh = ({ ac3: 6, eac3: 6, aac: 8, opus: 8 })[targetCodec] ?? 8;
 
                     if (shouldForce && ffstream.channels > targetMaxCh) {
-                        workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodec} - ${ffstream.channels}ch (${ffstreamCodec} @ ${srcRateStr}) exceeds the ${targetMaxCh}ch limit for ${targetCodec}. Enable downmix_to_six to reduce channels first.\n`;
+                        workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodec} - ${ffstreamCodec} @ ${srcRateStr} is ${ffstream.channels}ch which exceeds the ${targetMaxCh}ch limit for ${targetCodec}. Enable downmix_to_six to reduce channels first.\n`;
                     } else if (shouldForce) {
                         // Same channel count, codec swap only — honour the source bitrate as a floor so a
                         // high-bitrate source isn't needlessly degraded (capped at the codec ceiling inside resolveBitrate).
                         const dstBitArg = encoderArgsIdx(targetCodec, ffstream.channels, outputAudioIdx, srcBitrate);
                         const dstBitStr = resolveBitrate(targetCodec, ffstream.channels, srcBitrate);
-                        workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstreamCodec} to ${targetCodec} @ ${dstBitStr / 1000} kb/s (${ffstream.channels}ch @ ${srcRateStr})\n`;
+                        workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstreamCodec} @ ${srcRateStr} → ${targetCodec} ${ffstream.channels}ch @ ${dstBitStr / 1000} kb/s\n`;
                         extraArguments += ` -c:a:${outputAudioIdx} ${targetCodec}${dstBitArg}`;
                         modifiedAudioIdx.add(outputAudioIdx);
                         convert = true;
