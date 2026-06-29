@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/signs/sdh/commentary) -> Attachments -> Data\n`,
-    Version: '1.8.1',
+    Version: '1.8.2',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -236,6 +236,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return info.score - penalty;
     }
 
+    // Resolve the best available bitrate (bps) for a stream: ffprobe first, mediaInfo fallback.
+    // ffprobe cannot read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA
+    // in MP4/M4V), but mediaInfo decodes the substream headers and usually has it. Returns 0 if neither
+    // source has a value. Used to enrich stream objects before summariseStream or audioQuality sees them.
+    const resolveStreamBitrate = (ffstream) => {
+        const ffBitrate = Number(ffstream.bit_rate || 0);
+        if (ffBitrate > 0) return ffBitrate;
+        const ffmedia = (file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === ffstream.index);
+        return Number(ffmedia?.BitRate || 0);
+    };
+
     // Build a single bracket token summarising one ffprobe stream for the input/output summary lines.
     // Shared verbatim across all three awk plugins — keep byte-for-byte identical when editing.
     // Shows: video codec; audio lang/channels/codec/bitrate(+role); subtitle lang/codec(+forced/role);
@@ -290,7 +301,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
 
     // Input summary — the streams exactly as they arrived, before re-ordering.
-    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(summariseStream).join('')}\n`;
+    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream({ ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate })).join('')}\n`;
 
     // VIDEO -> AUDIO -> SUBTITLE -> ATTACHMENT -> DATA -> OTHER?
     const streamOrder = { video: 0, audio: 1, subtitle: 2 , attachment: 3, data: 4};
@@ -306,6 +317,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const streams = [];
     for (let i = 0; i < file.ffProbeData.streams.length; i++) {
         const ffstream = file.ffProbeData.streams[i];
+        // Enrich with mediaInfo bitrate before audioQuality scoring and summariseStream so that
+        // formats like DTS-HD MA (which ffprobe can't read a bitrate for in MP4/M4V containers)
+        // are scored and displayed correctly using the more accurate mediaInfo value.
+        const enrichedStream = { ...ffstream, bit_rate: resolveStreamBitrate(ffstream) || ffstream.bit_rate };
         const streamTitle = (ffstream.tags?.title || '').trim().toLowerCase();
         const streamLang = (ffstream.tags?.language?.trim() || 'und').toLowerCase();
         const streamLangShort = streamLang.replace(/[-_.].*$/, '');
@@ -320,7 +335,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         streams.push({
             index: i,
-            stream: ffstream,
+            stream: enrichedStream,
             type: streamType,
             title: streamTitle,
             lang: streamLang,
@@ -330,7 +345,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Only score audio streams — scoring video/subtitle/data would spam the log with
             // bogus "unknown codec"/"invalid bitrate" notices and serves no purpose since the
             // quality value is only used to sort audio.
-            audioquality: streamType === 'audio' ? audioQuality(ffstream) : 0,
+            audioquality: streamType === 'audio' ? audioQuality(enrichedStream) : 0,
             default: ffstream?.disposition?.default === 1,
 
             // simple classification (no helper functions)
