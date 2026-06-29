@@ -1063,7 +1063,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (convert === true) {
         response.preset += `,-map 0 -c copy${extraArguments} -max_muxing_queue_size 9999${networkDataOpt}`;
         response.infoLog += workDone;
-        response.infoLog += `☑Output streams: ${buildOutputSummary()}\n`;
+        response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;
         response.processFile = true;
     } else {
         if (workDone) response.infoLog += workDone;
