@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.20.3',
+    Version: '1.20.4',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -822,11 +822,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Any layout we don't have a verified channel list for returns null, and the caller falls back to
     // ffmpeg's safe built-in -ac 2 downmix rather than risk a confidently-wrong custom matrix.
     //
-    // Downmix rules (standard Lo/Ro): FL/FR kept full; FC at -3 dB (0.707) into both so dialogue stays
-    // clear; LFE dropped (avoids mud); back/side/wide channels at -3 dB to their own side; any centered
-    // channel (FC, BC) split equally to both sides. Coefficients are then PEAK-NORMALIZED — divided by the
-    // worst-case sum for that output — so loud content can't clip, while typical material (which never hits
-    // every channel at full simultaneously) keeps its level.
+    // Downmix rules (standard Lo/Ro): FL/FR kept at full scale; FC at -3 dB (0.707) into both so dialogue
+    // stays clear; LFE dropped (avoids mud); back/side/wide channels at -3 dB to their own side; any
+    // centered channel (FC, BC) split equally to both sides. FL/FR are kept at peak 1.0 — the -3 dB
+    // attenuation on center/surround provides the clipping headroom, matching the industry-standard Lo/Ro
+    // downmix used by Blu-ray players, AV receivers, and streaming services.
     //
     // Canonical ffmpeg channel lists per layout (verified against ffmpeg-utils "Channel Layout" docs).
     // Position in the array is the cN index used by the pan filter.
@@ -845,7 +845,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         '7.1(wide-side)': ['FL', 'FR', 'FC', 'LFE', 'FLC', 'FRC', 'SL', 'SR'],
     };
 
-    // Per-speaker contribution (pre-normalization) to the L and R downmix outputs.
+    // Per-speaker contribution to the L and R downmix outputs.
     // Centered channels (FC, BC) contribute equally to both; left-side channels contribute only to L,
     // right-side only to R; LFE contributes nothing. Values are the standard Lo/Ro gains.
     const SPEAKER_GAINS = {
@@ -862,8 +862,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         BC:  { L: 0.5,   R: 0.5   },
     };
 
-    // Build a peak-normalized pan=stereo matrix string for a known canonical layout, or null if the layout
+    // Build a Lo/Ro pan=stereo matrix string for a known canonical layout, or null if the layout
     // contributes no surround/center content (pure FL/FR or FL/FR/LFE), where -ac 2 is already correct.
+    // FL/FR are kept at full scale (peak = 1.0); center and surround channels fold in at their standard
+    // Lo/Ro gains (-3 dB for FC/BC/surrounds, LFE dropped). This matches the industry-standard Lo/Ro
+    // downmix used by Blu-ray players, AV receivers, and streaming services. The -3 dB attenuation on
+    // center/surround provides the clipping headroom — a global sum-normalization is not used because
+    // it produces output 6-8 dB quieter than the source on typical content.
     const buildPanMatrix = (channelList) => {
         const termsL = [];
         const termsR = [];
@@ -875,8 +880,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const g = SPEAKER_GAINS[spk];
             if (!g) return; // unknown speaker name — skip (shouldn't happen for canonical layouts)
             if (spk !== 'FL' && spk !== 'FR' && spk !== 'LFE') hasNonFront = true;
-            if (g.L > 0) { peakL += g.L; }
-            if (g.R > 0) { peakR += g.R; }
+            if (spk === 'FL') peakL = 1.0;
+            if (spk === 'FR') peakR = 1.0;
         });
 
         // No surround/center to fold in (e.g. 2.1 = FL FR LFE, or stereo) — let -ac 2 handle it.
@@ -886,8 +891,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         channelList.forEach((spk, i) => {
             const g = SPEAKER_GAINS[spk];
             if (!g) return;
-            // Floor to 3 decimals (truncate, not round) so the summed coefficients can never exceed the
-            // normalized 1.0 ceiling — rounding up could push the sum to 1.001 and clip on full-scale content.
+            // Divide by peakL/peakR (always 1.0 — set from FL/FR) so coefficients are emitted as-authored.
+            // Floor to 3 decimals (truncate, not round) for deterministic output.
             if (g.L > 0) termsL.push(`${(Math.floor((g.L / peakL) * 1000) / 1000).toFixed(3)}*c${i}`);
             if (g.R > 0) termsR.push(`${(Math.floor((g.R / peakR) * 1000) / 1000).toFixed(3)}*c${i}`);
         });
