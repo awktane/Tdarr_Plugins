@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.18.3',
+    Version: '1.18.5',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -319,6 +319,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Opus uses true VBR (-vbr on) with -b:a as the target average and max compression_level for quality.
     // AAC/AC3/EAC3 use CBR via -b:a (AAC VBR is experimental; AC3/EAC3 are CBR-only fixed-preset codecs).
     // Returns '' for codecs we don't bitrate-manage. srcBps lets the target honour a higher source rate.
+    // Note: this unscoped form is not called directly — all transcode paths use encoderArgsIdx instead.
     const encoderArgs = (codec, channels, srcBps = 0) => {
         const bps = resolveBitrate(codec, channels, srcBps);
         if (bps <= 0) return '';
@@ -334,7 +335,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const bps = resolveBitrate(codec, channels, srcBps);
         if (bps <= 0) return '';
         if (codec === 'opus')
-            return ` -vbr on -compression_level:a:${idx} 10 -b:a:${idx} ${bps / 1000}k`;
+            return ` -vbr:a:${idx} on -compression_level:a:${idx} 10 -b:a:${idx} ${bps / 1000}k`;
         return ` -b:a:${idx} ${bps / 1000}k`;
     };
 
@@ -531,10 +532,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     let workDone = '';
     let convert = false;
 
+    // Input summary — the streams exactly as they arrived, before any audio work.
+    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(summariseStream).join('')}\n`;
+
     //We really only care about the audio streams
     let audioStreams = file.ffProbeData.streams.filter(stream => (stream?.codec_type ?? '').trim().toLowerCase() === 'audio');
     if (audioStreams.length === 0) {
-        response.infoLog += '☒ Video file has no audio streams to manage.\n';
+        response.infoLog += '☒Video file has no audio streams to manage.\n';
         return response;
     }
 
@@ -544,9 +548,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.processFile = false;
         return response;
     }
-
-    // Input summary — the streams exactly as they arrived, before any audio work.
-    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(summariseStream).join('')}\n`;
 
     const isSecondaryTrack = (stream) => {
         const title = String(stream.tags?.title || '').toLowerCase();
