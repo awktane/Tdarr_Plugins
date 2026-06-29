@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/signs/sdh/commentary) -> Attachments -> Data\n`,
-    Version: '1.8.0',
+    Version: '1.8.1',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -236,6 +236,48 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return info.score - penalty;
     }
 
+    // Build a single bracket token summarising one ffprobe stream for the input/output summary lines.
+    // Shared verbatim across all three awk plugins — keep byte-for-byte identical when editing.
+    // Shows: video codec; audio lang/channels/codec/bitrate(+role); subtitle lang/codec(+forced/role);
+    // data and attachment codec. Role/forced detection mirrors the sorting logic (disposition flags
+    // first, then title keywords) so every plugin's summary lines up. subrip is shown as srt to match
+    // the friendlier name used when this pipeline converts subtitles.
+    const summariseStream = (s) => {
+        const type = (s.codec_type || '').trim().toLowerCase();
+        let codec = (s.codec_name || 'unknown').trim().toLowerCase();
+        if (codec === 'subrip') codec = 'srt';
+        const title = (s.tags?.title || '').trim().toLowerCase();
+        const disp = s.disposition || {};
+        const langRaw = (s.tags?.language || 'und').trim().toLowerCase();
+        const lang = langRaw !== 'und' ? langRaw : '';
+        if (type === 'video')
+            return `[video:${codec}]`;
+        if (type === 'audio') {
+            const ch = s.channels ? `${s.channels}ch` : '';
+            const bitrate = Number(s.bit_rate || 0);
+            const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
+            const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
+            const descriptive = disp.visual_impaired === 1 || title.includes('description')
+                || title.includes('descriptive') || title.includes('dvs') || title.includes('narration');
+            const role = commentary ? '/commentary' : (descriptive ? '/description' : '');
+            return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${role}]`;
+        }
+        if (type === 'subtitle') {
+            const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
+            const sdh = disp.hearing_impaired === 1 || title.includes('sdh')
+                || title.includes('hearing impaired') || title.includes('deaf');
+            const signs = disp.karaoke === 1 || title.includes('signs') || title.includes('songs');
+            const role = commentary ? '/commentary' : (sdh ? '/sdh' : (signs ? '/signs' : ''));
+            const forced = disp.forced === 1 ? '/forced' : '';
+            return `[sub:${[lang, codec].filter(Boolean).join(' ')}${forced}${role}]`;
+        }
+        if (type === 'attachment')
+            return `[attach:${codec}]`;
+        if (type === 'data')
+            return `[data:${codec}]`;
+        return `[${type || 'unknown'}:${codec}]`;
+    };
+
     if(!['descending', 'ascending'].includes(inputs.channel_order)) {
         response.infoLog += '☒channel_order has not been configured, please configure required options.\n';
         response.processFile = false;
@@ -246,6 +288,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.processFile = false;
         return response;
     }
+
+    // Input summary — the streams exactly as they arrived, before re-ordering.
+    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(summariseStream).join('')}\n`;
 
     // VIDEO -> AUDIO -> SUBTITLE -> ATTACHMENT -> DATA -> OTHER?
     const streamOrder = { video: 0, audio: 1, subtitle: 2 , attachment: 3, data: 4};
@@ -400,34 +445,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return response;
     }
 
-    // Build a human-readable summary of the new stream order for easier debugging
-    const orderSummary = streams.map(s => {
-        if (s.type === 'video') {
-            const codec = s.stream.codec_name || 'unknown';
-            return `[video:${codec}]`;
-        } else if (s.type === 'audio') {
-            const codec = s.stream.codec_name || 'unknown';
-            const ch = s.channels ? `${s.channels}ch` : '';
-            const lang = s.lang !== 'und' ? s.lang : '';
-            // Measured bitrate from the probe (this plugin runs after any transcode, so it's a real
-            // value). Shown as kbps; omitted when the stream carries no bit_rate so the entry stays clean.
-            const bitrate = Number(s.stream.bit_rate || 0);
-            const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
-            const role = s.commentary ? '/commentary' : (s.descriptive ? '/description' : '');
-            return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${role}]`;
-        } else if (s.type === 'subtitle') {
-            const lang = s.lang !== 'und' ? s.lang : '';
-            const role = s.commentary ? '/commentary' : (s.sdh ? '/sdh' : (s.signs ? '/signs' : ''));
-            const forced = s.forced ? '/forced' : '';
-            return `[sub:${[lang].filter(Boolean).join(' ')}${forced}${role}]`;
-        }
-        return `[${s.type}]`;
-    }).join(' ');
-
     response.processFile = true;
     response.reQueueAfter = true;
     response.preset = `,${ffmpegMap} -c copy -max_muxing_queue_size 9999${networkDataOpt}`;
-    response.infoLog += `☒Streams are not in the correct order.\n☒New order: ${orderSummary}\n`;
+    response.infoLog += `☑Output streams: ${streams.map(s => summariseStream(s.stream)).join('')}\n`;
 
     return response;
 };
