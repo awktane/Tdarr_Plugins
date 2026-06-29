@@ -12,7 +12,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.13.8',
+    Version: '1.13.9',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -310,14 +310,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Audio plugins (audio_clean, stream_ordering) carry the whole block:
     //   codecInfo, codecAliases, unknownCodecs, resolveCodecName, audioQuality,
     //   the role/forced classifiers, resolveStreamBitrate, summariseStream, escMeta.
-    // clean_and_remux carries only the classifiers, resolveStreamBitrate,
-    // summariseStream, and escMeta (the codec-scoring half is audio-only).
+    // clean_and_remux carries only the audio-independent tail: the classifiers,
+    // resolveStreamBitrate, summariseStream, and escMeta (the codec-scoring half is audio-only).
     // =====================================================================
 
-    // Stream role/forced classifiers — shared verbatim across all three awk plugins. Each takes a raw
-    // ffprobe stream and returns a boolean from the disposition flag first, then title keywords, exactly
-    // as the sorting and summary logic expects. Consolidated here so summariseStream, the stream-ordering
-    // sort keys, and audio_clean's secondary-track detection all read from one definition.
+    /* -=-=-= Stream role/forced classifiers =-=-=- */
+    // Each takes a raw ffprobe stream and returns a boolean from the  disposition flag first, then title keywords, exactly as the sorting and summary logic expects.
+    // Consolidated here so summariseStream, the stream-ordering sort keys, and audio_clean's secondary-track detection all read from one definition.
+    // Shared verbatim across all three awk plugins.
     const streamTitleLower = (s) => (s.tags?.title || '').trim().toLowerCase();
     const isCommentary  = (s) => s.disposition?.comment === 1
         || ['commentary', 'producer'].some(k => streamTitleLower(s).includes(k));
@@ -328,10 +328,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const isSigns       = (s) => s.disposition?.karaoke === 1
         || ['signs', 'songs'].some(k => streamTitleLower(s).includes(k));
 
-    // Resolve the best available bitrate (bps) for a stream: ffprobe first, mediaInfo fallback.
-    // ffprobe cannot read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA
-    // in MP4/M4V), but mediaInfo decodes the substream headers and usually has it. Returns 0 if neither
-    // source has a value. Used to enrich stream objects before summariseStream or audioQuality sees them.
+    /* -=-=-= Resolve the best available bitrate (bps) for a stream =-=-=- */
+    // ffprobe first, mediaInfo fallback. ffprobe cannot read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V), 
+    // but mediaInfo decodes the substream headers and usually has it. Returns 0 if neither source has a value. Used to enrich stream objects before summariseStream or audioQuality sees them.
     const resolveStreamBitrate = (ffstream) => {
         const ffBitrate = Number(ffstream.bit_rate || 0);
         if (ffBitrate > 0) return ffBitrate;
@@ -339,12 +338,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return Number(ffmedia?.BitRate || 0);
     };
 
-    // Build a single bracket token summarising one ffprobe stream for the input/output summary lines.
-    // Shared verbatim across all three awk plugins — keep byte-for-byte identical when editing.
-    // Shows: video codec; audio lang/channels/codec/bitrate(+role); subtitle lang/codec(+forced/role);
-    // data and attachment codec. Role/forced detection mirrors the sorting logic (disposition flags
-    // first, then title keywords, via the shared classifiers) so every plugin's summary lines up. subrip
+    /* -=-=-= Build single token summarising one ffprobe stream for the input/output summary lines. =-=-=- */
+    // Shows: video codec; audio lang/channels/codec/bitrate(+role); subtitle lang/codec(+forced/role); data and attachment codec.
+    // Role/forced detection mirrors the sorting logic (disposition flags first, then title keywords, via the shared classifiers) so every plugin's summary lines up. subrip
     // is shown as srt to match the friendlier name used when this pipeline converts subtitles.
+    // Shared verbatim across all three awk plugins
     const summariseStream = (s) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
@@ -372,15 +370,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return `[${type || 'unknown'}:${codec}]`;
     };
 
-    // Sanitize a value before embedding it inside a double-quoted ffmpeg -metadata argument (e.g.
-    // -metadata:s:a:0 "title=..."). Tdarr does NOT pass the preset through a shell — it splits the string
-    // into a quote-aware argv array and hands it to child_process.spawn, so shell metacharacters ($ ` ; |)
-    // are inert and reach ffmpeg as literal metadata bytes. The only injection vector is breaking out of
-    // the quoted value to inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper)
-    // or a control character. Tdarr's tokenizer strips quotes with no reliable backslash-escape convention,
-    // so we substitute rather than strip: backslash → forward-slash (readable, inert), double-quote →
-    // single-quote (safe inside the quoted value; preserves titles like "Director's Cut" and "AC3/Stereo"),
-    // control characters → space (avoids fusing words that a bare delete would join).
+    /* -=-=-= Sanitize value for embedding inside a double quotes ffmpeg -metadata argument (e.g. -metadata:s:a:0 "title=...") =-=-=- */
+    // Tdarr does NOT pass the preset through a shell — it splits the string into a quote-aware argv array and hands it to child_process.spawn, so shell metacharacters ($ ` ; |)
+    // are inert and reach ffmpeg as literal metadata bytes. The only injection vector is breaking out of the quoted value to inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper)
+    // or a control character.
+    // Tdarr's tokenizer strips quotes with no reliable backslash-escape convention,  so we substitute rather than strip:
+    //    backslash          -> forward-slash (readable, inert)
+    //    double-quote       -> single-quote (safe inside the quoted value; preserves titles like "Director's Cut" and "AC3/Stereo")
+    //    control characters -> space (avoids fusing words that a bare delete would join).
     const escMeta = (value) => String(value || '')
         .replace(/[\x00-\x1f\x7f]/g, ' ')  // control characters (newlines, null bytes, etc.) → space
         .replace(/\\/g, '/')               // backslash → forward-slash (inert, readable)
