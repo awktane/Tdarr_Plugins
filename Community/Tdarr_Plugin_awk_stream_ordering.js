@@ -476,7 +476,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     response.processFile = true;
     response.reQueueAfter = true;
     response.preset = `,${ffmpegMap} -c copy -max_muxing_queue_size 9999${networkDataOpt}`;
-    response.infoLog += `☑Output streams: ${streams.map(s => summariseStream(s.stream)).join('')}\n`;
+    response.infoLog += `☑Expected results: ${streams.map(s => summariseStream(s.stream)).join('')}\n`;
 
     return response;
 };
