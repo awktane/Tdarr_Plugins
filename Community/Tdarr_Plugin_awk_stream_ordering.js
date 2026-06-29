@@ -109,7 +109,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // summariseStream, and escMeta (the codec-scoring half is audio-only).
     // =====================================================================
 
-    //Codecs and some values to help us score the quality so that we can pick the best track - some of these formats are not supported by ffmpeg yet (ac4)
+    //Codecs and some values to help us score the quality so that we can pick the best track - some of these formats are not supported by ffmpeg yet (ex: ac4)
     const codecInfo = {
         // Lossless
         pcm:        { score: 100, lossless: true },
