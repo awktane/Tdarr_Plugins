@@ -12,7 +12,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.13.6',
+    Version: '1.13.7',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -776,7 +776,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.preset += `${fflags},-map 0 -c copy${extraArguments} -max_muxing_queue_size 9999${networkDataOpt}`;
         response.infoLog += workDone;
         const outSummary = file.ffProbeData.streams
-            .map((s, idx) => ({ s, idx }))
+            .map((s, idx) => ({ s: { ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate }, idx }))
             .filter(({ idx }) => !removedIndices.has(idx))
             .map(({ s, idx }) => (subCodecOverride.has(idx) ? { ...s, codec_name: subCodecOverride.get(idx) } : s))
             .map(summariseStream).join('');
