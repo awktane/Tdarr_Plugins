@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.20.0',
+    Version: '1.20.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -203,10 +203,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     // =====================================================================
-    // SHARED BLOCK — keep byte-for-byte identical across all awk plugins
-    // that use audio quality scoring. Functions: codecInfo, codecAliases,
-    // unknownCodecs, audioQuality, resolveStreamBitrate, summariseStream.
-    // clean_and_remux carries only resolveStreamBitrate + summariseStream.
+    // SHARED BLOCK — keep byte-for-byte identical across all awk plugins.
+    // Audio plugins (audio_clean, stream_ordering) carry the whole block:
+    //   codecInfo, codecAliases, unknownCodecs, resolveCodecName, audioQuality,
+    //   the role/forced classifiers, resolveStreamBitrate, summariseStream, escMeta.
+    // clean_and_remux carries only the classifiers, resolveStreamBitrate,
+    // summariseStream, and escMeta (the codec-scoring half is audio-only).
     // =====================================================================
 
     //Codecs and some values to help us score the quality so that we can pick the best track - some of these formats are not supported by ffmpeg yet (ac4)
@@ -259,8 +261,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     ];
     const unknownCodecs = new Set();
 
-    // Audio quality scoring — must be declared after response so infoLog is available
-    const audioQuality = (stream) => {
+    // Resolve an ffprobe stream to its canonical codec key used by codecInfo. Applies the alias prefixes,
+    // maps dca->dts, then refines DTS into its HD MA / HR / Express subtype and eac3 into eac3atmos.
+    // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" — none of the subtype keywords
+    // — so longName alone can't distinguish the subtypes there; we also check the stream profile
+    // (e.g. "DTS-HD MA", "DTS-HD HRA", "DTS Express") and fall back to mediaInfo's Format_Commercial_IfAny
+    // (e.g. "DTS-HD Master Audio"), which decodes the substream header. Atmos rarely shows in long_name, so
+    // eac3 also checks the title tag and the commercial name. Shared by audioQuality and losslessSource.
+    const resolveCodecName = (stream) => {
         let codec = (stream?.codec_name || '').toLowerCase().trim();
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
 
@@ -272,15 +280,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         //Do this first as there's no harm checking for additional info in the longName
-        if(codec === 'dca')
+        if (codec === 'dca')
             codec = 'dts';
 
-        // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" which contains none of the
-        // subtype keywords, so longName alone cannot distinguish DTS-HD MA/HR/Express from DTS Core in those
-        // containers. Check profile next (e.g. "DTS-HD MA", "DTS-HD HRA", "DTS Express") then fall back to
-        // mediaInfo's Format_Commercial_IfAny (e.g. "DTS-HD Master Audio") which decodes the substream header.
-        const profile       = (stream.profile || '').toLowerCase().trim();
-        const commercial    = ((file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === stream.index)?.Format_Commercial_IfAny || '').toLowerCase();
+        const profile    = (stream.profile || '').toLowerCase().trim();
+        const commercial = ((file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === stream.index)?.Format_Commercial_IfAny || '').toLowerCase();
         if (codec === 'dts') {
             if      (longName.includes('master')          || profile.includes('hd ma')  || commercial.includes('master'))
                 codec = 'dtsma';
@@ -288,9 +292,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 codec = 'dtshr';
             else if (longName.includes('express')         || profile.includes('express')|| commercial.includes('express'))
                 codec = 'dtsexpress';
-        // codec_long_name rarely says "atmos"; also check the stream title tag and mediaInfo commercial name.
         } else if (codec === 'eac3' && (longName.includes('atmos') || (stream.tags?.title || '').toLowerCase().includes('atmos') || commercial.includes('atmos')))
             codec = 'eac3atmos';
+
+        return codec;
+    };
+
+    // Audio quality scoring — must be declared after response so infoLog is available
+    const audioQuality = (stream) => {
+        const codec = resolveCodecName(stream);
 
         //Check if we can't identify the codec. If we can't then notify once per codec
         if(!(codec in codecInfo) && !unknownCodecs.has(codec)) {
@@ -350,6 +360,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return info.score - penalty;
     }
 
+    // Stream role/forced classifiers — shared verbatim across all three awk plugins. Each takes a raw
+    // ffprobe stream and returns a boolean from the disposition flag first, then title keywords, exactly
+    // as the sorting and summary logic expects. Consolidated here so summariseStream, the stream-ordering
+    // sort keys, and audio_clean's secondary-track detection all read from one definition.
+    const streamTitleLower = (s) => (s.tags?.title || '').trim().toLowerCase();
+    const isCommentary  = (s) => s.disposition?.comment === 1
+        || ['commentary', 'producer'].some(k => streamTitleLower(s).includes(k));
+    const isDescriptive = (s) => s.disposition?.visual_impaired === 1
+        || ['description', 'descriptive', 'dvs', 'narration'].some(k => streamTitleLower(s).includes(k));
+    const isSdh         = (s) => s.disposition?.hearing_impaired === 1
+        || ['sdh', 'hearing impaired', 'deaf'].some(k => streamTitleLower(s).includes(k));
+    const isSigns       = (s) => s.disposition?.karaoke === 1
+        || ['signs', 'songs'].some(k => streamTitleLower(s).includes(k));
+
     // Resolve the best available bitrate (bps) for a stream: ffprobe first, mediaInfo fallback.
     // ffprobe cannot read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA
     // in MP4/M4V), but mediaInfo decodes the substream headers and usually has it. Returns 0 if neither
@@ -365,14 +389,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Shared verbatim across all three awk plugins — keep byte-for-byte identical when editing.
     // Shows: video codec; audio lang/channels/codec/bitrate(+role); subtitle lang/codec(+forced/role);
     // data and attachment codec. Role/forced detection mirrors the sorting logic (disposition flags
-    // first, then title keywords) so every plugin's summary lines up. subrip is shown as srt to match
-    // the friendlier name used when this pipeline converts subtitles.
+    // first, then title keywords, via the shared classifiers) so every plugin's summary lines up. subrip
+    // is shown as srt to match the friendlier name used when this pipeline converts subtitles.
     const summariseStream = (s) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
         if (codec === 'subrip') codec = 'srt';
-        const title = (s.tags?.title || '').trim().toLowerCase();
-        const disp = s.disposition || {};
         const langRaw = (s.tags?.language || 'und').trim().toLowerCase();
         const lang = langRaw !== 'und' ? langRaw : '';
         if (type === 'video')
@@ -381,17 +403,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const ch = s.channels ? `${s.channels}ch` : '';
             const bitrate = Number(s.bit_rate || 0);
             const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
-            const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
-            const descriptive = disp.visual_impaired === 1 || title.includes('description') || title.includes('descriptive') || title.includes('dvs') || title.includes('narration');
-            const role = commentary ? '/commentary' : (descriptive ? '/description' : '');
+            const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : '');
             return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${role}]`;
         }
         if (type === 'subtitle') {
-            const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
-            const sdh = disp.hearing_impaired === 1 || title.includes('sdh') || title.includes('hearing impaired') || title.includes('deaf');
-            const signs = disp.karaoke === 1 || title.includes('signs') || title.includes('songs');
-            const role = commentary ? '/commentary' : (sdh ? '/sdh' : (signs ? '/signs' : ''));
-            const forced = disp.forced === 1 ? '/forced' : '';
+            const role = isCommentary(s) ? '/commentary' : (isSdh(s) ? '/sdh' : (isSigns(s) ? '/signs' : ''));
+            const forced = s.disposition?.forced === 1 ? '/forced' : '';
             return `[sub:${[lang, codec].filter(Boolean).join(' ')}${forced}${role}]`;
         }
         if (type === 'attachment')
@@ -400,6 +417,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return `[data:${codec}]`;
         return `[${type || 'unknown'}:${codec}]`;
     };
+
+    // Sanitize a value before embedding it inside a double-quoted ffmpeg -metadata argument (e.g.
+    // -metadata:s:a:0 "title=..."). Tdarr does NOT pass the preset through a shell — it splits the string
+    // into a quote-aware argv array and hands it to child_process.spawn, so shell metacharacters ($ ` ; |)
+    // are inert and reach ffmpeg as literal metadata bytes. The only injection vector is breaking out of
+    // the quoted value to inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper)
+    // or a control character. Tdarr's tokenizer strips quotes with no reliable backslash-escape convention,
+    // so rather than escape we remove the breakout characters (double quotes, backslashes) and all control
+    // characters outright. Spaces and any other printable text remain safe inside the kept quoted value.
+    const escMeta = (value) => String(value || '')
+        .replace(/[\x00-\x1f\x7f]/g, '')   // strip control characters (newlines, null bytes, etc.)
+        .replace(/[\\"]/g, '');            // remove backslashes and double quotes (argument-breakout chars)
 
     // =====================================================================
     // END SHARED BLOCK
@@ -510,29 +539,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { encoder: 'libfdk_aac', args: ` -vbr:a:${idx} ${vbrLevel}`, approxRate };
     };
 
-    // Resolve whether a source stream is lossless by running the same codec-family resolution used by
-    // audioQuality. Stored per-stream as isTdarrLossless to avoid repeating the resolution at emission.
+    // Resolve whether a source stream is lossless using the shared resolveCodecName resolution (same one
+    // audioQuality uses). Stored per-stream as isTdarrLossless to avoid repeating the resolution at emission.
     // Used only by force_codec to gate the source-bitrate floor in resolveBitrate — downmix paths don't
     // pass a source bitrate so they are unaffected regardless of this flag.
-    const losslessSource = (stream) => {
-        let codec = (stream?.codec_name || '').toLowerCase().trim();
-        const longName = (stream.codec_long_name || '').toLowerCase().trim();
-        for (const [prefix, replacement] of codecAliases) {
-            if (codec.startsWith(prefix)) { codec = replacement; break; }
-        }
-        if (codec === 'dca') codec = 'dts';
-        if (codec === 'dts') {
-            const profile    = (stream.profile || '').toLowerCase().trim();
-            const commercial = ((file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === stream.index)?.Format_Commercial_IfAny || '').toLowerCase();
-            if (longName.includes('master') || profile.includes('hd ma') || commercial.includes('master'))
-                codec = 'dtsma';
-            else if (longName.includes('high resolution') || profile.includes('hra') || commercial.includes('high resolution'))
-                codec = 'dtshr';
-            else if (longName.includes('express') || profile.includes('express') || commercial.includes('express'))
-                codec = 'dtsexpress';
-        }
-        return codecInfo[codec]?.lossless === true;
-    };
+    const losslessSource = (stream) => codecInfo[resolveCodecName(stream)]?.lossless === true;
 
     //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
     const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
@@ -616,22 +627,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return response;
     }
 
-    const isSecondaryTrack = (stream) => {
-        const title = String(stream.tags?.title || '').toLowerCase();
-        const disposition = stream.disposition || {};
-        return (
-            disposition.comment === 1 || 
-            disposition.visual_impaired === 1 ||
-            disposition.karaoke === 1 ||
-            title.includes('commentary') ||
-            title.includes('producer') ||
-            title.includes('description') ||
-            title.includes('descriptive') ||
-            title.includes('dvs') ||
-            title.includes('narration') ||
-            title.includes('signs') ||
-            title.includes('songs'));
-    };
+    // A secondary track is any commentary, visually-impaired/descriptive, or signs/songs track — the
+    // shared classifiers cover both the disposition flags and the title keywords.
+    const isSecondaryTrack = (stream) => isCommentary(stream) || isDescriptive(stream) || isSigns(stream);
 
     //Add secondary track flag and the cleaned language to each track
     audioStreams = audioStreams.map(item => {
@@ -827,13 +825,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (new RegExp(`(?:^|[^0-9.])${escapedLabel}$`).test(origTitle)) return origTitle;
         return `${origTitle} -> ${targetLabel}`;
     };
-    // Sanitize a value before embedding it inside a double-quoted ffmpeg -metadata argument. Tdarr splits the preset into an argv array (no shell) and feeds it to spawn, so shell
-    // metacharacters are inert — the only injection vector is breaking out of the quoted value to inject a new ffmpeg argument, which needs a double quote or control character. Tdarr's
-    // tokenizer strips quotes with no reliable backslash-escape convention, so we remove the breakout characters (double quotes, backslashes) and control characters outright rather
-    // than escape them. Spaces and other printable text are safe inside the kept quoted value.
-    const escTitle = (t) => String(t || '')
-        .replace(/[\x00-\x1f\x7f]/g, '')    // strip control characters (newlines, null bytes, etc.)
-        .replace(/[\\"]/g, '');             // remove backslashes and double quotes (argument-breakout chars)
 
     // Lo/Ro stereo downmix matrices, generated from each source layout's exact channel order.
     //
@@ -975,14 +966,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Each secondary surround track is transcoded in place independently — one stereo per secondary track, preserving all of them. keep_best_surround_safe never protects
             // secondary or lang-secondary tracks (they are excluded from protectedIndices), so there is no protected-source case here: an enabled secondary downmix always transcodes in place.
             if (downmixSecondaryStereo !== 'false' && ffstream.channels > 2 && !modifiedAudioIdx.has(outputAudioIdx)) {
-                const newTitle = escTitle(buildTitle(ffstream, '2.0'));
+                const newTitle = escMeta(buildTitle(ffstream, '2.0'));
                 // Downmix changes channel count, so the source bitrate isn't a comparable floor — use the table target for 2ch only.
                 // aac_vbr downmixes always use VBR 5 since there is no comparable stereo source bitrate.
                 if (stereoCodec === 'aac_vbr') {
                     const { encoder, args, approxRate } = aacVbrArgsIdx(outputAudioIdx);
                     workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → aac stereo @ ${approxRate} (libfdk VBR q5, secondary)\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
-                    if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
+                    if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: 2, bps: 0, approxRate });
                 } else {
@@ -990,7 +981,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const dstBitStr = resolveBitrate(stereoCodec, 2);
                     workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${stereoCodec} stereo @ ${dstBitStr / 1000} kb/s (secondary)\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${dstBitArg}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
-                    if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
+                    if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     outputAudioOverride.set(outputAudioIdx, { codec: stereoCodec, channels: 2, bps: dstBitStr });
                 }
@@ -1001,7 +992,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // One 6ch per language, from its best >6ch source. A protected best source is never replaced in place, so 'replace' becomes 'add' for it.
             if (downmixToSix !== 'false' && ffstream.channels > 6 && !created6chLangs.has(ffstreamLangKey)
                 && !existingSixLangs.has(ffstreamLangKey)) {
-                const newTitle = escTitle(buildTitle(ffstream, '5.1'));
+                const newTitle = escMeta(buildTitle(ffstream, '5.1'));
                 const sixMode = (downmixToSix === 'replace' && isProtected) ? 'true' : downmixToSix;
 
                 if (sixMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
@@ -1009,7 +1000,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const dstBitStr = resolveBitrate(surroundCodec, 6);
                     workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${surroundCodec}${dstBitArg} -ac:a:${outputAudioIdx} 6 -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
-                    if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
+                    if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     outputAudioOverride.set(outputAudioIdx, { codec: surroundCodec, channels: 6, bps: dstBitStr });
                     created6chLangs.add(ffstreamLangKey);
@@ -1019,7 +1010,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const dstBitStr = resolveBitrate(surroundCodec, 6);
                     workDone += `☐Stream ${ffstream.index}: Adding ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
                     extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${surroundCodec}${dstBitArg} -ac:a:${newStreamOutputIdx} 6 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
-                    if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escTitle(streamLang)}"`;
+                    if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
                     newStreamOutputIdx++;
                     appendedAudio.push({ srcStream: ffstream, codec: surroundCodec, channels: 6, bps: dstBitStr });
                     created6chLangs.add(ffstreamLangKey);
@@ -1036,13 +1027,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const twoMode = (downmixToTwo === 'replace' && isProtected) ? 'true' : downmixToTwo;
 
                 if (twoMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
-                    const newTitle = escTitle(buildTitle(ffstream, '2.0'));
+                    const newTitle = escMeta(buildTitle(ffstream, '2.0'));
                     // aac_vbr downmixes always use VBR 5 — source is surround, its bitrate describes N channels not 2.
                     if (stereoCodec === 'aac_vbr') {
                         const { encoder, args, approxRate } = aacVbrArgsIdx(outputAudioIdx);
                         workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → aac stereo @ ${approxRate} (libfdk VBR q5)\n`;
                         extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
-                        if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
+                        if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(streamLang)}"`;
                         modifiedAudioIdx.add(outputAudioIdx);
                         outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: 2, bps: 0, approxRate });
                     } else {
@@ -1050,20 +1041,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         const dstBitStr = resolveBitrate(stereoCodec, 2);
                         workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${stereoCodec} stereo @ ${dstBitStr / 1000} kb/s\n`;
                         extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${dstBitArg}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
-                        if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escTitle(streamLang)}"`;
+                        if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(streamLang)}"`;
                         modifiedAudioIdx.add(outputAudioIdx);
                         outputAudioOverride.set(outputAudioIdx, { codec: stereoCodec, channels: 2, bps: dstBitStr });
                     }
                     created2chLangs.add(ffstreamLangKey);
                     convert = true;
                 } else if (twoMode === 'true' || (twoMode === 'replace' && modifiedAudioIdx.has(outputAudioIdx))) {
-                    const newTitle = escTitle(buildTitle(ffstream, '2.0'));
+                    const newTitle = escMeta(buildTitle(ffstream, '2.0'));
                     // aac_vbr downmixes always use VBR 5 — source is surround, its bitrate describes N channels not 2.
                     if (stereoCodec === 'aac_vbr') {
                         const { encoder, args, approxRate } = aacVbrArgsIdx(newStreamOutputIdx);
                         workDone += `☐Stream ${ffstream.index}: Adding aac stereo @ ${approxRate} (libfdk VBR q5) from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
                         extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${encoder}${args}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
-                        if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escTitle(streamLang)}"`;
+                        if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
                         newStreamOutputIdx++;
                         appendedAudio.push({ srcStream: ffstream, codec: 'aac', channels: 2, bps: 0, approxRate });
                     } else {
@@ -1071,7 +1062,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         const dstBitStr = resolveBitrate(stereoCodec, 2);
                         workDone += `☐Stream ${ffstream.index}: Adding ${stereoCodec} stereo @ ${dstBitStr / 1000} kb/s from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
                         extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec}${dstBitArg}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
-                        if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escTitle(streamLang)}"`;
+                        if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
                         newStreamOutputIdx++;
                         appendedAudio.push({ srcStream: ffstream, codec: stereoCodec, channels: 2, bps: dstBitStr });
                     }
@@ -1143,6 +1134,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // approxRate string pre-formatted as the bit_rate field so the bracket token shows e.g. ~192k.
     const buildOutputSummary = () => {
         const tokens = [];
+        // Build an audio token for a VBR override/append, where the rate is an approximate string
+        // (e.g. '~192k') rather than a number summariseStream can format. Role comes from the shared
+        // classifiers on the original source stream.
+        const vbrAudioToken = (srcStream, channels, codec, approxRate) => {
+            const lang = (srcStream.tags?.language || '').trim().toLowerCase();
+            const langStr = (lang && lang !== 'und') ? lang : '';
+            const role = isCommentary(srcStream) ? '/commentary' : (isDescriptive(srcStream) ? '/description' : '');
+            return `[audio:${[langStr, `${channels}ch`, codec, approxRate].filter(Boolean).join(' ')}${role}]`;
+        };
         for (const s of file.ffProbeData.streams) {
             const enriched = { ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate };
             if ((s?.codec_type || '').trim().toLowerCase() === 'audio') {
@@ -1150,20 +1150,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const ov = outputAudioOverride.get(outputAudioIdxMap.get(s.index));
                 if (ov) {
                     // approxRate carries the VBR display string (e.g. '~192k'); bps===0 flags this.
-                    // summariseStream reads bit_rate numerically, so we pass 0 and inject approxRate
-                    // via a synthetic tag that summariseStream won't touch — instead we build the
-                    // token manually for VBR overrides to show the tilde-prefixed approximate rate.
+                    // summariseStream reads bit_rate numerically, so VBR overrides build the token via
+                    // vbrAudioToken to show the tilde-prefixed approximate rate instead.
                     if (ov.approxRate) {
-                        const lang = (s.tags?.language || '').trim().toLowerCase();
-                        const langStr = (lang && lang !== 'und') ? lang : '';
-                        const role = (() => {
-                            const title = (s.tags?.title || '').trim().toLowerCase();
-                            const disp = s.disposition || {};
-                            const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
-                            const descriptive = disp.visual_impaired === 1 || title.includes('description') || title.includes('descriptive') || title.includes('dvs') || title.includes('narration');
-                            return commentary ? '/commentary' : (descriptive ? '/description' : '');
-                        })();
-                        tokens.push(`[audio:${[langStr, `${ov.channels}ch`, ov.codec, ov.approxRate].filter(Boolean).join(' ')}${role}]`);
+                        tokens.push(vbrAudioToken(s, ov.channels, ov.codec, ov.approxRate));
                     } else {
                         tokens.push(summariseStream({ ...enriched, codec_name: ov.codec, channels: ov.channels, bit_rate: ov.bps }));
                     }
@@ -1175,16 +1165,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         for (const a of appendedAudio) {
             if (a.approxRate) {
-                const lang = (a.srcStream.tags?.language || '').trim().toLowerCase();
-                const langStr = (lang && lang !== 'und') ? lang : '';
-                const role = (() => {
-                    const title = (a.srcStream.tags?.title || '').trim().toLowerCase();
-                    const disp = a.srcStream.disposition || {};
-                    const commentary = disp.comment === 1 || title.includes('commentary') || title.includes('producer');
-                    const descriptive = disp.visual_impaired === 1 || title.includes('description') || title.includes('descriptive') || title.includes('dvs') || title.includes('narration');
-                    return commentary ? '/commentary' : (descriptive ? '/description' : '');
-                })();
-                tokens.push(`[audio:${[langStr, `${a.channels}ch`, a.codec, a.approxRate].filter(Boolean).join(' ')}${role}]`);
+                tokens.push(vbrAudioToken(a.srcStream, a.channels, a.codec, a.approxRate));
             } else {
                 tokens.push(summariseStream({ ...a.srcStream, codec_name: a.codec, channels: a.channels, bit_rate: a.bps }));
             }
