@@ -12,7 +12,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.13.4',
+    Version: '1.13.5',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -318,6 +318,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return title;
     }    
 
+    // =====================================================================
+    // SHARED BLOCK — keep byte-for-byte identical across all awk plugins.
+    // clean_and_remux carries only resolveStreamBitrate + summariseStream.
+    // stream_ordering and audio_clean also include codecInfo, codecAliases,
+    // unknownCodecs, and audioQuality preceding these two functions.
+    // =====================================================================
+
     // Resolve the best available bitrate (bps) for a stream: ffprobe first, mediaInfo fallback.
     // ffprobe cannot read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA
     // in MP4/M4V), but mediaInfo decodes the substream headers and usually has it. Returns 0 if neither
@@ -370,6 +377,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return `[data:${codec}]`;
         return `[${type || 'unknown'}:${codec}]`;
     };
+
+    // =====================================================================
+    // END SHARED BLOCK
+    // =====================================================================
 
     // Check if file is a video. If it isn't then exit plugin.
     if (file.fileMedium !== 'video') {
