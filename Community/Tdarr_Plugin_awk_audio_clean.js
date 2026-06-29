@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.18.1',
+    Version: '1.18.2',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -932,13 +932,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const targetMaxCh = ({ ac3: 6, eac3: 6, aac: 8, opus: 8 })[targetCodec] ?? 8;
 
                     if (shouldForce && ffstream.channels > targetMaxCh) {
-                        workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodec} - ${ffstreamCodec} @ ${srcRateStr} is ${ffstream.channels}ch which exceeds the ${targetMaxCh}ch limit for ${targetCodec}. Enable downmix_to_six to reduce channels first.\n`;
+                        workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodec} - ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} exceeds the ${targetMaxCh}ch limit for ${targetCodec}. Enable downmix_to_six to reduce channels first.\n`;
                     } else if (shouldForce) {
                         // Same channel count, codec swap only — honour the source bitrate as a floor so a
                         // high-bitrate source isn't needlessly degraded (capped at the codec ceiling inside resolveBitrate).
                         const dstBitArg = encoderArgsIdx(targetCodec, ffstream.channels, outputAudioIdx, srcBitrate);
                         const dstBitStr = resolveBitrate(targetCodec, ffstream.channels, srcBitrate);
-                        workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstreamCodec} @ ${srcRateStr} → ${targetCodec} ${ffstream.channels}ch @ ${dstBitStr / 1000} kb/s\n`;
+                        workDone += `☒Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${targetCodec} ${ffstream.channels}ch @ ${dstBitStr / 1000} kb/s\n`;
                         extraArguments += ` -c:a:${outputAudioIdx} ${targetCodec}${dstBitArg}`;
                         modifiedAudioIdx.add(outputAudioIdx);
                         convert = true;
