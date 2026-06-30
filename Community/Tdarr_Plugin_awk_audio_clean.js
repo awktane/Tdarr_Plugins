@@ -128,7 +128,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['aac','ac3','eac3','opus'],
             },
-            tooltip: `Specify codec for newly created surround tracks. Note that both AC3 and EAC3 are limited to 6 channels by ffmpeg's encoder, so tracks with more than 6 channels will not be transcoded to either even if force_codec is applied. Opus supports up to 8 channels.`,
+            tooltip: `Specify codec for newly created surround tracks. Note that both AC3 and EAC3 are limited to 6 channels (5.1) by ffmpeg's native encoders. Opus supports up to 8 channels.`,
         },
         {
             name: 'stereo_codec',
