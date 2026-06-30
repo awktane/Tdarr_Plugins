@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.22.0',
+    Version: '1.22.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -255,6 +255,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         adpcm:      { score: 60,  minimum: 128000,  transparent: 256000 },
         cook:       { score: 58,  minimum: 64000,   transparent: 128000 }
     };
+    // Prefix → canonical codec key (e.g. wmav1 → wma).
     const codecAliases = [
         ['pcm_',   'pcm'],
         ['adpcm',  'adpcm'],
