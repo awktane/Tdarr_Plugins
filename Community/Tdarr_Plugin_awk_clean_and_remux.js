@@ -12,7 +12,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.13.9',
+    Version: '1.13.10',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -691,8 +691,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // 'other' - unidentifiable attachment, leave it untouched (see attachmentKind).
             } else if ((ffstreamType === 'data') || ['data','bin_data','tmcd'].includes(ffstreamCodec)) {
                 workDone += `☐Remove stream ${i} - data stream (${ffstreamType}-${ffstreamCodec})\n`;
-                extraArguments += ` -map -0:${i}`;
-                removedIndices.add(i);
+                extraArguments += ` -map -0:${ffstream.index}`;
+                removedIndices.add(ffstream.index);
                 convert = true;
                 continue;
             }
@@ -719,11 +719,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             && ['ass', 'ssa'].includes((s.codec_name || '').toLowerCase()));
 
         if (!fontsNeeded) {
-            for (const i of deferredFontIndices) {
-                const fname = (file.ffProbeData.streams[i]?.tags?.filename || '').trim();
-                workDone += `☐Remove stream ${i} - orphaned font attachment (no ASS/SSA subtitle uses it)${fname ? ` "${fname}"` : ''}\n`;
-                extraArguments += ` -map -0:${i}`;
-                removedIndices.add(i);
+            for (const idx of deferredFontIndices) {
+                const fontStream = file.ffProbeData.streams.find(s => s.index === idx);
+                const fname = (fontStream?.tags?.filename || '').trim();
+                workDone += `☐Remove stream ${idx} - orphaned font attachment (no ASS/SSA subtitle uses it)${fname ? ` "${fname}"` : ''}\n`;
+                extraArguments += ` -map -0:${idx}`;
+                removedIndices.add(idx);
                 convert = true;
             }
         }
