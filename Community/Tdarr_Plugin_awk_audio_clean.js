@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.22.1',
+    Version: '1.22.2',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -364,18 +364,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
 
     /* -=-=-= Stream role/forced classifiers =-=-=- */
-    // Each takes a raw ffprobe stream and returns a boolean from the  disposition flag first, then title keywords, exactly as the sorting and summary logic expects.
-    // Consolidated here so summariseStream, the stream-ordering sort keys, and audio_clean's secondary-track detection all read from one definition.
+    // Each classifier returns true when the stream carries the disposition flag OR its title contains
+    // one of the keywords. All keyword/label data lives in the single dispositionTypes table below so
+    // the lists never drift; summariseStream, the stream-ordering sort keys, audio_clean's
+    // secondary-track detection, and clean_and_remux's title tagging all read from it.
     // Shared verbatim across all three awk plugins.
+    const dispositionTypes = {
+        comment:          { keywords: ['commentary', 'producer'],          label: 'Commentary' },
+        visual_impaired:  { keywords: ['descriptive', 'dvs', 'narration'], label: 'Descriptive' },
+        hearing_impaired: { keywords: ['sdh', 'hearing impaired', 'deaf'], label: 'SDH' },
+        karaoke:          { keywords: ['signs', 'songs'],                  label: 'Signs' },
+        forced:           { keywords: ['forced'],                          label: 'Forced' },
+        default:          { keywords: ['default'],                         label: 'Default' },
+        dub:              { keywords: ['dub', 'dubbed'],                   label: 'Dub' },
+        original:         { keywords: ['original'],                        label: 'Original' },
+    };
     const streamTitleLower = (s) => (s.tags?.title || '').trim().toLowerCase();
-    const isCommentary  = (s) => s.disposition?.comment === 1
-        || ['commentary', 'producer'].some(k => streamTitleLower(s).includes(k));
-    const isDescriptive = (s) => s.disposition?.visual_impaired === 1
-        || ['descriptive', 'dvs', 'narration'].some(k => streamTitleLower(s).includes(k));
-    const isSdh         = (s) => s.disposition?.hearing_impaired === 1
-        || ['sdh', 'hearing impaired', 'deaf'].some(k => streamTitleLower(s).includes(k));
-    const isSigns       = (s) => s.disposition?.karaoke === 1
-        || ['signs', 'songs'].some(k => streamTitleLower(s).includes(k));
+    const hasDisposition = (s, key) => s.disposition?.[key] === 1
+        || (dispositionTypes[key]?.keywords || []).some(k => streamTitleLower(s).includes(k));
+    const isCommentary  = (s) => hasDisposition(s, 'comment');
+    const isDescriptive = (s) => hasDisposition(s, 'visual_impaired');
+    const isSdh         = (s) => hasDisposition(s, 'hearing_impaired');
+    const isSigns       = (s) => hasDisposition(s, 'karaoke');
 
     /* -=-=-= Resolve the best available bitrate (bps) for a stream =-=-=- */
     // ffprobe first, mediaInfo fallback. ffprobe cannot read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V), 
