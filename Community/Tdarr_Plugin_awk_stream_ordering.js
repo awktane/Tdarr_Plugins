@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/signs/sdh/commentary) -> Attachments -> Data\n`,
-    Version: '1.9.6',
+    Version: '1.9.7',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -151,7 +151,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         adpcm:      { score: 60,  minimum: 128000,  transparent: 256000 },
         cook:       { score: 58,  minimum: 64000,   transparent: 128000 }
     };
-    //Any codec starting with the first term will return the second term. This is to compound things like wmav1 and wmav2 into wma as en example.
+    // Prefix → canonical codec key (e.g. wmav1 → wma).
     const codecAliases = [
         ['pcm_',   'pcm'],
         ['adpcm',  'adpcm'],
@@ -197,7 +197,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     /* -=-=-= Audio Quality Scoring =-=-=- */
     // With a given stream attempts to return a scoring of the quality to aid in the identification of the "best" stream. This scoring is based off of
-    // codec and bitrate compared to transparent bitrate
+    // codec and bitrate compared to transparent bitrate. Must be declared after response so infoLog is available.
     const audioQuality = (stream) => {
         const codec = resolveCodecName(stream);
 
@@ -388,25 +388,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             audioquality: streamType === 'audio' ? audioQuality(enrichedStream) : 0,
             default: ffstream?.disposition?.default === 1,
 
-            // simple classification (no helper functions)
-            commentary: ffstream?.disposition?.comment === 1 ||
-                        streamTitle.includes('commentary') ||
-                        streamTitle.includes('producer'),
-
-            descriptive:  ffstream?.disposition?.visual_impaired === 1 ||
-                          streamTitle.includes('description') ||
-                          streamTitle.includes('descriptive') ||
-                          streamTitle.includes('dvs') ||
-                          streamTitle.includes('narration'),
-
-            sdh: ffstream?.disposition?.hearing_impaired === 1 ||
-                 streamTitle.includes('sdh') ||
-                 streamTitle.includes('hearing impaired') ||
-                 streamTitle.includes('deaf'),
-
-            signs: ffstream?.disposition?.karaoke === 1 ||
-                   streamTitle.includes('signs') ||
-                   streamTitle.includes('songs'),
+            // Role classification via the shared classifiers (single source of truth — keeps the sort and the summary line in agreement).
+            commentary: isCommentary(ffstream),
+            descriptive: isDescriptive(ffstream),
+            sdh: isSdh(ffstream),
+            signs: isSigns(ffstream),
 
             mjpeg: (ffstream.codec_name || '').trim().toLowerCase() === 'mjpeg',
         });
