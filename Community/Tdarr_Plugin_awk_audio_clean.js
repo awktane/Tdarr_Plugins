@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.20.4',
+    Version: '1.21.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -32,7 +32,7 @@ const details = () => ({
             defaultValue: 'false',
             inputUI: {
                 type: 'dropdown',
-                options: ['false','replace','true'],
+                options: ['false', 'replace', 'true'],
             },
             tooltip: `Specify if we should downmix a 5.1 track if one doesn't already exist from the best quality higher channel track for that language (from downmix_language if specified) that is not a secondary track (unlisted language, commentary, descriptive, etc).
                 \\nIf a 5.1 track for the same language already exists or if no higher channel track exists then no new 6 channel track is created.
@@ -49,7 +49,7 @@ const details = () => ({
             defaultValue: 'false',
             inputUI: {
                 type: 'dropdown',
-                options: ['false','replace','true'],
+                options: ['false', 'replace', 'true'],
             },
             tooltip: `Specify if we should downmix a 2 channel track if one doesn't already exist from the best quality higher channel track for that language that is not a secondary track (commentary, descriptive, etc). If no higher channel track exists no work is done.
                 \\nIf a stereo track for the same language already exists or if no higher channel track exists then no new stereo channel track is created.
@@ -66,7 +66,7 @@ const details = () => ({
             defaultValue: 'false',
             inputUI: {
                 type: 'dropdown',
-                options: ['false','true'],
+                options: ['false', 'true'],
             },
             tooltip: `Should commentary, visual impaired tracks, and other secondary tracks be downmixed to stereo? Unlike the primary downmix options, each surround secondary track is transcoded in place to stereo independently — one stereo per secondary track, preserving all of them. This would normally be false.
                 \nThese tracks are never protected by keep_best_surround_safe, so an enabled secondary downmix always transcodes them in place.
@@ -77,29 +77,30 @@ const details = () => ({
                 \\nIf true  - each secondary track with more than 2 channels is transcoded in place to a stereo stereo_codec track (using the stereo_downmix matrix).`,
         },
         {
-            name: 'remove_duplicates',
+            name: 'remove_duplicates_by',
             type: 'string',
-            defaultValue: 'false',
+            defaultValue: 'disabled',
             inputUI: {
                 type: 'dropdown',
-                options: ['false','clean','true'],
+                options: ['disabled', 'type', 'channel'],
             },
-            tooltip: `If true then one track is allowed per channel count, language, and type (commentary, descriptive, etc). The highest quality stream in each group is kept and the rest are removed. Any stream newly created by downmix_to_six or downmix_to_stereo would also be kept.
-                \\nAssuming the example stream below
-                \\nExample:\\n
-                22.2 english mpegh3d, 7.1 english aac, 7.1 english flac, 5.1 french aac, 2.0 french truehd, 2.0 french aac, 2.0 english ac3, 2.0 english mp3, 5.1 english aac commentary
-                \\nIf clean results will be as seen below - assuming downmix_to_stereo is true, downmix_language is set to 'eng,en', keep_best_surround_safe is set to 'quality', force_codec is set to '6below', downmix_secondary_stereo is true
-                \\nExample:\\n
-                7.1 english flac (orig), 5.1 french aac (orig), 2.0 french aac (from truehd track), 2.0 english aac (from ac3), 5.1 english aac commentary (orig->stereo), 2.0 english aac commentary (from 5.1 commentary)
-                \\nIf clean results will be as seen below - assuming downmix_to_six is replace, downmix_to_stereo is replace, downmix_language is set to 'eng,en', force_codec is set to 'all', downmix_secondary_stereo is true, keep_best_surround_safe is false
-                \\nExample:\\n
-                5.1 english aac (from 7.1 flac), 2.0 french aac (from truehd track), 2.0 english aac (from ac3 track), 2.0 english aac commentary (from 5.1 commentary)
-                \\nIf true results will be as seen below - assuming default options
-                \\nExample:\\n
-                22.2 english mpegh3d, 7.1 english flac, 5.1 french aac, 2.0 french truehd, 2.0 english ac3, 5.1 english aac commentary
-                \\nIf false results will be as seen below 
-                \\nExample:\\n
-                22.2 english mpegh3d, 7.1 english aac, 7.1 english flac, 5.1 french aac, 2.0 french truehd, 2.0 french aac, 2.0 english ac3, 2.0 english mp3, 5.1 english aac commentary`,
+            tooltip: `If enabled then duplicate audio tracks (same language, same broad role) are reduced down to the highest quality option(s). Any stream newly created by downmix_to_six or downmix_to_stereo is always kept and is never collapsed against a different channel count it was created alongside (see below).
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nIf disabled - no streams are removed for being duplicates. Every track is left exactly as found.
+                \\nIf type     - one track per language is kept for each of two broad roles: "surround" (more than 2 channels) and "stereo" (2 or fewer channels). The highest quality track in each role wins; the rest in that role are removed.
+                       \\nException: if downmix_to_six is enabled, the 5.1/5.0 band (5-6 channels) is kept as its own separate role rather than folded into "surround" - so a downmix-created 6 channel track is never compared against, and removed in favour of, a higher channel track like a 7.1.
+                       \\nException: if downmix_to_stereo is enabled, exactly 2 channel tracks are kept as their own separate role rather than folded into "stereo" - so a downmix-created 2.0 track is never compared against, and removed in favour of, a mono track.
+                       \\nThese exceptions only apply while the matching downmix option is enabled, matching what that option would have created or kept anyway.
+                \\nIf channel  - one track per language is kept for each distinct channel count (2.0, 5.1, 7.1, etc are each their own group). The highest quality track in each channel count wins; the rest sharing that exact channel count are removed.
+                \\n=====
+                \\nExample\\n
+                \\n=====
+                \\nA file has these English tracks: 7.1 aac, 5.1 truehd, 2.0 ac3, 2.0 mp3
+                \\nIf channel - keeps 7.1 aac, 5.1 truehd, and the better of the two 2.0 tracks (2.0 ac3). The 7.1 and 5.1 are different channel counts so both survive.
+                \\nIf type, downmix_to_six false - keeps 5.1 truehd (better quality than 7.1 aac, both are "surround") and 2.0 ac3 (better than 2.0 mp3, both are "stereo"). The 7.1 aac is removed.
+                \\nIf type, downmix_to_six true and no 5.1 existed before this run (e.g. just downmixed from 7.1 aac into a new 5.1 ac3 alongside the original 7.1 aac) - the new 5.1 ac3 is kept in its own band and is NOT compared against the 7.1 aac it was made from, so both the 7.1 aac and the new 5.1 ac3 survive.`,
         },
         {
             name: 'keep_best_surround_safe',
@@ -539,7 +540,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const downmixToSix = String(inputs.downmix_to_six).trim();
     const downmixToTwo = String(inputs.downmix_to_stereo).trim();
     const downmixSecondaryStereo = String(inputs.downmix_secondary_stereo).trim();
-    const removeDuplicates = String(inputs.remove_duplicates).trim();
+    const removeDuplicatesBy = String(inputs.remove_duplicates_by).trim();
     const forceCodec = String(inputs.force_codec).trim();
     const surroundCodec = String(inputs.surround_codec).trim();
     const stereoCodec = String(inputs.stereo_codec).trim();
@@ -561,8 +562,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.processFile = false;
         return response;
     }
-    if(!['false','clean','true'].includes(removeDuplicates)) {
-        response.infoLog += `☒Somehow invalid removeDuplicates option provided. Check your settings!\n`;
+    if(!['disabled','type','channel'].includes(removeDuplicatesBy)) {
+        response.infoLog += `☒Somehow invalid removeDuplicatesBy option provided. Check your settings!\n`;
         response.processFile = false;
         return response;
     }
@@ -680,17 +681,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const existingSixLangs = new Set(audioStreams.filter(s => s.channels > 4 && s.channels <= 6 && !s.isTdarrSecondaryTrack && !s.isTdarrLangSecondary).map(s => s.isTdarrCleanLang));
 
     // Identify lower-quality duplicates. Within each group keep only the highest quality stream and mark the rest for removal. The grouping key depends on the mode:
-    //   'true'  - group by (lang, exact channel count, primary/secondary): one track per distinct channel count survives (e.g. a 7.1, a 5.1 and a 2.0 of the same language are all kept).
-    //   'clean' - group by (lang, surround-vs-stereo tier, primary/secondary): collapses every surround variant of a language down to a single best surround plus a single best
-    //             stereo, for a more predictable layout. Downmix targets created later are unaffected since they don't exist in audioStreams yet.
+    //   'channel' - group by (lang, exact channel count, primary/secondary): one track per distinct channel count survives (e.g. a 7.1, a 5.1 and a 2.0 of the same language are all kept).
+    //   'type'    - group by (lang, broad surround-vs-stereo role, primary/secondary): collapses every surround variant of a language down to a single best surround plus a single best
+    //               stereo, for a more predictable layout.
+    //               Exception: when downmix_to_six is enabled, the 5-6ch band is carved out into its own role rather than folded into "surround", so a downmix-created (or pre-existing)
+    //               5.1/5.0 track is never compared against, and removed in favour of, a different channel count like 7.1 — matching what downmix_to_six itself would create or preserve.
+    //               Exception: when downmix_to_stereo is enabled, exactly-2ch tracks are carved out into their own role rather than folded into "stereo", so a downmix-created (or
+    //               pre-existing) 2.0 track is never compared against, and removed in favour of, a mono track — matching what downmix_to_stereo itself would create or preserve.
+    //               Both exceptions only apply while the matching downmix option is enabled, and use the exact same channel-count bands as existingSixLangs/existingStereoLangs so
+    //               dedup can never disagree with, and re-trigger, the downmix creation guards (this is what previously caused an infinite create/remove loop between the two plugin runs).
     // Note: deduplication runs across ALL audio streams regardless of downmix_language or downmix_secondary_stereo, since those settings govern transcoding candidates, not what's a
     // genuine duplicate. A duplicate in a non-preferred language is still a duplicate. Protected (keep_best_surround_safe) tracks are never outright removed.
     const streamsToRemove = new Set();
-    if (removeDuplicates === 'true' || removeDuplicates === 'clean') {
+    if (removeDuplicatesBy === 'channel' || removeDuplicatesBy === 'type') {
         const seen = new Map();
         const byQuality = [...audioStreams].sort((a, b) => b.isTdarrQuality - a.isTdarrQuality || a.index - b.index);
         for (const s of byQuality) {
-            const tier = removeDuplicates === 'clean' ? (s.channels > 2 ? 'surround' : 'stereo') : s.channels;
+            let tier;
+            if (removeDuplicatesBy === 'channel') {
+                tier = s.channels;
+            } else if (downmixToSix !== 'false' && s.channels > 4 && s.channels <= 6) {
+                tier = 'six';
+            } else if (downmixToTwo !== 'false' && s.channels === 2) {
+                tier = 'stereo2';
+            } else {
+                tier = s.channels > 2 ? 'surround' : 'stereo';
+            }
             // Group only by the genuine commentary/VI marker (isTdarrSecondaryTrack), NOT by lang-secondary. A foreign-language MAIN track and a foreign-language COMMENTARY
             // track share the same language and channel count but are different content — keying on lang-secondary would collapse them together and wrongly delete the commentary.
             const key = `${s.isTdarrCleanLang}|${tier}|${s.isTdarrSecondaryTrack}`;
@@ -710,7 +726,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // inputAudioIdxMap: 0-based audio-type index within the INPUT file (for -map 0:a:N).
     // outputAudioIdxMap: 0-based audio-type index within the OUTPUT (for -c:a:N and -metadata:s:a:N).
-    // These differ when removeDuplicates removes streams, since -map 0:a:N always references input.
+    // These differ when removeDuplicatesBy removes streams, since -map 0:a:N always references input.
     const inputAudioIdxMap = new Map();
     const outputAudioIdxMap = new Map();
     let inputAudioCounter = 0;
