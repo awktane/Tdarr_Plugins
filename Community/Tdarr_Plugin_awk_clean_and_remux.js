@@ -9,10 +9,11 @@ const details = () => ({
                   Removes any subtitle or audio tracks that are not in the specified language(s) and optionally removes with deaf/SDH in their description.\n\n
                   Option to modify metadata to remove metadata comments and titles with too many periods.\n\n
                   Automatically deduplicates titles reducing "Stereo / Stereo" down to "Stereo" or "English - English" down to "English".\n\n
+                  Optionally surfaces audio disposition flags (Forced, Commentary, Descriptive, Dub, Original) in the track title for players that only show titles, and can import those keywords from existing titles into the real disposition flags.\n\n
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.14.0',
+    Version: '1.15.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -135,6 +136,19 @@ const details = () => ({
             tooltip: `Should subtitle tracks that contain the words "SDH, deaf, hearing impaired, etc" in their description be deleted?`,
         },
         {
+            name: 'tag_disposition',
+            type: 'boolean',
+            defaultValue: false,
+            inputUI: {
+                type: 'dropdown',
+                options: ['false','true'],
+            },
+            tooltip: `Should disposition keywords found in an audio track's title be imported into the real disposition flags?
+                \\nScans each audio title for words such as Forced, Commentary, Descriptive, Dub, and Original (and similar) and adds the matching ffmpeg disposition flag when it isn't already set. Existing flags are preserved.
+                \\nThis makes the flags the source of truth. Pair it with tag_channel_audio_title so title-only keywords are captured into the flags before the title is rebuilt, instead of being stripped away.
+                \\nDoes not touch the default flag - that is managed by track order in the stream ordering plugin.`,
+        },
+        {
             name: 'tag_channel_audio_title',
             type: 'boolean',
             defaultValue: true,
@@ -144,7 +158,8 @@ const details = () => ({
             },
             tooltip: `Specify if we should add a title based on the number of audio channels to files missing or equivalent titles
                 \\nSupported titles are 7.1, 5.1, 5.0, 4.0, 3.1, 3.0, 2.1, Stereo, and Mono.
-                \\nThis can cause track title duplication on some players (Dolby Digital 5.1 (5.1)) but is useful for players that don't display the number of channels.`,
+                \\nThis can cause track title duplication on some players (Dolby Digital 5.1 (5.1)) but is useful for players that don't display the number of channels.
+                \\nDisposition flags (Forced, Commentary, Descriptive, Dub, Original) are appended as a suffix rebuilt from the track's actual flags, e.g. "5.1 - Forced" or "5.1 -> 2.0 - Commentary". The suffix is kept in sync - a flag that is no longer set is dropped from the title. The default flag is intentionally not surfaced.`,
         },        
         {
             name: 'clean_metadata_comments',
@@ -202,13 +217,33 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const dstContainer = inputs.container.toLowerCase().trim();
     response.container = `.${dstContainer}`;
 
-    //The titles we will replace for tagChannelAudioTitle - include 2.0 to allow us to overwrite that with stereo
-    const tagChannelAudioTitleRegex =  /^(7\.1|6\.1|5\.1|5\.0|4\.0|3\.1|3\.0|2\.1|2\.0|stereo|mono)$/i;
+    //The channel labels we recognise/replace for tagChannelAudioTitle - include 2.0 to allow us to overwrite that with stereo
+    const channelTitleLabels = ['7.1', '6.1', '5.1', '5.0', '4.0', '3.1', '3.0', '2.1', '2.0', 'stereo', 'mono'];
+    const channelLabelAlternation = channelTitleLabels.map(l => l.replace(/\./g, '\\.')).join('|');
+    //A bare channel title (the whole title is just a channel label) - we own these and may derive/overwrite them.
+    const bareChannelRegex = new RegExp(`^(${channelLabelAlternation})$`, 'i');
+    //A downmix/channel-derived base produced elsewhere (e.g. audio_clean "5.1 -> 2.0") ending in "-> <channel>".
+    const downmixChannelRegex = new RegExp(`->\\s*(${channelLabelAlternation})\\s*$`, 'i');
+    //Map an audio stream's channel count to our short label, honouring LFE for the 3/4 channel ambiguity.
+    const channelLabel = (ffstream) => {
+        switch (ffstream.channels) {
+            case 8: return '7.1';
+            case 7: return '6.1';
+            case 6: return '5.1';
+            case 5: return '5.0';
+            case 4: return (ffstream?.channel_layout ?? '').toLowerCase().includes('lfe') ? '3.1' : '4.0';
+            case 3: return (ffstream?.channel_layout ?? '').toLowerCase().includes('lfe') ? '2.1' : '3.0';
+            case 2: return 'Stereo';
+            case 1: return 'Mono';
+            default: return '';
+        }
+    };
 
     //A few more that should come through as boolean
     const recoveryDiscard = String(inputs.recovery_discard_frame) === 'true';
     const recoveryGenpts = String(inputs.recovery_genpts) === 'true';
     const recoveryIgndts = String(inputs.recovery_igndts) === 'true';
+    const tagDisposition = String(inputs.tag_disposition) === 'true';
     const tagChannelAudioTitle = String(inputs.tag_channel_audio_title) === 'true';
     const metaCommentRemove = String(inputs.clean_metadata_comments) === 'true';
     const metaBusyTitleRemove = String(inputs.clean_metadata_busytitle) === 'true';
@@ -326,18 +361,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // =====================================================================
 
     /* -=-=-= Stream role/forced classifiers =-=-=- */
-    // Each takes a raw ffprobe stream and returns a boolean from the  disposition flag first, then title keywords, exactly as the sorting and summary logic expects.
-    // Consolidated here so summariseStream, the stream-ordering sort keys, and audio_clean's secondary-track detection all read from one definition.
+    // Each classifier returns true when the stream carries the disposition flag OR its title contains
+    // one of the keywords. All keyword/label data lives in the single dispositionTypes table below so
+    // the lists never drift; summariseStream, the stream-ordering sort keys, audio_clean's
+    // secondary-track detection, and clean_and_remux's title tagging all read from it.
     // Shared verbatim across all three awk plugins.
+    const dispositionTypes = {
+        comment:          { keywords: ['commentary', 'producer'],          label: 'Commentary' },
+        visual_impaired:  { keywords: ['descriptive', 'dvs', 'narration'], label: 'Descriptive' },
+        hearing_impaired: { keywords: ['sdh', 'hearing impaired', 'deaf'], label: 'SDH' },
+        karaoke:          { keywords: ['signs', 'songs'],                  label: 'Signs' },
+        forced:           { keywords: ['forced'],                          label: 'Forced' },
+        default:          { keywords: ['default'],                         label: 'Default' },
+        dub:              { keywords: ['dub', 'dubbed'],                   label: 'Dub' },
+        original:         { keywords: ['original'],                        label: 'Original' },
+    };
     const streamTitleLower = (s) => (s.tags?.title || '').trim().toLowerCase();
-    const isCommentary  = (s) => s.disposition?.comment === 1
-        || ['commentary', 'producer'].some(k => streamTitleLower(s).includes(k));
-    const isDescriptive = (s) => s.disposition?.visual_impaired === 1
-        || ['descriptive', 'dvs', 'narration'].some(k => streamTitleLower(s).includes(k));
-    const isSdh         = (s) => s.disposition?.hearing_impaired === 1
-        || ['sdh', 'hearing impaired', 'deaf'].some(k => streamTitleLower(s).includes(k));
-    const isSigns       = (s) => s.disposition?.karaoke === 1
-        || ['signs', 'songs'].some(k => streamTitleLower(s).includes(k));
+    const hasDisposition = (s, key) => s.disposition?.[key] === 1
+        || (dispositionTypes[key]?.keywords || []).some(k => streamTitleLower(s).includes(k));
+    const isCommentary  = (s) => hasDisposition(s, 'comment');
+    const isDescriptive = (s) => hasDisposition(s, 'visual_impaired');
+    const isSdh         = (s) => hasDisposition(s, 'hearing_impaired');
+    const isSigns       = (s) => hasDisposition(s, 'karaoke');
 
     /* -=-=-= Resolve the best available bitrate (bps) for a stream =-=-=- */
     // ffprobe first, mediaInfo fallback. ffprobe cannot read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V), 
@@ -397,6 +442,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // =====================================================================
     // END SHARED BLOCK
     // =====================================================================
+
+    // -=-=-= Audio disposition title helpers (clean_and_remux only) =-=-=-
+    // The disposition flags surfaced in the audio title, in display order. The default flag is
+    // deliberately excluded - it is owned by track order in the stream ordering plugin, not the title.
+    // Labels and keywords come from the shared dispositionTypes table.
+    const surfacedKeys = ['comment', 'visual_impaired', 'dub', 'original', 'forced'];
+    // Keywords stripped when recovering the channel/base portion of a title. Includes "default" so a
+    // legacy "5.1 - Default" collapses back to "5.1" (we never re-add it).
+    const stripKeys = [...surfacedKeys, 'default'];
+    const stripWords = new Set(stripKeys.flatMap(k => dispositionTypes[k].keywords).filter(w => !w.includes(' ')));
+    // Drop disposition keywords and stray separators from a title, leaving the channel/downmix base.
+    // Splits on whitespace, keeps the "->" downmix arrow, drops lone separators and any keyword token.
+    const stripDispositionWords = (title) => (title || '')
+        .split(/\s+/)
+        .filter(tok => !['-', '/', '|', '•'].includes(tok)
+            && !stripWords.has(tok.replace(/^[^\w]+|[^\w]+$/g, '').toLowerCase()))
+        .join(' ')
+        .trim();
+    // Will this flag be present on the OUTPUT stream? With tag_disposition we also trust title keywords
+    // (they are promoted to real flags above); otherwise only the existing flag counts.
+    const effectiveDisposition = (s, key) => (tagDisposition ? hasDisposition(s, key) : s.disposition?.[key] === 1);
 
     // Check if file is a video. If it isn't then exit plugin.
     if (file.fileMedium !== 'video') {
@@ -588,32 +654,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //Remove surrounding whitespace, single quotes and double quotes as there's no reason for them. Clear the title if metaBusyTitleRemove conditions are met
                 let newStreamTitle = cleanStreamTitle(streamTitle, metaBusyTitleRemove);
 
-                //Get the channel count string ready. Some assumptions are made but should handle most correctly.
-                if(tagChannelAudioTitle === true && ffstream.channels && (!newStreamTitle || tagChannelAudioTitleRegex.test(newStreamTitle))) {
-                    switch(ffstream.channels)
-                    {
-                        case 8: newStreamTitle = '7.1'; break;
-                        case 7: newStreamTitle = '6.1'; break;
-                        case 6: newStreamTitle = '5.1'; break;
-                        case 5: newStreamTitle = '5.0'; break;
-                        case 4:
-                            if((ffstream?.channel_layout ?? '').toLowerCase().includes('lfe')) {
-                                newStreamTitle = '3.1'; 
-                            } else
-                            {
-                                newStreamTitle = '4.0'; 
-                            }
-                            break;
-                        case 3:
-                            if((ffstream?.channel_layout ?? '').toLowerCase().includes('lfe')) {
-                                newStreamTitle = '2.1'; 
-                            } else
-                            {
-                                newStreamTitle = '3.0'; 
-                            }
-                            break;
-                        case 2: newStreamTitle = 'Stereo'; break;
-                        case 1: newStreamTitle = 'Mono'; break;
+                //tag_disposition: import any surfaced disposition keyword found in the title into the real flag (additive so existing flags are kept).
+                if(tagDisposition === true) {
+                    const promote = surfacedKeys.filter(key => hasDisposition(ffstream, key) && ffstream.disposition?.[key] !== 1);
+                    if(promote.length > 0) {
+                        workDone += `☐Set disposition on stream ${i} (audio) from title - ${promote.map(k => dispositionTypes[k].label).join(' ')}\n`;
+                        metadataCommand += ` -disposition:a:${audioStreamIndex} ${promote.map(k => `+${k}`).join('')}`;
+                    }
+                }
+
+                //tag_channel_audio_title: rebuild the title as a channel/downmix base plus a disposition suffix derived from the actual flags.
+                //Only titles we own are touched: empty, a bare channel label, or a downmix/channel-derived title (e.g. "5.1 -> 2.0"). Custom titles are left alone.
+                if(tagChannelAudioTitle === true && ffstream.channels) {
+                    let base = stripDispositionWords(newStreamTitle);
+                    if(!base || bareChannelRegex.test(base) || downmixChannelRegex.test(base)) {
+                        if(!base || bareChannelRegex.test(base))
+                            base = channelLabel(ffstream);
+                        const suffix = surfacedKeys.filter(key => effectiveDisposition(ffstream, key)).map(key => dispositionTypes[key].label).join(' ');
+                        newStreamTitle = suffix ? `${base} - ${suffix}` : base;
                     }
                 }
 
