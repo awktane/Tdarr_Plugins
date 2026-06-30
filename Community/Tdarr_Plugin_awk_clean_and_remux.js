@@ -12,7 +12,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.13.10',
+    Version: '1.14.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -40,7 +40,8 @@ const details = () => ({
             },
             tooltip: `Run with the ffmpeg +discardcorrupt options to drop any corrupt frames from the file.
                  \\nShould generally be false as it may cause a small blips of video/audio if there is damage but may still allow a damaged file to be processed.
-                 \\nMay also cause problems with timestamps which may require +genpts and/or +igndts to fix.`,
+                 \\nMay also cause problems with timestamps which may require +genpts and/or +igndts to fix.
+                 \\nRecovery is applied at most once per file - an awk_recovered tag is written afterward, so changing these options won't re-run recovery until that tag is cleared or the file otherwise changes.`,
         },
         {
             name: 'recovery_genpts',
@@ -53,7 +54,8 @@ const details = () => ({
             tooltip: `Run with the ffmpeg +genpts option to generate missing PTS (Presentation Timestamps).
                  \\nShould generally be false but can fix errors such as "first pts value must set", "Can't write packet with unknown timestamp", or "Timestamps are unset in a packet for stream".
                  \\nCombining this with igndts will tell ffmpeg to completely rebuild the timestamps for the file.
-                 \\nNote this is forced to true for ts, avi, mpg, and mpeg files as they often have timestamp issues.`,
+                 \\nNote this is forced to true for ts, avi, mpg, and mpeg files as they often have timestamp issues.
+                 \\nRecovery is applied at most once per file - an awk_recovered tag is written afterward, so changing these options won't re-run recovery until that tag is cleared or the file otherwise changes.`,
         },
         {
             name: 'recovery_igndts',
@@ -65,7 +67,8 @@ const details = () => ({
             },
             tooltip: `Run with the ffmpeg +igndts option to ignore DTS (Decode Time Stamps - has nothing to do with Dolby DTS).
                  \\nShould generally be false but can fix errors like "Non-monotonous DTS in output stream" or "DTS out of order".
-                 \\nWhen enabled genpts will be automatically enabled even if false is specified as messing with the timestream is a daunting exercise.`,
+                 \\nWhen enabled genpts will be automatically enabled even if false is specified as messing with the timestream is a daunting exercise.
+                 \\nRecovery is applied at most once per file - an awk_recovered tag is written afterward, so changing these options won't re-run recovery until that tag is cleared or the file otherwise changes.`,
         },
         {
             name: 'audio_language',
@@ -244,13 +247,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // is true, abort so the user can tag them manually and requeue. If false, processing continues and the fill_language assignments are logged as normal by the stream loop below.
     if (fillLanguage && failLangsBlank) {
         const streams = file.ffProbeData.streams || [];
-        const untaggedAudio = streams.filter(s => (s?.codec_type || '').toLowerCase() === 'audio' && (!s?.tags?.language || s.tags.language.trim().toLowerCase() === 'und')).length;
+        // Resolve each stream's language exactly as the main loop does below (ffprobe tag first, then the
+        // mediaInfo fallback). A stream whose language only mediaInfo supplies is never filled, so counting
+        // it as "untagged" here would abort files that would actually process fine.
+        const isUntagged = (s, i) => {
+            const ffmedia = file?.mediaInfo?.track?.find(t => Number(t.StreamOrder) === i);
+            const lang = (s?.tags?.language ?? (ffmedia?.Language ?? '')).trim().toLowerCase();
+            return !lang || lang === 'und';
+        };
+        const untaggedAudio = streams.filter((s, i) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s, i)).length;
         if (untaggedAudio > 1) {
             response.infoLog += `☒${untaggedAudio} audio streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue or set fail_langs_blank to false.\n`;
             response.processFile = false;
             return response;
         }
-        const untaggedSubs =  streams.filter(s =>(s?.codec_type || '').toLowerCase() === 'subtitle' && (!s?.tags?.language || s.tags.language.trim().toLowerCase() === 'und')).length;
+        const untaggedSubs =  streams.filter((s, i) =>(s?.codec_type || '').toLowerCase() === 'subtitle' && isUntagged(s, i)).length;
         if (untaggedSubs > 1) {
             response.infoLog += `☒${untaggedSubs} subtitle streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue or set fail_langs_blank to false.\n`;
             response.processFile = false;
@@ -763,6 +774,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     //Include recovery flags if requested or if the source container is known to have timestamp issues.
 
+    // Recovery (discard/genpts/igndts) leaves nothing observable in the output, so forcing a remux purely
+    // for it would make every Tdarr health-check pass reprocess the same file forever. We allow a
+    // recovery-only run exactly once by stamping a format-level awk_recovered sentinel (written below);
+    // its presence on a later pass suppresses the recovery-only trigger. Changing recovery options after
+    // that requires clearing the tag or otherwise changing the file — a deliberate, documented trade.
+    const recoveryRequested = recoveryDiscard || recoveryGenpts || recoveryIgndts;
+    const alreadyRecovered = Object.entries(file.ffProbeData.format?.tags || {})
+        .some(([k, v]) => k.toLowerCase() === 'awk_recovered' && String(v).trim() !== '');
+
     //Igndts can cause very strange problems if genpts isn't also enabled
     if(recoveryIgndts === true) 
         fflags += '+igndts+genpts';
@@ -779,6 +799,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if(fflags !== '') 
         fflags = `-fflags ${fflags}`;
 
+    // A recovery-only run has no other queued work, so force the remux here — but only the first time
+    // (the sentinel guards against re-triggering). When recovery rides along with other work convert is
+    // already true; either way we stamp the sentinel below so a later pass won't loop.
+    if (recoveryRequested && !alreadyRecovered)
+        convert = true;
+
+    // Stamp the sentinel whenever recovery is actually applied this run (we are remuxing and the file has
+    // not been recovered before). mp4 needs -movflags use_metadata_tags to persist a custom key in udta;
+    // mkv keeps arbitrary global tags natively.
+    if (convert === true && recoveryRequested && !alreadyRecovered) {
+        const recoverySig = [recoveryDiscard && 'discardcorrupt', (recoveryGenpts || recoveryIgndts) && 'genpts', recoveryIgndts && 'igndts'].filter(Boolean).join('+');
+        workDone += `☐Stamp awk_recovered=${recoverySig} so a recovery-only pass won't reprocess every loop\n`;
+        extraArguments += ` -metadata "awk_recovered=${escMeta(recoverySig)}"`;
+        if (dstContainer === 'mp4')
+            extraArguments += ' -movflags use_metadata_tags';
+    }
+
     //Convert file if convert variable is set to true.
     if (convert === true) {
         response.preset += `${fflags},-map 0 -c copy${extraArguments} -max_muxing_queue_size 9999${networkDataOpt}`;
@@ -791,6 +828,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.infoLog += `☑Expected results: ${outSummary}\n`;
         response.processFile = true;
     } else {
+        if (recoveryRequested && alreadyRecovered)
+            response.infoLog += `☑Already recovered (awk_recovered tag present) - skipping to avoid reprocessing. Clear the tag to recover again.\n`;
         response.infoLog += `☑File is already ${dstContainer} and contains no streams requiring removal or conversion.\n`;
         response.processFile = false;
     }
