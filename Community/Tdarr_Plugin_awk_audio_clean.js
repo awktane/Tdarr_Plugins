@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.21.0',
+    Version: '1.22.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -82,25 +82,26 @@ const details = () => ({
             defaultValue: 'disabled',
             inputUI: {
                 type: 'dropdown',
-                options: ['disabled', 'type', 'channel'],
+                options: ['disabled', 'multi-stereo', 'multi-stereo-error', 'channel', 'channel-error'],
             },
             tooltip: `If enabled then duplicate audio tracks (same language, same broad role) are reduced down to the highest quality option(s). Any stream newly created by downmix_to_six or downmix_to_stereo is always kept and is never collapsed against a different channel count it was created alongside (see below).
+                \\nThe "-error" variants use identical grouping/duplicate-detection logic to their non-error counterpart, but instead of deleting the lower quality duplicate(s) they abort the plugin run entirely (no streams are removed, no other changes in this run are applied) so the file can be inspected and tagged manually before being requeued.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nIf disabled - no streams are removed for being duplicates. Every track is left exactly as found.
-                \\nIf type     - one track per language is kept for each of two broad roles: "surround" (more than 2 channels) and "stereo" (2 or fewer channels). The highest quality track in each role wins; the rest in that role are removed.
+                \\nIf disabled            - no streams are removed for being duplicates. Every track is left exactly as found.
+                \\nIf multi-stereo        - one track per language is kept for each of two broad roles: "surround" (more than 2 channels) and "stereo" (2 or fewer channels). The highest quality track in each role wins; the rest in that role are removed.
                        \\nException: if downmix_to_six is enabled, the 5.1/5.0 band (5-6 channels) is kept as its own separate role rather than folded into "surround" - so a downmix-created 6 channel track is never compared against, and removed in favour of, a higher channel track like a 7.1.
                        \\nException: if downmix_to_stereo is enabled, exactly 2 channel tracks are kept as their own separate role rather than folded into "stereo" - so a downmix-created 2.0 track is never compared against, and removed in favour of, a mono track.
                        \\nThese exceptions only apply while the matching downmix option is enabled, matching what that option would have created or kept anyway.
-                \\nIf channel  - one track per language is kept for each distinct channel count (2.0, 5.1, 7.1, etc are each their own group). The highest quality track in each channel count wins; the rest sharing that exact channel count are removed.
-                \\n=====
-                \\nExample\\n
-                \\n=====
-                \\nA file has these English tracks: 7.1 aac, 5.1 truehd, 2.0 ac3, 2.0 mp3
-                \\nIf channel - keeps 7.1 aac, 5.1 truehd, and the better of the two 2.0 tracks (2.0 ac3). The 7.1 and 5.1 are different channel counts so both survive.
-                \\nIf type, downmix_to_six false - keeps 5.1 truehd (better quality than 7.1 aac, both are "surround") and 2.0 ac3 (better than 2.0 mp3, both are "stereo"). The 7.1 aac is removed.
-                \\nIf type, downmix_to_six true and no 5.1 existed before this run (e.g. just downmixed from 7.1 aac into a new 5.1 ac3 alongside the original 7.1 aac) - the new 5.1 ac3 is kept in its own band and is NOT compared against the 7.1 aac it was made from, so both the 7.1 aac and the new 5.1 ac3 survive.`,
+                \\nIf multi-stereo-error  - same grouping as multi-stereo, but on finding a duplicate the plugin aborts (processing fails, file sent to error queue) instead of deleting anything.
+                \\nIf channel             - one track per language is kept for each distinct channel count (2.0, 5.1, 7.1, etc are each their own group). The highest quality track in each channel count wins; the rest sharing that exact channel count are removed.
+                \\nIf channel-error       - same grouping as channel, but on finding a duplicate the plugin aborts (processing fails, file sent to error queue) instead of deleting anything.
+                \\nExample: 
+                    A file has these tracks with the same language: 7.1 aac, 5.1 truehd, 2.0 ac3, 2.0 mp3
+                \\nIf channel      - keeps 7.1 aac, 5.1 truehd, and the better of the two 2.0 tracks (2.0 ac3). The 7.1 and 5.1 are different channel counts so both survive.
+                \\nIf multi-stereo - keeps 5.1 truehd (better quality than 7.1 aac, both are "surround") and 2.0 ac3 (better than 2.0 mp3, both are "stereo"). The 7.1 aac is removed.
+                \\nIf channel-error or multi-stereo-error - aborts the run if it finds duplicates as per the categories above; no streams are removed and no other changes from this run are applied.`,
         },
         {
             name: 'keep_best_surround_safe',
@@ -562,7 +563,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.processFile = false;
         return response;
     }
-    if(!['disabled','type','channel'].includes(removeDuplicatesBy)) {
+    if(!['disabled','multi-stereo','multi-stereo-error','channel','channel-error'].includes(removeDuplicatesBy)) {
         response.infoLog += `☒Somehow invalid removeDuplicatesBy option provided. Check your settings!\n`;
         response.processFile = false;
         return response;
@@ -680,10 +681,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Channels > 4 && <= 6 covers 5.0 and 5.1 without catching 4.0/4.1 or 7.1 sources.
     const existingSixLangs = new Set(audioStreams.filter(s => s.channels > 4 && s.channels <= 6 && !s.isTdarrSecondaryTrack && !s.isTdarrLangSecondary).map(s => s.isTdarrCleanLang));
 
-    // Identify lower-quality duplicates. Within each group keep only the highest quality stream and mark the rest for removal. The grouping key depends on the mode:
-    //   'channel' - group by (lang, exact channel count, primary/secondary): one track per distinct channel count survives (e.g. a 7.1, a 5.1 and a 2.0 of the same language are all kept).
-    //   'type'    - group by (lang, broad surround-vs-stereo role, primary/secondary): collapses every surround variant of a language down to a single best surround plus a single best
-    //               stereo, for a more predictable layout.
+    // Identify lower-quality duplicates. Within each group keep only the highest quality stream; the rest are either
+    // marked for removal (removeDuplicatesBy === 'multi-stereo'/'channel') or, for the "-error" variants, cause the
+    // plugin to abort immediately (no streams are removed, no other changes from this run are applied). The grouping
+    // key depends on the mode (the "-error" suffix only changes what happens on a hit, never the grouping itself):
+    //   'channel'/'channel-error'           - group by (lang, exact channel count, primary/secondary): one track per
+    //                                          distinct channel count survives (e.g. a 7.1, a 5.1 and a 2.0 of the
+    //                                          same language are all kept).
+    //   'multi-stereo'/'multi-stereo-error' - group by (lang, broad surround-vs-stereo role, primary/secondary):
+    //                                          collapses every surround variant of a language down to a single best
+    //                                          surround plus a single best stereo, for a more predictable layout.
     //               Exception: when downmix_to_six is enabled, the 5-6ch band is carved out into its own role rather than folded into "surround", so a downmix-created (or pre-existing)
     //               5.1/5.0 track is never compared against, and removed in favour of, a different channel count like 7.1 — matching what downmix_to_six itself would create or preserve.
     //               Exception: when downmix_to_stereo is enabled, exactly-2ch tracks are carved out into their own role rather than folded into "stereo", so a downmix-created (or
@@ -691,14 +698,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //               Both exceptions only apply while the matching downmix option is enabled, and use the exact same channel-count bands as existingSixLangs/existingStereoLangs so
     //               dedup can never disagree with, and re-trigger, the downmix creation guards (this is what previously caused an infinite create/remove loop between the two plugin runs).
     // Note: deduplication runs across ALL audio streams regardless of downmix_language or downmix_secondary_stereo, since those settings govern transcoding candidates, not what's a
-    // genuine duplicate. A duplicate in a non-preferred language is still a duplicate. Protected (keep_best_surround_safe) tracks are never outright removed.
+    // genuine duplicate. A duplicate in a non-preferred language is still a duplicate. Protected (keep_best_surround_safe) tracks are never outright removed, and never trigger the
+    // "-error" abort either — a protected track was never a removal candidate in the first place.
+    const removeDuplicatesErrorMode = removeDuplicatesBy === 'multi-stereo-error' || removeDuplicatesBy === 'channel-error';
+    const removeDuplicatesGroupBy = removeDuplicatesErrorMode ? removeDuplicatesBy.replace(/-error$/, '') : removeDuplicatesBy;
     const streamsToRemove = new Set();
-    if (removeDuplicatesBy === 'channel' || removeDuplicatesBy === 'type') {
+    if (removeDuplicatesGroupBy === 'channel' || removeDuplicatesGroupBy === 'multi-stereo') {
         const seen = new Map();
         const byQuality = [...audioStreams].sort((a, b) => b.isTdarrQuality - a.isTdarrQuality || a.index - b.index);
         for (const s of byQuality) {
             let tier;
-            if (removeDuplicatesBy === 'channel') {
+            if (removeDuplicatesGroupBy === 'channel') {
                 tier = s.channels;
             } else if (downmixToSix !== 'false' && s.channels > 4 && s.channels <= 6) {
                 tier = 'six';
@@ -712,10 +722,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const key = `${s.isTdarrCleanLang}|${tier}|${s.isTdarrSecondaryTrack}`;
             if (seen.has(key)) {
                 if (protectedIndices.has(s.index)) continue;
+                const kept = seen.get(key);
+                if (removeDuplicatesErrorMode) {
+                    const rmRate = Number(s.bit_rate || 0) > 0 ? ` @ ${Math.round(Number(s.bit_rate) / 1000)} kb/s` : '';
+                    const keptRate = Number(kept.bit_rate || 0) > 0 ? ` @ ${Math.round(Number(kept.bit_rate) / 1000)} kb/s` : '';
+                    response.infoLog += `☒Stream ${s.index}: Duplicate audio track detected (${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang}${rmRate}) alongside stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate}) under remove_duplicates_by="${removeDuplicatesBy}". Aborting - tag/remove tracks manually and requeue, or switch remove_duplicates_by to a non-error mode.\n`;
+                    response.processFile = false;
+                    return response;
+                }
                 streamsToRemove.add(s.index);
                 // Show the removed track's bitrate and the kept track's for contrast — duplicates are
                 // decided by quality score (largely bitrate-driven), so this makes the choice transparent.
-                const kept = seen.get(key);
                 const rmRate = Number(s.bit_rate || 0) > 0 ? ` @ ${Math.round(Number(s.bit_rate) / 1000)} kb/s` : '';
                 const keptRate = Number(kept.bit_rate || 0) > 0 ? ` @ ${Math.round(Number(kept.bit_rate) / 1000)} kb/s` : '';
                 workDone += `☐Stream ${s.index}: Removing duplicate (lower quality ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang}${rmRate}) - keeping stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate})\n`;
