@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/signs/sdh/commentary) -> Attachments -> Data\n`,
-    Version: '1.9.8',
+    Version: '1.10.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -27,13 +27,14 @@ const details = () => ({
             defaultValue: 'descending',
             inputUI: {
                 type: 'dropdown',
-                options: ['descending', 'ascending'],
+                options: ['descending', 'ascending', 'disabled'],
             },
             tooltip: `Audio channel ordering preference - streams are ordered by channel then rating of codec/bitrate. Generally descending is recommended.
                 \\nExample:\\n
                     ascending: 2.0,5.1
                 \\nExample:\\n
-                    descending: 5.1,2.0`
+                    descending: 5.1,2.0
+                \\nSet to disabled to skip channel ordering entirely. If both channel_order and quality_order are disabled, audio is not reordered by channels or quality (language/default/role/codec_first still apply).`
         },
         {
             name: 'quality_order',
@@ -41,13 +42,14 @@ const details = () => ({
             defaultValue: 'descending',
             inputUI: {
                 type: 'dropdown',
-                options: ['descending', 'ascending'],
+                options: ['descending', 'ascending', 'disabled'],
             },
             tooltip: `Audio quality ordering preference - streams are ordered by channel then rating of codec/bitrate. Generally descending is recommended.
                 \\nExample:\\n
                     ascending: 128k,640k
                 \\nExample:\\n
-                    descending: 640k,128k`
+                    descending: 640k,128k
+                \\nSet to disabled to skip quality ordering entirely. If both channel_order and quality_order are disabled, audio is not reordered by channels or quality (language/default/role/codec_first still apply).`
         },
         {
             name: 'sdh_first',
@@ -60,17 +62,26 @@ const details = () => ({
             tooltip: 'Should SDH tracks be put at the top? (Subtitles for the Deaf and Hard-of-Hearing)',
         },
         {
-            name: 'default_audio_first',
+            name: 'default_first',
             type: 'boolean',
             defaultValue: false,
             inputUI: {
                 type: 'dropdown',
                 options: ['false', 'true'],
             },
-            tooltip: `Should we put the default audio first within its language group?
+            tooltip: `Should we put the default track first within its language group?
                 \\nLeave this false unless you specifically know you want it. The default disposition flag is frequently wrong or arbitrary depending on the file source, and when enabled it sorts ABOVE role — a track flagged default will be placed above the main/descriptive/commentary ordering within its language. A mis-flagged default commentary track would therefore sort above the main feature audio.
                 \\nOnly enable this if your files have a reliably-set default flag and you understand you are sorting on a potentially arbitrary tag.
                 \\nNote: language priority is always respected first — a default German track will not sort above a non-default English track when English is preferred.`,
+        },
+        {
+            name: 'codec_first',
+            type: 'string',
+            defaultValue: '',
+            inputUI: { type: 'text' },
+            tooltip: `Comma separated list of preferred audio codecs (e.g. eac3,aac). Blank to disable.
+                \\nMatching streams are grouped above non-matching ones within their language; each group is still ordered by channel_order then quality_order. List order is a membership set, not a ranking. Sits below default/role, above channels/quality.
+                \\nFamily-prefix match on the canonical codec: dts matches DTS-HD MA/HR/Express, eac3 includes Atmos. Use dtsma/dtshr/dtsexpress/eac3atmos for a specific variant.`,
         },
         {
             name: 'temp_on_network',
@@ -89,6 +100,7 @@ const details = () => ({
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const plugin = (file, librarySettings, inputs, otherArguments) => {
     const lib = require('../methods/lib')();
+    // eslint-disable-next-line @typescript-eslint/no-unused-vars,no-param-reassign
     inputs = lib.loadDefaultValues(inputs, details);
 
     const response = {
@@ -332,12 +344,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // END SHARED BLOCK
     // =====================================================================
 
-    if(!['descending', 'ascending'].includes(inputs.channel_order)) {
+    if(!['descending', 'ascending', 'disabled'].includes(inputs.channel_order)) {
         response.infoLog += '☒channel_order has not been configured, please configure required options.\n';
         response.processFile = false;
         return response;
     }
-    if(!['descending', 'ascending'].includes(inputs.quality_order)) {
+    if(!['descending', 'ascending', 'disabled'].includes(inputs.quality_order)) {
         response.infoLog += '☒quality_order has not been configured, please configure required options.\n';
         response.processFile = false;
         return response;
@@ -350,7 +362,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const streamOrder = { video: 0, audio: 1, subtitle: 2 , attachment: 3, data: 4};
     const preferredLanguages = (inputs.preferred_languages || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
     const sdhFirst = String(inputs.sdh_first) === 'true';
-    const defaultAudioFirst = String(inputs.default_audio_first) === 'true';
+    const defaultFirst = String(inputs.default_first) === 'true';
+    const codecFirstList = (inputs.codec_first || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
 
     //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
     const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
@@ -386,6 +399,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             forced: ffstream?.disposition?.forced === 1,
             // Only score audio streams — scoring video/subtitle/data would spam the log with bogus "unknown codec"/"invalid bitrate" notices and serves no purpose since the quality value is only used to sort audio.
             audioquality: streamType === 'audio' ? audioQuality(enrichedStream) : 0,
+            // Does this audio stream's canonical codec match the codec_first preference list? Family-prefix match so "dts" catches dtsma/dtshr/dtsexpress and "eac3" catches eac3atmos.
+            codecmatch: streamType === 'audio' && codecFirstList.some(c => resolveCodecName(enrichedStream).startsWith(c)),
             default: ffstream?.disposition?.default === 1,
 
             // Role classification via the shared classifiers (single source of truth — keeps the sort and the summary line in agreement).
@@ -419,14 +434,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return a.mjpeg ? 1 : -1;
         //Audio
         } else if(a.type === 'audio') {
-            //Language priority first — defaultAudioFirst is a tiebreaker within the same language, not a global override. A default German track should not sort above a non-default English track.
+            //Language priority first — defaultFirst is a tiebreaker within the same language, not a global override. A default German track should not sort above a non-default English track.
             const aRank = getLangRank(a.lang, a.shortlang);
             const bRank = getLangRank(b.lang, b.shortlang);
             if (aRank !== bRank)
                 return aRank - bRank;
 
             //Within the same language group, honour the default flag if requested. The default tag can be inaccurate depending on the file source.
-            if(defaultAudioFirst && (a.default !== b.default))
+            if(defaultFirst && (a.default !== b.default))
                 return a.default ? -1 : 1;
 
             //A commentary stream could be descriptive but it would still be a commentary
@@ -435,12 +450,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (aRole !== bRole)
                 return aRole - bRole;
 
-            //Channel ordering
-            if (a.channels !== b.channels)
+            //codec_first tier — preferred codecs form one group above the rest. Each group is still ordered by the channel/quality rules below, so this only promotes the group.
+            if (codecFirstList.length > 0 && (a.codecmatch !== b.codecmatch))
+                return a.codecmatch ? -1 : 1;
+
+            //Channel ordering (skipped when disabled)
+            if (inputs.channel_order !== 'disabled' && a.channels !== b.channels)
                 return (inputs.channel_order === 'descending' ? b.channels - a.channels : a.channels - b.channels);
 
-            //Quality
-            if (a.audioquality !== b.audioquality)
+            //Quality (skipped when disabled)
+            if (inputs.quality_order !== 'disabled' && a.audioquality !== b.audioquality)
                 return (inputs.quality_order === 'descending' ? b.audioquality - a.audioquality : a.audioquality - b.audioquality);
         //Subtitles
         } else if (a.type === 'subtitle') {
