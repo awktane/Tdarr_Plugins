@@ -5,8 +5,8 @@ const details = () => ({
     Name: 'Re-order streams video, audio, subtitle, then anything else',
     Type: 'Any',
     Operation: 'Transcode',
-    Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/signs/sdh/commentary) -> Attachments -> Data\n`,
-    Version: '1.10.0',
+    Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/signs/sdh/commentary) -> Attachments -> Data. Also marks the first audio track as the sole default.\n`,
+    Version: '1.11.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -60,19 +60,6 @@ const details = () => ({
                 options: ['false', 'true'],
             },
             tooltip: 'Should SDH tracks be put at the top? (Subtitles for the Deaf and Hard-of-Hearing)',
-        },
-        {
-            name: 'default_first',
-            type: 'boolean',
-            defaultValue: false,
-            inputUI: {
-                type: 'dropdown',
-                options: ['false', 'true'],
-            },
-            tooltip: `Should we put the default track first within its language group?
-                \\nLeave this false unless you specifically know you want it. The default disposition flag is frequently wrong or arbitrary depending on the file source, and when enabled it sorts ABOVE role — a track flagged default will be placed above the main/descriptive/commentary ordering within its language. A mis-flagged default commentary track would therefore sort above the main feature audio.
-                \\nOnly enable this if your files have a reliably-set default flag and you understand you are sorting on a potentially arbitrary tag.
-                \\nNote: language priority is always respected first — a default German track will not sort above a non-default English track when English is preferred.`,
         },
         {
             name: 'codec_first',
@@ -272,18 +259,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
 
     /* -=-=-= Stream role/forced classifiers =-=-=- */
-    // Each takes a raw ffprobe stream and returns a boolean from the  disposition flag first, then title keywords, exactly as the sorting and summary logic expects.
-    // Consolidated here so summariseStream, the stream-ordering sort keys, and audio_clean's secondary-track detection all read from one definition.
+    // Each classifier returns true when the stream carries the disposition flag OR its title contains
+    // one of the keywords. All keyword/label data lives in the single dispositionTypes table below so
+    // the lists never drift; summariseStream, the stream-ordering sort keys, audio_clean's
+    // secondary-track detection, and clean_and_remux's title tagging all read from it.
     // Shared verbatim across all three awk plugins.
+    const dispositionTypes = {
+        comment:          { keywords: ['commentary', 'producer'],          label: 'Commentary' },
+        visual_impaired:  { keywords: ['descriptive', 'dvs', 'narration'], label: 'Descriptive' },
+        hearing_impaired: { keywords: ['sdh', 'hearing impaired', 'deaf'], label: 'SDH' },
+        karaoke:          { keywords: ['signs', 'songs'],                  label: 'Signs' },
+        forced:           { keywords: ['forced'],                          label: 'Forced' },
+        default:          { keywords: ['default'],                         label: 'Default' },
+        dub:              { keywords: ['dub', 'dubbed'],                   label: 'Dub' },
+        original:         { keywords: ['original'],                        label: 'Original' },
+    };
     const streamTitleLower = (s) => (s.tags?.title || '').trim().toLowerCase();
-    const isCommentary  = (s) => s.disposition?.comment === 1
-        || ['commentary', 'producer'].some(k => streamTitleLower(s).includes(k));
-    const isDescriptive = (s) => s.disposition?.visual_impaired === 1
-        || ['descriptive', 'dvs', 'narration'].some(k => streamTitleLower(s).includes(k));
-    const isSdh         = (s) => s.disposition?.hearing_impaired === 1
-        || ['sdh', 'hearing impaired', 'deaf'].some(k => streamTitleLower(s).includes(k));
-    const isSigns       = (s) => s.disposition?.karaoke === 1
-        || ['signs', 'songs'].some(k => streamTitleLower(s).includes(k));
+    const hasDisposition = (s, key) => s.disposition?.[key] === 1
+        || (dispositionTypes[key]?.keywords || []).some(k => streamTitleLower(s).includes(k));
+    const isCommentary  = (s) => hasDisposition(s, 'comment');
+    const isDescriptive = (s) => hasDisposition(s, 'visual_impaired');
+    const isSdh         = (s) => hasDisposition(s, 'hearing_impaired');
+    const isSigns       = (s) => hasDisposition(s, 'karaoke');
 
     /* -=-=-= Resolve the best available bitrate (bps) for a stream =-=-=- */
     // ffprobe first, mediaInfo fallback. ffprobe cannot read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V), 
@@ -362,7 +359,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const streamOrder = { video: 0, audio: 1, subtitle: 2 , attachment: 3, data: 4};
     const preferredLanguages = (inputs.preferred_languages || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
     const sdhFirst = String(inputs.sdh_first) === 'true';
-    const defaultFirst = String(inputs.default_first) === 'true';
     const codecFirstList = (inputs.codec_first || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
 
     //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
@@ -434,15 +430,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return a.mjpeg ? 1 : -1;
         //Audio
         } else if(a.type === 'audio') {
-            //Language priority first — defaultFirst is a tiebreaker within the same language, not a global override. A default German track should not sort above a non-default English track.
+            //Language priority first. A track in a non-preferred language should not sort above one in a preferred language.
             const aRank = getLangRank(a.lang, a.shortlang);
             const bRank = getLangRank(b.lang, b.shortlang);
             if (aRank !== bRank)
                 return aRank - bRank;
-
-            //Within the same language group, honour the default flag if requested. The default tag can be inaccurate depending on the file source.
-            if(defaultFirst && (a.default !== b.default))
-                return a.default ? -1 : 1;
 
             //A commentary stream could be descriptive but it would still be a commentary
             const aRole = a.commentary ? 2 : (a.descriptive ? 1 : 0);
@@ -489,23 +481,37 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return a.index - b.index;
     });
 
-    //Check if order has changed and get the map ready
+    //Check if order has changed and build the map. Also normalise the audio default flag so exactly one
+    //audio track - the first in the sorted order - is default, matching the track our ordering rules
+    //chose. Additive +default/-default preserves forced/commentary/etc. Subtitle and video are untouched.
     let ffmpegMap = '';
+    let dispositionArgs = '';
     let changed = false;
+    let audioIndex = -1;
 
     for (let i = 0; i < streams.length; i++) {
         ffmpegMap += ` -map 0:${streams[i].index}`;
         if (streams[i].index !== i) changed = true;
+
+        if (streams[i].type === 'audio') {
+            audioIndex++;
+            if (audioIndex === 0 && !streams[i].default)
+                dispositionArgs += ` -disposition:a:${audioIndex} +default`;
+            else if (audioIndex > 0 && streams[i].default)
+                dispositionArgs += ` -disposition:a:${audioIndex} -default`;
+        }
     }
 
-    if (!changed) {
+    if (!changed && dispositionArgs === '') {
         response.infoLog += '☑Streams already in desired order.\n';
         return response;
     }
 
     response.processFile = true;
     response.reQueueAfter = true;
-    response.preset = `,${ffmpegMap} -c copy -max_muxing_queue_size 9999${networkDataOpt}`;
+    response.preset = `,${ffmpegMap} -c copy${dispositionArgs} -max_muxing_queue_size 9999${networkDataOpt}`;
+    if (dispositionArgs !== '')
+        response.infoLog += '☐Set the first audio track as the sole default.\n';
     response.infoLog += `☑Expected results: ${streams.map(s => summariseStream(s.stream)).join('')}\n`;
 
     return response;
