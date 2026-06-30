@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/signs/sdh/commentary) -> Attachments -> Data\n`,
-    Version: '1.9.7',
+    Version: '1.9.8',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -105,8 +105,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Audio plugins (audio_clean, stream_ordering) carry the whole block:
     //   codecInfo, codecAliases, unknownCodecs, resolveCodecName, audioQuality,
     //   the role/forced classifiers, resolveStreamBitrate, summariseStream, escMeta.
-    // clean_and_remux carries only the classifiers, resolveStreamBitrate,
-    // summariseStream, and escMeta (the codec-scoring half is audio-only).
+    // clean_and_remux carries only the audio-independent tail: the classifiers,
+    // resolveStreamBitrate, summariseStream, and escMeta (the codec-scoring half is audio-only).
     // =====================================================================
 
     //Codecs and some values to help us score the quality so that we can pick the best track - some of these formats are not supported by ffmpeg yet (ex: ac4)
