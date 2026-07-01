@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.22.2',
+    Version: '1.23.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -364,28 +364,51 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
 
     /* -=-=-= Stream role/forced classifiers =-=-=- */
-    // Each classifier returns true when the stream carries the disposition flag OR its title contains
-    // one of the keywords. All keyword/label data lives in the single dispositionTypes table below so
-    // the lists never drift; summariseStream, the stream-ordering sort keys, audio_clean's
-    // secondary-track detection, and clean_and_remux's title tagging all read from it.
+    // Classifiers group the real ffmpeg disposition flags below into the roles the pipeline sorts and
+    // tags by. dispositionTypes is keyed by the actual ffmpeg disposition; each entry declares the stream
+    // types it is valid on (streams), the title keywords that also indicate it (each keyword lives on one
+    // flag so title->flag promotion stays unambiguous), and the canonical string written into a stream
+    // title (tag, null when never written). hasDisposition gates on codec_type and matches keywords as
+    // whole tokens via matchesKeyword. summariseStream, the stream-ordering sort keys, audio_clean's
+    // secondary-track detection, and clean_and_remux's title/flag tagging all read from this table.
     // Shared verbatim across all three awk plugins.
     const dispositionTypes = {
-        comment:          { keywords: ['commentary', 'producer'],          label: 'Commentary' },
-        visual_impaired:  { keywords: ['descriptive', 'dvs', 'narration'], label: 'Descriptive' },
-        hearing_impaired: { keywords: ['sdh', 'hearing impaired', 'deaf'], label: 'SDH' },
-        karaoke:          { keywords: ['signs', 'songs'],                  label: 'Signs' },
-        forced:           { keywords: ['forced'],                          label: 'Forced' },
-        default:          { keywords: ['default'],                         label: 'Default' },
-        dub:              { keywords: ['dub', 'dubbed'],                   label: 'Dub' },
-        original:         { keywords: ['original'],                        label: 'Original' },
+        comment:          { streams: ['audio', 'subtitle'],          keywords: ['commentary'],                      tag: 'Commentary'  },
+        visual_impaired:  { streams: ['audio'],                      keywords: ['descriptive', 'dvs'],              tag: 'Descriptive' },
+        descriptions:     { streams: ['subtitle'],                   keywords: ['descriptive', 'dvs'],              tag: 'Descriptive' },
+        hearing_impaired: { streams: ['subtitle'],                   keywords: ['sdh', 'hearing impaired', 'deaf'], tag: 'SDH'         },
+        captions:         { streams: ['subtitle'],                   keywords: ['caption'],                         tag: 'SDH'         },
+        lyrics:           { streams: ['subtitle'],                   keywords: ['songs', 'lyrics'],                 tag: 'Lyrics'      },
+        forced:           { streams: ['subtitle'],                   keywords: ['forced'],                          tag: 'Forced'      },
+        dub:              { streams: ['audio'],                      keywords: ['dub', 'dubbed'],                   tag: 'Dub'         },
+        original:         { streams: ['audio'],                      keywords: ['original'],                        tag: 'Original'    },
+        default:          { streams: ['audio', 'subtitle', 'video'], keywords: ['default'],                         tag: null          },
+        attached_pic:     { streams: ['video'],                      keywords: [],                                  tag: null          },
+        still_image:      { streams: ['video'],                      keywords: [],                                  tag: null          },
+        timed_thumbnails: { streams: ['video'],                      keywords: [],                                  tag: null          },
     };
     const streamTitleLower = (s) => (s.tags?.title || '').trim().toLowerCase();
-    const hasDisposition = (s, key) => s.disposition?.[key] === 1
-        || (dispositionTypes[key]?.keywords || []).some(k => streamTitleLower(s).includes(k));
+    // Whole-token keyword matcher: a keyword matches only when not flanked by a letter/digit, so '[sdh]',
+    // 'eng-sdh', and 'sdh.' match while 'deafening'/'aboriginal' do not. An internal space matches any run
+    // of non-alphanumerics ('hearing impaired' == 'hearing_impaired'). Keywords are regex-escaped; the 'u'
+    // flag enables \p{L}/\p{N}. text must already be lowercased.
+    const matchesKeyword = (text, keywords) => {
+        if (!keywords.length) return false;
+        const pattern = keywords
+            .map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '[^\\p{L}\\p{N}]+'))
+            .join('|');
+        return new RegExp(`(?<![\\p{L}\\p{N}])(?:${pattern})(?![\\p{L}\\p{N}])`, 'u').test(text);
+    };
+    const hasDisposition = (s, key) => {
+        const entry = dispositionTypes[key];
+        if (!entry) return false;
+        if (!entry.streams.includes((s.codec_type || '').trim().toLowerCase())) return false;
+        return s.disposition?.[key] === 1 || matchesKeyword(streamTitleLower(s), entry.keywords);
+    };
     const isCommentary  = (s) => hasDisposition(s, 'comment');
-    const isDescriptive = (s) => hasDisposition(s, 'visual_impaired');
-    const isSdh         = (s) => hasDisposition(s, 'hearing_impaired');
-    const isSigns       = (s) => hasDisposition(s, 'karaoke');
+    const isDescriptive = (s) => hasDisposition(s, 'visual_impaired') || hasDisposition(s, 'descriptions');
+    const isSdh         = (s) => hasDisposition(s, 'hearing_impaired') || hasDisposition(s, 'captions');
+    const isLyrics      = (s) => hasDisposition(s, 'lyrics');
 
     /* -=-=-= Resolve the best available bitrate (bps) for a stream =-=-=- */
     // ffprobe first, mediaInfo fallback. ffprobe cannot read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V), 
@@ -418,7 +441,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${role}]`;
         }
         if (type === 'subtitle') {
-            const role = isCommentary(s) ? '/commentary' : (isSdh(s) ? '/sdh' : (isSigns(s) ? '/signs' : ''));
+            const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : (isSdh(s) ? '/sdh' : (isLyrics(s) ? '/lyrics' : '')));
             const forced = s.disposition?.forced === 1 ? '/forced' : '';
             return `[sub:${[lang, codec].filter(Boolean).join(' ')}${forced}${role}]`;
         }
@@ -626,9 +649,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return response;
     }
 
-    // A secondary track is any commentary, visually-impaired/descriptive, or signs/songs track — the
-    // shared classifiers cover both the disposition flags and the title keywords.
-    const isSecondaryTrack = (stream) => isCommentary(stream) || isDescriptive(stream) || isSigns(stream);
+    // A secondary track is any commentary or visually-impaired/descriptive track — the shared
+    // classifiers cover both the disposition flags and the title keywords. Signs/songs are subtitle-only
+    // now, so they never apply to an audio stream.
+    const isSecondaryTrack = (stream) => isCommentary(stream) || isDescriptive(stream);
 
     //Add secondary track flag and the cleaned language to each track
     audioStreams = audioStreams.map(item => {

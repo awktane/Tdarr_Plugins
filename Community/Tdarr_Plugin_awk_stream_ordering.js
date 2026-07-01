@@ -5,8 +5,8 @@ const details = () => ({
     Name: 'Re-order streams video, audio, subtitle, then anything else',
     Type: 'Any',
     Operation: 'Transcode',
-    Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/signs/sdh/commentary) -> Attachments -> Data. Also marks the first audio track as the sole default.\n`,
-    Version: '1.11.0',
+    Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/songs/sdh/descriptive/commentary) -> Attachments -> Data. Also marks the first audio track as the sole default.\n`,
+    Version: '1.12.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -259,28 +259,51 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
 
     /* -=-=-= Stream role/forced classifiers =-=-=- */
-    // Each classifier returns true when the stream carries the disposition flag OR its title contains
-    // one of the keywords. All keyword/label data lives in the single dispositionTypes table below so
-    // the lists never drift; summariseStream, the stream-ordering sort keys, audio_clean's
-    // secondary-track detection, and clean_and_remux's title tagging all read from it.
+    // Classifiers group the real ffmpeg disposition flags below into the roles the pipeline sorts and
+    // tags by. dispositionTypes is keyed by the actual ffmpeg disposition; each entry declares the stream
+    // types it is valid on (streams), the title keywords that also indicate it (each keyword lives on one
+    // flag so title->flag promotion stays unambiguous), and the canonical string written into a stream
+    // title (tag, null when never written). hasDisposition gates on codec_type and matches keywords as
+    // whole tokens via matchesKeyword. summariseStream, the stream-ordering sort keys, audio_clean's
+    // secondary-track detection, and clean_and_remux's title/flag tagging all read from this table.
     // Shared verbatim across all three awk plugins.
     const dispositionTypes = {
-        comment:          { keywords: ['commentary', 'producer'],          label: 'Commentary' },
-        visual_impaired:  { keywords: ['descriptive', 'dvs', 'narration'], label: 'Descriptive' },
-        hearing_impaired: { keywords: ['sdh', 'hearing impaired', 'deaf'], label: 'SDH' },
-        karaoke:          { keywords: ['signs', 'songs'],                  label: 'Signs' },
-        forced:           { keywords: ['forced'],                          label: 'Forced' },
-        default:          { keywords: ['default'],                         label: 'Default' },
-        dub:              { keywords: ['dub', 'dubbed'],                   label: 'Dub' },
-        original:         { keywords: ['original'],                        label: 'Original' },
+        comment:          { streams: ['audio', 'subtitle'],          keywords: ['commentary'],                      tag: 'Commentary'  },
+        visual_impaired:  { streams: ['audio'],                      keywords: ['descriptive', 'dvs'],              tag: 'Descriptive' },
+        descriptions:     { streams: ['subtitle'],                   keywords: ['descriptive', 'dvs'],              tag: 'Descriptive' },
+        hearing_impaired: { streams: ['subtitle'],                   keywords: ['sdh', 'hearing impaired', 'deaf'], tag: 'SDH'         },
+        captions:         { streams: ['subtitle'],                   keywords: ['caption'],                         tag: 'SDH'         },
+        lyrics:           { streams: ['subtitle'],                   keywords: ['songs', 'lyrics'],                 tag: 'Lyrics'      },
+        forced:           { streams: ['subtitle'],                   keywords: ['forced'],                          tag: 'Forced'      },
+        dub:              { streams: ['audio'],                      keywords: ['dub', 'dubbed'],                   tag: 'Dub'         },
+        original:         { streams: ['audio'],                      keywords: ['original'],                        tag: 'Original'    },
+        default:          { streams: ['audio', 'subtitle', 'video'], keywords: ['default'],                         tag: null          },
+        attached_pic:     { streams: ['video'],                      keywords: [],                                  tag: null          },
+        still_image:      { streams: ['video'],                      keywords: [],                                  tag: null          },
+        timed_thumbnails: { streams: ['video'],                      keywords: [],                                  tag: null          },
     };
     const streamTitleLower = (s) => (s.tags?.title || '').trim().toLowerCase();
-    const hasDisposition = (s, key) => s.disposition?.[key] === 1
-        || (dispositionTypes[key]?.keywords || []).some(k => streamTitleLower(s).includes(k));
+    // Whole-token keyword matcher: a keyword matches only when not flanked by a letter/digit, so '[sdh]',
+    // 'eng-sdh', and 'sdh.' match while 'deafening'/'aboriginal' do not. An internal space matches any run
+    // of non-alphanumerics ('hearing impaired' == 'hearing_impaired'). Keywords are regex-escaped; the 'u'
+    // flag enables \p{L}/\p{N}. text must already be lowercased.
+    const matchesKeyword = (text, keywords) => {
+        if (!keywords.length) return false;
+        const pattern = keywords
+            .map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '[^\\p{L}\\p{N}]+'))
+            .join('|');
+        return new RegExp(`(?<![\\p{L}\\p{N}])(?:${pattern})(?![\\p{L}\\p{N}])`, 'u').test(text);
+    };
+    const hasDisposition = (s, key) => {
+        const entry = dispositionTypes[key];
+        if (!entry) return false;
+        if (!entry.streams.includes((s.codec_type || '').trim().toLowerCase())) return false;
+        return s.disposition?.[key] === 1 || matchesKeyword(streamTitleLower(s), entry.keywords);
+    };
     const isCommentary  = (s) => hasDisposition(s, 'comment');
-    const isDescriptive = (s) => hasDisposition(s, 'visual_impaired');
-    const isSdh         = (s) => hasDisposition(s, 'hearing_impaired');
-    const isSigns       = (s) => hasDisposition(s, 'karaoke');
+    const isDescriptive = (s) => hasDisposition(s, 'visual_impaired') || hasDisposition(s, 'descriptions');
+    const isSdh         = (s) => hasDisposition(s, 'hearing_impaired') || hasDisposition(s, 'captions');
+    const isLyrics      = (s) => hasDisposition(s, 'lyrics');
 
     /* -=-=-= Resolve the best available bitrate (bps) for a stream =-=-=- */
     // ffprobe first, mediaInfo fallback. ffprobe cannot read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V), 
@@ -313,7 +336,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${role}]`;
         }
         if (type === 'subtitle') {
-            const role = isCommentary(s) ? '/commentary' : (isSdh(s) ? '/sdh' : (isSigns(s) ? '/signs' : ''));
+            const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : (isSdh(s) ? '/sdh' : (isLyrics(s) ? '/lyrics' : '')));
             const forced = s.disposition?.forced === 1 ? '/forced' : '';
             return `[sub:${[lang, codec].filter(Boolean).join(' ')}${forced}${role}]`;
         }
@@ -403,9 +426,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             commentary: isCommentary(ffstream),
             descriptive: isDescriptive(ffstream),
             sdh: isSdh(ffstream),
-            signs: isSigns(ffstream),
+            lyrics: isLyrics(ffstream),
 
-            mjpeg: (ffstream.codec_name || '').trim().toLowerCase() === 'mjpeg',
+            // Cover art / poster / thumbnail video streams sort last. Detected by the ffmpeg cover-art
+            // dispositions (any codec) or a still-image codec — mirrors clean_and_remux's image removal.
+            coverArt: hasDisposition(ffstream, 'attached_pic') || hasDisposition(ffstream, 'still_image') || hasDisposition(ffstream, 'timed_thumbnails')
+                || ['mjpeg', 'mjpegb', 'png', 'apng', 'gif', 'bmp', 'webp', 'tiff'].includes((ffstream.codec_name || '').trim().toLowerCase()),
         });
     }
 
@@ -424,10 +450,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (aOrder !== bOrder)
             return aOrder - bOrder;
 
-        //Video (but mjpeg goes last)
+        //Video (but cover art / posters / thumbnails go last)
         if (a.type === 'video') {
-            if (a.mjpeg !== b.mjpeg)
-                return a.mjpeg ? 1 : -1;
+            if (a.coverArt !== b.coverArt)
+                return a.coverArt ? 1 : -1;
         //Audio
         } else if(a.type === 'audio') {
             //Language priority first. A track in a non-preferred language should not sort above one in a preferred language.
@@ -470,9 +496,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (aRank !== bRank)
                 return aRank - bRank;
 
-            //Normal, signs, SDH, commentary - sdhFirst flag overrides SDH position above
-            const aRole = a.commentary ? 3 : (a.sdh ? 2 : (a.signs ? 1 : 0));
-            const bRole = b.commentary ? 3 : (b.sdh ? 2 : (b.signs ? 1 : 0));
+            //Normal, lyrics/songs, SDH, descriptive, commentary - sdhFirst flag overrides SDH position above
+            const aRole = a.commentary ? 4 : (a.descriptive ? 3 : (a.sdh ? 2 : (a.lyrics ? 1 : 0)));
+            const bRole = b.commentary ? 4 : (b.descriptive ? 3 : (b.sdh ? 2 : (b.lyrics ? 1 : 0)));
             if (aRole !== bRole)
                 return aRole - bRole;
         }
