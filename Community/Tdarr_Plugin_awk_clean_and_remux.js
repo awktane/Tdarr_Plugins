@@ -13,7 +13,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.15.1',
+    Version: '1.16.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -285,18 +285,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Resolve each stream's language exactly as the main loop does below (ffprobe tag first, then the
         // mediaInfo fallback). A stream whose language only mediaInfo supplies is never filled, so counting
         // it as "untagged" here would abort files that would actually process fine.
-        const isUntagged = (s, i) => {
-            const ffmedia = file?.mediaInfo?.track?.find(t => Number(t.StreamOrder) === i);
+        const isUntagged = (s) => {
+            const ffmedia = file?.mediaInfo?.track?.find(t => Number(t.StreamOrder) === s.index);
             const lang = (s?.tags?.language ?? (ffmedia?.Language ?? '')).trim().toLowerCase();
             return !lang || lang === 'und';
         };
-        const untaggedAudio = streams.filter((s, i) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s, i)).length;
+        const untaggedAudio = streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s)).length;
         if (untaggedAudio > 1) {
             response.infoLog += `☒${untaggedAudio} audio streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue or set fail_langs_blank to false.\n`;
             response.processFile = false;
             return response;
         }
-        const untaggedSubs =  streams.filter((s, i) =>(s?.codec_type || '').toLowerCase() === 'subtitle' && isUntagged(s, i)).length;
+        const untaggedSubs =  streams.filter((s) =>(s?.codec_type || '').toLowerCase() === 'subtitle' && isUntagged(s)).length;
         if (untaggedSubs > 1) {
             response.infoLog += `☒${untaggedSubs} subtitle streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue or set fail_langs_blank to false.\n`;
             response.processFile = false;
@@ -311,6 +311,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         'hearing impaired',
         'deaf'
     ];
+    // Whole-token matcher derived from deafKeywords. A keyword matches only when it is NOT flanked by a
+    // letter or digit, so every surrounding symbol/whitespace counts as a boundary — '[deaf]', '(deaf)',
+    // 'eng-deaf', 'deaf.', and 'sdh_forced' all match, while 'deafening' does not. An internal space in a
+    // keyword matches any run of non-alphanumeric separators, so 'hearing impaired', 'hearing-impaired',
+    // and 'hearing_impaired' all match. Keywords are regex-escaped so any future entry with metacharacters
+    // stays literal; the 'u' flag enables \p{L}/\p{N} (subtitleDescription is already lowercased).
+    const deafPattern = deafKeywords
+        .map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '[^\\p{L}\\p{N}]+'))
+        .join('|');
+    const deafRegex = new RegExp(`(?<![\\p{L}\\p{N}])(?:${deafPattern})(?![\\p{L}\\p{N}])`, 'u');
 
     // Classify an attachment stream so we only ever remove things we can positively identify:
     //   'image' - cover art / poster (mjpeg/png/gif/bmp, image/* mimetype, or an image filename). Always removed.
@@ -468,9 +478,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             && !stripWords.has(tok.replace(/^[^\w]+|[^\w]+$/g, '').toLowerCase()))
         .join(' ')
         .trim();
-    // Will this flag be present on the OUTPUT stream? With tag_disposition we also trust title keywords
-    // (they are promoted to real flags above); otherwise only the existing flag counts.
-    const effectiveDisposition = (s, key) => (tagDisposition ? hasDisposition(s, key) : s.disposition?.[key] === 1);
 
     // Check if file is a video. If it isn't then exit plugin.
     if (file.fileMedium !== 'video') {
@@ -518,7 +525,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     for (let i = 0; i < file.ffProbeData.streams.length; i++) {
         try {
             const ffstream = file.ffProbeData?.streams[i];
-            const ffmedia = file?.mediaInfo?.track?.find(t => Number(t.StreamOrder) === i);
+            const ffmedia = file?.mediaInfo?.track?.find(t => Number(t.StreamOrder) === ffstream.index);
             const ffstreamCodec = (ffstream.codec_name || '').toLowerCase();
             const ffstreamType = (ffstream.codec_type || '').toLowerCase();
 
@@ -562,7 +569,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if(subLanguage.length > 0 && !subLanguage.includes(workLang) && !subLanguage.includes(workLang.replace(/[-_.].*$/, ''))) {
                         workDone += `☐Remove stream ${i} - subtitle language (${streamLang})\n`;
                         delStream = true;
-                    } else if ((delDeaf === true) && (ffstream.disposition?.hearing_impaired === 1 || deafKeywords.some(keyword => subtitleDescription.includes(keyword)))) {
+                    } else if ((delDeaf === true) && (ffstream.disposition?.hearing_impaired === 1 || deafRegex.test(subtitleDescription))) {
                         workDone += `☐Remove stream ${i} - SDH (${logSafe(subtitleDescription)})\n`;
                         delStream = true;
                     }
@@ -671,14 +678,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     }
                 }
 
-                //tag_channel_audio_title: rebuild the title as a channel/downmix base plus a disposition suffix derived from the actual flags.
+                //tag_channel_audio_title: rebuild the title as a channel/downmix base plus a disposition suffix. The suffix reads each role from the
+                //shared classifiers (real flag OR title keyword, via hasDisposition), so a title-only role like "5.1 Commentary" is normalised to
+                //"5.1 - Commentary" and survives the reformat instead of being stripped when tag_disposition is off. tag_disposition still governs whether
+                //that title role is additionally promoted into a real flag above.
                 //Only titles we own are touched: empty, a bare channel label, or a downmix/channel-derived title (e.g. "5.1 -> 2.0"). Custom titles are left alone.
                 if(tagChannelAudioTitle === true && ffstream.channels) {
                     let base = stripDispositionWords(newStreamTitle);
                     if(!base || bareChannelRegex.test(base) || downmixChannelRegex.test(base)) {
                         if(!base || bareChannelRegex.test(base))
                             base = channelLabel(ffstream);
-                        const suffix = surfacedKeys.filter(key => effectiveDisposition(ffstream, key)).map(key => dispositionTypes[key].label).join(' ');
+                        const suffix = surfacedKeys.filter(key => hasDisposition(ffstream, key)).map(key => dispositionTypes[key].label).join(' ');
                         newStreamTitle = suffix ? `${base} - ${suffix}` : base;
                     }
                 }
