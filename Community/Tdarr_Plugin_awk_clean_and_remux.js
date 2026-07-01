@@ -13,7 +13,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.18.0',
+    Version: '1.18.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -353,10 +353,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return 'other';
     };
 
-    //Clean up titles - Remove surrounding whitespace, single quotes and double quotes as there's no reason for them & wipes title as specified by busyTitleRemove
-    function cleanStreamTitle(rawTitle, busyTitleRemove) {
+    //Clean up titles - Remove surrounding whitespace, single quotes and double quotes as there's no reason for them, and deduplicate repeated segments ("Stereo / Stereo" -> "Stereo").
+    //Busy-title removal (more than 3 periods) is applied by the callers AFTER tagging, not here, so disposition roles are captured into flags before an over-dotted title is cleared.
+    function cleanStreamTitle(rawTitle) {
         let title = (rawTitle || '').trim().replace(/^["']+|["']+$/g, '');
-        if (busyTitleRemove && title.split('.').length > 4) return '';
         if (title) {
             const parts = title.split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
             if (parts.length === 1) return parts[0];
@@ -620,8 +620,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
 
-                //Remove surrounding whitespace, single quotes and double quotes as there's no reason for them. Clear the title if metaBusyTitleRemove conditions are met
-                let newStreamTitle = cleanStreamTitle(streamTitle, metaBusyTitleRemove);
+                //Remove surrounding whitespace, single quotes and double quotes as there's no reason for them. Busy-title clearing happens after tag_disposition (below).
+                let newStreamTitle = cleanStreamTitle(streamTitle);
 
                 //tag_disposition: import any surfaced disposition keyword found in the title into the real flag (additive so existing flags are kept).
                 if(applies(tagDisposition, 'subtitle')) {
@@ -632,7 +632,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     }
                 }
 
-                //tag_title (subtitle): only titles we own (empty or already just role words) are set to the role tag(s). Custom titles are left untouched.
+                //Busy-title removal: now that tag_disposition (above) has captured any role keywords into the
+                //real flags, clear an over-dotted title so tag_title (below) re-names it by the usual rules -
+                //it drops in and is treated exactly as a blank title would be.
+                if(metaBusyTitleRemove && newStreamTitle.split('.').length > 4)
+                    newStreamTitle = '';
+
+                //tag_title (subtitle): titles we own (empty/role-only, including a just-cleared busy title) are set to the role tag(s). Custom titles are left untouched.
                 if(applies(tagTitle, 'subtitle')) {
                     const tags = titleTagsFor(ffstream);
                     if(tags.length > 0 && !stripDispositionWords(newStreamTitle))
@@ -717,8 +723,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
 
-                //Remove surrounding whitespace, single quotes and double quotes as there's no reason for them. Clear the title if metaBusyTitleRemove conditions are met
-                let newStreamTitle = cleanStreamTitle(streamTitle, metaBusyTitleRemove);
+                //Remove surrounding whitespace, single quotes and double quotes as there's no reason for them. Busy-title clearing happens after tag_disposition (below).
+                let newStreamTitle = cleanStreamTitle(streamTitle);
 
                 //tag_disposition: import any surfaced disposition keyword found in the title into the real flag (additive so existing flags are kept).
                 if(applies(tagDisposition, 'audio')) {
@@ -728,6 +734,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         metadataCommand += ` -disposition:a:${audioStreamIndex} ${promote.map(k => `+${k}`).join('')}`;
                     }
                 }
+
+                //Busy-title removal: now that tag_disposition (above) has captured any role keywords into the
+                //real flags, clear an over-dotted title so tag_title (below) re-names it by the usual rules -
+                //it drops in and is treated as a blank title (an empty base becomes the channel label).
+                if(metaBusyTitleRemove && newStreamTitle.split('.').length > 4)
+                    newStreamTitle = '';
 
                 //tag_title (audio): rebuild the title as a channel/downmix base plus a disposition suffix. The suffix reads each role from the
                 //shared classifiers (real flag OR title keyword, via hasDisposition), so a title-only role like "5.1 Commentary" is normalised to
