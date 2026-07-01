@@ -6,14 +6,14 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Identify and remove data streams and image/cover-art streams (by codec, or by attached_pic/still_image/timed_thumbnails disposition), and remux into mkv or mp4.\n\n
-                  Removes any subtitle or audio tracks that are not in the specified language(s) and optionally removes with deaf/SDH in their description.\n\n
+                  Removes any subtitle or audio tracks that are not in the specified language(s), and optionally removes accessibility tracks (SDH/CC subtitles, audio-description audio) via del_accessible - only when a plain track of the same language remains.\n\n
                   Option to modify metadata to remove metadata comments and titles with too many periods.\n\n
                   Automatically deduplicates titles reducing "Stereo / Stereo" down to "Stereo" or "English - English" down to "English".\n\n
                   Optionally rebuilds audio and/or subtitle titles from their disposition roles (tag_title) and imports title keywords into the real ffmpeg disposition flags (tag_disposition), each selectable per stream type (audio, subtitle, or both).\n\n
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.19.0',
+    Version: '1.20.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -86,14 +86,16 @@ const details = () => ({
                 \\nIf false - the fill_language assignment is logged as normal and processing continues.`,
         },        
         {
-            name: 'del_deaf',
-            type: 'boolean',
-            defaultValue: false,
+            name: 'del_accessible',
+            type: 'string',
+            defaultValue: 'disabled',
             inputUI: {
                 type: 'dropdown',
-                options: ['false', 'true'],
+                options: ['disabled', 'subtitle', 'audio', 'both'],
             },
-            tooltip: `Should subtitle tracks that contain the words "SDH, deaf, hearing impaired, etc" in their description be deleted?`,
+            tooltip: `Remove accessibility tracks. Choose which stream types to apply to: disabled, subtitle, audio, or both.
+                \\nSubtitle removes SDH / Closed Caption tracks (for the deaf/hard-of-hearing). Audio removes audio-description tracks (visual_impaired, for the blind). Detected by the real ffmpeg disposition flag or by keywords in the title/handler/description.
+                \\nSafety: a track is only removed when a "plain" track of the same language survives - one carrying no commentary/descriptive/SDH/lyrics role (and, for subtitles, in a format the output container keeps). So extras are removed, never the last usable track.`,
         },
         {
             name: 'tag_disposition',
@@ -325,7 +327,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
 
 
-    const delDeaf = String(inputs.del_deaf) === 'true';
+    const delAccessible = String(inputs.del_accessible || 'disabled').toLowerCase();
+    if(!['disabled', 'subtitle', 'audio', 'both'].includes(delAccessible)) {
+        response.infoLog += `☒Somehow invalid del_accessible option provided. Check your settings!\n`;
+        response.processFile = false;
+        return response;
+    }
 
     // Classify an attachment stream so we only ever remove things we can positively identify:
     //   'image' - cover art / poster (mjpeg/png/gif/bmp, image/* mimetype, or an image filename). Always removed.
@@ -395,19 +402,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // secondary-track detection, and clean_and_remux's title/flag tagging all read from this table.
     // Shared verbatim across all three awk plugins.
     const dispositionTypes = {
-        comment:          { streams: ['audio', 'subtitle'],          keywords: ['commentary'],                      tag: 'Commentary'  },
-        visual_impaired:  { streams: ['audio'],                      keywords: ['descriptive', 'dvs'],              tag: 'Descriptive' },
-        descriptions:     { streams: ['subtitle'],                   keywords: ['descriptive', 'dvs'],              tag: 'Descriptive' },
-        hearing_impaired: { streams: ['subtitle'],                   keywords: ['sdh', 'hearing impaired', 'deaf'], tag: 'SDH'         },
-        captions:         { streams: ['subtitle'],                   keywords: ['caption', 'captions', 'cc'],       tag: 'SDH'         },
-        lyrics:           { streams: ['subtitle'],                   keywords: ['songs', 'lyrics'],                 tag: 'Lyrics'      },
-        forced:           { streams: ['subtitle'],                   keywords: ['forced'],                          tag: 'Forced'      },
-        dub:              { streams: ['audio'],                      keywords: ['dub', 'dubbed'],                   tag: 'Dub'         },
-        original:         { streams: ['audio'],                      keywords: ['original'],                        tag: 'Original'    },
-        default:          { streams: ['audio', 'subtitle', 'video'], keywords: ['default'],                         tag: null          },
-        attached_pic:     { streams: ['video'],                      keywords: [],                                  tag: null          },
-        still_image:      { streams: ['video'],                      keywords: [],                                  tag: null          },
-        timed_thumbnails: { streams: ['video'],                      keywords: [],                                  tag: null          },
+        comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                            tag: 'Commentary'  },
+        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','dvs','audio description'], tag: 'Descriptive' },
+        descriptions:     { streams:['subtitle'],                 keywords: ['descriptive','dvs'],                     tag: 'Descriptive' },
+        hearing_impaired: { streams:['subtitle'],                 keywords: ['sdh','hearing impaired','deaf'],         tag: 'SDH'         },
+        captions:         { streams:['subtitle'],                 keywords: ['caption','captions','cc'],               tag: 'SDH'         },
+        lyrics:           { streams:['subtitle'],                 keywords: ['songs','lyrics'],                        tag: 'Lyrics'      },
+        forced:           { streams:['subtitle'],                 keywords: ['forced'],                                tag: 'Forced'      },
+        dub:              { streams:['audio'],                    keywords: ['dub','dubbed'],                          tag: 'Dub'         },
+        original:         { streams:['audio'],                    keywords: ['original'],                              tag: 'Original'    },
+        default:          { streams:['audio','subtitle','video'], keywords: ['default'],                               tag: null          },
+        attached_pic:     { streams:['video'],                    keywords: [],                                        tag: null          },
+        still_image:      { streams:['video'],                    keywords: [],                                        tag: null          },
+        timed_thumbnails: { streams:['video'],                    keywords: [],                                        tag: null          },
     };
     const streamTitleLower = (s) => (s.tags?.title || '').trim().toLowerCase();
     // Whole-token keyword matcher: a keyword matches only when not flanked by a letter/digit, so '[sdh]',
@@ -499,9 +506,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const dispKeysFor = (type) => Object.keys(dispositionTypes).filter(k => dispositionTypes[k].streams.includes(type));
     const titleTagsFor = (s) => [...new Set(dispKeysFor((s.codec_type || '').trim().toLowerCase())
         .filter(k => dispositionTypes[k].tag && hasDisposition(s, k)).map(k => dispositionTypes[k].tag))];
-    // SDH keywords for del_deaf's broad description scan (title/description/handler/mediaInfo) — sourced
-    // from the shared table (hearing_impaired + captions) and matched whole-token via matchesKeyword.
+    // Accessibility keywords for del_accessible's broad description scan (title/description/handler/mediaInfo),
+    // sourced from the shared table and matched whole-token via matchesKeyword. Subtitle side = hearing (SDH/CC);
+    // audio side = visual (audio description). visual_impaired carries 'audio description' in the shared table
+    // so AD tracks tagged only in the title are recognised everywhere (classification and removal), not just here.
     const sdhKeywords = [...dispositionTypes.hearing_impaired.keywords, ...dispositionTypes.captions.keywords];
+    const adKeywords  = dispositionTypes.visual_impaired.keywords;
     // Single-word keywords stripped when recovering the channel/base portion of a title (multi-word
     // keywords like "hearing impaired" can't appear as a lone channel token, so they are skipped).
     const stripWords = new Set(Object.values(dispositionTypes).flatMap(d => d.keywords).filter(w => !w.includes(' ')));
@@ -513,6 +523,41 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             && !stripWords.has(tok.replace(/^[^\w]+|[^\w]+$/g, '').toLowerCase()))
         .join(' ')
         .trim();
+
+    // -=-=-= del_accessible safety guard (clean_and_remux only) =-=-=-
+    // Subtitle codecs dropped purely by container/format (also applied in the subtitle loop) - hoisted so the
+    // pre-pass here and the loop share one definition.
+    const alwaysDropSubs  = ['eia_608', 'ttml'];
+    const mp4OnlyDropSubs = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub',
+                             'dvb_teletext', 'arib_caption', 'hdmv_text_subtitle'];
+    const subFormatDropped = (codec) => alwaysDropSubs.includes(codec)
+        || (dstContainer === 'mp4' && mp4OnlyDropSubs.includes(codec));
+
+    // A "plain" track carries no commentary/descriptive/SDH/lyrics role - a genuine main audio or dialogue
+    // subtitle. del_accessible removes an accessibility track (SDH/CC subtitle, audio-description audio) only
+    // when its language still has a plain track that SURVIVES the language (and, for subtitles, format) filter,
+    // so we strip extras and never the last usable track. resolveWorkLang mirrors the loop's language resolution.
+    const isPlainTrack = (s) => !isCommentary(s) && !isDescriptive(s) && !isSdh(s) && !isLyrics(s);
+    const resolveWorkLang = (s) => {
+        const m = file?.mediaInfo?.track?.find(t => Number(t.StreamOrder) === s.index);
+        const sl = (s?.tags?.language ?? (m?.Language ?? '')).trim().toLowerCase();
+        return (fillLanguage && (!sl || sl === 'und')) ? fillLanguage : (sl || 'und');
+    };
+    const plainAudioLangs = new Set();
+    const plainSubLangs = new Set();
+    if (delAccessible !== 'disabled') {
+        for (const s of (file.ffProbeData?.streams || [])) {
+            const t = (s.codec_type || '').trim().toLowerCase();
+            if ((t !== 'audio' && t !== 'subtitle') || !isPlainTrack(s)) continue;
+            if (t === 'subtitle' && subFormatDropped((s.codec_name || '').toLowerCase())) continue;
+            const wl = resolveWorkLang(s);
+            const langs = t === 'audio' ? audioLanguage : subLanguage;
+            if (langs.length > 0 && !langs.includes(wl) && !langs.includes(wl.replace(/[-_.].*$/, ''))) continue;
+            const set = t === 'audio' ? plainAudioLangs : plainSubLangs;
+            set.add(wl); set.add(wl.replace(/[-_.].*$/, ''));
+        }
+    }
+    const hasPlainSameLang = (set, wl) => set.has(wl) || set.has(wl.replace(/[-_.].*$/, ''));
 
     // Check if file is a video. If it isn't then exit plugin.
     if (file.fileMedium !== 'video') {
@@ -583,10 +628,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // dvb_teletext, arib_caption, hdmv_text_subtitle: decode-only, no encoder, no mp4 muxer support — drop for mp4.
                 //   hdmv_text_subtitle copies into mkv fine so it is only in the mp4 list.
                 // Image-based (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle, xsub): no encoder, mp4 rejects them — drop for mp4.
-                const alwaysDrop   = ['eia_608', 'ttml'];
-                const mp4OnlyDrop  = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub',
-                                      'dvb_teletext', 'arib_caption', 'hdmv_text_subtitle'];
-                if (alwaysDrop.includes(ffstreamCodec) || (dstContainer === 'mp4' && mp4OnlyDrop.includes(ffstreamCodec))) {
+                if (subFormatDropped(ffstreamCodec)) {
                     workDone += `☐Remove stream ${i} - unsupported (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
                 } else {
@@ -597,15 +639,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         workLang = fillLanguage;
                     }
 
-                    //Gather all of the places where we may find the deaf identification words we're looking for for delDeaf
+                    //Gather all of the places where we may find the accessibility (SDH/CC) identification words for del_accessible
                     const subtitleDescription = [ffstream.tags?.title,ffstream.tags?.description,ffstream.tags?.handler_name,ffmedia?.Title,ffmedia?.Description].filter(Boolean).join(' ').toLowerCase();
 
                     //If the subtitle is a language that should be removed then remove it regardless of other settings.
                     if(subLanguage.length > 0 && !subLanguage.includes(workLang) && !subLanguage.includes(workLang.replace(/[-_.].*$/, ''))) {
                         workDone += `☐Remove stream ${i} - subtitle language (${streamLang})\n`;
                         delStream = true;
-                    } else if ((delDeaf === true) && (ffstream.disposition?.hearing_impaired === 1 || ffstream.disposition?.captions === 1 || matchesKeyword(subtitleDescription, sdhKeywords))) {
-                        workDone += `☐Remove stream ${i} - SDH (${logSafe(subtitleDescription)})\n`;
+                    } else if (applies(delAccessible, 'subtitle')
+                        && (ffstream.disposition?.hearing_impaired === 1 || ffstream.disposition?.captions === 1 || matchesKeyword(subtitleDescription, sdhKeywords))
+                        && hasPlainSameLang(plainSubLangs, workLang)) {
+                        workDone += `☐Remove stream ${i} - accessibility subtitle SDH/CC (${logSafe(subtitleDescription)})\n`;
                         delStream = true;
                     }
                 }
@@ -708,9 +752,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     workLang = fillLanguage;
                 }
 
+                //Title/handler/mediaInfo scanned for the audio-description identifiers (del_accessible audio).
+                const audioDescription = [ffstream.tags?.title, ffstream.tags?.handler_name, ffmedia?.Title].filter(Boolean).join(' ').toLowerCase();
+
                 //If the audio is a language that should be removed then remove it regardless of other settings.
                 if(audioLanguage.length > 0 && !audioLanguage.includes(workLang) && !audioLanguage.includes(workLang.replace(/[-_.].*$/, ''))) {
                     workDone += `☐Remove stream ${i} - audio language (${streamLang})\n`;
+                    delStream = true;
+                } else if (applies(delAccessible, 'audio')
+                    && (ffstream.disposition?.visual_impaired === 1 || matchesKeyword(audioDescription, adKeywords))
+                    && hasPlainSameLang(plainAudioLangs, workLang)) {
+                    workDone += `☐Remove stream ${i} - audio description (${logSafe(audioDescription)})\n`;
                     delStream = true;
                 }
 

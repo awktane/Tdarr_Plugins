@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/songs/sdh/descriptive/commentary) -> Attachments -> Data. Also marks the first audio track as the sole default.\n`,
-    Version: '1.13.0',
+    Version: '1.14.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -268,19 +268,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // secondary-track detection, and clean_and_remux's title/flag tagging all read from this table.
     // Shared verbatim across all three awk plugins.
     const dispositionTypes = {
-        comment:          { streams: ['audio', 'subtitle'],          keywords: ['commentary'],                      tag: 'Commentary'  },
-        visual_impaired:  { streams: ['audio'],                      keywords: ['descriptive', 'dvs'],              tag: 'Descriptive' },
-        descriptions:     { streams: ['subtitle'],                   keywords: ['descriptive', 'dvs'],              tag: 'Descriptive' },
-        hearing_impaired: { streams: ['subtitle'],                   keywords: ['sdh', 'hearing impaired', 'deaf'], tag: 'SDH'         },
-        captions:         { streams: ['subtitle'],                   keywords: ['caption', 'captions', 'cc'],       tag: 'SDH'         },
-        lyrics:           { streams: ['subtitle'],                   keywords: ['songs', 'lyrics'],                 tag: 'Lyrics'      },
-        forced:           { streams: ['subtitle'],                   keywords: ['forced'],                          tag: 'Forced'      },
-        dub:              { streams: ['audio'],                      keywords: ['dub', 'dubbed'],                   tag: 'Dub'         },
-        original:         { streams: ['audio'],                      keywords: ['original'],                        tag: 'Original'    },
-        default:          { streams: ['audio', 'subtitle', 'video'], keywords: ['default'],                         tag: null          },
-        attached_pic:     { streams: ['video'],                      keywords: [],                                  tag: null          },
-        still_image:      { streams: ['video'],                      keywords: [],                                  tag: null          },
-        timed_thumbnails: { streams: ['video'],                      keywords: [],                                  tag: null          },
+        comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                            tag: 'Commentary'  },
+        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','dvs','audio description'], tag: 'Descriptive' },
+        descriptions:     { streams:['subtitle'],                 keywords: ['descriptive','dvs'],                     tag: 'Descriptive' },
+        hearing_impaired: { streams:['subtitle'],                 keywords: ['sdh','hearing impaired','deaf'],         tag: 'SDH'         },
+        captions:         { streams:['subtitle'],                 keywords: ['caption','captions','cc'],               tag: 'SDH'         },
+        lyrics:           { streams:['subtitle'],                 keywords: ['songs','lyrics'],                        tag: 'Lyrics'      },
+        forced:           { streams:['subtitle'],                 keywords: ['forced'],                                tag: 'Forced'      },
+        dub:              { streams:['audio'],                    keywords: ['dub','dubbed'],                          tag: 'Dub'         },
+        original:         { streams:['audio'],                    keywords: ['original'],                              tag: 'Original'    },
+        default:          { streams:['audio','subtitle','video'], keywords: ['default'],                               tag: null          },
+        attached_pic:     { streams:['video'],                    keywords: [],                                        tag: null          },
+        still_image:      { streams:['video'],                    keywords: [],                                        tag: null          },
+        timed_thumbnails: { streams:['video'],                    keywords: [],                                        tag: null          },
     };
     const streamTitleLower = (s) => (s.tags?.title || '').trim().toLowerCase();
     // Whole-token keyword matcher: a keyword matches only when not flanked by a letter/digit, so '[sdh]',
