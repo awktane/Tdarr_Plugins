@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.25.1',
+    Version: '1.26.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -276,7 +276,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype and eac3 into eac3atmos.
     // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" — none of the subtype keywords — so longName alone can't distinguish the subtypes there; we also check the stream profile
     //      (e.g. "DTS-HD MA", "DTS-HD HRA", "DTS Express") and fall back to mediaInfo's Format_Commercial_IfAny
-    //      (e.g. "DTS-HD Master Audio"), which decodes the substream header. Atmos rarely shows in long_name, so eac3 also checks the title tag and the commercial name. Shared by audioQuality and losslessSource.
+    //      (e.g. "DTS-HD Master Audio"), which decodes the substream header. Atmos is taken from long_name or the mediaInfo commercial name only - a title tag alone is not trusted (an editable title does not imply an actual Atmos substream). Shared by audioQuality and losslessSource.
     const resolveCodecName = (stream) => {
         let codec = (stream?.codec_name || '').toLowerCase().trim();
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
@@ -301,7 +301,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 codec = 'dtshr';
             else if (longName.includes('express')         || profile.includes('express')|| commercial.includes('express'))
                 codec = 'dtsexpress';
-        } else if (codec === 'eac3' && (longName.includes('atmos') || (stream.tags?.title || '').toLowerCase().includes('atmos') || commercial.includes('atmos')))
+        } else if (codec === 'eac3' && (longName.includes('atmos') || commercial.includes('atmos')))
             codec = 'eac3atmos';
 
         return codec;
@@ -350,9 +350,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
             const tbl = targets[codec];
             if (tbl) {
-                const estBps = tbl[Math.min(ch, codec === 'ac3' || codec === 'eac3' ? 6 : 8)] ?? 0;
-                const estPenalty = estBps > minimum
-                    ? (estBps >= transparent ? 0 : maxPenalty * (1 - ((estBps - minimum) / (transparent - minimum))))
+                // ac3/eac3 top out at 6ch in ffmpeg, so cap the channel count so the estimate and its
+                // min/transparent thresholds scale together - otherwise a 7.1 source scores below a 5.1 of
+                // the same codec (estBps pins at the 6ch target while the thresholds keep climbing).
+                const capCh = Math.min(ch, codec === 'ac3' || codec === 'eac3' ? 6 : 8);
+                const scale = Math.pow(Math.max(2, capCh) / 2, 0.65);
+                const estBps = tbl[capCh] ?? 0;
+                const estPenalty = estBps > info.minimum * scale
+                    ? (estBps >= info.transparent * scale ? 0 : maxPenalty * (1 - ((estBps - info.minimum * scale) / ((info.transparent - info.minimum) * scale))))
                     : maxPenalty;
                 return info.score - estPenalty;
             }
