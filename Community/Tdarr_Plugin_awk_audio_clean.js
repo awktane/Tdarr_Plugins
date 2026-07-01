@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.23.0',
+    Version: '1.24.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -377,7 +377,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         visual_impaired:  { streams: ['audio'],                      keywords: ['descriptive', 'dvs'],              tag: 'Descriptive' },
         descriptions:     { streams: ['subtitle'],                   keywords: ['descriptive', 'dvs'],              tag: 'Descriptive' },
         hearing_impaired: { streams: ['subtitle'],                   keywords: ['sdh', 'hearing impaired', 'deaf'], tag: 'SDH'         },
-        captions:         { streams: ['subtitle'],                   keywords: ['caption'],                         tag: 'SDH'         },
+        captions:         { streams: ['subtitle'],                   keywords: ['caption', 'captions', 'cc'],       tag: 'SDH'         },
         lyrics:           { streams: ['subtitle'],                   keywords: ['songs', 'lyrics'],                 tag: 'Lyrics'      },
         forced:           { streams: ['subtitle'],                   keywords: ['forced'],                          tag: 'Forced'      },
         dub:              { streams: ['audio'],                      keywords: ['dub', 'dubbed'],                   tag: 'Dub'         },

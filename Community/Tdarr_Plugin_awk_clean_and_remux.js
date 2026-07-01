@@ -13,7 +13,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.18.1',
+    Version: '1.19.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -399,7 +399,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         visual_impaired:  { streams: ['audio'],                      keywords: ['descriptive', 'dvs'],              tag: 'Descriptive' },
         descriptions:     { streams: ['subtitle'],                   keywords: ['descriptive', 'dvs'],              tag: 'Descriptive' },
         hearing_impaired: { streams: ['subtitle'],                   keywords: ['sdh', 'hearing impaired', 'deaf'], tag: 'SDH'         },
-        captions:         { streams: ['subtitle'],                   keywords: ['caption'],                         tag: 'SDH'         },
+        captions:         { streams: ['subtitle'],                   keywords: ['caption', 'captions', 'cc'],       tag: 'SDH'         },
         lyrics:           { streams: ['subtitle'],                   keywords: ['songs', 'lyrics'],                 tag: 'Lyrics'      },
         forced:           { streams: ['subtitle'],                   keywords: ['forced'],                          tag: 'Forced'      },
         dub:              { streams: ['audio'],                      keywords: ['dub', 'dubbed'],                   tag: 'Dub'         },

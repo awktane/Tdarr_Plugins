@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/songs/sdh/descriptive/commentary) -> Attachments -> Data. Also marks the first audio track as the sole default.\n`,
-    Version: '1.12.0',
+    Version: '1.13.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -272,7 +272,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         visual_impaired:  { streams: ['audio'],                      keywords: ['descriptive', 'dvs'],              tag: 'Descriptive' },
         descriptions:     { streams: ['subtitle'],                   keywords: ['descriptive', 'dvs'],              tag: 'Descriptive' },
         hearing_impaired: { streams: ['subtitle'],                   keywords: ['sdh', 'hearing impaired', 'deaf'], tag: 'SDH'         },
-        captions:         { streams: ['subtitle'],                   keywords: ['caption'],                         tag: 'SDH'         },
+        captions:         { streams: ['subtitle'],                   keywords: ['caption', 'captions', 'cc'],       tag: 'SDH'         },
         lyrics:           { streams: ['subtitle'],                   keywords: ['songs', 'lyrics'],                 tag: 'Lyrics'      },
         forced:           { streams: ['subtitle'],                   keywords: ['forced'],                          tag: 'Forced'      },
         dub:              { streams: ['audio'],                      keywords: ['dub', 'dubbed'],                   tag: 'Dub'         },
@@ -380,6 +380,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // VIDEO -> AUDIO -> SUBTITLE -> ATTACHMENT -> DATA -> OTHER?
     const streamOrder = { video: 0, audio: 1, subtitle: 2 , attachment: 3, data: 4};
+    // Cover-art / still-image video codecs (mirror of clean_and_remux's IMAGE_CODECS) - these video streams sort last.
+    const IMAGE_CODECS = ['mjpeg', 'mjpegb', 'png', 'apng', 'gif', 'bmp', 'webp', 'tiff'];
     const preferredLanguages = (inputs.preferred_languages || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
     const sdhFirst = String(inputs.sdh_first) === 'true';
     const codecFirstList = (inputs.codec_first || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
@@ -431,7 +433,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Cover art / poster / thumbnail video streams sort last. Detected by the ffmpeg cover-art
             // dispositions (any codec) or a still-image codec — mirrors clean_and_remux's image removal.
             coverArt: hasDisposition(ffstream, 'attached_pic') || hasDisposition(ffstream, 'still_image') || hasDisposition(ffstream, 'timed_thumbnails')
-                || ['mjpeg', 'mjpegb', 'png', 'apng', 'gif', 'bmp', 'webp', 'tiff'].includes((ffstream.codec_name || '').trim().toLowerCase()),
+                || IMAGE_CODECS.includes((ffstream.codec_name || '').trim().toLowerCase()),
         });
     }
 
