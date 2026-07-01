@@ -13,7 +13,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.15.0',
+    Version: '1.15.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -349,7 +349,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return parts[0];
         }
         return title;
-    }    
+    }
+
+    // Sanitize a file-supplied string (title/comment/handler/filename) for embedding in a single infoLog
+    // line. These fields can legitimately contain newlines/tabs/other control characters; infoLog is
+    // newline-delimited and every line must start with ☐/☑/☒, so a raw control character would split the
+    // line into a continuation with no status symbol. Collapse control characters to a space for display
+    // only — quotes and backslashes are preserved so the logged value still reads faithfully (unlike
+    // escMeta, which rewrites them for ffmpeg-argument safety). This is display-only and never feeds ffmpeg.
+    const logSafe = (value) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ');
 
     // =====================================================================
     // SHARED BLOCK — keep byte-for-byte identical across all awk plugins.
@@ -555,7 +563,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         workDone += `☐Remove stream ${i} - subtitle language (${streamLang})\n`;
                         delStream = true;
                     } else if ((delDeaf === true) && (ffstream.disposition?.hearing_impaired === 1 || deafKeywords.some(keyword => subtitleDescription.includes(keyword)))) {
-                        workDone += `☐Remove stream ${i} - SDH (${subtitleDescription})\n`;
+                        workDone += `☐Remove stream ${i} - SDH (${logSafe(subtitleDescription)})\n`;
                         delStream = true;
                     }
                 }
@@ -576,25 +584,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //We trimmed the title above so if it contains newlines or spaces they'll be removed. Make sure title is set at both metadata and stream levels
                 if(newStreamTitle !== streamTitle)
                 {
-                    workDone += `☐Change title of stream ${i} (subtitle) from "${streamTitle}" to "${newStreamTitle}"\n`;
+                    workDone += `☐Change title of stream ${i} (subtitle) from "${logSafe(streamTitle)}" to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${escMeta(newStreamTitle)}"`;
                 } else if((ffstream.tags?.title ?? '') !== (ffmedia?.Title ?? ''))
                 {
-                    workDone += `☐Change title of stream ${i} (subtitle) - Found "${(ffstream.tags?.title ?? '')}" and "${(ffmedia?.Title ?? '')}" change to "${newStreamTitle}"\n`;
+                    workDone += `☐Change title of stream ${i} (subtitle) - Found "${logSafe(ffstream.tags?.title ?? '')}" and "${logSafe(ffmedia?.Title ?? '')}" change to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${escMeta(newStreamTitle)}"`;
                 }
 
                 //The set_handler isn't needed at all for mkv and can cause some oddness with the title
                 if(dstContainer === 'mkv' && ffstream.tags?.handler_name) {
-                    workDone += `☐Wiping handler_name tag from ${i} (subtitle) "${ffstream.tags?.handler_name}"\n`;
+                    workDone += `☐Wiping handler_name tag from ${i} (subtitle) "${logSafe(ffstream.tags?.handler_name)}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "handler_name="`;
                 } else if(dstContainer === 'mp4' && ffstream.tags?.handler_name !== 'SubtitleHandler') {
-                    workDone += `☐Setting handler_name tag from ${i} (subtitle) to SubtitleHandler "${ffstream.tags?.handler_name}"\n`;
+                    workDone += `☐Setting handler_name tag from ${i} (subtitle) to SubtitleHandler "${logSafe(ffstream.tags?.handler_name)}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "handler_name=SubtitleHandler"`;
                 }
 
                 if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
-                    workDone += `☐Remove comment from stream ${i} (subtitle) "${(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
+                    workDone += `☐Remove comment from stream ${i} (subtitle) "${logSafe(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "comment="`;
                 }
                 
@@ -678,25 +686,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //We trimmed the title above so if it contains newlines or spaces they'll be removed. Ensure they are escaped before passing it to the command line.
                 if(newStreamTitle !== streamTitle)
                 {
-                    workDone += `☐Change title of stream ${i} (audio) from "${streamTitle}" to "${newStreamTitle}"\n`;
+                    workDone += `☐Change title of stream ${i} (audio) from "${logSafe(streamTitle)}" to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${escMeta(newStreamTitle)}"`;
                 } else if((ffstream.tags?.title ?? '') !== (ffmedia?.Title ?? ''))
                 {
-                    workDone += `☐Change title of stream ${i} (audio) - Found "${(ffstream.tags?.title ?? '')}" and "${(ffmedia?.Title ?? '')}" change to "${newStreamTitle}"\n`;
+                    workDone += `☐Change title of stream ${i} (audio) - Found "${logSafe(ffstream.tags?.title ?? '')}" and "${logSafe(ffmedia?.Title ?? '')}" change to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${escMeta(newStreamTitle)}"`;
                 }
 
                 //The set_handler isn't needed at all for mkv and can cause some oddness with the title
                 if(dstContainer === 'mkv' && ffstream.tags?.handler_name) {
-                    workDone += `☐Wiping handler_name tag from ${i} (audio) "${ffstream.tags?.handler_name}"\n`;
+                    workDone += `☐Wiping handler_name tag from ${i} (audio) "${logSafe(ffstream.tags?.handler_name)}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "handler_name="`;
                 } else if(dstContainer === 'mp4' && ffstream.tags?.handler_name !== 'SoundHandler') {
-                    workDone += `☐Setting handler_name tag from ${i} (audio) to SoundHandler "${ffstream.tags?.handler_name}"\n`;
+                    workDone += `☐Setting handler_name tag from ${i} (audio) to SoundHandler "${logSafe(ffstream.tags?.handler_name)}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "handler_name=SoundHandler"`;
                 }
 
                 if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
-                    workDone += `☐Remove comment from audio stream ${i} (audio) "${(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
+                    workDone += `☐Remove comment from audio stream ${i} (audio) "${logSafe(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "comment="`;
                 }
                     
@@ -720,21 +728,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }            
 
                 if(metaCommentRemove === true && (ffstream.tags?.comment || ffmedia?.Comment)) {
-                    workDone += `☐Remove comment from stream ${i} (video) "${ffstream.tags?.comment ?? ffmedia?.Comment ?? ''}"\n`;
+                    workDone += `☐Remove comment from stream ${i} (video) "${logSafe(ffstream.tags?.comment ?? ffmedia?.Comment ?? '')}"\n`;
                     metadataCommand += ` -metadata:s:v:${videoStreamIndex} "comment="`;
                 }
 
                 if(metaBusyTitleRemove === true && ((ffstream.tags?.title ?? '').trim().split('.').length > 4 || (ffmedia?.Title ?? '').trim().split('.').length > 4)) {
-                    workDone += `☐Remove title from stream ${i} (video) "${(ffstream.tags?.title ?? '').trim()}" and "${(ffmedia?.Title ?? '').trim()}"\n`;
+                    workDone += `☐Remove title from stream ${i} (video) "${logSafe((ffstream.tags?.title ?? '').trim())}" and "${logSafe((ffmedia?.Title ?? '').trim())}"\n`;
                     metadataCommand += ` -metadata:s:v:${videoStreamIndex} "title="`;
                 }
 
                 //The set_handler isn't needed at all for mkv and can cause some oddness with the title
                 if(dstContainer === 'mkv' && ffstream.tags?.handler_name) {
-                    workDone += `☐Wiping handler_name tag from ${i} as it can cause problems for titles in mkv (video) "${ffstream.tags?.handler_name}"\n`;
+                    workDone += `☐Wiping handler_name tag from ${i} as it can cause problems for titles in mkv (video) "${logSafe(ffstream.tags?.handler_name)}"\n`;
                     metadataCommand += ` -metadata:s:v:${videoStreamIndex} "handler_name="`;
                 } else if(dstContainer === 'mp4' && ffstream.tags?.handler_name !== 'VideoHandler') {
-                    workDone += `☐Setting handler_name tag from ${i} (video) to VideoHandler "${ffstream.tags?.handler_name}"\n`;
+                    workDone += `☐Setting handler_name tag from ${i} (video) to VideoHandler "${logSafe(ffstream.tags?.handler_name)}"\n`;
                     metadataCommand += ` -metadata:s:v:${videoStreamIndex} "handler_name=VideoHandler"`;
                 }
                 
@@ -791,7 +799,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             for (const idx of deferredFontIndices) {
                 const fontStream = file.ffProbeData.streams.find(s => s.index === idx);
                 const fname = (fontStream?.tags?.filename || '').trim();
-                workDone += `☐Remove stream ${idx} - orphaned font attachment (no ASS/SSA subtitle uses it)${fname ? ` "${fname}"` : ''}\n`;
+                workDone += `☐Remove stream ${idx} - orphaned font attachment (no ASS/SSA subtitle uses it)${fname ? ` "${logSafe(fname)}"` : ''}\n`;
                 extraArguments += ` -map -0:${idx}`;
                 removedIndices.add(idx);
                 convert = true;
@@ -813,13 +821,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     //Now the file level metadata can be cleaned up if needed.
     if((metaCommentRemove === true) && file.ffProbeData.format?.tags?.comment) {
-        workDone += `☐Remove comment from file "${file.ffProbeData.format?.tags?.comment}"\n`;
+        workDone += `☐Remove comment from file "${logSafe(file.ffProbeData.format?.tags?.comment)}"\n`;
         extraArguments += ` -metadata "comment="`;
         convert = true;
     }
 
     if((metaBusyTitleRemove === true) && (file.ffProbeData.format?.tags?.title ?? '').trim().split('.').length > 4) {
-        workDone += `☐Remove title from file "${(file.ffProbeData.format?.tags?.title ?? '').trim()}"\n`;
+        workDone += `☐Remove title from file "${logSafe((file.ffProbeData.format?.tags?.title ?? '').trim())}"\n`;
         extraArguments += ` -metadata "title="`;
         convert = true;
     }
