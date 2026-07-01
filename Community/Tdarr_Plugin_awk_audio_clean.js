@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.25.0',
+    Version: '1.25.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -203,6 +203,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         FFmpegMode: true,
         infoLog: '',
     };
+
+    // Bail out gracefully if the probe produced no stream data (a failed/partial probe) rather than throwing
+    // an uncaught TypeError on the first file.ffProbeData.streams access below.
+    if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams)) {
+        response.infoLog += '☒No ffProbe stream data available for this file.\n';
+        response.processFile = false;
+        return response;
+    }
 
     // =====================================================================
     // SHARED BLOCK — keep byte-for-byte identical across all awk plugins.

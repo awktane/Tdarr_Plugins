@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/songs/sdh/descriptive/commentary) -> Attachments -> Data. Also marks the first audio track as the sole default.\n`,
-    Version: '1.14.0',
+    Version: '1.14.1',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -98,6 +98,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         container: `.${file.container}`,
         infoLog: '',
     };
+
+    // Bail out gracefully if the probe produced no stream data (a failed/partial probe) rather than throwing
+    // an uncaught TypeError on the first file.ffProbeData.streams access below.
+    if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams)) {
+        response.infoLog += '☒No ffProbe stream data available for this file.\n';
+        response.processFile = false;
+        return response;
+    }
 
     // =====================================================================
     // SHARED BLOCK — keep byte-for-byte identical across all awk plugins.
@@ -411,6 +419,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         streams.push({
             index: ffstream.index,
+            origPos: i,
             stream: enrichedStream,
             type: streamType,
             title: streamTitle,
@@ -519,7 +528,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     for (let i = 0; i < streams.length; i++) {
         ffmpegMap += ` -map 0:${streams[i].index}`;
-        if (streams[i].index !== i) changed = true;
+        // Compare against each stream's ORIGINAL array position, not its absolute ffprobe index, so a file
+        // already in the desired order but with non-contiguous indices (e.g. 0,1,3 after an upstream drop)
+        // isn't remuxed pointlessly. -map still uses the absolute index above.
+        if (streams[i].origPos !== i) changed = true;
 
         if (streams[i].type === 'audio') {
             audioIndex++;

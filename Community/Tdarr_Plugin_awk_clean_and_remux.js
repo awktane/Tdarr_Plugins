@@ -13,7 +13,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.20.0',
+    Version: '1.20.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -227,6 +227,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         infoLog: '',
     };
 
+    // Bail out gracefully if the probe produced no stream data (a failed/partial probe) rather than throwing
+    // an uncaught TypeError on the first file.ffProbeData.streams access below.
+    if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams)) {
+        response.infoLog += '☒No ffProbe stream data available for this file.\n';
+        response.processFile = false;
+        return response;
+    }
+
     const srcContainer = file.container.toLowerCase().trim();
     const dstContainer = inputs.container.toLowerCase().trim();
     response.container = `.${dstContainer}`;
@@ -302,6 +310,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // If fill_language is set and more than one stream of the same type has no language tag, they will all receive the same language — but they may actually be different languages. If fail_langs_blank
     // is true, abort so the user can tag them manually and requeue. If false, processing continues and the fill_language assignments are logged as normal by the stream loop below.
+    // Subtitle codecs dropped purely by container/format - a stream in one of these is removed regardless of
+    // language, so it is never assigned fill_language (used by the fail_langs_blank count and the subtitle loop).
+    const alwaysDropSubs  = ['eia_608', 'ttml'];
+    const mp4OnlyDropSubs = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub',
+                             'dvb_teletext', 'arib_caption', 'hdmv_text_subtitle'];
+    const subFormatDropped = (codec) => alwaysDropSubs.includes(codec)
+        || (dstContainer === 'mp4' && mp4OnlyDropSubs.includes(codec));
+
     if (fillLanguage && failLangsBlank) {
         const streams = file.ffProbeData.streams || [];
         // Resolve each stream's language exactly as the main loop does below (ffprobe tag first, then the
@@ -318,7 +334,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.processFile = false;
             return response;
         }
-        const untaggedSubs =  streams.filter((s) =>(s?.codec_type || '').toLowerCase() === 'subtitle' && isUntagged(s)).length;
+        // Exclude subtitles that will be dropped by container/format anyway - they are never assigned
+        // fill_language, so counting them here would falsely abort a file that would otherwise process fine.
+        const untaggedSubs =  streams.filter((s) =>(s?.codec_type || '').toLowerCase() === 'subtitle' && !subFormatDropped((s.codec_name || '').toLowerCase()) && isUntagged(s)).length;
         if (untaggedSubs > 1) {
             response.infoLog += `☒${untaggedSubs} subtitle streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue or set fail_langs_blank to false.\n`;
             response.processFile = false;
@@ -525,14 +543,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .trim();
 
     // -=-=-= del_accessible safety guard (clean_and_remux only) =-=-=-
-    // Subtitle codecs dropped purely by container/format (also applied in the subtitle loop) - hoisted so the
-    // pre-pass here and the loop share one definition.
-    const alwaysDropSubs  = ['eia_608', 'ttml'];
-    const mp4OnlyDropSubs = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub',
-                             'dvb_teletext', 'arib_caption', 'hdmv_text_subtitle'];
-    const subFormatDropped = (codec) => alwaysDropSubs.includes(codec)
-        || (dstContainer === 'mp4' && mp4OnlyDropSubs.includes(codec));
-
+    // (subFormatDropped and the subtitle drop lists are defined earlier, by the fail_langs_blank count.)
     // A "plain" track carries no commentary/descriptive/SDH/lyrics role - a genuine main audio or dialogue
     // subtitle. del_accessible removes an accessibility track (SDH/CC subtitle, audio-description audio) only
     // when its language still has a plain track that SURVIVES the language (and, for subtitles, format) filter,
@@ -694,7 +705,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 {
                     workDone += `☐Change title of stream ${i} (subtitle) from "${logSafe(streamTitle)}" to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${escMeta(newStreamTitle)}"`;
-                } else if((ffstream.tags?.title ?? '') !== (ffmedia?.Title ?? ''))
+                } else if(ffmedia && (ffstream.tags?.title ?? '') !== (ffmedia.Title ?? ''))
                 {
                     workDone += `☐Change title of stream ${i} (subtitle) - Found "${logSafe(ffstream.tags?.title ?? '')}" and "${logSafe(ffmedia?.Title ?? '')}" change to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${escMeta(newStreamTitle)}"`;
@@ -813,7 +824,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 {
                     workDone += `☐Change title of stream ${i} (audio) from "${logSafe(streamTitle)}" to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${escMeta(newStreamTitle)}"`;
-                } else if((ffstream.tags?.title ?? '') !== (ffmedia?.Title ?? ''))
+                } else if(ffmedia && (ffstream.tags?.title ?? '') !== (ffmedia.Title ?? ''))
                 {
                     workDone += `☐Change title of stream ${i} (audio) - Found "${logSafe(ffstream.tags?.title ?? '')}" and "${logSafe(ffmedia?.Title ?? '')}" change to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${escMeta(newStreamTitle)}"`;
