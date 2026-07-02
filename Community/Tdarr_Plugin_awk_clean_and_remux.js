@@ -13,7 +13,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.20.2',
+    Version: '1.20.3',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -119,7 +119,7 @@ const details = () => ({
                 options: ['disabled', 'audio', 'subtitle', 'both'],
             },
             tooltip: `Rebuild stream titles from what the track actually is. Choose which stream types to apply to: disabled, audio, subtitle, or both.
-                \\nAudio: builds a channel-based title (7.1, 5.1, 5.0, 4.0, 3.1, 3.0, 2.1, Stereo, Mono) with any disposition roles appended, e.g. "5.1 - Commentary" or "5.1 -> 2.0 - Descriptive".
+                \\nAudio: builds a channel-based title (7.1, 6.1, 5.1, 5.0, 4.0, 3.1, 3.0, 2.1, Stereo, Mono) with any disposition roles appended, e.g. "5.1 - Commentary" or "5.1 -> 2.0 - Descriptive".
                 \\nSubtitle: only titles we own (empty or already just role words) are set to the role tag(s), e.g. "SDH" or "Forced Commentary"; custom subtitle titles are left untouched.
                 \\nRole tags come from the track's real disposition flags and title keywords (Commentary, Descriptive, SDH, Forced, Lyrics, Dub, Original). The default flag is intentionally not surfaced.`,
         },        
@@ -227,8 +227,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         infoLog: '',
     };
 
-    // Bail out gracefully if the probe produced no stream data (a failed/partial probe) rather than throwing
-    // an uncaught TypeError on the first file.ffProbeData.streams access below.
+    // Bail out gracefully on missing/partial probe data, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams)) {
         response.infoLog += '☒No ffProbe stream data available for this file.\n';
         response.processFile = false;
@@ -277,9 +276,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const audioLanguage = inputs.audio_language.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
     const failLangsBlank = String(inputs.fail_langs_blank) === 'true';
 
-    //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
-    const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
-
     if(!['see', 'saw'].includes(recoverSeesaw)) {
         response.infoLog += `☒Somehow invalid recover_seesaw option provided. Check your settings!\n`;
         response.processFile = false;
@@ -308,8 +304,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return response;
     }
 
-    // If fill_language is set and more than one stream of the same type has no language tag, they will all receive the same language — but they may actually be different languages. If fail_langs_blank
-    // is true, abort so the user can tag them manually and requeue. If false, processing continues and the fill_language assignments are logged as normal by the stream loop below.
+    // If fill_language is set and >1 stream of a type is untagged, they all get the same language - but may actually differ. If fail_langs_blank is true,
+    // abort so the user can tag them manually and requeue; if false, processing continues and fill_language assignments log normally in the stream loop below.
     // Subtitle codecs dropped purely by container/format - a stream in one of these is removed regardless of
     // language, so it is never assigned fill_language (used by the fail_langs_blank count and the subtitle loop).
     const alwaysDropSubs  = ['eia_608', 'ttml'];
@@ -320,9 +316,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     if (fillLanguage && failLangsBlank) {
         const streams = file.ffProbeData.streams || [];
-        // Resolve each stream's language exactly as the main loop does below (ffprobe tag first, then the
-        // mediaInfo fallback). A stream whose language only mediaInfo supplies is never filled, so counting
-        // it as "untagged" here would abort files that would actually process fine.
+        // Resolve each stream's language exactly as the main loop does below (ffprobe tag first, then the mediaInfo fallback). A stream whose language only
+        // mediaInfo supplies is never filled, so counting it as "untagged" here would abort files that would actually process fine.
         const isUntagged = (s) => {
             const ffmedia = file?.mediaInfo?.track?.find(t => Number(t.StreamOrder) === s.index);
             const lang = (s?.tags?.language ?? (ffmedia?.Language ?? '')).trim().toLowerCase();
@@ -354,11 +349,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Classify an attachment stream so we only ever remove things we can positively identify:
     //   'image' - cover art / poster (mjpeg/png/gif/bmp, image/* mimetype, or an image filename). Always removed.
-    //   'font'  - an embedded font (ttf/otf codec, a font mimetype, or a font filename extension). Removed ONLY when nothing in the output uses it (no surviving ASS/SSA subtitle). This is the key fix: on older ffmpeg
-    //             builds fonts report codec_name 'none'/'unknown', so we identify by filename and mimetype as well as codec, and never delete a font while a styled subtitle still needs it.
-    //   'other' - anything we cannot positively identify (a bare 'none'/'unknown' with no font/image signal). Left completely untouched - it could be anything, so deleting it is never safe to assume.
-    // Still-image / cover-art codecs, shared by attachmentKind and the video-stream image drop below.
-    const IMAGE_CODECS = ['mjpeg', 'mjpegb', 'png', 'apng', 'gif', 'bmp', 'webp', 'tiff'];
+    //   'font'  - an embedded font (ttf/otf codec, a font mimetype, or a font filename extension). Removed ONLY when nothing in the output uses it (no
+    //             surviving ASS/SSA subtitle). Key fix: older ffmpeg builds report codec_name 'none'/'unknown' for fonts, so we also ID by filename/mimetype,
+    //             and never delete a font while a styled subtitle still needs it.
+    //   'other' - anything unidentifiable (a bare 'none'/'unknown', no font/image signal). Left untouched - could be anything, never safe to remove.
     const attachmentKind = (s) => {
         const codec = (s.codec_name || '').trim().toLowerCase();
         const mime  = (s.tags?.mimetype || '').trim().toLowerCase();
@@ -375,40 +369,41 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return 'other';
     };
 
-    //Clean up titles - Remove surrounding whitespace, single quotes and double quotes as there's no reason for them, and deduplicate repeated segments ("Stereo / Stereo" -> "Stereo").
-    //Busy-title removal (more than 3 periods) is applied by the callers AFTER tagging, not here, so disposition roles are captured into flags before an over-dotted title is cleared.
+    //Clean up titles - remove surrounding whitespace/quotes (no reason for them), and dedupe repeated segments ("Stereo / Stereo" -> "Stereo").
+    //Busy-title removal (>3 periods) is applied by callers AFTER tagging, not here - roles are captured into flags before an over-dotted title clears.
     function cleanStreamTitle(rawTitle) {
         let title = (rawTitle || '').trim().replace(/^["']+|["']+$/g, '');
         if (title) {
             const parts = title.split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
             if (parts.length === 1) return parts[0];
             // When all parts are the same word (case-insensitive), deduplicate to the first occurrence.
-            // "First part wins" is intentional: it preserves the original casing from the leading segment (e.g. "Stereo / stereo" → "Stereo", "ENGLISH - English" → "ENGLISH").
+            // "First part wins" is intentional: preserves the leading segment's casing (e.g. "Stereo / stereo"→"Stereo", "ENGLISH - English"→"ENGLISH").
             if (parts.length > 1 && parts.every(p => p.toLowerCase() === parts[0].toLowerCase()))
                 return parts[0];
         }
         return title;
     }
 
-    // Sanitize a file-supplied string (title/comment/handler/filename) for embedding in a single infoLog line. These fields can legitimately contain newlines/tabs/other control characters; infoLog is
-    // newline-delimited and every line must start with ☐/☑/☒, so a raw control character would split the line into a continuation with no status symbol. Collapse control characters to a space for display only -
-    // quotes and backslashes are preserved so the logged value reads faithfully (unlike escMeta, which rewrites them for ffmpeg-argument safety). This is display-only and never feeds ffmpeg.
+    // Sanitize a file-supplied string (title/comment/handler/filename) for embedding in a single infoLog line. These fields can contain newlines/tabs/other
+    // control characters; infoLog is newline-delimited and every line must start with ☐/☑/☒, so a raw char would split it into a continuation with no
+    // status symbol. Collapse control characters to a space for display only - quotes/backslashes are preserved so the logged value reads faithfully
+    // (unlike escMeta, which rewrites them for ffmpeg-argument safety). Display-only, never feeds ffmpeg.
     const logSafe = (value) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ');
 
     // =====================================================================
-    // SHARED BLOCK — keep byte-for-byte identical across all awk plugins.
-    // Audio plugins (audio_clean, stream_ordering) carry the whole block:
-    //   codecInfo, codecAliases, unknownCodecs, resolveCodecName, audioQuality,
-    //   the role/forced classifiers, resolveStreamBitrate, summariseStream, escMeta.
-    // clean_and_remux carries only the audio-independent tail: the classifiers,
-    // resolveStreamBitrate, summariseStream, and escMeta (the codec-scoring half is audio-only).
+    // SHARED CODE — duplicated verbatim because Tdarr loads each plugin as one self-contained file.
+    // Split into labeled sections; each is byte-identical across the plugins named in its header, and a
+    // plugin carries only the sections it uses. The section LABEL is the anchor (order is free). Verify any
+    // edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: role/disposition classifiers =====
     /* -=-=-= Stream role/forced classifiers =-=-=- */
-    // Classifiers group the real ffmpeg disposition flags into the roles the pipeline sorts and tags by. dispositionTypes is keyed by the actual ffmpeg disposition; each entry declares the stream types it's valid
-    // on (streams), the title keywords that also indicate it (each keyword lives on one flag so title->flag promotion stays unambiguous), and the canonical string written into a title (tag, null when never written).
-    // hasDisposition gates on codec_type and matches keywords whole-token via matchesKeyword. summariseStream, the stream-ordering sort keys, audio_clean's secondary-track detection, and clean_and_remux's
-    // title/flag tagging all read from this table. Shared verbatim across all three awk plugins.
+    // Classifiers group the real ffmpeg disposition flags into the roles the pipeline sorts and tags by. dispositionTypes is keyed by the ffmpeg
+    // disposition; each entry declares the valid stream types (streams), the title keywords that also indicate it (each keyword lives on one flag so
+    // title->flag promotion stays unambiguous), and the canonical title string (tag, null when never written). hasDisposition gates on codec_type,
+    // matching keywords whole-token via matchesKeyword. Read by summariseStream, the stream-ordering sort keys, audio_clean's secondary-track
+    // detection, and clean_and_remux's title/flag tagging. Shared verbatim across all three awk plugins.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                            tag: 'Commentary'  },
         visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','dvs','audio description'], tag: 'Descriptive' },
@@ -425,8 +420,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         timed_thumbnails: { streams:['video'],                    keywords: [],                                        tag: null          },
     };
     const streamTitleLower = (s) => (s.tags?.title || '').trim().toLowerCase();
-    // Whole-token keyword matcher: a keyword matches only when not flanked by a letter/digit, so '[sdh]', 'eng-sdh', and 'sdh.' match while 'deafening'/'aboriginal' do not. An internal space matches any run of
-    // non-alphanumerics ('hearing impaired' == 'hearing_impaired'). Keywords are regex-escaped; the 'u' flag enables \p{L}/\p{N}. text must already be lowercased.
+    // Whole-token keyword matcher: a keyword matches only when not flanked by a letter/digit, so '[sdh]', 'eng-sdh', and 'sdh.' match while
+    // 'deafening'/'aboriginal' do not. An internal space matches any run of non-alphanumerics ('hearing impaired' == 'hearing_impaired'). Keywords are
+    // regex-escaped; the 'u' flag enables \p{L}/\p{N}. text must already be lowercased.
     const matchesKeyword = (text, keywords) => {
         if (!keywords.length) return false;
         const pattern = keywords
@@ -444,10 +440,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const isDescriptive = (s) => hasDisposition(s, 'visual_impaired') || hasDisposition(s, 'descriptions');
     const isSdh         = (s) => hasDisposition(s, 'hearing_impaired') || hasDisposition(s, 'captions');
     const isLyrics      = (s) => hasDisposition(s, 'lyrics');
+    // ===== END SHARED: role/disposition classifiers =====
 
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: stream / language / preset helpers =====
     /* -=-=-= Resolve the best available bitrate (bps) for a stream =-=-=- */
-    // ffprobe first, mediaInfo fallback: ffprobe can't read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V) but mediaInfo decodes the substream headers and usually has it.
-    // Returns 0 if neither has a value. Used to enrich stream objects before summariseStream or audioQuality sees them.
+    // ffprobe first, mediaInfo fallback: ffprobe can't read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V),
+    // but mediaInfo decodes the substream headers and usually has it. Returns 0 if neither has a value. Used to enrich stream objects before
+    // summariseStream or audioQuality sees them.
     const resolveStreamBitrate = (ffstream) => {
         const ffBitrate = Number(ffstream.bit_rate || 0);
         if (ffBitrate > 0) return ffBitrate;
@@ -456,8 +455,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     /* -=-=-= Build single token summarising one ffprobe stream for the input/output summary lines. =-=-=- */
-    // Shows: video codec; audio lang/channels/codec/bitrate(+role); subtitle lang/codec(+forced/role); data and attachment codec. Role/forced detection mirrors the sorting logic (disposition flags first, then
-    // title keywords, via the shared classifiers) so every plugin's summary lines up. subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Shared verbatim across all three.
+    // Shows: video codec; audio lang/channels/codec/bitrate(+role); subtitle lang/codec(+forced/role); data and attachment codec. Role/forced
+    // detection mirrors the sorting logic (disposition flags first, then title keywords, via the shared classifiers) so every plugin's summary lines
+    // up. subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Shared verbatim across all three.
     const summariseStream = (s) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
@@ -485,10 +485,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return `[${type || 'unknown'}:${codec}]`;
     };
 
+    // Short language code: strip any region/variant suffix so 'en-US', 'en_US', 'en.US' all compare as 'en'.
+    const shortLang = (l) => l.replace(/[-_.].*$/, '');
+
+    //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
+    const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
+    // ===== END SHARED: stream / language / preset helpers =====
+
+    // ===== SHARED [audio_clean, clean_and_remux]: ffmpeg metadata escaping =====
     /* -=-=-= Sanitize value for embedding inside a double quotes ffmpeg -metadata argument (e.g. -metadata:s:a:0 "title=...") =-=-=- */
-    // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array and hands it to child_process.spawn, so shell metacharacters ($ ` ; |) are inert and reach ffmpeg as literal
-    // metadata bytes. The only injection vector is breaking out of the quoted value to inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper) or a control character. Tdarr's tokenizer
-    // strips quotes with no reliable backslash-escape convention, so we substitute rather than strip:
+    // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array and hands it to child_process.spawn, so shell
+    // metacharacters ($ ` ; |) are inert and reach ffmpeg as literal metadata bytes. The only injection vector is breaking out of the quoted value to
+    // inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper) or a control character. Tdarr's tokenizer strips quotes with no
+    // reliable backslash-escape convention, so we substitute rather than strip:
     //    backslash          -> forward-slash (readable, inert)
     //    double-quote       -> single-quote (safe inside the quoted value; preserves titles like "Director's Cut" and "AC3/Stereo")
     //    control characters -> space (avoids fusing words that a bare delete would join).
@@ -496,14 +505,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .replace(/[\x00-\x1f\x7f]/g, ' ')  // control characters (newlines, null bytes, etc.) → space
         .replace(/\\/g, '/')               // backslash → forward-slash (inert, readable)
         .replace(/"/g, "'");               // double-quote → single-quote (safe inside the quoted value)
+    // ===== END SHARED: ffmpeg metadata escaping =====
 
-    // =====================================================================
-    // END SHARED BLOCK
-    // =====================================================================
+    // ===== SHARED [clean_and_remux, stream_ordering]: image / cover-art codecs =====
+    // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last.
+    const IMAGE_CODECS = ['mjpeg', 'mjpegb', 'png', 'apng', 'gif', 'bmp', 'webp', 'tiff'];
+    // ===== END SHARED: image / cover-art codecs =====
 
     // -=-=-= Disposition title/flag helpers (clean_and_remux only) =-=-=-
-    // Everything derives from the shared dispositionTypes table so there is a single source of truth. dispKeysFor: the dispositions valid on a stream type. titleTagsFor: the deduped canonical tag strings a stream
-    // matches (flag or keyword, via the shared classifiers), excluding untagged flags like default/cover-art. These drive both flag promotion and title rebuilding below.
+    // Everything derives from the shared dispositionTypes table (single source of truth). dispKeysFor: dispositions valid on a stream type. titleTagsFor: the
+    // deduped canonical tag strings a stream matches (flag or keyword, via the shared classifiers), excluding untagged flags like default/cover-art. Drives
+    // flag promotion and title rebuilding below.
     const dispKeysFor = (type) => Object.keys(dispositionTypes).filter(k => dispositionTypes[k].streams.includes(type));
     const titleTagsFor = (s) => [...new Set(dispKeysFor((s.codec_type || '').trim().toLowerCase())
         .filter(k => dispositionTypes[k].tag && hasDisposition(s, k)).map(k => dispositionTypes[k].tag))];
@@ -511,10 +523,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // flag - i.e. the keywords to promote into +flags. Same predicate for audio and subtitle, so keep it here.
     const dispositionsToPromote = (s, type) => dispKeysFor(type)
         .filter(key => dispositionTypes[key].tag && hasDisposition(s, key) && s.disposition?.[key] !== 1);
-    // Accessibility keywords for del_accessible's broad description scan (title/description/handler/mediaInfo),
-    // sourced from the shared table and matched whole-token via matchesKeyword. Subtitle side = hearing (SDH/CC);
-    // audio side = visual (audio description). visual_impaired carries 'audio description' in the shared table
-    // so AD tracks tagged only in the title are recognised everywhere (classification and removal), not just here.
+    // Accessibility keywords for del_accessible's broad description scan (title/description/handler/mediaInfo), sourced from the shared table and matched
+    // whole-token via matchesKeyword. Subtitle side = hearing (SDH/CC); audio side = visual (audio description). visual_impaired carries 'audio description' in
+    // the shared table so AD tracks tagged only in the title are recognised everywhere (classification and removal), not just here.
     const sdhKeywords = [...dispositionTypes.hearing_impaired.keywords, ...dispositionTypes.captions.keywords];
     const adKeywords  = dispositionTypes.visual_impaired.keywords;
     // Single-word keywords stripped when recovering the channel/base portion of a title (multi-word
@@ -530,9 +541,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .trim();
 
     // -=-=-= del_accessible safety guard (clean_and_remux only) =-=-=-
-    // (subFormatDropped and the subtitle drop lists are defined earlier, by the fail_langs_blank count.) A "plain" track carries no commentary/descriptive/SDH/lyrics role - a genuine main audio or dialogue subtitle.
-    // del_accessible removes an accessibility track (SDH/CC subtitle, audio-description audio) only when its language still has a plain track that SURVIVES the language (and, for subtitles, format) filter, so we strip
-    // extras and never the last usable track. resolveWorkLang mirrors the loop's language resolution.
+    // (subFormatDropped/subtitle drop lists defined earlier, by fail_langs_blank.) A "plain" track carries no commentary/descriptive/SDH/lyrics role - a
+    // genuine main audio or dialogue subtitle. del_accessible removes an accessibility track (SDH/CC subtitle, audio-description audio) only when its language
+    // still has a plain track that SURVIVES the language (and, for subtitles, format) filter, so we strip extras, never the last usable track. resolveWorkLang
+    // mirrors the loop's language resolution.
     const isPlainTrack = (s) => !isCommentary(s) && !isDescriptive(s) && !isSdh(s) && !isLyrics(s);
     const resolveWorkLang = (s) => {
         const m = file?.mediaInfo?.track?.find(t => Number(t.StreamOrder) === s.index);
@@ -548,12 +560,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (t === 'subtitle' && subFormatDropped((s.codec_name || '').toLowerCase())) continue;
             const wl = resolveWorkLang(s);
             const langs = t === 'audio' ? audioLanguage : subLanguage;
-            if (langs.length > 0 && !langs.includes(wl) && !langs.includes(wl.replace(/[-_.].*$/, ''))) continue;
+            if (langs.length > 0 && !langs.includes(wl) && !langs.includes(shortLang(wl))) continue;
             const set = t === 'audio' ? plainAudioLangs : plainSubLangs;
-            set.add(wl); set.add(wl.replace(/[-_.].*$/, ''));
+            set.add(wl); set.add(shortLang(wl));
         }
     }
-    const hasPlainSameLang = (set, wl) => set.has(wl) || set.has(wl.replace(/[-_.].*$/, ''));
+    const hasPlainSameLang = (set, wl) => set.has(wl) || set.has(shortLang(wl));
 
     // Check if file is a video. If it isn't then exit plugin.
     if (file.fileMedium !== 'video') {
@@ -587,15 +599,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const removedIndices = new Set();
     const subCodecOverride = new Map();
 
-    // Font attachments whose removal is deferred until after the main loop, when we know which subtitle
-    // streams survive. Decided here (not inline) because an attachment can appear before its subtitles in
-    // the file, so we cannot know whether a styled subtitle survives at the moment we reach the attachment.
+    // Font attachments whose removal is deferred until after the main loop, when we know which subtitle streams survive. Decided here (not inline) because an
+    // attachment can appear before its subtitles in the file, so we cannot know whether a styled subtitle survives at the moment we reach the attachment.
     const deferredFontIndices = [];
 
-    // Summarise the input streams exactly as they arrived, before any removal/remux, using the shared
-    // bracket helper. This plugin runs first, so this captures the file as received; reading it alongside
-    // the stream-ordering plugin's output line shows where a file came from and where it ended up.
-    // Starts with ☐ as it details the state we are about to act on.
+    // Summarise the input streams exactly as they arrived, before any removal/remux, using the shared bracket helper. This plugin runs first, so it captures
+    // the file as received; reading it alongside the stream-ordering plugin's output line shows where a file came from and where it ended up. Starts with ☐
+    // as it details the state we are about to act on.
     response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream({ ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate })).join('')}\n`;
 
     for (let i = 0; i < file.ffProbeData.streams.length; i++) {
@@ -639,7 +649,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const subtitleDescription = [ffstream.tags?.title,ffstream.tags?.description,ffstream.tags?.handler_name,ffmedia?.Title,ffmedia?.Description].filter(Boolean).join(' ').toLowerCase();
 
                     //If the subtitle is a language that should be removed then remove it regardless of other settings.
-                    if(subLanguage.length > 0 && !subLanguage.includes(workLang) && !subLanguage.includes(workLang.replace(/[-_.].*$/, ''))) {
+                    if(subLanguage.length > 0 && !subLanguage.includes(workLang) && !subLanguage.includes(shortLang(workLang))) {
                         workDone += `☐Remove stream ${i} - subtitle language (${streamLang})\n`;
                         delStream = true;
                     } else if (applies(delAccessible, 'subtitle')
@@ -660,7 +670,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
 
-                //Remove surrounding whitespace, single quotes and double quotes as there's no reason for them. Busy-title clearing happens after tag_disposition (below).
+                //Remove surrounding whitespace, single/double quotes (no reason for them). Busy-title clearing happens after tag_disposition (below).
                 let newStreamTitle = cleanStreamTitle(streamTitle);
 
                 //tag_disposition: import any surfaced disposition keyword found in the title into the real flag (additive so existing flags are kept).
@@ -672,13 +682,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     }
                 }
 
-                //Busy-title removal: now that tag_disposition (above) has captured any role keywords into the
-                //real flags, clear an over-dotted title so tag_title (below) re-names it by the usual rules -
-                //it drops in and is treated exactly as a blank title would be.
+                //Busy-title removal: now that tag_disposition (above) has captured any role keywords into the real flags, clear an over-dotted title so
+                //tag_title (below) re-names it by the usual rules - it drops in and is treated exactly as a blank title would be.
                 if(metaBusyTitleRemove && newStreamTitle.split('.').length > 4)
                     newStreamTitle = '';
 
-                //tag_title (subtitle): titles we own (empty/role-only, including a just-cleared busy title) are set to the role tag(s). Custom titles are left untouched.
+                //tag_title (subtitle): titles we own (empty/role-only, incl. a just-cleared busy title) get the role tag(s). Custom titles are left untouched.
                 if(applies(tagTitle, 'subtitle')) {
                     const tags = titleTagsFor(ffstream);
                     if(tags.length > 0 && !stripDispositionWords(newStreamTitle))
@@ -752,7 +761,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const audioDescription = [ffstream.tags?.title, ffstream.tags?.handler_name, ffmedia?.Title].filter(Boolean).join(' ').toLowerCase();
 
                 //If the audio is a language that should be removed then remove it regardless of other settings.
-                if(audioLanguage.length > 0 && !audioLanguage.includes(workLang) && !audioLanguage.includes(workLang.replace(/[-_.].*$/, ''))) {
+                if(audioLanguage.length > 0 && !audioLanguage.includes(workLang) && !audioLanguage.includes(shortLang(workLang))) {
                     workDone += `☐Remove stream ${i} - audio language (${streamLang})\n`;
                     delStream = true;
                 } else if (applies(delAccessible, 'audio')
@@ -771,7 +780,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
 
-                //Remove surrounding whitespace, single quotes and double quotes as there's no reason for them. Busy-title clearing happens after tag_disposition (below).
+                //Remove surrounding whitespace, single/double quotes (no reason for them). Busy-title clearing happens after tag_disposition (below).
                 let newStreamTitle = cleanStreamTitle(streamTitle);
 
                 //tag_disposition: import any surfaced disposition keyword found in the title into the real flag (additive so existing flags are kept).
@@ -783,15 +792,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     }
                 }
 
-                //Busy-title removal: now that tag_disposition (above) has captured any role keywords into the
-                //real flags, clear an over-dotted title so tag_title (below) re-names it by the usual rules -
-                //it drops in and is treated as a blank title (an empty base becomes the channel label).
+                //Busy-title removal: now that tag_disposition (above) has captured any role keywords into the real flags, clear an over-dotted title so
+                //tag_title (below) re-names it by the usual rules - it drops in and is treated as a blank title (an empty base becomes the channel label).
                 if(metaBusyTitleRemove && newStreamTitle.split('.').length > 4)
                     newStreamTitle = '';
 
-                //tag_title (audio): rebuild the title as a channel/downmix base plus a disposition suffix. The suffix reads each role from the shared classifiers (real flag OR title keyword, via hasDisposition), so a
-                //title-only role like "5.1 Commentary" is normalised to "5.1 - Commentary" and survives the reformat instead of being stripped when tag_disposition is off (tag_disposition still governs whether that
-                //title role is additionally promoted into a real flag above). Only titles we own are touched: empty, a bare channel label, or a downmix/channel-derived title (e.g. "5.1 -> 2.0"); custom titles are left alone.
+                //tag_title (audio): rebuilds the title as a channel/downmix base plus a disposition suffix. The suffix reads each role from the shared
+                //classifiers (real flag OR title keyword, via hasDisposition), so a title-only role like "5.1 Commentary" normalises to "5.1 - Commentary" and
+                //survives the reformat even when tag_disposition is off (it still governs whether that role is also promoted into a real flag above). Only
+                //titles we own are touched: empty, a bare channel label, or a downmix/channel-derived title (e.g. "5.1 -> 2.0"); custom titles are left alone.
                 if(applies(tagTitle, 'audio') && ffstream.channels) {
                     let base = stripDispositionWords(newStreamTitle);
                     if(!base || bareChannelRegex.test(base) || downmixChannelRegex.test(base)) {
@@ -802,7 +811,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     }
                 }
 
-                //We trimmed the title above so if it contains newlines or spaces they'll be removed. Ensure they are escaped before passing it to the command line.
+                //We trimmed the title above so newlines/spaces are removed. Ensure they're escaped before passing it to the command line.
                 if(newStreamTitle !== streamTitle)
                 {
                     workDone += `☐Change title of stream ${i} (audio) from "${logSafe(streamTitle)}" to "${logSafe(newStreamTitle)}"\n`;
@@ -894,7 +903,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 continue;
             }
 
-            //Any other stream type (e.g. an unrecognised attachment classified as 'other') is left untouched. If it needs to be removed it can be done with a separate plugin.
+            //Any other stream type (e.g. an unrecognised attachment classified as 'other') is left untouched - remove it with a separate plugin if needed.
         } catch (err) {
             // Error
             response.infoLog += `☒Error processing stream ${i}: ${err}\n`;
@@ -903,12 +912,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
     }
 
-    // Resolve deferred font attachments now that subtitle removals are final. Embedded fonts are only
-    // consumed by styled text subtitles (ASS/SSA). Keep the fonts if any such subtitle survives in the
-    // output; otherwise they are orphaned and removed. mp4 output never keeps fonts: ASS/SSA are converted
-    // to mov_text (which needs no fonts) and mp4 cannot carry font attachments anyway, so dstContainer
-    // gates this to mkv. The source codec is read from ffProbeData (it is still 'ass'/'ssa' there even
-    // when converted), which is why the mkv gate — not just the survivor check — is required.
+    // Resolve deferred font attachments now that subtitle removals are final. Embedded fonts are only consumed by styled text subtitles (ASS/SSA). Keep the
+    // fonts if any such subtitle survives in the output; otherwise they are orphaned and removed. mp4 output never keeps fonts: ASS/SSA are converted to
+    // mov_text (which needs no fonts) and mp4 cannot carry font attachments anyway, so dstContainer gates this to mkv. The source codec is read from
+    // ffProbeData (it is still 'ass'/'ssa' there even when converted), which is why the mkv gate — not just the survivor check — is required.
     if (deferredFontIndices.length > 0) {
         const fontsNeeded = dstContainer === 'mkv' && file.ffProbeData.streams.some(s =>
             (s.codec_type || '').toLowerCase() === 'subtitle'
@@ -960,9 +967,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     //Include recovery flags if requested or if the source container is known to have timestamp issues.
 
-    // Recovery (discard/genpts/igndts) leaves nothing observable in the stream layout, and with -c copy it's a no-op on already-cleaned content, so forcing a remux purely for it would make every Tdarr health-check
-    // pass reprocess the file forever. We record the recover intent - "<recover_seesaw>:<flags signature>" - in a format-level awk_recovered tag and only recover when the current intent differs from what is stamped
-    // (a changed recover option, a flipped seesaw, or no tag), then re-stamp. That converges (a matching tag means we skip), so a change re-runs recovery exactly once and then settles - no loop, no reset toggle.
+    // Recovery (discard/genpts/igndts) leaves nothing observable in the stream layout, and is a no-op with -c copy on already-cleaned content, so forcing a
+    // remux for it alone would make every Tdarr health-check pass reprocess the file forever. We record the intent - "<recover_seesaw>:<flags signature>" - in
+    // a format-level awk_recovered tag, and only recover when the current intent differs from the stamped one (changed recover option, flipped seesaw, or no
+    // tag), then re-stamp. That converges (matching tag = skip), so a change re-runs recovery once and settles: no loop, no reset toggle.
     const recoverRequested = recoverDiscard || recoverGenpts || recoverIgndts;
     // Order-stable signature of the recover flags requested this run.
     const recoverSig = [recoverDiscard && 'discardcorrupt', (recoverGenpts || recoverIgndts) && 'genpts', recoverIgndts && 'igndts'].filter(Boolean).join('+');
@@ -978,9 +986,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const containerChanging = srcContainer !== dstContainer;
     const runRecover = recoverRequested && (!intentMatches || containerChanging);
 
-    // Recover-option flags apply only on a run (a matching intent with no container change is skipped) so a
-    // remux triggered by OTHER work never re-applies them. The ts/avi/mpg/mpeg genpts/-avoid_negative_ts
-    // below is container-forced (needed to remux those formats at all) and is therefore always applied.
+    // Recover-option flags apply only on a run (a matching intent with no container change is skipped) so a remux triggered by OTHER work never re-applies
+    // them. The ts/avi/mpg/mpeg genpts/-avoid_negative_ts below is container-forced (needed to remux those formats at all) and is therefore always applied.
 
     //Igndts can cause very strange problems if genpts isn't also enabled
     if(runRecover && recoverIgndts === true)
@@ -1003,10 +1010,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (runRecover)
         convert = true;
 
-    // (Re)stamp the recover intent whenever we remux with recover requested. A fresh run is logged; when the
-    // intent already matches we still re-write it idempotently so it survives the remux - notably mkv->mp4,
-    // where mp4 drops a custom key unless -movflags use_metadata_tags is set (verified). Without this a
-    // container change would drop awk_recovered and the next pass would re-run recovery.
+    // (Re)stamp the recover intent whenever we remux with recover requested. A fresh run is logged; when the intent already matches we still re-write it
+    // idempotently so it survives the remux - notably mkv->mp4, where mp4 drops a custom key unless -movflags use_metadata_tags is set (verified). Without
+    // this a container change would drop awk_recovered and the next pass would re-run recovery.
     if (convert === true && recoverRequested) {
         if (runRecover)
             workDone += `☐Stamp awk_recovered=${recoverIntent} - recovery re-runs only if a recover option or recover_seesaw changes\n`;
