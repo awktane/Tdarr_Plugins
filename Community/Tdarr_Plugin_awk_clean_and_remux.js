@@ -13,7 +13,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.20.3',
+    Version: '1.21.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -154,49 +154,39 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['see', 'saw'],
             },
-            tooltip: `A see-saw toggle to force the recover_ options to run again. The recover options actually applied are recorded in an awk_recovered tag together with this value.
-                \\nFlip this to its other value (see <-> saw) to re-run the enabled recover_ options once on every file that doesn't already carry the new value, then it settles and won't reprocess again.
+            tooltip: `A see-saw toggle to force the recover_bad_* modes to run again. The mode actually applied is recorded in an awk_recovered tag together with this value.
+                \\nFlip this to its other value (see <-> saw) to re-run the enabled recover_bad_* modes once on every file that doesn't already carry the new value, then it settles and won't reprocess again.
                 \\nNote flipping this reprocesses (remuxes) every previously-recovered file it touches, so only flip it when you actually want to re-run recovery across the library.`,
         },
         {
-            name: 'recover_discard_frame',
-            type: 'boolean',
-            defaultValue: false,
+            name: 'recover_bad_timestamps',
+            type: 'string',
+            defaultValue: 'disabled',
             inputUI: {
                 type: 'dropdown',
-                options: ['false', 'true'],
+                options: ['disabled', 'light', 'aggressive'],
             },
-            tooltip: `Run with the ffmpeg +discardcorrupt options to drop any corrupt frames from the file.
-                 \\nShould generally be false as it may cause a small blips of video/audio if there is damage but may still allow a damaged file to be processed.
-                 \\nMay also cause problems with timestamps which may require +genpts and/or +igndts to fix.
-                 \\nThe recover options actually applied are recorded in an awk_recovered tag. Recovery re-runs when the set of recover options changes or recover_seesaw is flipped, then settles (it won't reprocess every pass). Container-forced timestamp fixes for ts/avi/mpg/mpeg still always apply.`,
+            tooltip: `Fix a broken presentation timeline: stutter, audio/video desync, or ffmpeg errors like "first pts value must set", "Timestamps are unset in a packet for stream", "Non-monotonous DTS in output stream", or "DTS out of order".
+                 \\nTry light first; if the error persists switch to aggressive and flip recover_seesaw (see <-> saw) to re-run on already-processed files.
+                 \\ndisabled: no timestamp recovery.
+                 \\nlight (risk-free): -fflags +genpts and -avoid_negative_ts make_zero - regenerates missing PTS and shifts negative start times to zero. Touches no frame data.
+                 \\naggressive: additionally -fflags +igndts - ignores the source DTS and fully rebuilds the timeline (fixes "Non-monotonous DTS"). Can produce odd results, so only use it if light didn't help.
+                 \\nThe mode actually applied is recorded in an awk_recovered tag. Recovery re-runs when a recover_bad_* mode or recover_seesaw changes, then settles (it won't reprocess every pass). Container-forced timestamp fixes for ts/avi/mpg/mpeg still always apply.`,
         },
         {
-            name: 'recover_genpts',
-            type: 'boolean',
-            defaultValue: false,
+            name: 'recover_bad_data',
+            type: 'string',
+            defaultValue: 'disabled',
             inputUI: {
                 type: 'dropdown',
-                options: ['false', 'true'],
+                options: ['disabled', 'light', 'aggressive'],
             },
-            tooltip: `Run with the ffmpeg +genpts option to generate missing PTS (Presentation Timestamps).
-                 \\nShould generally be false but can fix errors such as "first pts value must set", "Can't write packet with unknown timestamp", or "Timestamps are unset in a packet for stream".
-                 \\nCombining this with igndts will tell ffmpeg to completely rebuild the timestamps for the file.
-                 \\nNote this is forced to true for ts, avi, mpg, and mpeg files as they often have timestamp issues.
-                 \\nThe recover options actually applied are recorded in an awk_recovered tag. Recovery re-runs when the set of recover options changes or recover_seesaw is flipped, then settles.`,
-        },
-        {
-            name: 'recover_igndts',
-            type: 'boolean',
-            defaultValue: false,
-            inputUI: {
-                type: 'dropdown',
-                options: ['false', 'true'],
-            },
-            tooltip: `Run with the ffmpeg +igndts option to ignore DTS (Decode Time Stamps - has nothing to do with Dolby DTS).
-                 \\nShould generally be false but can fix errors like "Non-monotonous DTS in output stream" or "DTS out of order".
-                 \\nWhen enabled genpts will be automatically enabled even if false is specified as messing with the timestream is a daunting exercise.
-                 \\nThe recover options actually applied are recorded in an awk_recovered tag. Recovery re-runs when the set of recover options changes or recover_seesaw is flipped, then settles.`,
+            tooltip: `Push a structurally damaged file through: visible/audible glitches, the job aborting on this file, won't seek, or a wrong duration.
+                 \\nTry light first; if it doesn't help switch to aggressive and flip recover_seesaw (see <-> saw) to re-run on already-processed files.
+                 \\ndisabled: no data recovery.
+                 \\nlight (risk-free): -fflags +ignidx and -err_detect ignore_err - ignores a broken/corrupt index (AVI idx1, MOV/MP4 sample tables) and keeps reading past detected errors instead of failing. Drops no frames.
+                 \\naggressive: additionally -fflags +discardcorrupt - drops packets flagged corrupt, which may cause small video/audio blips where the damage is.
+                 \\nThe mode actually applied is recorded in an awk_recovered tag. Recovery re-runs when a recover_bad_* mode or recover_seesaw changes, then settles.`,
         },
         {
             name: 'temp_on_network',
@@ -260,10 +250,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
     };
 
-    //A few more that should come through as boolean
-    const recoverDiscard = String(inputs.recover_discard_frame) === 'true';
-    const recoverGenpts = String(inputs.recover_genpts) === 'true';
-    const recoverIgndts = String(inputs.recover_igndts) === 'true';
+    // Recovery modes: two symptom dropdowns, each disabled/light/aggressive. light = no-data-loss flags only; aggressive adds the side-effect ones.
+    // Unknown/typo'd values fall through to no recovery (safe by default). tsLight/dataLight are "light-and-up" (true for both light and aggressive).
+    const recoverTs = String(inputs.recover_bad_timestamps).toLowerCase().trim();
+    const recoverData = String(inputs.recover_bad_data).toLowerCase().trim();
+    const tsLight = recoverTs === 'light' || recoverTs === 'aggressive';
+    const tsAgg = recoverTs === 'aggressive';
+    const dataLight = recoverData === 'light' || recoverData === 'aggressive';
+    const dataAgg = recoverData === 'aggressive';
     const recoverSeesaw = String(inputs.recover_seesaw).toLowerCase().trim();
     const tagDisposition = String(inputs.tag_disposition || 'disabled').toLowerCase();
     const tagTitle = String(inputs.tag_title || 'disabled').toLowerCase();
@@ -584,6 +578,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Set up required variables.
     let extraArguments = '';
     let fflags = '';
+    let inputArgs = '';   // recovery args that must precede -i (e.g. -err_detect); placed on the input side of the preset
     let workDone = '';
     let convert = false;
     let subtitleDropped = 0;
@@ -967,14 +962,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     //Include recovery flags if requested or if the source container is known to have timestamp issues.
 
-    // Recovery (discard/genpts/igndts) leaves nothing observable in the stream layout, and is a no-op with -c copy on already-cleaned content, so forcing a
-    // remux for it alone would make every Tdarr health-check pass reprocess the file forever. We record the intent - "<recover_seesaw>:<flags signature>" - in
-    // a format-level awk_recovered tag, and only recover when the current intent differs from the stamped one (changed recover option, flipped seesaw, or no
+    // Recovery (the recover_bad_* modes) leaves nothing observable in the stream layout, and is a no-op with -c copy on already-cleaned content, so forcing a
+    // remux for it alone would make every Tdarr health-check pass reprocess the file forever. We record the intent - "<recover_seesaw>:<mode signature>" - in
+    // a format-level awk_recovered tag, and only recover when the current intent differs from the stamped one (changed mode, flipped seesaw, or no
     // tag), then re-stamp. That converges (matching tag = skip), so a change re-runs recovery once and settles: no loop, no reset toggle.
-    const recoverRequested = recoverDiscard || recoverGenpts || recoverIgndts;
-    // Order-stable signature of the recover flags requested this run.
-    const recoverSig = [recoverDiscard && 'discardcorrupt', (recoverGenpts || recoverIgndts) && 'genpts', recoverIgndts && 'igndts'].filter(Boolean).join('+');
-    // Full intent = seesaw + signature. escMeta is a no-op here (alphanumeric + ':' + '+') but keeps the
+    const recoverRequested = recoverTs !== 'disabled' || recoverData !== 'disabled';
+    // Order-stable signature of the recovery modes requested this run (e.g. "ts-light+data-aggressive").
+    const recoverSig = [recoverTs !== 'disabled' && `ts-${recoverTs}`, recoverData !== 'disabled' && `data-${recoverData}`].filter(Boolean).join('+');
+    // Full intent = seesaw + signature. escMeta is a no-op here (alphanumeric + '-' + ':' + '+') but keeps the
     // compared value byte-identical to what gets written to awk_recovered below.
     const recoverIntent = escMeta(`${recoverSeesaw}:${recoverSig}`);
     // Read case-insensitively on the key (matroska upper-cases tag keys on write; the value is preserved).
@@ -986,21 +981,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const containerChanging = srcContainer !== dstContainer;
     const runRecover = recoverRequested && (!intentMatches || containerChanging);
 
-    // Recover-option flags apply only on a run (a matching intent with no container change is skipped) so a remux triggered by OTHER work never re-applies
+    // Recovery-mode flags apply only on a run (a matching intent with no container change is skipped) so a remux triggered by OTHER work never re-applies
     // them. The ts/avi/mpg/mpeg genpts/-avoid_negative_ts below is container-forced (needed to remux those formats at all) and is therefore always applied.
 
-    //Igndts can cause very strange problems if genpts isn't also enabled
-    if(runRecover && recoverIgndts === true)
+    // recover_bad_timestamps: light = +genpts, aggressive = full +igndts+genpts rebuild (igndts can misbehave without genpts, so it always pulls it in).
+    if(runRecover && tsAgg)
         fflags += '+igndts+genpts';
+    else if(runRecover && tsLight)
+        fflags += '+genpts';
 
-    if (['ts', 'avi', 'mpg', 'mpeg'].includes(srcContainer)) {
+    if (['ts', 'avi', 'mpg', 'mpeg'].includes(srcContainer)) {          // container-forced timestamp fix (always applied)
         if(!fflags.includes('genpts'))
             fflags += '+genpts';
         extraArguments = ` -avoid_negative_ts make_zero${extraArguments}`;
-    } else if (runRecover && recoverGenpts === true && !recoverIgndts)
-        fflags += '+genpts';
+    } else if (runRecover && tsLight && !extraArguments.includes('avoid_negative_ts'))
+        extraArguments = ` -avoid_negative_ts make_zero${extraArguments}`;   // normalize negative starts on any container we rebuild
 
-    if(runRecover && recoverDiscard === true)
+    // recover_bad_data: light = +ignidx + -err_detect ignore_err (drops nothing), aggressive additionally drops corrupt frames.
+    if(runRecover && dataLight) {
+        fflags += '+ignidx';
+        inputArgs += ' -err_detect ignore_err';
+    }
+    if(runRecover && dataAgg)
         fflags += '+discardcorrupt';
     if(fflags !== '')
         fflags = `-fflags ${fflags}`;
@@ -1023,7 +1025,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     //Convert file if convert variable is set to true.
     if (convert === true) {
-        response.preset += `${fflags},-map 0 -c copy${extraArguments} -max_muxing_queue_size 9999${networkDataOpt}`;
+        response.preset += `${fflags}${inputArgs},-map 0 -c copy${extraArguments} -max_muxing_queue_size 9999${networkDataOpt}`;
         response.infoLog += workDone;
         const outSummary = file.ffProbeData.streams
             .map(s => ({ s: { ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate }, idx: s.index }))
