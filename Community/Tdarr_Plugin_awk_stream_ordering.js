@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/songs/sdh/descriptive/commentary) -> Attachments -> Data. Also marks the first audio track as the sole default.\n`,
-    Version: '1.15.0',
+    Version: '1.15.1',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -168,10 +168,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const unknownCodecs = new Set();
 
     /* -=-=-= Resolve an ffprobe stream to its canonical codec key used by codecInfo =-=-=- */
-    // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype and eac3 into eac3atmos.
-    // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" — none of the subtype keywords — so longName alone can't distinguish the subtypes there; we also check the stream profile
-    //      (e.g. "DTS-HD MA", "DTS-HD HRA", "DTS Express") and fall back to mediaInfo's Format_Commercial_IfAny
-    //      (e.g. "DTS-HD Master Audio"), which decodes the substream header. Atmos is taken from long_name or the mediaInfo commercial name only - a title tag alone is not trusted (an editable title does not imply an actual Atmos substream). Shared by audioQuality and losslessSource.
+    // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype and eac3 into eac3atmos. Shared by audioQuality and losslessSource.
+    // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't tell the subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and
+    //   fall back to mediaInfo's Format_Commercial_IfAny ("DTS-HD Master Audio"), which decodes the substream header. Atmos comes from longName or the commercial name only - an editable title tag doesn't imply a real Atmos substream.
     const resolveCodecName = (stream) => {
         let codec = (stream?.codec_name || '').toLowerCase().trim();
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
@@ -203,8 +202,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     /* -=-=-= Audio Quality Scoring =-=-=- */
-    // With a given stream attempts to return a scoring of the quality to aid in the identification of the "best" stream. This scoring is based off of
-    // codec and bitrate compared to transparent bitrate. Must be declared after response so infoLog is available.
+    // Scores a stream's quality (codec + bitrate vs the transparent bitrate) to help identify the "best" track. Must be declared after response so infoLog is available.
     const audioQuality = (stream) => {
         const codec = resolveCodecName(stream);
 
@@ -229,13 +227,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (info.lossless)
             return info.score;
 
-        // No stream-level bitrate reported. For codecs we know how to encode (aac, opus, ac3, eac3)
-        // we can estimate quality from the bitrate we would target for this channel count instead of a
-        // blind midpoint — freshly-transcoded tracks routinely omit per-stream bitrate. For source
-        // codecs that normally carry a bitrate (dts, ac3 from disc, etc.) we log once and use the midpoint.
+        // No stream-level bitrate reported (freshly-transcoded tracks routinely omit it). For codecs we know how to encode (aac, opus, ac3, eac3) we estimate quality from the bitrate we'd target for this
+        // channel count instead of a blind midpoint. For source codecs that normally carry a bitrate (dts, ac3 from disc, etc.) we log once and use the midpoint.
         if (bitrate <= 0) {
-            // Per-channel target bitrate (bps) for our encodable output codecs. Kept inline so this
-            // scoring function stays self-contained and byte-for-byte identical across plugins.
+            // Per-channel target bitrate (bps) for our encodable output codecs. Kept inline so this scoring function stays self-contained and byte-for-byte identical across plugins.
             const ch = Math.max(1, Number(stream?.channels ?? 2));
             const targets = {
                 aac:  { 1: 128000, 2: 256000, 3: 320000, 4: 384000, 5: 448000, 6: 512000, 7: 576000, 8: 640000 },
@@ -245,9 +240,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
             const tbl = targets[codec];
             if (tbl) {
-                // ac3/eac3 top out at 6ch in ffmpeg, so cap the channel count so the estimate and its
-                // min/transparent thresholds scale together - otherwise a 7.1 source scores below a 5.1 of
-                // the same codec (estBps pins at the 6ch target while the thresholds keep climbing).
+                // ac3/eac3 top out at 6ch in ffmpeg, so cap the channel count so the estimate and its min/transparent thresholds scale together - otherwise a 7.1 source scores below a 5.1 of the same codec
+                // (estBps pins at the 6ch target while the thresholds keep climbing).
                 const capCh = Math.min(ch, codec === 'ac3' || codec === 'eac3' ? 6 : 8);
                 const scale = Math.pow(Math.max(2, capCh) / 2, 0.65);
                 const estBps = tbl[capCh] ?? 0;
@@ -272,14 +266,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
 
     /* -=-=-= Stream role/forced classifiers =-=-=- */
-    // Classifiers group the real ffmpeg disposition flags below into the roles the pipeline sorts and
-    // tags by. dispositionTypes is keyed by the actual ffmpeg disposition; each entry declares the stream
-    // types it is valid on (streams), the title keywords that also indicate it (each keyword lives on one
-    // flag so title->flag promotion stays unambiguous), and the canonical string written into a stream
-    // title (tag, null when never written). hasDisposition gates on codec_type and matches keywords as
-    // whole tokens via matchesKeyword. summariseStream, the stream-ordering sort keys, audio_clean's
-    // secondary-track detection, and clean_and_remux's title/flag tagging all read from this table.
-    // Shared verbatim across all three awk plugins.
+    // Classifiers group the real ffmpeg disposition flags into the roles the pipeline sorts and tags by. dispositionTypes is keyed by the actual ffmpeg disposition; each entry declares the stream types it's valid
+    // on (streams), the title keywords that also indicate it (each keyword lives on one flag so title->flag promotion stays unambiguous), and the canonical string written into a title (tag, null when never written).
+    // hasDisposition gates on codec_type and matches keywords whole-token via matchesKeyword. summariseStream, the stream-ordering sort keys, audio_clean's secondary-track detection, and clean_and_remux's
+    // title/flag tagging all read from this table. Shared verbatim across all three awk plugins.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                            tag: 'Commentary'  },
         visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','dvs','audio description'], tag: 'Descriptive' },
@@ -296,10 +286,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         timed_thumbnails: { streams:['video'],                    keywords: [],                                        tag: null          },
     };
     const streamTitleLower = (s) => (s.tags?.title || '').trim().toLowerCase();
-    // Whole-token keyword matcher: a keyword matches only when not flanked by a letter/digit, so '[sdh]',
-    // 'eng-sdh', and 'sdh.' match while 'deafening'/'aboriginal' do not. An internal space matches any run
-    // of non-alphanumerics ('hearing impaired' == 'hearing_impaired'). Keywords are regex-escaped; the 'u'
-    // flag enables \p{L}/\p{N}. text must already be lowercased.
+    // Whole-token keyword matcher: a keyword matches only when not flanked by a letter/digit, so '[sdh]', 'eng-sdh', and 'sdh.' match while 'deafening'/'aboriginal' do not. An internal space matches any run of
+    // non-alphanumerics ('hearing impaired' == 'hearing_impaired'). Keywords are regex-escaped; the 'u' flag enables \p{L}/\p{N}. text must already be lowercased.
     const matchesKeyword = (text, keywords) => {
         if (!keywords.length) return false;
         const pattern = keywords
@@ -319,8 +307,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const isLyrics      = (s) => hasDisposition(s, 'lyrics');
 
     /* -=-=-= Resolve the best available bitrate (bps) for a stream =-=-=- */
-    // ffprobe first, mediaInfo fallback. ffprobe cannot read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V), 
-    // but mediaInfo decodes the substream headers and usually has it. Returns 0 if neither source has a value. Used to enrich stream objects before summariseStream or audioQuality sees them.
+    // ffprobe first, mediaInfo fallback: ffprobe can't read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V) but mediaInfo decodes the substream headers and usually has it.
+    // Returns 0 if neither has a value. Used to enrich stream objects before summariseStream or audioQuality sees them.
     const resolveStreamBitrate = (ffstream) => {
         const ffBitrate = Number(ffstream.bit_rate || 0);
         if (ffBitrate > 0) return ffBitrate;
@@ -329,10 +317,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     /* -=-=-= Build single token summarising one ffprobe stream for the input/output summary lines. =-=-=- */
-    // Shows: video codec; audio lang/channels/codec/bitrate(+role); subtitle lang/codec(+forced/role); data and attachment codec.
-    // Role/forced detection mirrors the sorting logic (disposition flags first, then title keywords, via the shared classifiers) so every plugin's summary lines up. subrip
-    // is shown as srt to match the friendlier name used when this pipeline converts subtitles.
-    // Shared verbatim across all three awk plugins
+    // Shows: video codec; audio lang/channels/codec/bitrate(+role); subtitle lang/codec(+forced/role); data and attachment codec. Role/forced detection mirrors the sorting logic (disposition flags first, then
+    // title keywords, via the shared classifiers) so every plugin's summary lines up. subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Shared verbatim across all three.
     const summariseStream = (s) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
@@ -361,10 +347,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     /* -=-=-= Sanitize value for embedding inside a double quotes ffmpeg -metadata argument (e.g. -metadata:s:a:0 "title=...") =-=-=- */
-    // Tdarr does NOT pass the preset through a shell — it splits the string into a quote-aware argv array and hands it to child_process.spawn, so shell metacharacters ($ ` ; |)
-    // are inert and reach ffmpeg as literal metadata bytes. The only injection vector is breaking out of the quoted value to inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper)
-    // or a control character.
-    // Tdarr's tokenizer strips quotes with no reliable backslash-escape convention,  so we substitute rather than strip:
+    // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array and hands it to child_process.spawn, so shell metacharacters ($ ` ; |) are inert and reach ffmpeg as literal
+    // metadata bytes. The only injection vector is breaking out of the quoted value to inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper) or a control character. Tdarr's tokenizer
+    // strips quotes with no reliable backslash-escape convention, so we substitute rather than strip:
     //    backslash          -> forward-slash (readable, inert)
     //    double-quote       -> single-quote (safe inside the quoted value; preserves titles like "Director's Cut" and "AC3/Stereo")
     //    control characters -> space (avoids fusing words that a bare delete would join).
@@ -444,8 +429,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             sdh: isSdh(ffstream),
             lyrics: isLyrics(ffstream),
 
-            // Cover art / poster / thumbnail video streams sort last. Detected by the ffmpeg cover-art
-            // dispositions (any codec) or a still-image codec — mirrors clean_and_remux's image removal.
+            // Cover art / poster / thumbnail video streams sort last. Detected by the ffmpeg cover-art dispositions (any codec) or a still-image codec - mirrors clean_and_remux's image removal.
             coverArt: hasDisposition(ffstream, 'attached_pic') || hasDisposition(ffstream, 'still_image') || hasDisposition(ffstream, 'timed_thumbnails')
                 || IMAGE_CODECS.includes((ffstream.codec_name || '').trim().toLowerCase()),
         });
@@ -523,9 +507,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return a.index - b.index;
     });
 
-    //Check if order has changed and build the map. Also normalise the audio default flag so exactly one
-    //audio track - the first in the sorted order - is default, matching the track our ordering rules
-    //chose. Additive +default/-default preserves forced/commentary/etc. Subtitle and video are untouched.
+    //Check if order has changed and build the map. Also normalise the audio default flag so exactly one audio track - the first in the sorted order - is default, matching the track our ordering rules chose.
+    //Additive +default/-default preserves forced/commentary/etc. Subtitle and video are untouched.
     let ffmpegMap = '';
     let dispositionArgs = '';
     let changed = false;
@@ -533,9 +516,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     for (let i = 0; i < streams.length; i++) {
         ffmpegMap += ` -map 0:${streams[i].index}`;
-        // Compare against each stream's ORIGINAL array position, not its absolute ffprobe index, so a file
-        // already in the desired order but with non-contiguous indices (e.g. 0,1,3 after an upstream drop)
-        // isn't remuxed pointlessly. -map still uses the absolute index above.
+        // Compare against each stream's ORIGINAL array position, not its absolute ffprobe index, so a file already in the desired order but with non-contiguous indices (e.g. 0,1,3 after an upstream drop) isn't
+        // remuxed pointlessly. -map still uses the absolute index above.
         if (streams[i].origPos !== i) changed = true;
 
         if (streams[i].type === 'audio') {

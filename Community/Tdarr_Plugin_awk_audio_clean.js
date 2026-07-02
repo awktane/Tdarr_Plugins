@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.26.0',
+    Version: '1.26.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -273,10 +273,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const unknownCodecs = new Set();
 
     /* -=-=-= Resolve an ffprobe stream to its canonical codec key used by codecInfo =-=-=- */
-    // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype and eac3 into eac3atmos.
-    // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" — none of the subtype keywords — so longName alone can't distinguish the subtypes there; we also check the stream profile
-    //      (e.g. "DTS-HD MA", "DTS-HD HRA", "DTS Express") and fall back to mediaInfo's Format_Commercial_IfAny
-    //      (e.g. "DTS-HD Master Audio"), which decodes the substream header. Atmos is taken from long_name or the mediaInfo commercial name only - a title tag alone is not trusted (an editable title does not imply an actual Atmos substream). Shared by audioQuality and losslessSource.
+    // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype and eac3 into eac3atmos. Shared by audioQuality and losslessSource.
+    // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't tell the subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and
+    //   fall back to mediaInfo's Format_Commercial_IfAny ("DTS-HD Master Audio"), which decodes the substream header. Atmos comes from longName or the commercial name only - an editable title tag doesn't imply a real Atmos substream.
     const resolveCodecName = (stream) => {
         let codec = (stream?.codec_name || '').toLowerCase().trim();
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
@@ -308,8 +307,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     /* -=-=-= Audio Quality Scoring =-=-=- */
-    // With a given stream attempts to return a scoring of the quality to aid in the identification of the "best" stream. This scoring is based off of
-    // codec and bitrate compared to transparent bitrate. Must be declared after response so infoLog is available.
+    // Scores a stream's quality (codec + bitrate vs the transparent bitrate) to help identify the "best" track. Must be declared after response so infoLog is available.
     const audioQuality = (stream) => {
         const codec = resolveCodecName(stream);
 
@@ -334,13 +332,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (info.lossless)
             return info.score;
 
-        // No stream-level bitrate reported. For codecs we know how to encode (aac, opus, ac3, eac3)
-        // we can estimate quality from the bitrate we would target for this channel count instead of a
-        // blind midpoint — freshly-transcoded tracks routinely omit per-stream bitrate. For source
-        // codecs that normally carry a bitrate (dts, ac3 from disc, etc.) we log once and use the midpoint.
+        // No stream-level bitrate reported (freshly-transcoded tracks routinely omit it). For codecs we know how to encode (aac, opus, ac3, eac3) we estimate quality from the bitrate we'd target for this
+        // channel count instead of a blind midpoint. For source codecs that normally carry a bitrate (dts, ac3 from disc, etc.) we log once and use the midpoint.
         if (bitrate <= 0) {
-            // Per-channel target bitrate (bps) for our encodable output codecs. Kept inline so this
-            // scoring function stays self-contained and byte-for-byte identical across plugins.
+            // Per-channel target bitrate (bps) for our encodable output codecs. Kept inline so this scoring function stays self-contained and byte-for-byte identical across plugins.
             const ch = Math.max(1, Number(stream?.channels ?? 2));
             const targets = {
                 aac:  { 1: 128000, 2: 256000, 3: 320000, 4: 384000, 5: 448000, 6: 512000, 7: 576000, 8: 640000 },
@@ -350,9 +345,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
             const tbl = targets[codec];
             if (tbl) {
-                // ac3/eac3 top out at 6ch in ffmpeg, so cap the channel count so the estimate and its
-                // min/transparent thresholds scale together - otherwise a 7.1 source scores below a 5.1 of
-                // the same codec (estBps pins at the 6ch target while the thresholds keep climbing).
+                // ac3/eac3 top out at 6ch in ffmpeg, so cap the channel count so the estimate and its min/transparent thresholds scale together - otherwise a 7.1 source scores below a 5.1 of the same codec
+                // (estBps pins at the 6ch target while the thresholds keep climbing).
                 const capCh = Math.min(ch, codec === 'ac3' || codec === 'eac3' ? 6 : 8);
                 const scale = Math.pow(Math.max(2, capCh) / 2, 0.65);
                 const estBps = tbl[capCh] ?? 0;
@@ -377,14 +371,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
 
     /* -=-=-= Stream role/forced classifiers =-=-=- */
-    // Classifiers group the real ffmpeg disposition flags below into the roles the pipeline sorts and
-    // tags by. dispositionTypes is keyed by the actual ffmpeg disposition; each entry declares the stream
-    // types it is valid on (streams), the title keywords that also indicate it (each keyword lives on one
-    // flag so title->flag promotion stays unambiguous), and the canonical string written into a stream
-    // title (tag, null when never written). hasDisposition gates on codec_type and matches keywords as
-    // whole tokens via matchesKeyword. summariseStream, the stream-ordering sort keys, audio_clean's
-    // secondary-track detection, and clean_and_remux's title/flag tagging all read from this table.
-    // Shared verbatim across all three awk plugins.
+    // Classifiers group the real ffmpeg disposition flags into the roles the pipeline sorts and tags by. dispositionTypes is keyed by the actual ffmpeg disposition; each entry declares the stream types it's valid
+    // on (streams), the title keywords that also indicate it (each keyword lives on one flag so title->flag promotion stays unambiguous), and the canonical string written into a title (tag, null when never written).
+    // hasDisposition gates on codec_type and matches keywords whole-token via matchesKeyword. summariseStream, the stream-ordering sort keys, audio_clean's secondary-track detection, and clean_and_remux's
+    // title/flag tagging all read from this table. Shared verbatim across all three awk plugins.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                            tag: 'Commentary'  },
         visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','dvs','audio description'], tag: 'Descriptive' },
@@ -401,10 +391,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         timed_thumbnails: { streams:['video'],                    keywords: [],                                        tag: null          },
     };
     const streamTitleLower = (s) => (s.tags?.title || '').trim().toLowerCase();
-    // Whole-token keyword matcher: a keyword matches only when not flanked by a letter/digit, so '[sdh]',
-    // 'eng-sdh', and 'sdh.' match while 'deafening'/'aboriginal' do not. An internal space matches any run
-    // of non-alphanumerics ('hearing impaired' == 'hearing_impaired'). Keywords are regex-escaped; the 'u'
-    // flag enables \p{L}/\p{N}. text must already be lowercased.
+    // Whole-token keyword matcher: a keyword matches only when not flanked by a letter/digit, so '[sdh]', 'eng-sdh', and 'sdh.' match while 'deafening'/'aboriginal' do not. An internal space matches any run of
+    // non-alphanumerics ('hearing impaired' == 'hearing_impaired'). Keywords are regex-escaped; the 'u' flag enables \p{L}/\p{N}. text must already be lowercased.
     const matchesKeyword = (text, keywords) => {
         if (!keywords.length) return false;
         const pattern = keywords
@@ -424,8 +412,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const isLyrics      = (s) => hasDisposition(s, 'lyrics');
 
     /* -=-=-= Resolve the best available bitrate (bps) for a stream =-=-=- */
-    // ffprobe first, mediaInfo fallback. ffprobe cannot read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V), 
-    // but mediaInfo decodes the substream headers and usually has it. Returns 0 if neither source has a value. Used to enrich stream objects before summariseStream or audioQuality sees them.
+    // ffprobe first, mediaInfo fallback: ffprobe can't read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V) but mediaInfo decodes the substream headers and usually has it.
+    // Returns 0 if neither has a value. Used to enrich stream objects before summariseStream or audioQuality sees them.
     const resolveStreamBitrate = (ffstream) => {
         const ffBitrate = Number(ffstream.bit_rate || 0);
         if (ffBitrate > 0) return ffBitrate;
@@ -434,10 +422,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     /* -=-=-= Build single token summarising one ffprobe stream for the input/output summary lines. =-=-=- */
-    // Shows: video codec; audio lang/channels/codec/bitrate(+role); subtitle lang/codec(+forced/role); data and attachment codec.
-    // Role/forced detection mirrors the sorting logic (disposition flags first, then title keywords, via the shared classifiers) so every plugin's summary lines up. subrip
-    // is shown as srt to match the friendlier name used when this pipeline converts subtitles.
-    // Shared verbatim across all three awk plugins
+    // Shows: video codec; audio lang/channels/codec/bitrate(+role); subtitle lang/codec(+forced/role); data and attachment codec. Role/forced detection mirrors the sorting logic (disposition flags first, then
+    // title keywords, via the shared classifiers) so every plugin's summary lines up. subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Shared verbatim across all three.
     const summariseStream = (s) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
@@ -466,10 +452,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     /* -=-=-= Sanitize value for embedding inside a double quotes ffmpeg -metadata argument (e.g. -metadata:s:a:0 "title=...") =-=-=- */
-    // Tdarr does NOT pass the preset through a shell — it splits the string into a quote-aware argv array and hands it to child_process.spawn, so shell metacharacters ($ ` ; |)
-    // are inert and reach ffmpeg as literal metadata bytes. The only injection vector is breaking out of the quoted value to inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper)
-    // or a control character.
-    // Tdarr's tokenizer strips quotes with no reliable backslash-escape convention,  so we substitute rather than strip:
+    // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array and hands it to child_process.spawn, so shell metacharacters ($ ` ; |) are inert and reach ffmpeg as literal
+    // metadata bytes. The only injection vector is breaking out of the quoted value to inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper) or a control character. Tdarr's tokenizer
+    // strips quotes with no reliable backslash-escape convention, so we substitute rather than strip:
     //    backslash          -> forward-slash (readable, inert)
     //    double-quote       -> single-quote (safe inside the quoted value; preserves titles like "Director's Cut" and "AC3/Stereo")
     //    control characters -> space (avoids fusing words that a bare delete would join).
@@ -487,16 +472,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const ac3Presets = [32000, 40000, 48000, 56000, 64000, 80000, 96000, 112000, 128000,
                         160000, 192000, 224000, 256000, 320000, 384000, 448000, 512000, 576000, 640000];
 
-    // Per-channel-count target bitrate (bps) for our four encodable output codecs. These sit at or
-    // comfortably above the transparent threshold from the codecInfo scoring table (scaled by channel
-    // count), and serve as the FLOOR for a transcode — the actual target is max(thisTable, source).
-    //
-    // AC3 / EAC3 — CBR fixed-preset. Targets: mono 192k, stereo 224k, 3ch 320k, 4ch 384k, 5ch 448k, 6ch 640k.
-    //              (640k is the Blu-ray 5.1 standard and the AC3/EAC3 codec ceiling.)
-    // AAC — CBR (native AAC VBR is experimental in ffmpeg). mono 128k, stereo 256k, 3ch 320k, 4ch 384k,
-    //              5ch 448k, 6ch 512k, 7ch 576k, 8ch 640k.
-    // Opus — true VBR (-vbr on), -b:a is the target average. More efficient than AAC so targets are lower:
-    //              mono 128k, stereo 192k, 3ch 256k, 4ch 320k, 5ch 320k, 6ch 384k, 7ch 448k, 8ch 448k.
+    // Per-channel-count target bitrate (bps) for our four encodable output codecs. These sit at or comfortably above the transparent threshold from the codecInfo scoring table (scaled by channel count), and
+    // serve as the FLOOR for a transcode - the actual target is max(thisTable, source).
+    // AC3 / EAC3 - CBR fixed-preset: mono 192k, stereo 224k, 3ch 320k, 4ch 384k, 5ch 448k, 6ch 640k (640k is the Blu-ray 5.1 standard and the AC3/EAC3 codec ceiling).
+    // AAC - CBR (native AAC VBR is experimental in ffmpeg): mono 128k, stereo 256k, 3ch 320k, 4ch 384k, 5ch 448k, 6ch 512k, 7ch 576k, 8ch 640k.
+    // Opus - true VBR (-vbr on), -b:a is the target average; more efficient than AAC so targets are lower: mono 128k, stereo 192k, 3ch 256k, 4ch 320k, 5ch 320k, 6ch 384k, 7ch 448k, 8ch 448k.
     const targetTable = (codec, channels) => {
         const ch = Math.max(1, Number(channels) || 1);
         if (codec === 'aac' || codec === 'aac_vbr') {
@@ -514,29 +494,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return 0;
     };
 
-    // Per-codec ceiling (bps) so a lossless or very-high-bitrate source (e.g. TrueHD ~4 Mbps) can't drag
-    // the transcode target absurdly high. AC3/EAC3 cap at their hard 640k limit. AAC/Opus cap generously
-    // per channel — well above transparent for any real content, but bounded.
+    // Per-codec ceiling (bps) so a lossless or very-high-bitrate source (e.g. TrueHD ~4 Mbps) can't drag the transcode target absurdly high. AC3/EAC3 cap at their hard 640k limit; AAC/Opus cap generously per
+    // channel - well above transparent for any real content, but bounded.
     const codecCeiling = (codec, channels) => {
         const ch = Math.max(1, Number(channels) || 1);
-        // AC3/EAC3 cap at their hard 640k codec limit. AAC and Opus scale per channel. These only ever
-        // apply to tracks at or below each codec's channel maximum (the force/downmix paths block higher
-        // counts before encoding), but the per-channel form stays correct regardless of channel count.
-        // Opus's ceiling (128k/ch) is deliberately half of ffmpeg's hard libopus limit (256k/ch), so a
-        // resolved Opus target can never be rejected by the encoder. AAC 160k/ch is generous but bounded.
+        // AC3/EAC3 cap at their hard 640k codec limit; AAC and Opus scale per channel. These only ever apply to tracks at or below each codec's channel maximum (the force/downmix paths block higher counts
+        // before encoding), but the per-channel form stays correct regardless of channel count. Opus's ceiling (128k/ch) is deliberately half of ffmpeg's hard libopus limit (256k/ch) so a resolved Opus target
+        // can never be rejected by the encoder. AAC 160k/ch is generous but bounded.
         if (codec === 'ac3' || codec === 'eac3') return 640000;
         if (codec === 'aac' || codec === 'aac_vbr') return ch * 160000;   // 160k/ch (stereo 320k, 5.1 960k, 7.1 1.28M)
         if (codec === 'opus') return ch * 128000;   // 128k/ch — half of libopus's 256k/ch hard maximum
         return 0;
     };
 
-    // Resolve the final target bitrate (bps) for a transcode: floor at the per-channel table target, raise
-    // to the source bitrate when the source is known, higher, and lossy (never throw away quality we can
-    // cheaply keep from a lossy source), then clamp to the codec ceiling. The floor is skipped for lossless
-    // sources because their bitrate is not a comparable quantity for a perceptual encode — a 4 Mbps TrueHD
-    // into AAC should target the table value (~512k for 5.1), not pin at the 960k ceiling every time.
-    // For AC3/EAC3 the result is snapped UP to the nearest valid preset so the requested rate is one ffmpeg
-    // actually honours.
+    // Resolve the final target bitrate (bps) for a transcode: floor at the per-channel table target, raise to the source bitrate when the source is known, higher, and lossy (never throw away quality we can
+    // cheaply keep from a lossy source), then clamp to the codec ceiling. The floor is skipped for lossless sources because their bitrate isn't a comparable quantity for a perceptual encode - a 4 Mbps TrueHD into
+    // AAC should target the table value (~512k for 5.1), not pin at the 960k ceiling every time. For AC3/EAC3 the result is snapped UP to the nearest valid preset so the requested rate is one ffmpeg actually honours.
     const resolveBitrate = (codec, channels, srcBps = 0, srcLossless = false) => {
         let bps = targetTable(codec, channels);
         if (bps <= 0) return 0;
@@ -729,25 +702,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Channels > 4 && <= 6 covers 5.0 and 5.1 without catching 4.0/4.1 or 7.1 sources.
     const existingSixLangs = new Set(audioStreams.filter(s => s.channels > 4 && s.channels <= 6 && !s.isTdarrSecondaryTrack && !s.isTdarrLangSecondary).map(s => s.isTdarrCleanLang));
 
-    // Identify lower-quality duplicates. Within each group keep only the highest quality stream; the rest are either
-    // marked for removal (removeDuplicatesBy === 'multi-stereo'/'channel') or, for the "-error" variants, cause the
-    // plugin to abort immediately (no streams are removed, no other changes from this run are applied). The grouping
-    // key depends on the mode (the "-error" suffix only changes what happens on a hit, never the grouping itself):
-    //   'channel'/'channel-error'           - group by (lang, exact channel count, primary/secondary): one track per
-    //                                          distinct channel count survives (e.g. a 7.1, a 5.1 and a 2.0 of the
-    //                                          same language are all kept).
-    //   'multi-stereo'/'multi-stereo-error' - group by (lang, broad surround-vs-stereo role, primary/secondary):
-    //                                          collapses every surround variant of a language down to a single best
-    //                                          surround plus a single best stereo, for a more predictable layout.
-    //               Exception: when downmix_to_six is enabled, the 5-6ch band is carved out into its own role rather than folded into "surround", so a downmix-created (or pre-existing)
-    //               5.1/5.0 track is never compared against, and removed in favour of, a different channel count like 7.1 — matching what downmix_to_six itself would create or preserve.
-    //               Exception: when downmix_to_stereo is enabled, exactly-2ch tracks are carved out into their own role rather than folded into "stereo", so a downmix-created (or
-    //               pre-existing) 2.0 track is never compared against, and removed in favour of, a mono track — matching what downmix_to_stereo itself would create or preserve.
-    //               Both exceptions only apply while the matching downmix option is enabled, and use the exact same channel-count bands as existingSixLangs/existingStereoLangs so
-    //               dedup can never disagree with, and re-trigger, the downmix creation guards (this is what previously caused an infinite create/remove loop between the two plugin runs).
-    // Note: deduplication runs across ALL audio streams regardless of downmix_language or downmix_secondary_stereo, since those settings govern transcoding candidates, not what's a
-    // genuine duplicate. A duplicate in a non-preferred language is still a duplicate. Protected (keep_best_surround_safe) tracks are never outright removed, and never trigger the
-    // "-error" abort either — a protected track was never a removal candidate in the first place.
+    // Identify lower-quality duplicates. Within each group keep only the highest quality stream; the rest are marked for removal ('multi-stereo'/'channel') or, for the "-error" variants, abort the plugin
+    // immediately (no streams removed, no other changes applied). The "-error" suffix only changes what happens on a hit, never the grouping. Grouping key by mode:
+    //   'channel'/'channel-error'           - (lang, exact channel count, primary/secondary): one track per distinct channel count survives (a 7.1, a 5.1 and a 2.0 of the same language are all kept).
+    //   'multi-stereo'/'multi-stereo-error' - (lang, broad surround-vs-stereo role, primary/secondary): collapses every surround variant of a language to a single best surround plus a single best stereo.
+    //       Exception: when downmix_to_six is enabled the 5-6ch band is carved into its own role (not folded into "surround") so a downmix-created/pre-existing 5.1/5.0 is never removed in favour of a 7.1.
+    //       Exception: when downmix_to_stereo is enabled exactly-2ch tracks are carved into their own role (not folded into "stereo") so a downmix-created/pre-existing 2.0 is never removed in favour of a mono.
+    //       Both exceptions only apply while the matching downmix option is enabled and use the same channel bands as existingSixLangs/existingStereoLangs, so dedup can't disagree with and re-trigger the
+    //       downmix creation guards (this previously caused an infinite create/remove loop between the two plugin runs).
+    // Note: dedup runs across ALL audio streams regardless of downmix_language/downmix_secondary_stereo (those govern transcoding candidates, not what's a genuine duplicate - a duplicate in a non-preferred
+    // language is still a duplicate). Protected (keep_best_surround_safe) tracks are never removed and never trigger the "-error" abort - a protected track was never a removal candidate.
     const removeDuplicatesErrorMode = removeDuplicatesBy === 'multi-stereo-error' || removeDuplicatesBy === 'channel-error';
     const removeDuplicatesGroupBy = removeDuplicatesErrorMode ? removeDuplicatesBy.replace(/-error$/, '') : removeDuplicatesBy;
     const streamsToRemove = new Set();
@@ -894,23 +858,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     // Lo/Ro stereo downmix matrices, generated from each source layout's exact channel order.
-    //
-    // WHY layout-keyed and not channel-count-keyed: several standard layouts share a channel count but
-    // order their channels differently (e.g. 6 channels can be 5.1, 5.1(side), 6.0, 6.0(front), or
-    // hexagonal). A count-based matrix would silently mis-route — dropping the wrong channel as "LFE" or
-    // panning a back-center where a surround belongs — producing audio that sounds wrong without any error.
-    // So we resolve the EXACT layout to its canonical channel list and build the matrix from speaker roles.
-    // Any layout we don't have a verified channel list for returns null, and the caller falls back to
-    // ffmpeg's safe built-in -ac 2 downmix rather than risk a confidently-wrong custom matrix.
-    //
-    // Downmix rules (standard Lo/Ro): FL/FR kept at full scale; FC at -3 dB (0.707) into both so dialogue
-    // stays clear; LFE dropped (avoids mud); back/side/wide channels at -3 dB to their own side; any
-    // centered channel (FC, BC) split equally to both sides. FL/FR are kept at peak 1.0 — the -3 dB
-    // attenuation on center/surround provides the clipping headroom, matching the industry-standard Lo/Ro
-    // downmix used by Blu-ray players, AV receivers, and streaming services.
-    //
-    // Canonical ffmpeg channel lists per layout (verified against ffmpeg-utils "Channel Layout" docs).
-    // Position in the array is the cN index used by the pan filter.
+    // WHY layout-keyed and not channel-count-keyed: several standard layouts share a channel count but order their channels differently (e.g. 6 channels can be 5.1, 5.1(side), 6.0, 6.0(front), or hexagonal). A
+    // count-based matrix would silently mis-route - dropping the wrong channel as "LFE" or panning a back-center where a surround belongs - producing audio that sounds wrong without any error. So we resolve the
+    // EXACT layout to its canonical channel list and build the matrix from speaker roles. Any layout without a verified channel list returns null and the caller falls back to ffmpeg's safe -ac 2 downmix.
+    // Downmix rules (standard Lo/Ro): FL/FR kept at full scale (peak 1.0); FC at -3 dB (0.707) into both so dialogue stays clear; LFE dropped (avoids mud); back/side/wide at -3 dB to their own side; any centered
+    // channel (FC, BC) split equally to both sides. The -3 dB attenuation on center/surround provides the clipping headroom, matching the industry-standard Lo/Ro downmix used by Blu-ray players, AV receivers, and
+    // streaming services.
+    // Canonical ffmpeg channel lists per layout (verified against ffmpeg-utils "Channel Layout" docs). Position in the array is the cN index used by the pan filter.
     const CANON_LAYOUTS = {
         '3.1':            ['FL', 'FR', 'FC', 'LFE'],
         '4.0':            ['FL', 'FR', 'FC', 'BC'],
@@ -943,13 +897,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         BC:  { L: 0.5,   R: 0.5   },
     };
 
-    // Build a Lo/Ro pan=stereo matrix string for a known canonical layout, or null if the layout
-    // contributes no surround/center content (pure FL/FR or FL/FR/LFE), where -ac 2 is already correct.
-    // FL/FR are kept at full scale (peak = 1.0); center and surround channels fold in at their standard
-    // Lo/Ro gains (-3 dB for FC/BC/surrounds, LFE dropped). This matches the industry-standard Lo/Ro
-    // downmix used by Blu-ray players, AV receivers, and streaming services. The -3 dB attenuation on
-    // center/surround provides the clipping headroom — a global sum-normalization is not used because
-    // it produces output 6-8 dB quieter than the source on typical content.
+    // Build a Lo/Ro pan=stereo matrix string for a known canonical layout, or null if the layout contributes no surround/center content (pure FL/FR or FL/FR/LFE) where -ac 2 is already correct. FL/FR kept at full
+    // scale (peak 1.0); center/surround fold in at standard Lo/Ro gains (-3 dB for FC/BC/surrounds, LFE dropped). The -3 dB attenuation provides the clipping headroom - a global sum-normalization is not used
+    // because it produces output 6-8 dB quieter than the source on typical content.
     const buildPanMatrix = (channelList) => {
         const termsL = [];
         const termsR = [];
@@ -1197,13 +1147,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
 
 
-    // Build the predicted output stream summary for the closing log line. Audio streams keep their
-    // original codec unless an in-place override was recorded; removed duplicates are dropped; newly
-    // created downmix tracks are appended (matching ffmpeg's -map 0 then -map 0:a:N ordering).
-    // All streams are enriched with resolveStreamBitrate before summariseStream, matching the input
-    // summary line — so untouched tracks (e.g. a copied stereo track) show their bitrate correctly.
-    // aac_vbr overrides carry approxRate instead of a fixed bps; summariseStream receives the
-    // approxRate string pre-formatted as the bit_rate field so the bracket token shows e.g. ~192k.
+    // Build the predicted output stream summary for the closing log line. Audio streams keep their original codec unless an in-place override was recorded; removed duplicates are dropped; newly created downmix
+    // tracks are appended (matching ffmpeg's -map 0 then -map 0:a:N ordering). All streams are enriched with resolveStreamBitrate before summariseStream, matching the input summary line - so untouched tracks (e.g. a
+    // copied stereo track) show their bitrate correctly. aac_vbr overrides carry approxRate instead of a fixed bps; summariseStream receives the approxRate string pre-formatted as the bit_rate field so the bracket
+    // token shows e.g. ~192k.
     const buildOutputSummary = () => {
         const tokens = [];
         // Build an audio token for a VBR override/append, where the rate is an approximate string
@@ -1247,12 +1194,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Convert file if convert variable is set to true.
     if (convert === true) {
-        // Dispositions (default flag) are intentionally left untouched. ffmpeg copies the source
-        // stream's disposition onto mapped/transcoded outputs, so a downmix_to_stereo track created
-        // from a default-flagged surround source will also carry the default flag — two tracks marked
-        // default. This is acceptable: the tracks are near-identical content at different channel counts,
-        // and most players handle multiple default flags without issue. Removing or reassigning the default
-        // flag is a separate concern outside this plugin's scope.
+        // Dispositions (default flag) are intentionally left untouched. ffmpeg copies the source stream's disposition onto mapped/transcoded outputs, so a downmix_to_stereo track created from a default-flagged
+        // surround source also carries the default flag - two tracks marked default. This is acceptable: the tracks are near-identical content at different channel counts and most players handle multiple default
+        // flags without issue. Removing or reassigning the default flag is a separate concern outside this plugin's scope.
         response.preset += `,-map 0 -c copy${extraArguments} -max_muxing_queue_size 9999${networkDataOpt}`;
         response.infoLog += workDone;
         response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;
