@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/songs/sdh/descriptive/commentary) -> Attachments -> Data. Also marks the first audio track as the sole default.\n`,
-    Version: '1.16.0',
+    Version: '2.0.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -99,13 +99,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         infoLog: '',
     };
 
-    // Bail out gracefully on missing/partial probe data, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
-    if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams)) {
-        response.infoLog += '☒No ffProbe stream data available for this file.\n';
-        response.processFile = false;
-        return response;
-    }
-
     // =====================================================================
     // SHARED CODE — duplicated verbatim because Tdarr loads each plugin as one self-contained file.
     // Split into labeled sections; each is byte-identical across the plugins named in its header, and a
@@ -114,7 +107,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // =====================================================================
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: role/disposition classifiers =====
-    /* -=-=-= Stream role/forced classifiers =-=-=- */
+    // -=-=-= dispositionTypes  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     // Classifiers group the real ffmpeg disposition flags into the roles the pipeline sorts and tags by. dispositionTypes is keyed by the ffmpeg
     // disposition; each entry declares the valid stream types (streams), the keywords that also indicate it (each keyword lives on one flag so
     // title->flag promotion stays unambiguous), and the canonical title string (tag, null when never written). hasDisposition gates on codec_type,
@@ -135,6 +128,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         still_image:      { streams:['video'],                    keywords: [],                                        tag: null          },
         timed_thumbnails: { streams:['video'],                    keywords: [],                                        tag: null          },
     };
+    // -=-=-= roleTextLower  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     // roleTextLower scrapes role-signal text from BOTH probes: dispositions are often incomplete and a title/description/handler can live in ffprobe OR
     // mediaInfo but not both, so we union every text field before classifying. mediaInfo is matched by StreamOrder (like resolveStreamBitrate); whole-token
     // matchesKeyword keeps generic values like "SoundHandler" inert. hasDisposition calls it repeatedly per stream, so memoize by stream object (WeakMap,
@@ -147,6 +141,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         roleTextCache.set(s, text);
         return text;
     };
+    // -=-=-= matchesKeyword  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     // Whole-token keyword matcher: a keyword matches only when not flanked by a letter/digit, so '[sdh]', 'eng-sdh', and 'sdh.' match while
     // 'deafening'/'aboriginal' do not. An internal space matches any run of non-alphanumerics ('hearing impaired' == 'hearing_impaired'). Keywords are
     // regex-escaped; the 'u' flag enables \p{L}/\p{N}. text must already be lowercased.
@@ -157,12 +152,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .join('|');
         return new RegExp(`(?<![\\p{L}\\p{N}])(?:${pattern})(?![\\p{L}\\p{N}])`, 'u').test(text);
     };
+    // -=-=-= hasDisposition  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     const hasDisposition = (s, key) => {
         const entry = dispositionTypes[key];
         if (!entry) return false;
         if (!entry.streams.includes((s.codec_type || '').trim().toLowerCase())) return false;
         return s.disposition?.[key] === 1 || matchesKeyword(roleTextLower(s), entry.keywords);
     };
+    // -=-=-= role classifiers: isCommentary / isDescriptive / isSdh / isLyrics  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     const isCommentary  = (s) => hasDisposition(s, 'comment');
     const isDescriptive = (s) => hasDisposition(s, 'visual_impaired') || hasDisposition(s, 'descriptions');
     const isSdh         = (s) => hasDisposition(s, 'hearing_impaired') || hasDisposition(s, 'captions');
@@ -170,6 +167,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: role/disposition classifiers =====
 
     // ===== SHARED [audio_clean, stream_ordering]: audio codec scoring =====
+    // -=-=-= codecInfo  [audio_clean, stream_ordering] =-=-=-
     //Codec quality weights so we can pick the best track. Some of these formats aren't supported by ffmpeg yet (e.g. ac4).
     const codecInfo = {
         // Lossless
@@ -212,6 +210,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         adpcm:      { score: 60,  minimum: 128000,  transparent: 256000 },
         cook:       { score: 58,  minimum: 64000,   transparent: 128000 }
     };
+    // -=-=-= codecAliases / unknownCodecs  [audio_clean, stream_ordering] =-=-=-
     // Prefix → canonical codec key (e.g. wmav1 → wma).
     const codecAliases = [
         ['pcm_',   'pcm'],
@@ -221,7 +220,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     ];
     const unknownCodecs = new Set();
 
-    /* -=-=-= Resolve an ffprobe stream to its canonical codec key used by codecInfo =-=-=- */
+    // -=-=-= resolveCodecName  [audio_clean, stream_ordering] =-=-=-
     // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype and eac3 into eac3atmos. Shared by audioQuality
     // and losslessSource. codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't tell the
     // subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to mediaInfo's Format_Commercial_IfAny
@@ -257,6 +256,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return codec;
     };
 
+    // -=-=-= CODEC_TARGET_BPS  [audio_clean, stream_ordering] =-=-=-
     // Per-channel target bitrate (bps) for our encodable output codecs (ac3/eac3 cap at 6ch in ffmpeg). Single source for BOTH the bitrate-less quality
     // estimate in audioQuality and audio_clean's transcode targetTable, so a target change can't make the predicted score disagree with the bitrate used.
     const CODEC_TARGET_BPS = {
@@ -265,7 +265,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ac3:  { 1: 192000, 2: 224000, 3: 320000, 4: 384000, 5: 448000, 6: 640000 },
         eac3: { 1: 192000, 2: 224000, 3: 320000, 4: 384000, 5: 448000, 6: 640000 },
     };
-    /* -=-=-= Audio Quality Scoring =-=-=- */
+    // -=-=-= audioQuality  [audio_clean, stream_ordering] =-=-=-
     // Scores a stream's quality (codec + bitrate vs transparent bitrate) to identify the "best" track. Declared after response so infoLog is available.
     const audioQuality = (stream) => {
         const codec = resolveCodecName(stream);
@@ -325,13 +325,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: audio codec scoring =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: stream / language / preset helpers =====
+    // -=-=-= mediaInfoFor  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     // Find the mediaInfo track corresponding to an ffprobe stream (matched by StreamOrder === ffprobe index); undefined when absent. The single join point
     // between the two probes - resolveStreamBitrate/resolveChannels/resolveLang and the per-plugin language/loop sites all go through it.
     const mediaInfoFor = (s) => (file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === s.index);
+    // -=-=-= resolveLang  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     // Resolve a stream's language: ffprobe tags.language, then mediaInfo Language (files often tag one probe but not the other), trimmed + lowercased. Empty
     // when neither reports it; callers wanting a placeholder use `resolveLang(s) || 'und'`.
     const resolveLang = (s) => (s.tags?.language ?? (mediaInfoFor(s)?.Language ?? '')).trim().toLowerCase();
-    /* -=-=-= Resolve the best available bitrate (bps) for a stream =-=-=- */
+    // -=-=-= resolveStreamBitrate  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     // ffprobe first, then mediaInfo fallbacks: ffprobe can't read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V).
     // mediaInfo order: measured BitRate, declared BitRate_Nominal, then a bytes-based measurement (StreamSize bytes * 8 / Duration seconds) - the last is a
     // real measurement (MediaInfo usually derives BitRate from it, but some containers report size+duration without a bitrate field), far better than the
@@ -352,6 +354,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return 0;
     };
 
+    // -=-=-= resolveChannels (+ channelsFromLayout helper)  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     // Resolve an audio stream's channel count, ffprobe first then fallbacks (mirrors resolveStreamBitrate): mediaInfo Channels, then a channel-layout string
     // from ffprobe channel_layout or mediaInfo ChannelLayout/ChannelPositions - "5.1(side)" -> 6, "stereo" -> 2, "FL+FR+LFE" -> 3. Returns 0 only when no
     // source reports it, so channel-dependent logic (scoring, dedup, downmix, labelling, force_codec) stays correct for tracks whose ffprobe entry omits it.
@@ -375,7 +378,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return channelsFromLayout(ffstream.channel_layout || ffmedia?.ChannelLayout || ffmedia?.ChannelPositions);
     };
 
-    /* -=-=-= Build single token summarising one ffprobe stream for the input/output summary lines. =-=-=- */
+    // -=-=-= enrichStream  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
+    // Enrich a stream with both-probe bitrate + channels before summariseStream/audioQuality/scoring, so ffprobe-unreadable values (e.g. DTS-HD MA
+    // bitrate in MP4) fall back to mediaInfo. Every summary and scoring call site uses this so logged tokens and the scoring path enrich identically.
+    const enrichStream = (s) => ({ ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate, channels: resolveChannels(s) || s.channels });
+    // -=-=-= summariseStream  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     // Shows: video codec; audio lang/channels/codec/bitrate(+role); subtitle lang/codec(+forced/role); data and attachment codec. Role/forced
     // detection mirrors the sorting logic (disposition flags first, then title keywords, via the shared classifiers) so every plugin's summary lines
     // up. subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Shared verbatim across all three.
@@ -406,11 +413,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return `[${type || 'unknown'}:${codec}]`;
     };
 
+    // -=-=-= shortLang  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     // Short language code: strip any region/variant suffix so 'en-US', 'en_US', 'en.US' all compare as 'en'.
     const shortLang = (l) => l.replace(/[-_.].*$/, '');
 
+    // -=-=-= networkDataOpt  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
     const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
+    // -=-=-= globalOutputOpt  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     // Output-side ffmpeg options applied to every run (the place to add any universal muxer/output flag). Currently just the muxer packet-buffer ceiling for
     // ffmpeg's "Too many packets buffered" interleave error - chiefly a transcode concern (audio_clean) plus clean_and_remux's recovery of mis-interleaved
     // files; mostly vestigial on modern ffmpeg (7.x auto-sizes the queue) but cheap insurance.
@@ -418,12 +428,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: stream / language / preset helpers =====
 
     // ===== SHARED [clean_and_remux, stream_ordering]: image / cover-art codecs =====
+    // -=-=-= IMAGE_CODECS / isCoverArt  [clean_and_remux, stream_ordering] =-=-=-
     // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last.
     const IMAGE_CODECS = ['mjpeg', 'mjpegb', 'png', 'apng', 'gif', 'bmp', 'webp', 'tiff'];
     // A stream is cover art / a still image when its codec is an image codec OR it carries a cover-art disposition (attached_pic/still_image/timed_thumbnails).
     const isCoverArt = (s) => IMAGE_CODECS.includes((s.codec_name || '').trim().toLowerCase())
         || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails');
     // ===== END SHARED: image / cover-art codecs =====
+
+    // Bail out gracefully on missing/partial probe data, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
+    if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams)) {
+        response.infoLog += '☒No ffProbe stream data available for this file.\n';
+        response.processFile = false;
+        return response;
+    }
 
     if(!['descending', 'ascending', 'disabled'].includes(inputs.channel_order)) {
         response.infoLog += '☒channel_order has not been configured, please configure required options.\n';
@@ -437,7 +455,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }
 
     // Input summary — the streams exactly as they arrived, before re-ordering.
-    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream({ ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate })).join('')}\n`;
+    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
 
     // VIDEO -> AUDIO -> SUBTITLE -> ATTACHMENT -> DATA -> OTHER?
     const streamOrder = { video: 0, audio: 1, subtitle: 2 , attachment: 3, data: 4};
@@ -445,16 +463,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const sdhFirst = String(inputs.sdh_first) === 'true';
     const codecFirstList = (inputs.codec_first || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
 
+    const getLangRank = (lang, shortlang) => {
+        let idx = preferredLanguages.indexOf(lang);
+        if (idx === -1) idx = preferredLanguages.indexOf(shortlang);
+        return idx === -1 ? 999 : idx;
+    };
+
     const streams = [];
     for (let i = 0; i < file.ffProbeData.streams.length; i++) {
         const ffstream = file.ffProbeData.streams[i];
         // Enrich with mediaInfo bitrate before audioQuality/summariseStream: ffprobe can't read e.g. DTS-HD MA's bitrate in MP4/M4V, so those
         // formats are scored/displayed from the more accurate mediaInfo value.
-        const enrichedStream = { ...ffstream, bit_rate: resolveStreamBitrate(ffstream) || ffstream.bit_rate, channels: resolveChannels(ffstream) || ffstream.channels };
+        const enrichedStream = enrichStream(ffstream);
         const streamLang = resolveLang(ffstream) || 'und';
         const streamLangShort = shortLang(streamLang);
                 
         const streamType = (ffstream.codec_type || '').trim().toLowerCase();
+        // Resolve the canonical codec once (resolveCodecName does a probe-join + string work); codec_first membership can't change between list entries.
+        const canon = streamType === 'audio' ? resolveCodecName(enrichedStream) : '';
 
         streams.push({
             index: ffstream.index,
@@ -468,7 +494,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Only score audio: scoring video/subtitle/data would spam bogus "unknown codec"/"invalid bitrate" notices, and quality is only used to sort audio.
             audioquality: streamType === 'audio' ? audioQuality(enrichedStream) : 0,
             // Does this audio stream's canonical codec match codec_first? Family-prefix match: "dts" catches dtsma/dtshr/dtsexpress, "eac3" catches eac3atmos.
-            codecmatch: streamType === 'audio' && codecFirstList.some(c => resolveCodecName(enrichedStream).startsWith(c)),
+            codecmatch: canon !== '' && codecFirstList.some(c => canon.startsWith(c)),
             default: ffstream?.disposition?.default === 1,
 
             // Role classification via the shared classifiers (single source of truth — keeps the sort and the summary line in agreement).
@@ -481,12 +507,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             coverArt: isCoverArt(ffstream),
         });
     }
-
-    const getLangRank = (lang, shortlang) => {
-        let idx = preferredLanguages.indexOf(lang);
-        if (idx === -1) idx = preferredLanguages.indexOf(shortlang);
-        return idx === -1 ? 999 : idx;
-    };
 
     //Sort the streams
     streams.sort((a, b) => {
