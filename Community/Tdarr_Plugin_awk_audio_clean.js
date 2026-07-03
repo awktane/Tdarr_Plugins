@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '1.26.2',
+    Version: '1.27.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -221,7 +221,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: role/disposition classifiers =====
     /* -=-=-= Stream role/forced classifiers =-=-=- */
     // Classifiers group the real ffmpeg disposition flags into the roles the pipeline sorts and tags by. dispositionTypes is keyed by the ffmpeg
-    // disposition; each entry declares the valid stream types (streams), the title keywords that also indicate it (each keyword lives on one flag so
+    // disposition; each entry declares the valid stream types (streams), the keywords that also indicate it (each keyword lives on one flag so
     // title->flag promotion stays unambiguous), and the canonical title string (tag, null when never written). hasDisposition gates on codec_type,
     // matching keywords whole-token via matchesKeyword. Read by summariseStream, the stream-ordering sort keys, audio_clean's secondary-track
     // detection, and clean_and_remux's title/flag tagging. Shared verbatim across all three awk plugins.
@@ -240,7 +240,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         still_image:      { streams:['video'],                    keywords: [],                                        tag: null          },
         timed_thumbnails: { streams:['video'],                    keywords: [],                                        tag: null          },
     };
-    const streamTitleLower = (s) => (s.tags?.title || '').trim().toLowerCase();
+    // roleTextLower scrapes role-signal text from BOTH probes: dispositions are often incomplete and a title/description/handler can live in ffprobe OR
+    // mediaInfo but not both, so we union every text field before classifying. mediaInfo is matched by StreamOrder (like resolveStreamBitrate); whole-token
+    // matchesKeyword keeps generic values like "SoundHandler" inert. hasDisposition calls it repeatedly per stream, so memoize by stream object (WeakMap,
+    // per-run closure - GC'd with the file, never shared across runs).
+    const roleTextCache = new WeakMap();
+    const roleTextLower = (s) => {
+        if (roleTextCache.has(s)) return roleTextCache.get(s);
+        const mi = mediaInfoFor(s);
+        const text = [s.tags?.title, s.tags?.description, s.tags?.handler_name, mi?.Title, mi?.Description].filter(Boolean).join(' ').trim().toLowerCase();
+        roleTextCache.set(s, text);
+        return text;
+    };
     // Whole-token keyword matcher: a keyword matches only when not flanked by a letter/digit, so '[sdh]', 'eng-sdh', and 'sdh.' match while
     // 'deafening'/'aboriginal' do not. An internal space matches any run of non-alphanumerics ('hearing impaired' == 'hearing_impaired'). Keywords are
     // regex-escaped; the 'u' flag enables \p{L}/\p{N}. text must already be lowercased.
@@ -255,7 +266,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const entry = dispositionTypes[key];
         if (!entry) return false;
         if (!entry.streams.includes((s.codec_type || '').trim().toLowerCase())) return false;
-        return s.disposition?.[key] === 1 || matchesKeyword(streamTitleLower(s), entry.keywords);
+        return s.disposition?.[key] === 1 || matchesKeyword(roleTextLower(s), entry.keywords);
     };
     const isCommentary  = (s) => hasDisposition(s, 'comment');
     const isDescriptive = (s) => hasDisposition(s, 'visual_impaired') || hasDisposition(s, 'descriptions');
@@ -337,7 +348,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             codec = 'dts';
 
         const profile    = (stream.profile || '').toLowerCase().trim();
-        const commercial = ((file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === stream.index)?.Format_Commercial_IfAny || '').toLowerCase();
+        const commercial = (mediaInfoFor(stream)?.Format_Commercial_IfAny || '').toLowerCase();
         if (codec === 'dts') {
             if      (longName.includes('master')          || profile.includes('hd ma')  || commercial.includes('master'))
                 codec = 'dtsma';
@@ -351,6 +362,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return codec;
     };
 
+    // Per-channel target bitrate (bps) for our encodable output codecs (ac3/eac3 cap at 6ch in ffmpeg). Single source for BOTH the bitrate-less quality
+    // estimate in audioQuality and audio_clean's transcode targetTable, so a target change can't make the predicted score disagree with the bitrate used.
+    const CODEC_TARGET_BPS = {
+        aac:  { 1: 128000, 2: 256000, 3: 320000, 4: 384000, 5: 448000, 6: 512000, 7: 576000, 8: 640000 },
+        opus: { 1: 128000, 2: 192000, 3: 256000, 4: 320000, 5: 320000, 6: 384000, 7: 448000, 8: 448000 },
+        ac3:  { 1: 192000, 2: 224000, 3: 320000, 4: 384000, 5: 448000, 6: 640000 },
+        eac3: { 1: 192000, 2: 224000, 3: 320000, 4: 384000, 5: 448000, 6: 640000 },
+    };
     /* -=-=-= Audio Quality Scoring =-=-=- */
     // Scores a stream's quality (codec + bitrate vs transparent bitrate) to identify the "best" track. Declared after response so infoLog is available.
     const audioQuality = (stream) => {
@@ -381,16 +400,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // estimate quality from the bitrate we'd target for this channel count instead of a blind midpoint. For source codecs that normally carry a
         // bitrate (dts, ac3 from disc, etc.) we log once and use the midpoint.
         if (bitrate <= 0) {
-            // Per-channel target bitrate (bps) for our encodable output codecs. Kept inline so this scoring function stays self-contained and
-            // byte-for-byte identical across plugins.
             const ch = Math.max(1, Number(stream?.channels ?? 2));
-            const targets = {
-                aac:  { 1: 128000, 2: 256000, 3: 320000, 4: 384000, 5: 448000, 6: 512000, 7: 576000, 8: 640000 },
-                opus: { 1: 128000, 2: 192000, 3: 256000, 4: 320000, 5: 320000, 6: 384000, 7: 448000, 8: 448000 },
-                ac3:  { 1: 192000, 2: 224000, 3: 320000, 4: 384000, 5: 448000, 6: 640000 },
-                eac3: { 1: 192000, 2: 224000, 3: 320000, 4: 384000, 5: 448000, 6: 640000 },
-            };
-            const tbl = targets[codec];
+            const tbl = CODEC_TARGET_BPS[codec];
             if (tbl) {
                 // ac3/eac3 top out at 6ch in ffmpeg, so cap the channel count so the estimate and its min/transparent thresholds scale together -
                 // otherwise a 7.1 source scores below a 5.1 of the same codec (estBps pins at the 6ch target while the thresholds keep climbing).
@@ -419,15 +430,54 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: audio codec scoring =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: stream / language / preset helpers =====
+    // Find the mediaInfo track corresponding to an ffprobe stream (matched by StreamOrder === ffprobe index); undefined when absent. The single join point
+    // between the two probes - resolveStreamBitrate/resolveChannels/resolveLang and the per-plugin language/loop sites all go through it.
+    const mediaInfoFor = (s) => (file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === s.index);
+    // Resolve a stream's language: ffprobe tags.language, then mediaInfo Language (files often tag one probe but not the other), trimmed + lowercased. Empty
+    // when neither reports it; callers wanting a placeholder use `resolveLang(s) || 'und'`.
+    const resolveLang = (s) => (s.tags?.language ?? (mediaInfoFor(s)?.Language ?? '')).trim().toLowerCase();
     /* -=-=-= Resolve the best available bitrate (bps) for a stream =-=-=- */
-    // ffprobe first, mediaInfo fallback: ffprobe can't read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V),
-    // but mediaInfo decodes the substream headers and usually has it. Returns 0 if neither has a value. Used to enrich stream objects before
-    // summariseStream or audioQuality sees them.
+    // ffprobe first, then mediaInfo fallbacks: ffprobe can't read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V).
+    // mediaInfo order: measured BitRate, declared BitRate_Nominal, then a bytes-based measurement (StreamSize bytes * 8 / Duration seconds) - the last is a
+    // real measurement (MediaInfo usually derives BitRate from it, but some containers report size+duration without a bitrate field), far better than the
+    // codec-target estimate audioQuality falls back to. Returns 0 only when truly unknown. Used to enrich streams before summariseStream/audioQuality.
     const resolveStreamBitrate = (ffstream) => {
         const ffBitrate = Number(ffstream.bit_rate || 0);
         if (ffBitrate > 0) return ffBitrate;
-        const ffmedia = (file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === ffstream.index);
-        return Number(ffmedia?.BitRate || 0);
+        const ffmedia = mediaInfoFor(ffstream);
+        if (!ffmedia) return 0;
+        const measured = Number(ffmedia.BitRate || 0) || Number(ffmedia.BitRate_Nominal || 0);
+        if (measured > 0) return measured;
+        const size = Number(ffmedia.StreamSize || 0);
+        const dur = Number(ffmedia.Duration || 0);
+        if (size > 0 && dur > 0) {
+            const bps = Math.round((size * 8) / dur);
+            if (bps > 1000 && bps < 100000000) return bps;   // clamp to a plausible audio range so a stray unit (ms Duration, etc.) or corrupt size can't inject garbage
+        }
+        return 0;
+    };
+
+    // Resolve an audio stream's channel count, ffprobe first then fallbacks (mirrors resolveStreamBitrate): mediaInfo Channels, then a channel-layout string
+    // from ffprobe channel_layout or mediaInfo ChannelLayout/ChannelPositions - "5.1(side)" -> 6, "stereo" -> 2, "FL+FR+LFE" -> 3. Returns 0 only when no
+    // source reports it, so channel-dependent logic (scoring, dedup, downmix, labelling, force_codec) stays correct for tracks whose ffprobe entry omits it.
+    const channelsFromLayout = (layout) => {
+        const s = String(layout || '').toLowerCase().trim();
+        if (!s) return 0;
+        if (s === 'mono') return 1;
+        if (s === 'stereo' || s === 'downmix') return 2;
+        if (s === 'quad') return 4;
+        const m = s.match(/(\d+)\.(\d+)/);                          // "5.1", "7.1(side)", "2.1" -> full channels + LFE
+        if (m) return Number(m[1]) + Number(m[2]);
+        const tokens = s.split(/[+\s,]+/).filter(Boolean);          // "FL+FR+FC+LFE+BL+BR" / "L R C LFE Ls Rs" -> count positions
+        return tokens.length > 1 ? tokens.length : 0;
+    };
+    const resolveChannels = (ffstream) => {
+        const ff = Number(ffstream.channels || 0);
+        if (ff > 0) return ff;
+        const ffmedia = mediaInfoFor(ffstream);
+        const mi = Number(ffmedia?.Channels || 0);
+        if (mi > 0) return mi;
+        return channelsFromLayout(ffstream.channel_layout || ffmedia?.ChannelLayout || ffmedia?.ChannelPositions);
     };
 
     /* -=-=-= Build single token summarising one ffprobe stream for the input/output summary lines. =-=-=- */
@@ -438,7 +488,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
         if (codec === 'subrip') codec = 'srt';
-        const langRaw = (s.tags?.language || 'und').trim().toLowerCase();
+        const langRaw = resolveLang(s) || 'und';
         const lang = langRaw !== 'und' ? langRaw : '';
         if (type === 'video')
             return `[video:${codec}]`;
@@ -466,6 +516,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
     const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
+    // Output-side ffmpeg options applied to every run (the place to add any universal muxer/output flag). Currently just the muxer packet-buffer ceiling for
+    // ffmpeg's "Too many packets buffered" interleave error - chiefly a transcode concern (audio_clean) plus clean_and_remux's recovery of mis-interleaved
+    // files; mostly vestigial on modern ffmpeg (7.x auto-sizes the queue) but cheap insurance.
+    const globalOutputOpt = ' -max_muxing_queue_size 9999';
     // ===== END SHARED: stream / language / preset helpers =====
 
     // ===== SHARED [audio_clean, clean_and_remux]: ffmpeg metadata escaping =====
@@ -492,24 +546,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // codecInfo scoring table (scaled by channel count), and serve as the FLOOR for a transcode - the actual target is max(thisTable, source).
     // AC3 / EAC3 - CBR fixed-preset: mono 192k, stereo 224k, 3ch 320k, 4ch 384k, 5ch 448k, 6ch 640k (640k is the Blu-ray 5.1 standard and the AC3/EAC3
     // codec ceiling).
-    // AAC - CBR (native AAC VBR is experimental in ffmpeg): mono 128k, stereo 256k, 3ch 320k, 4ch 384k, 5ch 448k, 6ch 512k, 7ch 576k, 8ch 640k.
-    // Opus - true VBR (-vbr on), -b:a is the target average; more efficient than AAC so targets are lower: mono 128k, stereo 192k, 3ch 256k, 4ch 320k,
-    // 5ch 320k, 6ch 384k, 7ch 448k, 8ch 448k.
+    // Transcode target bitrate (bps) for a codec + channel count, from the shared CODEC_TARGET_BPS table. aac_vbr shares aac's targets; ac3/eac3 cap at 6ch.
     const targetTable = (codec, channels) => {
         const ch = Math.max(1, Number(channels) || 1);
-        if (codec === 'aac' || codec === 'aac_vbr') {
-            const t = { 1: 128000, 2: 256000, 3: 320000, 4: 384000, 5: 448000, 6: 512000, 7: 576000, 8: 640000 };
-            return t[Math.min(ch, 8)] ?? 640000;
-        }
-        if (codec === 'opus') {
-            const t = { 1: 128000, 2: 192000, 3: 256000, 4: 320000, 5: 320000, 6: 384000, 7: 448000, 8: 448000 };
-            return t[Math.min(ch, 8)] ?? 448000;
-        }
-        if (codec === 'ac3' || codec === 'eac3') {
-            const t = { 1: 192000, 2: 224000, 3: 320000, 4: 384000, 5: 448000, 6: 640000 };
-            return t[Math.min(ch, 6)] ?? 640000;
-        }
-        return 0;
+        const family = codec === 'aac_vbr' ? 'aac' : codec;
+        const tbl = CODEC_TARGET_BPS[family];
+        if (!tbl) return 0;
+        const cap = (family === 'ac3' || family === 'eac3') ? 6 : 8;
+        return tbl[Math.min(ch, cap)] ?? tbl[cap];
     };
 
     // Per-codec ceiling (bps) so a lossless or very-high-bitrate source (e.g. TrueHD ~4 Mbps) can't drag the transcode target absurdly high. AC3/EAC3 cap
@@ -633,19 +677,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     let convert = false;
 
     // Input summary — the streams exactly as they arrived, before any audio work.
-    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream({ ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate })).join('')}\n`;
+    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream({ ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate, channels: resolveChannels(s) || s.channels })).join('')}\n`;
+
+    // Check if file is a video. If it isn't then exit plugin (before the no-audio check, so a non-video reports "not a video", not "no audio streams").
+    if (file.fileMedium !== 'video') {
+        response.infoLog += '☒File is not a video. \n';
+        response.processFile = false;
+        return response;
+    }
 
     //We really only care about the audio streams
     let audioStreams = file.ffProbeData.streams.filter(stream => (stream?.codec_type ?? '').trim().toLowerCase() === 'audio');
     if (audioStreams.length === 0) {
         response.infoLog += '☒Video file has no audio streams to manage.\n';
-        return response;
-    }
-
-    // Check if file is a video. If it isn't then exit plugin.
-    if (file.fileMedium !== 'video') {
-        response.infoLog += '☒File is not a video. \n';
-        response.processFile = false;
         return response;
     }
 
@@ -655,10 +699,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     //Add secondary track flag and the cleaned language to each track
     audioStreams = audioStreams.map(item => {
-        const cleanLang = String(shortLang((item.tags?.language || 'und').trim().toLowerCase()));
+        const cleanLang = String(shortLang(resolveLang(item) || 'und'));
         // Enrich with mediaInfo bitrate before audioQuality scoring so that formats like DTS-HD MA (which ffprobe can't read a bitrate for in MP4/M4V
         // containers) score and display correctly.
-        const enrichedItem = { ...item, bit_rate: resolveStreamBitrate(item) || item.bit_rate };
+        const enrichedItem = { ...item, bit_rate: resolveStreamBitrate(item) || item.bit_rate, channels: resolveChannels(item) || item.channels };
         return { ...enrichedItem,
             isTdarrSecondaryTrack: isSecondaryTrack(item),
             // Language-secondary: track language is not in downmixLanguage (when the list is non-empty). These tracks follow the secondary path
@@ -737,7 +781,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const streamsToRemove = new Set();
     if (removeDuplicatesGroupBy === 'channel' || removeDuplicatesGroupBy === 'multi-stereo') {
         const seen = new Map();
-        const byQuality = [...audioStreams].sort((a, b) => b.isTdarrQuality - a.isTdarrQuality || a.index - b.index);
+        // A measured bitrate beats a bitrate-less duplicate of the same tier: audioQuality can only ESTIMATE a track with no reported bitrate (optimistically,
+        // from the codec's per-channel target), so it must not win the "which duplicate to keep" decision over a track whose bitrate we actually measured. Both
+        // probes are already consulted (resolveStreamBitrate above), so bit_rate === 0 here means genuinely unknown, not just "ffprobe couldn't read it".
+        const hasKnownRate = (s) => Number(s.bit_rate || 0) > 0;
+        // On a quality tie, keep the higher channel count before falling back to index - matches keep_best_surround_safe, so multi-stereo dedup collapsing a
+        // language's surround variants keeps the 7.1 over a same-quality 5.1 (channel mode already tiers by exact count, so this only bites the broad modes).
+        const byQuality = [...audioStreams].sort((a, b) =>
+            (hasKnownRate(b) ? 1 : 0) - (hasKnownRate(a) ? 1 : 0) || b.isTdarrQuality - a.isTdarrQuality || b.channels - a.channels || a.index - b.index);
         for (const s of byQuality) {
             let tier;
             if (removeDuplicatesGroupBy === 'channel') {
@@ -812,8 +863,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     workStreams.sort((a, b) => {
         // language priority
-        let aLang = downmixLanguage.indexOf((a.tags?.language || 'und').trim().toLowerCase());
-        let bLang = downmixLanguage.indexOf((b.tags?.language || 'und').trim().toLowerCase());
+        let aLang = downmixLanguage.indexOf(resolveLang(a) || 'und');
+        let bLang = downmixLanguage.indexOf(resolveLang(b) || 'und');
 
         if(aLang === -1) aLang = downmixLanguage.indexOf(a.isTdarrCleanLang);
         if(bLang === -1) bLang = downmixLanguage.indexOf(b.isTdarrCleanLang);
@@ -941,6 +992,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // No surround/center to fold in (e.g. 2.1 = FL FR LFE, or stereo) — let -ac 2 handle it.
         if (!hasNonFront) return null;
+        // Defensive: a layout missing a front channel leaves peakL/peakR at 0 and would make the gain normalisation below divide by zero. Every canonical
+        // layout leads with FL,FR so this never triggers today - it just keeps the matrix safe if a non-FL/FR-leading layout is ever added to CANON_LAYOUTS.
         if (peakL <= 0 || peakR <= 0) return null;
 
         channelList.forEach((spk, i) => {
@@ -1121,11 +1174,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
 
             /*-=-=-= FORCE CODEC =-=-=-*/
-            // Skip protected best tracks UNLESS force_codec is 'all' — per keep_best_surround_safe, the protected track can only be touched when
-            // force_codec is 'all'. Also skip when the source has more channels than the target codec supports (ac3/eac3 max 6ch, opus/aac max 8ch in
-            // ffmpeg's encoder) to avoid an ffmpeg encode failure.
-            if (forceCodec !== 'false' && !modifiedAudioIdx.has(outputAudioIdx) && (!isProtected || forceCodec === 'all')) {
-                const isStereo = ffstream.channels <= 2;
+            // Skip protected best tracks UNLESS force_codec is 'all' — per keep_best_surround_safe, the protected track can only be touched when force_codec
+            // is 'all'. Also skip when the source has more channels than the target codec supports (ac3/eac3 max 6ch, opus/aac max 8ch) to avoid an ffmpeg
+            // encode failure. Channel count is resolved from ffprobe, then mediaInfo, then a channel-layout string (resolveChannels): a track no source can
+            // measure is left untouched rather than guessed, since a wrong count could route it to a codec that can't hold its real channels and fail.
+            const forceChannels = (forceCodec !== 'false' && !modifiedAudioIdx.has(outputAudioIdx) && (!isProtected || forceCodec === 'all')) ? resolveChannels(ffstream) : -1;
+            if (forceChannels === 0)
+                workDone += `☒Stream ${ffstream.index}: Skipping force_codec - no channel count in ffprobe, mediaInfo, or channel layout; can't safely choose a target codec or verify its channel limit.\n`;
+            if (forceChannels > 0) {
+                const isStereo = forceChannels <= 2;
                 const targetCodec = isStereo ? stereoCodec : surroundCodec;
                 // aac_vbr is only valid for stereo; for family-identity checks compare against 'aac'.
                 const targetCodecFamily = targetCodec === 'aac_vbr' ? 'aac' : targetCodec;
@@ -1133,33 +1190,33 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (ffstreamCodec !== targetCodecFamily) {
                     const shouldForce =
                         forceCodec === 'all' ||
-                        (forceCodec === '6below' && !isStereo && ffstream.channels <= 6) ||
+                        (forceCodec === '6below' && !isStereo && forceChannels <= 6) ||
                         (forceCodec === '6below' && isStereo) ||
                         (forceCodec === '2below' && isStereo);
 
                     const targetMaxCh = ({ ac3: 6, eac3: 6, aac: 8, aac_vbr: 8, opus: 8 })[targetCodec] ?? 8;
 
-                    if (shouldForce && ffstream.channels > targetMaxCh) {
-                        workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodecFamily} - ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} exceeds the ${targetMaxCh}ch limit for ${targetCodecFamily}. Enable downmix_to_six to reduce channels first.\n`;
+                    if (shouldForce && forceChannels > targetMaxCh) {
+                        workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodecFamily} - ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} exceeds the ${targetMaxCh}ch limit for ${targetCodecFamily}. Enable downmix_to_six to reduce channels first.\n`;
                     } else if (shouldForce) {
                         if (targetCodec === 'aac_vbr') {
                             // aac_vbr stereo force: use VBR 4 for low-bitrate sources, VBR 5 otherwise.
                             // srcBitrate is meaningful here — this is a codec-swap, same channel count.
                             const { encoder, args, approxRate } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true);
-                            workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → aac stereo @ ${approxRate} (libfdk VBR q${srcBitrate > 0 && srcBitrate <= 144000 ? 4 : 5})\n`;
+                            workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → aac stereo @ ${approxRate} (libfdk VBR q${srcBitrate > 0 && srcBitrate <= 144000 ? 4 : 5})\n`;
                             extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}`;
                             modifiedAudioIdx.add(outputAudioIdx);
-                            outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: ffstream.channels, bps: 0, approxRate });
+                            outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: forceChannels, bps: 0, approxRate });
                         } else {
                             // Same channel count, codec swap only — honour the source bitrate as a floor so a high-bitrate lossy source isn't needlessly
                             // degraded (capped at the codec ceiling inside resolveBitrate). Lossless sources skip the floor: their bitrate is not a
                             // comparable quantity for a perceptual encode.
-                            const dstBitArg = encoderArgsIdx(targetCodec, ffstream.channels, outputAudioIdx, srcBitrate, ffstream.isTdarrLossless);
-                            const dstBitStr = resolveBitrate(targetCodec, ffstream.channels, srcBitrate, ffstream.isTdarrLossless);
-                            workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${targetCodec} ${ffstream.channels}ch @ ${dstBitStr / 1000} kb/s\n`;
+                            const dstBitArg = encoderArgsIdx(targetCodec, forceChannels, outputAudioIdx, srcBitrate, ffstream.isTdarrLossless);
+                            const dstBitStr = resolveBitrate(targetCodec, forceChannels, srcBitrate, ffstream.isTdarrLossless);
+                            workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → ${targetCodec} ${forceChannels}ch @ ${dstBitStr / 1000} kb/s\n`;
                             extraArguments += ` -c:a:${outputAudioIdx} ${targetCodec}${dstBitArg}`;
                             modifiedAudioIdx.add(outputAudioIdx);
-                            outputAudioOverride.set(outputAudioIdx, { codec: targetCodec, channels: ffstream.channels, bps: dstBitStr });
+                            outputAudioOverride.set(outputAudioIdx, { codec: targetCodec, channels: forceChannels, bps: dstBitStr });
                         }
                         convert = true;
                     }
@@ -1189,7 +1246,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return `[audio:${[langStr, `${channels}ch`, codec, approxRate].filter(Boolean).join(' ')}${role}]`;
         };
         for (const s of file.ffProbeData.streams) {
-            const enriched = { ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate };
+            const enriched = { ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate, channels: resolveChannels(s) || s.channels };
             if ((s?.codec_type || '').trim().toLowerCase() === 'audio') {
                 if (streamsToRemove.has(s.index)) continue;
                 const ov = outputAudioOverride.get(outputAudioIdxMap.get(s.index));
@@ -1223,7 +1280,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // a downmix_to_stereo track created from a default-flagged surround source also carries the default flag - two tracks marked default. This is
         // acceptable: the tracks are near-identical content at different channel counts and most players handle multiple default flags without issue.
         // Removing or reassigning the default flag is a separate concern outside this plugin's scope.
-        response.preset += `,-map 0 -c copy${extraArguments} -max_muxing_queue_size 9999${networkDataOpt}`;
+        response.preset += `,-map 0 -c copy${extraArguments}${globalOutputOpt}${networkDataOpt}`;
         response.infoLog += workDone;
         response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;
         response.processFile = true;

@@ -13,7 +13,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '1.21.0',
+    Version: '1.22.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -235,15 +235,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const bareChannelRegex = new RegExp(`^(${channelLabelAlternation})$`, 'i');
     //A downmix/channel-derived base produced elsewhere (e.g. audio_clean "5.1 -> 2.0") ending in "-> <channel>".
     const downmixChannelRegex = new RegExp(`->\\s*(${channelLabelAlternation})\\s*$`, 'i');
-    //Map an audio stream's channel count to our short label, honouring LFE for the 3/4 channel ambiguity.
+    // Channel layout string from ffprobe, falling back to mediaInfo (ChannelLayout/ChannelPositions) - lets us spot the LFE that separates 3.1 from 4.0 and
+    // 2.1 from 3.0 even when ffprobe omits channel_layout.
+    const channelLayoutStr = (ffstream) => {
+        const ffmedia = mediaInfoFor(ffstream);
+        return (ffstream.channel_layout || ffmedia?.ChannelLayout || ffmedia?.ChannelPositions || '').toLowerCase();
+    };
+    // Map an audio stream's channel count (ffprobe, or mediaInfo/layout via resolveChannels) to our short label, honouring LFE for the 3/4 channel ambiguity.
     const channelLabel = (ffstream) => {
-        switch (ffstream.channels) {
+        switch (resolveChannels(ffstream)) {
             case 8: return '7.1';
             case 7: return '6.1';
             case 6: return '5.1';
             case 5: return '5.0';
-            case 4: return (ffstream?.channel_layout ?? '').toLowerCase().includes('lfe') ? '3.1' : '4.0';
-            case 3: return (ffstream?.channel_layout ?? '').toLowerCase().includes('lfe') ? '2.1' : '3.0';
+            case 4: return channelLayoutStr(ffstream).includes('lfe') ? '3.1' : '4.0';
+            case 3: return channelLayoutStr(ffstream).includes('lfe') ? '2.1' : '3.0';
             case 2: return 'Stereo';
             case 1: return 'Mono';
             default: return '';
@@ -312,6 +318,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const streams = file.ffProbeData.streams || [];
         // Resolve each stream's language exactly as the main loop does below (ffprobe tag first, then the mediaInfo fallback). A stream whose language only
         // mediaInfo supplies is never filled, so counting it as "untagged" here would abort files that would actually process fine.
+        // Defined before the shared stream/language helpers, so it can't use resolveLang/mediaInfoFor (temporal dead zone) - resolves language inline.
         const isUntagged = (s) => {
             const ffmedia = file?.mediaInfo?.track?.find(t => Number(t.StreamOrder) === s.index);
             const lang = (s?.tags?.language ?? (ffmedia?.Language ?? '')).trim().toLowerCase();
@@ -394,7 +401,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: role/disposition classifiers =====
     /* -=-=-= Stream role/forced classifiers =-=-=- */
     // Classifiers group the real ffmpeg disposition flags into the roles the pipeline sorts and tags by. dispositionTypes is keyed by the ffmpeg
-    // disposition; each entry declares the valid stream types (streams), the title keywords that also indicate it (each keyword lives on one flag so
+    // disposition; each entry declares the valid stream types (streams), the keywords that also indicate it (each keyword lives on one flag so
     // title->flag promotion stays unambiguous), and the canonical title string (tag, null when never written). hasDisposition gates on codec_type,
     // matching keywords whole-token via matchesKeyword. Read by summariseStream, the stream-ordering sort keys, audio_clean's secondary-track
     // detection, and clean_and_remux's title/flag tagging. Shared verbatim across all three awk plugins.
@@ -413,7 +420,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         still_image:      { streams:['video'],                    keywords: [],                                        tag: null          },
         timed_thumbnails: { streams:['video'],                    keywords: [],                                        tag: null          },
     };
-    const streamTitleLower = (s) => (s.tags?.title || '').trim().toLowerCase();
+    // roleTextLower scrapes role-signal text from BOTH probes: dispositions are often incomplete and a title/description/handler can live in ffprobe OR
+    // mediaInfo but not both, so we union every text field before classifying. mediaInfo is matched by StreamOrder (like resolveStreamBitrate); whole-token
+    // matchesKeyword keeps generic values like "SoundHandler" inert. hasDisposition calls it repeatedly per stream, so memoize by stream object (WeakMap,
+    // per-run closure - GC'd with the file, never shared across runs).
+    const roleTextCache = new WeakMap();
+    const roleTextLower = (s) => {
+        if (roleTextCache.has(s)) return roleTextCache.get(s);
+        const mi = mediaInfoFor(s);
+        const text = [s.tags?.title, s.tags?.description, s.tags?.handler_name, mi?.Title, mi?.Description].filter(Boolean).join(' ').trim().toLowerCase();
+        roleTextCache.set(s, text);
+        return text;
+    };
     // Whole-token keyword matcher: a keyword matches only when not flanked by a letter/digit, so '[sdh]', 'eng-sdh', and 'sdh.' match while
     // 'deafening'/'aboriginal' do not. An internal space matches any run of non-alphanumerics ('hearing impaired' == 'hearing_impaired'). Keywords are
     // regex-escaped; the 'u' flag enables \p{L}/\p{N}. text must already be lowercased.
@@ -428,7 +446,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const entry = dispositionTypes[key];
         if (!entry) return false;
         if (!entry.streams.includes((s.codec_type || '').trim().toLowerCase())) return false;
-        return s.disposition?.[key] === 1 || matchesKeyword(streamTitleLower(s), entry.keywords);
+        return s.disposition?.[key] === 1 || matchesKeyword(roleTextLower(s), entry.keywords);
     };
     const isCommentary  = (s) => hasDisposition(s, 'comment');
     const isDescriptive = (s) => hasDisposition(s, 'visual_impaired') || hasDisposition(s, 'descriptions');
@@ -437,15 +455,54 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: role/disposition classifiers =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: stream / language / preset helpers =====
+    // Find the mediaInfo track corresponding to an ffprobe stream (matched by StreamOrder === ffprobe index); undefined when absent. The single join point
+    // between the two probes - resolveStreamBitrate/resolveChannels/resolveLang and the per-plugin language/loop sites all go through it.
+    const mediaInfoFor = (s) => (file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === s.index);
+    // Resolve a stream's language: ffprobe tags.language, then mediaInfo Language (files often tag one probe but not the other), trimmed + lowercased. Empty
+    // when neither reports it; callers wanting a placeholder use `resolveLang(s) || 'und'`.
+    const resolveLang = (s) => (s.tags?.language ?? (mediaInfoFor(s)?.Language ?? '')).trim().toLowerCase();
     /* -=-=-= Resolve the best available bitrate (bps) for a stream =-=-=- */
-    // ffprobe first, mediaInfo fallback: ffprobe can't read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V),
-    // but mediaInfo decodes the substream headers and usually has it. Returns 0 if neither has a value. Used to enrich stream objects before
-    // summariseStream or audioQuality sees them.
+    // ffprobe first, then mediaInfo fallbacks: ffprobe can't read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V).
+    // mediaInfo order: measured BitRate, declared BitRate_Nominal, then a bytes-based measurement (StreamSize bytes * 8 / Duration seconds) - the last is a
+    // real measurement (MediaInfo usually derives BitRate from it, but some containers report size+duration without a bitrate field), far better than the
+    // codec-target estimate audioQuality falls back to. Returns 0 only when truly unknown. Used to enrich streams before summariseStream/audioQuality.
     const resolveStreamBitrate = (ffstream) => {
         const ffBitrate = Number(ffstream.bit_rate || 0);
         if (ffBitrate > 0) return ffBitrate;
-        const ffmedia = (file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === ffstream.index);
-        return Number(ffmedia?.BitRate || 0);
+        const ffmedia = mediaInfoFor(ffstream);
+        if (!ffmedia) return 0;
+        const measured = Number(ffmedia.BitRate || 0) || Number(ffmedia.BitRate_Nominal || 0);
+        if (measured > 0) return measured;
+        const size = Number(ffmedia.StreamSize || 0);
+        const dur = Number(ffmedia.Duration || 0);
+        if (size > 0 && dur > 0) {
+            const bps = Math.round((size * 8) / dur);
+            if (bps > 1000 && bps < 100000000) return bps;   // clamp to a plausible audio range so a stray unit (ms Duration, etc.) or corrupt size can't inject garbage
+        }
+        return 0;
+    };
+
+    // Resolve an audio stream's channel count, ffprobe first then fallbacks (mirrors resolveStreamBitrate): mediaInfo Channels, then a channel-layout string
+    // from ffprobe channel_layout or mediaInfo ChannelLayout/ChannelPositions - "5.1(side)" -> 6, "stereo" -> 2, "FL+FR+LFE" -> 3. Returns 0 only when no
+    // source reports it, so channel-dependent logic (scoring, dedup, downmix, labelling, force_codec) stays correct for tracks whose ffprobe entry omits it.
+    const channelsFromLayout = (layout) => {
+        const s = String(layout || '').toLowerCase().trim();
+        if (!s) return 0;
+        if (s === 'mono') return 1;
+        if (s === 'stereo' || s === 'downmix') return 2;
+        if (s === 'quad') return 4;
+        const m = s.match(/(\d+)\.(\d+)/);                          // "5.1", "7.1(side)", "2.1" -> full channels + LFE
+        if (m) return Number(m[1]) + Number(m[2]);
+        const tokens = s.split(/[+\s,]+/).filter(Boolean);          // "FL+FR+FC+LFE+BL+BR" / "L R C LFE Ls Rs" -> count positions
+        return tokens.length > 1 ? tokens.length : 0;
+    };
+    const resolveChannels = (ffstream) => {
+        const ff = Number(ffstream.channels || 0);
+        if (ff > 0) return ff;
+        const ffmedia = mediaInfoFor(ffstream);
+        const mi = Number(ffmedia?.Channels || 0);
+        if (mi > 0) return mi;
+        return channelsFromLayout(ffstream.channel_layout || ffmedia?.ChannelLayout || ffmedia?.ChannelPositions);
     };
 
     /* -=-=-= Build single token summarising one ffprobe stream for the input/output summary lines. =-=-=- */
@@ -456,7 +513,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
         if (codec === 'subrip') codec = 'srt';
-        const langRaw = (s.tags?.language || 'und').trim().toLowerCase();
+        const langRaw = resolveLang(s) || 'und';
         const lang = langRaw !== 'und' ? langRaw : '';
         if (type === 'video')
             return `[video:${codec}]`;
@@ -484,6 +541,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
     const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
+    // Output-side ffmpeg options applied to every run (the place to add any universal muxer/output flag). Currently just the muxer packet-buffer ceiling for
+    // ffmpeg's "Too many packets buffered" interleave error - chiefly a transcode concern (audio_clean) plus clean_and_remux's recovery of mis-interleaved
+    // files; mostly vestigial on modern ffmpeg (7.x auto-sizes the queue) but cheap insurance.
+    const globalOutputOpt = ' -max_muxing_queue_size 9999';
     // ===== END SHARED: stream / language / preset helpers =====
 
     // ===== SHARED [audio_clean, clean_and_remux]: ffmpeg metadata escaping =====
@@ -504,6 +565,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== SHARED [clean_and_remux, stream_ordering]: image / cover-art codecs =====
     // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last.
     const IMAGE_CODECS = ['mjpeg', 'mjpegb', 'png', 'apng', 'gif', 'bmp', 'webp', 'tiff'];
+    // A stream is cover art / a still image when its codec is an image codec OR it carries a cover-art disposition (attached_pic/still_image/timed_thumbnails).
+    const isCoverArt = (s) => IMAGE_CODECS.includes((s.codec_name || '').trim().toLowerCase())
+        || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails');
     // ===== END SHARED: image / cover-art codecs =====
 
     // -=-=-= Disposition title/flag helpers (clean_and_remux only) =-=-=-
@@ -517,11 +581,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // flag - i.e. the keywords to promote into +flags. Same predicate for audio and subtitle, so keep it here.
     const dispositionsToPromote = (s, type) => dispKeysFor(type)
         .filter(key => dispositionTypes[key].tag && hasDisposition(s, key) && s.disposition?.[key] !== 1);
-    // Accessibility keywords for del_accessible's broad description scan (title/description/handler/mediaInfo), sourced from the shared table and matched
-    // whole-token via matchesKeyword. Subtitle side = hearing (SDH/CC); audio side = visual (audio description). visual_impaired carries 'audio description' in
-    // the shared table so AD tracks tagged only in the title are recognised everywhere (classification and removal), not just here.
-    const sdhKeywords = [...dispositionTypes.hearing_impaired.keywords, ...dispositionTypes.captions.keywords];
-    const adKeywords  = dispositionTypes.visual_impaired.keywords;
     // Single-word keywords stripped when recovering the channel/base portion of a title (multi-word
     // keywords like "hearing impaired" can't appear as a lone channel token, so they are skipped).
     const stripWords = new Set(Object.values(dispositionTypes).flatMap(d => d.keywords).filter(w => !w.includes(' ')));
@@ -541,8 +600,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // mirrors the loop's language resolution.
     const isPlainTrack = (s) => !isCommentary(s) && !isDescriptive(s) && !isSdh(s) && !isLyrics(s);
     const resolveWorkLang = (s) => {
-        const m = file?.mediaInfo?.track?.find(t => Number(t.StreamOrder) === s.index);
-        const sl = (s?.tags?.language ?? (m?.Language ?? '')).trim().toLowerCase();
+        const sl = resolveLang(s);
         return (fillLanguage && (!sl || sl === 'und')) ? fillLanguage : (sl || 'und');
     };
     const plainAudioLangs = new Set();
@@ -606,7 +664,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     for (let i = 0; i < file.ffProbeData.streams.length; i++) {
         try {
             const ffstream = file.ffProbeData?.streams[i];
-            const ffmedia = file?.mediaInfo?.track?.find(t => Number(t.StreamOrder) === ffstream.index);
+            const ffmedia = mediaInfoFor(ffstream);
             const ffstreamCodec = (ffstream.codec_name || '').toLowerCase();
             const ffstreamType = (ffstream.codec_type || '').toLowerCase();
 
@@ -640,17 +698,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         workLang = fillLanguage;
                     }
 
-                    //Gather all of the places where we may find the accessibility (SDH/CC) identification words for del_accessible
-                    const subtitleDescription = [ffstream.tags?.title,ffstream.tags?.description,ffstream.tags?.handler_name,ffmedia?.Title,ffmedia?.Description].filter(Boolean).join(' ').toLowerCase();
-
                     //If the subtitle is a language that should be removed then remove it regardless of other settings.
                     if(subLanguage.length > 0 && !subLanguage.includes(workLang) && !subLanguage.includes(shortLang(workLang))) {
                         workDone += `☐Remove stream ${i} - subtitle language (${streamLang})\n`;
                         delStream = true;
-                    } else if (applies(delAccessible, 'subtitle')
-                        && (ffstream.disposition?.hearing_impaired === 1 || ffstream.disposition?.captions === 1 || matchesKeyword(subtitleDescription, sdhKeywords))
-                        && hasPlainSameLang(plainSubLangs, workLang)) {
-                        workDone += `☐Remove stream ${i} - accessibility subtitle SDH/CC (${logSafe(subtitleDescription)})\n`;
+                    } else if (applies(delAccessible, 'subtitle') && isSdh(ffstream) && hasPlainSameLang(plainSubLangs, workLang)) {
+                        workDone += `☐Remove stream ${i} - accessibility subtitle SDH/CC (${logSafe(roleTextLower(ffstream))})\n`;
                         delStream = true;
                     }
                 }
@@ -694,6 +747,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 {
                     workDone += `☐Change title of stream ${i} (subtitle) from "${logSafe(streamTitle)}" to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${escMeta(newStreamTitle)}"`;
+                // Reconcile when mediaInfo has a title the ffstream tag lacks: the write updates both probes, so it settles in one pass - not a remux loop.
                 } else if(ffmedia && (ffstream.tags?.title ?? '') !== (ffmedia.Title ?? ''))
                 {
                     workDone += `☐Change title of stream ${i} (subtitle) - Found "${logSafe(ffstream.tags?.title ?? '')}" and "${logSafe(ffmedia?.Title ?? '')}" change to "${logSafe(newStreamTitle)}"\n`;
@@ -752,17 +806,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     workLang = fillLanguage;
                 }
 
-                //Title/handler/mediaInfo scanned for the audio-description identifiers (del_accessible audio).
-                const audioDescription = [ffstream.tags?.title, ffstream.tags?.handler_name, ffmedia?.Title].filter(Boolean).join(' ').toLowerCase();
-
                 //If the audio is a language that should be removed then remove it regardless of other settings.
                 if(audioLanguage.length > 0 && !audioLanguage.includes(workLang) && !audioLanguage.includes(shortLang(workLang))) {
                     workDone += `☐Remove stream ${i} - audio language (${streamLang})\n`;
                     delStream = true;
-                } else if (applies(delAccessible, 'audio')
-                    && (ffstream.disposition?.visual_impaired === 1 || matchesKeyword(audioDescription, adKeywords))
-                    && hasPlainSameLang(plainAudioLangs, workLang)) {
-                    workDone += `☐Remove stream ${i} - audio description (${logSafe(audioDescription)})\n`;
+                } else if (applies(delAccessible, 'audio') && isDescriptive(ffstream) && hasPlainSameLang(plainAudioLangs, workLang)) {
+                    workDone += `☐Remove stream ${i} - audio description (${logSafe(roleTextLower(ffstream))})\n`;
                     delStream = true;
                 }
 
@@ -796,7 +845,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //classifiers (real flag OR title keyword, via hasDisposition), so a title-only role like "5.1 Commentary" normalises to "5.1 - Commentary" and
                 //survives the reformat even when tag_disposition is off (it still governs whether that role is also promoted into a real flag above). Only
                 //titles we own are touched: empty, a bare channel label, or a downmix/channel-derived title (e.g. "5.1 -> 2.0"); custom titles are left alone.
-                if(applies(tagTitle, 'audio') && ffstream.channels) {
+                if(applies(tagTitle, 'audio') && resolveChannels(ffstream)) {
                     let base = stripDispositionWords(newStreamTitle);
                     if(!base || bareChannelRegex.test(base) || downmixChannelRegex.test(base)) {
                         if(!base || bareChannelRegex.test(base))
@@ -811,6 +860,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 {
                     workDone += `☐Change title of stream ${i} (audio) from "${logSafe(streamTitle)}" to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${escMeta(newStreamTitle)}"`;
+                // Reconcile when mediaInfo has a title the ffstream tag lacks: the write updates both probes, so it settles in one pass - not a remux loop.
                 } else if(ffmedia && (ffstream.tags?.title ?? '') !== (ffmedia.Title ?? ''))
                 {
                     workDone += `☐Change title of stream ${i} (audio) - Found "${logSafe(ffstream.tags?.title ?? '')}" and "${logSafe(ffmedia?.Title ?? '')}" change to "${logSafe(newStreamTitle)}"\n`;
@@ -841,7 +891,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 videoStreamIndex++;
 
                 const isImageCodec = IMAGE_CODECS.includes(ffstreamCodec);
-                if (isImageCodec || hasDisposition(ffstream, 'attached_pic') || hasDisposition(ffstream, 'still_image') || hasDisposition(ffstream, 'timed_thumbnails')) {
+                if (isCoverArt(ffstream)) {
                     workDone += `☐Remove stream ${i} - ${isImageCodec ? 'image' : 'cover-art/thumbnail'} stream (${ffstreamType}-${ffstreamCodec})\n`;
                     extraArguments += ` -map -0:${ffstream.index}`;
                     removedIndices.add(ffstream.index);
@@ -1025,7 +1075,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     //Convert file if convert variable is set to true.
     if (convert === true) {
-        response.preset += `${fflags}${inputArgs},-map 0 -c copy${extraArguments} -max_muxing_queue_size 9999${networkDataOpt}`;
+        response.preset += `${fflags}${inputArgs},-map 0 -c copy${extraArguments}${globalOutputOpt}${networkDataOpt}`;
         response.infoLog += workDone;
         const outSummary = file.ffProbeData.streams
             .map(s => ({ s: { ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate }, idx: s.index }))
