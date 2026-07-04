@@ -13,7 +13,7 @@ const details = () => ({
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.0.1',
+    Version: '2.1.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -217,6 +217,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         infoLog: '',
     };
 
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: file-failure helpers =====
+    // -=-=-= AwkFailFile / failFile / failUnexpected  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
+    // Fail the whole file (send it to Tdarr's error queue) carrying the full infoLog as context. A returned processFile:false is Tdarr's "no work needed /
+    // skip" signal, NOT a failure — the flow's runClassicTranscodePlugin checks `if (result.error) throw` before `if (result.processFile !== true) continue`,
+    // so a skip return quietly moves on. To actually error the file a classic plugin must throw (works in classic AND flow mode). A raw throw discards the
+    // returned response, so failFile rides the accumulated infoLog (input summary + the ☒ reason) along as the Error message. The dedicated AwkFailFile type
+    // lets the body's outer catch (failUnexpected) tell a DELIBERATE failure (rethrow unchanged) from an unexpected bug (annotate + wrap, still fail w/ log).
+    class AwkFailFile extends Error {}
+    const failFile = (msg) => {
+        response.infoLog += `☒${msg}\n`;
+        throw new AwkFailFile(response.infoLog);
+    };
+    const failUnexpected = (err) => {
+        if (err instanceof AwkFailFile) throw err;
+        response.infoLog += `☒Unexpected error: ${err && err.message ? err.message : err}\n`;
+        throw new AwkFailFile(response.infoLog);
+    };
+    // ===== END SHARED: file-failure helpers =====
+
     // =====================================================================
     // SHARED CODE — duplicated verbatim because Tdarr loads each plugin as one self-contained file.
     // Split into labeled sections; each is byte-identical across the plugins named in its header, and a
@@ -412,18 +431,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: image / cover-art codecs =====
 
     // Bail out gracefully on missing/partial probe data, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
-    if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams)) {
-        response.infoLog += '☒No ffProbe stream data available for this file.\n';
-        response.processFile = false;
-        return response;
-    }
+    if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
+        failFile('No ffProbe stream data available for this file - the plugin cannot process it.');
+
+    // Input validation. Order mirrors the Inputs array in details(); only type:'string' inputs are checked - free-text inputs (audio_language, sub_language)
+    // have no fixed option set, and type:'boolean' inputs (fail_langs_blank, clean_metadata_*, temp_on_network) are coerced to a real true/false by
+    // loadDefaultValues (any out-of-set value becomes false), so a guard on them would be dead code. container is validated first (input #1) and before the
+    // dstContainer parse below so an empty value fails cleanly rather than throwing a raw TypeError. The remaining checks are grouped after all inputs parse.
+    if (!inputs.container || inputs.container === '')
+        failFile('Container has not been configured, please configure required options.');
 
     const srcContainer = file.container.toLowerCase().trim();
     const dstContainer = inputs.container.toLowerCase().trim();
     response.container = `.${dstContainer}`;
 
     // Recovery modes: two symptom dropdowns, each disabled/light/aggressive. light = no-data-loss flags only; aggressive adds the side-effect ones.
-    // Unknown/typo'd values fall through to no recovery (safe by default). tsLight/dataLight are "light-and-up" (true for both light and aggressive).
+    // Values outside the dropdown are rejected below (failFile) rather than silently no-op'd. tsLight/dataLight are "light-and-up" (true for light+aggressive).
     const recoverTs = String(inputs.recover_bad_timestamps).toLowerCase().trim();
     const recoverData = String(inputs.recover_bad_data).toLowerCase().trim();
     const tsLight = recoverTs === 'light' || recoverTs === 'aggressive';
@@ -441,34 +464,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const subLanguage = inputs.sub_language.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
     const audioLanguage = inputs.audio_language.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
     const failLangsBlank = String(inputs.fail_langs_blank) === 'true';
+    const delAccessible = String(inputs.del_accessible || 'disabled').toLowerCase();
 
-    if(!['see', 'saw'].includes(recoverSeesaw)) {
-        response.infoLog += `☒Somehow invalid recover_seesaw option provided. Check your settings!\n`;
-        response.processFile = false;
-        return response;
-    }
-
-    //Harder to cleanup than it is to fix now
+    // Value checks, in Inputs order (container already checked above). fill_language is format-checked and cross-checked against sub/audio_language; the
+    // remaining dropdowns are checked against their option set. audio_language/sub_language are free-text and fail_langs_blank/clean_metadata_* are boolean
+    // (loadDefaultValues-coerced), so neither is validated here.
     if(fillLanguage && fillLanguage.length !== 3)
-    {
-        response.infoLog += `☒fillLanguage is not a 3 character ISO-639-2 language code. It should follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes\n`;
-        response.processFile = false;
-        return response;
-    }
-
-    //If fillLanguage is set it should be a track that's kept (checked per-type so one type can legitimately exclude it)
+        failFile(`fillLanguage is not a 3 character ISO-639-2 language code. It should follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes`);
+    // If fillLanguage is set it should be a track that's kept (checked per-type so one type can legitimately exclude it).
     if(fillLanguage && subLanguage.length > 0 && !subLanguage.includes(fillLanguage))
-    {
-        response.infoLog += `☒You have specified that blank tracks should be tagged as ${fillLanguage}. You have not included it in sub_language which indirectly will remove untagged subtitle streams.\n`;
-        response.processFile = false;
-        return response;
-    }
+        failFile(`You have specified that blank tracks should be tagged as ${fillLanguage}. You have not included it in sub_language which indirectly will remove untagged subtitle streams.`);
     if(fillLanguage && audioLanguage.length > 0 && !audioLanguage.includes(fillLanguage))
-    {
-        response.infoLog += `☒You have specified that blank tracks should be tagged as ${fillLanguage}. You have not included it in audio_language which indirectly will remove untagged audio streams.\n`;
-        response.processFile = false;
-        return response;
-    }
+        failFile(`You have specified that blank tracks should be tagged as ${fillLanguage}. You have not included it in audio_language which indirectly will remove untagged audio streams.`);
+    if(!['disabled', 'subtitle', 'audio', 'both'].includes(delAccessible))
+        failFile(`Somehow invalid del_accessible option provided. Check your settings!`);
+    if(!['disabled', 'audio', 'subtitle', 'both'].includes(tagDisposition))
+        failFile(`Somehow invalid tag_disposition option provided. Check your settings!`);
+    if(!['disabled', 'audio', 'subtitle', 'both'].includes(tagTitle))
+        failFile(`Somehow invalid tag_title option provided. Check your settings!`);
+    if(!['see', 'saw'].includes(recoverSeesaw))
+        failFile(`Somehow invalid recover_seesaw option provided. Check your settings!`);
+    if(!['disabled', 'light', 'aggressive'].includes(recoverTs))
+        failFile(`Somehow invalid recover_bad_timestamps option provided. Check your settings!`);
+    if(!['disabled', 'light', 'aggressive'].includes(recoverData))
+        failFile(`Somehow invalid recover_bad_data option provided. Check your settings!`);
 
     // Subtitle codecs dropped purely by container/format - a stream in one of these is removed regardless of language, so it is never assigned fill_language
     // (used by the fail_langs_blank untagged-count below and the subtitle loop). The fail_langs_blank pre-check itself runs after the shared helpers, below.
@@ -477,14 +496,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                              'dvb_teletext', 'arib_caption', 'hdmv_text_subtitle'];
     const subFormatDropped = (codec) => alwaysDropSubs.includes(codec)
         || (dstContainer === 'mp4' && mp4OnlyDropSubs.includes(codec));
-
-
-    const delAccessible = String(inputs.del_accessible || 'disabled').toLowerCase();
-    if(!['disabled', 'subtitle', 'audio', 'both'].includes(delAccessible)) {
-        response.infoLog += `☒Somehow invalid del_accessible option provided. Check your settings!\n`;
-        response.processFile = false;
-        return response;
-    }
 
     //The channel labels we recognise/replace for tag_title - include 2.0 to allow us to overwrite that with stereo
     const channelTitleLabels = ['7.1', '6.1', '5.1', '5.0', '4.0', '3.1', '3.0', '2.1', '2.0', 'stereo', 'mono'];
@@ -591,19 +602,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const streams = file.ffProbeData.streams || [];
         const isUntagged = (s) => { const lang = resolveLang(s); return !lang || lang === 'und'; };
         const untaggedAudio = streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s)).length;
-        if (untaggedAudio > 1) {
-            response.infoLog += `☒${untaggedAudio} audio streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue or set fail_langs_blank to false.\n`;
-            response.processFile = false;
-            return response;
-        }
+        if (untaggedAudio > 1)
+            failFile(`${untaggedAudio} audio streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue or set fail_langs_blank to false.`);
         // Exclude subtitles that will be dropped by container/format anyway - they are never assigned
         // fill_language, so counting them here would falsely abort a file that would otherwise process fine.
         const untaggedSubs =  streams.filter((s) =>(s?.codec_type || '').toLowerCase() === 'subtitle' && !subFormatDropped((s.codec_name || '').toLowerCase()) && isUntagged(s)).length;
-        if (untaggedSubs > 1) {
-            response.infoLog += `☒${untaggedSubs} subtitle streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue or set fail_langs_blank to false.\n`;
-            response.processFile = false;
-            return response;
-        }
+        if (untaggedSubs > 1)
+            failFile(`${untaggedSubs} subtitle streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue or set fail_langs_blank to false.`);
     }
 
     // del_accessible safety guard (clean_and_remux only)
@@ -639,13 +644,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return response;
     }
 
-    // Check if inputs.container has been configured. If it hasn't then exit plugin. Shouldn't happen. Doesn't hurt to check.
-    if (!inputs.container || inputs.container === '') {
-        response.infoLog += '☒Container has not been configured, please configure required options. \n';
-        response.processFile = false;
-        return response;
-    }
-
     // Set up required variables.
     let extraArguments = '';
     let fflags = '';
@@ -673,8 +671,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // as it details the state we are about to act on.
     response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
 
-    for (let i = 0; i < file.ffProbeData.streams.length; i++) {
-        try {
+    // One guard around all the real work (the per-stream loop plus the font/metadata/preset build below): a deliberate failFile abort (AwkFailFile)
+    // rethrows unchanged, and any UNEXPECTED error fails the file too — annotated and carrying the full infoLog — instead of silently skipping. (Earlier
+    // input validation runs before this and fails via failFile directly.)
+    try {
+        for (let i = 0; i < file.ffProbeData.streams.length; i++) {
             const ffstream = file.ffProbeData?.streams[i];
             const ffmedia = mediaInfoFor(ffstream);
             const ffstreamCodec = (ffstream.codec_name || '').toLowerCase();
@@ -963,148 +964,139 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
 
             //Any other stream type (e.g. an unrecognised attachment classified as 'other') is left untouched - remove it with a separate plugin if needed.
-        } catch (err) {
-            // Error
-            response.infoLog += `☒Error processing stream ${i}: ${err}\n`;
-            response.processFile = false;
-            return response;
         }
-    }
 
-    // Resolve deferred font attachments now that subtitle removals are final. Embedded fonts are only consumed by styled text subtitles (ASS/SSA). Keep the
-    // fonts if any such subtitle survives in the output; otherwise they are orphaned and removed. mp4 output never keeps fonts: ASS/SSA are converted to
-    // mov_text (which needs no fonts) and mp4 cannot carry font attachments anyway, so dstContainer gates this to mkv. The source codec is read from
-    // ffProbeData (it is still 'ass'/'ssa' there even when converted), which is why the mkv gate — not just the survivor check — is required.
-    if (deferredFontIndices.length > 0) {
-        const fontsNeeded = dstContainer === 'mkv' && file.ffProbeData.streams.some(s =>
-            (s.codec_type || '').toLowerCase() === 'subtitle'
-            && !removedIndices.has(s.index)
-            && ['ass', 'ssa'].includes((s.codec_name || '').toLowerCase()));
+        // Resolve deferred font attachments now that subtitle removals are final. Embedded fonts are only consumed by styled text subtitles (ASS/SSA). Keep the
+        // fonts if any such subtitle survives in the output; otherwise they are orphaned and removed. mp4 output never keeps fonts: ASS/SSA are converted to
+        // mov_text (which needs no fonts) and mp4 cannot carry font attachments anyway, so dstContainer gates this to mkv. The source codec is read from
+        // ffProbeData (it is still 'ass'/'ssa' there even when converted), which is why the mkv gate — not just the survivor check — is required.
+        if (deferredFontIndices.length > 0) {
+            const fontsNeeded = dstContainer === 'mkv' && file.ffProbeData.streams.some(s =>
+                (s.codec_type || '').toLowerCase() === 'subtitle'
+                && !removedIndices.has(s.index)
+                && ['ass', 'ssa'].includes((s.codec_name || '').toLowerCase()));
 
-        if (!fontsNeeded) {
-            for (const idx of deferredFontIndices) {
-                const fontStream = file.ffProbeData.streams.find(s => s.index === idx);
-                const fname = (fontStream?.tags?.filename || '').trim();
-                workDone += `☐Remove stream ${idx} - orphaned font attachment (no ASS/SSA subtitle uses it)${fname ? ` "${logSafe(fname)}"` : ''}\n`;
-                extraArguments += ` -map -0:${idx}`;
-                removedIndices.add(idx);
-                convert = true;
+            if (!fontsNeeded) {
+                for (const idx of deferredFontIndices) {
+                    const fontStream = file.ffProbeData.streams.find(s => s.index === idx);
+                    const fname = (fontStream?.tags?.filename || '').trim();
+                    workDone += `☐Remove stream ${idx} - orphaned font attachment (no ASS/SSA subtitle uses it)${fname ? ` "${logSafe(fname)}"` : ''}\n`;
+                    extraArguments += ` -map -0:${idx}`;
+                    removedIndices.add(idx);
+                    convert = true;
+                }
             }
         }
-    }
 
-    if(videoDropped > 0 && videoStreamIndex === -1) {
-        response.infoLog += `☒Removing specified streams would leave the file without any video streams. Check to make sure file contains valid streams. \n`;
-        response.processFile = false;
-        return response;
-    }
+        if(videoDropped > 0 && videoStreamIndex === -1)
+            failFile('Removing specified streams would leave the file without any video streams. Check to make sure file contains valid streams.');
 
-    if(audioDropped > 0 && audioStreamIndex === -1) {
-        response.infoLog += `☒Removing specified streams would leave the file without any audio streams. Check to make sure file contains valid streams. \n`;
-        response.processFile = false;
-        return response;
-    }
+        if(audioDropped > 0 && audioStreamIndex === -1)
+            failFile('Removing specified streams would leave the file without any audio streams. Check to make sure file contains valid streams.');
 
-    //Now the file level metadata can be cleaned up if needed.
-    if((metaCommentRemove === true) && file.ffProbeData.format?.tags?.comment) {
-        workDone += `☐Remove comment from file "${logSafe(file.ffProbeData.format?.tags?.comment)}"\n`;
-        extraArguments += ` -metadata "comment="`;
-        convert = true;
-    }
+        //Now the file level metadata can be cleaned up if needed.
+        if((metaCommentRemove === true) && file.ffProbeData.format?.tags?.comment) {
+            workDone += `☐Remove comment from file "${logSafe(file.ffProbeData.format?.tags?.comment)}"\n`;
+            extraArguments += ` -metadata "comment="`;
+            convert = true;
+        }
 
-    if((metaBusyTitleRemove === true) && tooManyPeriods(file.ffProbeData.format?.tags?.title ?? '')) {
-        workDone += `☐Remove title from file "${logSafe((file.ffProbeData.format?.tags?.title ?? '').trim())}"\n`;
-        extraArguments += ` -metadata "title="`;
-        convert = true;
-    }
+        if((metaBusyTitleRemove === true) && tooManyPeriods(file.ffProbeData.format?.tags?.title ?? '')) {
+            workDone += `☐Remove title from file "${logSafe((file.ffProbeData.format?.tags?.title ?? '').trim())}"\n`;
+            extraArguments += ` -metadata "title="`;
+            convert = true;
+        }
 
-    //Check if remuxing is required due to container change
-    if (srcContainer !== dstContainer) {
-        workDone += `☐Remux file (${srcContainer}->${dstContainer})\n`;
-        convert = true;
-    }
+        //Check if remuxing is required due to container change
+        if (srcContainer !== dstContainer) {
+            workDone += `☐Remux file (${srcContainer}->${dstContainer})\n`;
+            convert = true;
+        }
 
-    //Include recovery flags if requested or if the source container is known to have timestamp issues.
+        //Include recovery flags if requested or if the source container is known to have timestamp issues.
 
-    // Recovery (the recover_bad_* modes) leaves nothing observable in the stream layout, and is a no-op with -c copy on already-cleaned content, so forcing a
-    // remux for it alone would make every Tdarr health-check pass reprocess the file forever. We record the intent - "<recover_seesaw>:<mode signature>" - in
-    // a format-level awk_recovered tag, and only recover when the current intent differs from the stamped one (changed mode, flipped seesaw, or no
-    // tag), then re-stamp. That converges (matching tag = skip), so a change re-runs recovery once and settles: no loop, no reset toggle.
-    const recoverRequested = recoverTs !== 'disabled' || recoverData !== 'disabled';
-    // Order-stable signature of the recovery modes requested this run (e.g. "ts-light+data-aggressive").
-    const recoverSig = [recoverTs !== 'disabled' && `ts-${recoverTs}`, recoverData !== 'disabled' && `data-${recoverData}`].filter(Boolean).join('+');
-    // Full intent = seesaw + signature. escMeta is a no-op here (alphanumeric + '-' + ':' + '+') but keeps the
-    // compared value byte-identical to what gets written to awk_recovered below.
-    const recoverIntent = escMeta(`${recoverSeesaw}:${recoverSig}`);
-    // Read case-insensitively on the key (matroska upper-cases tag keys on write; the value is preserved).
-    const recoveredTag = String(Object.entries(file.ffProbeData.format?.tags || {})
-        .find(([k]) => k.toLowerCase() === 'awk_recovered')?.[1] ?? '').trim();
-    const intentMatches = recoveredTag !== '' && recoveredTag === recoverIntent;
-    // A real container change (e.g. mkv->mp4) already remuxes and is a one-shot (a fixed config makes
-    // srcContainer==dstContainer afterward), so recovery can ride along regardless of the tag without looping.
-    const containerChanging = srcContainer !== dstContainer;
-    const runRecover = recoverRequested && (!intentMatches || containerChanging);
+        // Recovery (the recover_bad_* modes) leaves nothing observable in the stream layout, and is a no-op with -c copy on already-cleaned content, so forcing a
+        // remux for it alone would make every Tdarr health-check pass reprocess the file forever. We record the intent - "<recover_seesaw>:<mode signature>" - in
+        // a format-level awk_recovered tag, and only recover when the current intent differs from the stamped one (changed mode, flipped seesaw, or no
+        // tag), then re-stamp. That converges (matching tag = skip), so a change re-runs recovery once and settles: no loop, no reset toggle.
+        const recoverRequested = recoverTs !== 'disabled' || recoverData !== 'disabled';
+        // Order-stable signature of the recovery modes requested this run (e.g. "ts-light+data-aggressive").
+        const recoverSig = [recoverTs !== 'disabled' && `ts-${recoverTs}`, recoverData !== 'disabled' && `data-${recoverData}`].filter(Boolean).join('+');
+        // Full intent = seesaw + signature. escMeta is a no-op here (alphanumeric + '-' + ':' + '+') but keeps the
+        // compared value byte-identical to what gets written to awk_recovered below.
+        const recoverIntent = escMeta(`${recoverSeesaw}:${recoverSig}`);
+        // Read case-insensitively on the key (matroska upper-cases tag keys on write; the value is preserved).
+        const recoveredTag = String(Object.entries(file.ffProbeData.format?.tags || {})
+            .find(([k]) => k.toLowerCase() === 'awk_recovered')?.[1] ?? '').trim();
+        const intentMatches = recoveredTag !== '' && recoveredTag === recoverIntent;
+        // A real container change (e.g. mkv->mp4) already remuxes and is a one-shot (a fixed config makes
+        // srcContainer==dstContainer afterward), so recovery can ride along regardless of the tag without looping.
+        const containerChanging = srcContainer !== dstContainer;
+        const runRecover = recoverRequested && (!intentMatches || containerChanging);
 
-    // Recovery-mode flags apply only on a run (a matching intent with no container change is skipped) so a remux triggered by OTHER work never re-applies
-    // them. The ts/avi/mpg/mpeg genpts/-avoid_negative_ts below is container-forced (needed to remux those formats at all) and is therefore always applied.
+        // Recovery-mode flags apply only on a run (a matching intent with no container change is skipped) so a remux triggered by OTHER work never re-applies
+        // them. The ts/avi/mpg/mpeg genpts/-avoid_negative_ts below is container-forced (needed to remux those formats at all) and is therefore always applied.
 
-    // recover_bad_timestamps: light = +genpts, aggressive = full +igndts+genpts rebuild (igndts can misbehave without genpts, so it always pulls it in).
-    if(runRecover && tsAgg)
-        fflags += '+igndts+genpts';
-    else if(runRecover && tsLight)
-        fflags += '+genpts';
-
-    if (['ts', 'avi', 'mpg', 'mpeg'].includes(srcContainer)) {          // container-forced timestamp fix (always applied)
-        if(!fflags.includes('genpts'))
+        // recover_bad_timestamps: light = +genpts, aggressive = full +igndts+genpts rebuild (igndts can misbehave without genpts, so it always pulls it in).
+        if(runRecover && tsAgg)
+            fflags += '+igndts+genpts';
+        else if(runRecover && tsLight)
             fflags += '+genpts';
-        extraArguments = ` -avoid_negative_ts make_zero${extraArguments}`;
-    } else if (runRecover && tsLight && !extraArguments.includes('avoid_negative_ts'))
-        extraArguments = ` -avoid_negative_ts make_zero${extraArguments}`;   // normalize negative starts on any container we rebuild
 
-    // recover_bad_data: light = +ignidx + -err_detect ignore_err (drops nothing), aggressive additionally drops corrupt frames.
-    if(runRecover && dataLight) {
-        fflags += '+ignidx';
-        inputArgs += ' -err_detect ignore_err';
-    }
-    if(runRecover && dataAgg)
-        fflags += '+discardcorrupt';
-    if(fflags !== '')
-        fflags = `-fflags ${fflags}`;
+        if (['ts', 'avi', 'mpg', 'mpeg'].includes(srcContainer)) {          // container-forced timestamp fix (always applied)
+            if(!fflags.includes('genpts'))
+                fflags += '+genpts';
+            extraArguments = ` -avoid_negative_ts make_zero${extraArguments}`;
+        } else if (runRecover && tsLight && !extraArguments.includes('avoid_negative_ts'))
+            extraArguments = ` -avoid_negative_ts make_zero${extraArguments}`;   // normalize negative starts on any container we rebuild
 
-    // A recover-only run has no other queued work, so force the remux when this intent needs applying (a
-    // matching intent with no container change means recovery already ran, so we don't reprocess).
-    if (runRecover)
-        convert = true;
+        // recover_bad_data: light = +ignidx + -err_detect ignore_err (drops nothing), aggressive additionally drops corrupt frames.
+        if(runRecover && dataLight) {
+            fflags += '+ignidx';
+            inputArgs += ' -err_detect ignore_err';
+        }
+        if(runRecover && dataAgg)
+            fflags += '+discardcorrupt';
+        if(fflags !== '')
+            fflags = `-fflags ${fflags}`;
 
-    // (Re)stamp the recover intent whenever we remux with recover requested. A fresh run is logged; when the intent already matches we still re-write it
-    // idempotently so it survives the remux - notably mkv->mp4, where mp4 drops a custom key unless -movflags use_metadata_tags is set (verified). Without
-    // this a container change would drop awk_recovered and the next pass would re-run recovery.
-    if (convert === true && recoverRequested) {
+        // A recover-only run has no other queued work, so force the remux when this intent needs applying (a
+        // matching intent with no container change means recovery already ran, so we don't reprocess).
         if (runRecover)
-            workDone += `☐Stamp awk_recovered=${recoverIntent} - recovery re-runs only if a recover option or recover_seesaw changes\n`;
-        extraArguments += ` -metadata "awk_recovered=${recoverIntent}"`;
-        if (dstContainer === 'mp4')
-            extraArguments += ' -movflags use_metadata_tags';
-    }
+            convert = true;
 
-    //Convert file if convert variable is set to true.
-    if (convert === true) {
-        response.preset += `${fflags}${inputArgs},-map 0 -c copy${extraArguments}${globalOutputOpt}${networkDataOpt}`;
-        response.infoLog += workDone;
-        const outSummary = file.ffProbeData.streams
-            .map(s => ({ s: enrichStream(s), idx: s.index }))
-            .filter(({ idx }) => !removedIndices.has(idx))
-            .map(({ s, idx }) => (subCodecOverride.has(idx) ? { ...s, codec_name: subCodecOverride.get(idx) } : s))
-            .map(summariseStream).join('');
-        response.infoLog += `☑Expected results: ${outSummary}\n`;
-        response.processFile = true;
-    } else {
-        if (recoverRequested && intentMatches)
-            response.infoLog += `☑Already recovered with these options (awk_recovered=${recoveredTag}) - skipping to avoid reprocessing. Change a recover option or flip recover_seesaw to run again.\n`;
-        response.infoLog += `☑File is already ${dstContainer} and contains no streams requiring removal or conversion.\n`;
-        response.processFile = false;
+        // (Re)stamp the recover intent whenever we remux with recover requested. A fresh run is logged; when the intent already matches we still re-write it
+        // idempotently so it survives the remux - notably mkv->mp4, where mp4 drops a custom key unless -movflags use_metadata_tags is set (verified). Without
+        // this a container change would drop awk_recovered and the next pass would re-run recovery.
+        if (convert === true && recoverRequested) {
+            if (runRecover)
+                workDone += `☐Stamp awk_recovered=${recoverIntent} - recovery re-runs only if a recover option or recover_seesaw changes\n`;
+            extraArguments += ` -metadata "awk_recovered=${recoverIntent}"`;
+            if (dstContainer === 'mp4')
+                extraArguments += ' -movflags use_metadata_tags';
+        }
+
+        //Convert file if convert variable is set to true.
+        if (convert === true) {
+            response.preset += `${fflags}${inputArgs},-map 0 -c copy${extraArguments}${globalOutputOpt}${networkDataOpt}`;
+            response.infoLog += workDone;
+            const outSummary = file.ffProbeData.streams
+                .map(s => ({ s: enrichStream(s), idx: s.index }))
+                .filter(({ idx }) => !removedIndices.has(idx))
+                .map(({ s, idx }) => (subCodecOverride.has(idx) ? { ...s, codec_name: subCodecOverride.get(idx) } : s))
+                .map(summariseStream).join('');
+            response.infoLog += `☑Expected results: ${outSummary}\n`;
+            response.processFile = true;
+        } else {
+            if (recoverRequested && intentMatches)
+                response.infoLog += `☑Already recovered with these options (awk_recovered=${recoveredTag}) - skipping to avoid reprocessing. Change a recover option or flip recover_seesaw to run again.\n`;
+            response.infoLog += `☑File is already ${dstContainer} and contains no streams requiring removal or conversion.\n`;
+            response.processFile = false;
+        }
+        return response;
+    } catch (err) {
+        failUnexpected(err);   // AwkFailFile → rethrow unchanged; anything else → annotate + fail the file with the full infoLog
     }
-    return response;
 };
 module.exports.details = details;
 module.exports.plugin = plugin;

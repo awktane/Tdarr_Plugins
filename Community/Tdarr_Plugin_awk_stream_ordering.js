@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/songs/sdh/descriptive/commentary) -> Attachments -> Data. Also marks the first audio track as the sole default.\n`,
-    Version: '2.0.1',
+    Version: '2.1.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -98,6 +98,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         container: `.${file.container}`,
         infoLog: '',
     };
+
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: file-failure helpers =====
+    // -=-=-= AwkFailFile / failFile / failUnexpected  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
+    // Fail the whole file (send it to Tdarr's error queue) carrying the full infoLog as context. A returned processFile:false is Tdarr's "no work needed /
+    // skip" signal, NOT a failure — the flow's runClassicTranscodePlugin checks `if (result.error) throw` before `if (result.processFile !== true) continue`,
+    // so a skip return quietly moves on. To actually error the file a classic plugin must throw (works in classic AND flow mode). A raw throw discards the
+    // returned response, so failFile rides the accumulated infoLog (input summary + the ☒ reason) along as the Error message. The dedicated AwkFailFile type
+    // lets the body's outer catch (failUnexpected) tell a DELIBERATE failure (rethrow unchanged) from an unexpected bug (annotate + wrap, still fail w/ log).
+    class AwkFailFile extends Error {}
+    const failFile = (msg) => {
+        response.infoLog += `☒${msg}\n`;
+        throw new AwkFailFile(response.infoLog);
+    };
+    const failUnexpected = (err) => {
+        if (err instanceof AwkFailFile) throw err;
+        response.infoLog += `☒Unexpected error: ${err && err.message ? err.message : err}\n`;
+        throw new AwkFailFile(response.infoLog);
+    };
+    // ===== END SHARED: file-failure helpers =====
 
     // =====================================================================
     // SHARED CODE — duplicated verbatim because Tdarr loads each plugin as one self-contained file.
@@ -437,178 +456,177 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: image / cover-art codecs =====
 
     // Bail out gracefully on missing/partial probe data, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
-    if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams)) {
-        response.infoLog += '☒No ffProbe stream data available for this file.\n';
-        response.processFile = false;
-        return response;
-    }
+    if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
+        failFile('No ffProbe stream data available for this file - the plugin cannot process it.');
 
-    if(!['descending', 'ascending', 'disabled'].includes(inputs.channel_order)) {
-        response.infoLog += '☒channel_order has not been configured, please configure required options.\n';
-        response.processFile = false;
-        return response;
-    }
-    if(!['descending', 'ascending', 'disabled'].includes(inputs.quality_order)) {
-        response.infoLog += '☒quality_order has not been configured, please configure required options.\n';
-        response.processFile = false;
-        return response;
-    }
+    // Value checks, in Inputs order. preferred_languages/codec_first are free-text and sdh_first/temp_on_network are type:'boolean' (loadDefaultValues coerces
+    // any out-of-set value to false), so only channel_order/quality_order have a fixed option set to validate.
+    if(!['descending', 'ascending', 'disabled'].includes(inputs.channel_order))
+        failFile('channel_order has not been configured, please configure required options.');
+    if(!['descending', 'ascending', 'disabled'].includes(inputs.quality_order))
+        failFile('quality_order has not been configured, please configure required options.');
 
-    // Input summary — the streams exactly as they arrived, before re-ordering.
-    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
+    // One guard around all the reordering work below: a deliberate failFile abort (AwkFailFile) rethrows unchanged, and any UNEXPECTED error fails the
+    // file too — annotated and carrying the full infoLog — instead of silently skipping. (Earlier input validation runs before this and fails via failFile.)
+    try {
+        // Input summary — the streams exactly as they arrived, before re-ordering.
+        response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
 
-    // VIDEO -> AUDIO -> SUBTITLE -> ATTACHMENT -> DATA -> OTHER?
-    const streamOrder = { video: 0, audio: 1, subtitle: 2 , attachment: 3, data: 4};
-    const preferredLanguages = (inputs.preferred_languages || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
-    const sdhFirst = String(inputs.sdh_first) === 'true';
-    const codecFirstList = (inputs.codec_first || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
+        // VIDEO -> AUDIO -> SUBTITLE -> ATTACHMENT -> DATA -> OTHER?
+        const streamOrder = { video: 0, audio: 1, subtitle: 2 , attachment: 3, data: 4};
+        const preferredLanguages = (inputs.preferred_languages || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
+        const sdhFirst = String(inputs.sdh_first) === 'true';
+        const codecFirstList = (inputs.codec_first || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
 
-    const getLangRank = (lang, shortlang) => {
-        let idx = preferredLanguages.indexOf(lang);
-        if (idx === -1) idx = preferredLanguages.indexOf(shortlang);
-        return idx === -1 ? 999 : idx;
-    };
+        const getLangRank = (lang, shortlang) => {
+            let idx = preferredLanguages.indexOf(lang);
+            if (idx === -1) idx = preferredLanguages.indexOf(shortlang);
+            return idx === -1 ? 999 : idx;
+        };
 
-    const streams = [];
-    for (let i = 0; i < file.ffProbeData.streams.length; i++) {
-        const ffstream = file.ffProbeData.streams[i];
-        // Enrich with mediaInfo bitrate before audioQuality/summariseStream: ffprobe can't read e.g. DTS-HD MA's bitrate in MP4/M4V, so those
-        // formats are scored/displayed from the more accurate mediaInfo value.
-        const enrichedStream = enrichStream(ffstream);
-        const streamLang = resolveLang(ffstream) || 'und';
-        const streamLangShort = shortLang(streamLang);
+        const streams = [];
+        for (let i = 0; i < file.ffProbeData.streams.length; i++) {
+            const ffstream = file.ffProbeData.streams[i];
+            // Enrich with mediaInfo bitrate before audioQuality/summariseStream: ffprobe can't read e.g. DTS-HD MA's bitrate in MP4/M4V, so those
+            // formats are scored/displayed from the more accurate mediaInfo value.
+            const enrichedStream = enrichStream(ffstream);
+            const streamLang = resolveLang(ffstream) || 'und';
+            const streamLangShort = shortLang(streamLang);
                 
-        const streamType = (ffstream.codec_type || '').trim().toLowerCase();
-        // Resolve the canonical codec once (resolveCodecName does a probe-join + string work); codec_first membership can't change between list entries.
-        const canon = streamType === 'audio' ? resolveCodecName(enrichedStream) : '';
+            const streamType = (ffstream.codec_type || '').trim().toLowerCase();
+            // Resolve the canonical codec once (resolveCodecName does a probe-join + string work); codec_first membership can't change between list entries.
+            const canon = streamType === 'audio' ? resolveCodecName(enrichedStream) : '';
 
-        streams.push({
-            index: ffstream.index,
-            origPos: i,
-            stream: enrichedStream,
-            type: streamType,
-            lang: streamLang,
-            shortlang: streamLangShort,
-            channels: enrichedStream.channels || 0,
-            forced: ffstream?.disposition?.forced === 1,
-            // Only score audio: scoring video/subtitle/data would spam bogus "unknown codec"/"invalid bitrate" notices, and quality is only used to sort audio.
-            audioquality: streamType === 'audio' ? audioQuality(enrichedStream) : 0,
-            // Does this audio stream's canonical codec match codec_first? Family-prefix match: "dts" catches dtsma/dtshr/dtsexpress, "eac3" catches eac3atmos.
-            codecmatch: canon !== '' && codecFirstList.some(c => canon.startsWith(c)),
-            default: ffstream?.disposition?.default === 1,
+            streams.push({
+                index: ffstream.index,
+                origPos: i,
+                stream: enrichedStream,
+                type: streamType,
+                lang: streamLang,
+                shortlang: streamLangShort,
+                channels: enrichedStream.channels || 0,
+                forced: ffstream?.disposition?.forced === 1,
+                // Only score audio: scoring video/subtitle/data would spam bogus "unknown codec"/"invalid bitrate" notices, and quality is only used to sort audio.
+                audioquality: streamType === 'audio' ? audioQuality(enrichedStream) : 0,
+                // Does this audio stream's canonical codec match codec_first? Family-prefix match: "dts" catches dtsma/dtshr/dtsexpress, "eac3" catches eac3atmos.
+                codecmatch: canon !== '' && codecFirstList.some(c => canon.startsWith(c)),
+                default: ffstream?.disposition?.default === 1,
 
-            // Role classification via the shared classifiers (single source of truth — keeps the sort and the summary line in agreement).
-            commentary: isCommentary(ffstream),
-            descriptive: isDescriptive(ffstream),
-            sdh: isSdh(ffstream),
-            lyrics: isLyrics(ffstream),
+                // Role classification via the shared classifiers (single source of truth — keeps the sort and the summary line in agreement).
+                commentary: isCommentary(ffstream),
+                descriptive: isDescriptive(ffstream),
+                sdh: isSdh(ffstream),
+                lyrics: isLyrics(ffstream),
 
-            // Cover art/poster/thumbnail sort last: ffmpeg cover-art dispositions (any codec) or a still-image codec - mirrors clean_and_remux image removal.
-            coverArt: isCoverArt(ffstream),
+                // Cover art/poster/thumbnail sort last: ffmpeg cover-art dispositions (any codec) or a still-image codec - mirrors clean_and_remux image removal.
+                coverArt: isCoverArt(ffstream),
+            });
+        }
+
+        //Sort the streams
+        streams.sort((a, b) => {
+            //Stream Type
+            const aOrder = streamOrder[a.type] ?? 99;
+            const bOrder = streamOrder[b.type] ?? 99;
+
+            if (aOrder !== bOrder)
+                return aOrder - bOrder;
+
+            //Video (but cover art / posters / thumbnails go last)
+            if (a.type === 'video') {
+                if (a.coverArt !== b.coverArt)
+                    return a.coverArt ? 1 : -1;
+            //Audio
+            } else if(a.type === 'audio') {
+                //Language priority first. A track in a non-preferred language should not sort above one in a preferred language.
+                const aRank = getLangRank(a.lang, a.shortlang);
+                const bRank = getLangRank(b.lang, b.shortlang);
+                if (aRank !== bRank)
+                    return aRank - bRank;
+
+                //A commentary stream could be descriptive but it would still be a commentary
+                const aRole = a.commentary ? 2 : (a.descriptive ? 1 : 0);
+                const bRole = b.commentary ? 2 : (b.descriptive ? 1 : 0);
+                if (aRole !== bRole)
+                    return aRole - bRole;
+
+                //codec_first tier — preferred codecs form one group above the rest, each still ordered by channel/quality below; this only promotes the group.
+                if (codecFirstList.length > 0 && (a.codecmatch !== b.codecmatch))
+                    return a.codecmatch ? -1 : 1;
+
+                //Channel ordering (skipped when disabled)
+                if (inputs.channel_order !== 'disabled' && a.channels !== b.channels)
+                    return (inputs.channel_order === 'descending' ? b.channels - a.channels : a.channels - b.channels);
+
+                //Quality (skipped when disabled)
+                if (inputs.quality_order !== 'disabled' && a.audioquality !== b.audioquality)
+                    return (inputs.quality_order === 'descending' ? b.audioquality - a.audioquality : a.audioquality - b.audioquality);
+            //Subtitles
+            } else if (a.type === 'subtitle') {
+                //Forced always first
+                if (a.forced !== b.forced)
+                    return a.forced ? -1 : 1;
+
+                //Override
+                if(sdhFirst && (a.sdh !== b.sdh))
+                    return a.sdh ? -1 : 1;
+
+                //Language
+                const aRank = getLangRank(a.lang, a.shortlang);
+                const bRank = getLangRank(b.lang, b.shortlang);
+
+                if (aRank !== bRank)
+                    return aRank - bRank;
+
+                //Normal, lyrics/songs, SDH, descriptive, commentary - sdhFirst flag overrides SDH position above
+                const aRole = a.commentary ? 4 : (a.descriptive ? 3 : (a.sdh ? 2 : (a.lyrics ? 1 : 0)));
+                const bRole = b.commentary ? 4 : (b.descriptive ? 3 : (b.sdh ? 2 : (b.lyrics ? 1 : 0)));
+                if (aRole !== bRole)
+                    return aRole - bRole;
+            }
+
+            //Next would be attachments and data but the order of these aren't important
+            return a.index - b.index;
         });
-    }
 
-    //Sort the streams
-    streams.sort((a, b) => {
-        //Stream Type
-        const aOrder = streamOrder[a.type] ?? 99;
-        const bOrder = streamOrder[b.type] ?? 99;
+        //Check if order changed and build the map; also normalise the audio default flag so exactly one audio track — the first in sorted order — is default,
+        //matching what our ordering rules chose. Additive +default/-default preserves forced/commentary/etc; subtitle/video untouched.
+        let ffmpegMap = '';
+        let dispositionArgs = '';
+        let changed = false;
+        let audioIndex = -1;
 
-        if (aOrder !== bOrder)
-            return aOrder - bOrder;
+        for (let i = 0; i < streams.length; i++) {
+            ffmpegMap += ` -map 0:${streams[i].index}`;
+            // Compare against each stream's ORIGINAL array position, not its absolute ffprobe index, so a file already in the desired order but with
+            // non-contiguous indices (e.g. 0,1,3 after an upstream drop) isn't remuxed pointlessly. -map still uses the absolute index above.
+            if (streams[i].origPos !== i) changed = true;
 
-        //Video (but cover art / posters / thumbnails go last)
-        if (a.type === 'video') {
-            if (a.coverArt !== b.coverArt)
-                return a.coverArt ? 1 : -1;
-        //Audio
-        } else if(a.type === 'audio') {
-            //Language priority first. A track in a non-preferred language should not sort above one in a preferred language.
-            const aRank = getLangRank(a.lang, a.shortlang);
-            const bRank = getLangRank(b.lang, b.shortlang);
-            if (aRank !== bRank)
-                return aRank - bRank;
-
-            //A commentary stream could be descriptive but it would still be a commentary
-            const aRole = a.commentary ? 2 : (a.descriptive ? 1 : 0);
-            const bRole = b.commentary ? 2 : (b.descriptive ? 1 : 0);
-            if (aRole !== bRole)
-                return aRole - bRole;
-
-            //codec_first tier — preferred codecs form one group above the rest, each still ordered by channel/quality below; this only promotes the group.
-            if (codecFirstList.length > 0 && (a.codecmatch !== b.codecmatch))
-                return a.codecmatch ? -1 : 1;
-
-            //Channel ordering (skipped when disabled)
-            if (inputs.channel_order !== 'disabled' && a.channels !== b.channels)
-                return (inputs.channel_order === 'descending' ? b.channels - a.channels : a.channels - b.channels);
-
-            //Quality (skipped when disabled)
-            if (inputs.quality_order !== 'disabled' && a.audioquality !== b.audioquality)
-                return (inputs.quality_order === 'descending' ? b.audioquality - a.audioquality : a.audioquality - b.audioquality);
-        //Subtitles
-        } else if (a.type === 'subtitle') {
-            //Forced always first
-            if (a.forced !== b.forced)
-                return a.forced ? -1 : 1;
-
-            //Override
-            if(sdhFirst && (a.sdh !== b.sdh))
-                return a.sdh ? -1 : 1;
-
-            //Language
-            const aRank = getLangRank(a.lang, a.shortlang);
-            const bRank = getLangRank(b.lang, b.shortlang);
-
-            if (aRank !== bRank)
-                return aRank - bRank;
-
-            //Normal, lyrics/songs, SDH, descriptive, commentary - sdhFirst flag overrides SDH position above
-            const aRole = a.commentary ? 4 : (a.descriptive ? 3 : (a.sdh ? 2 : (a.lyrics ? 1 : 0)));
-            const bRole = b.commentary ? 4 : (b.descriptive ? 3 : (b.sdh ? 2 : (b.lyrics ? 1 : 0)));
-            if (aRole !== bRole)
-                return aRole - bRole;
+            if (streams[i].type === 'audio') {
+                audioIndex++;
+                if (audioIndex === 0 && !streams[i].default)
+                    dispositionArgs += ` -disposition:a:${audioIndex} +default`;
+                else if (audioIndex > 0 && streams[i].default)
+                    dispositionArgs += ` -disposition:a:${audioIndex} -default`;
+            }
         }
 
-        //Next would be attachments and data but the order of these aren't important
-        return a.index - b.index;
-    });
-
-    //Check if order changed and build the map; also normalise the audio default flag so exactly one audio track — the first in sorted order — is default,
-    //matching what our ordering rules chose. Additive +default/-default preserves forced/commentary/etc; subtitle/video untouched.
-    let ffmpegMap = '';
-    let dispositionArgs = '';
-    let changed = false;
-    let audioIndex = -1;
-
-    for (let i = 0; i < streams.length; i++) {
-        ffmpegMap += ` -map 0:${streams[i].index}`;
-        // Compare against each stream's ORIGINAL array position, not its absolute ffprobe index, so a file already in the desired order but with
-        // non-contiguous indices (e.g. 0,1,3 after an upstream drop) isn't remuxed pointlessly. -map still uses the absolute index above.
-        if (streams[i].origPos !== i) changed = true;
-
-        if (streams[i].type === 'audio') {
-            audioIndex++;
-            if (audioIndex === 0 && !streams[i].default)
-                dispositionArgs += ` -disposition:a:${audioIndex} +default`;
-            else if (audioIndex > 0 && streams[i].default)
-                dispositionArgs += ` -disposition:a:${audioIndex} -default`;
+        if (!changed && dispositionArgs === '') {
+            response.infoLog += '☑Streams already in desired order.\n';
+            return response;
         }
-    }
 
-    if (!changed && dispositionArgs === '') {
-        response.infoLog += '☑Streams already in desired order.\n';
+        response.processFile = true;
+        response.reQueueAfter = true;
+        response.preset = `,${ffmpegMap} -c copy${dispositionArgs}${globalOutputOpt}${networkDataOpt}`;
+        if (dispositionArgs !== '')
+            response.infoLog += '☐Set the first audio track as the sole default.\n';
+        response.infoLog += `☑Expected results: ${streams.map(s => summariseStream(s.stream)).join('')}\n`;
+
         return response;
+    } catch (err) {
+        failUnexpected(err);   // AwkFailFile → rethrow unchanged; anything else → annotate + fail the file with the full infoLog
     }
-
-    response.processFile = true;
-    response.reQueueAfter = true;
-    response.preset = `,${ffmpegMap} -c copy${dispositionArgs}${globalOutputOpt}${networkDataOpt}`;
-    if (dispositionArgs !== '')
-        response.infoLog += '☐Set the first audio track as the sole default.\n';
-    response.infoLog += `☑Expected results: ${streams.map(s => summariseStream(s.stream)).join('')}\n`;
-
-    return response;
 };
 
 module.exports.details = details;

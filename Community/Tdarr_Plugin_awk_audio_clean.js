@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.2.1',
+    Version: '2.3.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -220,6 +220,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         FFmpegMode: true,
         infoLog: '',
     };
+
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: file-failure helpers =====
+    // -=-=-= AwkFailFile / failFile / failUnexpected  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
+    // Fail the whole file (send it to Tdarr's error queue) carrying the full infoLog as context. A returned processFile:false is Tdarr's "no work needed /
+    // skip" signal, NOT a failure — the flow's runClassicTranscodePlugin checks `if (result.error) throw` before `if (result.processFile !== true) continue`,
+    // so a skip return quietly moves on. To actually error the file a classic plugin must throw (works in classic AND flow mode). A raw throw discards the
+    // returned response, so failFile rides the accumulated infoLog (input summary + the ☒ reason) along as the Error message. The dedicated AwkFailFile type
+    // lets the body's outer catch (failUnexpected) tell a DELIBERATE failure (rethrow unchanged) from an unexpected bug (annotate + wrap, still fail w/ log).
+    class AwkFailFile extends Error {}
+    const failFile = (msg) => {
+        response.infoLog += `☒${msg}\n`;
+        throw new AwkFailFile(response.infoLog);
+    };
+    const failUnexpected = (err) => {
+        if (err instanceof AwkFailFile) throw err;
+        response.infoLog += `☒Unexpected error: ${err && err.message ? err.message : err}\n`;
+        throw new AwkFailFile(response.infoLog);
+    };
+    // ===== END SHARED: file-failure helpers =====
 
     // =====================================================================
     // SHARED CODE — duplicated verbatim because Tdarr loads each plugin as one self-contained file.
@@ -565,11 +584,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: ffmpeg metadata escaping =====
 
     // Bail out gracefully on missing/partial probe data, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
-    if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams)) {
-        response.infoLog += '☒No ffProbe stream data available for this file.\n';
-        response.processFile = false;
-        return response;
-    }
+    if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
+        failFile('No ffProbe stream data available for this file - the plugin cannot process it.');
 
     // AC3 valid CBR presets in bps. ffmpeg rounds an AC3 request to the NEAREST of these (can round DOWN); resolveBitrate snaps UP to a preset itself so the
     // emitted rate is never below target and the log matches what ffmpeg produces. EAC3/AAC/Opus honour arbitrary rates (verified) and are NOT snapped.
@@ -669,69 +685,41 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // paths don't pass a source bitrate so they are unaffected regardless of this flag.
     const losslessSource = (stream) => codecInfo[resolveCodecName(stream)]?.lossless === true;
     
-    //Check our inputs
+    // Parse + validate inputs. Order here mirrors the Inputs array in details() so the two never drift. Only type:'string' dropdowns are validated here -
+    // free-text inputs (downmix_language) have no fixed option set, and type:'boolean' inputs (temp_on_network) are already coerced to a real true/false by
+    // loadDefaultValues (any out-of-set value becomes false), so a guard on them would be dead code. Every checked value fails the file on an out-of-set value.
     const downmixLanguage = String(inputs.downmix_language).toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
     const downmixToSix = String(inputs.downmix_to_six).trim();
     const downmixToTwo = String(inputs.downmix_to_stereo).trim();
     const downmixSecondaryStereo = String(inputs.downmix_secondary_stereo).trim();
-    const removeDuplicatesBy = String(inputs.remove_duplicates_by).trim();
-    const forceCodec = String(inputs.codec_force).trim();
     const surroundCodec = String(inputs.codec_surround).trim();
     const stereoCodec = String(inputs.codec_stereo).trim();
-    const stereoDownmix = String(inputs.method_stereo_downmix).trim();
+    const forceCodec = String(inputs.codec_force).trim();
     const keepBestSurroundSafe = String(inputs.keep_best_surround_safe).trim();
+    const removeDuplicatesBy = String(inputs.remove_duplicates_by).trim();
+    const stereoDownmix = String(inputs.method_stereo_downmix).trim();
     const methodOpusLayoutErr = String(inputs.method_opus_layout_err).trim();
 
-    if(!['false','replace','true'].includes(downmixToSix)) {
-        response.infoLog += `☒Somehow invalid downmixToSix option provided. Check your settings!\n`;
-        response.processFile = false;
-        return response;
-    }
-    if(!['false','replace','true'].includes(downmixToTwo)) {
-        response.infoLog += `☒Somehow invalid downmixToStereo option provided. Check your settings!\n`;
-        response.processFile = false;
-        return response;
-    }
-    if(!['false','true'].includes(downmixSecondaryStereo)) {
-        response.infoLog += `☒Somehow invalid downmixSecondaryStereo option provided. Check your settings!\n`;
-        response.processFile = false;
-        return response;
-    }
-    if(!['disabled','multi-stereo','multi-stereo-error','channel','channel-error'].includes(removeDuplicatesBy)) {
-        response.infoLog += `☒Somehow invalid removeDuplicatesBy option provided. Check your settings!\n`;
-        response.processFile = false;
-        return response;
-    }
-    if(!['false','6below','2below','all'].includes(forceCodec)) {
-        response.infoLog += `☒Somehow invalid forceCodec option provided. Check your settings!\n`;
-        response.processFile = false;
-        return response;
-    }
-    if(!['ac3','eac3','aac','opus'].includes(surroundCodec)) {
-        response.infoLog += `☒Somehow invalid surroundCodec option provided. Check your settings!\n`;
-        response.processFile = false;
-        return response;
-    }
-    if(!['ac3','eac3','aac','aac_vbr','opus'].includes(stereoCodec)) {
-        response.infoLog += `☒Somehow invalid stereoCodec option provided. Check your settings!\n`;
-        response.processFile = false;
-        return response;
-    }
-    if(!['default','dialogue'].includes(stereoDownmix)) {
-        response.infoLog += `☒Somehow invalid stereoDownmix option provided. Check your settings!\n`;
-        response.processFile = false;
-        return response;
-    }
-    if(!['false','quality','channel'].includes(keepBestSurroundSafe)) {
-        response.infoLog += `☒Somehow invalid keepBestSurroundSafe option provided. Check your settings!\n`;
-        response.processFile = false;
-        return response;
-    }
-    if(!['keep','drop','remix'].includes(methodOpusLayoutErr)) {
-        response.infoLog += `☒Somehow invalid methodOpusLayoutErr option provided. Check your settings!\n`;
-        response.processFile = false;
-        return response;
-    }
+    if(!['false','replace','true'].includes(downmixToSix))
+        failFile(`Somehow invalid downmixToSix option provided. Check your settings!`);
+    if(!['false','replace','true'].includes(downmixToTwo))
+        failFile(`Somehow invalid downmixToStereo option provided. Check your settings!`);
+    if(!['false','true'].includes(downmixSecondaryStereo))
+        failFile(`Somehow invalid downmixSecondaryStereo option provided. Check your settings!`);
+    if(!['ac3','eac3','aac','opus'].includes(surroundCodec))
+        failFile(`Somehow invalid surroundCodec option provided. Check your settings!`);
+    if(!['ac3','eac3','aac','aac_vbr','opus'].includes(stereoCodec))
+        failFile(`Somehow invalid stereoCodec option provided. Check your settings!`);
+    if(!['false','6below','2below','all'].includes(forceCodec))
+        failFile(`Somehow invalid forceCodec option provided. Check your settings!`);
+    if(!['false','quality','channel'].includes(keepBestSurroundSafe))
+        failFile(`Somehow invalid keepBestSurroundSafe option provided. Check your settings!`);
+    if(!['disabled','multi-stereo','multi-stereo-error','channel','channel-error'].includes(removeDuplicatesBy))
+        failFile(`Somehow invalid removeDuplicatesBy option provided. Check your settings!`);
+    if(!['default','dialogue'].includes(stereoDownmix))
+        failFile(`Somehow invalid stereoDownmix option provided. Check your settings!`);
+    if(!['keep','drop','remix'].includes(methodOpusLayoutErr))
+        failFile(`Somehow invalid methodOpusLayoutErr option provided. Check your settings!`);
 
     let extraArguments = '';
     let workDone = '';
@@ -754,392 +742,394 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Input summary — the streams exactly as they arrived, before any audio work.
     response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
 
-    // A secondary track is any commentary or visually-impaired/descriptive track — the shared classifiers cover both the disposition flags and the title
-    // keywords. Lyrics/songs are subtitle-only, so they never apply to an audio stream.
-    const isSecondaryTrack = (stream) => isCommentary(stream) || isDescriptive(stream);
+    // One guard around all the per-file work (dedup, index mapping, the transcode loop, and the output-summary / preset build): a deliberate failFile
+    // abort (AwkFailFile) rethrows unchanged, and any UNEXPECTED error fails the file too — annotated and carrying the full infoLog — not a silent skip.
+    // (Earlier input validation and the not-a-video / no-audio pre-flight checks run before this and fail-or-skip on their own.)
+    try {
 
-    //Add secondary track flag and the cleaned language to each track
-    audioStreams = audioStreams.map(item => {
-        const fullLang = resolveLang(item) || 'und';
-        const cleanLang = String(shortLang(fullLang));
-        // Enrich with mediaInfo bitrate before audioQuality scoring so that formats like DTS-HD MA (which ffprobe can't read a bitrate for in MP4/M4V
-        // containers) score and display correctly.
-        const enrichedItem = enrichStream(item);
-        return { ...enrichedItem,
-            isTdarrSecondaryTrack: isSecondaryTrack(item),
-            // Language-secondary: track language is not in downmixLanguage (when the list is non-empty). These tracks follow the secondary path
-            // (downmix_secondary_stereo, codec_force) but are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo).
-            isTdarrLangSecondary: downmixLanguage.length > 0 && !downmixLanguage.includes(cleanLang),
-            isTdarrCleanLang: cleanLang,
-            isTdarrFullLang: fullLang,
-            isTdarrQuality: audioQuality(enrichedItem),
-            // Used by codec_force to suppress the source-bitrate floor in resolveBitrate for lossless sources. A lossless bitrate (e.g. 4 Mbps TrueHD) is not a
-            // comparable quantity for a perceptual encode and would otherwise pin the output at the codec ceiling for no audible gain.
-            isTdarrLossless: losslessSource(item)
-        };
-    });
+        // A secondary track is any commentary or visually-impaired/descriptive track — the shared classifiers cover both the disposition flags and the title
+        // keywords. Lyrics/songs are subtitle-only, so they never apply to an audio stream.
+        const isSecondaryTrack = (stream) => isCommentary(stream) || isDescriptive(stream);
 
-    // candidateStreams: the pool for workStreams and keep_best_surround_safe. Lang-secondary tracks (unlisted language) are included here so codec_force
-    // and downmix_secondary_stereo can act on them. They are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo) in the processing
-    // loop below. Secondary and lang-secondary tracks are only dropped from the pool when there is genuinely nothing to do with them:
-    // downmix_secondary_stereo is false AND codec_force is false. When codec_force is set they stay so the force-codec path can standardize their codec
-    // too (e.g. codec_force='all' must touch every track, including commentary and unlisted-language tracks).
-    let candidateStreams = audioStreams;
-    if (downmixSecondaryStereo === 'false' && forceCodec === 'false')
-        candidateStreams = candidateStreams.filter(stream => !stream.isTdarrSecondaryTrack && !stream.isTdarrLangSecondary);
+        //Add secondary track flag and the cleaned language to each track
+        audioStreams = audioStreams.map(item => {
+            const fullLang = resolveLang(item) || 'und';
+            const cleanLang = String(shortLang(fullLang));
+            // Enrich with mediaInfo bitrate before audioQuality scoring so that formats like DTS-HD MA (which ffprobe can't read a bitrate for in MP4/M4V
+            // containers) score and display correctly.
+            const enrichedItem = enrichStream(item);
+            return { ...enrichedItem,
+                isTdarrSecondaryTrack: isSecondaryTrack(item),
+                // Language-secondary: track language is not in downmixLanguage (when the list is non-empty). These tracks follow the secondary path
+                // (downmix_secondary_stereo, codec_force) but are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo).
+                isTdarrLangSecondary: downmixLanguage.length > 0 && !downmixLanguage.includes(cleanLang),
+                isTdarrCleanLang: cleanLang,
+                isTdarrFullLang: fullLang,
+                isTdarrQuality: audioQuality(enrichedItem),
+                // Used by codec_force to suppress the source-bitrate floor in resolveBitrate for lossless sources. A lossless bitrate (e.g. 4 Mbps TrueHD) is not a
+                // comparable quantity for a perceptual encode and would otherwise pin the output at the codec ceiling for no audible gain.
+                isTdarrLossless: losslessSource(item)
+            };
+        });
 
-    // keep_best_surround_safe: protect the best track per language among preferred-language primary tracks. Lang-secondary and disposition-secondary tracks are
-    // excluded — protecting a non-preferred-language track or a commentary track serves no purpose and would prevent codec_force from touching it.
-    const protectedIndices = new Set();
-    if (keepBestSurroundSafe !== 'false') {
-        const bestByLang = new Map();
-        const qualityFirst = keepBestSurroundSafe === 'quality';
-        for (const s of candidateStreams) {
-            if (s.isTdarrSecondaryTrack || s.isTdarrLangSecondary) continue;
-            const cur = bestByLang.get(s.isTdarrCleanLang);
-            if (!cur) {
-                bestByLang.set(s.isTdarrCleanLang, s);
-                continue;
+        // candidateStreams: the pool for workStreams and keep_best_surround_safe. Lang-secondary tracks (unlisted language) are included here so codec_force
+        // and downmix_secondary_stereo can act on them. They are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo) in the processing
+        // loop below. Secondary and lang-secondary tracks are only dropped from the pool when there is genuinely nothing to do with them:
+        // downmix_secondary_stereo is false AND codec_force is false. When codec_force is set they stay so the force-codec path can standardize their codec
+        // too (e.g. codec_force='all' must touch every track, including commentary and unlisted-language tracks).
+        let candidateStreams = audioStreams;
+        if (downmixSecondaryStereo === 'false' && forceCodec === 'false')
+            candidateStreams = candidateStreams.filter(stream => !stream.isTdarrSecondaryTrack && !stream.isTdarrLangSecondary);
+
+        // keep_best_surround_safe: protect the best track per language among preferred-language primary tracks. Lang-secondary and disposition-secondary tracks are
+        // excluded — protecting a non-preferred-language track or a commentary track serves no purpose and would prevent codec_force from touching it.
+        const protectedIndices = new Set();
+        if (keepBestSurroundSafe !== 'false') {
+            const bestByLang = new Map();
+            const qualityFirst = keepBestSurroundSafe === 'quality';
+            for (const s of candidateStreams) {
+                if (s.isTdarrSecondaryTrack || s.isTdarrLangSecondary) continue;
+                const cur = bestByLang.get(s.isTdarrCleanLang);
+                if (!cur) {
+                    bestByLang.set(s.isTdarrCleanLang, s);
+                    continue;
+                }
+                const better = qualityFirst
+                    ? s.isTdarrQuality > cur.isTdarrQuality
+                      || (s.isTdarrQuality === cur.isTdarrQuality && s.channels > cur.channels)
+                      || (s.isTdarrQuality === cur.isTdarrQuality && s.channels === cur.channels && s.index < cur.index)
+                    : s.channels > cur.channels
+                      || (s.channels === cur.channels && s.isTdarrQuality > cur.isTdarrQuality)
+                      || (s.channels === cur.channels && s.isTdarrQuality === cur.isTdarrQuality && s.index < cur.index);
+                if (better) bestByLang.set(s.isTdarrCleanLang, s);
             }
-            const better = qualityFirst
-                ? s.isTdarrQuality > cur.isTdarrQuality
-                  || (s.isTdarrQuality === cur.isTdarrQuality && s.channels > cur.channels)
-                  || (s.isTdarrQuality === cur.isTdarrQuality && s.channels === cur.channels && s.index < cur.index)
-                : s.channels > cur.channels
-                  || (s.channels === cur.channels && s.isTdarrQuality > cur.isTdarrQuality)
-                  || (s.channels === cur.channels && s.isTdarrQuality === cur.isTdarrQuality && s.index < cur.index);
-            if (better) bestByLang.set(s.isTdarrCleanLang, s);
+            for (const s of bestByLang.values()) protectedIndices.add(s.index);
         }
-        for (const s of bestByLang.values()) protectedIndices.add(s.index);
-    }
 
-    // Languages that already have a primary stereo track, so downmix_to_stereo can honour "create a 2 channel track only if one doesn't exist". Uses
-    // isTdarrCleanLang (normalised short code, e.g. 'en' for 'en-US') to match the same key used by created2chLangs and ffstreamLangKey — preventing
-    // redundant stereo creation when the existing track is tagged with a regional variant like en-US.
-    const existingStereoLangs = new Set(audioStreams.filter(s => s.channels === 2 && !s.isTdarrSecondaryTrack && !s.isTdarrLangSecondary).map(s => s.isTdarrCleanLang));
+        // Languages that already have a primary stereo track, so downmix_to_stereo can honour "create a 2 channel track only if one doesn't exist". Uses
+        // isTdarrCleanLang (normalised short code, e.g. 'en' for 'en-US') to match the same key used by created2chLangs and ffstreamLangKey — preventing
+        // redundant stereo creation when the existing track is tagged with a regional variant like en-US.
+        const existingStereoLangs = new Set(audioStreams.filter(s => s.channels === 2 && !s.isTdarrSecondaryTrack && !s.isTdarrLangSecondary).map(s => s.isTdarrCleanLang));
 
-    // Languages that already have a primary 5.1/6ch track, so downmix_to_six can honour "create a 5.1 track only if one doesn't exist". Mirrors
-    // existingStereoLangs. Channels > 4 && <= 6 covers 5.0 and 5.1 without catching 4.0/4.1 or 7.1 sources.
-    const existingSixLangs = new Set(audioStreams.filter(s => s.channels > 4 && s.channels <= 6 && !s.isTdarrSecondaryTrack && !s.isTdarrLangSecondary).map(s => s.isTdarrCleanLang));
+        // Languages that already have a primary 5.1/6ch track, so downmix_to_six can honour "create a 5.1 track only if one doesn't exist". Mirrors
+        // existingStereoLangs. Channels > 4 && <= 6 covers 5.0 and 5.1 without catching 4.0/4.1 or 7.1 sources.
+        const existingSixLangs = new Set(audioStreams.filter(s => s.channels > 4 && s.channels <= 6 && !s.isTdarrSecondaryTrack && !s.isTdarrLangSecondary).map(s => s.isTdarrCleanLang));
 
-    // Identify lower-quality duplicates. Within each group keep only the highest quality stream; the rest are marked for removal ('multi-stereo'/'channel')
-    // or, for the "-error" variants, abort the plugin immediately (no streams removed, no other changes applied). The "-error" suffix only changes what
-    // happens on a hit, never the grouping. Grouping key by mode:
-    //   'channel'/'channel-error' - (lang, exact channel count, primary/secondary): one track per distinct channel count survives (a 7.1, a 5.1 and
-    //     a 2.0 of the same language are all kept).
-    //   'multi-stereo'/'multi-stereo-error' - (lang, broad surround-vs-stereo role, primary/secondary): collapses every surround variant of a
-    //     language to a single best surround plus a single best stereo.
-    //       Exception: when downmix_to_six is enabled the 5-6ch band is carved into its own role (not folded into "surround") so a
-    //       downmix-created/pre-existing 5.1/5.0 is never removed in favour of a 7.1.
-    //       Exception: when downmix_to_stereo is enabled exactly-2ch tracks are carved into their own role (not folded into "stereo") so a
-    //       downmix-created/pre-existing 2.0 is never removed in favour of a mono.
-    //       Both exceptions only apply while the matching downmix option is enabled and use the same channel bands as existingSixLangs/
-    //       existingStereoLangs, so dedup can't disagree with and re-trigger the downmix creation guards (this previously caused an infinite
-    //       create/remove loop between the two plugin runs).
-    // Note: dedup runs across ALL audio streams regardless of downmix_language/downmix_secondary_stereo (those govern transcoding candidates, not what's a
-    // genuine duplicate - a duplicate in a non-preferred language is still a duplicate). Protected (keep_best_surround_safe) tracks are never removed and
-    // never trigger the "-error" abort - a protected track was never a removal candidate.
-    const removeDuplicatesErrorMode = removeDuplicatesBy === 'multi-stereo-error' || removeDuplicatesBy === 'channel-error';
-    const removeDuplicatesGroupBy = removeDuplicatesErrorMode ? removeDuplicatesBy.replace(/-error$/, '') : removeDuplicatesBy;
-    const streamsToRemove = new Set();
-    if (removeDuplicatesGroupBy === 'channel' || removeDuplicatesGroupBy === 'multi-stereo') {
-        const seen = new Map();
-        // A measured bitrate beats a bitrate-less duplicate of the same tier: audioQuality can only ESTIMATE a track with no reported bitrate (optimistically,
-        // from the codec's per-channel target), so it must not win the "which duplicate to keep" decision over a track whose bitrate we actually measured. Both
-        // probes are already consulted (resolveStreamBitrate above), so bit_rate === 0 here means genuinely unknown, not just "ffprobe couldn't read it".
-        const hasKnownRate = (s) => Number(s.bit_rate || 0) > 0;
-        // On a quality tie, keep the higher channel count before falling back to index - matches keep_best_surround_safe, so multi-stereo dedup collapsing a
-        // language's surround variants keeps the 7.1 over a same-quality 5.1 (channel mode already tiers by exact count, so this only bites the broad modes).
-        const byQuality = [...audioStreams].sort((a, b) =>
-            (hasKnownRate(b) ? 1 : 0) - (hasKnownRate(a) ? 1 : 0) || b.isTdarrQuality - a.isTdarrQuality || b.channels - a.channels || a.index - b.index);
-        for (const s of byQuality) {
-            let tier;
-            if (removeDuplicatesGroupBy === 'channel') {
-                tier = s.channels;
-            } else if (downmixToSix !== 'false' && s.channels > 4 && s.channels <= 6) {
-                tier = 'six';
-            } else if (downmixToTwo !== 'false' && s.channels === 2) {
-                tier = 'stereo2';
-            } else {
-                tier = s.channels > 2 ? 'surround' : 'stereo';
-            }
-            // Group only by the genuine commentary/VI marker (isTdarrSecondaryTrack), NOT by lang-secondary. A foreign-language MAIN track and a
-            // foreign-language COMMENTARY track share the same language and channel count but are different content — keying on lang-secondary would
-            // collapse them together and wrongly delete the commentary.
-            const key = `${s.isTdarrCleanLang}|${tier}|${s.isTdarrSecondaryTrack}`;
-            if (seen.has(key)) {
-                if (protectedIndices.has(s.index)) continue;
-                const kept = seen.get(key);
-                if (removeDuplicatesErrorMode) {
+        // Identify lower-quality duplicates. Within each group keep only the highest quality stream; the rest are marked for removal ('multi-stereo'/'channel')
+        // or, for the "-error" variants, abort the plugin immediately (no streams removed, no other changes applied). The "-error" suffix only changes what
+        // happens on a hit, never the grouping. Grouping key by mode:
+        //   'channel'/'channel-error' - (lang, exact channel count, primary/secondary): one track per distinct channel count survives (a 7.1, a 5.1 and
+        //     a 2.0 of the same language are all kept).
+        //   'multi-stereo'/'multi-stereo-error' - (lang, broad surround-vs-stereo role, primary/secondary): collapses every surround variant of a
+        //     language to a single best surround plus a single best stereo.
+        //       Exception: when downmix_to_six is enabled the 5-6ch band is carved into its own role (not folded into "surround") so a
+        //       downmix-created/pre-existing 5.1/5.0 is never removed in favour of a 7.1.
+        //       Exception: when downmix_to_stereo is enabled exactly-2ch tracks are carved into their own role (not folded into "stereo") so a
+        //       downmix-created/pre-existing 2.0 is never removed in favour of a mono.
+        //       Both exceptions only apply while the matching downmix option is enabled and use the same channel bands as existingSixLangs/
+        //       existingStereoLangs, so dedup can't disagree with and re-trigger the downmix creation guards (this previously caused an infinite
+        //       create/remove loop between the two plugin runs).
+        // Note: dedup runs across ALL audio streams regardless of downmix_language/downmix_secondary_stereo (those govern transcoding candidates, not what's a
+        // genuine duplicate - a duplicate in a non-preferred language is still a duplicate). Protected (keep_best_surround_safe) tracks are never removed and
+        // never trigger the "-error" abort - a protected track was never a removal candidate.
+        const removeDuplicatesErrorMode = removeDuplicatesBy === 'multi-stereo-error' || removeDuplicatesBy === 'channel-error';
+        const removeDuplicatesGroupBy = removeDuplicatesErrorMode ? removeDuplicatesBy.replace(/-error$/, '') : removeDuplicatesBy;
+        const streamsToRemove = new Set();
+        if (removeDuplicatesGroupBy === 'channel' || removeDuplicatesGroupBy === 'multi-stereo') {
+            const seen = new Map();
+            // A measured bitrate beats a bitrate-less duplicate of the same tier: audioQuality can only ESTIMATE a track with no reported bitrate (optimistically,
+            // from the codec's per-channel target), so it must not win the "which duplicate to keep" decision over a track whose bitrate we actually measured. Both
+            // probes are already consulted (resolveStreamBitrate above), so bit_rate === 0 here means genuinely unknown, not just "ffprobe couldn't read it".
+            const hasKnownRate = (s) => Number(s.bit_rate || 0) > 0;
+            // On a quality tie, keep the higher channel count before falling back to index - matches keep_best_surround_safe, so multi-stereo dedup collapsing a
+            // language's surround variants keeps the 7.1 over a same-quality 5.1 (channel mode already tiers by exact count, so this only bites the broad modes).
+            const byQuality = [...audioStreams].sort((a, b) =>
+                (hasKnownRate(b) ? 1 : 0) - (hasKnownRate(a) ? 1 : 0) || b.isTdarrQuality - a.isTdarrQuality || b.channels - a.channels || a.index - b.index);
+            for (const s of byQuality) {
+                let tier;
+                if (removeDuplicatesGroupBy === 'channel') {
+                    tier = s.channels;
+                } else if (downmixToSix !== 'false' && s.channels > 4 && s.channels <= 6) {
+                    tier = 'six';
+                } else if (downmixToTwo !== 'false' && s.channels === 2) {
+                    tier = 'stereo2';
+                } else {
+                    tier = s.channels > 2 ? 'surround' : 'stereo';
+                }
+                // Group only by the genuine commentary/VI marker (isTdarrSecondaryTrack), NOT by lang-secondary. A foreign-language MAIN track and a
+                // foreign-language COMMENTARY track share the same language and channel count but are different content — keying on lang-secondary would
+                // collapse them together and wrongly delete the commentary.
+                const key = `${s.isTdarrCleanLang}|${tier}|${s.isTdarrSecondaryTrack}`;
+                if (seen.has(key)) {
+                    if (protectedIndices.has(s.index)) continue;
+                    const kept = seen.get(key);
+                    if (removeDuplicatesErrorMode) {
+                        const rmRate = hasKnownRate(s) ? ` @ ${Math.round(Number(s.bit_rate) / 1000)} kb/s` : '';
+                        const keptRate = hasKnownRate(kept) ? ` @ ${Math.round(Number(kept.bit_rate) / 1000)} kb/s` : '';
+                        failFile(`Stream ${s.index}: Duplicate audio track detected (${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang}${rmRate}) alongside stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate}) under remove_duplicates_by="${removeDuplicatesBy}". Aborting - tag/remove tracks manually and requeue, or switch remove_duplicates_by to a non-error mode.`);
+                    }
+                    streamsToRemove.add(s.index);
+                    // Show the removed track's bitrate and the kept track's for contrast — duplicates are
+                    // decided by quality score (largely bitrate-driven), so this makes the choice transparent.
                     const rmRate = hasKnownRate(s) ? ` @ ${Math.round(Number(s.bit_rate) / 1000)} kb/s` : '';
                     const keptRate = hasKnownRate(kept) ? ` @ ${Math.round(Number(kept.bit_rate) / 1000)} kb/s` : '';
-                    response.infoLog += `☒Stream ${s.index}: Duplicate audio track detected (${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang}${rmRate}) alongside stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate}) under remove_duplicates_by="${removeDuplicatesBy}". Aborting - tag/remove tracks manually and requeue, or switch remove_duplicates_by to a non-error mode.\n`;
-                    response.processFile = false;
-                    return response;
-                }
+                    workDone += `☐Stream ${s.index}: Removing duplicate (lower quality ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang}${rmRate}) - keeping stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate})\n`;
+                } else
+                    seen.set(key, s);
+            }
+        }
+
+        // libopus only accepts its RFC-mapping layouts and HARD-ERRORS on the rest, failing the whole job; ffmpeg's DEFAULT layout for 3ch
+        // (2.1) and 4ch (4.0) is also rejected. AC3/EAC3/AAC accept every layout, so this only guards the force-to-opus path. OK set + relabels
+        // verified via `anullsrc=channel_layout=X -c:a libopus` on jellyfin-ffmpeg (see the ffmpeg-codec-ranges memory).
+        const OPUS_OK_LAYOUTS = new Set(['mono', 'stereo', '3.0', 'quad', '5.0', '5.1', '5.1(side)', '6.1', '7.1']);
+        const opusAcceptsLayout = (channels, layoutStr) => {
+            const lay = (layoutStr || '').toLowerCase().trim();
+            if (lay) return OPUS_OK_LAYOUTS.has(lay);
+            // No explicit layout → ffmpeg assigns the default for the count; those are OK for every count EXCEPT 3 (2.1) and 4 (4.0).
+            return channels >= 1 && channels <= 8 && channels !== 3 && channels !== 4;
+        };
+        // Layouts that map LOSSLESSLY to an opus-accepted layout at the SAME channel count by pure relabel (side↔back position equivalence)
+        // - emitted via channelmap (a permutation matrix, never a mix). Anything not here remixes down to stereo.
+        const OPUS_RELABEL = {
+            '5.0(side)': { layout: '5.0', map: 'FL-FL|FR-FR|FC-FC|SL-BL|SR-BR' },
+            '6.1(back)': { layout: '6.1', map: 'FL-FL|FR-FR|FC-FC|LFE-LFE|BL-SL|BR-SR|BC-BC' },
+        };
+        // Audio streams still present (not in streamsToRemove), read at call time so it reflects dedup + pre-pass removals - backs the never-drop-last-track guard.
+        const countSurvivingAudio = () => file.ffProbeData.streams.filter(a => (a?.codec_type || '').toLowerCase() === 'audio' && !streamsToRemove.has(a.index)).length;
+
+        // method_opus_layout_err=drop must remove streams BEFORE outputAudioIdxMap / the -map removal are built below - a mid-loop removal
+        // would break the OTHER forced tracks' -c:a:N numbering. Pre-scan for a surround track codec_force would send to opus with a
+        // libopus-incompatible layout that NO downmix will convert to stereo, and remove it (never the last audio track). keep/remix stay in
+        // the loop; this mirrors the loop's surround shouldForce for exactly the drop subset.
+        if (methodOpusLayoutErr === 'drop' && forceCodec !== 'false' && surroundCodec === 'opus') {
+            for (const s of audioStreams) {
+                if (streamsToRemove.has(s.index)) continue;
+                const ch = resolveChannels(s);
+                const lay = (s.channel_layout || '').toLowerCase().trim();
+                if (ch <= 2 || ch > 8) continue;                                             // stereo→codec_stereo; >8 blocked (targetMaxCh)
+                if ((s.codec_name || '').toLowerCase() === 'opus') continue;                 // already opus
+                if (protectedIndices.has(s.index) && forceCodec !== 'all') continue;         // keep_best_surround_safe
+                if (!(forceCodec === 'all' || (forceCodec === '6below' && ch <= 6))) continue;   // surround shouldForce (mirrors the loop)
+                if (opusAcceptsLayout(ch, lay)) continue;
+                if (OPUS_RELABEL[lay]) continue;                                             // losslessly relabelable → the loop transcodes it, never drop
+                // A downmix that converts this track to stereo makes it opus-safe → don't drop: secondary→downmix_secondary_stereo=true; primary→
+                // downmix_to_stereo=replace (any >2ch), or downmix_to_six=replace (>6ch → opus-safe 5.1). Only a NON-protected primary converts in place: a
+                // protected best track flips 'replace'→'add' (leaves the surround, so force still hits it), so those stay droppable. The per-language one-shot
+                // (created2chLangs/six) is dynamic and can't be predicted here; if it pre-empts the downmix the track lands in the loop fallback, logged there.
+                const secondary = s.isTdarrSecondaryTrack || s.isTdarrLangSecondary;
+                if (secondary ? downmixSecondaryStereo === 'true'
+                              : (!protectedIndices.has(s.index) && (downmixToTwo === 'replace' || (ch > 6 && downmixToSix === 'replace')))) continue;
+                if (countSurvivingAudio() <= 1) continue;                                    // never drop the last audio track
                 streamsToRemove.add(s.index);
-                // Show the removed track's bitrate and the kept track's for contrast — duplicates are
-                // decided by quality score (largely bitrate-driven), so this makes the choice transparent.
-                const rmRate = hasKnownRate(s) ? ` @ ${Math.round(Number(s.bit_rate) / 1000)} kb/s` : '';
-                const keptRate = hasKnownRate(kept) ? ` @ ${Math.round(Number(kept.bit_rate) / 1000)} kb/s` : '';
-                workDone += `☐Stream ${s.index}: Removing duplicate (lower quality ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang}${rmRate}) - keeping stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate})\n`;
-            } else
-                seen.set(key, s);
+                workDone += `☒Stream ${s.index}: Dropping - libopus can't encode a ${s.channel_layout || `${ch}ch`} layout (method_opus_layout_err=drop).\n`;
+            }
         }
-    }
 
-    // libopus only accepts its RFC-mapping layouts and HARD-ERRORS on the rest, failing the whole job; ffmpeg's DEFAULT layout for 3ch
-    // (2.1) and 4ch (4.0) is also rejected. AC3/EAC3/AAC accept every layout, so this only guards the force-to-opus path. OK set + relabels
-    // verified via `anullsrc=channel_layout=X -c:a libopus` on jellyfin-ffmpeg (see the ffmpeg-codec-ranges memory).
-    const OPUS_OK_LAYOUTS = new Set(['mono', 'stereo', '3.0', 'quad', '5.0', '5.1', '5.1(side)', '6.1', '7.1']);
-    const opusAcceptsLayout = (channels, layoutStr) => {
-        const lay = (layoutStr || '').toLowerCase().trim();
-        if (lay) return OPUS_OK_LAYOUTS.has(lay);
-        // No explicit layout → ffmpeg assigns the default for the count; those are OK for every count EXCEPT 3 (2.1) and 4 (4.0).
-        return channels >= 1 && channels <= 8 && channels !== 3 && channels !== 4;
-    };
-    // Layouts that map LOSSLESSLY to an opus-accepted layout at the SAME channel count by pure relabel (side↔back position equivalence)
-    // - emitted via channelmap (a permutation matrix, never a mix). Anything not here remixes down to stereo.
-    const OPUS_RELABEL = {
-        '5.0(side)': { layout: '5.0', map: 'FL-FL|FR-FR|FC-FC|SL-BL|SR-BR' },
-        '6.1(back)': { layout: '6.1', map: 'FL-FL|FR-FR|FC-FC|LFE-LFE|BL-SL|BR-SR|BC-BC' },
-    };
-    // Audio streams still present (not in streamsToRemove), read at call time so it reflects dedup + pre-pass removals - backs the never-drop-last-track guard.
-    const countSurvivingAudio = () => file.ffProbeData.streams.filter(a => (a?.codec_type || '').toLowerCase() === 'audio' && !streamsToRemove.has(a.index)).length;
-
-    // method_opus_layout_err=drop must remove streams BEFORE outputAudioIdxMap / the -map removal are built below - a mid-loop removal
-    // would break the OTHER forced tracks' -c:a:N numbering. Pre-scan for a surround track codec_force would send to opus with a
-    // libopus-incompatible layout that NO downmix will convert to stereo, and remove it (never the last audio track). keep/remix stay in
-    // the loop; this mirrors the loop's surround shouldForce for exactly the drop subset.
-    if (methodOpusLayoutErr === 'drop' && forceCodec !== 'false' && surroundCodec === 'opus') {
-        for (const s of audioStreams) {
-            if (streamsToRemove.has(s.index)) continue;
-            const ch = resolveChannels(s);
-            const lay = (s.channel_layout || '').toLowerCase().trim();
-            if (ch <= 2 || ch > 8) continue;                                             // stereo→codec_stereo; >8 blocked (targetMaxCh)
-            if ((s.codec_name || '').toLowerCase() === 'opus') continue;                 // already opus
-            if (protectedIndices.has(s.index) && forceCodec !== 'all') continue;         // keep_best_surround_safe
-            if (!(forceCodec === 'all' || (forceCodec === '6below' && ch <= 6))) continue;   // surround shouldForce (mirrors the loop)
-            if (opusAcceptsLayout(ch, lay)) continue;
-            if (OPUS_RELABEL[lay]) continue;                                             // losslessly relabelable → the loop transcodes it, never drop
-            // A downmix that converts this track to stereo makes it opus-safe → don't drop: secondary→downmix_secondary_stereo=true; primary→
-            // downmix_to_stereo=replace (any >2ch), or downmix_to_six=replace (>6ch → opus-safe 5.1). Only a NON-protected primary converts in place: a
-            // protected best track flips 'replace'→'add' (leaves the surround, so force still hits it), so those stay droppable. The per-language one-shot
-            // (created2chLangs/six) is dynamic and can't be predicted here; if it pre-empts the downmix the track lands in the loop fallback, logged there.
-            const secondary = s.isTdarrSecondaryTrack || s.isTdarrLangSecondary;
-            if (secondary ? downmixSecondaryStereo === 'true'
-                          : (!protectedIndices.has(s.index) && (downmixToTwo === 'replace' || (ch > 6 && downmixToSix === 'replace')))) continue;
-            if (countSurvivingAudio() <= 1) continue;                                    // never drop the last audio track
-            streamsToRemove.add(s.index);
-            workDone += `☒Stream ${s.index}: Dropping - libopus can't encode a ${s.channel_layout || `${ch}ch`} layout (method_opus_layout_err=drop).\n`;
+        // inputAudioIdxMap: 0-based audio-type index within the INPUT file (for -map 0:a:N).
+        // outputAudioIdxMap: 0-based audio-type index within the OUTPUT (for -c:a:N and -metadata:s:a:N).
+        // These differ when removeDuplicatesBy removes streams, since -map 0:a:N always references input.
+        const inputAudioIdxMap = new Map();
+        const outputAudioIdxMap = new Map();
+        let inputAudioCounter = 0;
+        let totalOutputAudioBeforeNew = 0;
+        for (const stream of file.ffProbeData.streams) {
+            if ((stream?.codec_type || '').trim().toLowerCase() === 'audio') {
+                inputAudioIdxMap.set(stream.index, inputAudioCounter++);
+                if (!streamsToRemove.has(stream.index))
+                    outputAudioIdxMap.set(stream.index, totalOutputAudioBeforeNew++);
+            }
         }
-    }
 
-    // inputAudioIdxMap: 0-based audio-type index within the INPUT file (for -map 0:a:N).
-    // outputAudioIdxMap: 0-based audio-type index within the OUTPUT (for -c:a:N and -metadata:s:a:N).
-    // These differ when removeDuplicatesBy removes streams, since -map 0:a:N always references input.
-    const inputAudioIdxMap = new Map();
-    const outputAudioIdxMap = new Map();
-    let inputAudioCounter = 0;
-    let totalOutputAudioBeforeNew = 0;
-    for (const stream of file.ffProbeData.streams) {
-        if ((stream?.codec_type || '').trim().toLowerCase() === 'audio') {
-            inputAudioIdxMap.set(stream.index, inputAudioCounter++);
-            if (!streamsToRemove.has(stream.index))
-                outputAudioIdxMap.set(stream.index, totalOutputAudioBeforeNew++);
-        }
-    }
+        //Remove any tracks that we won't use based on channel count, etc.
+        // aac_vbr is treated as the aac family for codec-identity checks — ffprobe always reports codec_name 'aac' regardless of which encoder produced the
+        // track, so comparing against 'aac_vbr' directly would never match and would needlessly re-encode existing AAC tracks.
+        const stereoCodecFamily = stereoCodec === 'aac_vbr' ? 'aac' : stereoCodec;
+        const channelMatch = (stream) => {
+            //8 channel
+            if(stream.channels > 6 && (downmixToSix === 'false') && (downmixToTwo === 'false') && (forceCodec === 'all' && ((stream?.codec_name ?? '').trim().toLowerCase() === surroundCodec)))
+                return false;
+            //3-6 channel
+            else if(stream.channels > 2 && stream.channels <= 6 && (downmixToTwo === 'false') && (['all','6below'].includes(forceCodec) && ((stream?.codec_name ?? '').trim().toLowerCase() === surroundCodec)))
+                return false;
+            if((stream.channels <= 2) && ['all','6below','2below'].includes(forceCodec) && ((stream?.codec_name ?? '').trim().toLowerCase() === stereoCodecFamily))
+                return false;
+            return true;
+        };
 
-    //Remove any tracks that we won't use based on channel count, etc.
-    // aac_vbr is treated as the aac family for codec-identity checks — ffprobe always reports codec_name 'aac' regardless of which encoder produced the
-    // track, so comparing against 'aac_vbr' directly would never match and would needlessly re-encode existing AAC tracks.
-    const stereoCodecFamily = stereoCodec === 'aac_vbr' ? 'aac' : stereoCodec;
-    const channelMatch = (stream) => {
-        //8 channel
-        if(stream.channels > 6 && (downmixToSix === 'false') && (downmixToTwo === 'false') && (forceCodec === 'all' && ((stream?.codec_name ?? '').trim().toLowerCase() === surroundCodec)))
-            return false;
-        //3-6 channel
-        else if(stream.channels > 2 && stream.channels <= 6 && (downmixToTwo === 'false') && (['all','6below'].includes(forceCodec) && ((stream?.codec_name ?? '').trim().toLowerCase() === surroundCodec)))
-            return false;
-        if((stream.channels <= 2) && ['all','6below','2below'].includes(forceCodec) && ((stream?.codec_name ?? '').trim().toLowerCase() === stereoCodecFamily))
-            return false;
-        return true;
-    };
+        // workStreams: surviving candidates that still need codec work (downmix or force codec).
+        let workStreams = candidateStreams
+            .filter(s => !streamsToRemove.has(s.index))
+            .filter(s => channelMatch(s));
 
-    // workStreams: surviving candidates that still need codec work (downmix or force codec).
-    let workStreams = candidateStreams
-        .filter(s => !streamsToRemove.has(s.index))
-        .filter(s => channelMatch(s));
+        workStreams.sort((a, b) => {
+            // language priority
+            let aLang = downmixLanguage.indexOf(a.isTdarrFullLang);
+            let bLang = downmixLanguage.indexOf(b.isTdarrFullLang);
 
-    workStreams.sort((a, b) => {
-        // language priority
-        let aLang = downmixLanguage.indexOf(a.isTdarrFullLang);
-        let bLang = downmixLanguage.indexOf(b.isTdarrFullLang);
+            if(aLang === -1) aLang = downmixLanguage.indexOf(a.isTdarrCleanLang);
+            if(bLang === -1) bLang = downmixLanguage.indexOf(b.isTdarrCleanLang);
 
-        if(aLang === -1) aLang = downmixLanguage.indexOf(a.isTdarrCleanLang);
-        if(bLang === -1) bLang = downmixLanguage.indexOf(b.isTdarrCleanLang);
+            const aRank = aLang === -1 ? 999 : aLang;
+            const bRank = bLang === -1 ? 999 : bLang;
+            if (aRank !== bRank) return aRank - bRank;
 
-        const aRank = aLang === -1 ? 999 : aLang;
-        const bRank = bLang === -1 ? 999 : bLang;
-        if (aRank !== bRank) return aRank - bRank;
+            const aRole = (a.isTdarrSecondaryTrack || a.isTdarrLangSecondary) ? 1 : 0;
+            const bRole = (b.isTdarrSecondaryTrack || b.isTdarrLangSecondary) ? 1 : 0;
+            if (aRole !== bRole) return aRole - bRole;
 
-        const aRole = (a.isTdarrSecondaryTrack || a.isTdarrLangSecondary) ? 1 : 0;
-        const bRole = (b.isTdarrSecondaryTrack || b.isTdarrLangSecondary) ? 1 : 0;
-        if (aRole !== bRole) return aRole - bRole;
+            // channel ordering
+            if (a.channels !== b.channels)
+                return b.channels - a.channels;
 
-        // channel ordering
-        if (a.channels !== b.channels)
-            return b.channels - a.channels;
+            const aQuality = a.isTdarrQuality;
+            const bQuality = b.isTdarrQuality;
+            if(aQuality !== bQuality) return bQuality - aQuality;
 
-        const aQuality = a.isTdarrQuality;
-        const bQuality = b.isTdarrQuality;
-        if(aQuality !== bQuality) return bQuality - aQuality;
-
-        return a.index - b.index;
-    });
-
-    if (workStreams.length === 0 && streamsToRemove.size === 0) {
-        response.infoLog += '☑ No audio tracks require changes.\n';
-        return response;
-    }
-
-    // Seed extraArguments with removal exclusions before any codec args.
-    if (streamsToRemove.size > 0) {
-        for (const idx of streamsToRemove)
-            extraArguments += ` -map -0:${idx}`;
-        convert = true;
-    }
-
-    // New streams added via -map are numbered after all surviving original audio streams.
-    let newStreamOutputIdx = totalOutputAudioBeforeNew;
-
-    // Create at most one 6ch and one 2ch downmix per language, sourced from that language's best (first, highest-channel/quality) track.
-    const created6chLangs = new Set();
-    const created2chLangs = new Set();
-
-    // Tracks which input audio indices have already received a -c:a:N assignment so we don't emit conflicting codec directives for the same stream.
-    const modifiedAudioIdx = new Set();
-
-    // Predicted-output tracking for the closing summary line (does not affect the ffmpeg preset).
-    // outputAudioOverride: outputAudioIdx -> {codec, channels, bps} for in-place transcodes/downmixes.
-    // appendedAudio: streams added via -map 0:a:N (downmix 'true'/add), appended after all originals.
-    const outputAudioOverride = new Map();
-    const appendedAudio = [];
-
-    // Build the title for a new or replaced track. The original track title is always preserved and the new channel count is appended with -> (e.g. a
-    // source titled "E-AC-3 Atmos 5.1" downmixed to stereo becomes "E-AC-3 Atmos 5.1 -> 2.0"). This keeps role words like "Commentary"/"Director's
-    // Commentary" visible after a downmix. When the source has no title the new channel count alone is used (e.g. "2.0"). If the title already ends in
-    // the target label (not preceded by a digit/dot, so "5.1" won't match "15.1") it is returned unchanged to avoid "... 2.0 -> 2.0".
-    const buildTitle = (srcStream, targetLabel) => {
-        const origTitle = (srcStream.tags?.title || mediaInfoFor(srcStream)?.Title || '').trim();
-        if (!origTitle) return targetLabel;
-        const escapedLabel = targetLabel.replace(/\./g, '\\.');
-        if (new RegExp(`(?:^|[^0-9.])${escapedLabel}$`).test(origTitle)) return origTitle;
-        return `${origTitle} -> ${targetLabel}`;
-    };
-
-    // Lo/Ro stereo downmix matrices, generated from each source layout's exact channel order.
-    // WHY layout-keyed and not channel-count-keyed: several standard layouts share a channel count but order their channels differently (e.g. 6 channels
-    // can be 5.1, 5.1(side), 6.0, 6.0(front), or hexagonal). A count-based matrix would silently mis-route - dropping the wrong channel as "LFE" or
-    // panning a back-center where a surround belongs - producing audio that sounds wrong without any error. So we resolve the EXACT layout to its
-    // canonical channel list and build the matrix from speaker roles. Any layout without a verified channel list returns null and the caller falls back
-    // to ffmpeg's safe -ac 2 downmix.
-    // Downmix rules (standard Lo/Ro): FL/FR kept at full scale (peak 1.0); FC at -3 dB (0.707) into both so dialogue stays clear; LFE dropped (avoids
-    // mud); back/side/wide at -3 dB to their own side; any centered channel (FC, BC) split equally to both sides. The -3 dB attenuation on
-    // center/surround provides the clipping headroom, matching the industry-standard Lo/Ro downmix used by Blu-ray players, AV receivers, and streaming
-    // services.
-    // Canonical ffmpeg channel lists per layout (verified against ffmpeg-utils "Channel Layout" docs). Position in the array is the cN index used by
-    // the pan filter.
-    const CANON_LAYOUTS = {
-        '3.1':            ['FL', 'FR', 'FC', 'LFE'],
-        '4.0':            ['FL', 'FR', 'FC', 'BC'],
-        '5.0':            ['FL', 'FR', 'FC', 'BL', 'BR'],
-        '5.0(side)':      ['FL', 'FR', 'FC', 'SL', 'SR'],
-        '5.1':            ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR'],
-        '5.1(side)':      ['FL', 'FR', 'FC', 'LFE', 'SL', 'SR'],
-        '6.1':            ['FL', 'FR', 'FC', 'LFE', 'BC', 'SL', 'SR'],
-        '6.1(back)':      ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'BC'],
-        '6.1(front)':     ['FL', 'FR', 'LFE', 'FLC', 'FRC', 'SL', 'SR'],
-        '7.1':            ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'SL', 'SR'],
-        '7.1(wide)':      ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'FLC', 'FRC'],
-        '7.1(wide-side)': ['FL', 'FR', 'FC', 'LFE', 'FLC', 'FRC', 'SL', 'SR'],
-    };
-
-    // Per-speaker contribution to the L and R downmix outputs. Centered channels (FC, BC) contribute equally to both; left-side channels contribute only to L,
-    // right-side only to R; LFE contributes nothing. Values are the standard Lo/Ro gains.
-    const SPEAKER_GAINS = {
-        FL:  { L: 1.0,   R: 0     },
-        FR:  { L: 0,     R: 1.0   },
-        FC:  { L: 0.707, R: 0.707 },
-        LFE: { L: 0,     R: 0     },
-        BL:  { L: 0.707, R: 0     },
-        BR:  { L: 0,     R: 0.707 },
-        SL:  { L: 0.707, R: 0     },
-        SR:  { L: 0,     R: 0.707 },
-        FLC: { L: 0.707, R: 0     },
-        FRC: { L: 0,     R: 0.707 },
-        BC:  { L: 0.5,   R: 0.5   },
-    };
-
-    // Build a Lo/Ro pan=stereo matrix string for a known canonical layout, or null if the layout contributes no surround/center content (pure FL/FR or
-    // FL/FR/LFE) where -ac 2 is already correct. FL/FR kept at full scale (peak 1.0); center/surround fold in at standard Lo/Ro gains (-3 dB for
-    // FC/BC/surrounds, LFE dropped). The -3 dB attenuation provides the clipping headroom - a global sum-normalization is not used because it produces
-    // output 6-8 dB quieter than the source on typical content.
-    const buildPanMatrix = (channelList) => {
-        const termsL = [];
-        const termsR = [];
-        let peakL = 0;
-        let peakR = 0;
-        let hasNonFront = false; // any channel beyond FL/FR/LFE that needs explicit panning
-
-        channelList.forEach((spk, i) => {
-            const g = SPEAKER_GAINS[spk];
-            if (!g) return; // unknown speaker name — skip (shouldn't happen for canonical layouts)
-            if (spk !== 'FL' && spk !== 'FR' && spk !== 'LFE') hasNonFront = true;
-            if (spk === 'FL') peakL = 1.0;
-            if (spk === 'FR') peakR = 1.0;
+            return a.index - b.index;
         });
 
-        // No surround/center to fold in (e.g. 2.1 = FL FR LFE, or stereo) — let -ac 2 handle it.
-        if (!hasNonFront) return null;
-        // Defensive: a layout missing a front channel leaves peakL/peakR at 0 and would make the gain normalisation below divide by zero. Every canonical
-        // layout leads with FL,FR so this never triggers today - it just keeps the matrix safe if a non-FL/FR-leading layout is ever added to CANON_LAYOUTS.
-        if (peakL <= 0 || peakR <= 0) return null;
+        if (workStreams.length === 0 && streamsToRemove.size === 0) {
+            response.infoLog += '☑ No audio tracks require changes.\n';
+            return response;
+        }
 
-        channelList.forEach((spk, i) => {
-            const g = SPEAKER_GAINS[spk];
-            if (!g) return;
-            // Divide by peakL/peakR (always 1.0 — set from FL/FR) so coefficients are emitted as-authored.
-            // Floor to 3 decimals (truncate, not round) for deterministic output.
-            if (g.L > 0) termsL.push(`${(Math.floor((g.L / peakL) * 1000) / 1000).toFixed(3)}*c${i}`);
-            if (g.R > 0) termsR.push(`${(Math.floor((g.R / peakR) * 1000) / 1000).toFixed(3)}*c${i}`);
-        });
+        // Seed extraArguments with removal exclusions before any codec args.
+        if (streamsToRemove.size > 0) {
+            for (const idx of streamsToRemove)
+                extraArguments += ` -map -0:${idx}`;
+            convert = true;
+        }
 
-        return `pan=stereo|FL=${termsL.join('+')}|FR=${termsR.join('+')}`;
-    };
+        // New streams added via -map are numbered after all surviving original audio streams.
+        let newStreamOutputIdx = totalOutputAudioBeforeNew;
 
-    // Resolve a source stream to its canonical layout key, then to a verified pan matrix (or null). We normalize the ffmpeg channel_layout string (lowercased,
-    // trimmed). If the file reports no layout or an unrecognized one, we return null so the caller uses ffmpeg's safe -ac 2 downmix.
-    const downmixMatrix = (srcStream) => {
-        const layoutFull = (srcStream?.channel_layout || '').toLowerCase().trim();
-        if (!layoutFull) return null;
-        // ffmpeg layout names are already lowercase-stable (e.g. "5.1(side)"); match directly.
-        const channelList = CANON_LAYOUTS[layoutFull];
-        if (!channelList) return null;
-        // Sanity: the reported channel count should match the canonical list length; if a file lies about
-        // its layout vs channel count, fall back to the safe path rather than emit a mismatched matrix.
-        if (Number(srcStream?.channels) !== channelList.length) return null;
-        return buildPanMatrix(channelList);
-    };
+        // Create at most one 6ch and one 2ch downmix per language, sourced from that language's best (first, highest-channel/quality) track.
+        const created6chLangs = new Set();
+        const created2chLangs = new Set();
 
-    // Channel/filter snippet for a new or replaced stereo track.
-    const stereoArg = (idx, srcStream) => {
-        const matrix = (stereoDownmix === 'dialogue') ? downmixMatrix(srcStream) : null;
-        return matrix ? ` -filter:a:${idx} "${matrix}"` : ` -ac:a:${idx} 2`;
-    };
+        // Tracks which input audio indices have already received a -c:a:N assignment so we don't emit conflicting codec directives for the same stream.
+        const modifiedAudioIdx = new Set();
 
-    for (let i = 0; i < workStreams.length; i++) {
-        try {
+        // Predicted-output tracking for the closing summary line (does not affect the ffmpeg preset).
+        // outputAudioOverride: outputAudioIdx -> {codec, channels, bps} for in-place transcodes/downmixes.
+        // appendedAudio: streams added via -map 0:a:N (downmix 'true'/add), appended after all originals.
+        const outputAudioOverride = new Map();
+        const appendedAudio = [];
+
+        // Build the title for a new or replaced track. The original track title is always preserved and the new channel count is appended with -> (e.g. a
+        // source titled "E-AC-3 Atmos 5.1" downmixed to stereo becomes "E-AC-3 Atmos 5.1 -> 2.0"). This keeps role words like "Commentary"/"Director's
+        // Commentary" visible after a downmix. When the source has no title the new channel count alone is used (e.g. "2.0"). If the title already ends in
+        // the target label (not preceded by a digit/dot, so "5.1" won't match "15.1") it is returned unchanged to avoid "... 2.0 -> 2.0".
+        const buildTitle = (srcStream, targetLabel) => {
+            const origTitle = (srcStream.tags?.title || mediaInfoFor(srcStream)?.Title || '').trim();
+            if (!origTitle) return targetLabel;
+            const escapedLabel = targetLabel.replace(/\./g, '\\.');
+            if (new RegExp(`(?:^|[^0-9.])${escapedLabel}$`).test(origTitle)) return origTitle;
+            return `${origTitle} -> ${targetLabel}`;
+        };
+
+        // Lo/Ro stereo downmix matrices, generated from each source layout's exact channel order.
+        // WHY layout-keyed and not channel-count-keyed: several standard layouts share a channel count but order their channels differently (e.g. 6 channels
+        // can be 5.1, 5.1(side), 6.0, 6.0(front), or hexagonal). A count-based matrix would silently mis-route - dropping the wrong channel as "LFE" or
+        // panning a back-center where a surround belongs - producing audio that sounds wrong without any error. So we resolve the EXACT layout to its
+        // canonical channel list and build the matrix from speaker roles. Any layout without a verified channel list returns null and the caller falls back
+        // to ffmpeg's safe -ac 2 downmix.
+        // Downmix rules (standard Lo/Ro): FL/FR kept at full scale (peak 1.0); FC at -3 dB (0.707) into both so dialogue stays clear; LFE dropped (avoids
+        // mud); back/side/wide at -3 dB to their own side; any centered channel (FC, BC) split equally to both sides. The -3 dB attenuation on
+        // center/surround provides the clipping headroom, matching the industry-standard Lo/Ro downmix used by Blu-ray players, AV receivers, and streaming
+        // services.
+        // Canonical ffmpeg channel lists per layout (verified against ffmpeg-utils "Channel Layout" docs). Position in the array is the cN index used by
+        // the pan filter.
+        const CANON_LAYOUTS = {
+            '3.1':            ['FL', 'FR', 'FC', 'LFE'],
+            '4.0':            ['FL', 'FR', 'FC', 'BC'],
+            '5.0':            ['FL', 'FR', 'FC', 'BL', 'BR'],
+            '5.0(side)':      ['FL', 'FR', 'FC', 'SL', 'SR'],
+            '5.1':            ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR'],
+            '5.1(side)':      ['FL', 'FR', 'FC', 'LFE', 'SL', 'SR'],
+            '6.1':            ['FL', 'FR', 'FC', 'LFE', 'BC', 'SL', 'SR'],
+            '6.1(back)':      ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'BC'],
+            '6.1(front)':     ['FL', 'FR', 'LFE', 'FLC', 'FRC', 'SL', 'SR'],
+            '7.1':            ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'SL', 'SR'],
+            '7.1(wide)':      ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'FLC', 'FRC'],
+            '7.1(wide-side)': ['FL', 'FR', 'FC', 'LFE', 'FLC', 'FRC', 'SL', 'SR'],
+        };
+
+        // Per-speaker contribution to the L and R downmix outputs. Centered channels (FC, BC) contribute equally to both; left-side channels contribute only to L,
+        // right-side only to R; LFE contributes nothing. Values are the standard Lo/Ro gains.
+        const SPEAKER_GAINS = {
+            FL:  { L: 1.0,   R: 0     },
+            FR:  { L: 0,     R: 1.0   },
+            FC:  { L: 0.707, R: 0.707 },
+            LFE: { L: 0,     R: 0     },
+            BL:  { L: 0.707, R: 0     },
+            BR:  { L: 0,     R: 0.707 },
+            SL:  { L: 0.707, R: 0     },
+            SR:  { L: 0,     R: 0.707 },
+            FLC: { L: 0.707, R: 0     },
+            FRC: { L: 0,     R: 0.707 },
+            BC:  { L: 0.5,   R: 0.5   },
+        };
+
+        // Build a Lo/Ro pan=stereo matrix string for a known canonical layout, or null if the layout contributes no surround/center content (pure FL/FR or
+        // FL/FR/LFE) where -ac 2 is already correct. FL/FR kept at full scale (peak 1.0); center/surround fold in at standard Lo/Ro gains (-3 dB for
+        // FC/BC/surrounds, LFE dropped). The -3 dB attenuation provides the clipping headroom - a global sum-normalization is not used because it produces
+        // output 6-8 dB quieter than the source on typical content.
+        const buildPanMatrix = (channelList) => {
+            const termsL = [];
+            const termsR = [];
+            let peakL = 0;
+            let peakR = 0;
+            let hasNonFront = false; // any channel beyond FL/FR/LFE that needs explicit panning
+
+            channelList.forEach((spk, i) => {
+                const g = SPEAKER_GAINS[spk];
+                if (!g) return; // unknown speaker name — skip (shouldn't happen for canonical layouts)
+                if (spk !== 'FL' && spk !== 'FR' && spk !== 'LFE') hasNonFront = true;
+                if (spk === 'FL') peakL = 1.0;
+                if (spk === 'FR') peakR = 1.0;
+            });
+
+            // No surround/center to fold in (e.g. 2.1 = FL FR LFE, or stereo) — let -ac 2 handle it.
+            if (!hasNonFront) return null;
+            // Defensive: a layout missing a front channel leaves peakL/peakR at 0 and would make the gain normalisation below divide by zero. Every canonical
+            // layout leads with FL,FR so this never triggers today - it just keeps the matrix safe if a non-FL/FR-leading layout is ever added to CANON_LAYOUTS.
+            if (peakL <= 0 || peakR <= 0) return null;
+
+            channelList.forEach((spk, i) => {
+                const g = SPEAKER_GAINS[spk];
+                if (!g) return;
+                // Divide by peakL/peakR (always 1.0 — set from FL/FR) so coefficients are emitted as-authored.
+                // Floor to 3 decimals (truncate, not round) for deterministic output.
+                if (g.L > 0) termsL.push(`${(Math.floor((g.L / peakL) * 1000) / 1000).toFixed(3)}*c${i}`);
+                if (g.R > 0) termsR.push(`${(Math.floor((g.R / peakR) * 1000) / 1000).toFixed(3)}*c${i}`);
+            });
+
+            return `pan=stereo|FL=${termsL.join('+')}|FR=${termsR.join('+')}`;
+        };
+
+        // Resolve a source stream to its canonical layout key, then to a verified pan matrix (or null). We normalize the ffmpeg channel_layout string (lowercased,
+        // trimmed). If the file reports no layout or an unrecognized one, we return null so the caller uses ffmpeg's safe -ac 2 downmix.
+        const downmixMatrix = (srcStream) => {
+            const layoutFull = (srcStream?.channel_layout || '').toLowerCase().trim();
+            if (!layoutFull) return null;
+            // ffmpeg layout names are already lowercase-stable (e.g. "5.1(side)"); match directly.
+            const channelList = CANON_LAYOUTS[layoutFull];
+            if (!channelList) return null;
+            // Sanity: the reported channel count should match the canonical list length; if a file lies about
+            // its layout vs channel count, fall back to the safe path rather than emit a mismatched matrix.
+            if (Number(srcStream?.channels) !== channelList.length) return null;
+            return buildPanMatrix(channelList);
+        };
+
+        // Channel/filter snippet for a new or replaced stereo track.
+        const stereoArg = (idx, srcStream) => {
+            const matrix = (stereoDownmix === 'dialogue') ? downmixMatrix(srcStream) : null;
+            return matrix ? ` -filter:a:${idx} "${matrix}"` : ` -ac:a:${idx} 2`;
+        };
+
+        for (let i = 0; i < workStreams.length; i++) {
             const ffstream = workStreams[i];
             const ffstreamCodec = (ffstream.codec_name || '').toLowerCase();
             const streamLang = resolveLang(ffstream);
@@ -1378,74 +1368,72 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     }
                 }
             }
-        } catch (err) {
-            response.infoLog += `☒Error processing stream ${i}: ${err}\n`;
-            response.processFile = false;
-            return response;
         }
-    }
 
 
-    // Build the predicted output stream summary for the closing log line. Audio streams keep their original codec unless an in-place override was
-    // recorded; removed duplicates are dropped; newly created downmix tracks are appended (matching ffmpeg's -map 0 then -map 0:a:N ordering). All
-    // streams are enriched with resolveStreamBitrate before summariseStream, matching the input summary line - so untouched tracks (e.g. a copied stereo
-    // track) show their bitrate correctly. aac_vbr overrides carry approxRate instead of a fixed bps; summariseStream receives the approxRate string
-    // pre-formatted as the bit_rate field so the bracket token shows e.g. ~192k.
-    const buildOutputSummary = () => {
-        const tokens = [];
-        // Build an audio token for a VBR override/append, where the rate is an approximate string (e.g. '~192k') rather than a number summariseStream can
-        // format. Role comes from the shared classifiers on the original source stream.
-        const vbrAudioToken = (srcStream, channels, codec, approxRate) => {
-            const lang = resolveLang(srcStream);
-            const langStr = (lang && lang !== 'und') ? lang : '';
-            const role = isCommentary(srcStream) ? '/commentary' : (isDescriptive(srcStream) ? '/description' : '');
-            return `[audio:${[langStr, `${channels}ch`, codec, approxRate].filter(Boolean).join(' ')}${role}]`;
-        };
-        for (const s of file.ffProbeData.streams) {
-            const enriched = enrichStream(s);
-            if ((s?.codec_type || '').trim().toLowerCase() === 'audio') {
-                if (streamsToRemove.has(s.index)) continue;
-                const ov = outputAudioOverride.get(outputAudioIdxMap.get(s.index));
-                if (ov) {
-                    // approxRate carries the VBR display string (e.g. '~192k'); bps===0 flags this. summariseStream reads bit_rate numerically, so VBR
-                    // overrides build the token via vbrAudioToken to show the tilde-prefixed approximate rate instead.
-                    if (ov.approxRate) {
-                        tokens.push(vbrAudioToken(s, ov.channels, ov.codec, ov.approxRate));
+        // Build the predicted output stream summary for the closing log line. Audio streams keep their original codec unless an in-place override was
+        // recorded; removed duplicates are dropped; newly created downmix tracks are appended (matching ffmpeg's -map 0 then -map 0:a:N ordering). All
+        // streams are enriched with resolveStreamBitrate before summariseStream, matching the input summary line - so untouched tracks (e.g. a copied stereo
+        // track) show their bitrate correctly. aac_vbr overrides carry approxRate instead of a fixed bps; summariseStream receives the approxRate string
+        // pre-formatted as the bit_rate field so the bracket token shows e.g. ~192k.
+        const buildOutputSummary = () => {
+            const tokens = [];
+            // Build an audio token for a VBR override/append, where the rate is an approximate string (e.g. '~192k') rather than a number summariseStream can
+            // format. Role comes from the shared classifiers on the original source stream.
+            const vbrAudioToken = (srcStream, channels, codec, approxRate) => {
+                const lang = resolveLang(srcStream);
+                const langStr = (lang && lang !== 'und') ? lang : '';
+                const role = isCommentary(srcStream) ? '/commentary' : (isDescriptive(srcStream) ? '/description' : '');
+                return `[audio:${[langStr, `${channels}ch`, codec, approxRate].filter(Boolean).join(' ')}${role}]`;
+            };
+            for (const s of file.ffProbeData.streams) {
+                const enriched = enrichStream(s);
+                if ((s?.codec_type || '').trim().toLowerCase() === 'audio') {
+                    if (streamsToRemove.has(s.index)) continue;
+                    const ov = outputAudioOverride.get(outputAudioIdxMap.get(s.index));
+                    if (ov) {
+                        // approxRate carries the VBR display string (e.g. '~192k'); bps===0 flags this. summariseStream reads bit_rate numerically, so VBR
+                        // overrides build the token via vbrAudioToken to show the tilde-prefixed approximate rate instead.
+                        if (ov.approxRate) {
+                            tokens.push(vbrAudioToken(s, ov.channels, ov.codec, ov.approxRate));
+                        } else {
+                            tokens.push(summariseStream({ ...enriched, codec_name: ov.codec, channels: ov.channels, bit_rate: ov.bps }));
+                        }
                     } else {
-                        tokens.push(summariseStream({ ...enriched, codec_name: ov.codec, channels: ov.channels, bit_rate: ov.bps }));
+                        tokens.push(summariseStream(enriched));
                     }
-                } else {
+                } else
                     tokens.push(summariseStream(enriched));
-                }
-            } else
-                tokens.push(summariseStream(enriched));
-        }
-        for (const a of appendedAudio) {
-            if (a.approxRate) {
-                tokens.push(vbrAudioToken(a.srcStream, a.channels, a.codec, a.approxRate));
-            } else {
-                tokens.push(summariseStream({ ...a.srcStream, codec_name: a.codec, channels: a.channels, bit_rate: a.bps }));
             }
-        }
-        return tokens.join('');
-    };
+            for (const a of appendedAudio) {
+                if (a.approxRate) {
+                    tokens.push(vbrAudioToken(a.srcStream, a.channels, a.codec, a.approxRate));
+                } else {
+                    tokens.push(summariseStream({ ...a.srcStream, codec_name: a.codec, channels: a.channels, bit_rate: a.bps }));
+                }
+            }
+            return tokens.join('');
+        };
 
-    // Convert file if convert variable is set to true.
-    if (convert === true) {
-        // Dispositions (default flag) are intentionally left untouched. ffmpeg copies the source stream's disposition onto mapped/transcoded outputs, so
-        // a downmix_to_stereo track created from a default-flagged surround source also carries the default flag - two tracks marked default. This is
-        // acceptable: the tracks are near-identical content at different channel counts and most players handle multiple default flags without issue.
-        // Removing or reassigning the default flag is a separate concern outside this plugin's scope.
-        response.preset += `,-map 0 -c copy${extraArguments}${globalOutputOpt}${networkDataOpt}`;
-        response.infoLog += workDone;
-        response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;
-        response.processFile = true;
-    } else {
-        if (workDone) response.infoLog += workDone;
-        response.infoLog += `☑Audio already has the correct formats available.\n`;
-        response.processFile = false;
+        // Convert file if convert variable is set to true.
+        if (convert === true) {
+            // Dispositions (default flag) are intentionally left untouched. ffmpeg copies the source stream's disposition onto mapped/transcoded outputs, so
+            // a downmix_to_stereo track created from a default-flagged surround source also carries the default flag - two tracks marked default. This is
+            // acceptable: the tracks are near-identical content at different channel counts and most players handle multiple default flags without issue.
+            // Removing or reassigning the default flag is a separate concern outside this plugin's scope.
+            response.preset += `,-map 0 -c copy${extraArguments}${globalOutputOpt}${networkDataOpt}`;
+            response.infoLog += workDone;
+            response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;
+            response.processFile = true;
+        } else {
+            if (workDone) response.infoLog += workDone;
+            response.infoLog += `☑Audio already has the correct formats available.\n`;
+            response.processFile = false;
+        }
+        return response;
+    } catch (err) {
+        failUnexpected(err);   // AwkFailFile → rethrow unchanged; anything else → annotate + fail the file with the full infoLog
     }
-    return response;
 };
 module.exports.details = details;
 module.exports.plugin = plugin;
