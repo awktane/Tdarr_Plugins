@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.0.0',
+    Version: '2.1.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -554,8 +554,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return response;
     }
 
-    // AC3/EAC3 valid CBR presets in bps (ffmpeg rounds to these internally; we snap explicitly
-    // so the logged/targeted rate matches what ffmpeg actually produces).
+    // AC3 valid CBR presets in bps. ffmpeg rounds an AC3 request to the NEAREST of these (can round DOWN); resolveBitrate snaps UP to a preset itself so the
+    // emitted rate is never below target and the log matches what ffmpeg produces. EAC3/AAC/Opus honour arbitrary rates (verified) and are NOT snapped.
     const ac3Presets = [32000, 40000, 48000, 56000, 64000, 80000, 96000, 112000, 128000,
                         160000, 192000, 224000, 256000, 320000, 384000, 448000, 512000, 576000, 640000];
 
@@ -580,36 +580,54 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // AC3/EAC3 cap at their hard 640k codec limit; AAC and Opus scale per channel. These only ever apply to tracks at or below each codec's channel
         // maximum (the force/downmix paths block higher counts before encoding), but the per-channel form stays correct regardless of channel count.
         // Opus's ceiling (128k/ch) is deliberately half of ffmpeg's hard libopus limit (256k/ch) so a resolved Opus target can never be rejected by the
-        // encoder. AAC 160k/ch is generous but bounded.
+        // encoder. AAC 160k/ch is generous but bounded. Limits verified on Linux/Windows/Mac jellyfin-ffmpeg 7.1.4: ac3 clamps at exactly 640k; eac3 clamps
+        // at 6144k (640k is our efficient near-transparent 5.1 target); native aac clamps ~185-208k/ch; libopus hard-ERRORS above 256k/ch (so 128k/ch is safe).
         if (codec === 'ac3' || codec === 'eac3') return 640000;
         if (codec === 'aac' || codec === 'aac_vbr') return ch * 160000;   // 160k/ch (stereo 320k, 5.1 960k, 7.1 1.28M)
         if (codec === 'opus') return ch * 128000;   // 128k/ch — half of libopus's 256k/ch hard maximum
         return 0;
     };
 
-    // Resolve the final target bitrate (bps) for a transcode: floor at the per-channel table target, raise to the source bitrate when the source is known,
-    // higher, and lossy (never throw away quality we can cheaply keep from a lossy source), then clamp to the codec ceiling. The floor is skipped for
-    // lossless sources because their bitrate isn't a comparable quantity for a perceptual encode - a 4 Mbps TrueHD into AAC should target the table value
-    // (~512k for 5.1), not pin at the 960k ceiling every time. For AC3/EAC3 the result is snapped UP to the nearest valid preset so the requested rate is
-    // one ffmpeg actually honours.
-    const resolveBitrate = (codec, channels, srcBps = 0, srcLossless = false) => {
-        let bps = targetTable(codec, channels);
-        if (bps <= 0) return 0;
+    // Resolve the final target bitrate (bps) for a transcode. Baseline is the per-channel table target (the FLOOR). A known lossy source pulls the target
+    // DOWN toward its own bitrate when the target codec is at least as good as the source AT the source's bitrate (guard: audioQuality(target) >= srcQuality):
+    // we cap at the source rate rather than inflate to the floor, because the codec-efficiency gain preserves quality at equal bitrate and extra bits above
+    // source only re-encode detail a lossy source already discarded. The guard defaults OFF (srcQuality = Infinity) so only the force_codec same-channel path
+    // opts in; downmix callers pass no srcBps and stay on the floor, and lossless sources skip the branch (their bitrate isn't a comparable perceptual quantity
+    // - a 4 Mbps TrueHD into eac3 should target the floor, not its own rate). A pathological sub-minimum source is floored at the codec's channel-scaled
+    // minimum. When the guard fails (target less efficient), a higher-than-floor lossy source still raises the target (unchanged old behavior). Result is
+    // clamped to the codec ceiling, then for AC3 ONLY snapped UP to the nearest valid preset: ffmpeg rounds an AC3 request to the NEAREST preset (can round
+    // down), so we round up ourselves to guarantee the emitted rate is never below target and the log matches what ffmpeg produces; eac3/aac/opus honour
+    // arbitrary rates (verified) and are emitted as-is.
+    const resolveBitrate = (codec, channels, srcBps = 0, srcLossless = false, srcQuality = Infinity) => {
+        const floor = targetTable(codec, channels);
+        if (floor <= 0) return 0;
         const src = Number(srcBps) || 0;
-        if (!srcLossless && src > bps) bps = src;
-        bps = Math.min(bps, codecCeiling(codec, channels));
-        if (codec === 'ac3' || codec === 'eac3') {
-            // snap up to nearest valid preset >= bps (fall back to highest preset if above all)
-            bps = ac3Presets.find(p => p >= bps) ?? ac3Presets[ac3Presets.length - 1];
+        let bps = floor;
+        if (src > 0 && !srcLossless) {
+            const family = codec === 'aac_vbr' ? 'aac' : codec;
+            const targetQuality = audioQuality({ codec_name: family, channels, bit_rate: src });
+            if (targetQuality >= srcQuality) {
+                // Guard passed: target codec scores >= the source at the source bitrate. Track the source exactly (no pad), floored at the perceptual minimum.
+                const chScale = Math.pow(Math.max(2, Number(channels) || 1) / 2, 0.65);
+                const targetMin = (codecInfo[family]?.minimum || 0) * chScale;
+                bps = Math.max(src, targetMin);
+            } else if (src > floor) {
+                bps = src;   // guard failed (target less efficient than source): keep the source floor so a high-bitrate lossy source isn't needlessly degraded
+            }
         }
+        bps = Math.min(bps, codecCeiling(codec, channels));
+        if (codec === 'ac3')
+            bps = ac3Presets.find(p => p >= bps) ?? ac3Presets[ac3Presets.length - 1];   // AC3 only: coarse fixed table, round UP so we never land below target
+        else
+            bps = Math.round(bps / 1000) * 1000;   // eac3/aac/opus honour arbitrary rates - emit the exact value, rounded to whole kbps
         return bps;
     };
 
     // Per-codec audio argument string scoped to a specific output stream index (e.g. -b:a:2 instead of -b:a). ffmpeg accepts the stream-qualified forms; we use
-    // them so each track gets its own settings when a single command touches several. Mirrors encoderArgs but with :idx suffixes. srcLossless is forwarded to
-    // resolveBitrate to suppress the source-bitrate floor for lossless sources.
-    const encoderArgsIdx = (codec, channels, idx, srcBps = 0, srcLossless = false) => {
-        const bps = resolveBitrate(codec, channels, srcBps, srcLossless);
+    // them so each track gets its own settings when a single command touches several. Mirrors encoderArgs but with :idx suffixes. srcLossless and srcQuality
+    // are forwarded to resolveBitrate (srcLossless skips the source cap for lossless sources; srcQuality gates the guarded source-cap on the force path).
+    const encoderArgsIdx = (codec, channels, idx, srcBps = 0, srcLossless = false, srcQuality = Infinity) => {
+        const bps = resolveBitrate(codec, channels, srcBps, srcLossless, srcQuality);
         if (bps <= 0) return '';
         if (codec === 'opus')
             return ` -vbr:a:${idx} on -compression_level:a:${idx} 10 -b:a:${idx} ${bps / 1000}k`;
@@ -1225,11 +1243,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             modifiedAudioIdx.add(outputAudioIdx);
                             outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: forceChannels, bps: 0, approxRate });
                         } else {
-                            // Same channel count, codec swap only — honour the source bitrate as a floor so a high-bitrate lossy source isn't needlessly
-                            // degraded (capped at the codec ceiling inside resolveBitrate). Lossless sources skip the floor: their bitrate is not a
-                            // comparable quantity for a perceptual encode.
-                            const dstBitArg = encoderArgsIdx(targetCodec, forceChannels, outputAudioIdx, srcBitrate, ffstream.isTdarrLossless);
-                            const dstBitStr = resolveBitrate(targetCodec, forceChannels, srcBitrate, ffstream.isTdarrLossless);
+                            // Same channel count, codec swap only. resolveBitrate caps the target at the source bitrate (no inflation to the codec floor) when
+                            // the target codec scores >= the source at that bitrate — the guard, gated by the source's isTdarrQuality. Lossless sources skip the
+                            // cap (their bitrate isn't a comparable perceptual quantity), and a high-bitrate lossy source is still bounded by the codec ceiling.
+                            const dstBitArg = encoderArgsIdx(targetCodec, forceChannels, outputAudioIdx, srcBitrate, ffstream.isTdarrLossless, ffstream.isTdarrQuality);
+                            const dstBitStr = resolveBitrate(targetCodec, forceChannels, srcBitrate, ffstream.isTdarrLossless, ffstream.isTdarrQuality);
                             workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → ${targetCodec} ${forceChannels}ch @ ${dstBitStr / 1000} kb/s\n`;
                             extraArguments += ` -c:a:${outputAudioIdx} ${targetCodec}${dstBitArg}`;
                             modifiedAudioIdx.add(outputAudioIdx);
