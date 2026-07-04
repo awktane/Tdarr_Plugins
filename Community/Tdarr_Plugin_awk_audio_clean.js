@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.3.0',
+    Version: '2.3.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -226,17 +226,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Fail the whole file (send it to Tdarr's error queue) carrying the full infoLog as context. A returned processFile:false is Tdarr's "no work needed /
     // skip" signal, NOT a failure — the flow's runClassicTranscodePlugin checks `if (result.error) throw` before `if (result.processFile !== true) continue`,
     // so a skip return quietly moves on. To actually error the file a classic plugin must throw (works in classic AND flow mode). A raw throw discards the
-    // returned response, so failFile rides the accumulated infoLog (input summary + the ☒ reason) along as the Error message. The dedicated AwkFailFile type
-    // lets the body's outer catch (failUnexpected) tell a DELIBERATE failure (rethrow unchanged) from an unexpected bug (annotate + wrap, still fail w/ log).
+    // returned response, so failFile rides the accumulated infoLog (input summary + the ☒ reason) along as the Error message, thrown with a leading \n so the
+    // log starts on its own line instead of glued onto Tdarr's "...Plugin error! Error:" wrapper. The dedicated AwkFailFile type lets the body's outer catch
+    // (failUnexpected) tell a DELIBERATE failure (rethrow unchanged) from an unexpected bug (annotate + wrap, still fail w/ log).
     class AwkFailFile extends Error {}
     const failFile = (msg) => {
         response.infoLog += `☒${msg}\n`;
-        throw new AwkFailFile(response.infoLog);
+        throw new AwkFailFile(`\n${response.infoLog}`);
     };
     const failUnexpected = (err) => {
         if (err instanceof AwkFailFile) throw err;
         response.infoLog += `☒Unexpected error: ${err && err.message ? err.message : err}\n`;
-        throw new AwkFailFile(response.infoLog);
+        throw new AwkFailFile(`\n${response.infoLog}`);
     };
     // ===== END SHARED: file-failure helpers =====
 
