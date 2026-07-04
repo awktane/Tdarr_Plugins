@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.1.0',
+    Version: '2.2.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -18,7 +18,7 @@ const details = () => ({
             tooltip: `Specify language tags here for the audio tracks you'd like to transcode. If blank then all tracks will be considered. Tracks in languages not listed will not be considered for the downmix_to_six, downmix_to_stereo options, nor keep_best_surround_safe.
                 \\nStreams with no language tag are treated as though they their language is "und". Any tracks with a language not in this list will be treated as a secondary track and therefore affected by downmix_secondary_stereo.
                 \\nThis list should include both two character and three character codes as this will successfully catch values like en, eng, en-US, en_US, and en.US.
-                \\nTracks with these languages will follow downmix_to_six, downmix_to_stereo, and force_codec
+                \\nTracks with these languages will follow downmix_to_six, downmix_to_stereo, and codec_force
                 \\nExample:\\n
                     en,eng,fr,fre,fra,und,mul,jpn,ja,zxx,mis\\n
                     English, French, and Japanese (ISO-639-2 and ISO-639-1) (und = undefined, mul = multiple languages, zxx = no linguistic content, mis = missing language / no language code)
@@ -40,8 +40,8 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\nIf false   - no new 6 channel track is created from higher channel surround channel
-                \\nIf replace - a new surround_codec 6 channel track replaces the higher channel track used to create it unless protected by keep_best_surround_safe.
-                \\nIf true    - a new surround_codec 6 channel track will be created from the higher channel track and both will be kept`,
+                \\nIf replace - a new codec_surround 6 channel track replaces the higher channel track used to create it unless protected by keep_best_surround_safe.
+                \\nIf true    - a new codec_surround 6 channel track will be created from the higher channel track and both will be kept`,
         },
         {
             name: 'downmix_to_stereo',
@@ -57,8 +57,8 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\nIf false   - no new 2 channel track is created from surround channel
-                \\nIf replace - a new 2 channel track with codec stereo_codec replaces the higher channel track used to create it unless it was created by downmix_to_six.
-                \\nIf true    - a new 2 channel track with stereo_codec will be created from a higher channel track and both will be kept`,
+                \\nIf replace - a new 2 channel track with codec codec_stereo replaces the higher channel track used to create it unless it was created by downmix_to_six.
+                \\nIf true    - a new 2 channel track with codec_stereo will be created from a higher channel track and both will be kept`,
         },        
         {
             name: 'downmix_secondary_stereo',
@@ -74,7 +74,64 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\nIf false - secondary tracks are left untouched
-                \\nIf true  - each secondary track with more than 2 channels is transcoded in place to a stereo stereo_codec track (using the stereo_downmix matrix).`,
+                \\nIf true  - each secondary track with more than 2 channels is transcoded in place to a stereo codec_stereo track (using the stereo_downmix matrix).`,
+        },
+        {
+            name: 'codec_surround',
+            type: 'string',
+            defaultValue: 'aac',
+            inputUI: {
+                type: 'dropdown',
+                options: ['aac','ac3','eac3','opus'],
+            },
+            tooltip: `Specify codec for newly created surround tracks. Note that both AC3 and EAC3 are limited to 6 channels (5.1) by ffmpeg's native encoders. Opus supports up to 8 channels.`,
+        },
+        {
+            name: 'codec_stereo',
+            type: 'string',
+            defaultValue: 'aac',
+            inputUI: {
+                type: 'dropdown',
+                options: ['aac','aac_vbr','ac3','eac3','opus'],
+            },
+            tooltip: `Specify codec for newly created stereo tracks. AAC and Opus are the most compatible choices for modern media servers and clients. EAC3 is useful for Dolby branding on compatible devices. AC3 is the most broadly compatible legacy choice.
+                \\naac_vbr uses libfdk_aac in VBR mode (-vbr 5, ~192-224 kb/s) for higher quality than native AAC CBR. Falls back to -vbr 4 (~128-144 kb/s) when codec_force is converting an existing stereo track whose bitrate is at or below 144 kb/s, matching the lower-information source.
+                \\nExisting AAC tracks are never re-encoded when aac_vbr is selected — the AAC family check prevents a generational loss for no gain.`,
+        },        
+        {
+            name: 'codec_force',
+            type: 'string',
+            defaultValue: 'false',
+            inputUI: {
+                type: 'dropdown',
+                options: ['false','6below','2below','all'],
+            },
+            tooltip: `Transcode all tracks to the codecs specified in codec_surround and codec_stereo depending on their channel count. Note streams with more channels than supported by the codec will not be transcoded.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nIf false  - Codecs will be left as is and those two settings will only apply to new tracks
+                \\nIf 2below - Streams with two or fewer channels will be transcoded to codec_stereo (unless protected by keep_best_surround_safe). Anything above that will be left in its original codec.
+                \\nIf 6below - Streams with six or fewer channels will be transcoded to codec_surround (unless protected by keep_best_surround_safe). Tracks with two or fewer channel will be converted to codec_stereo.
+                \\nIf all   - All streams will be transcoded to the codecs specified by codec_surround and codec_stereo depending on their channel count INCLUDING the track protected by keep_best_surround_safe`,
+        },                
+        {
+            name: 'keep_best_surround_safe',
+            type: 'string',
+            defaultValue: 'quality',
+            inputUI: {
+                type: 'dropdown',
+                options: ['false','quality','channel'],
+            },
+            tooltip: `If enabled then we should keep the best quality and highest channel option for each language (downmix_language list or if blank all). This track will be treated as a source and will not be transcoded or removed.
+                \\nThis track can only be affected by codec_force being set to all. No secondary tracks, including when language of the track is not in downmix_language, get this type of protection.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nIf false   - All tracks are treated normally
+                \\nIf quality - The focus is on track quality. A lossless 5.1 track would be kept over a lossy 7.1 as an example. If there is a 5.1 and 7.1 of similar quality then the 7.1 would be chosen.
+                \\nIf channel - The focus is on channel count. A lossy 7.1 track will always be kept over the lossless 5.1 track in the previous example.`,
+
         },
         {
             name: 'remove_duplicates_by',
@@ -104,63 +161,7 @@ const details = () => ({
                 \\nIf channel-error or multi-stereo-error - aborts the run if it finds duplicates as per the categories above; no streams are removed and no other changes from this run are applied.`,
         },
         {
-            name: 'keep_best_surround_safe',
-            type: 'string',
-            defaultValue: 'quality',
-            inputUI: {
-                type: 'dropdown',
-                options: ['false','quality','channel'],
-            },
-            tooltip: `If enabled then we should keep the best quality and highest channel option for each language (downmix_language list or if blank all). This track will be treated as a source and will not be transcoded or removed.
-                \\nThis track can only be affected by force_codec being set to all. No secondary tracks, including when language of the track is not in downmix_language, get this type of protection.
-                \\n=====
-                \\nActions
-                \\n=====
-                \\nIf false   - All tracks are treated normally
-                \\nIf quality - The focus is on track quality. A lossless 5.1 track would be kept over a lossy 7.1 as an example. If there is a 5.1 and 7.1 of similar quality then the 7.1 would be chosen.
-                \\nIf channel - The focus is on channel count. A lossy 7.1 track will always be kept over the lossless 5.1 track in the previous example.`,
-
-        },        {
-            name: 'surround_codec',
-            type: 'string',
-            defaultValue: 'aac',
-            inputUI: {
-                type: 'dropdown',
-                options: ['aac','ac3','eac3','opus'],
-            },
-            tooltip: `Specify codec for newly created surround tracks. Note that both AC3 and EAC3 are limited to 6 channels (5.1) by ffmpeg's native encoders. Opus supports up to 8 channels.`,
-        },
-        {
-            name: 'stereo_codec',
-            type: 'string',
-            defaultValue: 'aac',
-            inputUI: {
-                type: 'dropdown',
-                options: ['aac','aac_vbr','ac3','eac3','opus'],
-            },
-            tooltip: `Specify codec for newly created stereo tracks. AAC and Opus are the most compatible choices for modern media servers and clients. EAC3 is useful for Dolby branding on compatible devices. AC3 is the most broadly compatible legacy choice.
-                \\naac_vbr uses libfdk_aac in VBR mode (-vbr 5, ~192-224 kb/s) for higher quality than native AAC CBR. Falls back to -vbr 4 (~128-144 kb/s) when force_codec is converting an existing stereo track whose bitrate is at or below 144 kb/s, matching the lower-information source.
-                \\nExisting AAC tracks are never re-encoded when aac_vbr is selected — the AAC family check prevents a generational loss for no gain.`,
-        },        
-        {
-            name: 'force_codec',
-            type: 'string',
-            defaultValue: 'false',
-            inputUI: {
-                type: 'dropdown',
-                options: ['false','6below','2below','all'],
-            },
-            tooltip: `Transcode all tracks to the codecs specified in surround_codec and stereo_codec depending on their channel count. Note streams with more channels than supported by the codec will not be transcoded.
-                \\n=====
-                \\nActions
-                \\n=====
-                \\nIf false  - Codecs will be left as is and those two settings will only apply to new tracks
-                \\nIf 2below - Streams with two or fewer channels will be transcoded to stereo_codec (unless protected by keep_best_surround_safe). Anything above that will be left in its original codec.
-                \\nIf 6below - Streams with six or fewer channels will be transcoded to surround_codec (unless protected by keep_best_surround_safe). Tracks with two or fewer channel will be converted to stereo_codec.
-                \\nIf all   - All streams will be transcoded to the codecs specified by surround_codec and stereo_codec depending on their channel count INCLUDING the track protected by keep_best_surround_safe`,
-        },                
-        {
-            name: 'stereo_downmix_method',
+            name: 'method_stereo_downmix',
             type: 'string',
             defaultValue: 'dialogue',
             inputUI: {
@@ -174,6 +175,22 @@ const details = () => ({
                 \\nIf default  - ffmpeg's built in downmix (-ac 2). Simple, but the auto leveling can sound quiet with buried dialogue.
                 \\nIf dialogue - applies a Lo/Ro downmix matrix (center kept at -3 dB, LFE dropped) so dialogue stays clear and the overall level stays up.
                 \\nFalls back to default automatically for unusual layouts such as 2.1 and 3.0.`,
+        },
+        {
+            name: 'method_opus_layout_err',
+            type: 'string',
+            defaultValue: 'keep',
+            inputUI: {
+                type: 'dropdown',
+                options: ['keep','drop','remix'],
+            },
+            tooltip: `What to do when codec_surround is opus and a source track has a channel layout libopus cannot encode (e.g. 2.1, 4.0, 4.1, 6.0, 7.0, 7.1(wide)). Left unhandled, ffmpeg aborts the whole job on that track. Only the force-to-opus path is affected - the downmix options already emit opus-safe layouts, and a layout that just needs relabeling (5.0(side) -> 5.0, 6.1(back) -> 6.1) is ALWAYS relabeled losslessly regardless of this setting. AC3/EAC3/AAC accept every layout, so this only matters for opus.
+                \\n=====
+                \\nActions (only for a layout with no lossless relabel)
+                \\n=====
+                \\nIf keep  - the track is left in its source codec (not forced to opus). Safe default: nothing fails and no audio is lost.
+                \\nIf drop  - the track is removed entirely. The last remaining audio track is never dropped (falls back to keep).
+                \\nIf remix - the track is downmixed to a codec_stereo stereo. Defers to downmix_to_stereo / downmix_secondary_stereo when they already convert the track, and falls back to keep rather than create a duplicate stereo.`,
         },
         {
             name: 'temp_on_network',
@@ -462,7 +479,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= resolveChannels (+ channelsFromLayout helper)  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     // Resolve an audio stream's channel count, ffprobe first then fallbacks (mirrors resolveStreamBitrate): mediaInfo Channels, then a channel-layout string
     // from ffprobe channel_layout or mediaInfo ChannelLayout/ChannelPositions - "5.1(side)" -> 6, "stereo" -> 2, "FL+FR+LFE" -> 3. Returns 0 only when no
-    // source reports it, so channel-dependent logic (scoring, dedup, downmix, labelling, force_codec) stays correct for tracks whose ffprobe entry omits it.
+    // source reports it, so channel-dependent logic (scoring, dedup, downmix, labelling, codec forcing) stays correct for tracks whose ffprobe entry omits it.
     const channelsFromLayout = (layout) => {
         const s = String(layout || '').toLowerCase().trim();
         if (!s) return 0;
@@ -591,7 +608,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Resolve the final target bitrate (bps) for a transcode. Baseline is the per-channel table target (the FLOOR). A known lossy source pulls the target
     // DOWN toward its own bitrate when the target codec is at least as good as the source AT the source's bitrate (guard: audioQuality(target) >= srcQuality):
     // we cap at the source rate rather than inflate to the floor, because the codec-efficiency gain preserves quality at equal bitrate and extra bits above
-    // source only re-encode detail a lossy source already discarded. The guard defaults OFF (srcQuality = Infinity) so only the force_codec same-channel path
+    // source only re-encode detail a lossy source already discarded. The guard defaults OFF (srcQuality = Infinity) so only the codec_force same-channel path
     // opts in; downmix callers pass no srcBps and stay on the floor, and lossless sources skip the branch (their bitrate isn't a comparable perceptual quantity
     // - a 4 Mbps TrueHD into eac3 should target the floor, not its own rate). A pathological sub-minimum source is floored at the codec's channel-scaled
     // minimum. When the guard fails (target less efficient), a higher-than-floor lossy source still raises the target (unchanged old behavior). Result is
@@ -611,6 +628,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const chScale = Math.pow(Math.max(2, Number(channels) || 1) / 2, 0.65);
                 const targetMin = (codecInfo[family]?.minimum || 0) * chScale;
                 bps = Math.max(src, targetMin);
+                // This can emit BELOW the table floor. Safe re: audioQuality's bitrate-less estBps estimate (which still assumes the floor): a re-scan reads the
+                // real rate back - eac3/ac3 are CBR and always report bit_rate; aac/opus recover via resolveStreamBitrate (mediaInfo StreamSize/Duration). The
+                // estBps path only fires on a stream with NO recoverable bitrate (synthetic), never a real re-scanned transcode.
             } else if (src > floor) {
                 bps = src;   // guard failed (target less efficient than source): keep the source floor so a high-bitrate lossy source isn't needlessly degraded
             }
@@ -637,7 +657,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Emit the encoder name and VBR arguments for an aac_vbr stereo track scoped to output index idx. Uses -vbr 4 (~128-144 kb/s) when the source stereo
     // bitrate is at or below 144k — matching a lower-information source avoids wasting bits encoding silence-grade content at VBR 5 quality. Uses -vbr 5
     // (~192-224 kb/s) for all other cases, including all downmix-created stereo tracks where the source is surround (its bitrate describes N channels, not 2,
-    // so 144k doesn't apply). isStereoSrc should be true only for force_codec codec-swap paths where the source is already 2ch.
+    // so 144k doesn't apply). isStereoSrc should be true only for codec_force codec-swap paths where the source is already 2ch.
     const aacVbrArgsIdx = (idx, srcBps = 0, isStereoSrc = false) => {
         const vbrLevel = (isStereoSrc && Number(srcBps) > 0 && Number(srcBps) <= 144000) ? 4 : 5;
         const approxRate = vbrLevel === 4 ? '~128k' : '~192k';
@@ -645,7 +665,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     // Resolve whether a source stream is lossless using the shared resolveCodecName resolution (same one audioQuality uses). Stored per-stream as
-    // isTdarrLossless to avoid repeating the resolution at emission. Used only by force_codec to gate the source-bitrate floor in resolveBitrate — downmix
+    // isTdarrLossless to avoid repeating the resolution at emission. Used only by codec_force to gate the source-bitrate floor in resolveBitrate — downmix
     // paths don't pass a source bitrate so they are unaffected regardless of this flag.
     const losslessSource = (stream) => codecInfo[resolveCodecName(stream)]?.lossless === true;
     
@@ -655,11 +675,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const downmixToTwo = String(inputs.downmix_to_stereo).trim();
     const downmixSecondaryStereo = String(inputs.downmix_secondary_stereo).trim();
     const removeDuplicatesBy = String(inputs.remove_duplicates_by).trim();
-    const forceCodec = String(inputs.force_codec).trim();
-    const surroundCodec = String(inputs.surround_codec).trim();
-    const stereoCodec = String(inputs.stereo_codec).trim();
-    const stereoDownmix = String(inputs.stereo_downmix_method).trim();
+    const forceCodec = String(inputs.codec_force).trim();
+    const surroundCodec = String(inputs.codec_surround).trim();
+    const stereoCodec = String(inputs.codec_stereo).trim();
+    const stereoDownmix = String(inputs.method_stereo_downmix).trim();
     const keepBestSurroundSafe = String(inputs.keep_best_surround_safe).trim();
+    const methodOpusLayoutErr = String(inputs.method_opus_layout_err).trim();
 
     if(!['false','replace','true'].includes(downmixToSix)) {
         response.infoLog += `☒Somehow invalid downmixToSix option provided. Check your settings!\n`;
@@ -706,6 +727,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.processFile = false;
         return response;
     }
+    if(!['keep','drop','remix'].includes(methodOpusLayoutErr)) {
+        response.infoLog += `☒Somehow invalid methodOpusLayoutErr option provided. Check your settings!\n`;
+        response.processFile = false;
+        return response;
+    }
 
     let extraArguments = '';
     let workDone = '';
@@ -742,28 +768,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { ...enrichedItem,
             isTdarrSecondaryTrack: isSecondaryTrack(item),
             // Language-secondary: track language is not in downmixLanguage (when the list is non-empty). These tracks follow the secondary path
-            // (downmix_secondary_stereo, force_codec) but are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo).
+            // (downmix_secondary_stereo, codec_force) but are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo).
             isTdarrLangSecondary: downmixLanguage.length > 0 && !downmixLanguage.includes(cleanLang),
             isTdarrCleanLang: cleanLang,
             isTdarrFullLang: fullLang,
             isTdarrQuality: audioQuality(enrichedItem),
-            // Used by force_codec to suppress the source-bitrate floor in resolveBitrate for lossless sources. A lossless bitrate (e.g. 4 Mbps TrueHD) is not a
+            // Used by codec_force to suppress the source-bitrate floor in resolveBitrate for lossless sources. A lossless bitrate (e.g. 4 Mbps TrueHD) is not a
             // comparable quantity for a perceptual encode and would otherwise pin the output at the codec ceiling for no audible gain.
             isTdarrLossless: losslessSource(item)
         };
     });
 
-    // candidateStreams: the pool for workStreams and keep_best_surround_safe. Lang-secondary tracks (unlisted language) are included here so force_codec
+    // candidateStreams: the pool for workStreams and keep_best_surround_safe. Lang-secondary tracks (unlisted language) are included here so codec_force
     // and downmix_secondary_stereo can act on them. They are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo) in the processing
     // loop below. Secondary and lang-secondary tracks are only dropped from the pool when there is genuinely nothing to do with them:
-    // downmix_secondary_stereo is false AND force_codec is false. When force_codec is set they stay so the force-codec path can standardize their codec
-    // too (e.g. force_codec='all' must touch every track, including commentary and unlisted-language tracks).
+    // downmix_secondary_stereo is false AND codec_force is false. When codec_force is set they stay so the force-codec path can standardize their codec
+    // too (e.g. codec_force='all' must touch every track, including commentary and unlisted-language tracks).
     let candidateStreams = audioStreams;
     if (downmixSecondaryStereo === 'false' && forceCodec === 'false')
         candidateStreams = candidateStreams.filter(stream => !stream.isTdarrSecondaryTrack && !stream.isTdarrLangSecondary);
 
     // keep_best_surround_safe: protect the best track per language among preferred-language primary tracks. Lang-secondary and disposition-secondary tracks are
-    // excluded — protecting a non-preferred-language track or a commentary track serves no purpose and would prevent force_codec from touching it.
+    // excluded — protecting a non-preferred-language track or a commentary track serves no purpose and would prevent codec_force from touching it.
     const protectedIndices = new Set();
     if (keepBestSurroundSafe !== 'false') {
         const bestByLang = new Map();
@@ -859,6 +885,50 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 workDone += `☐Stream ${s.index}: Removing duplicate (lower quality ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang}${rmRate}) - keeping stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate})\n`;
             } else
                 seen.set(key, s);
+        }
+    }
+
+    // libopus only accepts its RFC-mapping layouts and HARD-ERRORS on the rest, failing the whole job; ffmpeg's DEFAULT layout for 3ch
+    // (2.1) and 4ch (4.0) is also rejected. AC3/EAC3/AAC accept every layout, so this only guards the force-to-opus path. OK set + relabels
+    // verified via `anullsrc=channel_layout=X -c:a libopus` on jellyfin-ffmpeg (see the ffmpeg-codec-ranges memory).
+    const OPUS_OK_LAYOUTS = new Set(['mono', 'stereo', '3.0', 'quad', '5.0', '5.1', '5.1(side)', '6.1', '7.1']);
+    const opusAcceptsLayout = (channels, layoutStr) => {
+        const lay = (layoutStr || '').toLowerCase().trim();
+        if (lay) return OPUS_OK_LAYOUTS.has(lay);
+        // No explicit layout → ffmpeg assigns the default for the count; those are OK for every count EXCEPT 3 (2.1) and 4 (4.0).
+        return channels >= 1 && channels <= 8 && channels !== 3 && channels !== 4;
+    };
+    // Layouts that map LOSSLESSLY to an opus-accepted layout at the SAME channel count by pure relabel (side↔back position equivalence)
+    // - emitted via channelmap (a permutation matrix, never a mix). Anything not here remixes down to stereo.
+    const OPUS_RELABEL = {
+        '5.0(side)': { layout: '5.0', map: 'FL-FL|FR-FR|FC-FC|SL-BL|SR-BR' },
+        '6.1(back)': { layout: '6.1', map: 'FL-FL|FR-FR|FC-FC|LFE-LFE|BL-SL|BR-SR|BC-BC' },
+    };
+
+    // method_opus_layout_err=drop must remove streams BEFORE outputAudioIdxMap / the -map removal are built below - a mid-loop removal
+    // would break the OTHER forced tracks' -c:a:N numbering. Pre-scan for a surround track codec_force would send to opus with a
+    // libopus-incompatible layout that NO downmix will convert to stereo, and remove it (never the last audio track). keep/remix stay in
+    // the loop; this mirrors the loop's surround shouldForce for exactly the drop subset.
+    if (methodOpusLayoutErr === 'drop' && forceCodec !== 'false' && surroundCodec === 'opus') {
+        for (const s of audioStreams) {
+            if (streamsToRemove.has(s.index)) continue;
+            const ch = resolveChannels(s);
+            const lay = (s.channel_layout || '').toLowerCase().trim();
+            if (ch <= 2 || ch > 8) continue;                                             // stereo→codec_stereo; >8 blocked (targetMaxCh)
+            if ((s.codec_name || '').toLowerCase() === 'opus') continue;                 // already opus
+            if (protectedIndices.has(s.index) && forceCodec !== 'all') continue;         // keep_best_surround_safe
+            if (!(forceCodec === 'all' || (forceCodec === '6below' && ch <= 6))) continue;   // surround shouldForce (mirrors the loop)
+            if (opusAcceptsLayout(ch, lay)) continue;
+            if (OPUS_RELABEL[lay]) continue;                                             // losslessly relabelable → the loop transcodes it, never drop
+            // A downmix that converts this track to stereo makes it opus-safe → don't drop: secondary→downmix_secondary_stereo=true;
+            // primary→downmix_to_stereo=replace (any >2ch), or downmix_to_six=replace (>6ch, becomes an opus-safe 5.1).
+            const secondary = s.isTdarrSecondaryTrack || s.isTdarrLangSecondary;
+            if (secondary ? downmixSecondaryStereo === 'true'
+                          : (downmixToTwo === 'replace' || (ch > 6 && downmixToSix === 'replace'))) continue;
+            const survivingAudio = file.ffProbeData.streams.filter(a => (a?.codec_type || '').toLowerCase() === 'audio' && !streamsToRemove.has(a.index)).length;
+            if (survivingAudio <= 1) continue;                                           // never drop the last audio track
+            streamsToRemove.add(s.index);
+            workDone += `☒Stream ${s.index}: Dropping - libopus can't encode a ${s.channel_layout || `${ch}ch`} layout (method_opus_layout_err=drop).\n`;
         }
     }
 
@@ -1209,13 +1279,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
 
             // ====== FORCE CODEC ======
-            // Skip protected best tracks UNLESS force_codec is 'all' — per keep_best_surround_safe, the protected track can only be touched when force_codec
+            // Skip protected best tracks UNLESS codec_force is 'all' — per keep_best_surround_safe, the protected track can only be touched when codec_force
             // is 'all'. Also skip when the source has more channels than the target codec supports (ac3/eac3 max 6ch, opus/aac max 8ch) to avoid an ffmpeg
             // encode failure. Channel count is resolved from ffprobe, then mediaInfo, then a channel-layout string (resolveChannels): a track no source can
             // measure is left untouched rather than guessed, since a wrong count could route it to a codec that can't hold its real channels and fail.
             const forceChannels = (forceCodec !== 'false' && !modifiedAudioIdx.has(outputAudioIdx) && (!isProtected || forceCodec === 'all')) ? resolveChannels(ffstream) : -1;
             if (forceChannels === 0)
-                workDone += `☒Stream ${ffstream.index}: Skipping force_codec - no channel count in ffprobe, mediaInfo, or channel layout; can't safely choose a target codec or verify its channel limit.\n`;
+                workDone += `☒Stream ${ffstream.index}: Skipping codec_force - no channel count in ffprobe, mediaInfo, or channel layout; can't safely choose a target codec or verify its channel limit.\n`;
             if (forceChannels > 0) {
                 const isStereo = forceChannels <= 2;
                 const targetCodec = isStereo ? stereoCodec : surroundCodec;
@@ -1234,7 +1304,46 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (shouldForce && forceChannels > targetMaxCh) {
                         workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodecFamily} - ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} exceeds the ${targetMaxCh}ch limit for ${targetCodecFamily}. Enable downmix_to_six to reduce channels first.\n`;
                     } else if (shouldForce) {
-                        if (targetCodec === 'aac_vbr') {
+                        // Guard the force-to-opus path against libopus-incompatible layouts (method_opus_layout_err). Only opus is affected - AC3/EAC3/AAC
+                        // take any layout. `forced` gates the run's convert flag so a keep/defer makes no change (and doesn't cause a needless re-run).
+                        const srcLayout = (ffstream.channel_layout || '').toLowerCase().trim();
+                        const opusBad = targetCodec === 'opus' && forceChannels > 2 && !opusAcceptsLayout(forceChannels, srcLayout);
+                        const relabel = opusBad ? OPUS_RELABEL[srcLayout] : null;
+                        const layoutName = srcLayout || `${forceChannels}ch`;
+                        // remix→stereo defers when a stereo already exists for this language (pre-existing or downmix-created): a second one would be a
+                        // cross-run duplicate that dedup only collapses on the NEXT run. Fall back to keep.
+                        const remixDefer = opusBad && !relabel && methodOpusLayoutErr === 'remix' && existingStereoLangs.has(ffstreamLangKey);
+                        let forced = false;
+
+                        if (opusBad && !relabel && (methodOpusLayoutErr === 'keep' || methodOpusLayoutErr === 'drop' || remixDefer)) {
+                            // No lossless relabel exists (relabelable layouts fall through to the transcode branch below in every mode). keep; a remix that
+                            // deferred to an existing stereo; or a drop the pre-pass couldn't apply (it was the last audio track) - leave the source codec.
+                            // Real drops already happened in the pre-pass above (before the index map).
+                            const why = remixDefer ? ' (a stereo already exists for this language)'
+                                      : methodOpusLayoutErr === 'drop' ? ' (kept - it is the last audio track)'
+                                      : ', enable a downmix option or set method_opus_layout_err to drop/remix';
+                            workDone += `☒Stream ${ffstream.index}: Not forcing opus - libopus can't encode a ${layoutName} layout; left as ${ffstreamCodec}${why}.\n`;
+                        } else if (opusBad && methodOpusLayoutErr === 'remix' && !relabel) {
+                            // remix→stereo: downmix in place to a codec_stereo track (NOT opus) so it stays stereo-codec-consistent and idempotent (a stereo
+                            // opus would be re-forced to codec_stereo next run). Mirrors downmix_secondary_stereo; the 2ch table target (surround source
+                            // bitrate isn't a comparable floor).
+                            const newTitle = escMeta(buildTitle(ffstream, '2.0'));
+                            if (stereoCodec === 'aac_vbr') {
+                                const { encoder, args, approxRate } = aacVbrArgsIdx(outputAudioIdx);
+                                workDone += `☐Stream ${ffstream.index}: Remixing ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} (${layoutName}, opus-incompatible) → aac stereo @ ${approxRate} (libfdk VBR q5)\n`;
+                                extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                                modifiedAudioIdx.add(outputAudioIdx);
+                                outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: 2, bps: 0, approxRate });
+                            } else {
+                                const dstBitArg = encoderArgsIdx(stereoCodec, 2, outputAudioIdx);
+                                const dstBitStr = resolveBitrate(stereoCodec, 2);
+                                workDone += `☐Stream ${ffstream.index}: Remixing ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} (${layoutName}, opus-incompatible) → ${stereoCodec} stereo @ ${dstBitStr / 1000} kb/s\n`;
+                                extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${dstBitArg}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                                modifiedAudioIdx.add(outputAudioIdx);
+                                outputAudioOverride.set(outputAudioIdx, { codec: stereoCodec, channels: 2, bps: dstBitStr });
+                            }
+                            forced = true;
+                        } else if (targetCodec === 'aac_vbr') {
                             // aac_vbr stereo force: use VBR 4 for low-bitrate sources, VBR 5 otherwise.
                             // srcBitrate is meaningful here — this is a codec-swap, same channel count.
                             const { encoder, args, approxRate } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true);
@@ -1242,18 +1351,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}`;
                             modifiedAudioIdx.add(outputAudioIdx);
                             outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: forceChannels, bps: 0, approxRate });
+                            forced = true;
                         } else {
-                            // Same channel count, codec swap only. resolveBitrate caps the target at the source bitrate (no inflation to the codec floor) when
-                            // the target codec scores >= the source at that bitrate — the guard, gated by the source's isTdarrQuality. Lossless sources skip the
-                            // cap (their bitrate isn't a comparable perceptual quantity), and a high-bitrate lossy source is still bounded by the codec ceiling.
+                            // Same channel count, codec swap - optionally a LOSSLESS opus relabel (5.0(side)→5.0 via channelmap, keeps all channels).
+                            // resolveBitrate caps the target at the source bitrate when the target codec scores >= the source (guard via isTdarrQuality);
+                            // lossless skips the cap; a high-bitrate lossy source is bounded by the codec ceiling.
+                            const layoutFilter = relabel ? ` -filter:a:${outputAudioIdx} "channelmap=map=${relabel.map}:channel_layout=${relabel.layout}"` : '';
+                            const note = relabel ? ` (relabel ${layoutName}→${relabel.layout})` : '';
                             const dstBitArg = encoderArgsIdx(targetCodec, forceChannels, outputAudioIdx, srcBitrate, ffstream.isTdarrLossless, ffstream.isTdarrQuality);
                             const dstBitStr = resolveBitrate(targetCodec, forceChannels, srcBitrate, ffstream.isTdarrLossless, ffstream.isTdarrQuality);
-                            workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → ${targetCodec} ${forceChannels}ch @ ${dstBitStr / 1000} kb/s\n`;
-                            extraArguments += ` -c:a:${outputAudioIdx} ${targetCodec}${dstBitArg}`;
+                            workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → ${targetCodec} ${forceChannels}ch @ ${dstBitStr / 1000} kb/s${note}\n`;
+                            extraArguments += ` -c:a:${outputAudioIdx} ${targetCodec}${dstBitArg}${layoutFilter}`;
                             modifiedAudioIdx.add(outputAudioIdx);
                             outputAudioOverride.set(outputAudioIdx, { codec: targetCodec, channels: forceChannels, bps: dstBitStr });
+                            forced = true;
                         }
-                        convert = true;
+                        if (forced) convert = true;
                     }
                 }
             }
