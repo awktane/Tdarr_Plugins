@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.2.0',
+    Version: '2.2.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -904,6 +904,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         '5.0(side)': { layout: '5.0', map: 'FL-FL|FR-FR|FC-FC|SL-BL|SR-BR' },
         '6.1(back)': { layout: '6.1', map: 'FL-FL|FR-FR|FC-FC|LFE-LFE|BL-SL|BR-SR|BC-BC' },
     };
+    // Audio streams still present (not in streamsToRemove), read at call time so it reflects dedup + pre-pass removals - backs the never-drop-last-track guard.
+    const countSurvivingAudio = () => file.ffProbeData.streams.filter(a => (a?.codec_type || '').toLowerCase() === 'audio' && !streamsToRemove.has(a.index)).length;
 
     // method_opus_layout_err=drop must remove streams BEFORE outputAudioIdxMap / the -map removal are built below - a mid-loop removal
     // would break the OTHER forced tracks' -c:a:N numbering. Pre-scan for a surround track codec_force would send to opus with a
@@ -920,13 +922,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!(forceCodec === 'all' || (forceCodec === '6below' && ch <= 6))) continue;   // surround shouldForce (mirrors the loop)
             if (opusAcceptsLayout(ch, lay)) continue;
             if (OPUS_RELABEL[lay]) continue;                                             // losslessly relabelable → the loop transcodes it, never drop
-            // A downmix that converts this track to stereo makes it opus-safe → don't drop: secondary→downmix_secondary_stereo=true;
-            // primary→downmix_to_stereo=replace (any >2ch), or downmix_to_six=replace (>6ch, becomes an opus-safe 5.1).
+            // A downmix that converts this track to stereo makes it opus-safe → don't drop: secondary→downmix_secondary_stereo=true; primary→
+            // downmix_to_stereo=replace (any >2ch), or downmix_to_six=replace (>6ch → opus-safe 5.1). Only a NON-protected primary converts in place: a
+            // protected best track flips 'replace'→'add' (leaves the surround, so force still hits it), so those stay droppable. The per-language one-shot
+            // (created2chLangs/six) is dynamic and can't be predicted here; if it pre-empts the downmix the track lands in the loop fallback, logged there.
             const secondary = s.isTdarrSecondaryTrack || s.isTdarrLangSecondary;
             if (secondary ? downmixSecondaryStereo === 'true'
-                          : (downmixToTwo === 'replace' || (ch > 6 && downmixToSix === 'replace'))) continue;
-            const survivingAudio = file.ffProbeData.streams.filter(a => (a?.codec_type || '').toLowerCase() === 'audio' && !streamsToRemove.has(a.index)).length;
-            if (survivingAudio <= 1) continue;                                           // never drop the last audio track
+                          : (!protectedIndices.has(s.index) && (downmixToTwo === 'replace' || (ch > 6 && downmixToSix === 'replace')))) continue;
+            if (countSurvivingAudio() <= 1) continue;                                    // never drop the last audio track
             streamsToRemove.add(s.index);
             workDone += `☒Stream ${s.index}: Dropping - libopus can't encode a ${s.channel_layout || `${ch}ch`} layout (method_opus_layout_err=drop).\n`;
         }
@@ -1310,18 +1313,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         const opusBad = targetCodec === 'opus' && forceChannels > 2 && !opusAcceptsLayout(forceChannels, srcLayout);
                         const relabel = opusBad ? OPUS_RELABEL[srcLayout] : null;
                         const layoutName = srcLayout || `${forceChannels}ch`;
-                        // remix→stereo defers when a stereo already exists for this language (pre-existing or downmix-created): a second one would be a
-                        // cross-run duplicate that dedup only collapses on the NEXT run. Fall back to keep.
-                        const remixDefer = opusBad && !relabel && methodOpusLayoutErr === 'remix' && existingStereoLangs.has(ffstreamLangKey);
+                        // remix→stereo defers when a stereo already exists for this language - pre-existing (existingStereoLangs) OR created earlier this run
+                        // by a downmix or a prior remix (created2chLangs). A second one would be a same-language duplicate stereo that dedup only collapses on
+                        // the NEXT run (non-idempotent), or persists if dedup is disabled. Fall back to keep.
+                        const remixDefer = opusBad && !relabel && methodOpusLayoutErr === 'remix'
+                            && (existingStereoLangs.has(ffstreamLangKey) || created2chLangs.has(ffstreamLangKey));
                         let forced = false;
 
                         if (opusBad && !relabel && (methodOpusLayoutErr === 'keep' || methodOpusLayoutErr === 'drop' || remixDefer)) {
                             // No lossless relabel exists (relabelable layouts fall through to the transcode branch below in every mode). keep; a remix that
-                            // deferred to an existing stereo; or a drop the pre-pass couldn't apply (it was the last audio track) - leave the source codec.
-                            // Real drops already happened in the pre-pass above (before the index map).
-                            const why = remixDefer ? ' (a stereo already exists for this language)'
-                                      : methodOpusLayoutErr === 'drop' ? ' (kept - it is the last audio track)'
-                                      : ', enable a downmix option or set method_opus_layout_err to drop/remix';
+                            // deferred to an existing stereo; or a drop the pre-pass couldn't apply - leave the source codec. Real drops already happened in the
+                            // pre-pass (before the index map); a drop reaches here only when the pre-pass couldn't remove it: the last audio track, or a downmix
+                            // it expected to convert this track was pre-empted (per-language slot already filled). Report the actual reason, not a fixed one.
+                            let why;
+                            if (remixDefer) why = ' (a stereo already exists for this language)';
+                            else if (methodOpusLayoutErr === 'drop') why = countSurvivingAudio() <= 1 ? ' (kept - it is the last audio track)' : ' (kept - no downmix converted it to an opus-safe layout)';
+                            else why = ', enable a downmix option or set method_opus_layout_err to drop/remix';
                             workDone += `☒Stream ${ffstream.index}: Not forcing opus - libopus can't encode a ${layoutName} layout; left as ${ffstreamCodec}${why}.\n`;
                         } else if (opusBad && methodOpusLayoutErr === 'remix' && !relabel) {
                             // remix→stereo: downmix in place to a codec_stereo track (NOT opus) so it stays stereo-codec-consistent and idempotent (a stereo
@@ -1342,6 +1349,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                                 modifiedAudioIdx.add(outputAudioIdx);
                                 outputAudioOverride.set(outputAudioIdx, { codec: stereoCodec, channels: 2, bps: dstBitStr });
                             }
+                            created2chLangs.add(ffstreamLangKey);   // register the remix-created stereo so a later same-language downmix / remix defers to it
                             forced = true;
                         } else if (targetCodec === 'aac_vbr') {
                             // aac_vbr stereo force: use VBR 4 for low-bitrate sources, VBR 5 otherwise.
