@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '2.5.0',
+    Version: '2.6.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -64,13 +64,16 @@ const details = () => ({
             defaultValue: 'descending',
             inputUI: {
                 type: 'dropdown',
-                options: ['descending', 'ascending', 'disabled'],
+                options: ['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled'],
             },
             tooltip: `Audio channel ordering preference - streams are ordered by channel then rating of codec/bitrate. Generally descending is recommended.
                 \\nExample:\\n
-                    ascending: 2.0,5.1
-                \\nExample:\\n
                     descending: 5.1,2.0
+                \\nExample:\\n
+                    ascending: 2.0,5.1
+                \\ndescending <=6 / <=8 cap the surround: any track above the cap (<=6 = up to 5.1, <=8 = up to 7.1) is demoted to the END, so a client whose
+                ceiling is that layout auto-picks the best track it can play (e.g. the 5.1) rather than a 22.2/7.1 it must down-convert. Within the demoted tail
+                the largest lands last. The cap only applies to descending - ascending already puts the smallest first, so over-cap tracks are naturally last.
                 \\nSet to disabled to skip channel ordering entirely. If both order_channel and order_quality are disabled, audio is not reordered by channels or quality (language/role/order_codec still apply).`
         },
         {
@@ -79,13 +82,16 @@ const details = () => ({
             defaultValue: 'descending',
             inputUI: {
                 type: 'dropdown',
-                options: ['descending', 'ascending', 'disabled'],
+                options: ['descending', 'descending <=1024k', 'ascending', 'disabled'],
             },
             tooltip: `Audio quality ordering preference - streams are ordered by channel then rating of codec/bitrate. Generally descending is recommended.
                 \\nExample:\\n
-                    ascending: 128k,640k
-                \\nExample:\\n
                     descending: 640k,128k
+                \\nExample:\\n
+                    ascending: 128k,640k
+                \\ndescending <=1024k caps by bitrate: tracks above 1024k (lossless-scale TrueHD/DTS-HD MA) are demoted to the END so the client's auto-pick leads
+                with a manageable track it can serve without a heavy transcode, not the huge one. Within the demoted tail the largest lands last. Ordering within
+                the kept group is still by the quality score; the cap only applies to descending (ascending already puts the smallest first).
                 \\nSet to disabled to skip quality ordering entirely. If both order_channel and order_quality are disabled, audio is not reordered by channels or quality (language/role/order_codec still apply).`
         },
         {
@@ -487,9 +493,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // value), so only first_audio, order_channel, order_quality and first_subtitle have a fixed option set to validate.
     if(!['language', 'original', 'default', 'descriptive'].includes(inputs.first_audio))
         failFile('first_audio has not been configured, please configure required options.');
-    if(!['descending', 'ascending', 'disabled'].includes(inputs.order_channel))
+    if(!['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled'].includes(inputs.order_channel))
         failFile('order_channel has not been configured, please configure required options.');
-    if(!['descending', 'ascending', 'disabled'].includes(inputs.order_quality))
+    if(!['descending', 'descending <=1024k', 'ascending', 'disabled'].includes(inputs.order_quality))
         failFile('order_quality has not been configured, please configure required options.');
     if(!['normal', 'default', 'sdh', 'descriptive'].includes(inputs.first_subtitle))
         failFile('first_subtitle has not been configured, please configure required options.');
@@ -506,6 +512,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const subtitleFirst = inputs.first_subtitle; // 'normal' (baseline) | 'default' | 'sdh' | 'descriptive'
         const preferredLanguages = (inputs.order_language || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
         const codecFirstList = (inputs.order_codec || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
+
+        // Parse an order mode ('descending' | 'descending <=N' | 'ascending' | 'disabled') into {enabled, dir, cap}. The '<=N' suffix caps descending: a stream
+        // whose cap-metric exceeds N is demoted below every at/under-cap stream. A trailing 'k' (order_quality's bitrate cap) means N is in kbps -> bps. Parsed
+        // ONCE here, not per-comparison, because the comparator below runs O(n log n) times.
+        const parseOrderMode = (mode) => {
+            if (mode === 'disabled') return { enabled: false };
+            const m = /^descending\s*<=\s*(\d+)(k?)$/.exec(mode);
+            if (m) return { enabled: true, dir: 'descending', cap: Number(m[1]) * (m[2] === 'k' ? 1000 : 1) };
+            return { enabled: true, dir: mode === 'ascending' ? 'ascending' : 'descending', cap: Infinity };
+        };
+        // Ordered comparison with an optional cap. dir='ascending' -> plain ascending by the sort value (cap ignored). Otherwise descending, but any stream whose
+        // CAP value exceeds `cap` is demoted below every at/under-cap stream; within the over-cap tail it sorts ascending by the sort value so the largest lands
+        // last. cap=Infinity -> plain descending. For channels the sort value IS the cap value; for quality the sort value is the audioquality score and the cap
+        // value is the raw bitrate.
+        const orderedCompare = (aSort, bSort, aCapVal, bCapVal, dir, cap) => {
+            if (dir === 'ascending') return aSort - bSort;
+            const aOver = aCapVal > cap, bOver = bCapVal > cap;
+            if (aOver !== bOver) return aOver ? 1 : -1;
+            return aOver ? aSort - bSort : bSort - aSort;
+        };
+        const channelOrder = parseOrderMode(inputs.order_channel);
+        const qualityOrder = parseOrderMode(inputs.order_quality);
 
         const getLangRank = (lang, shortlang) => {
             let idx = preferredLanguages.indexOf(lang);
@@ -534,6 +562,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 lang: streamLang,
                 shortlang: streamLangShort,
                 channels: enrichedStream.channels || 0,
+                // Resolved bitrate in bps (shared resolveStreamBitrate fallback, via enrichStream). order_quality sorts by the audioquality score but CAPS by
+                // raw bitrate ('descending <=1024k'), so the cap threshold needs the actual bitrate, not the score. 0 when unknown -> treated as under-cap.
+                bitrate: enrichedStream.bit_rate || 0,
                 forced: ffstream?.disposition?.forced === 1,
                 // Only score audio: scoring video/subtitle/data would spam bogus "unknown codec"/"invalid bitrate" notices, and quality is only used to sort audio.
                 audioquality: streamType === 'audio' ? audioQuality(enrichedStream) : 0,
@@ -595,13 +626,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (codecFirstList.length > 0 && (a.codecmatch !== b.codecmatch))
                     return a.codecmatch ? -1 : 1;
 
-                //Channel ordering (skipped when disabled)
-                if (inputs.order_channel !== 'disabled' && a.channels !== b.channels)
-                    return (inputs.order_channel === 'descending' ? b.channels - a.channels : a.channels - b.channels);
+                //Channel ordering (skipped when disabled). A 'descending <=N' mode caps by channel count: over-cap tracks are demoted to the tail (largest last),
+                //so a client capped at that layout auto-picks the best it can play. Sort value == cap value here (both a.channels).
+                if (channelOrder.enabled) {
+                    const c = orderedCompare(a.channels, b.channels, a.channels, b.channels, channelOrder.dir, channelOrder.cap);
+                    if (c !== 0) return c;
+                }
 
-                //Quality (skipped when disabled)
-                if (inputs.order_quality !== 'disabled' && a.audioquality !== b.audioquality)
-                    return (inputs.order_quality === 'descending' ? b.audioquality - a.audioquality : a.audioquality - b.audioquality);
+                //Quality (skipped when disabled). A 'descending <=1024k' mode caps by BITRATE (a.bitrate) while still ordering by the audioquality score, so
+                //lossless-scale tracks are demoted below the ones a client can serve without a heavy transcode.
+                if (qualityOrder.enabled) {
+                    const c = orderedCompare(a.audioquality, b.audioquality, a.bitrate, b.bitrate, qualityOrder.dir, qualityOrder.cap);
+                    if (c !== 0) return c;
+                }
             //Subtitles
             } else if (a.type === 'subtitle') {
                 //Forced always first
