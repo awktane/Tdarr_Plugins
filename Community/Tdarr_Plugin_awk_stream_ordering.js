@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio (by language, then main/descriptive/commentary, then channels and quality) -> Subtitles (forced first, by language, then normal/songs/sdh/descriptive/commentary) -> Attachments -> Data. Also marks the first audio track as the sole default.\n`,
-    Version: '2.1.1',
+    Version: '2.2.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -403,28 +403,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // bitrate in MP4) fall back to mediaInfo. Every summary and scoring call site uses this so logged tokens and the scoring path enrich identically.
     const enrichStream = (s) => ({ ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate, channels: resolveChannels(s) || s.channels });
     // -=-=-= summariseStream  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
-    // Shows: video codec; audio lang/channels/codec/bitrate(+role); subtitle lang/codec(+forced/role); data and attachment codec. Role/forced
-    // detection mirrors the sorting logic (disposition flags first, then title keywords, via the shared classifiers) so every plugin's summary lines
-    // up. subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Shared verbatim across all three.
+    // Per type: video codec (+/cover for cover-art/still images); data & attachment codec only. Audio & subtitle append /default, then their role markers.
+    // Audio role markers: /commentary|/description then /dub|/original. Subtitle: /forced then /commentary|/description|/sdh|/lyrics.
+    // /default and /forced read the REAL disposition flag only — a title keyword must not flip a selection flag (as forced already did).
+    // /cover and the role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary lines up.
+    // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Shared verbatim across all three.
     const summariseStream = (s) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
         if (codec === 'subrip') codec = 'srt';
         const langRaw = resolveLang(s) || 'und';
         const lang = langRaw !== 'und' ? langRaw : '';
+        const def = s.disposition?.default === 1 ? '/default' : '';
         if (type === 'video')
-            return `[video:${codec}]`;
+            return `[video:${codec}${isCoverArt(s) ? '/cover' : ''}]`;
         if (type === 'audio') {
             const ch = s.channels ? `${s.channels}ch` : '';
             const bitrate = Number(s.bit_rate || 0);
             const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : '');
-            return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${role}]`;
+            const prov = hasDisposition(s, 'dub') ? '/dub' : (hasDisposition(s, 'original') ? '/original' : '');
+            return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
         }
         if (type === 'subtitle') {
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : (isSdh(s) ? '/sdh' : (isLyrics(s) ? '/lyrics' : '')));
             const forced = s.disposition?.forced === 1 ? '/forced' : '';
-            return `[sub:${[lang, codec].filter(Boolean).join(' ')}${forced}${role}]`;
+            return `[sub:${[lang, codec].filter(Boolean).join(' ')}${def}${forced}${role}]`;
         }
         if (type === 'attachment')
             return `[attach:${codec}]`;
@@ -447,9 +451,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const globalOutputOpt = ' -max_muxing_queue_size 9999';
     // ===== END SHARED: stream / language / preset helpers =====
 
-    // ===== SHARED [clean_and_remux, stream_ordering]: image / cover-art codecs =====
-    // -=-=-= IMAGE_CODECS / isCoverArt  [clean_and_remux, stream_ordering] =-=-=-
-    // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last.
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: image / cover-art codecs =====
+    // -=-=-= IMAGE_CODECS / isCoverArt  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
+    // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last;
+    // summariseStream flags them /cover.
     const IMAGE_CODECS = ['mjpeg', 'mjpegb', 'png', 'apng', 'gif', 'bmp', 'webp', 'tiff'];
     // A stream is cover art / a still image when its codec is an image codec OR it carries a cover-art disposition (attached_pic/still_image/timed_thumbnails).
     const isCoverArt = (s) => IMAGE_CODECS.includes((s.codec_name || '').trim().toLowerCase())
@@ -605,10 +610,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
             if (streams[i].type === 'audio') {
                 audioIndex++;
-                if (audioIndex === 0 && !streams[i].default)
+                const wantDefault = audioIndex === 0;   // exactly the first audio track carries default
+                if (wantDefault && !streams[i].default)
                     dispositionArgs += ` -disposition:a:${audioIndex} +default`;
-                else if (audioIndex > 0 && streams[i].default)
+                else if (!wantDefault && streams[i].default)
                     dispositionArgs += ` -disposition:a:${audioIndex} -default`;
+                // Reflect the normalized flag in the Expected results summary (summariseStream reads disposition.default);
+                // shallow-clone so the source probe object is untouched.
+                if (streams[i].default !== wantDefault)
+                    streams[i].stream = { ...streams[i].stream, disposition: { ...streams[i].stream.disposition, default: wantDefault ? 1 : 0 } };
             }
         }
 
