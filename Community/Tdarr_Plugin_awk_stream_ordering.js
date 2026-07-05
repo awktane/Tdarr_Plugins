@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote SDH or descriptive tracks. The first audio track is marked the sole default.\n`,
-    Version: '2.3.0',
+    Version: '2.3.1',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -20,6 +20,19 @@ const details = () => ({
             tooltip: `Which audio track sorts first (this key sits above every other audio key).
                 \\nlanguage (default): normal ordering - order_language decides, and the first sorted track becomes the sole default.
                 \\noriginal: promote the original-language track (ffmpeg 'original' disposition, or an 'original' title) above language, so a foreign film keeps its original audio first (and default) instead of a dub. Falls back to language ordering when no track is flagged original.`,
+        },
+        {
+            name: 'first_subtitle',
+            type: 'string',
+            defaultValue: 'normal',
+            inputUI: {
+                type: 'dropdown',
+                options: ['normal', 'sdh', 'descriptive'],
+            },
+            tooltip: `Which subtitle role sorts first, after forced (forced subtitles always lead regardless).
+                \\nnormal (default): standard role order within each language - normal, then songs/lyrics, sdh, descriptive, commentary.
+                \\nsdh: promote SDH tracks (Subtitles for the Deaf and Hard-of-Hearing) above language, to the very top (just under forced).
+                \\ndescriptive: promote descriptive tracks above language, to the very top (just under forced).`,
         },
         {
             name: 'order_language',
@@ -71,19 +84,6 @@ const details = () => ({
                 \\nExample:\\n
                     descending: 640k,128k
                 \\nSet to disabled to skip quality ordering entirely. If both order_channel and order_quality are disabled, audio is not reordered by channels or quality (language/role/order_codec still apply).`
-        },
-        {
-            name: 'first_subtitle',
-            type: 'string',
-            defaultValue: 'normal',
-            inputUI: {
-                type: 'dropdown',
-                options: ['normal', 'sdh', 'descriptive'],
-            },
-            tooltip: `Which subtitle role sorts first, after forced (forced subtitles always lead regardless).
-                \\nnormal (default): standard role order within each language - normal, then songs/lyrics, sdh, descriptive, commentary.
-                \\nsdh: promote SDH tracks (Subtitles for the Deaf and Hard-of-Hearing) above language, to the very top (just under forced).
-                \\ndescriptive: promote descriptive tracks above language, to the very top (just under forced).`,
         },
         {
             name: 'temp_on_network',
