@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.6.0',
+    Version: '2.7.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -131,7 +131,7 @@ const details = () => ({
                 \\n=====
                 \\nIf false          - No protection. Every operation proceeds as configured; even a lossless source can be transcoded or replaced.
                 \\nIf lossless       - Protect only when the SOURCE is lossless (TrueHD, DTS-HD MA, FLAC, PCM, etc.). Lossy sources are never protected - lossy-to-lossy transcodes/downmixes proceed as configured.
-                \\nIf quality        - (Default) Protect when the source is lossless, OR the operation reduces the channel count, OR a lossy source's predicted quality drop is significant (~6 points). A near-transparent swap such as 640k E-AC-3 to 640k AC3 is allowed through, while a 2048k E-AC-3 to 640k AC3 is kept. Allows AC3 to EAC3 at equal quality.
+                \\nIf quality        - (Default) Protect when the source is lossless, OR the operation reduces the channel count, OR a lossy source's predicted quality drop is significant (more than ~7 points). A comparable-codec swap such as 640k E-AC-3 to 640k AC3 (or a full-rate 1.5 Mbps DTS 5.1 to 640k AC3) is allowed through, while flattening a Dolby Atmos or DTS-HD source to 640k AC3 is kept. Allows AC3 to EAC3 at equal quality.
                 \\nIf quality-strict - Like quality, but a lossy source is protected on ANY predicted drop, however small (the most protective tier) - use it to keep a track even for a marginal quality difference. It protects the same ~1.5 Mbps DTS 5.1 forced to 640k AC3 that quality would let through. Because a downmix always drops channels, a downmix 'replace' always behaves as 'add' under either quality tier.`,
 
         },
@@ -322,7 +322,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ===== SHARED [audio_clean, stream_ordering]: audio codec scoring =====
     // -=-=-= codecInfo  [audio_clean, stream_ordering] =-=-=-
-    //Codec quality weights so we can pick the best track. Some of these formats aren't supported by ffmpeg yet (e.g. ac4).
+    // Codec quality weights + bitrate thresholds for picking the best track (audioQuality). Three row shapes, each field one job:
+    //   lossless: { score }                                    - already perfect; audioQuality returns score directly.
+    //   encodable (aac/opus/ac3/eac3): { score, minimum }      - SCORING thresholds come from the CODEC_TARGET_BPS ladder (see scoreThresholds); no
+    //       `transparent` here, and `minimum` is kept ONLY as the transcode floor read by resolveBitrate (audio_clean).
+    //   source-lossy (everything else): { score, transparent } - `transparent` is the 2-CHANNEL baseline; scoreThresholds scales it by (ch/2)^0.65 and
+    //       derives minimum as MIN_RATIO of transparent. Some formats here aren't ffmpeg-encodable (e.g. ac4).
     const codecInfo = {
         // Lossless
         pcm:        { score: 100, lossless: true },
@@ -337,32 +342,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Dolby family
         truehd:     { score: 99,  lossless: true },
         dtsma:      { score: 98,  lossless: true },
-        dtshr:      { score: 94,  minimum: 1000000, transparent: 3000000 },
-        dts:        { score: 91,  minimum: 768000,  transparent: 1509000 },
-        eac3atmos:  { score: 92,  minimum: 256000,  transparent: 768000 },
-        dtsexpress: { score: 80,  minimum: 128000,  transparent: 384000 },
-        
+        dtshr:      { score: 94,  transparent: 1470000 },
+        dts:        { score: 91,  transparent: 740000 },
+        eac3atmos:  { score: 92,  transparent: 375000 },
+        dtsexpress: { score: 80,  transparent: 188000 },
+
         // Modern multichannel codecs
-        ac4:        { score: 90,  minimum: 128000,  transparent: 384000 },
-        eac3:       { score: 89,  minimum: 192000,  transparent: 640000 },
-        mpegh3d:    { score: 89,  minimum: 192000,  transparent: 512000 },
+        ac4:        { score: 90,  transparent: 188000 },
+        eac3:       { score: 89,  minimum: 192000 },       // encodable -> scores off CODEC_TARGET_BPS; minimum = transcode floor only
+        mpegh3d:    { score: 89,  transparent: 250000 },
 
         // Modern general-purpose codecs
-        opus:       { score: 89,  minimum: 64000,   transparent: 192000 },
-        aac:        { score: 87,  minimum: 96000,   transparent: 256000 },
-        vorbis:     { score: 86,  minimum: 128000,  transparent: 256000 },
+        opus:       { score: 89,  minimum: 64000 },        // encodable
+        aac:        { score: 87,  minimum: 96000 },        // encodable
+        vorbis:     { score: 86,  transparent: 256000 },
 
         // Legacy but still excellent
-        ac3:        { score: 84,  minimum: 192000,  transparent: 640000 },
-        atrac:      { score: 83,  minimum: 96000,   transparent: 192000 },
-        wma:        { score: 82,  minimum: 96000,   transparent: 192000 },
-        mpc:        { score: 82,  minimum: 128000,  transparent: 220000 },
+        ac3:        { score: 84,  minimum: 192000 },       // encodable
+        atrac:      { score: 83,  transparent: 192000 },
+        wma:        { score: 82,  transparent: 192000 },
+        mpc:        { score: 82,  transparent: 220000 },
 
         // Older codecs
-        mp3:        { score: 78,  minimum: 128000,  transparent: 320000 },
-        mp2:        { score: 73,  minimum: 128000,  transparent: 256000 },
-        adpcm:      { score: 60,  minimum: 128000,  transparent: 256000 },
-        cook:       { score: 58,  minimum: 64000,   transparent: 128000 }
+        mp3:        { score: 78,  transparent: 320000 },
+        mp2:        { score: 73,  transparent: 256000 },
+        adpcm:      { score: 60,  transparent: 256000 },
+        cook:       { score: 58,  transparent: 128000 }
     };
     // -=-=-= codecAliases / unknownCodecs  [audio_clean, stream_ordering] =-=-=-
     // Prefix → canonical codec key (e.g. wmav1 → wma).
@@ -411,13 +416,31 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     // -=-=-= CODEC_TARGET_BPS  [audio_clean, stream_ordering] =-=-=-
-    // Per-channel target bitrate (bps) for our encodable output codecs (ac3/eac3 cap at 6ch in ffmpeg). Single source for BOTH the bitrate-less quality
-    // estimate in audioQuality and audio_clean's transcode targetTable, so a target change can't make the predicted score disagree with the bitrate used.
+    // Per-channel target bitrate (bps) for our encodable output codecs (ac3/eac3 cap at 6ch in ffmpeg). Single source for scoreThresholds' transparent
+    // point, audioQuality's bitrate-less membership check, and audio_clean's transcode targetTable - so scored transparent and transcode target can't drift.
     const CODEC_TARGET_BPS = {
         aac:  { 1: 128000, 2: 256000, 3: 320000, 4: 384000, 5: 448000, 6: 512000, 7: 576000, 8: 640000 },
         opus: { 1: 128000, 2: 192000, 3: 256000, 4: 320000, 5: 320000, 6: 384000, 7: 448000, 8: 448000 },
         ac3:  { 1: 192000, 2: 224000, 3: 320000, 4: 384000, 5: 448000, 6: 640000 },
         eac3: { 1: 192000, 2: 224000, 3: 320000, 4: 384000, 5: 448000, 6: 640000 },
+    };
+    // -=-=-= MIN_RATIO / scoreThresholds  [audio_clean, stream_ordering] =-=-=-
+    // Channel-count-aware scoring thresholds (bps) for a codec: transparent (0 penalty) and minimum (max penalty). Encodable codecs (aac/opus/ac3/eac3)
+    // read the real per-channel CODEC_TARGET_BPS ladder - so scoring-transparent IS the encode target and the two can't drift. Every other codec scales
+    // its 2-channel codecInfo.transparent baseline by (ch/2)^0.65. minimum is a uniform MIN_RATIO fraction of transparent for every codec, so no
+    // hand-tuned floor can land on top of a standard reduced-rate mode (e.g. half-rate DTS @768k).
+    const MIN_RATIO = 0.4;
+    const scoreThresholds = (codec, channels) => {
+        const family = codec === 'aac_vbr' ? 'aac' : codec;
+        const tbl = CODEC_TARGET_BPS[family];
+        let transparent;
+        if (tbl) {
+            const cap = (family === 'ac3' || family === 'eac3') ? 6 : 8;
+            transparent = tbl[Math.min(Math.max(1, Number(channels) || 1), cap)] ?? tbl[cap];
+        } else {
+            transparent = (codecInfo[codec]?.transparent ?? 320000) * Math.pow(Math.max(2, Number(channels) || 2) / 2, 0.65);
+        }
+        return { minimum: transparent * MIN_RATIO, transparent };
     };
     // -=-=-= audioQuality  [audio_clean, stream_ordering] =-=-=-
     // Scores a stream's quality (codec + bitrate vs transparent bitrate) to identify the "best" track. Declared after response so infoLog is available.
@@ -431,42 +454,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         //This is a pretty weak way to score an unknown codec
-        const info = codecInfo[codec] ?? { score: 70, minimum: 128000, transparent: 320000 };
-
-        //Get the variables ready for scoring
-        const bitrate = Number(stream.bit_rate || 0);
-        const channelScale = Math.pow((Math.max(2, Number(stream?.channels ?? 2))) / 2, 0.65);
-        const minimum = info.minimum * channelScale;
-        const transparent = info.transparent * channelScale;
+        const info = codecInfo[codec] ?? { score: 70 };
         const maxPenalty = 18;
-        let penalty = maxPenalty;
 
         // Lossless codecs are already "perfect"
         if (info.lossless)
             return info.score;
 
-        // No stream-level bitrate reported (freshly-transcoded tracks routinely omit it). For codecs we know how to encode (aac, opus, ac3, eac3) we
-        // estimate quality from the bitrate we'd target for this channel count instead of a blind midpoint. For source codecs that normally carry a
-        // bitrate (dts, ac3 from disc, etc.) we log once and use the midpoint.
+        // No stream-level bitrate reported (freshly-transcoded tracks routinely omit it). A codec we encode is assumed to sit at our per-channel target,
+        // which IS its transparent point (see scoreThresholds), so it scores full marks; a source codec that normally carries a bitrate (dts, ac3 from
+        // disc, etc.) is logged once and scored nominally.
+        const bitrate = Number(stream.bit_rate || 0);
         if (bitrate <= 0) {
-            const ch = Math.max(1, Number(stream?.channels ?? 2));
-            const tbl = CODEC_TARGET_BPS[codec];
-            if (tbl) {
-                // ac3/eac3 top out at 6ch in ffmpeg, so cap the channel count so the estimate and its min/transparent thresholds scale together -
-                // otherwise a 7.1 source scores below a 5.1 of the same codec (estBps pins at the 6ch target while the thresholds keep climbing).
-                const capCh = Math.min(ch, codec === 'ac3' || codec === 'eac3' ? 6 : 8);
-                const scale = Math.pow(Math.max(2, capCh) / 2, 0.65);
-                const estBps = tbl[capCh] ?? 0;
-                const estPenalty = estBps > info.minimum * scale
-                    ? (estBps >= info.transparent * scale ? 0 : maxPenalty * (1 - ((estBps - info.minimum * scale) / ((info.transparent - info.minimum) * scale))))
-                    : maxPenalty;
-                return info.score - estPenalty;
-            }
+            if (CODEC_TARGET_BPS[codec === 'aac_vbr' ? 'aac' : codec])
+                return info.score;
             response.infoLog += `☒Stream ${stream.index}: No bitrate reported for ${codec}, assuming nominal quality.\n`;
             return info.score - (maxPenalty / 2);
         }
 
-        //Score the track
+        //Score the track against its channel-count-aware thresholds
+        const { minimum, transparent } = scoreThresholds(codec, Number(stream?.channels ?? 2));
+        let penalty = maxPenalty;
         if (bitrate > minimum) {
             if (bitrate >= transparent)
                 penalty = 0;
@@ -609,11 +617,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const ac3Presets = [32000, 40000, 48000, 56000, 64000, 80000, 96000, 112000, 128000,
                         160000, 192000, 224000, 256000, 320000, 384000, 448000, 512000, 576000, 640000];
 
-    // Per-channel-count target bitrate (bps) for our four encodable output codecs. These sit at or comfortably above the transparent threshold from the
-    // codecInfo scoring table (scaled by channel count), and serve as the FLOOR for a transcode - the actual target is max(thisTable, source).
-    // AC3 / EAC3 - CBR fixed-preset: mono 192k, stereo 224k, 3ch 320k, 4ch 384k, 5ch 448k, 6ch 640k (640k is the Blu-ray 5.1 standard and the AC3/EAC3
-    // codec ceiling).
-    // Transcode target bitrate (bps) for a codec + channel count, from the shared CODEC_TARGET_BPS table. aac_vbr shares aac's targets; ac3/eac3 cap at 6ch.
+    // Transcode target bitrate (bps) for a codec + channel count, from the shared CODEC_TARGET_BPS table (aac_vbr shares aac's targets; ac3/eac3 cap at 6ch).
+    // For these encodable codecs the ladder IS the scoring transparent point (scoreThresholds reads the same table), and it serves as the FLOOR for a
+    // transcode - the actual target is max(thisTable, source). AC3/EAC3 CBR fixed-preset: mono 192k, stereo 224k, 3ch 320k, 4ch 384k, 5ch 448k, 6ch 640k
+    // (640k is the Blu-ray 5.1 standard and the AC3/EAC3 codec ceiling).
     const targetTable = (codec, channels) => {
         const ch = Math.max(1, Number(channels) || 1);
         const family = codec === 'aac_vbr' ? 'aac' : codec;
@@ -661,9 +668,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const chScale = Math.pow(Math.max(2, Number(channels) || 1) / 2, 0.65);
                 const targetMin = (codecInfo[family]?.minimum || 0) * chScale;
                 bps = Math.max(src, targetMin);
-                // This can emit BELOW the table floor. Safe re: audioQuality's bitrate-less estBps estimate (which still assumes the floor): a re-scan reads the
-                // real rate back - eac3/ac3 are CBR and always report bit_rate; aac/opus recover via resolveStreamBitrate (mediaInfo StreamSize/Duration). The
-                // estBps path only fires on a stream with NO recoverable bitrate (synthetic), never a real re-scanned transcode.
+                // This can emit BELOW the table floor. Safe: audioQuality's bitrate-less branch assumes an encodable track is at its transparent target, and a
+                // re-scan reads the real rate back - eac3/ac3 are CBR and always report bit_rate; aac/opus recover via resolveStreamBitrate (mediaInfo
+                // StreamSize/Duration). That branch only fires on a stream with NO recoverable bitrate (synthetic), never a real re-scanned transcode.
             } else if (src > floor) {
                 bps = src;   // guard failed (target less efficient than source): keep the source floor so a high-bitrate lossy source isn't needlessly degraded
             }
@@ -809,9 +816,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // earned PER OPERATION — each decision site calls guardBlocks with its own real target codec/channels — not assigned to a single "best" track. Secondary
         // (commentary/descriptive) and lang-secondary (unlisted language, filter active) tracks are never archived: the language filter and secondary status win
         // (isTdarrLangSecondary is only set when a listed-language primary exists, so a dormant filter leaves a foreign-only track primary and protectable).
-        // 'quality-strict' protects on ANY predicted score drop; 'quality' (default) only when the drop is at least QUALITY_MARGIN, so a near-transparent swap (640k
-        // eac3 → 640k ac3, ~5pt) passes while a big one (2048k eac3 → 640k ac3, ~18pt) is still kept. Lossless sources and channel-reducing ops protect in both tiers.
-        const QUALITY_MARGIN = 6;
+        // 'quality-strict' protects on ANY predicted score drop; 'quality' (default) protects only when the drop EXCEEDS QUALITY_MARGIN. Comparable-codec
+        // swaps pass (640k eac3 → 640k ac3 = 5pt; 1509k DTS 5.1 → 640k ac3 = 7pt); flattening a premium master is kept (Atmos → ac3 = 8pt, DTS-HD
+        // → ac3 = 10pt). QUALITY_MARGIN = 7 is the DTS(91)-vs-ac3(84) base-score gap, so a DTS core → ac3 sits exactly at the margin on the pass side (a
+        // drop must STRICTLY exceed the margin to protect) - preserving the force-DTS-to-ac3 behaviour. Lossless/channel-reducing ops protect in both tiers.
+        const QUALITY_MARGIN = 7;
         const guardBlocks = (stream, targetCodec, targetChannels, srcChannels) => {
             if (archiveGuard === 'false') return false;
             if (stream.isTdarrSecondaryTrack || stream.isTdarrLangSecondary) return false;
