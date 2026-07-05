@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote SDH or descriptive tracks. The first audio track is marked the sole default.\n`,
-    Version: '2.3.1',
+    Version: '2.4.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -29,10 +29,10 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['normal', 'sdh', 'descriptive'],
             },
-            tooltip: `Which subtitle role sorts first, after forced (forced subtitles always lead regardless).
+            tooltip: `Which subtitle role is promoted to the top of its language (forced subtitles and order_language priority still lead).
                 \\nnormal (default): standard role order within each language - normal, then songs/lyrics, sdh, descriptive, commentary.
-                \\nsdh: promote SDH tracks (Subtitles for the Deaf and Hard-of-Hearing) above language, to the very top (just under forced).
-                \\ndescriptive: promote descriptive tracks above language, to the very top (just under forced).`,
+                \\nsdh: lift SDH tracks (Subtitles for the Deaf and Hard-of-Hearing) to the top of their language.
+                \\ndescriptive: lift descriptive tracks to the top of their language.`,
         },
         {
             name: 'order_language',
@@ -421,7 +421,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Per type: video codec (+/cover for cover-art/still images); data & attachment codec only. Audio & subtitle append /default, then their role markers.
     // Audio role markers: /commentary|/description then /dub|/original. Subtitle: /forced then /commentary|/description|/sdh|/lyrics.
     // /default and /forced read the REAL disposition flag only — a title keyword must not flip a selection flag (as forced already did).
-    // /cover and the role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary lines up.
+    // The role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary lines up.
     // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Shared verbatim across all three.
     const summariseStream = (s) => {
         const type = (s.codec_type || '').trim().toLowerCase();
@@ -599,20 +599,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (a.forced !== b.forced)
                     return a.forced ? -1 : 1;
 
-                //first_subtitle promotes SDH or descriptive subtitles above language and the normal role order (still below forced).
-                if (subtitleFirst === 'sdh' && a.sdh !== b.sdh)
-                    return a.sdh ? -1 : 1;
-                else if (subtitleFirst === 'descriptive' && a.descriptive !== b.descriptive)
-                    return a.descriptive ? -1 : 1;
-
-                //Language
+                //Language priority next (forced already handled above).
                 const aRank = getLangRank(a.lang, a.shortlang);
                 const bRank = getLangRank(b.lang, b.shortlang);
 
                 if (aRank !== bRank)
                     return aRank - bRank;
 
-                //Normal, lyrics/songs, SDH, descriptive, commentary - first_subtitle overrides the SDH/descriptive position above
+                //first_subtitle promotes SDH or descriptive subtitles to the top of THEIR language (below forced + language, above the normal role order).
+                if (subtitleFirst === 'sdh' && a.sdh !== b.sdh)
+                    return a.sdh ? -1 : 1;
+                else if (subtitleFirst === 'descriptive' && a.descriptive !== b.descriptive)
+                    return a.descriptive ? -1 : 1;
+
+                //Normal, lyrics/songs, SDH, descriptive, commentary - first_subtitle overrides the SDH/descriptive position within the language
                 const aRole = a.commentary ? 4 : (a.descriptive ? 3 : (a.sdh ? 2 : (a.lyrics ? 1 : 0)));
                 const bRole = b.commentary ? 4 : (b.descriptive ? 3 : (b.sdh ? 2 : (b.lyrics ? 1 : 0)));
                 if (aRole !== bRole)
