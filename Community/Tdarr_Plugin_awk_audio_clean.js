@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.3.1',
+    Version: '2.4.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -16,7 +16,8 @@ const details = () => ({
             defaultValue: '',
             inputUI: { type: 'text' },
             tooltip: `Specify language tags here for the audio tracks you'd like to transcode. If blank then all tracks will be considered. Tracks in languages not listed will not be considered for the downmix_to_six, downmix_to_stereo options, nor keep_best_surround_safe.
-                \\nStreams with no language tag are treated as though they their language is "und". Any tracks with a language not in this list will be treated as a secondary track and therefore affected by downmix_secondary_stereo.
+                \\nStreams with no language tag are treated as though their language is "und". A track whose language is not in this list is treated as secondary - excluded from the primary downmix paths (downmix_to_six/downmix_to_stereo, keep_best_surround_safe) and instead handled by downmix_secondary_stereo.
+                \\nException: if the file has NO genuine (non-commentary, non-descriptive) track in a listed language, the language filter goes dormant and every genuine track is treated as primary - so a foreign-language-only file (e.g. Japanese-only when the list is English) keeps its surround instead of being downmixed. Commentary and descriptive tracks are always secondary regardless of language.
                 \\nThis list should include both two character and three character codes as this will successfully catch values like en, eng, en-US, en_US, and en.US.
                 \\nTracks with these languages will follow downmix_to_six, downmix_to_stereo, and codec_force
                 \\nExample:\\n
@@ -34,7 +35,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['false', 'replace', 'true'],
             },
-            tooltip: `Specify if we should downmix a 5.1 track if one doesn't already exist from the best quality higher channel track for that language (from downmix_language if specified) that is not a secondary track (unlisted language, commentary, descriptive, etc).
+            tooltip: `Specify if we should downmix a 5.1 track if one doesn't already exist from the best quality higher channel track for that language (from downmix_language if specified) that is not a secondary track (commentary, descriptive, etc).
                 \\nIf a 5.1 track for the same language already exists or if no higher channel track exists then no new 6 channel track is created.
                 \\n=====
                 \\nActions
@@ -124,7 +125,7 @@ const details = () => ({
                 options: ['false','quality','channel'],
             },
             tooltip: `If enabled then we should keep the best quality and highest channel option for each language (downmix_language list or if blank all). This track will be treated as a source and will not be transcoded or removed.
-                \\nThis track can only be affected by codec_force being set to all. No secondary tracks, including when language of the track is not in downmix_language, get this type of protection.
+                \\nThis track can only be affected by codec_force being set to all. Commentary and descriptive tracks never get this protection. A track in a language not in downmix_language normally doesn't either - unless the language filter is dormant (no listed-language non-commentary/descriptive track present), in which case it is treated as primary and can be protected. See downmix_language.
                 \\n=====
                 \\nActions
                 \\n=====
@@ -752,6 +753,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // keywords. Lyrics/songs are subtitle-only, so they never apply to an audio stream.
         const isSecondaryTrack = (stream) => isCommentary(stream) || isDescriptive(stream);
 
+        // hasPreferredPrimary: does any genuine (non-commentary/descriptive) track sit in a listed language? Only then does the language filter demote unlisted
+        // languages to secondary. If nothing listed is present, the filter goes dormant - every non-commentary track is treated as primary, so a foreign-only
+        // file keeps its surround instead of being downmixed. Commentary/descriptive tracks are secondary regardless and never count toward preferred-primary presence.
+        const hasPreferredPrimary = downmixLanguage.length > 0
+            && audioStreams.some(s => !isSecondaryTrack(s) && downmixLanguage.includes(String(shortLang(resolveLang(s) || 'und'))));
+
         //Add secondary track flag and the cleaned language to each track
         audioStreams = audioStreams.map(item => {
             const fullLang = resolveLang(item) || 'und';
@@ -761,9 +768,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const enrichedItem = enrichStream(item);
             return { ...enrichedItem,
                 isTdarrSecondaryTrack: isSecondaryTrack(item),
-                // Language-secondary: track language is not in downmixLanguage (when the list is non-empty). These tracks follow the secondary path
-                // (downmix_secondary_stereo, codec_force) but are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo).
-                isTdarrLangSecondary: downmixLanguage.length > 0 && !downmixLanguage.includes(cleanLang),
+                // Language-secondary: track language is not in downmixLanguage AND a listed-language primary exists (hasPreferredPrimary). These follow the
+                // secondary path (downmix_secondary_stereo, codec_force) but are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo).
+                // When no listed-language primary is present the filter is dormant, so this stays false and the track is treated as primary.
+                isTdarrLangSecondary: hasPreferredPrimary && !downmixLanguage.includes(cleanLang),
                 isTdarrCleanLang: cleanLang,
                 isTdarrFullLang: fullLang,
                 isTdarrQuality: audioQuality(enrichedItem),
