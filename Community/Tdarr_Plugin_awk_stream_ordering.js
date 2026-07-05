@@ -5,8 +5,8 @@ const details = () => ({
     Name: 'Re-order streams video, audio, subtitle, then anything else',
     Type: 'Any',
     Operation: 'Transcode',
-    Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote SDH or descriptive tracks. The first audio track is marked the sole default.\n`,
-    Version: '2.4.0',
+    Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
+    Version: '2.5.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -15,11 +15,13 @@ const details = () => ({
             defaultValue: 'language',
             inputUI: {
                 type: 'dropdown',
-                options: ['language', 'original'],
+                options: ['language', 'original', 'default', 'descriptive'],
             },
             tooltip: `Which audio track sorts first (this key sits above every other audio key).
                 \\nlanguage (default): normal ordering - order_language decides, and the first sorted track becomes the sole default.
-                \\noriginal: promote the original-language track (ffmpeg 'original' disposition, or an 'original' title) above language, so a foreign film keeps its original audio first (and default) instead of a dub. Falls back to language ordering when no track is flagged original.`,
+                \\noriginal: promote the original-language track (ffmpeg 'original' disposition, or an 'original' title) above language, so a foreign film keeps its original audio first (and default) instead of a dub. Falls back to language ordering when no track is flagged original.
+                \\ndefault: promote the track already flagged default (ffmpeg 'default' disposition) above language, so the source's chosen default audio stays first. Falls back to language ordering when no track is flagged default.
+                \\ndescriptive: promote the descriptive (audio-description) track above language. Falls back to language ordering when no descriptive track is present. Note: the first sorted track becomes the sole default, so this makes the description the default audio.`,
         },
         {
             name: 'first_subtitle',
@@ -27,10 +29,11 @@ const details = () => ({
             defaultValue: 'normal',
             inputUI: {
                 type: 'dropdown',
-                options: ['normal', 'sdh', 'descriptive'],
+                options: ['normal', 'default', 'sdh', 'descriptive'],
             },
             tooltip: `Which subtitle role is promoted to the top of its language (forced subtitles and order_language priority still lead).
                 \\nnormal (default): standard role order within each language - normal, then songs/lyrics, sdh, descriptive, commentary.
+                \\ndefault: lift the track flagged default (ffmpeg 'default' disposition) to the top of its language.
                 \\nsdh: lift SDH tracks (Subtitles for the Deaf and Hard-of-Hearing) to the top of their language.
                 \\ndescriptive: lift descriptive tracks to the top of their language.`,
         },
@@ -482,13 +485,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Value checks, in Inputs order. order_language/order_codec are free-text and temp_on_network is type:'boolean' (loadDefaultValues coerces any out-of-set
     // value), so only first_audio, order_channel, order_quality and first_subtitle have a fixed option set to validate.
-    if(!['language', 'original'].includes(inputs.first_audio))
+    if(!['language', 'original', 'default', 'descriptive'].includes(inputs.first_audio))
         failFile('first_audio has not been configured, please configure required options.');
     if(!['descending', 'ascending', 'disabled'].includes(inputs.order_channel))
         failFile('order_channel has not been configured, please configure required options.');
     if(!['descending', 'ascending', 'disabled'].includes(inputs.order_quality))
         failFile('order_quality has not been configured, please configure required options.');
-    if(!['normal', 'sdh', 'descriptive'].includes(inputs.first_subtitle))
+    if(!['normal', 'default', 'sdh', 'descriptive'].includes(inputs.first_subtitle))
         failFile('first_subtitle has not been configured, please configure required options.');
 
     // One guard around all the reordering work below: a deliberate failFile abort (AwkFailFile) rethrows unchanged, and any UNEXPECTED error fails the
@@ -499,8 +502,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // VIDEO -> AUDIO -> SUBTITLE -> ATTACHMENT -> DATA -> OTHER?
         const streamOrder = { video: 0, audio: 1, subtitle: 2 , attachment: 3, data: 4};
-        const audioFirst = inputs.first_audio;       // 'language' (baseline) | 'original'
-        const subtitleFirst = inputs.first_subtitle; // 'normal' (baseline) | 'sdh' | 'descriptive'
+        const audioFirst = inputs.first_audio;       // 'language' (baseline) | 'original' | 'default' | 'descriptive'
+        const subtitleFirst = inputs.first_subtitle; // 'normal' (baseline) | 'default' | 'sdh' | 'descriptive'
         const preferredLanguages = (inputs.order_language || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
         const codecFirstList = (inputs.order_codec || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
 
@@ -565,10 +568,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     return a.coverArt ? 1 : -1;
             //Audio
             } else if(a.type === 'audio') {
-                //first_audio='original': promote the original-language track (original disposition) above every audio key -
-                //keeps a foreign film's original audio first (and default), not a dub. No effect when no track is flagged original.
+                //first_audio promotes one track above every audio key (including language). Only one value is active, so at most one clause fires;
+                //each is a no-op when no track carries that flag, falling through to normal language ordering.
+                //original: keeps a foreign film's original audio first (and default), not a dub. default: keeps the source's flagged-default audio first.
+                //descriptive: lifts the audio-description track first (and, via normalisation, makes it the default).
                 if (audioFirst === 'original' && a.original !== b.original)
                     return a.original ? -1 : 1;
+                if (audioFirst === 'default' && a.default !== b.default)
+                    return a.default ? -1 : 1;
+                if (audioFirst === 'descriptive' && a.descriptive !== b.descriptive)
+                    return a.descriptive ? -1 : 1;
 
                 //Language priority first. A track in a non-preferred language should not sort above one in a preferred language.
                 const aRank = getLangRank(a.lang, a.shortlang);
@@ -606,13 +615,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (aRank !== bRank)
                     return aRank - bRank;
 
-                //first_subtitle promotes SDH or descriptive subtitles to the top of THEIR language (below forced + language, above the normal role order).
-                if (subtitleFirst === 'sdh' && a.sdh !== b.sdh)
+                //first_subtitle promotes the default/SDH/descriptive subtitle to the top of THEIR language (below forced + language, above the normal role order).
+                if (subtitleFirst === 'default' && a.default !== b.default)
+                    return a.default ? -1 : 1;
+                else if (subtitleFirst === 'sdh' && a.sdh !== b.sdh)
                     return a.sdh ? -1 : 1;
                 else if (subtitleFirst === 'descriptive' && a.descriptive !== b.descriptive)
                     return a.descriptive ? -1 : 1;
 
-                //Normal, lyrics/songs, SDH, descriptive, commentary - first_subtitle overrides the SDH/descriptive position within the language
+                //Normal, lyrics/songs, SDH, descriptive, commentary - first_subtitle overrides the default/SDH/descriptive position within the language
                 const aRole = a.commentary ? 4 : (a.descriptive ? 3 : (a.sdh ? 2 : (a.lyrics ? 1 : 0)));
                 const bRole = b.commentary ? 4 : (b.descriptive ? 3 : (b.sdh ? 2 : (b.lyrics ? 1 : 0)));
                 if (aRole !== bRole)
