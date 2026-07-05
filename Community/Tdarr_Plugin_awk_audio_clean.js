@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.5.1',
+    Version: '2.6.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -15,8 +15,8 @@ const details = () => ({
             type: 'string',
             defaultValue: '',
             inputUI: { type: 'text' },
-            tooltip: `Specify language tags here for the audio tracks you'd like to transcode. If blank then all tracks will be considered. Tracks in languages not listed will not be considered for the downmix_to_six, downmix_to_stereo options, nor keep_best_surround_safe.
-                \\nStreams with no language tag are treated as though their language is "und". A track whose language is not in this list is treated as secondary - excluded from the primary downmix paths (downmix_to_six/downmix_to_stereo, keep_best_surround_safe) and instead handled by downmix_secondary_stereo.
+            tooltip: `Specify language tags here for the audio tracks you'd like to transcode. If blank then all tracks will be considered. Tracks in languages not listed will not be considered for the downmix_to_six, downmix_to_stereo options, nor archive_guard.
+                \\nStreams with no language tag are treated as though their language is "und". A track whose language is not in this list is treated as secondary - excluded from the primary downmix paths (downmix_to_six/downmix_to_stereo), never archived by archive_guard, and instead handled by downmix_secondary_stereo.
                 \\nException: if the file has NO genuine (non-commentary, non-descriptive) track in a listed language, the language filter goes dormant and every genuine track is treated as primary - so a foreign-language-only file (e.g. Japanese-only when the list is English) keeps its surround instead of being downmixed. Commentary and descriptive tracks are always secondary regardless of language.
                 \\nThis list should include both two character and three character codes as this will successfully catch values like en, eng, en-US, en_US, and en.US.
                 \\nTracks with these languages will follow downmix_to_six, downmix_to_stereo, and codec_force
@@ -41,7 +41,7 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\nIf false   - no new 6 channel track is created from higher channel surround channel
-                \\nIf replace - a new codec_surround 6 channel track replaces the higher channel track used to create it unless protected by keep_best_surround_safe.
+                \\nIf replace - a new codec_surround 6 channel track replaces the higher channel track used to create it unless protected by archive_guard.
                 \\nIf true    - a new codec_surround 6 channel track will be created from the higher channel track and both will be kept`,
         },
         {
@@ -70,7 +70,7 @@ const details = () => ({
                 options: ['false', 'true'],
             },
             tooltip: `Should commentary, visual impaired tracks, and other secondary tracks be downmixed to stereo? Unlike the primary downmix options, each surround secondary track is transcoded in place to stereo independently — one stereo per secondary track, preserving all of them. This would normally be false.
-                \nThese tracks are never protected by keep_best_surround_safe, so an enabled secondary downmix always transcodes them in place.
+                \nThese tracks are never archived by archive_guard, so an enabled secondary downmix always transcodes them in place.
                 \\n=====
                 \\nActions
                 \\n=====
@@ -112,26 +112,27 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\nIf false  - Codecs will be left as is and those two settings will only apply to new tracks
-                \\nIf 2below - Streams with two or fewer channels will be transcoded to codec_stereo (unless protected by keep_best_surround_safe). Anything above that will be left in its original codec.
-                \\nIf 6below - Streams with six or fewer channels will be transcoded to codec_surround (unless protected by keep_best_surround_safe). Tracks with two or fewer channel will be converted to codec_stereo.
-                \\nIf all   - All streams will be transcoded to the codecs specified by codec_surround and codec_stereo depending on their channel count INCLUDING the track protected by keep_best_surround_safe`,
+                \\nIf 2below - Streams with two or fewer channels will be transcoded to codec_stereo (unless protected by archive_guard). Anything above that will be left in its original codec.
+                \\nIf 6below - Streams with six or fewer channels will be transcoded to codec_surround (unless protected by archive_guard). Tracks with two or fewer channel will be converted to codec_stereo.
+                \\nIf all   - Like 6below but also transcodes surround tracks above six channels, each subject to its codec's channel limit (ac3/eac3 6ch, aac/opus 8ch). archive_guard still applies in every mode - a track it protects is left in its source codec; 'all' differs from 6below only by the channel-count threshold.`,
         },                
         {
-            name: 'keep_best_surround_safe',
+            name: 'archive_guard',
             type: 'string',
             defaultValue: 'quality',
             inputUI: {
                 type: 'dropdown',
-                options: ['false','quality','channel'],
+                options: ['false','lossless','quality','quality-strict'],
             },
-            tooltip: `If enabled then we should keep the best quality and highest channel option for each language (downmix_language list or if blank all). This track will be treated as a source and will not be transcoded or removed.
-                \\nThis track can only be affected by codec_force being set to all. Commentary and descriptive tracks never get this protection. A track in a language not in downmix_language normally doesn't either - unless the language filter is dormant (no listed-language non-commentary/descriptive track present), in which case it is treated as primary and can be protected. See downmix_language.
+            tooltip: `Protect a track from a destructive operation (downmix_to_six / downmix_to_stereo 'replace', codec_force, and duplicate removal) ONLY when that operation would irreversibly lose detail the destination format can't hold. Protection is earned PER OPERATION against that operation's real target codec/channels - it is not a single "best track" flag. Every downmix/force output codec is lossy, so transcoding a lossless source always loses detail.
+                \\nA guarded downmix 'replace' becomes 'add' (the source is kept and the downmix is added alongside); a guarded codec_force is skipped (left in its source codec); a guarded duplicate is kept instead of removed. codec_force='all' no longer overrides this - a guarded track is left alone in every force mode. Commentary/descriptive tracks and unlisted-language tracks (while the downmix_language filter is active) are never archived - the language filter and secondary status take precedence; a dormant filter (no listed-language primary present) leaves a foreign-only track primary, so it can be protected. See downmix_language.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nIf false   - All tracks are treated normally
-                \\nIf quality - The focus is on track quality. A lossless 5.1 track would be kept over a lossy 7.1 as an example. If there is a 5.1 and 7.1 of similar quality then the 7.1 would be chosen.
-                \\nIf channel - The focus is on channel count. A lossy 7.1 track will always be kept over the lossless 5.1 track in the previous example.`,
+                \\nIf false          - No protection. Every operation proceeds as configured; even a lossless source can be transcoded or replaced.
+                \\nIf lossless       - Protect only when the SOURCE is lossless (TrueHD, DTS-HD MA, FLAC, PCM, etc.). Lossy sources are never protected - lossy-to-lossy transcodes/downmixes proceed as configured.
+                \\nIf quality        - (Default) Protect when the source is lossless, OR the operation reduces the channel count, OR a lossy source's predicted quality drop is significant (~6 points). A near-transparent swap such as 640k E-AC-3 to 640k AC3 is allowed through, while a 2048k E-AC-3 to 640k AC3 is kept. Allows AC3 to EAC3 at equal quality.
+                \\nIf quality-strict - Like quality, but a lossy source is protected on ANY predicted drop, however small (the most protective tier) - use it to keep a track even for a marginal quality difference. It protects the same ~1.5 Mbps DTS 5.1 forced to 640k AC3 that quality would let through. Because a downmix always drops channels, a downmix 'replace' always behaves as 'add' under either quality tier.`,
 
         },
         {
@@ -158,7 +159,7 @@ const details = () => ({
                 \\nExample: 
                     A file has these tracks with the same language: 7.1 aac, 5.1 truehd, 2.0 ac3, 2.0 mp3
                 \\nIf channel      - keeps 7.1 aac, 5.1 truehd, and the better of the two 2.0 tracks (2.0 ac3). The 7.1 and 5.1 are different channel counts so both survive.
-                \\nIf multi-stereo - keeps 5.1 truehd (better quality than 7.1 aac, both are "surround") and 2.0 ac3 (better than 2.0 mp3, both are "stereo"). The 7.1 aac is removed.
+                \\nIf multi-stereo - keeps 5.1 truehd (better quality than 7.1 aac, both are "surround") and 2.0 ac3 (better than 2.0 mp3, both are "stereo"). The 7.1 aac is removed - but with archive_guard=quality the higher-channel 7.1 is kept alongside the 5.1, since the guard blocks a removal that drops channels the survivor lacks.
                 \\nIf channel-error or multi-stereo-error - aborts the run if it finds duplicates as per the categories above; no streams are removed and no other changes from this run are applied.`,
         },
         {
@@ -711,7 +712,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const surroundCodec = String(inputs.codec_surround).trim();
     const stereoCodec = String(inputs.codec_stereo).trim();
     const forceCodec = String(inputs.codec_force).trim();
-    const keepBestSurroundSafe = String(inputs.keep_best_surround_safe).trim();
+    const archiveGuard = String(inputs.archive_guard).trim();
     const removeDuplicatesBy = String(inputs.remove_duplicates_by).trim();
     const stereoDownmix = String(inputs.method_stereo_downmix).trim();
     const methodOpusLayoutErr = String(inputs.method_opus_layout_err).trim();
@@ -728,8 +729,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`Somehow invalid stereoCodec option provided. Check your settings!`);
     if(!['false','6below','2below','all'].includes(forceCodec))
         failFile(`Somehow invalid forceCodec option provided. Check your settings!`);
-    if(!['false','quality','channel'].includes(keepBestSurroundSafe))
-        failFile(`Somehow invalid keepBestSurroundSafe option provided. Check your settings!`);
+    if(!['false','lossless','quality','quality-strict'].includes(archiveGuard))
+        failFile(`Somehow invalid archiveGuard option provided. Check your settings!`);
     if(!['disabled','multi-stereo','multi-stereo-error','channel','channel-error'].includes(removeDuplicatesBy))
         failFile(`Somehow invalid removeDuplicatesBy option provided. Check your settings!`);
     if(!['default','dialogue'].includes(stereoDownmix))
@@ -795,7 +796,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
         });
 
-        // candidateStreams: the pool for workStreams and keep_best_surround_safe. Lang-secondary tracks (unlisted language) are included here so codec_force
+        // candidateStreams: the pool for workStreams. Lang-secondary tracks (unlisted language) are included here so codec_force
         // and downmix_secondary_stereo can act on them. They are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo) in the processing
         // loop below. Secondary and lang-secondary tracks are only dropped from the pool when there is genuinely nothing to do with them:
         // downmix_secondary_stereo is false AND codec_force is false. When codec_force is set they stay so the force-codec path can standardize their codec
@@ -804,30 +805,41 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (downmixSecondaryStereo === 'false' && forceCodec === 'false')
             candidateStreams = candidateStreams.filter(stream => !stream.isTdarrSecondaryTrack && !stream.isTdarrLangSecondary);
 
-        // keep_best_surround_safe: protect the best track per language among preferred-language primary tracks. Lang-secondary and disposition-secondary tracks are
-        // excluded — protecting a non-preferred-language track or a commentary track serves no purpose and would prevent codec_force from touching it.
-        const protectedIndices = new Set();
-        if (keepBestSurroundSafe !== 'false') {
-            const bestByLang = new Map();
-            const qualityFirst = keepBestSurroundSafe === 'quality';
-            for (const s of candidateStreams) {
-                if (s.isTdarrSecondaryTrack || s.isTdarrLangSecondary) continue;
-                const cur = bestByLang.get(s.isTdarrCleanLang);
-                if (!cur) {
-                    bestByLang.set(s.isTdarrCleanLang, s);
-                    continue;
-                }
-                const better = qualityFirst
-                    ? s.isTdarrQuality > cur.isTdarrQuality
-                      || (s.isTdarrQuality === cur.isTdarrQuality && s.channels > cur.channels)
-                      || (s.isTdarrQuality === cur.isTdarrQuality && s.channels === cur.channels && s.index < cur.index)
-                    : s.channels > cur.channels
-                      || (s.channels === cur.channels && s.isTdarrQuality > cur.isTdarrQuality)
-                      || (s.channels === cur.channels && s.isTdarrQuality === cur.isTdarrQuality && s.index < cur.index);
-                if (better) bestByLang.set(s.isTdarrCleanLang, s);
-            }
-            for (const s of bestByLang.values()) protectedIndices.add(s.index);
-        }
+        // archive_guard: block a destructive operation on a track ONLY when it would irreversibly lose detail the destination format can't hold. Protection is
+        // earned PER OPERATION — each decision site calls guardBlocks with its own real target codec/channels — not assigned to a single "best" track. Secondary
+        // (commentary/descriptive) and lang-secondary (unlisted language, filter active) tracks are never archived: the language filter and secondary status win
+        // (isTdarrLangSecondary is only set when a listed-language primary exists, so a dormant filter leaves a foreign-only track primary and protectable).
+        // 'quality-strict' protects on ANY predicted score drop; 'quality' (default) only when the drop is at least QUALITY_MARGIN, so a near-transparent swap (640k
+        // eac3 → 640k ac3, ~5pt) passes while a big one (2048k eac3 → 640k ac3, ~18pt) is still kept. Lossless sources and channel-reducing ops protect in both tiers.
+        const QUALITY_MARGIN = 6;
+        const guardBlocks = (stream, targetCodec, targetChannels, srcChannels) => {
+            if (archiveGuard === 'false') return false;
+            if (stream.isTdarrSecondaryTrack || stream.isTdarrLangSecondary) return false;
+            if (stream.isTdarrLossless) return true;                             // every downmix/force output is lossy → lossless detail can't survive
+            if (archiveGuard === 'lossless') return false;                       // lossy source: only the lossless tier protects, and it stopped above
+            if (Number(targetChannels) < Number(srcChannels)) return true;       // the operation drops channels
+            const family = targetCodec === 'aac_vbr' ? 'aac' : targetCodec;      // aac_vbr scores as the aac family
+            // Predict the bitrate the same-channel force branch actually emits, then score it. aac_vbr emits libfdk VBR (~128k q4 for a <=144k source, else ~192k
+            // q5; see aacVbrArgsIdx), NOT resolveBitrate's CBR target — predict the VBR rate directly for aac_vbr or the guard would overstate the delivered quality.
+            const srcBps = Number(stream.bit_rate) || 0;
+            const predBps = targetCodec === 'aac_vbr'
+                ? (srcBps > 0 && srcBps <= 144000 ? 128000 : 192000)
+                : resolveBitrate(family, targetChannels, srcBps, false, stream.isTdarrQuality);
+            const predQuality = audioQuality({ codec_name: family, channels: targetChannels, bit_rate: predBps });
+            const margin = archiveGuard === 'quality-strict' ? 0 : QUALITY_MARGIN;
+            return predQuality < stream.isTdarrQuality - margin;                 // target scores below the source by more than the tier's margin → detail lost
+        };
+
+        // Duplicate removal keeps `survivor` and drops `removed`. Block only when the drop loses detail the survivor can't hold. Separate from guardBlocks: dedupe
+        // compares against an existing survivor (not a predicted transcode) and must check the survivor's losslessness. No quality clause on purpose — the dedupe
+        // sort is measured-bitrate-first, so a survivor can carry a LOWER isTdarrQuality than the removed track; a quality clause would wrongly block those drops.
+        const dedupeGuardBlocks = (removed, survivor) => {
+            if (archiveGuard === 'false') return false;
+            if (removed.isTdarrSecondaryTrack || removed.isTdarrLangSecondary) return false;
+            if (removed.isTdarrLossless && !survivor.isTdarrLossless) return true;                   // dropping the last lossless copy
+            if (archiveGuard === 'quality' && removed.channels > survivor.channels) return true;     // survivor has fewer channels
+            return false;
+        };
 
         // Languages that already have a primary stereo track, so downmix_to_stereo can honour "create a 2 channel track only if one doesn't exist". Uses
         // isTdarrCleanLang (normalised short code, e.g. 'en' for 'en-US') to match the same key used by created2chLangs and ffstreamLangKey — preventing
@@ -853,8 +865,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //       existingStereoLangs, so dedup can't disagree with and re-trigger the downmix creation guards (this previously caused an infinite
         //       create/remove loop between the two plugin runs).
         // Note: dedup runs across ALL audio streams regardless of downmix_language/downmix_secondary_stereo (those govern transcoding candidates, not what's a
-        // genuine duplicate - a duplicate in a non-preferred language is still a duplicate). Protected (keep_best_surround_safe) tracks are never removed and
-        // never trigger the "-error" abort - a protected track was never a removal candidate.
+        // genuine duplicate - a duplicate in a non-preferred language is still a duplicate). archive_guard (dedupeGuardBlocks) keeps a duplicate whose removal
+        // would lose detail the survivor can't hold (a last lossless copy, or a higher-channel track under quality) instead of removing it, and never -errors on it.
         const removeDuplicatesErrorMode = removeDuplicatesBy === 'multi-stereo-error' || removeDuplicatesBy === 'channel-error';
         const removeDuplicatesGroupBy = removeDuplicatesErrorMode ? removeDuplicatesBy.replace(/-error$/, '') : removeDuplicatesBy;
         const streamsToRemove = new Set();
@@ -864,8 +876,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // from the codec's per-channel target), so it must not win the "which duplicate to keep" decision over a track whose bitrate we actually measured. Both
             // probes are already consulted (resolveStreamBitrate above), so bit_rate === 0 here means genuinely unknown, not just "ffprobe couldn't read it".
             const hasKnownRate = (s) => Number(s.bit_rate || 0) > 0;
-            // On a quality tie, keep the higher channel count before falling back to index - matches keep_best_surround_safe, so multi-stereo dedup collapsing a
-            // language's surround variants keeps the 7.1 over a same-quality 5.1 (channel mode already tiers by exact count, so this only bites the broad modes).
+            // On a quality tie, keep the higher channel count before falling back to index, so multi-stereo dedup collapsing a language's surround variants keeps
+            // the 7.1 over a same-quality 5.1 (channel mode already tiers by exact count, so this only bites the broad modes).
             const byQuality = [...audioStreams].sort((a, b) =>
                 (hasKnownRate(b) ? 1 : 0) - (hasKnownRate(a) ? 1 : 0) || b.isTdarrQuality - a.isTdarrQuality || b.channels - a.channels || a.index - b.index);
             for (const s of byQuality) {
@@ -884,8 +896,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // collapse them together and wrongly delete the commentary.
                 const key = `${s.isTdarrCleanLang}|${tier}|${s.isTdarrSecondaryTrack}`;
                 if (seen.has(key)) {
-                    if (protectedIndices.has(s.index)) continue;
                     const kept = seen.get(key);
+                    if (dedupeGuardBlocks(s, kept)) continue;
                     if (removeDuplicatesErrorMode) {
                         const rmRate = hasKnownRate(s) ? ` @ ${Math.round(Number(s.bit_rate) / 1000)} kb/s` : '';
                         const keptRate = hasKnownRate(kept) ? ` @ ${Math.round(Number(kept.bit_rate) / 1000)} kb/s` : '';
@@ -932,17 +944,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const lay = (s.channel_layout || '').toLowerCase().trim();
                 if (ch <= 2 || ch > 8) continue;                                             // stereo→codec_stereo; >8 blocked (targetMaxCh)
                 if ((s.codec_name || '').toLowerCase() === 'opus') continue;                 // already opus
-                if (protectedIndices.has(s.index) && forceCodec !== 'all') continue;         // keep_best_surround_safe
+                if (guardBlocks(s, surroundCodec, ch, ch)) continue;   // archive_guard — mirrors the force-site guard (surroundCodec is opus)
                 if (!(forceCodec === 'all' || (forceCodec === '6below' && ch <= 6))) continue;   // surround shouldForce (mirrors the loop)
                 if (opusAcceptsLayout(ch, lay)) continue;
                 if (OPUS_RELABEL[lay]) continue;                                             // losslessly relabelable → the loop transcodes it, never drop
-                // A downmix that converts this track to stereo makes it opus-safe → don't drop: secondary→downmix_secondary_stereo=true; primary→
-                // downmix_to_stereo=replace (any >2ch), or downmix_to_six=replace (>6ch → opus-safe 5.1). Only a NON-protected primary converts in place: a
-                // protected best track flips 'replace'→'add' (leaves the surround, so force still hits it), so those stay droppable. The per-language one-shot
-                // (created2chLangs/six) is dynamic and can't be predicted here; if it pre-empts the downmix the track lands in the loop fallback, logged there.
+                // A downmix that will process this track keeps it out of the drop pile — whether it converts in place (replace, unguarded) or flips to 'add'
+                // (guarded: source kept + a derivative added), the track SURVIVES, so defer the drop to the loop; only a track NO downmix touches is truly dropped.
+                // Must NOT gate this on guardBlocks: a guarded replace flips to 'add', which keeps the source — dropping it here would delete it before that add runs
+                // (a data-loss regression). primary: downmix_to_stereo=replace (any >2ch) or downmix_to_six=replace (>6ch → 5.1); secondary: downmix_secondary_stereo.
+                // The per-language one-shot (created2chLangs/six) is dynamic and can't be predicted here; a pre-empted downmix lands the track in the loop keep fallback.
                 const secondary = s.isTdarrSecondaryTrack || s.isTdarrLangSecondary;
                 if (secondary ? downmixSecondaryStereo === 'true'
-                              : (!protectedIndices.has(s.index) && (downmixToTwo === 'replace' || (ch > 6 && downmixToSix === 'replace')))) continue;
+                              : (downmixToTwo === 'replace' || (ch > 6 && downmixToSix === 'replace'))) continue;
                 if (countSurvivingAudio() <= 1) continue;                                    // never drop the last audio track
                 streamsToRemove.add(s.index);
                 workDone += `☒Stream ${s.index}: Dropping - libopus can't encode a ${s.channel_layout || `${ch}ch`} layout (method_opus_layout_err=drop).\n`;
@@ -1167,7 +1180,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
 
             const ffstreamLangKey = ffstream.isTdarrCleanLang;
-            const isProtected = protectedIndices.has(ffstream.index);
 
             // Human-readable source bitrate for the operation log. Falls back to the known target bitrate for our own output codecs (common for
             // freshly-transcoded tracks where the muxer omits per-stream bitrate), or 'unknown bitrate' otherwise.
@@ -1184,8 +1196,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (ffstream.isTdarrSecondaryTrack || ffstream.isTdarrLangSecondary) {
             // ---- SECONDARY: DOWNMIX TO STEREO ----
             // Each secondary surround track is transcoded in place independently — one stereo per secondary track, preserving all of them.
-            // keep_best_surround_safe never protects secondary or lang-secondary tracks (they are excluded from protectedIndices), so there is no
-            // protected-source case here: an enabled secondary downmix always transcodes in place.
+            // archive_guard never archives secondary or lang-secondary tracks (guardBlocks short-circuits false for them), so there is no guarded-source
+            // case here: an enabled secondary downmix always transcodes in place.
             if (downmixSecondaryStereo !== 'false' && ffstream.channels > 2 && !modifiedAudioIdx.has(outputAudioIdx)) {
                 const newTitle = escMeta(buildTitle(ffstream, '2.0'));
                 // Downmix changes channel count, so the source bitrate isn't a comparable floor — use the table target for 2ch only.
@@ -1210,11 +1222,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             } else {
             // ====== DOWNMIX TO 6 CHANNELS ======
-            // One 6ch per language, from its best >6ch source. A protected best source is never replaced in place, so 'replace' becomes 'add' for it.
+            // One 6ch per language, from its best >6ch source. A guarded source (guardBlocks) is never replaced in place, so 'replace' becomes 'add' for it.
             if (downmixToSix !== 'false' && ffstream.channels > 6 && !created6chLangs.has(ffstreamLangKey)
                 && !existingSixLangs.has(ffstreamLangKey)) {
                 const newTitle = escMeta(buildTitle(ffstream, '5.1'));
-                const sixMode = (downmixToSix === 'replace' && isProtected) ? 'true' : downmixToSix;
+                const sixMode = (downmixToSix === 'replace' && guardBlocks(ffstream, surroundCodec, 6, ffstream.channels)) ? 'true' : downmixToSix;
 
                 if (sixMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
                     const dstBitArg = encoderArgsIdx(surroundCodec, 6, outputAudioIdx);
@@ -1240,13 +1252,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
 
             // ====== DOWNMIX TO 2 CHANNELS ======
-            // One stereo track per language, from its best >2ch source, only when the language has no primary stereo already. Protected best source:
+            // One stereo track per language, from its best >2ch source, only when the language has no primary stereo already. A guarded source (guardBlocks):
             // 'replace' becomes 'add'. When 'replace' is requested but downmix_to_six already consumed this same source in place (single >6ch source,
             // both downmixes enabled), the in-place slot is taken, so we fall back to ADDING a stereo from the original input. The user enabled
             // downmix_to_stereo expecting a 2.0 in the output, so a lone 7.1 with both downmixes on yields a 5.1 and a 2.0 rather than silently dropping
             // the stereo.
             if (downmixToTwo !== 'false' && ffstream.channels > 2 && !created2chLangs.has(ffstreamLangKey) && !existingStereoLangs.has(ffstreamLangKey)) {
-                const twoMode = (downmixToTwo === 'replace' && isProtected) ? 'true' : downmixToTwo;
+                const twoMode = (downmixToTwo === 'replace' && guardBlocks(ffstream, stereoCodec, 2, ffstream.channels)) ? 'true' : downmixToTwo;
 
                 if (twoMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
                     const newTitle = escMeta(buildTitle(ffstream, '2.0'));
@@ -1295,11 +1307,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
 
             // ====== FORCE CODEC ======
-            // Skip protected best tracks UNLESS codec_force is 'all' — per keep_best_surround_safe, the protected track can only be touched when codec_force
-            // is 'all'. Also skip when the source has more channels than the target codec supports (ac3/eac3 max 6ch, opus/aac max 8ch) to avoid an ffmpeg
+            // Skip a track archive_guard protects — guardBlocks: a lossless source, or a quality-tier target that scores lower. codec_force no longer overrides
+            // it in any mode, including 'all', so a guarded track is left in its source codec. Also skip when the source has more channels than the target codec
+            // supports (ac3/eac3 max 6ch, opus/aac max 8ch) to avoid an ffmpeg
             // encode failure. Channel count is resolved from ffprobe, then mediaInfo, then a channel-layout string (resolveChannels): a track no source can
             // measure is left untouched rather than guessed, since a wrong count could route it to a codec that can't hold its real channels and fail.
-            const forceChannels = (forceCodec !== 'false' && !modifiedAudioIdx.has(outputAudioIdx) && (!isProtected || forceCodec === 'all')) ? resolveChannels(ffstream) : -1;
+            const forceChannels = (forceCodec !== 'false' && !modifiedAudioIdx.has(outputAudioIdx)) ? resolveChannels(ffstream) : -1;
             if (forceChannels === 0)
                 workDone += `☒Stream ${ffstream.index}: Skipping codec_force - no channel count in ffprobe, mediaInfo, or channel layout; can't safely choose a target codec or verify its channel limit.\n`;
             if (forceChannels > 0) {
@@ -1318,7 +1331,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const targetMaxCh = ({ ac3: 6, eac3: 6, aac: 8, aac_vbr: 8, opus: 8 })[targetCodec] ?? 8;
 
                     if (shouldForce && forceChannels > targetMaxCh) {
-                        workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodecFamily} - ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} exceeds the ${targetMaxCh}ch limit for ${targetCodecFamily}. Enable downmix_to_six to reduce channels first.\n`;
+                        workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodecFamily} - ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} exceeds the ${targetMaxCh}ch limit for ${targetCodecFamily}. Enable downmix_to_six to create a 5.1 from it first.\n`;
+                    } else if (shouldForce && guardBlocks(ffstream, targetCodec, forceChannels, forceChannels)) {
+                        // archive_guard: forcing this codec would irreversibly lose detail the target can't hold (lossless source, or quality tier scores it lower). Leave it.
+                        workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodecFamily} - would lose detail vs ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} (archive_guard=${archiveGuard}); left as ${ffstreamCodec}.\n`;
                     } else if (shouldForce) {
                         // Guard the force-to-opus path against libopus-incompatible layouts (method_opus_layout_err). Only opus is affected - AC3/EAC3/AAC
                         // take any layout. `forced` gates the run's convert flag so a keep/defer makes no change (and doesn't cause a needless re-run).
