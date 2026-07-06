@@ -11,9 +11,10 @@ const details = () => ({
                   Automatically deduplicates titles reducing "Stereo / Stereo" down to "Stereo" or "English - English" down to "English".\n\n
                   Optionally rebuilds audio and/or subtitle titles from their disposition roles (tag_title) and imports title keywords into the real ffmpeg disposition flags (tag_disposition), each selectable per stream type (audio, subtitle, or both).\n\n
                   Removes unsupported image based subtitles during remux. Converts mov_text to srt when remuxing to mkv. Converts text-based subtitles to mov_text when remuxing to mp4. Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container.\n\n
+                  Optional clean_mkv_image_subs removes picture-based subtitles (PGS, VobSub, DVB) from mkv output, which mkv would otherwise keep - useful when you only want text subtitles.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.3.0',
+    Version: '2.4.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -28,8 +29,8 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nmkv will also remove eia_608, ttml, and any other non-muxable subtitle formats. mov_text is converted to srt for compatibility.
-                \\nmp4 will also remove image-based subtitles (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle, xsub), broadcast-only subtitles (dvb_teletext, arib_caption, eia_608), ttml, and hdmv_text_subtitle. Text-based subtitles (subrip, srt, ass, ssa, webvtt, text) are converted to mov_text. Genpts may be required to fix timestamps.`,
+                \\nmkv removes eia_608, ttml, xsub, dvb_teletext, and any other subtitle format the mkv muxer can't carry. mov_text is converted to srt for compatibility.
+                \\nmp4 additionally removes the image-based subtitles mkv keeps (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle), plus arib_caption and hdmv_text_subtitle. Text-based subtitles (subrip, srt, ass, ssa, webvtt, text) are converted to mov_text. Genpts may be required to fix timestamps.`,
         },
         {
             name: 'audio_language',
@@ -95,7 +96,7 @@ const details = () => ({
             },
             tooltip: `Remove accessibility tracks. Choose which stream types to apply to: disabled, subtitle, audio, or both.
                 \\nSubtitle removes SDH / Closed Caption tracks (for the deaf/hard-of-hearing). Audio removes audio-description tracks (visual_impaired, for the blind). Detected by the real ffmpeg disposition flag or by keywords in the title/handler/description.
-                \\nSafety: a track is only removed when a "plain" track of the same language survives - one carrying no commentary/descriptive/SDH/lyrics role (and, for subtitles, in a format the output container keeps). So extras are removed, never the last usable track.`,
+                \\nSafety: a track is only removed when a "plain" track of the same language survives - one carrying no commentary/descriptive/SDH/lyrics role (and, for subtitles, in a format the output container keeps and not stripped by clean_mkv_image_subs). So extras are removed, never the last usable track.`,
         },
         {
             name: 'tag_disposition',
@@ -145,6 +146,18 @@ const details = () => ({
                 \\nNote this also checks the handler_name for the same thing.
                 \\nExample:\\n
                 This.Title.Has.Too.Many.Periods would have title set to blank`,
+        },
+        {
+            name: 'clean_mkv_image_subs',
+            type: 'boolean',
+            defaultValue: false,
+            inputUI: {
+                type: 'dropdown',
+                options: ['false','true'],
+            },
+            tooltip: `Should image-based (bitmap) subtitles be removed from mkv output? Applies only when the container is mkv - mp4 already drops these formats.
+                \\nRemoves hdmv_pgs_subtitle (Blu-ray PGS), dvd_subtitle (VobSub), and dvb_subtitle - picture subtitles mkv keeps by default. They can't be searched, restyled, or converted to text without OCR, so this strips them when you only want text subtitles.
+                \\nText subtitles (subrip, srt, ass, ssa, webvtt, mov_text) are never affected. xsub is always removed regardless of this setting because it can't be muxed into mkv.`,
         },
         {
             name: 'recover_seesaw',
@@ -441,9 +454,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile('No ffProbe stream data available for this file - the plugin cannot process it.');
 
     // Input validation. Order mirrors the Inputs array in details(); only type:'string' inputs are checked - free-text inputs (audio_language, sub_language)
-    // have no fixed option set, and type:'boolean' inputs (fail_langs_blank, clean_metadata_*, temp_on_network) are coerced to a real true/false by
-    // loadDefaultValues (any out-of-set value becomes false), so a guard on them would be dead code. container is validated first (input #1) and before the
-    // dstContainer parse below so an empty value fails cleanly rather than throwing a raw TypeError. The remaining checks are grouped after all inputs parse.
+    // have no fixed option set, and type:'boolean' inputs (fail_langs_blank, clean_metadata_*, clean_mkv_image_subs, temp_on_network) are coerced to a real
+    // true/false by loadDefaultValues (any out-of-set value becomes false), so a guard on them would be dead code. container is validated first (input #1) and
+    // before the dstContainer parse below so an empty value fails cleanly rather than throwing a raw TypeError. Remaining checks run after all inputs parse.
     if (!inputs.container || inputs.container === '')
         failFile('Container has not been configured, please configure required options.');
 
@@ -465,6 +478,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const applies = (opt, type) => opt === 'both' || opt === type;
     const metaCommentRemove = String(inputs.clean_metadata_comments) === 'true';
     const metaBusyTitleRemove = String(inputs.clean_metadata_busytitle) === 'true';
+    const cleanMkvImageSubs = String(inputs.clean_mkv_image_subs) === 'true';
 
     const fillLanguage = (inputs.fill_language ? inputs.fill_language.toLowerCase().trim() : '');
     const subLanguage = inputs.sub_language.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
@@ -497,11 +511,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Subtitle codecs dropped purely by container/format - a stream in one of these is removed regardless of language, so it is never assigned fill_language
     // (used by the fail_langs_blank untagged-count below and the subtitle loop). The fail_langs_blank pre-check itself runs after the shared helpers, below.
-    const alwaysDropSubs  = ['eia_608', 'ttml'];
-    const mp4OnlyDropSubs = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub',
-                             'dvb_teletext', 'arib_caption', 'hdmv_text_subtitle'];
+    // alwaysDropSubs: unmuxable by BOTH mkv and mp4 - eia_608/ttml (no muxer path either way) plus xsub and dvb_teletext, which have no Matroska CodecID so
+    // the mkv muxer rejects them too (mkv has no generic subtitle passthrough). mp4OnlyDropSubs: muxes fine in mkv but the mp4 muxer can't carry it - the
+    // image-based PGS/VobSub/DVB, plus arib_caption and hdmv_text_subtitle.
+    const alwaysDropSubs  = ['eia_608', 'ttml', 'xsub', 'dvb_teletext'];
+    const mp4OnlyDropSubs = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'arib_caption', 'hdmv_text_subtitle'];
     const subFormatDropped = (codec) => alwaysDropSubs.includes(codec)
         || (dstContainer === 'mp4' && mp4OnlyDropSubs.includes(codec));
+    // Image-based subtitles mkv natively muxes and would otherwise keep - PGS/VobSub/DVB. Removed only when clean_mkv_image_subs is on and the output is
+    // mkv (mp4 already drops these via mp4OnlyDropSubs). xsub is image-based too but is unmuxable in mkv, so it lives in alwaysDropSubs and is always removed.
+    const imageSubCodecs = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle'];
+    const imageSubDropped = (codec) => cleanMkvImageSubs && dstContainer === 'mkv' && imageSubCodecs.includes(codec);
+    // A subtitle removed regardless of language - by container/format (subFormatDropped) or by clean_mkv_image_subs (imageSubDropped). Neither is ever assigned
+    // fill_language, and neither counts as a survivor for the fail_langs_blank untagged tally or the del_accessible plain-track guard.
+    const subDroppedAnyReason = (codec) => subFormatDropped(codec) || imageSubDropped(codec);
 
     //The channel labels we recognise/replace for tag_title - include 2.0 to allow us to overwrite that with stereo
     const channelTitleLabels = ['7.1', '6.1', '5.1', '5.0', '4.0', '3.1', '3.0', '2.1', '2.0', 'stereo', 'mono'];
@@ -614,16 +637,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             failFile(`${untaggedAudio} audio streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue or set fail_langs_blank to false.`);
         // Exclude subtitles that will be dropped by container/format anyway - they are never assigned
         // fill_language, so counting them here would falsely abort a file that would otherwise process fine.
-        const untaggedSubs =  streams.filter((s) =>(s?.codec_type || '').toLowerCase() === 'subtitle' && !subFormatDropped((s.codec_name || '').toLowerCase()) && isUntagged(s)).length;
+        const untaggedSubs = streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'subtitle'
+            && !subDroppedAnyReason((s.codec_name || '').toLowerCase()) && isUntagged(s)).length;
         if (untaggedSubs > 1)
             failFile(`${untaggedSubs} subtitle streams have no language tag and would all be assigned "${fillLanguage}" by fill_language — they may be different languages. Tag them manually and requeue or set fail_langs_blank to false.`);
     }
 
     // del_accessible safety guard (clean_and_remux only)
-    // (subFormatDropped/subtitle drop lists defined earlier, by fail_langs_blank.) A "plain" track carries no commentary/descriptive/SDH/lyrics role - a
+    // (subDroppedAnyReason/subtitle drop lists defined earlier, by fail_langs_blank.) A "plain" track carries no commentary/descriptive/SDH/lyrics role - a
     // genuine main audio or dialogue subtitle. del_accessible removes an accessibility track (SDH/CC subtitle, audio-description audio) only when its language
-    // still has a plain track that SURVIVES the language (and, for subtitles, format) filter, so we strip extras, never the last usable track. resolveWorkLang
-    // mirrors the loop's language resolution.
+    // still has a plain track that SURVIVES the language, format, and clean_mkv_image_subs filters, so we strip extras, never the last usable track.
+    // resolveWorkLang mirrors the loop's language resolution.
     const plainAudioLangs = new Set();
     const plainSubLangs = new Set();
     const isPlainTrack = (s) => !isCommentary(s) && !isDescriptive(s) && !isSdh(s) && !isLyrics(s);
@@ -636,7 +660,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         for (const s of (file.ffProbeData?.streams || [])) {
             const t = (s.codec_type || '').trim().toLowerCase();
             if ((t !== 'audio' && t !== 'subtitle') || !isPlainTrack(s)) continue;
-            if (t === 'subtitle' && subFormatDropped((s.codec_name || '').toLowerCase())) continue;
+            if (t === 'subtitle' && subDroppedAnyReason((s.codec_name || '').toLowerCase())) continue;
             const wl = resolveWorkLang(s);
             const langs = t === 'audio' ? audioLanguage : subLanguage;
             if (langs.length > 0 && !langs.includes(wl) && !langs.includes(shortLang(wl))) continue;
@@ -705,11 +729,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //First remove any subtitles that would be removed due to format as in that case language doesn't matter.
                 // eia_608: closed-caption data embedded in video bitstream, not a real subtitle stream — always drop.
                 // ttml: ffmpeg has no working encoder or muxer path for ttml; drop for both containers.
-                // dvb_teletext, arib_caption, hdmv_text_subtitle: decode-only, no encoder, no mp4 muxer support — drop for mp4.
-                //   hdmv_text_subtitle copies into mkv fine so it is only in the mp4 list.
-                // Image-based (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle, xsub): no encoder, mp4 rejects them — drop for mp4.
+                // xsub, dvb_teletext: no Matroska CodecID (mkv can't mux them) and no mp4 support either — drop for both containers.
+                // arib_caption, hdmv_text_subtitle: decode-only, no mp4 muxer support (hdmv_text_subtitle copies into mkv fine) — drop for mp4.
+                // Image-based (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle): mp4 rejects them, mkv keeps them — drop for mp4, or for mkv when
+                //   clean_mkv_image_subs is on.
                 if (subFormatDropped(ffstreamCodec)) {
                     workDone += `☐Remove stream ${i} - unsupported (${ffstreamType}-${ffstreamCodec})\n`;
+                    delStream = true;
+                } else if (imageSubDropped(ffstreamCodec)) {
+                    workDone += `☐Remove stream ${i} - image-based subtitle, clean_mkv_image_subs (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
                 } else {
                     //Rescue any we can by filling in the language before deciding whether to remove it
@@ -788,9 +816,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "comment="`;
                 }
                 
-                // mkv: mov_text is a QuickTime-only format that most players won't render in mkv — convert to srt.
-                //      All other subtitle codecs (subrip, ass, ssa, webvtt, hdmv_pgs_subtitle, dvd_subtitle,
-                //      dvb_subtitle, xsub, hdmv_text_subtitle, text) are natively supported by the mkv muxer.
+                // mkv: mov_text is a QuickTime-only format that most players won't render in mkv — convert to srt. Every other subtitle codec mkv keeps
+                //      natively (subrip, ass, ssa, webvtt, hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle, hdmv_text_subtitle, text). xsub is the exception —
+                //      it has no Matroska CodecID, so it is always dropped above (alwaysDropSubs).
                 if((dstContainer === 'mkv') && ffstreamCodec === 'mov_text') {
                     workDone += `☐Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} subtitle to srt\n`;
                     extraArguments += metadataCommand+` -c:s:${subtitleStreamIndex} srt`;
