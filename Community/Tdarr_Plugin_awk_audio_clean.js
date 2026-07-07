@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.7.0',
+    Version: '2.8.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -15,8 +15,8 @@ const details = () => ({
             type: 'string',
             defaultValue: '',
             inputUI: { type: 'text' },
-            tooltip: `Specify language tags here for the audio tracks you'd like to transcode. If blank then all tracks will be considered. Tracks in languages not listed will not be considered for the downmix_to_six, downmix_to_stereo options, nor archive_guard.
-                \\nStreams with no language tag are treated as though their language is "und". A track whose language is not in this list is treated as secondary - excluded from the primary downmix paths (downmix_to_six/downmix_to_stereo), never archived by archive_guard, and instead handled by downmix_secondary_stereo.
+            tooltip: `Specify language tags here for the audio tracks you'd like to transcode. If blank then all tracks will be considered. Tracks in languages not listed will not be considered for the downmix_to_six, downmix_to_stereo options, nor guard_lossless/guard_quality/guard_object_audio.
+                \\nStreams with no language tag are treated as though their language is "und". A track whose language is not in this list is treated as secondary - excluded from the primary downmix paths (downmix_to_six/downmix_to_stereo), never protected by guard_lossless/guard_quality/guard_object_audio, and instead handled by downmix_secondary_stereo.
                 \\nException: if the file has NO genuine (non-commentary, non-descriptive) track in a listed language, the language filter goes dormant and every genuine track is treated as primary - so a foreign-language-only file (e.g. Japanese-only when the list is English) keeps its surround instead of being downmixed. Commentary and descriptive tracks are always secondary regardless of language.
                 \\nThis list should include both two character and three character codes as this will successfully catch values like en, eng, en-US, en_US, and en.US.
                 \\nTracks with these languages will follow downmix_to_six, downmix_to_stereo, and codec_force
@@ -41,7 +41,7 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\nIf false   - no new 6 channel track is created from higher channel surround channel
-                \\nIf replace - a new codec_surround 6 channel track replaces the higher channel track used to create it unless protected by archive_guard.
+                \\nIf replace - a new codec_surround 6 channel track replaces the higher channel track used to create it unless protected by guard_lossless/guard_quality/guard_object_audio.
                 \\nIf true    - a new codec_surround 6 channel track will be created from the higher channel track and both will be kept`,
         },
         {
@@ -70,7 +70,7 @@ const details = () => ({
                 options: ['false', 'true'],
             },
             tooltip: `Should commentary, visual impaired tracks, and other secondary tracks be downmixed to stereo? Unlike the primary downmix options, each surround secondary track is transcoded in place to stereo independently — one stereo per secondary track, preserving all of them. This would normally be false.
-                \nThese tracks are never archived by archive_guard, so an enabled secondary downmix always transcodes them in place.
+                \nThese tracks are never protected by guard_lossless/guard_quality/guard_object_audio, so an enabled secondary downmix always transcodes them in place.
                 \\n=====
                 \\nActions
                 \\n=====
@@ -112,31 +112,12 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\nIf false  - Codecs will be left as is and those two settings will only apply to new tracks
-                \\nIf 2below - Streams with two or fewer channels will be transcoded to codec_stereo (unless protected by archive_guard). Anything above that will be left in its original codec.
-                \\nIf 6below - Streams with six or fewer channels will be transcoded to codec_surround (unless protected by archive_guard). Tracks with two or fewer channel will be converted to codec_stereo.
-                \\nIf all   - Like 6below but also transcodes surround tracks above six channels, each subject to its codec's channel limit (ac3/eac3 6ch, aac/opus 8ch). archive_guard still applies in every mode - a track it protects is left in its source codec; 'all' differs from 6below only by the channel-count threshold.`,
+                \\nIf 2below - Streams with two or fewer channels will be transcoded to codec_stereo (unless protected by guard_lossless/guard_quality/guard_object_audio). Anything above that will be left in its original codec.
+                \\nIf 6below - Streams with six or fewer channels will be transcoded to codec_surround (unless protected by guard_lossless/guard_quality/guard_object_audio). Tracks with two or fewer channel will be converted to codec_stereo.
+                \\nIf all   - Like 6below but also transcodes surround tracks above six channels, each subject to its codec's channel limit (ac3/eac3 6ch, aac/opus 8ch). guard_lossless/guard_quality/guard_object_audio still apply in every mode - a track they protect is left in its source codec; 'all' differs from 6below only by the channel-count threshold.`,
         },                
         {
-            name: 'archive_guard',
-            type: 'string',
-            defaultValue: 'quality',
-            inputUI: {
-                type: 'dropdown',
-                options: ['false','lossless','quality','quality-strict'],
-            },
-            tooltip: `Protect a track from a destructive operation (downmix_to_six / downmix_to_stereo 'replace', codec_force, and duplicate removal) ONLY when that operation would irreversibly lose detail the destination format can't hold. Protection is earned PER OPERATION against that operation's real target codec/channels - it is not a single "best track" flag. Every downmix/force output codec is lossy, so transcoding a lossless source always loses detail.
-                \\nA guarded downmix 'replace' becomes 'add' (the source is kept and the downmix is added alongside); a guarded codec_force is skipped (left in its source codec); a guarded duplicate is kept instead of removed. codec_force='all' no longer overrides this - a guarded track is left alone in every force mode. Commentary/descriptive tracks and unlisted-language tracks (while the downmix_language filter is active) are never archived - the language filter and secondary status take precedence; a dormant filter (no listed-language primary present) leaves a foreign-only track primary, so it can be protected. See downmix_language.
-                \\n=====
-                \\nActions
-                \\n=====
-                \\nIf false          - No protection. Every operation proceeds as configured; even a lossless source can be transcoded or replaced.
-                \\nIf lossless       - Protect only when the SOURCE is lossless (TrueHD, DTS-HD MA, FLAC, PCM, etc.). Lossy sources are never protected - lossy-to-lossy transcodes/downmixes proceed as configured.
-                \\nIf quality        - (Default) Protect when the source is lossless, OR the operation reduces the channel count, OR a lossy source's predicted quality drop is significant (more than ~7 points). A comparable-codec swap such as 640k E-AC-3 to 640k AC3 (or a full-rate 1.5 Mbps DTS 5.1 to 640k AC3) is allowed through, while flattening a Dolby Atmos or DTS-HD source to 640k AC3 is kept. Allows AC3 to EAC3 at equal quality.
-                \\nIf quality-strict - Like quality, but a lossy source is protected on ANY predicted drop, however small (the most protective tier) - use it to keep a track even for a marginal quality difference. It protects the same ~1.5 Mbps DTS 5.1 forced to 640k AC3 that quality would let through. Because a downmix always drops channels, a downmix 'replace' always behaves as 'add' under either quality tier.`,
-
-        },
-        {
-            name: 'remove_duplicates_by',
+            name: 'method_deduplicate',
             type: 'string',
             defaultValue: 'disabled',
             inputUI: {
@@ -159,8 +140,37 @@ const details = () => ({
                 \\nExample: 
                     A file has these tracks with the same language: 7.1 aac, 5.1 truehd, 2.0 ac3, 2.0 mp3
                 \\nIf channel      - keeps 7.1 aac, 5.1 truehd, and the better of the two 2.0 tracks (2.0 ac3). The 7.1 and 5.1 are different channel counts so both survive.
-                \\nIf multi-stereo - keeps 5.1 truehd (better quality than 7.1 aac, both are "surround") and 2.0 ac3 (better than 2.0 mp3, both are "stereo"). The 7.1 aac is removed - but with archive_guard=quality the higher-channel 7.1 is kept alongside the 5.1, since the guard blocks a removal that drops channels the survivor lacks.
+                \\nIf multi-stereo - keeps 5.1 truehd (better quality than 7.1 aac, both are "surround") and 2.0 ac3 (better than 2.0 mp3, both are "stereo"). The 7.1 aac is removed - but with guard_quality=enabled the higher-channel 7.1 is kept alongside the 5.1, since the guard blocks a removal that drops channels the survivor lacks.
                 \\nIf channel-error or multi-stereo-error - aborts the run if it finds duplicates as per the categories above; no streams are removed and no other changes from this run are applied.`,
+        },
+        {
+            name: 'method_loudnorm',
+            type: 'string',
+            defaultValue: 'disabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['disabled', 'tv', 'cinema', 'quiet_room'],
+            },
+            tooltip: `Two-pass measured loudness normalization (EBU R128 / ffmpeg's loudnorm filter) for every kept audio track guard_lossless/guard_quality/guard_object_audio don't protect.
+                \\naudio_clean spawns ffmpeg itself for an audio-only analysis pass per track, then applies the real measured correction - no other plugin
+                or flow ordering is involved (NOT the same as running a separate 2-pass loudnorm plugin - this is self-contained in one invocation).
+                \\nA track already within about 1 LU of the preset target is left completely untouched (no re-encode). A track whose current codec isn't
+                one this plugin can encode (e.g. a kept DTS-core or MP3 track) converges to codec_surround/codec_stereo, respecting each codec's
+                channel-count ceiling, but only as a side effect of a correction that's actually needed - it never touches a track that's already close
+                enough, regardless of codec.
+                \\nApplies whether or not the track is also being downmixed/forced/converted for another reason this run - a track that's untouched
+                otherwise is measured and corrected on its own; a track already being modified rides on that same re-encode instead of a separate one.
+                \\nOn a Matroska container (mkv/webm/mka) a track untouched by anything else this run is stamped with an awk_loudnorm tag once measured
+                (corrected or already close) - a later run trusts that tag and skips re-measuring while this setting stays the same. Changing this
+                setting invalidates the tag (fresh measurement). mp4/m4a muxers drop custom tags, so on those containers loudnorm re-measures each
+                run instead of caching (an already-correct track stays a no-op there rather than remuxing).
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nIf disabled   - no loudness measurement or correction; every other audio_clean option is unaffected.
+                \\nIf tv         - -16 LUFS integrated, LRA 11, true peak -1.5 dBTP. General home viewing, matches typical streaming-platform loudness.
+                \\nIf cinema     - -23 LUFS integrated, LRA 15, true peak -1.0 dBTP. EBU R128 broadcast standard, preserves more theatrical dynamic range.
+                \\nIf quiet_room - -16 LUFS integrated, LRA 6, true peak -1.5 dBTP. Tighter dynamic range so dialogue stays audible without volume-riding loud scenes.`,
         },
         {
             name: 'method_stereo_downmix',
@@ -193,6 +203,97 @@ const details = () => ({
                 \\nIf keep  - the track is left in its source codec (not forced to opus). Safe default: nothing fails and no audio is lost.
                 \\nIf drop  - the track is removed entirely. The last remaining audio track is never dropped (falls back to keep).
                 \\nIf remix - the track is downmixed to a codec_stereo stereo. Defers to downmix_to_stereo / downmix_secondary_stereo when they already convert the track, and falls back to keep rather than create a duplicate stereo.`,
+        },
+        {
+            name: 'method_verbose',
+            type: 'string',
+            defaultValue: 'enabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['enabled', 'disabled'],
+            },
+            tooltip: `Control whether the log explains tracks that DIDN'T change, on top of the tracks that did. Every actual change (transcoding,
+                adding, remixing, normalizing, removing a duplicate) is always logged regardless of this setting - that part matches the log you see
+                today. This only affects the extra diagnostic layer: why a guard protected a track, why a layout couldn't be forced, why a track was
+                skipped - useful for tracing which of your settings is doing something you didn't expect, without digging through the code.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nIf enabled  - (Default) Also log every track that was protected or skipped, and why - the negative space alongside the real changes.
+                \\nIf disabled - Only log tracks that actually changed. Close to the plugin's classic output - no explanation for tracks left alone.`,
+        },
+        {
+            name: 'guard_quality',
+            type: 'string',
+            defaultValue: 'enabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['enabled','strict','disabled'],
+            },
+            tooltip: `Protect a track from a destructive operation (downmix_to_six / downmix_to_stereo 'replace', codec_force, duplicate removal, and method_loudnorm)
+                whenever the operation reduces channel count OR a lossy source's predicted quality drop is significant - independent of guard_lossless
+                and guard_object_audio below. Protection is earned PER OPERATION against that operation's real target codec/channels - not a single "best track" flag.
+                A guarded downmix 'replace' becomes 'add'; a guarded codec_force/method_loudnorm is skipped; a guarded duplicate is kept instead of removed.
+                codec_force='all' does not override this - a guarded track is left alone in every force mode. Commentary/descriptive tracks and
+                unlisted-language tracks (while the downmix_language filter is active) are never protected. See downmix_language.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nIf enabled  - (Default) Protect when the operation reduces channel count, or a lossy source's predicted quality drop is more than ~7
+                points. A comparable-codec swap such as 640k E-AC-3 to 640k AC3 (or a full-rate 1.5 Mbps DTS 5.1 to 640k AC3) is allowed through, while
+                flattening a Dolby Atmos or DTS-HD source to 640k AC3 is kept. Allows AC3 to EAC3 at equal quality.
+                \\nIf strict   - Like enabled, but a lossy source is protected on ANY predicted drop, however small (the most protective tier) - use it
+                to keep a track even for a marginal quality difference. It protects the same ~1.5 Mbps DTS 5.1 forced to 640k AC3 that enabled would
+                let through. Because a downmix always drops channels, a downmix 'replace' always behaves as 'add' under either enabled or strict.
+                \\nIf disabled - No channel-count or quality-margin protection; guard_lossless (if enabled) still protects lossless sources on its own.`,
+        },
+        {
+            name: 'guard_lossless',
+            type: 'string',
+            defaultValue: 'enabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['enabled','disabled'],
+            },
+            tooltip: `Protect a track from a destructive operation (downmix_to_six / downmix_to_stereo 'replace', codec_force, duplicate removal, and method_loudnorm)
+                whenever its SOURCE is lossless (TrueHD, DTS-HD MA, FLAC, PCM, etc.) - independent of guard_quality and guard_object_audio, so disabling
+                quality-based protection never accidentally exposes a lossless master too; you have to turn this off on purpose. A guarded downmix 'replace'
+                becomes 'add' (the source is kept and the downmix is added alongside); a guarded codec_force/method_loudnorm is skipped (left in its source
+                codec); a guarded duplicate is kept instead of removed. Commentary/descriptive tracks and unlisted-language tracks (while the
+                downmix_language filter is active) are never protected - the language filter and secondary status take precedence. See downmix_language.
+                \\nNote: disabling this alone does not guarantee a lossless source gets touched - guard_quality's own quality-margin math still runs
+                using that source's (near-maximum) quality score, and in practice will usually still block a conversion to any lossy codec unless
+                guard_quality is ALSO relaxed. The three guards (guard_quality, this, guard_object_audio) are fully independent, not a fallback chain.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nIf enabled  - (Default) Protect lossless sources from every operation above.
+                \\nIf disabled - No lossless-specific protection; guard_quality (if enabled) still evaluates every operation on its own terms.`,
+        },
+        {
+            name: 'guard_object_audio',
+            type: 'string',
+            defaultValue: 'enabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['enabled','disabled'],
+            },
+            tooltip: `Protect a track from a destructive operation (downmix_to_six / downmix_to_stereo 'replace', codec_force, duplicate removal, and
+                method_loudnorm) whenever it carries OBJECT AUDIO (Dolby Atmos on E-AC-3, DTS:X, or MPEG-H) - independent of guard_lossless and
+                guard_quality. ffmpeg has no encoder for these object-audio layers, so ANY re-encode permanently flattens the track to its plain
+                channel bed, silently discarding the height/object information - the same irreversible loss guard_lossless prevents for lossless
+                masters, but for LOSSY object-audio carriers that guard_lossless doesn't cover (Atmos on E-AC-3 and DTS:X on DTS core/HR are lossy).
+                Atmos/DTS:X on a lossless carrier (TrueHD, DTS-HD MA) is already covered by guard_lossless. A guarded downmix 'replace' becomes 'add';
+                a guarded codec_force/method_loudnorm is skipped; a guarded duplicate is kept. Commentary/descriptive and unlisted-language tracks are
+                never protected. See downmix_language.
+                \\nNote: object-audio detection is best-effort - Atmos on E-AC-3 is reliable, but DTS:X relies on a MediaInfo field its own maintainers
+                note is incomplete for an undocumented format, so a real DTS:X track may occasionally not be recognized (it never false-positives). A
+                recognized object-audio track is also PREFERRED over an otherwise-equal plain track when remove_duplicates picks which to keep.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nIf enabled  - (Default) Protect object-audio tracks from every operation above.
+                \\nIf disabled - No object-audio-specific protection; the other two guards (if enabled) still evaluate every operation on their own terms.`,
         },
         {
             name: 'temp_on_network',
@@ -320,71 +421,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails');
     // ===== END SHARED: image / cover-art codecs =====
 
-    // ===== SHARED [audio_clean, stream_ordering]: audio codec scoring =====
-    // -=-=-= codecInfo  [audio_clean, stream_ordering] =-=-=-
-    // Codec quality weights + bitrate thresholds for picking the best track (audioQuality). Three row shapes, each field one job:
-    //   lossless: { score }                                    - already perfect; audioQuality returns score directly.
-    //   encodable (aac/opus/ac3/eac3): { score, minimum }      - SCORING thresholds come from the CODEC_TARGET_BPS ladder (see scoreThresholds); no
-    //       `transparent` here, and `minimum` is kept ONLY as the transcode floor read by resolveBitrate (audio_clean).
-    //   source-lossy (everything else): { score, transparent } - `transparent` is the 2-CHANNEL baseline; scoreThresholds scales it by (ch/2)^0.65 and
-    //       derives minimum as MIN_RATIO of transparent. Some formats here aren't ffmpeg-encodable (e.g. ac4).
-    const codecInfo = {
-        // Lossless
-        pcm:        { score: 100, lossless: true },
-        flac:       { score: 100, lossless: true },
-        alac:       { score: 100, lossless: true },
-        wavpack:    { score: 100, lossless: true },
-        ape:        { score: 100, lossless: true },
-        tak:        { score: 100, lossless: true },
-        tta:        { score: 100, lossless: true },
-        mlp:        { score: 99,  lossless: true },
-
-        // Dolby family
-        truehd:     { score: 99,  lossless: true },
-        dtsma:      { score: 98,  lossless: true },
-        dtshr:      { score: 94,  transparent: 1470000 },
-        dts:        { score: 91,  transparent: 740000 },
-        eac3atmos:  { score: 92,  transparent: 375000 },
-        dtsexpress: { score: 80,  transparent: 188000 },
-
-        // Modern multichannel codecs
-        ac4:        { score: 90,  transparent: 188000 },
-        eac3:       { score: 89,  minimum: 192000 },       // encodable -> scores off CODEC_TARGET_BPS; minimum = transcode floor only
-        mpegh3d:    { score: 89,  transparent: 250000 },
-
-        // Modern general-purpose codecs
-        opus:       { score: 89,  minimum: 64000 },        // encodable
-        aac:        { score: 87,  minimum: 96000 },        // encodable
-        vorbis:     { score: 86,  transparent: 256000 },
-
-        // Legacy but still excellent
-        ac3:        { score: 84,  minimum: 192000 },       // encodable
-        atrac:      { score: 83,  transparent: 192000 },
-        wma:        { score: 82,  transparent: 192000 },
-        mpc:        { score: 82,  transparent: 220000 },
-
-        // Older codecs
-        mp3:        { score: 78,  transparent: 320000 },
-        mp2:        { score: 73,  transparent: 256000 },
-        adpcm:      { score: 60,  transparent: 256000 },
-        cook:       { score: 58,  transparent: 128000 }
-    };
-    // -=-=-= codecAliases / unknownCodecs  [audio_clean, stream_ordering] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: codec name resolution =====
+    // -=-=-= codecAliases  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     // Prefix → canonical codec key (e.g. wmav1 → wma).
     const codecAliases = [
         ['pcm_',   'pcm'],
         ['adpcm',  'adpcm'],
         ['wmav',   'wma'],
         ['atrac',  'atrac'],
+        ['mpegh',  'mpegh3d'],   // ffmpeg reports MPEG-H 3D Audio as mpegh_3d_audio; map it to the codecInfo key so it scores + gets object-audio protection
     ];
-    const unknownCodecs = new Set();
-
-    // -=-=-= resolveCodecName  [audio_clean, stream_ordering] =-=-=-
-    // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype and eac3 into eac3atmos. Shared by audioQuality
-    // and losslessSource. codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't tell the
-    // subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to mediaInfo's Format_Commercial_IfAny
-    // ("DTS-HD Master Audio"), which decodes the substream header. Atmos comes from longName or the commercial name only - an editable title tag does
-    // not imply a real Atmos substream.
+    // -=-=-= resolveCodecName  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
+    // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the
+    // _x variant when DTS:X is detected) and eac3 into eac3atmos. Used by audioQuality/losslessSource (audio_clean,
+    // stream_ordering) for scoring, and by summariseStream (all three) purely for accurate display labeling - a plugin
+    // that doesn't score audio still benefits from showing "eac3atmos"/"dtsx" instead of a bare "eac3"/"dts" in its logs.
+    // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't
+    // tell the subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to
+    // mediaInfo's Format_Commercial_IfAny ("DTS-HD Master Audio"), which decodes the substream header. Atmos comes from
+    // longName or the commercial name only - an editable title tag does not imply a real Atmos substream.
+    // DTS:X detection is best-effort: MediaInfo exposes it via Format_AdditionalFeatures containing "XLL X" (vs plain
+    // "XLL" for MA without X), but MediaInfo's own maintainers note this is incomplete for an undocumented format -
+    // expect a real DTS:X track to sometimes still classify as the plain (non-X) subtype, never the reverse (this only
+    // fires on an actual reported value, never on absence of one, so it can't produce a false positive).
     const resolveCodecName = (stream) => {
         let codec = (stream?.codec_name || '').toLowerCase().trim();
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
@@ -401,7 +460,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             codec = 'dts';
 
         const profile    = (stream.profile || '').toLowerCase().trim();
-        const commercial = (mediaInfoFor(stream)?.Format_Commercial_IfAny || '').toLowerCase();
+        const mi         = mediaInfoFor(stream);
+        const commercial = (mi?.Format_Commercial_IfAny || '').toLowerCase();
         if (codec === 'dts') {
             if      (longName.includes('master')          || profile.includes('hd ma')  || commercial.includes('master'))
                 codec = 'dtsma';
@@ -409,11 +469,92 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 codec = 'dtshr';
             else if (longName.includes('express')         || profile.includes('express')|| commercial.includes('express'))
                 codec = 'dtsexpress';
+
+            const DTS_X_VARIANT = { dtsma: 'dtsmax', dtshr: 'dtshrx', dts: 'dtsx', dtsexpress: 'dtsexpressx' };
+            if (DTS_X_VARIANT[codec]) {
+                // MediaInfo marks DTS:X with the token "XLL X" in Format_AdditionalFeatures (plain DTS-HD is "XLL"). Match it as a
+                // whole trailing token (\bxll x\b) NOT a raw substring, so a hypothetical "XLL X96"/"XLL XBR" can't false-positive
+                // (those core-extension tokens attach to plain DTS core, which has no XLL, but the boundary check makes the guarantee literal).
+                const additionalFeatures = (mi?.Format_AdditionalFeatures || '').toLowerCase();
+                if (/\bxll x\b/.test(additionalFeatures))
+                    codec = DTS_X_VARIANT[codec];
+            }
         } else if (codec === 'eac3' && (longName.includes('atmos') || commercial.includes('atmos')))
             codec = 'eac3atmos';
 
         return codec;
     };
+    // -=-=-= codecDisplayName  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
+    // Friendly single-token display string for a summary line, used only for the codecs resolveCodecName REFINES beyond the
+    // bare container codec_name - the DTS subtypes and object-audio layers a raw "dts"/"eac3" hides. Any other codec falls
+    // back to its own raw codec_name unchanged (so pcm_s16le keeps its bit depth, wmav2 stays wmav2, etc. - this only ever
+    // ADDS subtype detail, never collapses an already-informative name). Single hyphenated tokens keep the terse token style.
+    const CODEC_DISPLAY = {
+        dtsma:   'dts-hd-ma',   dtsmax:      'dts-hd-ma-x',
+        dtshr:   'dts-hd-hr',   dtshrx:      'dts-hd-hr-x',
+        dtsx:    'dts-x',       dtsexpress:  'dts-express',   dtsexpressx: 'dts-express-x',
+        eac3atmos: 'eac3-atmos', mpegh3d: 'mpeg-h',
+    };
+    const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
+    // ===== END SHARED: codec name resolution =====
+
+    // ===== SHARED [audio_clean, stream_ordering]: audio codec scoring =====
+    // -=-=-= codecInfo  [audio_clean, stream_ordering] =-=-=-
+    // Codec quality weights + bitrate thresholds for picking the best track (audioQuality). Three row shapes, each field one job:
+    //   lossless: { score }                                    - already perfect; audioQuality returns score directly.
+    //   encodable (aac/opus/ac3/eac3): { score, minimum }      - SCORING thresholds come from the CODEC_TARGET_BPS ladder (see scoreThresholds); no
+    //       `transparent` here, and `minimum` is kept ONLY as the transcode floor read by resolveBitrate (audio_clean).
+    //   source-lossy (everything else): { score, transparent } - `transparent` is the 2-CHANNEL baseline; scoreThresholds scales it by (ch/2)^0.65 and
+    //       derives minimum as MIN_RATIO of transparent. Some formats here aren't ffmpeg-encodable (e.g. ac4).
+    // objectAudio: true marks a codec whose stream carries object-audio metadata (Atmos/DTS:X/MPEG-H) that ffmpeg cannot
+    // re-encode - read only by audio_clean's guard_object_audio, never by the score/threshold math below.
+    const codecInfo = {
+        // Lossless
+        pcm:         { score: 100, lossless: true },
+        flac:        { score: 100, lossless: true },
+        alac:        { score: 100, lossless: true },
+        wavpack:     { score: 100, lossless: true },
+        ape:         { score: 100, lossless: true },
+        tak:         { score: 100, lossless: true },
+        tta:         { score: 100, lossless: true },
+        mlp:         { score: 99,  lossless: true },
+
+        // Dolby family
+        truehd:      { score: 99,  lossless: true },
+        dtsma:       { score: 98,  lossless: true },
+        dtsmax:      { score: 98,  lossless: true,       objectAudio: true },
+        dtshr:       { score: 94,  transparent: 1470000 },
+        dtshrx:      { score: 96,  transparent: 1470000, objectAudio: true },
+        dts:         { score: 91,  transparent: 740000 },
+        dtsx:        { score: 93,  transparent: 740000,  objectAudio: true },
+        eac3atmos:   { score: 92,  transparent: 375000,  objectAudio: true },
+        dtsexpress:  { score: 80,  transparent: 188000 },
+        dtsexpressx: { score: 82,  transparent: 188000,  objectAudio: true },
+
+        // Modern multichannel codecs
+        ac4:         { score: 90,  transparent: 188000 },
+        eac3:        { score: 89,  minimum:     192000 },  // encodable -> scores off CODEC_TARGET_BPS; minimum = transcode floor only
+        mpegh3d:     { score: 89,  transparent: 250000,  objectAudio: true },
+
+        // Modern general-purpose codecs
+        opus:        { score: 89,  minimum:      64000 },  // encodable
+        aac:         { score: 87,  minimum:      96000 },  // encodable
+        vorbis:      { score: 86,  transparent: 256000 },
+
+        // Legacy but still excellent
+        ac3:         { score: 84,  minimum:     192000 },  // encodable
+        atrac:       { score: 83,  transparent: 192000 },
+        wma:         { score: 82,  transparent: 192000 },
+        mpc:         { score: 82,  transparent: 220000 },
+
+        // Older codecs
+        mp3:         { score: 78,  transparent: 320000 },
+        mp2:         { score: 73,  transparent: 256000 },
+        adpcm:       { score: 60,  transparent: 256000 },
+        cook:        { score: 58,  transparent: 128000 }
+    };
+    // -=-=-= unknownCodecs  [audio_clean, stream_ordering] =-=-=-
+    const unknownCodecs = new Set();
 
     // -=-=-= CODEC_TARGET_BPS  [audio_clean, stream_ordering] =-=-=-
     // Per-channel target bitrate (bps) for our encodable output codecs (ac3/eac3 cap at 6ch in ffmpeg). Single source for scoreThresholds' transparent
@@ -549,7 +690,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Audio role markers: /commentary|/description then /dub|/original. Subtitle: /forced then /commentary|/description|/sdh|/lyrics.
     // /default and /forced read the REAL disposition flag only — a title keyword must not flip a selection flag (as forced already did).
     // The role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary lines up.
-    // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Shared verbatim across all three.
+    // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Audio uses codecDisplayName so a DTS subtype
+    // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all three.
     const summariseStream = (s) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
@@ -565,7 +707,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : '');
             const prov = hasDisposition(s, 'dub') ? '/dub' : (hasDisposition(s, 'original') ? '/original' : '');
-            return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
+            return `[audio:${[lang, ch, codecDisplayName(s), rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
         }
         if (type === 'subtitle') {
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : (isSdh(s) ? '/sdh' : (isLyrics(s) ? '/lyrics' : '')));
@@ -708,7 +850,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // isTdarrLossless to avoid repeating the resolution at emission. Used only by codec_force to gate the source-bitrate floor in resolveBitrate — downmix
     // paths don't pass a source bitrate so they are unaffected regardless of this flag.
     const losslessSource = (stream) => codecInfo[resolveCodecName(stream)]?.lossless === true;
-    
+
+    // Resolve whether a source stream carries object-audio metadata (Atmos / DTS:X / MPEG-H) that ffmpeg cannot reconstruct on re-encode - keyed off the
+    // codecInfo objectAudio flag via the same resolveCodecName resolution. Stored per-stream as isTdarrObjectAudio. Read by guard_object_audio (an
+    // independent third guard) and used as a dedup tie-breaker so an object-audio track is preferred over an otherwise-equal plain one.
+    const objectAudioSource = (stream) => codecInfo[resolveCodecName(stream)]?.objectAudio === true;
+
     // Parse + validate inputs. Order here mirrors the Inputs array in details() so the two never drift. Only type:'string' dropdowns are validated here -
     // free-text inputs (downmix_language) have no fixed option set, and type:'boolean' inputs (temp_on_network) are already coerced to a real true/false by
     // loadDefaultValues (any out-of-set value becomes false), so a guard on them would be dead code. Every checked value fails the file on an out-of-set value.
@@ -719,10 +866,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const surroundCodec = String(inputs.codec_surround).trim();
     const stereoCodec = String(inputs.codec_stereo).trim();
     const forceCodec = String(inputs.codec_force).trim();
-    const archiveGuard = String(inputs.archive_guard).trim();
-    const removeDuplicatesBy = String(inputs.remove_duplicates_by).trim();
+    const removeDuplicatesBy = String(inputs.method_deduplicate).trim();
     const stereoDownmix = String(inputs.method_stereo_downmix).trim();
     const methodOpusLayoutErr = String(inputs.method_opus_layout_err).trim();
+    const loudnorm = String(inputs.method_loudnorm).trim();
+    const methodVerbose = String(inputs.method_verbose).trim();
+    const guardQuality = String(inputs.guard_quality).trim();
+    const guardLossless = String(inputs.guard_lossless).trim();
+    const guardObjectAudio = String(inputs.guard_object_audio).trim();
 
     if(!['false','replace','true'].includes(downmixToSix))
         failFile(`Somehow invalid downmixToSix option provided. Check your settings!`);
@@ -736,17 +887,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`Somehow invalid stereoCodec option provided. Check your settings!`);
     if(!['false','6below','2below','all'].includes(forceCodec))
         failFile(`Somehow invalid forceCodec option provided. Check your settings!`);
-    if(!['false','lossless','quality','quality-strict'].includes(archiveGuard))
-        failFile(`Somehow invalid archiveGuard option provided. Check your settings!`);
     if(!['disabled','multi-stereo','multi-stereo-error','channel','channel-error'].includes(removeDuplicatesBy))
         failFile(`Somehow invalid removeDuplicatesBy option provided. Check your settings!`);
     if(!['default','dialogue'].includes(stereoDownmix))
         failFile(`Somehow invalid stereoDownmix option provided. Check your settings!`);
     if(!['keep','drop','remix'].includes(methodOpusLayoutErr))
         failFile(`Somehow invalid methodOpusLayoutErr option provided. Check your settings!`);
+    if(!['disabled','tv','cinema','quiet_room'].includes(loudnorm))
+        failFile(`Somehow invalid loudnorm option provided. Check your settings!`);
+    if(!['enabled','disabled'].includes(methodVerbose))
+        failFile(`Somehow invalid methodVerbose option provided. Check your settings!`);
+    if(!['enabled','strict','disabled'].includes(guardQuality))
+        failFile(`Somehow invalid guardQuality option provided. Check your settings!`);
+    if(!['enabled','disabled'].includes(guardLossless))
+        failFile(`Somehow invalid guardLossless option provided. Check your settings!`);
+    if(!['enabled','disabled'].includes(guardObjectAudio))
+        failFile(`Somehow invalid guardObjectAudio option provided. Check your settings!`);
 
     let extraArguments = '';
-    let workDone = '';
+    let workDone = '';       // "this changed" lines (transcode/add/remix/normalize/remove) - always shown, matching pre-method_verbose behavior.
+    let verboseDone = '';    // "this DIDN'T change, and why" lines (guard blocks, ceiling/missing-data skips) - shown only when method_verbose='enabled'.
     let convert = false;
 
     // Check if file is a video. If it isn't then exit plugin (before the no-audio check, so a non-video reports "not a video", not "no audio streams").
@@ -799,7 +959,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 isTdarrQuality: audioQuality(enrichedItem),
                 // Used by codec_force to suppress the source-bitrate floor in resolveBitrate for lossless sources. A lossless bitrate (e.g. 4 Mbps TrueHD) is not a
                 // comparable quantity for a perceptual encode and would otherwise pin the output at the codec ceiling for no audible gain.
-                isTdarrLossless: losslessSource(item)
+                isTdarrLossless: losslessSource(item),
+                // True when the source carries Atmos/DTS:X/MPEG-H object audio ffmpeg can't re-encode - read by guard_object_audio and the dedup tie-break.
+                isTdarrObjectAudio: objectAudioSource(item)
             };
         });
 
@@ -812,20 +974,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (downmixSecondaryStereo === 'false' && forceCodec === 'false')
             candidateStreams = candidateStreams.filter(stream => !stream.isTdarrSecondaryTrack && !stream.isTdarrLangSecondary);
 
-        // archive_guard: block a destructive operation on a track ONLY when it would irreversibly lose detail the destination format can't hold. Protection is
-        // earned PER OPERATION — each decision site calls guardBlocks with its own real target codec/channels — not assigned to a single "best" track. Secondary
-        // (commentary/descriptive) and lang-secondary (unlisted language, filter active) tracks are never archived: the language filter and secondary status win
-        // (isTdarrLangSecondary is only set when a listed-language primary exists, so a dormant filter leaves a foreign-only track primary and protectable).
-        // 'quality-strict' protects on ANY predicted score drop; 'quality' (default) protects only when the drop EXCEEDS QUALITY_MARGIN. Comparable-codec
-        // swaps pass (640k eac3 → 640k ac3 = 5pt; 1509k DTS 5.1 → 640k ac3 = 7pt); flattening a premium master is kept (Atmos → ac3 = 8pt, DTS-HD
-        // → ac3 = 10pt). QUALITY_MARGIN = 7 is the DTS(91)-vs-ac3(84) base-score gap, so a DTS core → ac3 sits exactly at the margin on the pass side (a
-        // drop must STRICTLY exceed the margin to protect) - preserving the force-DTS-to-ac3 behaviour. Lossless/channel-reducing ops protect in both tiers.
+        // guard_lossless/guard_quality/guard_object_audio: block a destructive operation on a track ONLY when it would irreversibly lose detail the
+        // destination format can't hold. Protection is earned PER OPERATION — each decision site calls guardBlocks with its own real target codec/channels —
+        // not assigned to a single "best" track. Secondary (commentary/descriptive) and lang-secondary (unlisted language, filter active) tracks are never
+        // protected: the language filter and secondary status win (isTdarrLangSecondary is only set when a listed-language primary exists, so a dormant filter
+        // leaves a foreign-only track primary and protectable). The THREE guards are fully independent (no fallback chain): guard_lossless alone decides
+        // whether a lossless SOURCE is protected; guard_object_audio alone decides whether an Atmos/DTS:X/MPEG-H object-audio source is protected (ffmpeg has
+        // no encoder for the object layer, so any re-encode flattens it - this covers the LOSSY object-audio carriers guard_lossless can't, e.g. E-AC-3 Atmos);
+        // guard_quality alone decides the channel-drop rule and the quality-margin math below, regardless of the other two. Disabling guard_lossless with
+        // guard_quality still enabled does NOT bypass the quality-margin check for a lossless source - it still scores near its near-maximum codecInfo score,
+        // so in practice a real conversion to any lossy codec will usually still get blocked by guard_quality on its own unless that is ALSO relaxed.
+        // guard_quality='strict' protects on ANY predicted score drop; 'enabled' (default) protects only when the drop EXCEEDS QUALITY_MARGIN. Comparable-codec
+        // swaps pass (640k eac3 → 640k ac3 = 5pt; 1509k DTS 5.1 → 640k ac3 = 7pt); flattening a premium master is kept (Atmos → ac3 = 8pt, DTS-HD → ac3 = 10pt).
+        // QUALITY_MARGIN = 7 is the DTS(91)-vs-ac3(84) base-score gap, so a DTS core → ac3 sits exactly at the margin on the pass side (a drop must STRICTLY
+        // exceed the margin to protect) - preserving the force-DTS-to-ac3 behaviour.
         const QUALITY_MARGIN = 7;
         const guardBlocks = (stream, targetCodec, targetChannels, srcChannels) => {
-            if (archiveGuard === 'false') return false;
             if (stream.isTdarrSecondaryTrack || stream.isTdarrLangSecondary) return false;
-            if (stream.isTdarrLossless) return true;                             // every downmix/force output is lossy → lossless detail can't survive
-            if (archiveGuard === 'lossless') return false;                       // lossy source: only the lossless tier protects, and it stopped above
+            if (guardLossless === 'enabled' && stream.isTdarrLossless) return true;         // lossless detail can't survive any lossy re-encode
+            if (guardObjectAudio === 'enabled' && stream.isTdarrObjectAudio) return true;   // Atmos/DTS:X/MPEG-H object layer has no ffmpeg encoder
+            if (guardQuality === 'disabled') return false;
             if (Number(targetChannels) < Number(srcChannels)) return true;       // the operation drops channels
             const family = targetCodec === 'aac_vbr' ? 'aac' : targetCodec;      // aac_vbr scores as the aac family
             // Predict the bitrate the same-channel force branch actually emits, then score it. aac_vbr emits libfdk VBR (~128k q4 for a <=144k source, else ~192k
@@ -835,18 +1003,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 ? (srcBps > 0 && srcBps <= 144000 ? 128000 : 192000)
                 : resolveBitrate(family, targetChannels, srcBps, false, stream.isTdarrQuality);
             const predQuality = audioQuality({ codec_name: family, channels: targetChannels, bit_rate: predBps });
-            const margin = archiveGuard === 'quality-strict' ? 0 : QUALITY_MARGIN;
+            const margin = guardQuality === 'strict' ? 0 : QUALITY_MARGIN;
             return predQuality < stream.isTdarrQuality - margin;                 // target scores below the source by more than the tier's margin → detail lost
         };
 
         // Duplicate removal keeps `survivor` and drops `removed`. Block only when the drop loses detail the survivor can't hold. Separate from guardBlocks: dedupe
         // compares against an existing survivor (not a predicted transcode) and must check the survivor's losslessness. No quality clause on purpose — the dedupe
         // sort is measured-bitrate-first, so a survivor can carry a LOWER isTdarrQuality than the removed track; a quality clause would wrongly block those drops.
+        // The channel-count check protects the higher-channel duplicate under BOTH quality tiers ('enabled' and 'strict'), so 'strict' is genuinely ⊇ 'enabled'
+        // (its documented "most protective" role). This is a deliberate change from the old archive_guard, whose channel clause fired only under 'quality' and NOT
+        // 'quality-strict' — that inversion (strict being LESS protective for a channel-dropping dedup) was a quirk, corrected here in the guard split.
         const dedupeGuardBlocks = (removed, survivor) => {
-            if (archiveGuard === 'false') return false;
             if (removed.isTdarrSecondaryTrack || removed.isTdarrLangSecondary) return false;
-            if (removed.isTdarrLossless && !survivor.isTdarrLossless) return true;                   // dropping the last lossless copy
-            if (archiveGuard === 'quality' && removed.channels > survivor.channels) return true;     // survivor has fewer channels
+            if (guardLossless === 'enabled' && removed.isTdarrLossless && !survivor.isTdarrLossless) return true;   // dropping the last lossless copy
+            if (guardObjectAudio === 'enabled' && removed.isTdarrObjectAudio && !survivor.isTdarrObjectAudio) return true;   // dropping the last object-audio (Atmos/DTS:X) copy
+            if (guardQuality !== 'disabled' && removed.channels > survivor.channels) return true;     // survivor has fewer channels (enabled AND strict)
             return false;
         };
 
@@ -874,7 +1045,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //       existingStereoLangs, so dedup can't disagree with and re-trigger the downmix creation guards (this previously caused an infinite
         //       create/remove loop between the two plugin runs).
         // Note: dedup runs across ALL audio streams regardless of downmix_language/downmix_secondary_stereo (those govern transcoding candidates, not what's a
-        // genuine duplicate - a duplicate in a non-preferred language is still a duplicate). archive_guard (dedupeGuardBlocks) keeps a duplicate whose removal
+        // genuine duplicate - a duplicate in a non-preferred language is still a duplicate). guard_lossless/guard_quality/guard_object_audio (dedupeGuardBlocks) keep a duplicate whose removal
         // would lose detail the survivor can't hold (a last lossless copy, or a higher-channel track under quality) instead of removing it, and never -errors on it.
         const removeDuplicatesErrorMode = removeDuplicatesBy === 'multi-stereo-error' || removeDuplicatesBy === 'channel-error';
         const removeDuplicatesGroupBy = removeDuplicatesErrorMode ? removeDuplicatesBy.replace(/-error$/, '') : removeDuplicatesBy;
@@ -886,9 +1057,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // probes are already consulted (resolveStreamBitrate above), so bit_rate === 0 here means genuinely unknown, not just "ffprobe couldn't read it".
             const hasKnownRate = (s) => Number(s.bit_rate || 0) > 0;
             // On a quality tie, keep the higher channel count before falling back to index, so multi-stereo dedup collapsing a language's surround variants keeps
-            // the 7.1 over a same-quality 5.1 (channel mode already tiers by exact count, so this only bites the broad modes).
+            // the 7.1 over a same-quality 5.1 (channel mode already tiers by exact count, so this only bites the broad modes). When channels also tie, prefer an
+            // object-audio (Atmos/DTS:X) track over an otherwise-equal plain one so dedup keeps the copy with the object layer (the codecInfo score bump usually
+            // separates them before this fires; the tie-break only matters when their scores land exactly equal).
             const byQuality = [...audioStreams].sort((a, b) =>
-                (hasKnownRate(b) ? 1 : 0) - (hasKnownRate(a) ? 1 : 0) || b.isTdarrQuality - a.isTdarrQuality || b.channels - a.channels || a.index - b.index);
+                (hasKnownRate(b) ? 1 : 0) - (hasKnownRate(a) ? 1 : 0) || b.isTdarrQuality - a.isTdarrQuality || b.channels - a.channels
+                || (b.isTdarrObjectAudio ? 1 : 0) - (a.isTdarrObjectAudio ? 1 : 0) || a.index - b.index);
             for (const s of byQuality) {
                 let tier;
                 if (removeDuplicatesGroupBy === 'channel') {
@@ -910,7 +1084,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (removeDuplicatesErrorMode) {
                         const rmRate = hasKnownRate(s) ? ` @ ${Math.round(Number(s.bit_rate) / 1000)} kb/s` : '';
                         const keptRate = hasKnownRate(kept) ? ` @ ${Math.round(Number(kept.bit_rate) / 1000)} kb/s` : '';
-                        failFile(`Stream ${s.index}: Duplicate audio track detected (${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang}${rmRate}) alongside stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate}) under remove_duplicates_by="${removeDuplicatesBy}". Aborting - tag/remove tracks manually and requeue, or switch remove_duplicates_by to a non-error mode.`);
+                        failFile(`Stream ${s.index}: Duplicate audio track detected (${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang}${rmRate}) alongside stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate}) under method_deduplicate="${removeDuplicatesBy}". Aborting - tag/remove tracks manually and requeue, or switch method_deduplicate to a non-error mode.`);
                     }
                     streamsToRemove.add(s.index);
                     // Show the removed track's bitrate and the kept track's for contrast — duplicates are
@@ -953,7 +1127,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const lay = (s.channel_layout || '').toLowerCase().trim();
                 if (ch <= 2 || ch > 8) continue;                                             // stereo→codec_stereo; >8 blocked (targetMaxCh)
                 if ((s.codec_name || '').toLowerCase() === 'opus') continue;                 // already opus
-                if (guardBlocks(s, surroundCodec, ch, ch)) continue;   // archive_guard — mirrors the force-site guard (surroundCodec is opus)
+                if (guardBlocks(s, surroundCodec, ch, ch)) continue;   // guard_lossless/guard_quality/guard_object_audio — mirrors the force-site guard (surroundCodec is opus)
                 if (!(forceCodec === 'all' || (forceCodec === '6below' && ch <= 6))) continue;   // surround shouldForce (mirrors the loop)
                 if (opusAcceptsLayout(ch, lay)) continue;
                 if (OPUS_RELABEL[lay]) continue;                                             // losslessly relabelable → the loop transcodes it, never drop
@@ -967,7 +1141,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                               : (downmixToTwo === 'replace' || (ch > 6 && downmixToSix === 'replace'))) continue;
                 if (countSurvivingAudio() <= 1) continue;                                    // never drop the last audio track
                 streamsToRemove.add(s.index);
-                workDone += `☒Stream ${s.index}: Dropping - libopus can't encode a ${s.channel_layout || `${ch}ch`} layout (method_opus_layout_err=drop).\n`;
+                workDone += `☒Stream ${s.index}: Dropping - libopus can't encode a ${s.channel_layout || `${ch}ch`} layout (method_opus_layout_err=drop).\n`;   // this IS a change (removal) - always shown
             }
         }
 
@@ -1034,7 +1208,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return a.index - b.index;
         });
 
-        if (workStreams.length === 0 && streamsToRemove.size === 0) {
+        if (workStreams.length === 0 && streamsToRemove.size === 0 && loudnorm === 'disabled') {
             response.infoLog += '☑ No audio tracks require changes.\n';
             return response;
         }
@@ -1168,10 +1342,104 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return buildPanMatrix(channelList);
         };
 
-        // Channel/filter snippet for a new or replaced stereo track.
+        // ===== LOUDNORM =====
+        // Two-pass measured EBU R128 loudness correction, entirely self-contained within this plugin's own invocation - no cross-plugin/cross-run
+        // state, no HTTP calls to Tdarr's API. audio_clean spawns ffmpeg itself (the first subprocess call from any of the three awk plugins) to run
+        // an analysis-only pass, then builds the real measured correction filter from its output. otherArguments.ffmpegPath is already available to
+        // classic plugins; several official Community/*.js plugins already call child_process.exec/execSync (including two that shell out to ffmpeg
+        // directly), and Tdarr loads classic plugins as ordinary, unsandboxed Node modules - so this needed no new capability from Tdarr itself.
+        const LOUDNORM_PRESETS = {
+            tv:         { I: -16, LRA: 11, TP: -1.5 },
+            cinema:     { I: -23, LRA: 15, TP: -1.0 },
+            quiet_room: { I: -16, LRA: 6,  TP: -1.5 },
+        };
+        const LOUDNORM_TOLERANCE_LU = 1;
+        // Codecs loudnorm can leave a track in without converging it, and each one's channel-count ceiling (mirrors codec_force's targetMaxCh below).
+        const LOUDNORM_MAX_CH = { ac3: 6, eac3: 6, aac: 8, opus: 8 };
+
+        // Run ffmpeg as a synchronous child process to measure one audio stream's loudness (analysis-only, audio-only, no output written). Returns
+        // { stats } with the measured EBU R128 JSON fields (input_i/input_tp/input_lra/input_thresh/target_offset), or { error } on any failure - a
+        // missing binary, non-zero exit, timeout, or unparseable output are all reported here rather than thrown, so the caller decides how to fail
+        // the file. ffmpeg's loudnorm filter logs its print_format=json summary at AV_LOG_INFO, so -loglevel must stay at or above that - only
+        // -nostats (which silences the unrelated periodic progress line, not the loudnorm summary) is passed. Args-array form only, never a
+        // shell-interpolated string, so a file path can never break out into a second command.
+        // The JSON is NOT the last thing on stderr: real ffmpeg (5.1+, every platform) prints the loudnorm summary during
+        // filter teardown, then two more AV_LOG_INFO lines - "[out#0/null ...] muxing overhead: unknown" and a final
+        // "size=N/A time=... speed=..." trailer (neither suppressible without also losing the JSON). So we take the LAST
+        // flat {...} block anywhere in stderr, not one anchored to end-of-string; last-match also skips a track title that
+        // contains literal braces (e.g. a "{weird}" title) since ffmpeg emits that BEFORE the loudnorm summary.
+        const measureLoudness = (srcAudioIdx, preFilter, preset) => {
+            const { spawnSync } = require('child_process');
+            const analysisFilter = `${preFilter ? `${preFilter},` : ''}loudnorm=I=${preset.I}:LRA=${preset.LRA}:TP=${preset.TP}:print_format=json`;
+            const args = ['-nostats', '-hide_banner', '-i', file.file, '-map', `0:a:${srcAudioIdx}`, '-af', analysisFilter, '-f', 'null', '-'];
+            const result = spawnSync(otherArguments.ffmpegPath, args, { timeout: 10 * 60 * 1000, maxBuffer: 64 * 1024 * 1024, encoding: 'utf-8' });
+            if (result.error) return { error: `could not start ffmpeg (${result.error.message})` };
+            if (result.signal) return { error: `ffmpeg was killed (signal ${result.signal}, likely a timeout)` };
+            if (result.status !== 0) return { error: `ffmpeg exited with status ${result.status}` };
+            const jsonBlocks = String(result.stderr || '').match(/\{[^{}]*\}/g);
+            // Take the LAST block that actually parses AND carries the loudnorm field, so a brace-bearing title can't shadow it.
+            let stats = null;
+            for (const block of (jsonBlocks || [])) {
+                try { const parsed = JSON.parse(block); if (parsed && 'input_i' in parsed) stats = parsed; } catch (e) { /* not the JSON block */ }
+            }
+            if (!stats) return { error: 'could not find loudnorm measurement JSON in ffmpeg output' };
+            return { stats };
+        };
+
+        // Measure, then decide the correction filter comma-chained onto preFilter, or return unchanged (changed:false) when already within
+        // LOUDNORM_TOLERANCE_LU of the preset target. measured_thresh has NO uppercase alias (unlike measured_I/measured_LRA/measured_TP, which
+        // accept either case) - keep it exactly lowercase. Pass-1's JSON field names (input_i/input_lra/input_tp/target_offset) are NOT the same
+        // strings as pass-2's filter option names (measured_I/measured_LRA/measured_TP/offset) - same numbers, different names on each side.
+        const buildLoudnormFilter = (streamIndex, srcAudioIdx, preFilter, preset) => {
+            const analysis = measureLoudness(srcAudioIdx, preFilter, preset);
+            if (analysis.error)
+                failFile(`Stream ${streamIndex}: loudnorm analysis pass failed (${analysis.error}). If this file has known corruption, try clean_and_remux's recover_bad_timestamps/recover_bad_data first - if the codec itself is unsupported, that won't help.`);
+            const { stats } = analysis;
+            // A digitally-silent track measures input_i="-inf" (and target_offset="inf"); Number("-inf") is NaN (JS parses
+            // "Infinity", not "inf"), which would defeat the tolerance test AND then bake a literal measured_I=-inf into the
+            // correction filter that the real pass-2 transcode rejects ("out of range [-99 - 0]"). Silence can't be
+            // loudness-normalized anyway, so treat any non-finite measured integrated loudness as within-tolerance (skip).
+            if (!Number.isFinite(Number(stats.input_i)) || Math.abs(Number(stats.input_i) - preset.I) <= LOUDNORM_TOLERANCE_LU)
+                return { filter: preFilter, changed: false };
+            const corrected = `loudnorm=I=${preset.I}:LRA=${preset.LRA}:TP=${preset.TP}:measured_I=${stats.input_i}:measured_LRA=${stats.input_lra}:measured_TP=${stats.input_tp}:measured_thresh=${stats.input_thresh}:offset=${stats.target_offset}:linear=true`;
+            return { filter: preFilter ? `${preFilter},${corrected}` : corrected, changed: true };
+        };
+
+        // Caching tag for Branch B only (a track untouched by anything else this run - the only case where "nothing about this
+        // stream changed since we last checked it" is actually guaranteed). Written as "<preset>-<plugin version>" (e.g.
+        // "tv-2.8.0") but matched on the preset portion ONLY - the version rides along unused today, kept in reserve for if a
+        // future bug fix ever needs to distinguish "measured/corrected by a version with a known bug" from a trustworthy one.
+        // Matroska uppercases unrecognized custom tag names on write (confirmed against the real ffmpeg binary), so read-back
+        // must be case-insensitive - mirrors clean_and_remux's existing awk_recovered lookup pattern exactly.
+        const readLoudnormTag = (stream) => String(Object.entries(stream.tags || {})
+            .find(([k]) => k.toLowerCase() === 'awk_loudnorm')?.[1] ?? '').trim();
+        const loudnormTagMatchesPreset = (stream) => readLoudnormTag(stream).split('-')[0] === loudnorm;
+        const loudnormTagValue = () => `${loudnorm}-${details().Version}`;
+        // Only Matroska persists arbitrary per-stream tags through a -c copy remux; the mov/mp4/m4a muxers silently DROP a
+        // custom awk_loudnorm tag. On those containers the cache stamp would vanish and be re-applied every reprocess - and
+        // for an already-within-tolerance track that stamp is the ONLY change, so it would remux the file on every single
+        // pass forever (a non-idempotent loop). So the stamp is emitted only when it will actually survive; on other
+        // containers a within-tolerance track is left a true no-op (re-measured next run, but never remuxed). A track that
+        // genuinely needs correction still re-encodes once regardless of container, then measures within tolerance next run.
+        const loudnormTagPersists = ['mkv', 'webm', 'mka'].includes(String(file.container).toLowerCase());
+        const loudnormStampArg = (idx) => (loudnormTagPersists ? ` -metadata:s:a:${idx} "awk_loudnorm=${loudnormTagValue()}"` : '');
+        // ===== END LOUDNORM =====
+
+        // Channel/filter snippet for a new or replaced stereo track. When loudnorm is enabled, every call site here has already either passed its
+        // own guardBlocks check (an in-place replace/secondary/remix-defer reaches this helper only after that), or is a brand-new appended
+        // derivative (downmix 'add'/'true') that's an unconditional lossy re-encode by construction - so no additional guard_lossless/guard_quality/guard_object_audio check is
+        // needed here either way; loudnorm rides on whichever of those two guarantees already applies. The no-verified-pan-matrix fallback must be
+        // an explicit filter (aformat=channel_layouts=stereo, verified equivalent to -ac 2 - see the loudnorm section) rather than bare -ac when
+        // loudnorm is active, so the downmix can be comma-chained BEFORE loudnorm's analysis/correction filter instead of ffmpeg silently applying
+        // the implicit -ac conversion AFTER an explicit -filter:a (which would measure/correct the wrong, pre-downmix signal).
         const stereoArg = (idx, srcStream) => {
             const matrix = (stereoDownmix === 'dialogue') ? downmixMatrix(srcStream) : null;
-            return matrix ? ` -filter:a:${idx} "${matrix}"` : ` -ac:a:${idx} 2`;
+            if (loudnorm === 'disabled')
+                return matrix ? ` -filter:a:${idx} "${matrix}"` : ` -ac:a:${idx} 2`;
+            const preFilter = matrix || 'aformat=channel_layouts=stereo';
+            const srcAudioIdx = inputAudioIdxMap.get(srcStream.index);
+            const { filter } = buildLoudnormFilter(srcStream.index, srcAudioIdx, preFilter, LOUDNORM_PRESETS[loudnorm]);
+            return ` -filter:a:${idx} "${filter}"`;
         };
 
         for (let i = 0; i < workStreams.length; i++) {
@@ -1184,7 +1452,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Guard: if either index is missing the stream wasn't tracked correctly — skip rather than emitting a broken argument like -c:a:undefined
             // which ffmpeg will reject with a cryptic error.
             if (outputAudioIdx === undefined || srcAudioIdx === undefined) {
-                response.infoLog += `☒Stream ${ffstream.index}: Could not resolve audio index mapping, skipping.\n`;
+                // Always shown (workDone, not verboseDone): this is a should-never-happen internal-tracking defect, not routine
+                // diagnostic negative-space — it means a user-configured op on this stream is silently skipped, so surface it
+                // even when method_verbose='disabled'.
+                workDone += `☒Stream ${ffstream.index}: Could not resolve audio index mapping, skipping.\n`;
                 continue;
             }
 
@@ -1205,7 +1476,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (ffstream.isTdarrSecondaryTrack || ffstream.isTdarrLangSecondary) {
             // ---- SECONDARY: DOWNMIX TO STEREO ----
             // Each secondary surround track is transcoded in place independently — one stereo per secondary track, preserving all of them.
-            // archive_guard never archives secondary or lang-secondary tracks (guardBlocks short-circuits false for them), so there is no guarded-source
+            // guard_lossless/guard_quality/guard_object_audio never protect secondary or lang-secondary tracks (guardBlocks short-circuits false for them), so there is no guarded-source
             // case here: an enabled secondary downmix always transcodes in place.
             if (downmixSecondaryStereo !== 'false' && ffstream.channels > 2 && !modifiedAudioIdx.has(outputAudioIdx)) {
                 const newTitle = escMeta(buildTitle(ffstream, '2.0'));
@@ -1240,8 +1511,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (sixMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
                     const dstBitArg = encoderArgsIdx(surroundCodec, 6, outputAudioIdx);
                     const dstBitStr = resolveBitrate(surroundCodec, 6);
+                    // sixMode==='replace' only when guardBlocks did NOT block this downmix, so loudnorm rides on the same guarantee - no additional
+                    // check. Explicit aformat=channel_layouts=5.1 (verified equivalent to -ac 6) replaces the bare -ac so loudnorm's analysis/
+                    // correction can be chained after it - a bare -ac would apply its implicit conversion AFTER an explicit -filter:a instead.
+                    let sixFilter = ` -ac:a:${outputAudioIdx} 6`;
+                    if (loudnorm !== 'disabled') {
+                        const { filter } = buildLoudnormFilter(ffstream.index, srcAudioIdx, 'aformat=channel_layouts=5.1', LOUDNORM_PRESETS[loudnorm]);
+                        sixFilter = ` -filter:a:${outputAudioIdx} "${filter}"`;
+                    }
                     workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s\n`;
-                    extraArguments += ` -c:a:${outputAudioIdx} ${surroundCodec}${dstBitArg} -ac:a:${outputAudioIdx} 6 -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                    extraArguments += ` -c:a:${outputAudioIdx} ${surroundCodec}${dstBitArg}${sixFilter} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     outputAudioOverride.set(outputAudioIdx, { codec: surroundCodec, channels: 6, bps: dstBitStr });
@@ -1250,8 +1529,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 } else if (sixMode === 'true') {
                     const dstBitArg = encoderArgsIdx(surroundCodec, 6, newStreamOutputIdx);
                     const dstBitStr = resolveBitrate(surroundCodec, 6);
+                    // Brand-new appended derivative (the source survives untouched elsewhere in the output) - loudnorm applies unconditionally, no
+                    // guardBlocks check: this stream is an unconditional lossy re-encode by construction regardless of what the guard would say.
+                    let sixFilter = ` -ac:a:${newStreamOutputIdx} 6`;
+                    if (loudnorm !== 'disabled') {
+                        const { filter } = buildLoudnormFilter(ffstream.index, srcAudioIdx, 'aformat=channel_layouts=5.1', LOUDNORM_PRESETS[loudnorm]);
+                        sixFilter = ` -filter:a:${newStreamOutputIdx} "${filter}"`;
+                    }
                     workDone += `☐Stream ${ffstream.index}: Adding ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
-                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${surroundCodec}${dstBitArg} -ac:a:${newStreamOutputIdx} 6 -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${surroundCodec}${dstBitArg}${sixFilter} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
                     newStreamOutputIdx++;
                     appendedAudio.push({ srcStream: ffstream, codec: surroundCodec, channels: 6, bps: dstBitStr });
@@ -1316,14 +1602,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
 
             // ====== FORCE CODEC ======
-            // Skip a track archive_guard protects — guardBlocks: a lossless source, or a quality-tier target that scores lower. codec_force no longer overrides
+            // Skip a track guard_lossless/guard_quality/guard_object_audio protects — guardBlocks: a lossless source, or a quality-tier target that scores lower. codec_force no longer overrides
             // it in any mode, including 'all', so a guarded track is left in its source codec. Also skip when the source has more channels than the target codec
             // supports (ac3/eac3 max 6ch, opus/aac max 8ch) to avoid an ffmpeg
             // encode failure. Channel count is resolved from ffprobe, then mediaInfo, then a channel-layout string (resolveChannels): a track no source can
             // measure is left untouched rather than guessed, since a wrong count could route it to a codec that can't hold its real channels and fail.
             const forceChannels = (forceCodec !== 'false' && !modifiedAudioIdx.has(outputAudioIdx)) ? resolveChannels(ffstream) : -1;
             if (forceChannels === 0)
-                workDone += `☒Stream ${ffstream.index}: Skipping codec_force - no channel count in ffprobe, mediaInfo, or channel layout; can't safely choose a target codec or verify its channel limit.\n`;
+                verboseDone += `☒Stream ${ffstream.index}: Skipping codec_force - no channel count in ffprobe, mediaInfo, or channel layout; can't safely choose a target codec or verify its channel limit.\n`;
             if (forceChannels > 0) {
                 const isStereo = forceChannels <= 2;
                 const targetCodec = isStereo ? stereoCodec : surroundCodec;
@@ -1340,10 +1626,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const targetMaxCh = ({ ac3: 6, eac3: 6, aac: 8, aac_vbr: 8, opus: 8 })[targetCodec] ?? 8;
 
                     if (shouldForce && forceChannels > targetMaxCh) {
-                        workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodecFamily} - ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} exceeds the ${targetMaxCh}ch limit for ${targetCodecFamily}. Enable downmix_to_six to create a 5.1 from it first.\n`;
+                        verboseDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodecFamily} - ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} exceeds the ${targetMaxCh}ch limit for ${targetCodecFamily}. Enable downmix_to_six to create a 5.1 from it first.\n`;
                     } else if (shouldForce && guardBlocks(ffstream, targetCodec, forceChannels, forceChannels)) {
-                        // archive_guard: forcing this codec would irreversibly lose detail the target can't hold (lossless source, or quality tier scores it lower). Leave it.
-                        workDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodecFamily} - would lose detail vs ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} (archive_guard=${archiveGuard}); left as ${ffstreamCodec}.\n`;
+                        // guard_lossless/guard_quality/guard_object_audio: forcing this codec would irreversibly lose detail the target can't hold (lossless source, or quality tier scores it lower). Leave it.
+                        verboseDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodecFamily} - would lose detail vs ${codecDisplayName(ffstream)} ${forceChannels}ch @ ${srcRateStr} (guard_lossless=${guardLossless}, guard_quality=${guardQuality}, guard_object_audio=${guardObjectAudio}); left as ${ffstreamCodec}.\n`;
                     } else if (shouldForce) {
                         // Guard the force-to-opus path against libopus-incompatible layouts (method_opus_layout_err). Only opus is affected - AC3/EAC3/AAC
                         // take any layout. `forced` gates the run's convert flag so a keep/defer makes no change (and doesn't cause a needless re-run).
@@ -1367,7 +1653,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             if (remixDefer) why = ' (a stereo already exists for this language)';
                             else if (methodOpusLayoutErr === 'drop') why = countSurvivingAudio() <= 1 ? ' (kept - it is the last audio track)' : ' (kept - no downmix converted it to an opus-safe layout)';
                             else why = ', enable a downmix option or set method_opus_layout_err to drop/remix';
-                            workDone += `☒Stream ${ffstream.index}: Not forcing opus - libopus can't encode a ${layoutName} layout; left as ${ffstreamCodec}${why}.\n`;
+                            verboseDone += `☒Stream ${ffstream.index}: Not forcing opus - libopus can't encode a ${layoutName} layout; left as ${ffstreamCodec}${why}.\n`;
                         } else if (opusBad && methodOpusLayoutErr === 'remix' && !relabel) {
                             // remix→stereo: downmix in place to a codec_stereo track (NOT opus) so it stays stereo-codec-consistent and idempotent (a stereo
                             // opus would be re-forced to codec_stereo next run). Mirrors downmix_secondary_stereo; the 2ch table target (surround source
@@ -1393,8 +1679,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // aac_vbr stereo force: use VBR 4 for low-bitrate sources, VBR 5 otherwise.
                             // srcBitrate is meaningful here — this is a codec-swap, same channel count.
                             const { encoder, args, approxRate } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true);
+                            // No pre-filter (same channel count, no relabel) - measure the source directly. guardBlocks for THIS force already
+                            // passed (line above), so loudnorm rides on the same guarantee, no additional check.
+                            let aacVbrFilter = '';
+                            if (loudnorm !== 'disabled') {
+                                const { filter } = buildLoudnormFilter(ffstream.index, srcAudioIdx, '', LOUDNORM_PRESETS[loudnorm]);
+                                if (filter) aacVbrFilter = ` -filter:a:${outputAudioIdx} "${filter}"`;
+                            }
                             workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → aac stereo @ ${approxRate} (libfdk VBR q${srcBitrate > 0 && srcBitrate <= 144000 ? 4 : 5})\n`;
-                            extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}`;
+                            extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${aacVbrFilter}`;
                             modifiedAudioIdx.add(outputAudioIdx);
                             outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: forceChannels, bps: 0, approxRate });
                             forced = true;
@@ -1402,8 +1695,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // Same channel count, codec swap - optionally a LOSSLESS opus relabel (5.0(side)→5.0 via channelmap, keeps all channels).
                             // resolveBitrate caps the target at the source bitrate when the target codec scores >= the source (guard via isTdarrQuality);
                             // lossless skips the cap; a high-bitrate lossy source is bounded by the codec ceiling.
-                            const layoutFilter = relabel ? ` -filter:a:${outputAudioIdx} "channelmap=map=${relabel.map}:channel_layout=${relabel.layout}"` : '';
+                            const relabelFilter = relabel ? `channelmap=map=${relabel.map}:channel_layout=${relabel.layout}` : '';
                             const note = relabel ? ` (relabel ${layoutName}→${relabel.layout})` : '';
+                            // guardBlocks for THIS force already passed (line above); loudnorm rides on the same guarantee. The relabel filter (if
+                            // any) is the pre-filter loudnorm's measurement must be chained after, so the analysis reflects the actual post-relabel
+                            // signal - though a lossless channelmap relabel doesn't change loudness, keeping the chain order consistent either way.
+                            let layoutFilter = '';
+                            if (loudnorm !== 'disabled') {
+                                const { filter } = buildLoudnormFilter(ffstream.index, srcAudioIdx, relabelFilter, LOUDNORM_PRESETS[loudnorm]);
+                                if (filter) layoutFilter = ` -filter:a:${outputAudioIdx} "${filter}"`;
+                            } else if (relabelFilter) {
+                                layoutFilter = ` -filter:a:${outputAudioIdx} "${relabelFilter}"`;
+                            }
                             const dstBitArg = encoderArgsIdx(targetCodec, forceChannels, outputAudioIdx, srcBitrate, ffstream.isTdarrLossless, ffstream.isTdarrQuality);
                             const dstBitStr = resolveBitrate(targetCodec, forceChannels, srcBitrate, ffstream.isTdarrLossless, ffstream.isTdarrQuality);
                             workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → ${targetCodec} ${forceChannels}ch @ ${dstBitStr / 1000} kb/s${note}\n`;
@@ -1417,6 +1720,85 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
             }
         }
+
+        // ===== LOUDNORM: untouched tracks =====
+        // Tracks none of the 12 sites above touched at all (the common case - already the right codec/channels, nothing else needed). Runs over
+        // EVERY kept audio stream directly (not workStreams/candidateStreams, which exist for codec_force/downmix_secondary_stereo's own narrower
+        // eligibility and would silently exclude secondary/commentary tracks under default settings) - guard_lossless/guard_quality/guard_object_audio are the only scope gate.
+        // A track ALSO being modified by one of the 12 sites above rides on that same re-encode instead (each site's own stereoArg/layoutFilter/
+        // inline block calls buildLoudnormFilter directly - see the Branch A comments at those call sites); this loop only handles the leftovers.
+        if (loudnorm !== 'disabled') {
+            const preset = LOUDNORM_PRESETS[loudnorm];
+            for (const stream of audioStreams) {
+                if (streamsToRemove.has(stream.index)) continue;
+                const outputAudioIdx = outputAudioIdxMap.get(stream.index);
+                const srcAudioIdx = inputAudioIdxMap.get(stream.index);
+                if (outputAudioIdx === undefined || srcAudioIdx === undefined || modifiedAudioIdx.has(outputAudioIdx)) continue;
+
+                const channels = resolveChannels(stream);
+                if (channels <= 0) {
+                    verboseDone += `☒Stream ${stream.index}: Skipping loudnorm - no channel count in ffprobe, mediaInfo, or channel layout; can't safely choose a target codec or verify its channel limit.\n`;
+                    continue;
+                }
+                const rawCodec = (stream.codec_name || '').trim().toLowerCase();
+                const isStereo = channels <= 2;
+                // Keep the current codec if it's already one this plugin can encode - never force convergence to codec_surround/codec_stereo just
+                // because they differ from what's already there (that is codec_force's job). Only converge when the current codec is genuinely
+                // outside this plugin's encodable domain (e.g. a kept DTS-core or MP3 track).
+                const configuredCodec = isStereo ? stereoCodec : surroundCodec;
+                const targetCodec = ['ac3', 'eac3', 'aac', 'opus'].includes(rawCodec) ? rawCodec : configuredCodec;
+                const targetFamily = targetCodec === 'aac_vbr' ? 'aac' : targetCodec;
+                const maxCh = LOUDNORM_MAX_CH[targetFamily] ?? 8;
+                if (channels > maxCh) {
+                    verboseDone += `☒Stream ${stream.index}: Skipping loudnorm - ${rawCodec} ${channels}ch exceeds the ${maxCh}ch limit for ${targetFamily}.\n`;
+                    continue;
+                }
+                if (guardBlocks(stream, targetFamily, channels, channels)) {
+                    verboseDone += `☒Stream ${stream.index}: Not normalizing - would lose detail vs ${codecDisplayName(stream)} ${channels}ch (guard_lossless=${guardLossless}, guard_quality=${guardQuality}, guard_object_audio=${guardObjectAudio}); left as ${rawCodec}.\n`;
+                    continue;
+                }
+
+                // Cache check: this stream isn't being touched by anything else this run (Branch B), so if it already carries a
+                // tag matching the CURRENT preset, its content hasn't changed since we last measured/corrected it against this
+                // exact target - trust it and skip the measurement subprocess entirely. A stale tag from a DIFFERENT preset (or
+                // no tag at all) falls through to a fresh measurement below.
+                if (loudnormTagMatchesPreset(stream)) continue;
+
+                const srcBitrate = Number(stream.bit_rate || 0);
+                const { filter, changed } = buildLoudnormFilter(stream.index, srcAudioIdx, '', preset);
+                if (!changed) {
+                    // Already within tolerance. On a tag-persisting container, stamp it (a metadata-only remux) so a FUTURE run
+                    // can skip re-measuring while the preset stays the same. On a container that would drop the tag, do NOTHING
+                    // (a true no-op) - stamping there would just remux every reprocess forever without ever caching (see
+                    // loudnormTagPersists above).
+                    if (loudnormTagPersists) {
+                        workDone += `☐Stream ${stream.index}: Stamping awk_loudnorm=${loudnorm} (already within tolerance) - future runs skip re-measuring while loudnorm stays "${loudnorm}"\n`;
+                        extraArguments += loudnormStampArg(outputAudioIdx);
+                        convert = true;
+                    }
+                    continue;
+                }
+
+                if (targetCodec === 'aac_vbr') {
+                    const { encoder, args, approxRate } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true);
+                    workDone += `☐Stream ${stream.index}: Normalizing ${rawCodec} ${channels}ch (loudnorm=${loudnorm}) → aac stereo @ ${approxRate} (libfdk VBR)\n`;
+                    extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args} -filter:a:${outputAudioIdx} "${filter}"${loudnormStampArg(outputAudioIdx)}`;
+                    modifiedAudioIdx.add(outputAudioIdx);
+                    outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels, bps: 0, approxRate });
+                } else {
+                    const dstBitArg = encoderArgsIdx(targetCodec, channels, outputAudioIdx, srcBitrate, stream.isTdarrLossless, stream.isTdarrQuality);
+                    const dstBitStr = resolveBitrate(targetCodec, channels, srcBitrate, stream.isTdarrLossless, stream.isTdarrQuality);
+                    const srcRateStr = srcBitrate > 0 ? `${Math.round(srcBitrate / 1000)} kb/s` : 'unknown bitrate';
+                    const note = targetCodec !== rawCodec ? ` (converged from ${rawCodec})` : '';
+                    workDone += `☐Stream ${stream.index}: Normalizing ${rawCodec} ${channels}ch @ ${srcRateStr} → ${targetCodec} ${channels}ch @ ${dstBitStr / 1000} kb/s (loudnorm=${loudnorm})${note}\n`;
+                    extraArguments += ` -c:a:${outputAudioIdx} ${targetCodec}${dstBitArg} -filter:a:${outputAudioIdx} "${filter}"${loudnormStampArg(outputAudioIdx)}`;
+                    modifiedAudioIdx.add(outputAudioIdx);
+                    outputAudioOverride.set(outputAudioIdx, { codec: targetCodec, channels, bps: dstBitStr });
+                }
+                convert = true;
+            }
+        }
+        // ===== END LOUDNORM: untouched tracks =====
 
 
         // Build the predicted output stream summary for the closing log line. Audio streams keep their original codec unless an in-place override was
@@ -1470,11 +1852,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // acceptable: the tracks are near-identical content at different channel counts and most players handle multiple default flags without issue.
             // Removing or reassigning the default flag is a separate concern outside this plugin's scope.
             response.preset += `,-map 0 -c copy${extraArguments}${globalOutputOpt}${networkDataOpt}`;
+            // workDone (what changed) always shows, matching pre-method_verbose behavior exactly. verboseDone (why something DIDN'T change - guard
+            // blocks, ceiling/missing-data skips) is the part method_verbose gates - the diagnostic negative-space, not the status of real changes.
             response.infoLog += workDone;
+            if (methodVerbose === 'enabled') response.infoLog += verboseDone;
             response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;
             response.processFile = true;
         } else {
             if (workDone) response.infoLog += workDone;
+            if (methodVerbose === 'enabled' && verboseDone) response.infoLog += verboseDone;
             response.infoLog += `☑Audio already has the correct formats available.\n`;
             response.processFile = false;
         }

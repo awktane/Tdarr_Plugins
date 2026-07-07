@@ -14,7 +14,7 @@ const details = () => ({
                   Optional clean_mkv_image_subs removes picture-based subtitles (PGS, VobSub, DVB) from mkv output, which mkv would otherwise keep - useful when you only want text subtitles.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.4.0',
+    Version: '2.5.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -327,6 +327,83 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails');
     // ===== END SHARED: image / cover-art codecs =====
 
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: codec name resolution =====
+    // -=-=-= codecAliases  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
+    // Prefix → canonical codec key (e.g. wmav1 → wma).
+    const codecAliases = [
+        ['pcm_',   'pcm'],
+        ['adpcm',  'adpcm'],
+        ['wmav',   'wma'],
+        ['atrac',  'atrac'],
+        ['mpegh',  'mpegh3d'],   // ffmpeg reports MPEG-H 3D Audio as mpegh_3d_audio; map it to the codecInfo key so it scores + gets object-audio protection
+    ];
+    // -=-=-= resolveCodecName  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
+    // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the
+    // _x variant when DTS:X is detected) and eac3 into eac3atmos. Used by audioQuality/losslessSource (audio_clean,
+    // stream_ordering) for scoring, and by summariseStream (all three) purely for accurate display labeling - a plugin
+    // that doesn't score audio still benefits from showing "eac3atmos"/"dtsx" instead of a bare "eac3"/"dts" in its logs.
+    // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't
+    // tell the subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to
+    // mediaInfo's Format_Commercial_IfAny ("DTS-HD Master Audio"), which decodes the substream header. Atmos comes from
+    // longName or the commercial name only - an editable title tag does not imply a real Atmos substream.
+    // DTS:X detection is best-effort: MediaInfo exposes it via Format_AdditionalFeatures containing "XLL X" (vs plain
+    // "XLL" for MA without X), but MediaInfo's own maintainers note this is incomplete for an undocumented format -
+    // expect a real DTS:X track to sometimes still classify as the plain (non-X) subtype, never the reverse (this only
+    // fires on an actual reported value, never on absence of one, so it can't produce a false positive).
+    const resolveCodecName = (stream) => {
+        let codec = (stream?.codec_name || '').toLowerCase().trim();
+        const longName = (stream.codec_long_name || '').toLowerCase().trim();
+
+        for (const [prefix, replacement] of codecAliases) {
+            if (codec.startsWith(prefix)) {
+                codec = replacement;
+                break;
+            }
+        }
+
+        //Do this first as there's no harm checking for additional info in the longName
+        if (codec === 'dca')
+            codec = 'dts';
+
+        const profile    = (stream.profile || '').toLowerCase().trim();
+        const mi         = mediaInfoFor(stream);
+        const commercial = (mi?.Format_Commercial_IfAny || '').toLowerCase();
+        if (codec === 'dts') {
+            if      (longName.includes('master')          || profile.includes('hd ma')  || commercial.includes('master'))
+                codec = 'dtsma';
+            else if (longName.includes('high resolution') || profile.includes('hra')    || commercial.includes('high resolution'))
+                codec = 'dtshr';
+            else if (longName.includes('express')         || profile.includes('express')|| commercial.includes('express'))
+                codec = 'dtsexpress';
+
+            const DTS_X_VARIANT = { dtsma: 'dtsmax', dtshr: 'dtshrx', dts: 'dtsx', dtsexpress: 'dtsexpressx' };
+            if (DTS_X_VARIANT[codec]) {
+                // MediaInfo marks DTS:X with the token "XLL X" in Format_AdditionalFeatures (plain DTS-HD is "XLL"). Match it as a
+                // whole trailing token (\bxll x\b) NOT a raw substring, so a hypothetical "XLL X96"/"XLL XBR" can't false-positive
+                // (those core-extension tokens attach to plain DTS core, which has no XLL, but the boundary check makes the guarantee literal).
+                const additionalFeatures = (mi?.Format_AdditionalFeatures || '').toLowerCase();
+                if (/\bxll x\b/.test(additionalFeatures))
+                    codec = DTS_X_VARIANT[codec];
+            }
+        } else if (codec === 'eac3' && (longName.includes('atmos') || commercial.includes('atmos')))
+            codec = 'eac3atmos';
+
+        return codec;
+    };
+    // -=-=-= codecDisplayName  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
+    // Friendly single-token display string for a summary line, used only for the codecs resolveCodecName REFINES beyond the
+    // bare container codec_name - the DTS subtypes and object-audio layers a raw "dts"/"eac3" hides. Any other codec falls
+    // back to its own raw codec_name unchanged (so pcm_s16le keeps its bit depth, wmav2 stays wmav2, etc. - this only ever
+    // ADDS subtype detail, never collapses an already-informative name). Single hyphenated tokens keep the terse token style.
+    const CODEC_DISPLAY = {
+        dtsma:   'dts-hd-ma',   dtsmax:      'dts-hd-ma-x',
+        dtshr:   'dts-hd-hr',   dtshrx:      'dts-hd-hr-x',
+        dtsx:    'dts-x',       dtsexpress:  'dts-express',   dtsexpressx: 'dts-express-x',
+        eac3atmos: 'eac3-atmos', mpegh3d: 'mpeg-h',
+    };
+    const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
+    // ===== END SHARED: codec name resolution =====
+
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: stream / language / preset helpers =====
     // -=-=-= mediaInfoFor  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     // Find the mediaInfo track corresponding to an ffprobe stream (matched by StreamOrder === ffprobe index); undefined when absent. The single join point
@@ -390,7 +467,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Audio role markers: /commentary|/description then /dub|/original. Subtitle: /forced then /commentary|/description|/sdh|/lyrics.
     // /default and /forced read the REAL disposition flag only — a title keyword must not flip a selection flag (as forced already did).
     // The role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary lines up.
-    // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Shared verbatim across all three.
+    // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Audio uses codecDisplayName so a DTS subtype
+    // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all three.
     const summariseStream = (s) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
@@ -406,7 +484,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : '');
             const prov = hasDisposition(s, 'dub') ? '/dub' : (hasDisposition(s, 'original') ? '/original' : '');
-            return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
+            return `[audio:${[lang, ch, codecDisplayName(s), rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
         }
         if (type === 'subtitle') {
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : (isSdh(s) ? '/sdh' : (isLyrics(s) ? '/lyrics' : '')));

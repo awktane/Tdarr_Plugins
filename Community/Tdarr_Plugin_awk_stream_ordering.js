@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '2.7.0',
+    Version: '2.8.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -220,71 +220,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails');
     // ===== END SHARED: image / cover-art codecs =====
 
-    // ===== SHARED [audio_clean, stream_ordering]: audio codec scoring =====
-    // -=-=-= codecInfo  [audio_clean, stream_ordering] =-=-=-
-    // Codec quality weights + bitrate thresholds for picking the best track (audioQuality). Three row shapes, each field one job:
-    //   lossless: { score }                                    - already perfect; audioQuality returns score directly.
-    //   encodable (aac/opus/ac3/eac3): { score, minimum }      - SCORING thresholds come from the CODEC_TARGET_BPS ladder (see scoreThresholds); no
-    //       `transparent` here, and `minimum` is kept ONLY as the transcode floor read by resolveBitrate (audio_clean).
-    //   source-lossy (everything else): { score, transparent } - `transparent` is the 2-CHANNEL baseline; scoreThresholds scales it by (ch/2)^0.65 and
-    //       derives minimum as MIN_RATIO of transparent. Some formats here aren't ffmpeg-encodable (e.g. ac4).
-    const codecInfo = {
-        // Lossless
-        pcm:        { score: 100, lossless: true },
-        flac:       { score: 100, lossless: true },
-        alac:       { score: 100, lossless: true },
-        wavpack:    { score: 100, lossless: true },
-        ape:        { score: 100, lossless: true },
-        tak:        { score: 100, lossless: true },
-        tta:        { score: 100, lossless: true },
-        mlp:        { score: 99,  lossless: true },
-
-        // Dolby family
-        truehd:     { score: 99,  lossless: true },
-        dtsma:      { score: 98,  lossless: true },
-        dtshr:      { score: 94,  transparent: 1470000 },
-        dts:        { score: 91,  transparent: 740000 },
-        eac3atmos:  { score: 92,  transparent: 375000 },
-        dtsexpress: { score: 80,  transparent: 188000 },
-
-        // Modern multichannel codecs
-        ac4:        { score: 90,  transparent: 188000 },
-        eac3:       { score: 89,  minimum: 192000 },       // encodable -> scores off CODEC_TARGET_BPS; minimum = transcode floor only
-        mpegh3d:    { score: 89,  transparent: 250000 },
-
-        // Modern general-purpose codecs
-        opus:       { score: 89,  minimum: 64000 },        // encodable
-        aac:        { score: 87,  minimum: 96000 },        // encodable
-        vorbis:     { score: 86,  transparent: 256000 },
-
-        // Legacy but still excellent
-        ac3:        { score: 84,  minimum: 192000 },       // encodable
-        atrac:      { score: 83,  transparent: 192000 },
-        wma:        { score: 82,  transparent: 192000 },
-        mpc:        { score: 82,  transparent: 220000 },
-
-        // Older codecs
-        mp3:        { score: 78,  transparent: 320000 },
-        mp2:        { score: 73,  transparent: 256000 },
-        adpcm:      { score: 60,  transparent: 256000 },
-        cook:       { score: 58,  transparent: 128000 }
-    };
-    // -=-=-= codecAliases / unknownCodecs  [audio_clean, stream_ordering] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: codec name resolution =====
+    // -=-=-= codecAliases  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
     // Prefix → canonical codec key (e.g. wmav1 → wma).
     const codecAliases = [
         ['pcm_',   'pcm'],
         ['adpcm',  'adpcm'],
         ['wmav',   'wma'],
         ['atrac',  'atrac'],
+        ['mpegh',  'mpegh3d'],   // ffmpeg reports MPEG-H 3D Audio as mpegh_3d_audio; map it to the codecInfo key so it scores + gets object-audio protection
     ];
-    const unknownCodecs = new Set();
-
-    // -=-=-= resolveCodecName  [audio_clean, stream_ordering] =-=-=-
-    // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype and eac3 into eac3atmos. Shared by audioQuality
-    // and losslessSource. codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't tell the
-    // subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to mediaInfo's Format_Commercial_IfAny
-    // ("DTS-HD Master Audio"), which decodes the substream header. Atmos comes from longName or the commercial name only - an editable title tag does
-    // not imply a real Atmos substream.
+    // -=-=-= resolveCodecName  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
+    // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the
+    // _x variant when DTS:X is detected) and eac3 into eac3atmos. Used by audioQuality/losslessSource (audio_clean,
+    // stream_ordering) for scoring, and by summariseStream (all three) purely for accurate display labeling - a plugin
+    // that doesn't score audio still benefits from showing "eac3atmos"/"dtsx" instead of a bare "eac3"/"dts" in its logs.
+    // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't
+    // tell the subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to
+    // mediaInfo's Format_Commercial_IfAny ("DTS-HD Master Audio"), which decodes the substream header. Atmos comes from
+    // longName or the commercial name only - an editable title tag does not imply a real Atmos substream.
+    // DTS:X detection is best-effort: MediaInfo exposes it via Format_AdditionalFeatures containing "XLL X" (vs plain
+    // "XLL" for MA without X), but MediaInfo's own maintainers note this is incomplete for an undocumented format -
+    // expect a real DTS:X track to sometimes still classify as the plain (non-X) subtype, never the reverse (this only
+    // fires on an actual reported value, never on absence of one, so it can't produce a false positive).
     const resolveCodecName = (stream) => {
         let codec = (stream?.codec_name || '').toLowerCase().trim();
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
@@ -301,7 +259,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             codec = 'dts';
 
         const profile    = (stream.profile || '').toLowerCase().trim();
-        const commercial = (mediaInfoFor(stream)?.Format_Commercial_IfAny || '').toLowerCase();
+        const mi         = mediaInfoFor(stream);
+        const commercial = (mi?.Format_Commercial_IfAny || '').toLowerCase();
         if (codec === 'dts') {
             if      (longName.includes('master')          || profile.includes('hd ma')  || commercial.includes('master'))
                 codec = 'dtsma';
@@ -309,11 +268,92 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 codec = 'dtshr';
             else if (longName.includes('express')         || profile.includes('express')|| commercial.includes('express'))
                 codec = 'dtsexpress';
+
+            const DTS_X_VARIANT = { dtsma: 'dtsmax', dtshr: 'dtshrx', dts: 'dtsx', dtsexpress: 'dtsexpressx' };
+            if (DTS_X_VARIANT[codec]) {
+                // MediaInfo marks DTS:X with the token "XLL X" in Format_AdditionalFeatures (plain DTS-HD is "XLL"). Match it as a
+                // whole trailing token (\bxll x\b) NOT a raw substring, so a hypothetical "XLL X96"/"XLL XBR" can't false-positive
+                // (those core-extension tokens attach to plain DTS core, which has no XLL, but the boundary check makes the guarantee literal).
+                const additionalFeatures = (mi?.Format_AdditionalFeatures || '').toLowerCase();
+                if (/\bxll x\b/.test(additionalFeatures))
+                    codec = DTS_X_VARIANT[codec];
+            }
         } else if (codec === 'eac3' && (longName.includes('atmos') || commercial.includes('atmos')))
             codec = 'eac3atmos';
 
         return codec;
     };
+    // -=-=-= codecDisplayName  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
+    // Friendly single-token display string for a summary line, used only for the codecs resolveCodecName REFINES beyond the
+    // bare container codec_name - the DTS subtypes and object-audio layers a raw "dts"/"eac3" hides. Any other codec falls
+    // back to its own raw codec_name unchanged (so pcm_s16le keeps its bit depth, wmav2 stays wmav2, etc. - this only ever
+    // ADDS subtype detail, never collapses an already-informative name). Single hyphenated tokens keep the terse token style.
+    const CODEC_DISPLAY = {
+        dtsma:   'dts-hd-ma',   dtsmax:      'dts-hd-ma-x',
+        dtshr:   'dts-hd-hr',   dtshrx:      'dts-hd-hr-x',
+        dtsx:    'dts-x',       dtsexpress:  'dts-express',   dtsexpressx: 'dts-express-x',
+        eac3atmos: 'eac3-atmos', mpegh3d: 'mpeg-h',
+    };
+    const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
+    // ===== END SHARED: codec name resolution =====
+
+    // ===== SHARED [audio_clean, stream_ordering]: audio codec scoring =====
+    // -=-=-= codecInfo  [audio_clean, stream_ordering] =-=-=-
+    // Codec quality weights + bitrate thresholds for picking the best track (audioQuality). Three row shapes, each field one job:
+    //   lossless: { score }                                    - already perfect; audioQuality returns score directly.
+    //   encodable (aac/opus/ac3/eac3): { score, minimum }      - SCORING thresholds come from the CODEC_TARGET_BPS ladder (see scoreThresholds); no
+    //       `transparent` here, and `minimum` is kept ONLY as the transcode floor read by resolveBitrate (audio_clean).
+    //   source-lossy (everything else): { score, transparent } - `transparent` is the 2-CHANNEL baseline; scoreThresholds scales it by (ch/2)^0.65 and
+    //       derives minimum as MIN_RATIO of transparent. Some formats here aren't ffmpeg-encodable (e.g. ac4).
+    // objectAudio: true marks a codec whose stream carries object-audio metadata (Atmos/DTS:X/MPEG-H) that ffmpeg cannot
+    // re-encode - read only by audio_clean's guard_object_audio, never by the score/threshold math below.
+    const codecInfo = {
+        // Lossless
+        pcm:         { score: 100, lossless: true },
+        flac:        { score: 100, lossless: true },
+        alac:        { score: 100, lossless: true },
+        wavpack:     { score: 100, lossless: true },
+        ape:         { score: 100, lossless: true },
+        tak:         { score: 100, lossless: true },
+        tta:         { score: 100, lossless: true },
+        mlp:         { score: 99,  lossless: true },
+
+        // Dolby family
+        truehd:      { score: 99,  lossless: true },
+        dtsma:       { score: 98,  lossless: true },
+        dtsmax:      { score: 98,  lossless: true,       objectAudio: true },
+        dtshr:       { score: 94,  transparent: 1470000 },
+        dtshrx:      { score: 96,  transparent: 1470000, objectAudio: true },
+        dts:         { score: 91,  transparent: 740000 },
+        dtsx:        { score: 93,  transparent: 740000,  objectAudio: true },
+        eac3atmos:   { score: 92,  transparent: 375000,  objectAudio: true },
+        dtsexpress:  { score: 80,  transparent: 188000 },
+        dtsexpressx: { score: 82,  transparent: 188000,  objectAudio: true },
+
+        // Modern multichannel codecs
+        ac4:         { score: 90,  transparent: 188000 },
+        eac3:        { score: 89,  minimum:     192000 },  // encodable -> scores off CODEC_TARGET_BPS; minimum = transcode floor only
+        mpegh3d:     { score: 89,  transparent: 250000,  objectAudio: true },
+
+        // Modern general-purpose codecs
+        opus:        { score: 89,  minimum:      64000 },  // encodable
+        aac:         { score: 87,  minimum:      96000 },  // encodable
+        vorbis:      { score: 86,  transparent: 256000 },
+
+        // Legacy but still excellent
+        ac3:         { score: 84,  minimum:     192000 },  // encodable
+        atrac:       { score: 83,  transparent: 192000 },
+        wma:         { score: 82,  transparent: 192000 },
+        mpc:         { score: 82,  transparent: 220000 },
+
+        // Older codecs
+        mp3:         { score: 78,  transparent: 320000 },
+        mp2:         { score: 73,  transparent: 256000 },
+        adpcm:       { score: 60,  transparent: 256000 },
+        cook:        { score: 58,  transparent: 128000 }
+    };
+    // -=-=-= unknownCodecs  [audio_clean, stream_ordering] =-=-=-
+    const unknownCodecs = new Set();
 
     // -=-=-= CODEC_TARGET_BPS  [audio_clean, stream_ordering] =-=-=-
     // Per-channel target bitrate (bps) for our encodable output codecs (ac3/eac3 cap at 6ch in ffmpeg). Single source for scoreThresholds' transparent
@@ -449,7 +489,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Audio role markers: /commentary|/description then /dub|/original. Subtitle: /forced then /commentary|/description|/sdh|/lyrics.
     // /default and /forced read the REAL disposition flag only — a title keyword must not flip a selection flag (as forced already did).
     // The role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary lines up.
-    // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Shared verbatim across all three.
+    // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Audio uses codecDisplayName so a DTS subtype
+    // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all three.
     const summariseStream = (s) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
@@ -465,7 +506,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : '');
             const prov = hasDisposition(s, 'dub') ? '/dub' : (hasDisposition(s, 'original') ? '/original' : '');
-            return `[audio:${[lang, ch, codec, rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
+            return `[audio:${[lang, ch, codecDisplayName(s), rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
         }
         if (type === 'subtitle') {
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : (isSdh(s) ? '/sdh' : (isLyrics(s) ? '/lyrics' : '')));
