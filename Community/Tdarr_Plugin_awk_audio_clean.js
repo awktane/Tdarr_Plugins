@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.8.0',
+    Version: '2.9.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -78,28 +78,6 @@ const details = () => ({
                 \\nIf true  - each secondary track with more than 2 channels is transcoded in place to a stereo codec_stereo track (using the stereo_downmix matrix).`,
         },
         {
-            name: 'codec_surround',
-            type: 'string',
-            defaultValue: 'aac',
-            inputUI: {
-                type: 'dropdown',
-                options: ['aac','ac3','eac3','opus'],
-            },
-            tooltip: `Specify codec for newly created surround tracks. Note that both AC3 and EAC3 are limited to 6 channels (5.1) by ffmpeg's native encoders. Opus supports up to 8 channels.`,
-        },
-        {
-            name: 'codec_stereo',
-            type: 'string',
-            defaultValue: 'aac',
-            inputUI: {
-                type: 'dropdown',
-                options: ['aac','aac_vbr','ac3','eac3','opus'],
-            },
-            tooltip: `Specify codec for newly created stereo tracks. AAC and Opus are the most compatible choices for modern media servers and clients. EAC3 is useful for Dolby branding on compatible devices. AC3 is the most broadly compatible legacy choice.
-                \\naac_vbr uses libfdk_aac in VBR mode (-vbr 5, ~192-224 kb/s) for higher quality than native AAC CBR. Falls back to -vbr 4 (~128-144 kb/s) when codec_force is converting an existing stereo track whose bitrate is at or below 144 kb/s, matching the lower-information source.
-                \\nExisting AAC tracks are never re-encoded when aac_vbr is selected — the AAC family check prevents a generational loss for no gain.`,
-        },        
-        {
             name: 'codec_force',
             type: 'string',
             defaultValue: 'false',
@@ -116,6 +94,28 @@ const details = () => ({
                 \\nIf 6below - Streams with six or fewer channels will be transcoded to codec_surround (unless protected by guard_lossless/guard_quality/guard_object_audio). Tracks with two or fewer channel will be converted to codec_stereo.
                 \\nIf all   - Like 6below but also transcodes surround tracks above six channels, each subject to its codec's channel limit (ac3/eac3 6ch, aac/opus 8ch). guard_lossless/guard_quality/guard_object_audio still apply in every mode - a track they protect is left in its source codec; 'all' differs from 6below only by the channel-count threshold.`,
         },                
+        {
+            name: 'codec_stereo',
+            type: 'string',
+            defaultValue: 'aac',
+            inputUI: {
+                type: 'dropdown',
+                options: ['aac','aac_vbr','ac3','eac3','opus'],
+            },
+            tooltip: `Specify codec for newly created stereo tracks. AAC and Opus are the most compatible choices for modern media servers and clients. EAC3 is useful for Dolby branding on compatible devices. AC3 is the most broadly compatible legacy choice.
+                \\naac_vbr uses libfdk_aac in VBR mode (-vbr 5, ~192-224 kb/s) for higher quality than native AAC CBR. Falls back to -vbr 4 (~128-144 kb/s) when codec_force is converting an existing stereo track whose bitrate is at or below 144 kb/s, matching the lower-information source.
+                \\nExisting AAC tracks are never re-encoded when aac_vbr is selected — the AAC family check prevents a generational loss for no gain.`,
+        },        
+        {
+            name: 'codec_surround',
+            type: 'string',
+            defaultValue: 'aac',
+            inputUI: {
+                type: 'dropdown',
+                options: ['aac','ac3','eac3','opus'],
+            },
+            tooltip: `Specify codec for newly created surround tracks. Note that both AC3 and EAC3 are limited to 6 channels (5.1) by ffmpeg's native encoders. Opus supports up to 8 channels.`,
+        },
         {
             name: 'method_deduplicate',
             type: 'string',
@@ -205,22 +205,27 @@ const details = () => ({
                 \\nIf remix - the track is downmixed to a codec_stereo stereo. Defers to downmix_to_stereo / downmix_secondary_stereo when they already convert the track, and falls back to keep rather than create a duplicate stereo.`,
         },
         {
-            name: 'method_verbose',
+            name: 'guard_lossless',
             type: 'string',
             defaultValue: 'enabled',
             inputUI: {
                 type: 'dropdown',
-                options: ['enabled', 'disabled'],
+                options: ['enabled','disabled'],
             },
-            tooltip: `Control whether the log explains tracks that DIDN'T change, on top of the tracks that did. Every actual change (transcoding,
-                adding, remixing, normalizing, removing a duplicate) is always logged regardless of this setting - that part matches the log you see
-                today. This only affects the extra diagnostic layer: why a guard protected a track, why a layout couldn't be forced, why a track was
-                skipped - useful for tracing which of your settings is doing something you didn't expect, without digging through the code.
+            tooltip: `Protect a track from a destructive operation (downmix_to_six / downmix_to_stereo 'replace', codec_force, duplicate removal, and method_loudnorm)
+                whenever its SOURCE is lossless (TrueHD, DTS-HD MA, FLAC, PCM, etc.) - independent of guard_quality and guard_object_audio, so disabling
+                quality-based protection never accidentally exposes a lossless master too; you have to turn this off on purpose. A guarded downmix 'replace'
+                becomes 'add' (the source is kept and the downmix is added alongside); a guarded codec_force/method_loudnorm is skipped (left in its source
+                codec); a guarded duplicate is kept instead of removed. Commentary/descriptive tracks and unlisted-language tracks (while the
+                downmix_language filter is active) are never protected - the language filter and secondary status take precedence. See downmix_language.
+                \\nNote: disabling this alone does not guarantee a lossless source gets touched - guard_quality's own quality-margin math still runs
+                using that source's (near-maximum) quality score, and in practice will usually still block a conversion to any lossy codec unless
+                guard_quality is ALSO relaxed. The three guards (guard_quality, this, guard_object_audio) are fully independent, not a fallback chain.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nIf enabled  - (Default) Also log every track that was protected or skipped, and why - the negative space alongside the real changes.
-                \\nIf disabled - Only log tracks that actually changed. Close to the plugin's classic output - no explanation for tracks left alone.`,
+                \\nIf enabled  - (Default) Protect lossless sources from every operation above.
+                \\nIf disabled - No lossless-specific protection; guard_quality (if enabled) still evaluates every operation on its own terms.`,
         },
         {
             name: 'guard_quality',
@@ -248,29 +253,6 @@ const details = () => ({
                 \\nIf disabled - No channel-count or quality-margin protection; guard_lossless (if enabled) still protects lossless sources on its own.`,
         },
         {
-            name: 'guard_lossless',
-            type: 'string',
-            defaultValue: 'enabled',
-            inputUI: {
-                type: 'dropdown',
-                options: ['enabled','disabled'],
-            },
-            tooltip: `Protect a track from a destructive operation (downmix_to_six / downmix_to_stereo 'replace', codec_force, duplicate removal, and method_loudnorm)
-                whenever its SOURCE is lossless (TrueHD, DTS-HD MA, FLAC, PCM, etc.) - independent of guard_quality and guard_object_audio, so disabling
-                quality-based protection never accidentally exposes a lossless master too; you have to turn this off on purpose. A guarded downmix 'replace'
-                becomes 'add' (the source is kept and the downmix is added alongside); a guarded codec_force/method_loudnorm is skipped (left in its source
-                codec); a guarded duplicate is kept instead of removed. Commentary/descriptive tracks and unlisted-language tracks (while the
-                downmix_language filter is active) are never protected - the language filter and secondary status take precedence. See downmix_language.
-                \\nNote: disabling this alone does not guarantee a lossless source gets touched - guard_quality's own quality-margin math still runs
-                using that source's (near-maximum) quality score, and in practice will usually still block a conversion to any lossy codec unless
-                guard_quality is ALSO relaxed. The three guards (guard_quality, this, guard_object_audio) are fully independent, not a fallback chain.
-                \\n=====
-                \\nActions
-                \\n=====
-                \\nIf enabled  - (Default) Protect lossless sources from every operation above.
-                \\nIf disabled - No lossless-specific protection; guard_quality (if enabled) still evaluates every operation on its own terms.`,
-        },
-        {
             name: 'guard_object_audio',
             type: 'string',
             defaultValue: 'enabled',
@@ -296,15 +278,22 @@ const details = () => ({
                 \\nIf disabled - No object-audio-specific protection; the other two guards (if enabled) still evaluate every operation on their own terms.`,
         },
         {
-            name: 'temp_on_network',
-            type: 'boolean',
-            defaultValue: true,
+            name: 'method_verbose',
+            type: 'string',
+            defaultValue: 'enabled',
             inputUI: {
                 type: 'dropdown',
-                options: ['true', 'false'],
+                options: ['enabled', 'disabled'],
             },
-            tooltip: `Is the temp folder on the network? Enabling this adds a ffmpeg options to reduce the number of reads/writes.
-                 \\nGenerally speaking this has very little effect if the files are local instead and therefore it's enabled by default.`,
+            tooltip: `Control whether the log explains tracks that DIDN'T change, on top of the tracks that did. Every actual change (transcoding,
+                adding, remixing, normalizing, removing a duplicate) is always logged regardless of this setting - that part matches the log you see
+                today. This only affects the extra diagnostic layer: why a guard protected a track, why a layout couldn't be forced, why a track was
+                skipped - useful for tracing which of your settings is doing something you didn't expect, without digging through the code.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nIf enabled  - (Default) Also log every track that was protected or skipped, and why - the negative space alongside the real changes.
+                \\nIf disabled - Only log tracks that actually changed. Close to the plugin's classic output - no explanation for tracks left alone.`,
         },
     ],
 });
@@ -725,14 +714,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Short language code: strip any region/variant suffix so 'en-US', 'en_US', 'en.US' all compare as 'en'.
     const shortLang = (l) => l.replace(/[-_.].*$/, '');
 
-    // -=-=-= networkDataOpt  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
-    //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
-    const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
     // -=-=-= globalOutputOpt  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
-    // Output-side ffmpeg options applied to every run (the place to add any universal muxer/output flag). Currently just the muxer packet-buffer ceiling for
-    // ffmpeg's "Too many packets buffered" interleave error - chiefly a transcode concern (audio_clean) plus clean_and_remux's recovery of mis-interleaved
-    // files; mostly vestigial on modern ffmpeg (7.x auto-sizes the queue) but cheap insurance.
-    const globalOutputOpt = ' -max_muxing_queue_size 9999';
+    // Output-side ffmpeg options applied to EVERY run (the place for any universal muxer/output flag). Two flags: -max_muxing_queue_size 9999 raises the
+    // muxer packet-buffer ceiling for ffmpeg's "Too many packets buffered" interleave error (chiefly a transcode/recovery concern; mostly vestigial on
+    // ffmpeg 7.x which auto-sizes the queue, but cheap insurance); -flush_packets 0 buffers muxer writes instead of flushing per packet - the throughput-
+    // optimal choice for FILE muxing (helps high-latency/network temp storage, negligible cost when local), so it is always applied, not exposed as a toggle.
+    const globalOutputOpt = ' -max_muxing_queue_size 9999 -flush_packets 0';
     // ===== END SHARED: stream / language / preset helpers =====
 
     // ===== SHARED [audio_clean, clean_and_remux]: ffmpeg metadata escaping =====
@@ -857,8 +844,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const objectAudioSource = (stream) => codecInfo[resolveCodecName(stream)]?.objectAudio === true;
 
     // Parse + validate inputs. Order here mirrors the Inputs array in details() so the two never drift. Only type:'string' dropdowns are validated here -
-    // free-text inputs (downmix_language) have no fixed option set, and type:'boolean' inputs (temp_on_network) are already coerced to a real true/false by
-    // loadDefaultValues (any out-of-set value becomes false), so a guard on them would be dead code. Every checked value fails the file on an out-of-set value.
+    // the one free-text input (downmix_language) has no fixed option set, and there are no type:'boolean' inputs. Every checked value fails the file on an
+    // out-of-set value.
     const downmixLanguage = String(inputs.downmix_language).toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
     const downmixToSix = String(inputs.downmix_to_six).trim();
     const downmixToTwo = String(inputs.downmix_to_stereo).trim();
@@ -1851,7 +1838,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // a downmix_to_stereo track created from a default-flagged surround source also carries the default flag - two tracks marked default. This is
             // acceptable: the tracks are near-identical content at different channel counts and most players handle multiple default flags without issue.
             // Removing or reassigning the default flag is a separate concern outside this plugin's scope.
-            response.preset += `,-map 0 -c copy${extraArguments}${globalOutputOpt}${networkDataOpt}`;
+            response.preset += `,-map 0 -c copy${extraArguments}${globalOutputOpt}`;
             // workDone (what changed) always shows, matching pre-method_verbose behavior exactly. verboseDone (why something DIDN'T change - guard
             // blocks, ceiling/missing-data skips) is the part method_verbose gates - the diagnostic negative-space, not the status of real changes.
             response.infoLog += workDone;

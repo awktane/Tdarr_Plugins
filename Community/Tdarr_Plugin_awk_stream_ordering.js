@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '2.8.0',
+    Version: '2.9.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -93,17 +93,6 @@ const details = () => ({
                 with a manageable track it can serve without a heavy transcode, not the huge one. Within the demoted tail the largest lands last. Ordering within
                 the kept group is still by the quality score; the cap only applies to descending (ascending already puts the smallest first).
                 \\nSet to disabled to skip quality ordering entirely. If both order_channel and order_quality are disabled, audio is not reordered by channels or quality (language/role/order_codec still apply).`
-        },
-        {
-            name: 'temp_on_network',
-            type: 'boolean',
-            defaultValue: true,
-            inputUI: {
-                type: 'dropdown',
-                options: ['true', 'false'],
-            },
-            tooltip: `Is the temp folder on the network? Enabling this adds stops ffmpeg from flushing the buffer quite as often. (-flush_packets 0)
-                 \\nGenerally speaking this has very little effect if the files are local instead and therefore it's enabled by default.`,
         },
     ],
 });
@@ -524,22 +513,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Short language code: strip any region/variant suffix so 'en-US', 'en_US', 'en.US' all compare as 'en'.
     const shortLang = (l) => l.replace(/[-_.].*$/, '');
 
-    // -=-=-= networkDataOpt  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
-    //This is the only option I found that consistently made a difference. Not a huge difference but nonetheless...
-    const networkDataOpt = (String(inputs.temp_on_network) === 'true' ? ' -flush_packets 0' : '');
     // -=-=-= globalOutputOpt  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
-    // Output-side ffmpeg options applied to every run (the place to add any universal muxer/output flag). Currently just the muxer packet-buffer ceiling for
-    // ffmpeg's "Too many packets buffered" interleave error - chiefly a transcode concern (audio_clean) plus clean_and_remux's recovery of mis-interleaved
-    // files; mostly vestigial on modern ffmpeg (7.x auto-sizes the queue) but cheap insurance.
-    const globalOutputOpt = ' -max_muxing_queue_size 9999';
+    // Output-side ffmpeg options applied to EVERY run (the place for any universal muxer/output flag). Two flags: -max_muxing_queue_size 9999 raises the
+    // muxer packet-buffer ceiling for ffmpeg's "Too many packets buffered" interleave error (chiefly a transcode/recovery concern; mostly vestigial on
+    // ffmpeg 7.x which auto-sizes the queue, but cheap insurance); -flush_packets 0 buffers muxer writes instead of flushing per packet - the throughput-
+    // optimal choice for FILE muxing (helps high-latency/network temp storage, negligible cost when local), so it is always applied, not exposed as a toggle.
+    const globalOutputOpt = ' -max_muxing_queue_size 9999 -flush_packets 0';
     // ===== END SHARED: stream / language / preset helpers =====
 
     // Bail out gracefully on missing/partial probe data, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
         failFile('No ffProbe stream data available for this file - the plugin cannot process it.');
 
-    // Value checks, in Inputs order. order_language/order_codec are free-text and temp_on_network is type:'boolean' (loadDefaultValues coerces any out-of-set
-    // value), so only first_audio, order_channel, order_quality and first_subtitle have a fixed option set to validate.
+    // Value checks, in Inputs order. order_language/order_codec are free-text (no fixed option set), so only first_audio, first_subtitle, order_channel and
+    // order_quality have a fixed option set to validate.
     if(!['language', 'original', 'default', 'descriptive'].includes(inputs.first_audio))
         failFile('first_audio has not been configured, please configure required options.');
     if(!['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled'].includes(inputs.order_channel))
@@ -754,7 +741,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         response.processFile = true;
         response.reQueueAfter = true;
-        response.preset = `,${ffmpegMap} -c copy${dispositionArgs}${globalOutputOpt}${networkDataOpt}`;
+        response.preset = `,${ffmpegMap} -c copy${dispositionArgs}${globalOutputOpt}`;
         if (dispositionArgs !== '')
             response.infoLog += '☐Set the first audio track as the sole default.\n';
         response.infoLog += `☑Expected results: ${streams.map(s => summariseStream(s.stream)).join('')}\n`;
