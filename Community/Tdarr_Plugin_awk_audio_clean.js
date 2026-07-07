@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.9.0',
+    Version: '2.9.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -998,8 +998,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // compares against an existing survivor (not a predicted transcode) and must check the survivor's losslessness. No quality clause on purpose — the dedupe
         // sort is measured-bitrate-first, so a survivor can carry a LOWER isTdarrQuality than the removed track; a quality clause would wrongly block those drops.
         // The channel-count check protects the higher-channel duplicate under BOTH quality tiers ('enabled' and 'strict'), so 'strict' is genuinely ⊇ 'enabled'
-        // (its documented "most protective" role). This is a deliberate change from the old archive_guard, whose channel clause fired only under 'quality' and NOT
-        // 'quality-strict' — that inversion (strict being LESS protective for a channel-dropping dedup) was a quirk, corrected here in the guard split.
+        // (its documented "most protective" role) - there is no tier where 'strict' is less protective than 'enabled' for a channel-dropping dedup.
         const dedupeGuardBlocks = (removed, survivor) => {
             if (removed.isTdarrSecondaryTrack || removed.isTdarrLangSecondary) return false;
             if (guardLossless === 'enabled' && removed.isTdarrLossless && !survivor.isTdarrLossless) return true;   // dropping the last lossless copy
@@ -1029,8 +1028,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //       Exception: when downmix_to_stereo is enabled exactly-2ch tracks are carved into their own role (not folded into "stereo") so a
         //       downmix-created/pre-existing 2.0 is never removed in favour of a mono.
         //       Both exceptions only apply while the matching downmix option is enabled and use the same channel bands as existingSixLangs/
-        //       existingStereoLangs, so dedup can't disagree with and re-trigger the downmix creation guards (this previously caused an infinite
-        //       create/remove loop between the two plugin runs).
+        //       existingStereoLangs, so dedup can't disagree with and re-trigger the downmix creation guards - a disagreement would create an
+        //       infinite create/remove loop between the two options.
         // Note: dedup runs across ALL audio streams regardless of downmix_language/downmix_secondary_stereo (those govern transcoding candidates, not what's a
         // genuine duplicate - a duplicate in a non-preferred language is still a duplicate). guard_lossless/guard_quality/guard_object_audio (dedupeGuardBlocks) keep a duplicate whose removal
         // would lose detail the survivor can't hold (a last lossless copy, or a higher-channel track under quality) instead of removing it, and never -errors on it.
@@ -1498,9 +1497,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (sixMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
                     const dstBitArg = encoderArgsIdx(surroundCodec, 6, outputAudioIdx);
                     const dstBitStr = resolveBitrate(surroundCodec, 6);
-                    // sixMode==='replace' only when guardBlocks did NOT block this downmix, so loudnorm rides on the same guarantee - no additional
-                    // check. Explicit aformat=channel_layouts=5.1 (verified equivalent to -ac 6) replaces the bare -ac so loudnorm's analysis/
-                    // correction can be chained after it - a bare -ac would apply its implicit conversion AFTER an explicit -filter:a instead.
+                    // guardBlocks already passed for sixMode==='replace' (loudnorm rides on that guarantee - see stereoArg above). Explicit
+                    // aformat=channel_layouts=5.1 (verified equivalent to -ac 6) replaces the bare -ac so loudnorm's analysis/correction can be
+                    // chained after it - a bare -ac would apply its implicit conversion AFTER an explicit -filter:a instead.
                     let sixFilter = ` -ac:a:${outputAudioIdx} 6`;
                     if (loudnorm !== 'disabled') {
                         const { filter } = buildLoudnormFilter(ffstream.index, srcAudioIdx, 'aformat=channel_layouts=5.1', LOUDNORM_PRESETS[loudnorm]);
@@ -1589,8 +1588,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
 
             // ====== FORCE CODEC ======
-            // Skip a track guard_lossless/guard_quality/guard_object_audio protects — guardBlocks: a lossless source, or a quality-tier target that scores lower. codec_force no longer overrides
-            // it in any mode, including 'all', so a guarded track is left in its source codec. Also skip when the source has more channels than the target codec
+            // Skip a track guard_lossless/guard_quality/guard_object_audio protects — guardBlocks: a lossless source, or a quality-tier target that scores lower. codec_force never
+            // overrides guard protection, in any mode including 'all', so a guarded track is left in its source codec. Also skip when the source has more channels than the target codec
             // supports (ac3/eac3 max 6ch, opus/aac max 8ch) to avoid an ffmpeg
             // encode failure. Channel count is resolved from ffprobe, then mediaInfo, then a channel-layout string (resolveChannels): a track no source can
             // measure is left untouched rather than guessed, since a wrong count could route it to a codec that can't hold its real channels and fail.
@@ -1666,8 +1665,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // aac_vbr stereo force: use VBR 4 for low-bitrate sources, VBR 5 otherwise.
                             // srcBitrate is meaningful here — this is a codec-swap, same channel count.
                             const { encoder, args, approxRate } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true);
-                            // No pre-filter (same channel count, no relabel) - measure the source directly. guardBlocks for THIS force already
-                            // passed (line above), so loudnorm rides on the same guarantee, no additional check.
+                            // No pre-filter (same channel count, no relabel) - measure the source directly. guardBlocks for this force already
+                            // passed above (loudnorm rides on that guarantee - see stereoArg).
                             let aacVbrFilter = '';
                             if (loudnorm !== 'disabled') {
                                 const { filter } = buildLoudnormFilter(ffstream.index, srcAudioIdx, '', LOUDNORM_PRESETS[loudnorm]);
@@ -1684,9 +1683,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // lossless skips the cap; a high-bitrate lossy source is bounded by the codec ceiling.
                             const relabelFilter = relabel ? `channelmap=map=${relabel.map}:channel_layout=${relabel.layout}` : '';
                             const note = relabel ? ` (relabel ${layoutName}→${relabel.layout})` : '';
-                            // guardBlocks for THIS force already passed (line above); loudnorm rides on the same guarantee. The relabel filter (if
-                            // any) is the pre-filter loudnorm's measurement must be chained after, so the analysis reflects the actual post-relabel
-                            // signal - though a lossless channelmap relabel doesn't change loudness, keeping the chain order consistent either way.
+                            // guardBlocks for this force already passed above (loudnorm rides on that guarantee - see stereoArg). The relabel filter
+                            // (if any) is the pre-filter loudnorm's measurement must be chained after, so the analysis reflects the actual
+                            // post-relabel signal - though a lossless channelmap relabel doesn't change loudness, keeping the chain order consistent.
                             let layoutFilter = '';
                             if (loudnorm !== 'disabled') {
                                 const { filter } = buildLoudnormFilter(ffstream.index, srcAudioIdx, relabelFilter, LOUDNORM_PRESETS[loudnorm]);
