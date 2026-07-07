@@ -14,7 +14,7 @@ const details = () => ({
                   Optional remove_mkv_imagesubs removes picture-based subtitles (PGS, VobSub, DVB) from mkv output, which mkv would otherwise keep - useful when you only want text subtitles.\n\n
                   Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps.\n\n
                   Image (cover-art) attachments are removed. Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.6.0',
+    Version: '2.7.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -73,18 +73,17 @@ const details = () => ({
                     jpn`,
         },
         {
-            name: 'fail_langs_blank',
+            name: 'fail_blank_langs',
             type: 'boolean',
             defaultValue: true,
             inputUI: {
                 type: 'dropdown',
                 options: ['true', 'false'],
             },
-            tooltip: `If language_fill is set and more than one audio or subtitle stream has no language tag, should processing be aborted?
-                \\nWhen multiple streams share the same blank language tag, language_fill assigns them all the same language. They may actually be different languages — the only way to know is by listening.
-                \\nSubsequent plugins may then treat them as duplicates and remove one, causing silent content loss (e.g. deleting the only Japanese track because it was tagged the same as English).
+            tooltip: `If more than one audio or subtitle stream has no language tag, should processing be aborted?
+                \\nMultiple untagged streams of the same type can't be told apart by language — the only way to know is by listening. If language_fill is set they'd all be assigned the same language; either way a subsequent plugin may treat them as duplicates and remove one, causing silent content loss (e.g. deleting the only Japanese track because it was tagged the same as English).
                 \\nIf true  - processing is aborted and the file is sent to the error queue. Tag the streams manually and requeue.
-                \\nIf false - the language_fill assignment is logged as normal and processing continues.`,
+                \\nIf false - processing continues; any missing languages will be filled by language_fill which could cause logic to remove one of the tracks as lower quality, etc.`,
         },        
         {
             name: 'tag_disposition',
@@ -507,7 +506,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile('No ffProbe stream data available for this file - the plugin cannot process it.');
 
     // Input validation. Order mirrors the Inputs array in details(); only type:'string' inputs are checked - free-text inputs (language_audio, language_sub)
-    // have no fixed option set, and type:'boolean' inputs (fail_langs_blank, remove_comments/remove_busytitle, remove_mkv_imagesubs) are coerced to a real
+    // have no fixed option set, and type:'boolean' inputs (fail_blank_langs, remove_comments/remove_busytitle, remove_mkv_imagesubs) are coerced to a real
     // true/false by loadDefaultValues (any out-of-set value becomes false), so a guard on them would be dead code. container is validated first (input #1) and
     // before the dstContainer parse below so an empty value fails cleanly rather than throwing a raw TypeError. Remaining checks run after all inputs parse.
     if (!inputs.container || inputs.container === '')
@@ -535,11 +534,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const fillLanguage = (inputs.language_fill ? inputs.language_fill.toLowerCase().trim() : '');
     const subLanguage = inputs.language_sub.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
     const audioLanguage = inputs.language_audio.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
-    const failLangsBlank = String(inputs.fail_langs_blank) === 'true';
+    const failBlankLangs = String(inputs.fail_blank_langs) === 'true';
     const removeAccessible = String(inputs.remove_accessibility || 'disabled').toLowerCase();
 
     // Value checks, in Inputs order (container already checked above). language_fill is format-checked and cross-checked against language_sub/language_audio; the
-    // remaining dropdowns are checked against their option set. language_audio/language_sub are free-text and fail_langs_blank/remove_comments/remove_busytitle/
+    // remaining dropdowns are checked against their option set. language_audio/language_sub are free-text and fail_blank_langs/remove_comments/remove_busytitle/
     // remove_mkv_imagesubs are boolean (loadDefaultValues-coerced), so none is validated here.
     if(fillLanguage && fillLanguage.length !== 3)
         failFile(`fillLanguage is not a 3 character ISO-639-2 language code. It should follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes`);
@@ -560,7 +559,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`Somehow invalid recover_bad_data option provided. Check your settings!`);
 
     // Subtitle codecs dropped purely by container/format - a stream in one of these is removed regardless of language, so it is never assigned language_fill
-    // (used by the fail_langs_blank untagged-count below and the subtitle loop). The fail_langs_blank pre-check itself runs after the shared helpers, below.
+    // (used by the fail_blank_langs untagged-count below and the subtitle loop). The fail_blank_langs pre-check itself runs after the shared helpers, below.
     // alwaysDropSubs: unmuxable by BOTH mkv and mp4 - eia_608/ttml (no muxer path either way) plus xsub and dvb_teletext, which have no Matroska CodecID so
     // the mkv muxer rejects them too (mkv has no generic subtitle passthrough). mp4OnlyDropSubs: muxes fine in mkv but the mp4 muxer can't carry it - the
     // image-based PGS/VobSub/DVB, plus arib_caption and hdmv_text_subtitle.
@@ -573,7 +572,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const imageSubCodecs = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle'];
     const imageSubDropped = (codec) => cleanMkvImageSubs && dstContainer === 'mkv' && imageSubCodecs.includes(codec);
     // A subtitle removed regardless of language - by container/format (subFormatDropped) or by remove_mkv_imagesubs (imageSubDropped). Neither is ever assigned
-    // language_fill, and neither counts as a survivor for the fail_langs_blank untagged tally or the remove_accessibility plain-track guard.
+    // language_fill, and neither counts as a survivor for the fail_blank_langs untagged tally or the remove_accessibility plain-track guard.
     const subDroppedAnyReason = (codec) => subFormatDropped(codec) || imageSubDropped(codec);
 
     //The channel labels we recognise/replace for tag_title - include 2.0 to allow us to overwrite that with stereo
@@ -675,26 +674,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .join(' ')
         .trim();
 
-    // fail_langs_blank pre-check: when language_fill is set and >1 stream of a type is untagged, they'd all be assigned the same language but may actually
-    // differ - abort so the user can tag them manually and requeue (fail_langs_blank=false instead lets processing continue, filling them in the loop below).
-    // Now placed after the shared helpers so it resolves language via resolveLang (ffprobe tag, then mediaInfo fallback): a language only mediaInfo supplies
-    // is never filled, so counting it "untagged" here would wrongly abort a file that would actually process fine.
-    if (fillLanguage && failLangsBlank) {
+    // fail_blank_langs pre-check: when >1 stream of a type is untagged, they can't be told apart by language - abort so the user can tag them manually and
+    // requeue (fail_blank_langs=false instead lets processing continue). This runs independently of language_fill: whether the blanks get filled to the same
+    // language (dedupe-collision risk) or stay "und" (an ambiguous, incomplete file), multiple untagged streams of a type are the problem worth failing on.
+    // Placed after the shared helpers so it resolves language via resolveLang (ffprobe tag, then mediaInfo fallback): a language only mediaInfo supplies is not
+    // treated as blank here, so counting it "untagged" would wrongly abort a file that would actually process fine. The language_fill assignment note is appended
+    // to the message only when language_fill is set.
+    if (failBlankLangs) {
         const streams = file.ffProbeData.streams || [];
         const isUntagged = (s) => { const lang = resolveLang(s); return !lang || lang === 'und'; };
+        const fillNote = fillLanguage ? ` and would all be assigned "${fillLanguage}" by language_fill` : '';
         const untaggedAudio = streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s)).length;
         if (untaggedAudio > 1)
-            failFile(`${untaggedAudio} audio streams have no language tag and would all be assigned "${fillLanguage}" by language_fill — they may be different languages. Tag them manually and requeue or set fail_langs_blank to false.`);
-        // Exclude subtitles that will be dropped by container/format anyway - they are never assigned
-        // language_fill, so counting them here would falsely abort a file that would otherwise process fine.
+            failFile(`${untaggedAudio} audio streams have no language tag${fillNote} — they may be different languages. Tag them manually and requeue or set fail_blank_langs to false.`);
+        // Exclude subtitles that will be dropped by container/format anyway - they never reach the output (and are never assigned language_fill), so counting
+        // them here would falsely abort a file that would otherwise process fine.
         const untaggedSubs = streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'subtitle'
             && !subDroppedAnyReason((s.codec_name || '').toLowerCase()) && isUntagged(s)).length;
         if (untaggedSubs > 1)
-            failFile(`${untaggedSubs} subtitle streams have no language tag and would all be assigned "${fillLanguage}" by language_fill — they may be different languages. Tag them manually and requeue or set fail_langs_blank to false.`);
+            failFile(`${untaggedSubs} subtitle streams have no language tag${fillNote} — they may be different languages. Tag them manually and requeue or set fail_blank_langs to false.`);
     }
 
     // remove_accessibility safety guard (clean_and_remux only)
-    // (subDroppedAnyReason/subtitle drop lists defined earlier, by fail_langs_blank.) A "plain" track carries no commentary/descriptive/SDH/lyrics role - a
+    // (subDroppedAnyReason/subtitle drop lists defined earlier, by fail_blank_langs.) A "plain" track carries no commentary/descriptive/SDH/lyrics role - a
     // genuine main audio or dialogue subtitle. remove_accessibility removes an accessibility track (SDH/CC subtitle, audio-description audio) only when its language
     // still has a plain track that SURVIVES the language, format, and remove_mkv_imagesubs filters, so we strip extras, never the last usable track.
     // resolveWorkLang mirrors the loop's language resolution.
