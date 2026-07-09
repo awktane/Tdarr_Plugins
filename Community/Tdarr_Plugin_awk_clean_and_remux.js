@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.8.1',
+    Version: '2.8.2',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -43,11 +43,12 @@ const details = () => ({
             tooltip: `Specify language tags here for the audio tracks you'd like to keep. If blank then no tracks will be removed.
                 \\nStreams with no language tag are treated as though they had language_fill as their language or "und" if language_fill isn't set
                 \\nThis list should include both two character and three character codes as this will successfully catch unusual values like en, eng, en-US, en_US, and en.US
-                \\nExample: 
+                \\nExample:\\n
                     en,eng,fr,fre,fra,und,mul,jpn,ja,zxx,mis
                     \\nEnglish, French, and Japanese (ISO-639-2 and ISO-639-1) (und = undefined, mul = multiple languages, zxx = no linguistic content, mis = missing language / no language code)
                 \\nExample:\\n
-                    en,eng,und`,
+                    en,eng,und
+                    \\nEnglish and both audio streams marked as und or with no language set.`,
         },
         {
             name: 'language_sub',
@@ -57,10 +58,12 @@ const details = () => ({
             tooltip: `Specify language tags here for the subtitle tracks you'd like to keep. If blank then no tracks will be removed.
                 \\nStreams with no language tag are treated as though they had language_fill as their language or "und" if language_fill isn't set
                 \\nThis list should include both two character and three character codes as this will successfully catch unusual values like en, eng, en-US, en_US, and en.US
-                \\nExample: English and French (ISO-639-2 and ISO-639-1) (und = undefined, mul = multiple languages, mis = unusual language)\\n
-                    en,eng,fr,fre,fra,und,mul,mis
                 \\nExample:\\n
-                    en,eng,und`,
+                    en,eng,fr,fre,fra,und,mul,mis
+                    \\nEnglish and French (ISO-639-2 and ISO-639-1) (und = undefined, mul = multiple languages, mis = unusual language)
+                \\nExample:\\n
+                    en,eng,und
+                    \\nEnglish and both subtitles marked as und or with no language set`,
         },
         {
             name: 'language_fill',
