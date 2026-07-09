@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.9.1',
+    Version: '2.10.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -189,20 +189,20 @@ const details = () => ({
                 \\nFalls back to default automatically for unusual layouts such as 2.1 and 3.0.`,
         },
         {
-            name: 'method_opus_layout_err',
+            name: 'method_layout_err',
             type: 'string',
             defaultValue: 'keep',
             inputUI: {
                 type: 'dropdown',
                 options: ['keep','drop','remix'],
             },
-            tooltip: `What to do when codec_surround is opus and a source track has a channel layout libopus cannot encode (e.g. 2.1, 4.0, 4.1, 6.0, 7.0, 7.1(wide)). Left unhandled, ffmpeg aborts the whole job on that track. Only the force-to-opus path is affected - the downmix options already emit opus-safe layouts, and a layout that just needs relabeling (5.0(side) -> 5.0, 6.1(back) -> 6.1) is ALWAYS relabeled losslessly regardless of this setting. AC3/EAC3/AAC accept every layout, so this only matters for opus.
+            tooltip: `What to do when a track can't be written in the target codec because of its channel layout. This happens only when codec_surround is opus and a track's layout is one libopus can't encode (e.g. 2.1, 4.0, 4.1, 6.0, 7.0, 7.1(wide)) - reached either because codec_force is sending that track to opus, or because method_loudnorm has to re-encode a kept track whose own codec ffmpeg can't encode (e.g. a DTS core) and it converges to codec_surround. Left unhandled, ffmpeg aborts the whole job on that track. A layout that just needs relabeling (5.0(side) -> 5.0, 6.1(back) -> 6.1) is ALWAYS relabeled losslessly regardless of this setting. AC3/EAC3/AAC accept every layout, so this only matters when codec_surround is opus.
                 \\n=====
                 \\nActions (only for a layout with no lossless relabel)
                 \\n=====
-                \\nIf keep  - the track is left in its source codec (not forced to opus). Safe default: nothing fails and no audio is lost.
-                \\nIf drop  - the track is removed entirely. The last remaining audio track is never dropped (falls back to keep).
-                \\nIf remix - the track is downmixed to a codec_stereo stereo. Defers to downmix_to_stereo / downmix_secondary_stereo when they already convert the track, and falls back to keep rather than create a duplicate stereo.`,
+                \\nIf keep  - the track is left in its source codec (not written as opus). Safe default: nothing fails and no audio is lost; a loudnorm-only run just leaves that one track un-normalized.
+                \\nIf drop  - the track is removed entirely. The last remaining audio track is never dropped (falls back to keep). A stereo/5.1 a downmix would derive from that track is still created.
+                \\nIf remix - the track is downmixed to a codec_stereo stereo (using method_stereo_downmix), with loudness applied when method_loudnorm is active. Defers to downmix_to_stereo / downmix_secondary_stereo when they already convert the track, and falls back to keep rather than create a duplicate stereo.`,
         },
         {
             name: 'guard_lossless',
@@ -855,7 +855,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const forceCodec = String(inputs.codec_force).trim();
     const removeDuplicatesBy = String(inputs.method_deduplicate).trim();
     const stereoDownmix = String(inputs.method_stereo_downmix).trim();
-    const methodOpusLayoutErr = String(inputs.method_opus_layout_err).trim();
+    const methodLayoutErr = String(inputs.method_layout_err).trim();
     const loudnorm = String(inputs.method_loudnorm).trim();
     const methodVerbose = String(inputs.method_verbose).trim();
     const guardQuality = String(inputs.guard_quality).trim();
@@ -878,8 +878,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`Somehow invalid removeDuplicatesBy option provided. Check your settings!`);
     if(!['default','dialogue'].includes(stereoDownmix))
         failFile(`Somehow invalid stereoDownmix option provided. Check your settings!`);
-    if(!['keep','drop','remix'].includes(methodOpusLayoutErr))
-        failFile(`Somehow invalid methodOpusLayoutErr option provided. Check your settings!`);
+    if(!['keep','drop','remix'].includes(methodLayoutErr))
+        failFile(`Somehow invalid methodLayoutErr option provided. Check your settings!`);
     if(!['disabled','tv','cinema','quiet_room'].includes(loudnorm))
         failFile(`Somehow invalid loudnorm option provided. Check your settings!`);
     if(!['enabled','disabled'].includes(methodVerbose))
@@ -1007,14 +1007,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return false;
         };
 
-        // Languages that already have a primary stereo track, so downmix_to_stereo can honour "create a 2 channel track only if one doesn't exist". Uses
-        // isTdarrCleanLang (normalised short code, e.g. 'en' for 'en-US') to match the same key used by created2chLangs and ffstreamLangKey — preventing
-        // redundant stereo creation when the existing track is tagged with a regional variant like en-US.
-        const existingStereoLangs = new Set(audioStreams.filter(s => s.channels === 2 && !s.isTdarrSecondaryTrack && !s.isTdarrLangSecondary).map(s => s.isTdarrCleanLang));
-
-        // Languages that already have a primary 5.1/6ch track, so downmix_to_six can honour "create a 5.1 track only if one doesn't exist". Mirrors
-        // existingStereoLangs. Channels > 4 && <= 6 covers 5.0 and 5.1 without catching 4.0/4.1 or 7.1 sources.
-        const existingSixLangs = new Set(audioStreams.filter(s => s.channels > 4 && s.channels <= 6 && !s.isTdarrSecondaryTrack && !s.isTdarrLangSecondary).map(s => s.isTdarrCleanLang));
+        // existingStereoLangs / existingSixLangs (languages that already have a primary stereo / 5.1-6ch track, so downmix_to_* only creates one when a
+        // language lacks it) are computed AFTER dedup and the layout-drop pre-pass below, off the surviving (not-in-streamsToRemove) streams - so a track
+        // those two removals take can't leave a stale "already exists" entry that wrongly suppresses a downmix backfill.
 
         // Identify lower-quality duplicates. Within each group keep only the highest quality stream; the rest are marked for removal ('multi-stereo'/'channel')
         // or, for the "-error" variants, abort the plugin immediately (no streams removed, no other changes applied). The "-error" suffix only changes what
@@ -1042,12 +1037,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // from the codec's per-channel target), so it must not win the "which duplicate to keep" decision over a track whose bitrate we actually measured. Both
             // probes are already consulted (resolveStreamBitrate above), so bit_rate === 0 here means genuinely unknown, not just "ffprobe couldn't read it".
             const hasKnownRate = (s) => Number(s.bit_rate || 0) > 0;
+            // A lossless track's score is a codec fact (a fixed codecInfo.score), not the optimistic estimate audioQuality gives a bitrate-less LOSSY codec -
+            // so it's trustworthy for ranking even with no reported bitrate. Group known-rate OR lossless tracks above estimate-only (bitrate-less lossy) ones,
+            // so a lossless master whose bitrate neither probe reports is never sorted below a lossy duplicate and picked for removal (a silent-master-loss bug
+            // when guard_lossless is disabled). hasKnownRate still gates the rate DISPLAY below (a lossless track with no bitrate simply shows no "@ N kb/s").
+            const trustedRate = (s) => hasKnownRate(s) || s.isTdarrLossless;
             // On a quality tie, keep the higher channel count before falling back to index, so multi-stereo dedup collapsing a language's surround variants keeps
             // the 7.1 over a same-quality 5.1 (channel mode already tiers by exact count, so this only bites the broad modes). When channels also tie, prefer an
             // object-audio (Atmos/DTS:X) track over an otherwise-equal plain one so dedup keeps the copy with the object layer (the codecInfo score bump usually
             // separates them before this fires; the tie-break only matters when their scores land exactly equal).
             const byQuality = [...audioStreams].sort((a, b) =>
-                (hasKnownRate(b) ? 1 : 0) - (hasKnownRate(a) ? 1 : 0) || b.isTdarrQuality - a.isTdarrQuality || b.channels - a.channels
+                (trustedRate(b) ? 1 : 0) - (trustedRate(a) ? 1 : 0) || b.isTdarrQuality - a.isTdarrQuality || b.channels - a.channels
                 || (b.isTdarrObjectAudio ? 1 : 0) - (a.isTdarrObjectAudio ? 1 : 0) || a.index - b.index);
             for (const s of byQuality) {
                 let tier;
@@ -1102,11 +1102,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Audio streams still present (not in streamsToRemove), read at call time so it reflects dedup + pre-pass removals - backs the never-drop-last-track guard.
         const countSurvivingAudio = () => file.ffProbeData.streams.filter(a => (a?.codec_type || '').toLowerCase() === 'audio' && !streamsToRemove.has(a.index)).length;
 
-        // method_opus_layout_err=drop must remove streams BEFORE outputAudioIdxMap / the -map removal are built below - a mid-loop removal
+        // A source the layout-drop pre-pass removes may have been the SOLE source a downmix would have derived a track from - dropping it must not
+        // silently lose that derivative. Each such dropped source is recorded here and its stereo/5.1 derivative is created after the main loop, but
+        // only when the language didn't otherwise get one (so a redundant dropped source adds nothing). See the post-loop derivative pass below.
+        const layoutDroppedDeriveSources = [];
+
+        // method_layout_err=drop must remove streams BEFORE outputAudioIdxMap / the -map removal are built below - a mid-loop removal
         // would break the OTHER forced tracks' -c:a:N numbering. Pre-scan for a surround track codec_force would send to opus with a
         // libopus-incompatible layout that NO downmix will convert to stereo, and remove it (never the last audio track). keep/remix stay in
-        // the loop; this mirrors the loop's surround shouldForce for exactly the drop subset.
-        if (methodOpusLayoutErr === 'drop' && forceCodec !== 'false' && surroundCodec === 'opus') {
+        // the loop; this mirrors the loop's surround shouldForce for exactly the drop subset. (The loudnorm-only convergence-to-opus path
+        // can't drop here - it only knows a track needs re-encoding after measuring, past this point - so there 'drop' falls back to 'keep'.)
+        if (methodLayoutErr === 'drop' && forceCodec !== 'false' && surroundCodec === 'opus') {
             for (const s of audioStreams) {
                 if (streamsToRemove.has(s.index)) continue;
                 const ch = resolveChannels(s);
@@ -1122,14 +1128,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // Must NOT gate this on guardBlocks: a guarded replace flips to 'add', which keeps the source — dropping it here would delete it before that add runs
                 // (a data-loss regression). primary: downmix_to_stereo=replace (any >2ch) or downmix_to_six=replace (>6ch → 5.1); secondary: downmix_secondary_stereo.
                 // The per-language one-shot (created2chLangs/six) is dynamic and can't be predicted here; a pre-empted downmix lands the track in the loop keep fallback.
-                const secondary = s.isTdarrSecondaryTrack || s.isTdarrLangSecondary;
+                 const secondary = s.isTdarrSecondaryTrack || s.isTdarrLangSecondary;
                 if (secondary ? downmixSecondaryStereo === 'true'
                               : (downmixToTwo === 'replace' || (ch > 6 && downmixToSix === 'replace'))) continue;
                 if (countSurvivingAudio() <= 1) continue;                                    // never drop the last audio track
                 streamsToRemove.add(s.index);
-                workDone += `☒Stream ${s.index}: Dropping - libopus can't encode a ${s.channel_layout || `${ch}ch`} layout (method_opus_layout_err=drop).\n`;   // this IS a change (removal) - always shown
+                workDone += `☒Stream ${s.index}: Dropping - libopus can't encode a ${s.channel_layout || `${ch}ch`} layout (method_layout_err=drop).\n`;   // this IS a change (removal) - always shown
+                // Remember a dropped source a downmix (add/'true' mode) would derive from, so its stereo/5.1 still gets created even though the source
+                // itself is gone (see the post-loop pass below). 'replace' modes already deferred above (they convert the source in place), so only the
+                // 'true'/add cases reach here. Secondary tracks are handled by downmix_secondary_stereo in place, never derived, so they're excluded.
+                if (!secondary && (downmixToTwo !== 'false' || (ch > 6 && downmixToSix !== 'false')))
+                    layoutDroppedDeriveSources.push(s);
             }
         }
+
+        // Now that dedup + the layout-drop pre-pass have finalised streamsToRemove, snapshot which languages still have a primary stereo / 5.1-6ch track
+        // among the SURVIVORS, so downmix_to_stereo/downmix_to_six only create one for a language that genuinely lacks it (a removed track can't leave a
+        // stale entry). isTdarrCleanLang (normalised short code, e.g. 'en' for 'en-US') matches created2chLangs/ffstreamLangKey. Channels 2 = stereo;
+        // >4 && <=6 = 5.0/5.1 without catching 4.0/4.1 or 7.1.
+        const survivingPrimaryAudio = audioStreams.filter(s => !streamsToRemove.has(s.index) && !s.isTdarrSecondaryTrack && !s.isTdarrLangSecondary);
+        const existingStereoLangs = new Set(survivingPrimaryAudio.filter(s => s.channels === 2).map(s => s.isTdarrCleanLang));
+        const existingSixLangs = new Set(survivingPrimaryAudio.filter(s => s.channels > 4 && s.channels <= 6).map(s => s.isTdarrCleanLang));
 
         // inputAudioIdxMap: 0-based audio-type index within the INPUT file (for -map 0:a:N).
         // outputAudioIdxMap: 0-based audio-type index within the OUTPUT (for -c:a:N and -metadata:s:a:N).
@@ -1617,7 +1636,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         // guard_lossless/guard_quality/guard_object_audio: forcing this codec would irreversibly lose detail the target can't hold (lossless source, or quality tier scores it lower). Leave it.
                         verboseDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodecFamily} - would lose detail vs ${codecDisplayName(ffstream)} ${forceChannels}ch @ ${srcRateStr} (guard_lossless=${guardLossless}, guard_quality=${guardQuality}, guard_object_audio=${guardObjectAudio}); left as ${ffstreamCodec}.\n`;
                     } else if (shouldForce) {
-                        // Guard the force-to-opus path against libopus-incompatible layouts (method_opus_layout_err). Only opus is affected - AC3/EAC3/AAC
+                        // Guard the force-to-opus path against libopus-incompatible layouts (method_layout_err). Only opus is affected - AC3/EAC3/AAC
                         // take any layout. `forced` gates the run's convert flag so a keep/defer makes no change (and doesn't cause a needless re-run).
                         const srcLayout = (ffstream.channel_layout || '').toLowerCase().trim();
                         const opusBad = targetCodec === 'opus' && forceChannels > 2 && !opusAcceptsLayout(forceChannels, srcLayout);
@@ -1626,21 +1645,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         // remix→stereo defers when a stereo already exists for this language - pre-existing (existingStereoLangs) OR created earlier this run
                         // by a downmix or a prior remix (created2chLangs). A second one would be a same-language duplicate stereo that dedup only collapses on
                         // the NEXT run (non-idempotent), or persists if dedup is disabled. Fall back to keep.
-                        const remixDefer = opusBad && !relabel && methodOpusLayoutErr === 'remix'
+                        const remixDefer = opusBad && !relabel && methodLayoutErr === 'remix'
                             && (existingStereoLangs.has(ffstreamLangKey) || created2chLangs.has(ffstreamLangKey));
                         let forced = false;
 
-                        if (opusBad && !relabel && (methodOpusLayoutErr === 'keep' || methodOpusLayoutErr === 'drop' || remixDefer)) {
+                        if (opusBad && !relabel && (methodLayoutErr === 'keep' || methodLayoutErr === 'drop' || remixDefer)) {
                             // No lossless relabel exists (relabelable layouts fall through to the transcode branch below in every mode). keep; a remix that
                             // deferred to an existing stereo; or a drop the pre-pass couldn't apply - leave the source codec. Real drops already happened in the
                             // pre-pass (before the index map); a drop reaches here only when the pre-pass couldn't remove it: the last audio track, or a downmix
                             // it expected to convert this track was pre-empted (per-language slot already filled). Report the actual reason, not a fixed one.
                             let why;
                             if (remixDefer) why = ' (a stereo already exists for this language)';
-                            else if (methodOpusLayoutErr === 'drop') why = countSurvivingAudio() <= 1 ? ' (kept - it is the last audio track)' : ' (kept - no downmix converted it to an opus-safe layout)';
-                            else why = ', enable a downmix option or set method_opus_layout_err to drop/remix';
+                            else if (methodLayoutErr === 'drop') why = countSurvivingAudio() <= 1 ? ' (kept - it is the last audio track)' : ' (kept - no downmix converted it to an opus-safe layout)';
+                            else why = ', enable a downmix option or set method_layout_err to drop/remix';
                             verboseDone += `☒Stream ${ffstream.index}: Not forcing opus - libopus can't encode a ${layoutName} layout; left as ${ffstreamCodec}${why}.\n`;
-                        } else if (opusBad && methodOpusLayoutErr === 'remix' && !relabel) {
+                        } else if (opusBad && methodLayoutErr === 'remix' && !relabel) {
                             // remix→stereo: downmix in place to a codec_stereo track (NOT opus) so it stays stereo-codec-consistent and idempotent (a stereo
                             // opus would be re-forced to codec_stereo next run). Mirrors downmix_secondary_stereo; the 2ch table target (surround source
                             // bitrate isn't a comparable floor).
@@ -1707,6 +1726,62 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
+        // ===== LAYOUT-DROP DOWNMIX DERIVATIVES =====
+        // A source the layout-drop pre-pass removed (un-writable opus surround, method_layout_err=drop) may have been the sole source its language's
+        // downmix would have derived from. The source is correctly gone, but the derivative the user configured must still be created - from the ORIGINAL
+        // input stream via -map 0:a:N, appended like any downmix add. Only create it when the language didn't otherwise get one this run (created*Langs)
+        // or already have one among survivors (existing*Langs), so a redundant dropped source produces nothing. Mirrors the downmix add branches (title,
+        // codec, loudnorm via stereoArg / the 5.1 filter). These new tracks are opus-safe (stereo -> codec_stereo; a -ac 6 downmix yields a 5.1 layout).
+        for (const s of layoutDroppedDeriveSources) {
+            const lang = s.isTdarrCleanLang;
+            const srcAudioIdx = inputAudioIdxMap.get(s.index);
+            if (srcAudioIdx === undefined) continue;
+            const streamLang = resolveLang(s);
+            const srcBitrate = Number(s.bit_rate || 0);
+            const srcRateStr = srcBitrate > 0 ? `${Math.round(srcBitrate / 1000)} kb/s` : 'unknown bitrate';
+            const srcCodec = (s.codec_name || 'unknown').trim().toLowerCase();
+            // 5.1 derivative from a >6ch source (downmix_to_six), when the language still lacks one.
+            if (s.channels > 6 && downmixToSix !== 'false' && !created6chLangs.has(lang) && !existingSixLangs.has(lang)) {
+                const newTitle = escMeta(buildTitle(s, '5.1'));
+                const dstBitArg = encoderArgsIdx(surroundCodec, 6, newStreamOutputIdx);
+                const dstBitStr = resolveBitrate(surroundCodec, 6);
+                let sixFilter = ` -ac:a:${newStreamOutputIdx} 6`;
+                if (loudnorm !== 'disabled') {
+                    const { filter } = buildLoudnormFilter(s.index, srcAudioIdx, 'aformat=channel_layouts=5.1', LOUDNORM_PRESETS[loudnorm]);
+                    sixFilter = ` -filter:a:${newStreamOutputIdx} "${filter}"`;
+                }
+                workDone += `☐Stream ${s.index}: Adding ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s from ${srcCodec} ${s.channels}ch @ ${srcRateStr} (source dropped - libopus can't encode its layout)\n`;
+                extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${surroundCodec}${dstBitArg}${sixFilter} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
+                appendedAudio.push({ srcStream: s, codec: surroundCodec, channels: 6, bps: dstBitStr });
+                newStreamOutputIdx++;
+                created6chLangs.add(lang);
+                convert = true;
+            }
+            // Stereo derivative (downmix_to_stereo), when the language still lacks one.
+            if (downmixToTwo !== 'false' && !created2chLangs.has(lang) && !existingStereoLangs.has(lang)) {
+                const newTitle = escMeta(buildTitle(s, '2.0'));
+                if (stereoCodec === 'aac_vbr') {
+                    const { encoder, args, approxRate } = aacVbrArgsIdx(newStreamOutputIdx);
+                    workDone += `☐Stream ${s.index}: Adding aac stereo @ ${approxRate} (libfdk VBR q5) from ${srcCodec} ${s.channels}ch @ ${srcRateStr} (source dropped - libopus can't encode its layout)\n`;
+                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${encoder}${args}${stereoArg(newStreamOutputIdx, s)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                    if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
+                    appendedAudio.push({ srcStream: s, codec: 'aac', channels: 2, bps: 0, approxRate });
+                } else {
+                    const dstBitArg = encoderArgsIdx(stereoCodec, 2, newStreamOutputIdx);
+                    const dstBitStr = resolveBitrate(stereoCodec, 2);
+                    workDone += `☐Stream ${s.index}: Adding ${stereoCodec} stereo @ ${dstBitStr / 1000} kb/s from ${srcCodec} ${s.channels}ch @ ${srcRateStr} (source dropped - libopus can't encode its layout)\n`;
+                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${stereoCodec}${dstBitArg}${stereoArg(newStreamOutputIdx, s)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                    if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
+                    appendedAudio.push({ srcStream: s, codec: stereoCodec, channels: 2, bps: dstBitStr });
+                }
+                newStreamOutputIdx++;
+                created2chLangs.add(lang);
+                convert = true;
+            }
+        }
+        // ===== END LAYOUT-DROP DOWNMIX DERIVATIVES =====
+
         // ===== LOUDNORM: untouched tracks =====
         // Tracks none of the 12 sites above touched at all (the common case - already the right codec/channels, nothing else needed). Runs over
         // EVERY kept audio stream directly (not workStreams/candidateStreams, which exist for codec_force/downmix_secondary_stereo's own narrower
@@ -1739,7 +1814,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     verboseDone += `☒Stream ${stream.index}: Skipping loudnorm - ${rawCodec} ${channels}ch exceeds the ${maxCh}ch limit for ${targetFamily}.\n`;
                     continue;
                 }
-                if (guardBlocks(stream, targetFamily, channels, channels)) {
+                if (guardBlocks(stream, targetCodec, channels, channels)) {
                     verboseDone += `☒Stream ${stream.index}: Not normalizing - would lose detail vs ${codecDisplayName(stream)} ${channels}ch (guard_lossless=${guardLossless}, guard_quality=${guardQuality}, guard_object_audio=${guardObjectAudio}); left as ${rawCodec}.\n`;
                     continue;
                 }
@@ -1750,8 +1825,47 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // no tag at all) falls through to a fresh measurement below.
                 if (loudnormTagMatchesPreset(stream)) continue;
 
+                // Converging a non-opus source to opus (rawCodec isn't opus-encodable, so targetCodec fell through to codec_surround=opus): if libopus
+                // can't encode this track's layout, a bare -c:a opus would abort the whole ffmpeg job. Relabel losslessly when possible (chained before
+                // loudnorm); otherwise defer to method_layout_err. 'remix' downmixes to codec_stereo (+ loudnorm) in place; 'keep' - and 'drop', which
+                // can't remove a track once the audio index maps are built (the codec_force path drops such a track in the pre-pass) - leave it in its
+                // source codec, un-normalized. AC3/EAC3/AAC accept every layout, so this only fires when codec_surround is opus.
+                let loudnormRelabel = '';
+                if (targetFamily === 'opus' && channels > 2 && rawCodec !== 'opus') {
+                    const lay = (stream.channel_layout || '').toLowerCase().trim();
+                    if (!opusAcceptsLayout(channels, lay)) {
+                        const relabel = OPUS_RELABEL[lay];
+                        if (relabel) {
+                            loudnormRelabel = `channelmap=map=${relabel.map}:channel_layout=${relabel.layout}`;   // lossless relabel to an opus-safe layout, chained ahead of loudnorm
+                        } else if (methodLayoutErr === 'remix') {
+                            const newTitle = escMeta(buildTitle(stream, '2.0'));
+                            const sLang = resolveLang(stream);
+                            if (stereoCodec === 'aac_vbr') {
+                                const { encoder, args, approxRate } = aacVbrArgsIdx(outputAudioIdx);
+                                workDone += `☐Stream ${stream.index}: Normalizing ${rawCodec} ${channels}ch (loudnorm=${loudnorm}) → aac stereo @ ${approxRate} (libfdk VBR; remixed - libopus can't encode a ${lay || `${channels}ch`} layout)\n`;
+                                extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${stereoArg(outputAudioIdx, stream)}${loudnormStampArg(outputAudioIdx)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                                if (sLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(sLang)}"`;
+                                outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: 2, bps: 0, approxRate });
+                            } else {
+                                const dstBitArg = encoderArgsIdx(stereoCodec, 2, outputAudioIdx);
+                                const dstBitStr = resolveBitrate(stereoCodec, 2);
+                                workDone += `☐Stream ${stream.index}: Normalizing ${rawCodec} ${channels}ch (loudnorm=${loudnorm}) → ${stereoCodec} stereo @ ${dstBitStr / 1000} kb/s (remixed - libopus can't encode a ${lay || `${channels}ch`} layout)\n`;
+                                extraArguments += ` -c:a:${outputAudioIdx} ${stereoCodec}${dstBitArg}${stereoArg(outputAudioIdx, stream)}${loudnormStampArg(outputAudioIdx)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                                if (sLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(sLang)}"`;
+                                outputAudioOverride.set(outputAudioIdx, { codec: stereoCodec, channels: 2, bps: dstBitStr });
+                            }
+                            modifiedAudioIdx.add(outputAudioIdx);
+                            convert = true;
+                            continue;
+                        } else {
+                            verboseDone += `☒Stream ${stream.index}: Not normalizing - libopus can't encode a ${lay || `${channels}ch`} layout; left as ${rawCodec} (method_layout_err=${methodLayoutErr}).\n`;
+                            continue;
+                        }
+                    }
+                }
+
                 const srcBitrate = Number(stream.bit_rate || 0);
-                const { filter, changed } = buildLoudnormFilter(stream.index, srcAudioIdx, '', preset);
+                const { filter, changed } = buildLoudnormFilter(stream.index, srcAudioIdx, loudnormRelabel, preset);
                 if (!changed) {
                     // Already within tolerance. On a tag-persisting container, stamp it (a metadata-only remux) so a FUTURE run
                     // can skip re-measuring while the preset stays the same. On a container that would drop the tag, do NOTHING

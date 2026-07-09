@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '2.9.0',
+    Version: '2.10.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -20,7 +20,7 @@ const details = () => ({
             tooltip: `Which audio track sorts first (this key sits above every other audio key).
                 \\nlanguage (default): normal ordering - order_language decides, and the first sorted track becomes the sole default.
                 \\noriginal: promote the original-language track (ffmpeg 'original' disposition, or an 'original' title) above language, so a foreign film keeps its original audio first (and default) instead of a dub. Falls back to language ordering when no track is flagged original.
-                \\ndefault: promote the track already flagged default (ffmpeg 'default' disposition) above language, so the source's chosen default audio stays first. Falls back to language ordering when no track is flagged default.
+                \\ndefault: promote the track already flagged default (ffmpeg 'default' disposition) above language, so the source's chosen default audio stays first. If several tracks are flagged default (e.g. a source track and a downmix that inherited the flag), the highest-priority one by the normal ordering leads and becomes the sole default. Falls back to language ordering when no track is flagged default.
                 \\ndescriptive: promote the descriptive (audio-description) track above language. Falls back to language ordering when no descriptive track is present. Note: the first sorted track becomes the sole default, so this makes the description the default audio.`,
         },
         {
@@ -72,8 +72,9 @@ const details = () => ({
                 \\nExample:\\n
                     ascending: 2.0,5.1
                 \\ndescending <=6 / <=8 cap the surround: any track above the cap (<=6 = up to 5.1, <=8 = up to 7.1) is demoted to the END, so a client whose
-                ceiling is that layout auto-picks the best track it can play (e.g. the 5.1) rather than a 22.2/7.1 it must down-convert. Within the demoted tail
-                the largest lands last. The cap only applies to descending - ascending already puts the smallest first, so over-cap tracks are naturally last.
+                ceiling is that layout auto-picks the best track it can play (e.g. the 5.1) rather than a 22.2/7.1 it must down-convert. The demoted tail stays in
+                the requested descending order (largest first) - the cap only shifts which serveable track leads, it never re-sorts the tail. If order_quality also
+                caps, a track over EITHER cap is demoted. The cap only applies to descending - ascending already puts the smallest first.
                 \\nSet to disabled to skip channel ordering entirely. If both order_channel and order_quality are disabled, audio is not reordered by channels or quality (language/role/order_codec still apply).`
         },
         {
@@ -89,9 +90,10 @@ const details = () => ({
                     descending: 640k,128k
                 \\nExample:\\n
                     ascending: 128k,640k
-                \\ndescending <=1024k caps by bitrate: tracks above 1024k (lossless-scale TrueHD/DTS-HD MA) are demoted to the END so the client's auto-pick leads
-                with a manageable track it can serve without a heavy transcode, not the huge one. Within the demoted tail the largest lands last. Ordering within
-                the kept group is still by the quality score; the cap only applies to descending (ascending already puts the smallest first).
+                \\ndescending <=1024k caps by bitrate: tracks above 1024k (lossless-scale TrueHD/DTS-HD MA, including a lossless track whose bitrate is unknown) are
+                demoted to the END so the client's auto-pick leads with a manageable track it can serve without a heavy transcode, not the huge one. The demoted tail
+                stays in the requested descending order; ordering within each group is by the quality score. If order_channel also caps, a track over EITHER cap is
+                demoted. The cap only applies to descending (ascending already puts the smallest first).
                 \\nSet to disabled to skip quality ordering entirely. If both order_channel and order_quality are disabled, audio is not reordered by channels or quality (language/role/order_codec still apply).`
         },
     ],
@@ -558,23 +560,46 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (m) return { enabled: true, dir: 'descending', cap: Number(m[1]) * (m[2] === 'k' ? 1000 : 1) };
             return { enabled: true, dir: mode === 'ascending' ? 'ascending' : 'descending', cap: Infinity };
         };
-        // Ordered comparison with an optional cap. dir='ascending' -> plain ascending by the sort value (cap ignored). Otherwise descending, but any stream whose
-        // CAP value exceeds `cap` is demoted below every at/under-cap stream; within the over-cap tail it sorts ascending by the sort value so the largest lands
-        // last. cap=Infinity -> plain descending. For channels the sort value IS the cap value; for quality the sort value is the audioquality score and the cap
-        // value is the raw bitrate.
-        const orderedCompare = (aSort, bSort, aCapVal, bCapVal, dir, cap) => {
-            if (dir === 'ascending') return aSort - bSort;
-            const aOver = aCapVal > cap, bOver = bCapVal > cap;
-            if (aOver !== bOver) return aOver ? 1 : -1;
-            return aOver ? aSort - bSort : bSort - aSort;
-        };
         const channelOrder = parseOrderMode(inputs.order_channel);
         const qualityOrder = parseOrderMode(inputs.order_quality);
+        // Union-of-caps demotion: a track over EITHER the channel cap OR the quality cap is demoted below every under-all-caps track, so the fully-serveable
+        // track leads - e.g. a 5.1 that's under the <=6 channel cap but over the <=1024k quality cap is still demoted, not kept above a stereo. A finite cap
+        // exists only in a 'descending <=N' mode (plain descending/ascending/disabled don't cap -> Infinity). Channel caps by channel count; quality by capBitrate.
+        const chanCap = (channelOrder.enabled && channelOrder.dir === 'descending') ? channelOrder.cap : Infinity;
+        const qualCap = (qualityOrder.enabled && qualityOrder.dir === 'descending') ? qualityOrder.cap : Infinity;
+        const overCap = (s) => s.channels > chanCap || s.capBitrate > qualCap;
 
         const getLangRank = (lang, shortlang) => {
             let idx = preferredLanguages.indexOf(lang);
             if (idx === -1) idx = preferredLanguages.indexOf(shortlang);
             return idx === -1 ? 999 : idx;
+        };
+
+        // Audio ordering below first_audio, shared by the sort AND the winning-default pre-pass (#7): language -> role -> order_codec -> the union cap partition
+        // (over EITHER cap -> tail) -> channel (direction) -> quality (direction). Returns 0 when every key ties. The cap ONLY partitions; within each partition
+        // channel/quality keep their requested direction, so a 'descending <=N' list stays fully descending - the cap just shifts which serveable track leads.
+        const audioKeyCompare = (a, b) => {
+            const aRank = getLangRank(a.lang, a.shortlang);
+            const bRank = getLangRank(b.lang, b.shortlang);
+            if (aRank !== bRank) return aRank - bRank;
+            //A commentary stream could be descriptive but it would still be a commentary
+            const aRole = a.commentary ? 2 : (a.descriptive ? 1 : 0);
+            const bRole = b.commentary ? 2 : (b.descriptive ? 1 : 0);
+            if (aRole !== bRole) return aRole - bRole;
+            //order_codec tier — preferred codecs form one group above the rest; this only promotes the group, each still ordered by channel/quality below.
+            if (codecFirstList.length > 0 && a.codecmatch !== b.codecmatch) return a.codecmatch ? -1 : 1;
+            //Union cap partition: an over-EITHER-cap track is demoted to the tail. The tail and the lead group each keep the channel/quality direction below.
+            if (chanCap < Infinity || qualCap < Infinity) {
+                const aOver = overCap(a), bOver = overCap(b);
+                if (aOver !== bOver) return aOver ? 1 : -1;
+            }
+            //Channel (skipped when disabled): the cap already partitioned above, so this is a plain direction sort by channel count.
+            if (channelOrder.enabled && a.channels !== b.channels)
+                return channelOrder.dir === 'ascending' ? a.channels - b.channels : b.channels - a.channels;
+            //Quality (skipped when disabled): orders by the audioquality score in the requested direction.
+            if (qualityOrder.enabled && a.audioquality !== b.audioquality)
+                return qualityOrder.dir === 'ascending' ? a.audioquality - b.audioquality : b.audioquality - a.audioquality;
+            return 0;
         };
 
         const streams = [];
@@ -599,8 +624,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 shortlang: streamLangShort,
                 channels: enrichedStream.channels || 0,
                 // Resolved bitrate in bps (shared resolveStreamBitrate fallback, via enrichStream). order_quality sorts by the audioquality score but CAPS by
-                // raw bitrate ('descending <=1024k'), so the cap threshold needs the actual bitrate, not the score. 0 when unknown -> treated as under-cap.
+                // raw bitrate ('descending <=1024k'), so the cap threshold needs the actual bitrate, not the score.
                 bitrate: enrichedStream.bit_rate || 0,
+                // Bitrate the order_quality cap compares against: a LOSSLESS track whose bitrate neither probe reports (0) is still a heavy, hard-to-serve
+                // track, so it must count as OVER any bitrate cap (Infinity), never under it. A non-lossless bitrate-0 track (e.g. a freshly-transcoded aac) is
+                // genuinely small and stays 0 = under-cap. Only the '<=Nk' cap reads this; plain descending/ascending ignore it.
+                capBitrate: (streamType === 'audio' && !(enrichedStream.bit_rate > 0) && codecInfo[canon]?.lossless === true) ? Infinity : (enrichedStream.bit_rate || 0),
                 forced: ffstream?.disposition?.forced === 1,
                 // Only score audio: scoring video/subtitle/data would spam bogus "unknown codec"/"invalid bitrate" notices, and quality is only used to sort audio.
                 audioquality: streamType === 'audio' ? audioQuality(enrichedStream) : 0,
@@ -620,6 +649,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             });
         }
 
+        // #7 (first_audio='default'): only ONE audio track can remain default (the normalisation below marks the first sorted audio the sole default). So promote
+        // the SINGLE default track that WINS the normal ordering, not every default flag - then the emitted order already matches the post-normalisation state and
+        // is a fixpoint. Promoting every default would lead with a lower-priority default on pass 1, then re-sort it once its default is stripped (a wasteful extra
+        // reorder remux before it settles). undefined when no track is flagged default, so first_audio='default' then falls through to normal ordering. Identity-compared below.
+        const winningDefault = audioFirst === 'default'
+            ? [...streams.filter(s => s.type === 'audio' && s.default)].sort((a, b) => audioKeyCompare(a, b) || a.index - b.index)[0]
+            : undefined;
+
         //Sort the streams
         streams.sort((a, b) => {
             //Stream Type
@@ -635,46 +672,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     return a.coverArt ? 1 : -1;
             //Audio
             } else if(a.type === 'audio') {
-                //first_audio promotes one track above every audio key (including language). Only one value is active, so at most one clause fires;
-                //each is a no-op when no track carries that flag, falling through to normal language ordering.
-                //original: keeps a foreign film's original audio first (and default), not a dub. default: keeps the source's flagged-default audio first.
+                //first_audio promotes ONE track above every audio key (including language). Only one value is active, so at most one clause fires; each is a no-op
+                //when no track qualifies, falling through to the normal ordering. original: keeps a foreign film's original audio first (and default), not a dub.
+                //default: keeps the source's flagged-default audio first - promoting only the WINNING default (winningDefault) so the result is idempotent.
                 //descriptive: lifts the audio-description track first (and, via normalisation, makes it the default).
                 if (audioFirst === 'original' && a.original !== b.original)
                     return a.original ? -1 : 1;
-                if (audioFirst === 'default' && a.default !== b.default)
-                    return a.default ? -1 : 1;
+                if (audioFirst === 'default') {
+                    const aWin = a === winningDefault, bWin = b === winningDefault;
+                    if (aWin !== bWin) return aWin ? -1 : 1;
+                }
                 if (audioFirst === 'descriptive' && a.descriptive !== b.descriptive)
                     return a.descriptive ? -1 : 1;
 
-                //Language priority first. A track in a non-preferred language should not sort above one in a preferred language.
-                const aRank = getLangRank(a.lang, a.shortlang);
-                const bRank = getLangRank(b.lang, b.shortlang);
-                if (aRank !== bRank)
-                    return aRank - bRank;
-
-                //A commentary stream could be descriptive but it would still be a commentary
-                const aRole = a.commentary ? 2 : (a.descriptive ? 1 : 0);
-                const bRole = b.commentary ? 2 : (b.descriptive ? 1 : 0);
-                if (aRole !== bRole)
-                    return aRole - bRole;
-
-                //order_codec tier — preferred codecs form one group above the rest, each still ordered by channel/quality below; this only promotes the group.
-                if (codecFirstList.length > 0 && (a.codecmatch !== b.codecmatch))
-                    return a.codecmatch ? -1 : 1;
-
-                //Channel ordering (skipped when disabled). A 'descending <=N' mode caps by channel count: over-cap tracks are demoted to the tail (largest last),
-                //so a client capped at that layout auto-picks the best it can play. Sort value == cap value here (both a.channels).
-                if (channelOrder.enabled) {
-                    const c = orderedCompare(a.channels, b.channels, a.channels, b.channels, channelOrder.dir, channelOrder.cap);
-                    if (c !== 0) return c;
-                }
-
-                //Quality (skipped when disabled). A 'descending <=1024k' mode caps by BITRATE (a.bitrate) while still ordering by the audioquality score, so
-                //lossless-scale tracks are demoted below the ones a client can serve without a heavy transcode.
-                if (qualityOrder.enabled) {
-                    const c = orderedCompare(a.audioquality, b.audioquality, a.bitrate, b.bitrate, qualityOrder.dir, qualityOrder.cap);
-                    if (c !== 0) return c;
-                }
+                //Language, role, order_codec, the union cap partition, then channel + quality — all in audioKeyCompare (shared with the winning-default pre-pass).
+                const c = audioKeyCompare(a, b);
+                if (c !== 0) return c;
             //Subtitles
             } else if (a.type === 'subtitle') {
                 //Forced always first
