@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.8.0',
+    Version: '2.8.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -676,23 +676,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .join(' ')
         .trim();
 
-    // language_fill_fail pre-check: when >1 stream of a type is untagged, they can't be told apart by language - abort so the user can tag them manually and
-    // requeue (language_fill_fail=false instead lets processing continue). This runs independently of language_fill: whether the blanks get filled to the same
-    // language (dedupe-collision risk) or stay "und" (an ambiguous, incomplete file), multiple untagged streams of a type are the problem worth failing on.
+    // language_fill_fail pre-check: when >1 untagged stream of a type WILL REACH THE OUTPUT, they can't be told apart by language - abort so the user can tag them
+    // manually and requeue (language_fill_fail=false instead lets processing continue). Whether the blanks get filled to the same language (a downstream dedupe-
+    // collision risk) or stay "und" (an ambiguous, incomplete file), multiple untagged streams of a type are the problem worth failing on - BUT only counting the
+    // ones that survive the language filter. An untagged track the language filter would drop never reaches a later plugin, so it carries no ambiguity risk;
+    // counting it would spuriously quarantine a file that processes fine (and disagree with the remove_accessibility survivor guard below, which excludes them).
     // Placed after the shared helpers so it resolves language via resolveLang (ffprobe tag, then mediaInfo fallback): a language only mediaInfo supplies is not
-    // treated as blank here, so counting it "untagged" would wrongly abort a file that would actually process fine. The language_fill assignment note is appended
-    // to the message only when language_fill is set.
+    // treated as blank here. The language_fill assignment note is appended to the message only when language_fill is set.
     if (failBlankLangs) {
         const streams = file.ffProbeData.streams || [];
         const isUntagged = (s) => { const lang = resolveLang(s); return !lang || lang === 'und'; };
         const fillNote = fillLanguage ? ` and would all be assigned "${fillLanguage}" by language_fill` : '';
-        const untaggedAudio = streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s)).length;
+        // Every untagged track shares the same post-fill language (language_fill if set, else "und"), so "does it survive the language filter" is one check per
+        // type: kept when the language list is empty (keep-all) or contains that language. Mirrors the main loop's own keep/drop decision.
+        const untaggedWorkLang = fillLanguage || 'und';
+        const keptByLangFilter = (langs) => langs.length === 0 || langs.includes(untaggedWorkLang) || langs.includes(shortLang(untaggedWorkLang));
+        const untaggedAudio = keptByLangFilter(audioLanguage)
+            ? streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s)).length : 0;
         if (untaggedAudio > 1)
             failFile(`${untaggedAudio} audio streams have no language tag${fillNote} — they may be different languages. Tag them manually and requeue or set language_fill_fail to false.`);
-        // Exclude subtitles that will be dropped by container/format anyway - they never reach the output (and are never assigned language_fill), so counting
-        // them here would falsely abort a file that would otherwise process fine.
-        const untaggedSubs = streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'subtitle'
-            && !subDroppedAnyReason((s.codec_name || '').toLowerCase()) && isUntagged(s)).length;
+        // Also exclude subtitles the container/format drops (subDroppedAnyReason) - like the language-dropped ones above, they never reach the output.
+        const untaggedSubs = keptByLangFilter(subLanguage)
+            ? streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'subtitle'
+                && !subDroppedAnyReason((s.codec_name || '').toLowerCase()) && isUntagged(s)).length : 0;
         if (untaggedSubs > 1)
             failFile(`${untaggedSubs} subtitle streams have no language tag${fillNote} — they may be different languages. Tag them manually and requeue or set language_fill_fail to false.`);
     }
