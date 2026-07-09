@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '2.10.0',
+    Version: '2.10.1',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -754,7 +754,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         response.processFile = true;
         response.reQueueAfter = true;
-        response.preset = `,${ffmpegMap} -c copy${dispositionArgs}${globalOutputOpt}`;
+        // mp4/mov muxers drop a custom GLOBAL metadata tag (e.g. clean_and_remux's awk_recovered, set upstream) on a -c copy remux unless told to keep it,
+        // which would re-trigger recovery on the next pass. Preserve it on the mov family.
+        const mp4KeepTags = ['mp4', 'mov', 'm4v', 'm4a'].includes(String(file.container).toLowerCase()) ? ' -movflags use_metadata_tags' : '';
+        response.preset = `,${ffmpegMap} -c copy${dispositionArgs}${globalOutputOpt}${mp4KeepTags}`;
         if (dispositionArgs !== '')
             response.infoLog += '☐Set the first audio track as the sole default.\n';
         response.infoLog += `☑Expected results: ${streams.map(s => summariseStream(s.stream)).join('')}\n`;

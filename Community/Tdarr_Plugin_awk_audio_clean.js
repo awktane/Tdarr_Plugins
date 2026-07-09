@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.10.0',
+    Version: '2.10.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1951,7 +1951,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // a downmix_to_stereo track created from a default-flagged surround source also carries the default flag - two tracks marked default. This is
             // acceptable: the tracks are near-identical content at different channel counts and most players handle multiple default flags without issue.
             // Removing or reassigning the default flag is a separate concern outside this plugin's scope.
-            response.preset += `,-map 0 -c copy${extraArguments}${globalOutputOpt}`;
+            // mp4/mov muxers drop a custom GLOBAL metadata tag (e.g. clean_and_remux's awk_recovered, set upstream) on a -c copy remux unless told to keep it,
+            // which would re-trigger recovery on the next pass. Preserve it. (Per-stream custom tags like awk_loudnorm are NOT rescued by this flag - verified
+            // against the real mov muxer - which is why loudnorm caches on Matroska only; see loudnormTagPersists.)
+            const mp4KeepTags = ['mp4', 'mov', 'm4v', 'm4a'].includes(String(file.container).toLowerCase()) ? ' -movflags use_metadata_tags' : '';
+            response.preset += `,-map 0 -c copy${extraArguments}${globalOutputOpt}${mp4KeepTags}`;
             // workDone (what changed) always shows, matching pre-method_verbose behavior exactly. verboseDone (why something DIDN'T change - guard
             // blocks, ceiling/missing-data skips) is the part method_verbose gates - the diagnostic negative-space, not the status of real changes.
             response.infoLog += workDone;
