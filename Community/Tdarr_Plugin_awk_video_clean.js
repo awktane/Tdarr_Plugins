@@ -234,7 +234,7 @@ const details = () => ({
                      -Preserves static HDR10/HLG colour metadata; leaves Dolby Vision / HDR10+ files untouched by default (dynamic metadata can't survive a re-encode).\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '1.0.1',
+    Version: '1.1.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -261,18 +261,6 @@ const details = () => ({
             tooltip: `Cap the output resolution by height (only ever downscales, never upscales). The quality tier is re-derived for the new height.
                 \\noriginal: keep the source resolution.
                 \\n1080: downscale anything taller than 1080p to 1080p (the classic "shrink 4K to 1080p to save space"). 720 / 480 likewise. 2160 / 1440 cap only larger sources.`,
-        },
-        {
-            name: 'container',
-            type: 'string',
-            defaultValue: 'original',
-            inputUI: {
-                type: 'dropdown',
-                options: ['original', 'mkv', 'mp4'],
-            },
-            tooltip: `Output container.
-                \\noriginal: keep the source container (recommended - container policy is clean_and_remux's job).
-                \\nmkv / mp4: force the container. For HEVC in mp4 the plugin adds -tag:v hvc1 so Apple/QuickTime plays it.`,
         },
         {
             name: 'quality_sd',
@@ -710,7 +698,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // only type:'string' dropdowns get an option guard (booleans are coerced by loadDefaultValues, so a guard is dead code).
     const codec = String(inputs.codec || 'hevc').toLowerCase().trim();
     const maxHeightOpt = String(inputs.max_height || 'original').toLowerCase().trim();
-    const containerOpt = String(inputs.container || 'original').toLowerCase().trim();
     const speed = String(inputs.speed || 'medium').toLowerCase().trim();
     const bitDepthOpt = String(inputs.bit_depth || 'source').toLowerCase().trim();
     const encoderOpt = String(inputs.encoder || 'auto').toLowerCase().trim();
@@ -735,7 +722,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     if (!['hevc', 'h264', 'av1'].includes(codec)) failFile('Somehow invalid codec option provided. Check your settings!');
     if (!['original', '2160', '1440', '1080', '720', '480'].includes(maxHeightOpt)) failFile('Somehow invalid max_height option provided. Check your settings!');
-    if (!['original', 'mkv', 'mp4'].includes(containerOpt)) failFile('Somehow invalid container option provided. Check your settings!');
     if (!['slow', 'medium', 'fast'].includes(speed)) failFile('Somehow invalid speed option provided. Check your settings!');
     if (!['source', '8', '10'].includes(bitDepthOpt)) failFile('Somehow invalid bit_depth option provided. Check your settings!');
     if (!['auto', 'nvenc', 'qsv', 'vaapi', 'videotoolbox', 'amf', 'cpu'].includes(encoderOpt)) failFile('Somehow invalid encoder option provided. Check your settings!');
@@ -765,8 +751,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const srcHeight = Number(primary.height || mi?.Height || 0);
         const srcCodecName = (primary.codec_name || '').toLowerCase().trim();
         const targetCodecName = codec;   // 'hevc' | 'h264' | 'av1' match the ffprobe codec_name
-        const srcContainer = String(file.container || '').toLowerCase().trim();
-        const dstContainer = containerOpt === 'original' ? srcContainer : containerOpt;
+        // Output container is always the source container - clean_and_remux owns container policy; this plugin only re-encodes video (and tags hvc1 for HEVC-in-mp4 below).
+        const dstContainer = String(file.container || '').toLowerCase().trim();
         response.container = `.${dstContainer}`;
 
         // Bit depth: source-detected (raw sample depth, or a 10-bit pixel format / profile), overridable. H.264 is always 8-bit.
