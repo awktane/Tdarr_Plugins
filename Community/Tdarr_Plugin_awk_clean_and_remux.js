@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.9.0',
+    Version: '2.10.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -33,7 +33,7 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\nmkv removes eia_608, ttml, xsub, dvb_teletext, and any other subtitle format the mkv muxer can't carry. mov_text is converted to srt for compatibility.
-                \\nmp4 additionally removes the image-based subtitles mkv keeps (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle), plus arib_caption and hdmv_text_subtitle. Text-based subtitles (subrip, srt, ass, ssa, webvtt, text) are converted to mov_text. Genpts may be required to fix timestamps.`,
+                \\nmp4 additionally removes the image-based subtitles mkv keeps (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle), plus arib_caption and hdmv_text_subtitle. Text-based subtitles (subrip, srt, ass, ssa, webvtt, text) are converted to mov_text. Genpts may be required to fix timestamps. HEVC video is tagged hvc1 so Apple/QuickTime can play it.`,
         },
         {
             name: 'language_audio',
@@ -1013,6 +1013,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     videoStreamIndex--;
                     continue;
                 }            
+
+                // HEVC in mp4 must carry the hvc1 fourcc or Apple/QuickTime won't decode it - a plain remux writes hev1. Tag the retained HEVC video stream
+                // when the output is mp4 and it isn't already hvc1: this converges after one heal (an already-hvc1 file is a no-op, never a perpetual remux).
+                if (dstContainer === 'mp4' && ffstreamCodec === 'hevc' && (ffstream.codec_tag_string || '').toLowerCase() !== 'hvc1') {
+                    workDone += `☐Tag stream ${i} (video) as hvc1 - HEVC-in-mp4 needs the hvc1 fourcc for Apple/QuickTime playback\n`;
+                    extraArguments += ` -tag:v:${videoStreamIndex} hvc1`;
+                    convert = true;
+                }
 
                 if(metaCommentRemove === true && (ffstream.tags?.comment || ffmedia?.Comment)) {
                     workDone += `☐Remove comment from stream ${i} (video) "${logSafe(ffstream.tags?.comment ?? ffmedia?.Comment ?? '')}"\n`;
