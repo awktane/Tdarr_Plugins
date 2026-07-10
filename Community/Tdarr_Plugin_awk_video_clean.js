@@ -234,7 +234,7 @@ const details = () => ({
                      -Preserves static HDR10/HLG colour metadata; leaves Dolby Vision / HDR10+ files untouched by default (dynamic metadata can't survive a re-encode).\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '1.0.0',
+    Version: '1.0.1',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -277,7 +277,7 @@ const details = () => ({
         {
             name: 'quality_sd',
             type: 'string',
-            defaultValue: '23',
+            defaultValue: '21',
             inputUI: { type: 'text' },
             tooltip: `Constant-quality target for SD output (height <= 576). HEVC-CRF scale: lower = higher quality / bigger file, higher = smaller. Typical range 18-28.
                 \\nThis number is used as-is for HEVC and H.264, and shifted onto the AV1 scale automatically. It maps to each encoder's native quality flag (libx265 -crf, NVENC -cq, QSV -global_quality, VAAPI -qp, ...).`,
@@ -292,14 +292,14 @@ const details = () => ({
         {
             name: 'quality_1080p',
             type: 'string',
-            defaultValue: '21',
+            defaultValue: '23',
             inputUI: { type: 'text' },
             tooltip: `Constant-quality target for 1080p output (height 721-1080). HEVC-CRF scale, lower = better. See quality_sd.`,
         },
         {
             name: 'quality_4k',
             type: 'string',
-            defaultValue: '22',
+            defaultValue: '25',
             inputUI: { type: 'text' },
             tooltip: `Constant-quality target for UHD output (height > 1080, i.e. 1440p/4K). HEVC-CRF scale, lower = better. See quality_sd.`,
         },
