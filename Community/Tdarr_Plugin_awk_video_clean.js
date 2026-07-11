@@ -234,7 +234,7 @@ const details = () => ({
                      -Preserves static HDR10/HLG colour metadata; leaves Dolby Vision / HDR10+ files untouched by default (dynamic metadata can't survive a re-encode).\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '1.1.0',
+    Version: '1.2.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -294,7 +294,7 @@ const details = () => ({
         {
             name: 'speed',
             type: 'string',
-            defaultValue: 'medium',
+            defaultValue: 'slow',
             inputUI: {
                 type: 'dropdown',
                 options: ['slow', 'medium', 'fast'],
