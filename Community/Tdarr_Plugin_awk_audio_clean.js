@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.11.0',
+    Version: '2.12.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -18,6 +18,7 @@ const details = () => ({
             tooltip: `Specify language tags here for the audio tracks you'd like to transcode. If blank then all tracks will be considered. Tracks in languages not listed will not be considered for the downmix_to_six, downmix_to_stereo options, nor guard_lossless/guard_quality/guard_object_audio.
                 \\nStreams with no language tag are treated as though their language is "und". A track whose language is not in this list is treated as secondary - excluded from the primary downmix paths (downmix_to_six/downmix_to_stereo), never protected by guard_lossless/guard_quality/guard_object_audio, and instead handled by downmix_secondary_stereo.
                 \\nException: if the file has NO genuine (non-commentary, non-descriptive) track in a listed language, the language filter goes dormant and every genuine track is treated as primary - so a foreign-language-only file (e.g. Japanese-only when the list is English) keeps its surround instead of being downmixed. Commentary and descriptive tracks are always secondary regardless of language.
+                \\nException: guard_original, when enabled, keeps an 'original'-disposition track (a foreign film's original-language audio) primary even in an unlisted language - so it is protected as if its language were listed. See guard_original.
                 \\nThis list should include both two character and three character codes as this will successfully catch values like en, eng, en-US, en_US, and en.US.
                 \\nTracks with these languages will follow downmix_to_six, downmix_to_stereo, and codec_force
                 \\nExample:\\n
@@ -178,7 +179,7 @@ const details = () => ({
             defaultValue: 'dialogue',
             inputUI: {
                 type: 'dropdown',
-                options: ['default','dialogue'],
+                options: ['dialogue','default'],
             },
             tooltip: `Method used when creating stereo (2.0) tracks from surround sources.
                 \\n=====
@@ -276,6 +277,31 @@ const details = () => ({
                 \\n=====
                 \\nIf enabled  - (Default) Protect object-audio tracks from every operation above.
                 \\nIf disabled - No object-audio-specific protection; the other two guards (if enabled) still evaluate every operation on their own terms.`,
+        },
+        {
+            name: 'guard_original',
+            type: 'string',
+            defaultValue: 'disabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['disabled','enabled'],
+            },
+            tooltip: `Protect a foreign film's ORIGINAL-language track from being downmixed away just because its language isn't in downmix_language. A track
+                carrying the ffmpeg 'original' disposition (or an "original" title) whose language is NOT listed is normally demoted to secondary - excluded
+                from the primary downmix paths and downmixed in place by downmix_secondary_stereo, protected by none of the guards. When enabled, such a track
+                is instead treated exactly as if its language WERE in downmix_language - the same level of protection a listed language gets, no more. In
+                practice guard_quality (whose channel-drop rule flips a downmix 'replace' to 'add') keeps the surround, downmix_secondary_stereo no longer
+                downmixes it in place, and guard_lossless/guard_object_audio apply normally.
+                \\nOnly affects an 'original' track in an UNLISTED language while a listed-language primary is also present (e.g. a Japanese 5.1 original beside
+                an English dub with downmix_language=eng); an original already in a listed language, or a foreign-only file whose language filter is dormant, is
+                already primary and unchanged. The track must be identifiable as original (the 'original' flag or an "original" title) - an untagged foreign
+                track has no signal to key off. Commentary/descriptive tracks are unaffected: this clears only the language demotion, never the role demotion.
+                See downmix_language.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nIf enabled  - Treat an unlisted-language original track as a listed-language primary (keeps its surround under the default guards).
+                \\nIf disabled - (Default) The original track follows normal unlisted-language handling - it may be downmixed like any other secondary track.`,
         },
         {
             name: 'method_verbose',
@@ -865,6 +891,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const guardQuality = String(inputs.guard_quality).trim();
     const guardLossless = String(inputs.guard_lossless).trim();
     const guardObjectAudio = String(inputs.guard_object_audio).trim();
+    const guardOriginal = String(inputs.guard_original).trim();
 
     if(!['false','replace','true'].includes(downmixToSix))
         failFile(`Somehow invalid downmixToSix option provided. Check your settings!`);
@@ -894,6 +921,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`Somehow invalid guardLossless option provided. Check your settings!`);
     if(!['enabled','disabled'].includes(guardObjectAudio))
         failFile(`Somehow invalid guardObjectAudio option provided. Check your settings!`);
+    if(!['enabled','disabled'].includes(guardOriginal))
+        failFile(`Somehow invalid guardOriginal option provided. Check your settings!`);
 
     let extraArguments = '';
     let workDone = '';       // "this changed" lines (transcode/add/remix/normalize/remove) - always shown, matching pre-method_verbose behavior.
@@ -943,8 +972,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 isTdarrSecondaryTrack: isSecondaryTrack(item),
                 // Language-secondary: track language is not in downmixLanguage AND a listed-language primary exists (hasPreferredPrimary). These follow the
                 // secondary path (downmix_secondary_stereo, codec_force) but are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo).
-                // When no listed-language primary is present the filter is dormant, so this stays false and the track is treated as primary.
-                isTdarrLangSecondary: hasPreferredPrimary && !downmixLanguage.includes(cleanLang),
+                // When no listed-language primary is present the filter is dormant, so this stays false and the track is treated as primary. guard_original
+                // exempts an 'original'-disposition track: it stays primary in an unlisted language, getting the same protection a listed language would (see guard_original).
+                isTdarrLangSecondary: hasPreferredPrimary && !downmixLanguage.includes(cleanLang)
+                    && !(guardOriginal === 'enabled' && hasDisposition(item, 'original')),
                 isTdarrCleanLang: cleanLang,
                 isTdarrFullLang: fullLang,
                 isTdarrQuality: audioQuality(enrichedItem),
