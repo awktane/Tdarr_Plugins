@@ -1,226 +1,4 @@
 /* eslint no-plusplus: ["error", { "allowForLoopAfterthoughts": true }] */
-
-const os = require('os');
-const fs = require('fs');
-const childProcess = require('child_process');
-
-// ====== ENCODER CAPABILITY + SELECTION (module level so the per-worker cache persists across files) ======
-// A Tdarr plugin's inputs are set once per LIBRARY and shipped identically to every node/worker, so a video
-// encoder can't be a stored setting on a mixed Mac/PC/Linux + dGPU/iGPU/none fleet - it must be resolved at
-// runtime, per node. We do that with a CAPABILITY QUERY (not a trial-encode ladder): ask ffmpeg what the build
-// supports, intersect with a cheap zero-encode hardware-presence check, and only fall back to a single confirming
-// probe for the genuinely-ambiguous cases (Windows QSV/AMF where nothing cheap proves the GPU exists, and any AV1
-// hardware encode where -encoders + presence can't prove the GPU is new enough - Arc / RTX-40xx / RDNA3).
-
-// Priority order of hardware families to try per OS (best/most-common first). CPU is always the final fallback.
-const HW_FAMILIES = {
-    darwin: ['videotoolbox'],
-    win32: ['nvenc', 'qsv', 'amf'],
-    linux: ['nvenc', 'qsv', 'vaapi', 'amf'],
-};
-// ffmpeg encoder name per (target codec, family). null = that family has no encoder for that codec (e.g. no AV1 videotoolbox).
-const ENCODER_NAME = {
-    hevc: { nvenc: 'hevc_nvenc', qsv: 'hevc_qsv', vaapi: 'hevc_vaapi', videotoolbox: 'hevc_videotoolbox', amf: 'hevc_amf', cpu: 'libx265' },
-    h264: { nvenc: 'h264_nvenc', qsv: 'h264_qsv', vaapi: 'h264_vaapi', videotoolbox: 'h264_videotoolbox', amf: 'h264_amf', cpu: 'libx264' },
-    av1: { nvenc: 'av1_nvenc', qsv: 'av1_qsv', vaapi: 'av1_vaapi', videotoolbox: null, amf: 'av1_amf', cpu: 'libsvtav1' },
-};
-
-// Query the ffmpeg build's encoder list + hardware presence, once per (ffmpegPath) per worker process. The build's
-// capabilities and the node's GPU don't change within a worker's life, so this whole probe runs once, not per file.
-const _capCache = new Map();
-const queryCapabilities = (ffmpegPath) => {
-    const key = ffmpegPath || 'ffmpeg';
-    if (_capCache.has(key)) return _capCache.get(key);
-    const cap = { encoders: new Set(), nvidia: false, dri: false };
-    try {
-        const r = childProcess.spawnSync(key, ['-hide_banner', '-encoders'], { encoding: 'utf8', timeout: 20000 });
-        for (const line of String(r.stdout || '').split('\n')) {
-            const m = line.match(/^\s*[A-Z.]{6}\s+([A-Za-z0-9_]+)/);   // " V....D hevc_nvenc  NVIDIA NVENC hevc encoder"
-            if (m) cap.encoders.add(m[1]);
-        }
-    } catch (e) { /* leave encoders empty -> everything falls back to CPU */ }
-    try {
-        const r = childProcess.spawnSync('nvidia-smi', ['--query-gpu=name', '--format=csv,noheader'], { encoding: 'utf8', timeout: 8000 });
-        cap.nvidia = r.status === 0 && String(r.stdout || '').trim().length > 0;
-    } catch (e) { /* nvidia-smi absent -> no NVIDIA GPU */ }
-    try { cap.dri = fs.existsSync('/dev/dri/renderD128'); } catch (e) { cap.dri = false; }
-    _capCache.set(key, cap);
-    return cap;
-};
-
-// Single lightweight confirming probe (one 256x256 frame) of ONE candidate encoder - used only for the ambiguous
-// families/cases, never as a blind per-codec ladder. Cached per (ffmpegPath+encoderName) so it fires at most once.
-const _confirmCache = new Map();
-const confirmEncode = (ffmpegPath, encoderName, inputSide, filter) => {
-    const key = `${ffmpegPath || 'ffmpeg'}|${encoderName}`;
-    if (_confirmCache.has(key)) return _confirmCache.get(key);
-    let ok = false;
-    try {
-        const args = ['-hide_banner'];
-        if (inputSide) args.push(...inputSide.split(' ').filter(Boolean));
-        args.push('-f', 'lavfi', '-i', 'color=c=black:s=256x256:d=1:r=5');
-        if (filter) args.push('-vf', filter);
-        args.push('-frames:v', '1', '-c:v', encoderName, '-f', 'null', '-');
-        const r = childProcess.spawnSync(ffmpegPath || 'ffmpeg', args, { encoding: 'utf8', timeout: 25000 });
-        ok = r.status === 0;
-    } catch (e) { ok = false; }
-    _confirmCache.set(key, ok);
-    return ok;
-};
-
-// Cheap zero-encode presence verdict for a family on this platform: 'yes' (usable), 'no' (definitely not), or
-// 'probe' (can't tell cheaply - confirm with one encode). videotoolbox = Mac only; nvenc = nvidia-smi; vaapi/qsv
-// on Linux = /dev/dri; QSV on Windows and AMF anywhere have no cheap signal, so they need the confirm probe.
-const presenceOf = (family, cap, platform) => {
-    switch (family) {
-        case 'cpu': return 'yes';
-        case 'videotoolbox': return platform === 'darwin' ? 'yes' : 'no';
-        case 'nvenc': return cap.nvidia ? 'yes' : 'no';
-        case 'vaapi': return cap.dri ? 'yes' : 'no';
-        case 'qsv': return platform === 'linux' ? (cap.dri ? 'yes' : 'no') : 'probe';
-        case 'amf': return 'probe';
-        default: return 'no';
-    }
-};
-
-// Resolve the encoder for THIS node. Returns { family, encoderName, notes:[infoLog lines] }. Honors an explicit
-// encoder input (force on this node, CPU fallback if unavailable) or 'auto' (best available). Tests may inject a
-// capability object + platform/workerType via otherArguments.__awkCap to avoid any real ffmpeg/nvidia-smi spawn.
-const selectEncoder = ({ codec, encoderOpt, otherArguments }) => {
-    const inj = otherArguments && otherArguments.__awkCap;
-    const platform = (inj && inj.platform) || os.platform();
-    const workerType = String((otherArguments && otherArguments.workerType) || '').toLowerCase();
-    const isGpuWorker = workerType.includes('gpu');
-    const ffmpegPath = (otherArguments && otherArguments.ffmpegPath) || 'ffmpeg';
-    const cap = inj
-        ? { encoders: new Set(inj.encoders || []), nvidia: !!inj.nvidia, dri: !!inj.dri }
-        : queryCapabilities(ffmpegPath);
-    const confirm = (encoderName, inputSide, filter) => (inj
-        ? !!(inj.confirm && inj.confirm[encoderName])
-        : confirmEncode(ffmpegPath, encoderName, inputSide, filter));
-    const notes = [];
-    const cpuChoice = () => ({ family: 'cpu', encoderName: ENCODER_NAME[codec].cpu, notes });
-
-    // Candidate families: an explicit pick is tried first (then CPU); 'auto' tries the platform's HW list only on a
-    // GPU worker (CPU workers stay on software so slow encodes don't land on the GPU), then CPU.
-    let families;
-    if (encoderOpt !== 'auto') {
-        families = [encoderOpt, 'cpu'];
-    } else if (isGpuWorker) {
-        families = [...(HW_FAMILIES[platform] || []), 'cpu'];
-    } else {
-        families = ['cpu'];
-    }
-
-    for (const family of families) {
-        if (family === 'cpu') break;   // reached the fallback
-        const encoderName = ENCODER_NAME[codec][family];
-        if (!encoderName) {   // e.g. AV1 has no videotoolbox encoder
-            if (encoderOpt === family) notes.push(`☒${family} has no ${codec} encoder; using ${ENCODER_NAME[codec].cpu}.\n`);
-            continue;
-        }
-        if (!cap.encoders.has(encoderName)) {   // ffmpeg build doesn't ship it (e.g. no nvenc in the Mac build)
-            if (encoderOpt === family) notes.push(`☒${encoderName} is not in this ffmpeg build on this node; using ${ENCODER_NAME[codec].cpu}.\n`);
-            continue;
-        }
-        const presence = presenceOf(family, cap, platform);
-        if (presence === 'no') {
-            if (encoderOpt === family) notes.push(`☒${family} hardware not detected on this node; using ${ENCODER_NAME[codec].cpu}.\n`);
-            continue;
-        }
-        // Confirm with one probe when presence is ambiguous, and always for AV1 hardware (generation can't be inferred).
-        const needProbe = presence === 'probe' || codec === 'av1';
-        if (needProbe) {
-            const probeIn = family === 'vaapi' ? '-vaapi_device /dev/dri/renderD128' : '';
-            const probeFilter = family === 'vaapi' ? 'format=nv12,hwupload' : '';
-            if (!confirm(encoderName, probeIn, probeFilter)) {
-                if (encoderOpt === family) notes.push(`☒${encoderName} did not initialise on this node; using ${ENCODER_NAME[codec].cpu}.\n`);
-                continue;
-            }
-        }
-        notes.push(`☐Encoder: ${encoderName} (${encoderOpt === 'auto' ? 'auto' : 'forced'}, ${platform}${isGpuWorker ? ' gpu-worker' : ''}).\n`);
-        return { family, encoderName, notes };
-    }
-
-    if (encoderOpt === 'auto' && !isGpuWorker) notes.push(`☐Encoder: ${ENCODER_NAME[codec].cpu} (auto, CPU worker).\n`);
-    else if (encoderOpt === 'auto') notes.push(`☐Encoder: ${ENCODER_NAME[codec].cpu} (auto, no usable GPU encoder on this node).\n`);
-    return cpuChoice();
-};
-
-// ====== PER-ENCODER QUALITY / SPEED / PIXEL-FORMAT TRANSLATION ======
-// One normalized quality target (HEVC-CRF scale, lower = better) mapped to each encoder's native flag so the same
-// setting yields comparable quality on every node. H.264 uses the same number; AV1 is shifted onto the SVT-AV1 /
-// AV1 CQ scale (+8, clamped 0-63) since the same visual quality sits at a higher number there. HW flag syntax
-// mirrors the proven community plugins (Migz nvenc -cq:v, Boosh qsv -global_quality, vaapi -qp, amf -qp_i/-qp_p).
-const nativeQuality = (codec, family, qNorm) => {
-    let q = Math.round(qNorm);
-    if (codec === 'av1') q = Math.max(0, Math.min(63, q + 8));
-    switch (family) {
-        case 'cpu': return `-crf ${q}`;                                   // libx264 / libx265 / libsvtav1 all take -crf
-        case 'nvenc': return `-rc:v vbr -cq:v ${q} -b:v 0`;               // constant-quality NVENC (VBR envelope off)
-        case 'qsv': return `-global_quality ${q}`;                        // QSV ICQ
-        case 'vaapi': return `-rc_mode CQP -qp ${q}`;                     // VAAPI constant-QP
-        case 'amf': return `-rc cqp -qp_i ${q} -qp_p ${q} -qp_b ${q}`;    // AMF constant-QP
-        case 'videotoolbox': return `-q:v ${Math.max(1, Math.min(100, Math.round(118 - q * 2.6)))}`; // VT quality 1-100, higher = better
-        default: return `-crf ${q}`;
-    }
-};
-// Normalized speed -> each family's native knob. libsvtav1's -preset is numeric (0-13); the x26x pair is named;
-// nvenc uses p1-p7; qsv named; vaapi/videotoolbox have no comparable preset (omitted). Slower = better/smaller.
-const nativeSpeed = (codec, family, speed) => {
-    if (family === 'cpu') {
-        if (codec === 'av1') return `-preset ${{ slow: '4', medium: '6', fast: '8' }[speed]}`;
-        return `-preset ${{ slow: 'slow', medium: 'medium', fast: 'fast' }[speed]}`;
-    }
-    if (family === 'nvenc') return `-preset ${{ slow: 'p7', medium: 'p5', fast: 'p3' }[speed]}`;
-    if (family === 'qsv') return `-preset ${{ slow: 'veryslow', medium: 'medium', fast: 'veryfast' }[speed]}`;
-    if (family === 'amf') return `-quality ${{ slow: 'quality', medium: 'balanced', fast: 'speed' }[speed]}`;
-    return '';   // vaapi / videotoolbox: no equivalent preset knob
-};
-
-// Build the video-encode arguments for the chosen encoder: decode-side (input) flags + the output -c:v block
-// (encoder, quality, speed, pixel format, optional scale filter, hvc1 tag). Source colour metadata (incl. static
-// HDR10/HLG) is carried through automatically by ffmpeg - no explicit colour flags needed (verified empirically).
-// Decode is kept on software frames (nvenc via the shared nvdecPreset helper) so a single CPU scale filter and
-// -pix_fmt path work uniformly across families; VAAPI is the exception - it needs its frames uploaded, so it
-// carries an explicit device + format,hwupload filter. Returns { inputSide, videoOut }.
-const buildVideoArgs = ({ family, encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file }) => {
-    const { getNvdecHwaccelPreset, getNvenc10BitFormatArg } = require('../methods/nvdecPreset');
-    const q = nativeQuality(codec, family, qNorm);
-    const spd = nativeSpeed(codec, family, speed);
-    let inputSide = '';
-    const parts = [`-c:v ${encoderName}`, q, spd];
-    const vf = [];
-    const scale = (fmt) => { if (willDownscale) vf.push(`scale=-2:${outHeight}`); if (fmt) vf.push(fmt); };
-
-    if (family === 'nvenc') {
-        inputSide = getNvdecHwaccelPreset(file, { softwareFrames: true });   // '-hwaccel cuda' (system-memory frames) or '' for software decode
-        scale();
-        parts.push(wantTenbit ? getNvenc10BitFormatArg(file, { softwareFrames: true }).trim() : '-pix_fmt yuv420p');
-    } else if (family === 'qsv') {
-        scale();
-        if (wantTenbit) parts.push('-pix_fmt p010le', '-profile:v main10'); else parts.push('-pix_fmt nv12');
-    } else if (family === 'vaapi') {
-        inputSide = '-vaapi_device /dev/dri/renderD128';
-        scale(`format=${wantTenbit ? 'p010' : 'nv12'}`);
-        vf.push('hwupload');
-    } else if (family === 'amf') {
-        scale();
-        parts.push(wantTenbit ? '-pix_fmt p010le' : '-pix_fmt yuv420p');
-    } else if (family === 'videotoolbox') {
-        scale();
-        parts.push(wantTenbit ? '-pix_fmt p010le' : '-pix_fmt yuv420p');
-        if (wantTenbit && codec === 'hevc') parts.push('-profile:v main10');
-    } else {   // cpu
-        scale();
-        parts.push(`-pix_fmt ${wantTenbit ? 'yuv420p10le' : 'yuv420p'}`);
-    }
-
-    if (codec === 'hevc' && ['mp4', 'm4v', 'mov'].includes(dstContainer)) parts.push('-tag:v hvc1');   // Apple/QuickTime HEVC-in-mp4 playback
-    const vfArg = vf.length ? ` -vf "${vf.join(',')}"` : '';
-    return { inputSide, videoOut: `${parts.filter(Boolean).join(' ')}${vfArg}` };
-};
-
 const details = () => ({
     id: 'Tdarr_Plugin_awk_video_clean',
     Stage: 'Pre-processing',
@@ -234,7 +12,7 @@ const details = () => ({
                      -Preserves static HDR10/HLG colour metadata; leaves Dolby Vision / HDR10+ files untouched by default (dynamic metadata can't survive a re-encode).\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '1.2.0',
+    Version: '1.2.1',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -685,6 +463,221 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .replace(/\\/g, '/')               // backslash → forward-slash (inert, readable)
         .replace(/"/g, "'");               // double-quote → single-quote (safe inside the quoted value)
     // ===== END SHARED: ffmpeg metadata escaping =====
+
+    const os = require('os');
+    const fs = require('fs');
+    const childProcess = require('child_process');
+
+    // ====== ENCODER CAPABILITY + SELECTION ======
+    // A Tdarr plugin's inputs are set once per LIBRARY and shipped identically to every node/worker, so a video
+    // encoder can't be a stored setting on a mixed Mac/PC/Linux + dGPU/iGPU/none fleet - it must be resolved at
+    // runtime, per node. We do that with a CAPABILITY QUERY (not a trial-encode ladder): ask ffmpeg what the build
+    // supports, intersect with a cheap zero-encode hardware-presence check, and only fall back to a single confirming
+    // probe for the genuinely-ambiguous cases (Windows QSV/AMF where nothing cheap proves the GPU exists, and any AV1
+    // hardware encode where -encoders + presence can't prove the GPU is new enough - Arc / RTX-40xx / RDNA3).
+
+    // Priority order of hardware families to try per OS (best/most-common first). CPU is always the final fallback.
+    const HW_FAMILIES = {
+        darwin: ['videotoolbox'],
+        win32: ['nvenc', 'qsv', 'amf'],
+        linux: ['nvenc', 'qsv', 'vaapi', 'amf'],
+    };
+    // ffmpeg encoder name per (target codec, family). null = that family has no encoder for that codec (e.g. no AV1 videotoolbox).
+    const ENCODER_NAME = {
+        hevc: { nvenc: 'hevc_nvenc', qsv: 'hevc_qsv', vaapi: 'hevc_vaapi', videotoolbox: 'hevc_videotoolbox', amf: 'hevc_amf', cpu: 'libx265' },
+        h264: { nvenc: 'h264_nvenc', qsv: 'h264_qsv', vaapi: 'h264_vaapi', videotoolbox: 'h264_videotoolbox', amf: 'h264_amf', cpu: 'libx264' },
+        av1: { nvenc: 'av1_nvenc', qsv: 'av1_qsv', vaapi: 'av1_vaapi', videotoolbox: null, amf: 'av1_amf', cpu: 'libsvtav1' },
+    };
+
+    // Query the ffmpeg build's encoder list + hardware presence for this node: encoders from `-encoders`, NVIDIA from nvidia-smi,
+    // VAAPI/QSV from a /dev/dri check. Tdarr reloads each classic plugin fresh per file and selectEncoder calls this once, so it runs once per file.
+    const queryCapabilities = (ffmpegPath) => {
+        const ff = ffmpegPath || 'ffmpeg';
+        const cap = { encoders: new Set(), nvidia: false, dri: false };
+        try {
+            const r = childProcess.spawnSync(ff, ['-hide_banner', '-encoders'], { encoding: 'utf8', timeout: 20000 });
+            for (const line of String(r.stdout || '').split('\n')) {
+                const m = line.match(/^\s*[A-Z.]{6}\s+([A-Za-z0-9_]+)/);   // " V....D hevc_nvenc  NVIDIA NVENC hevc encoder"
+                if (m) cap.encoders.add(m[1]);
+            }
+        } catch (e) { /* leave encoders empty -> everything falls back to CPU */ }
+        try {
+            const r = childProcess.spawnSync('nvidia-smi', ['--query-gpu=name', '--format=csv,noheader'], { encoding: 'utf8', timeout: 8000 });
+            cap.nvidia = r.status === 0 && String(r.stdout || '').trim().length > 0;
+        } catch (e) { /* nvidia-smi absent -> no NVIDIA GPU */ }
+        try { cap.dri = fs.existsSync('/dev/dri/renderD128'); } catch (e) { cap.dri = false; }
+        return cap;
+    };
+
+    // Single lightweight confirming probe (one 256x256 frame) of ONE candidate encoder - used only for the ambiguous
+    // families/cases, never as a blind per-codec ladder.
+    const confirmEncode = (ffmpegPath, encoderName, inputSide, filter) => {
+        let ok = false;
+        try {
+            const args = ['-hide_banner'];
+            if (inputSide) args.push(...inputSide.split(' ').filter(Boolean));
+            args.push('-f', 'lavfi', '-i', 'color=c=black:s=256x256:d=1:r=5');
+            if (filter) args.push('-vf', filter);
+            args.push('-frames:v', '1', '-c:v', encoderName, '-f', 'null', '-');
+            const r = childProcess.spawnSync(ffmpegPath || 'ffmpeg', args, { encoding: 'utf8', timeout: 25000 });
+            ok = r.status === 0;
+        } catch (e) { ok = false; }
+        return ok;
+    };
+
+    // Cheap zero-encode presence verdict for a family on this platform: 'yes' (usable), 'no' (definitely not), or
+    // 'probe' (can't tell cheaply - confirm with one encode). videotoolbox = Mac only; nvenc = nvidia-smi; vaapi/qsv
+    // on Linux = /dev/dri; QSV on Windows and AMF anywhere have no cheap signal, so they need the confirm probe.
+    const presenceOf = (family, cap, platform) => {
+        switch (family) {
+            case 'cpu': return 'yes';
+            case 'videotoolbox': return platform === 'darwin' ? 'yes' : 'no';
+            case 'nvenc': return cap.nvidia ? 'yes' : 'no';
+            case 'vaapi': return cap.dri ? 'yes' : 'no';
+            case 'qsv': return platform === 'linux' ? (cap.dri ? 'yes' : 'no') : 'probe';
+            case 'amf': return 'probe';
+            default: return 'no';
+        }
+    };
+
+    // Resolve the encoder for THIS node. Returns { family, encoderName, notes:[infoLog lines] }. Honors an explicit
+    // encoder input (force on this node, CPU fallback if unavailable) or 'auto' (best available). Tests may inject a
+    // capability object + platform/workerType via otherArguments.__awkCap to avoid any real ffmpeg/nvidia-smi spawn.
+    const selectEncoder = ({ codec, encoderOpt, otherArguments }) => {
+        const inj = otherArguments && otherArguments.__awkCap;
+        const platform = (inj && inj.platform) || os.platform();
+        const workerType = String((otherArguments && otherArguments.workerType) || '').toLowerCase();
+        const isGpuWorker = workerType.includes('gpu');
+        const ffmpegPath = (otherArguments && otherArguments.ffmpegPath) || 'ffmpeg';
+        const cap = inj
+            ? { encoders: new Set(inj.encoders || []), nvidia: !!inj.nvidia, dri: !!inj.dri }
+            : queryCapabilities(ffmpegPath);
+        const confirm = (encoderName, inputSide, filter) => (inj
+            ? !!(inj.confirm && inj.confirm[encoderName])
+            : confirmEncode(ffmpegPath, encoderName, inputSide, filter));
+        const notes = [];
+        const cpuChoice = () => ({ family: 'cpu', encoderName: ENCODER_NAME[codec].cpu, notes });
+
+        // Candidate families: an explicit pick is tried first (then CPU); 'auto' tries the platform's HW list only on a
+        // GPU worker (CPU workers stay on software so slow encodes don't land on the GPU), then CPU.
+        let families;
+        if (encoderOpt !== 'auto') {
+            families = [encoderOpt, 'cpu'];
+        } else if (isGpuWorker) {
+            families = [...(HW_FAMILIES[platform] || []), 'cpu'];
+        } else {
+            families = ['cpu'];
+        }
+
+        for (const family of families) {
+            if (family === 'cpu') break;   // reached the fallback
+            const encoderName = ENCODER_NAME[codec][family];
+            if (!encoderName) {   // e.g. AV1 has no videotoolbox encoder
+                if (encoderOpt === family) notes.push(`☒${family} has no ${codec} encoder; using ${ENCODER_NAME[codec].cpu}.\n`);
+                continue;
+            }
+            if (!cap.encoders.has(encoderName)) {   // ffmpeg build doesn't ship it (e.g. no nvenc in the Mac build)
+                if (encoderOpt === family) notes.push(`☒${encoderName} is not in this ffmpeg build on this node; using ${ENCODER_NAME[codec].cpu}.\n`);
+                continue;
+            }
+            const presence = presenceOf(family, cap, platform);
+            if (presence === 'no') {
+                if (encoderOpt === family) notes.push(`☒${family} hardware not detected on this node; using ${ENCODER_NAME[codec].cpu}.\n`);
+                continue;
+            }
+            // Confirm with one probe when presence is ambiguous, and always for AV1 hardware (generation can't be inferred).
+            const needProbe = presence === 'probe' || codec === 'av1';
+            if (needProbe) {
+                const probeIn = family === 'vaapi' ? '-vaapi_device /dev/dri/renderD128' : '';
+                const probeFilter = family === 'vaapi' ? 'format=nv12,hwupload' : '';
+                if (!confirm(encoderName, probeIn, probeFilter)) {
+                    if (encoderOpt === family) notes.push(`☒${encoderName} did not initialise on this node; using ${ENCODER_NAME[codec].cpu}.\n`);
+                    continue;
+                }
+            }
+            notes.push(`☐Encoder: ${encoderName} (${encoderOpt === 'auto' ? 'auto' : 'forced'}, ${platform}${isGpuWorker ? ' gpu-worker' : ''}).\n`);
+            return { family, encoderName, notes };
+        }
+
+        if (encoderOpt === 'auto' && !isGpuWorker) notes.push(`☐Encoder: ${ENCODER_NAME[codec].cpu} (auto, CPU worker).\n`);
+        else if (encoderOpt === 'auto') notes.push(`☐Encoder: ${ENCODER_NAME[codec].cpu} (auto, no usable GPU encoder on this node).\n`);
+        return cpuChoice();
+    };
+
+    // ====== PER-ENCODER QUALITY / SPEED / PIXEL-FORMAT TRANSLATION ======
+    // One normalized quality target (HEVC-CRF scale, lower = better) mapped to each encoder's native flag so the same
+    // setting yields comparable quality on every node. H.264 uses the same number; AV1 is shifted onto the SVT-AV1 /
+    // AV1 CQ scale (+8, clamped 0-63) since the same visual quality sits at a higher number there. HW flag syntax
+    // mirrors the proven community plugins (Migz nvenc -cq:v, Boosh qsv -global_quality, vaapi -qp, amf -qp_i/-qp_p).
+    const nativeQuality = (codec, family, qNorm) => {
+        let q = Math.round(qNorm);
+        if (codec === 'av1') q = Math.max(0, Math.min(63, q + 8));
+        switch (family) {
+            case 'cpu': return `-crf ${q}`;                                   // libx264 / libx265 / libsvtav1 all take -crf
+            case 'nvenc': return `-rc:v vbr -cq:v ${q} -b:v 0`;               // constant-quality NVENC (VBR envelope off)
+            case 'qsv': return `-global_quality ${q}`;                        // QSV ICQ
+            case 'vaapi': return `-rc_mode CQP -qp ${q}`;                     // VAAPI constant-QP
+            case 'amf': return `-rc cqp -qp_i ${q} -qp_p ${q} -qp_b ${q}`;    // AMF constant-QP
+            case 'videotoolbox': return `-q:v ${Math.max(1, Math.min(100, Math.round(118 - q * 2.6)))}`; // VT quality 1-100, higher = better
+            default: return `-crf ${q}`;
+        }
+    };
+    // Normalized speed -> each family's native knob. libsvtav1's -preset is numeric (0-13); the x26x pair is named;
+    // nvenc uses p1-p7; qsv named; vaapi/videotoolbox have no comparable preset (omitted). Slower = better/smaller.
+    const nativeSpeed = (codec, family, speed) => {
+        if (family === 'cpu') {
+            if (codec === 'av1') return `-preset ${{ slow: '4', medium: '6', fast: '8' }[speed]}`;
+            return `-preset ${{ slow: 'slow', medium: 'medium', fast: 'fast' }[speed]}`;
+        }
+        if (family === 'nvenc') return `-preset ${{ slow: 'p7', medium: 'p5', fast: 'p3' }[speed]}`;
+        if (family === 'qsv') return `-preset ${{ slow: 'veryslow', medium: 'medium', fast: 'veryfast' }[speed]}`;
+        if (family === 'amf') return `-quality ${{ slow: 'quality', medium: 'balanced', fast: 'speed' }[speed]}`;
+        return '';   // vaapi / videotoolbox: no equivalent preset knob
+    };
+
+    // Build the video-encode arguments for the chosen encoder: decode-side (input) flags + the output -c:v block
+    // (encoder, quality, speed, pixel format, optional scale filter, hvc1 tag). Source colour metadata (incl. static
+    // HDR10/HLG) is carried through automatically by ffmpeg - no explicit colour flags needed (verified empirically).
+    // Decode is kept on software frames (nvenc via the shared nvdecPreset helper) so a single CPU scale filter and
+    // -pix_fmt path work uniformly across families; VAAPI is the exception - it needs its frames uploaded, so it
+    // carries an explicit device + format,hwupload filter. Returns { inputSide, videoOut }.
+    const buildVideoArgs = ({ family, encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file }) => {
+        const { getNvdecHwaccelPreset, getNvenc10BitFormatArg } = require('../methods/nvdecPreset');
+        const q = nativeQuality(codec, family, qNorm);
+        const spd = nativeSpeed(codec, family, speed);
+        let inputSide = '';
+        const parts = [`-c:v ${encoderName}`, q, spd];
+        const vf = [];
+        const scale = (fmt) => { if (willDownscale) vf.push(`scale=-2:${outHeight}`); if (fmt) vf.push(fmt); };
+
+        if (family === 'nvenc') {
+            inputSide = getNvdecHwaccelPreset(file, { softwareFrames: true });   // '-hwaccel cuda' (system-memory frames) or '' for software decode
+            scale();
+            parts.push(wantTenbit ? getNvenc10BitFormatArg(file, { softwareFrames: true }).trim() : '-pix_fmt yuv420p');
+        } else if (family === 'qsv') {
+            scale();
+            if (wantTenbit) parts.push('-pix_fmt p010le', '-profile:v main10'); else parts.push('-pix_fmt nv12');
+        } else if (family === 'vaapi') {
+            inputSide = '-vaapi_device /dev/dri/renderD128';
+            scale(`format=${wantTenbit ? 'p010' : 'nv12'}`);
+            vf.push('hwupload');
+        } else if (family === 'amf') {
+            scale();
+            parts.push(wantTenbit ? '-pix_fmt p010le' : '-pix_fmt yuv420p');
+        } else if (family === 'videotoolbox') {
+            scale();
+            parts.push(wantTenbit ? '-pix_fmt p010le' : '-pix_fmt yuv420p');
+            if (wantTenbit && codec === 'hevc') parts.push('-profile:v main10');
+        } else {   // cpu
+            scale();
+            parts.push(`-pix_fmt ${wantTenbit ? 'yuv420p10le' : 'yuv420p'}`);
+        }
+
+        if (codec === 'hevc' && ['mp4', 'm4v', 'mov'].includes(dstContainer)) parts.push('-tag:v hvc1');   // Apple/QuickTime HEVC-in-mp4 playback
+        const vfArg = vf.length ? ` -vf "${vf.join(',')}"` : '';
+        return { inputSide, videoOut: `${parts.filter(Boolean).join(' ')}${vfArg}` };
+    };
+
     // ---------------------------------------------------------------------
     // awk_video_clean: validate -> classify source video -> decide -> select encoder per node -> build preset.
     // Video-only by design (audio and subtitles are always copied) so it composes with the other awk plugins.
