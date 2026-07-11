@@ -12,7 +12,7 @@ const details = () => ({
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|default|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '1.1.0',
+    Version: '1.1.1',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -44,14 +44,14 @@ const details = () => ({
             name: 'remove_after_extract',
             type: 'boolean',
             defaultValue: true,
-            inputUI: { type: 'dropdown', options: ['false', 'true'] },
+            inputUI: { type: 'dropdown', options: ['true', 'false'] },
             tooltip: `On extract, remove each text subtitle from the video after it is written to a sidecar. Off = write sidecars but keep the embedded tracks.`,
         },
         {
             name: 'remove_sidecar_after_import',
             type: 'boolean',
             defaultValue: true,
-            inputUI: { type: 'dropdown', options: ['false', 'true'] },
+            inputUI: { type: 'dropdown', options: ['true', 'false'] },
             tooltip: `On import, delete each sidecar file once its content is confirmed embedded (a global awk_sub_worker marker plus a language+title+disposition match). Off = leave the sidecars in place.`,
         },
     ],
