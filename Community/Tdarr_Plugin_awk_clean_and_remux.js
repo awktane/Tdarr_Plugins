@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.12.0',
+    Version: '2.13.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -245,7 +245,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // disposition; each entry declares the valid stream types (streams), the keywords that also indicate it (each keyword lives on one flag so
     // title->flag promotion stays unambiguous), and the canonical title string (tag, null when never written). hasDisposition gates on codec_type,
     // matching keywords whole-token via matchesKeyword. Read by summariseStream, the stream-ordering sort keys, audio_clean's secondary-track
-    // detection, and clean_and_remux's title/flag tagging. Shared verbatim across all three awk plugins.
+    // detection, and clean_and_remux's title/flag tagging. Shared verbatim across all five awk plugins.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                            tag: 'Commentary'  },
         visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','dvs','audio description'], tag: 'Descriptive' },
@@ -322,7 +322,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= resolveCodecName  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the
     // _x variant when DTS:X is detected) and eac3 into eac3atmos. Used by audioQuality/losslessSource (audio_clean,
-    // stream_ordering) for scoring, and by summariseStream (all three) purely for accurate display labeling - a plugin
+    // stream_ordering) for scoring, and by summariseStream (all five) purely for accurate display labeling - a plugin
     // that doesn't score audio still benefits from showing "eac3atmos"/"dtsx" instead of a bare "eac3"/"dts" in its logs.
     // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't
     // tell the subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to
@@ -394,7 +394,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= resolveLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Resolve a stream's language: ffprobe tags.language, then mediaInfo Language (files often tag one probe but not the other), trimmed + lowercased. Empty
     // when neither reports it; callers wanting a placeholder use `resolveLang(s) || 'und'`.
-    const resolveLang = (s) => (s.tags?.language ?? (mediaInfoFor(s)?.Language ?? '')).trim().toLowerCase();
+    const resolveLang = (s) => { const t = (s.tags?.language || '').trim(); return (t || (mediaInfoFor(s)?.Language ?? '')).trim().toLowerCase(); };
     // -=-=-= resolveStreamBitrate  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // ffprobe first, then mediaInfo fallbacks: ffprobe can't read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V).
     // mediaInfo order: measured BitRate, declared BitRate_Nominal, then a bytes-based measurement (StreamSize bytes * 8 / Duration seconds) - the last is a
@@ -426,9 +426,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (s === 'mono') return 1;
         if (s === 'stereo' || s === 'downmix') return 2;
         if (s === 'quad') return 4;
-        const m = s.match(/(\d+)\.(\d+)/);                          // "5.1", "7.1(side)", "2.1" -> full channels + LFE
-        if (m) return Number(m[1]) + Number(m[2]);
-        const tokens = s.split(/[+\s,]+/).filter(Boolean);          // "FL+FR+FC+LFE+BL+BR" / "L R C LFE Ls Rs" -> count positions
+        const m = s.match(/(\d+)\.(\d+)(?:\.(\d+))?/);              // "5.1"->6, "7.1(side)"->8, "7.1.4" Atmos -> 12 (front + LFE + height)
+        if (m) return Number(m[1]) + Number(m[2]) + Number(m[3] || 0);
+        const tokens = s.split(/[+\s,]+/).filter((t) => t && !t.endsWith(':'));   // "FL+FR+FC+LFE" -> 4; drop MediaInfo ChannelPositions labels ("Front:", "Side:")
         return tokens.length > 1 ? tokens.length : 0;
     };
     const resolveChannels = (ffstream) => {
@@ -450,7 +450,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // /default and /forced read the REAL disposition flag only — a title keyword must not flip a selection flag (as forced already did).
     // The role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary lines up.
     // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Audio uses codecDisplayName so a DTS subtype
-    // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all three.
+    // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all five.
     const summariseStream = (s) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
@@ -460,7 +460,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const def = s.disposition?.default === 1 ? '/default' : '';
         if (type === 'video') {
             const vHeight = Number(s.height || mediaInfoFor(s)?.Height || 0);
-            const vTenbit = Number(s.bits_per_raw_sample || mediaInfoFor(s)?.BitDepth || 0) >= 10 || /10/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
+            const vTenbit = Number(s.bits_per_raw_sample || mediaInfoFor(s)?.BitDepth || 0) >= 10 || /p10(le|be)?$|10le|10be/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
             const vHdr = ['smpte2084', 'arib-std-b67'].includes((s.color_transfer || '').toLowerCase().trim());
             return `[video:${[codec, vHeight > 0 ? `${vHeight}p` : '', vTenbit ? '10bit' : '', vHdr ? 'hdr' : ''].filter(Boolean).join(' ')}${isCoverArt(s) ? '/cover' : ''}]`;
         }
@@ -687,7 +687,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (same 'SDH' tag) and hearing_impaired persists in both containers, so we promote hearing_impaired in captions' place rather than dropping the SDH role;
     // a role with no storable flag in this container (lyrics anywhere; original into mp4) is skipped - its title keyword still drives the classifiers, summary
     // and sort order, so nothing is lost but a redundant, non-persisting flag write. Dedupe by target so a track matching both SDH synonyms promotes once.
-    const unstorableDisp = { mkv: new Set(['captions', 'lyrics']), mp4: new Set(['original', 'lyrics']) };
+    // captions is remapped to hearing_impaired (storable in both containers) BEFORE this set is consulted, so it needs no mkv entry; the set lists only flags with
+    // no storable target in the container: lyrics (neither) and original (mp4 only).
+    const unstorableDisp = { mkv: new Set(['lyrics']), mp4: new Set(['original', 'lyrics']) };
     const dispositionsToPromote = (s, type) => {
         const out = []; const seen = new Set();
         for (const key of dispKeysFor(type)) {
@@ -710,38 +712,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .join(' ')
         .trim();
 
-    // language_fill_fail pre-check: when >1 untagged stream of a type WILL REACH THE OUTPUT, they can't be told apart by language - abort so the user can tag them
-    // manually and requeue (language_fill_fail=false instead lets processing continue). Whether the blanks get filled to the same language (a downstream dedupe-
-    // collision risk) or stay "und" (an ambiguous, incomplete file), multiple untagged streams of a type are the problem worth failing on - BUT only counting the
-    // ones that survive the language filter. An untagged track the language filter would drop never reaches a later plugin, so it carries no ambiguity risk;
-    // counting it would spuriously quarantine a file that processes fine (and disagree with the remove_accessibility survivor guard below, which excludes them).
-    // Placed after the shared helpers so it resolves language via resolveLang (ffprobe tag, then mediaInfo fallback): a language only mediaInfo supplies is not
-    // treated as blank here. The language_fill assignment note is appended to the message only when language_fill is set.
-    if (failBlankLangs) {
-        const streams = file.ffProbeData.streams || [];
-        const isUntagged = (s) => { const lang = resolveLang(s); return !lang || lang === 'und'; };
-        const fillNote = fillLanguage ? ` and would all be assigned "${fillLanguage}" by language_fill` : '';
-        // Every untagged track shares the same post-fill language (language_fill if set, else "und"), so "does it survive the language filter" is one check per
-        // type: kept when the language list is empty (keep-all) or contains that language. Mirrors the main loop's own keep/drop decision.
-        const untaggedWorkLang = fillLanguage || 'und';
-        const keptByLangFilter = (langs) => langs.length === 0 || langs.includes(untaggedWorkLang) || langs.includes(shortLang(untaggedWorkLang));
-        const untaggedAudio = keptByLangFilter(audioLanguage)
-            ? streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s)).length : 0;
-        if (untaggedAudio > 1)
-            failFile(`${untaggedAudio} audio streams have no language tag${fillNote} — they may be different languages. Tag them manually and requeue or set language_fill_fail to false.`);
-        // Also exclude subtitles the container/format drops (subDroppedAnyReason) - like the language-dropped ones above, they never reach the output.
-        const untaggedSubs = keptByLangFilter(subLanguage)
-            ? streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'subtitle'
-                && !subDroppedAnyReason((s.codec_name || '').toLowerCase()) && isUntagged(s)).length : 0;
-        if (untaggedSubs > 1)
-            failFile(`${untaggedSubs} subtitle streams have no language tag${fillNote} — they may be different languages. Tag them manually and requeue or set language_fill_fail to false.`);
+    // Check if file is a video. If it isn't then exit plugin. This benign skip (processFile:false) must precede the per-file CONTENT checks below - the
+    // language_fill_fail pre-check can failFile (quarantine), and a non-video file the plugin only means to skip must never be routed to the error queue.
+    if (file.fileMedium !== 'video') {
+        response.infoLog += '☒File is not a video. \n';
+        response.processFile = false;
+        return response;
     }
 
     // remove_accessibility safety guard.
-    // (subDroppedAnyReason/subtitle drop lists defined earlier, by language_fill_fail) A "plain" track carries no commentary/descriptive/SDH/lyrics role - a
-    // genuine main audio or dialogue subtitle. remove_accessibility removes an accessibility track (SDH/CC subtitle, audio-description audio) only when its language
-    // still has a plain track that SURVIVES the language, format, and remove_mkv_imagesubs filters, so we strip extras, never the last usable track.
-    // resolveWorkLang mirrors the loop's language resolution.
+    // (subDroppedAnyReason/subtitle drop lists defined earlier) A "plain" track carries no commentary/descriptive/SDH/lyrics role - a genuine main audio or
+    // dialogue subtitle. remove_accessibility removes an accessibility track (SDH/CC subtitle, audio-description audio) only when its language still has a plain
+    // track that SURVIVES the language, format, and remove_mkv_imagesubs filters, so we strip extras, never the last usable track. resolveWorkLang mirrors the
+    // loop's language resolution. Computed BEFORE the language_fill_fail pre-check so that check can exclude the accessibility tracks this guard will drop.
     const plainAudioLangs = new Set();
     const plainSubLangs = new Set();
     const isPlainTrack = (s) => !isCommentary(s) && !isDescriptive(s) && !isSdh(s) && !isLyrics(s);
@@ -763,11 +746,34 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
     }
 
-    // Check if file is a video. If it isn't then exit plugin.
-    if (file.fileMedium !== 'video') {
-        response.infoLog += '☒File is not a video. \n';
-        response.processFile = false;
-        return response;
+    // language_fill_fail pre-check: when >1 untagged stream of a type WILL REACH THE OUTPUT, they can't be told apart by language - abort so the user can tag them
+    // manually and requeue (language_fill_fail=false instead lets processing continue). Whether the blanks get filled to the same language (a downstream dedupe-
+    // collision risk) or stay "und" (an ambiguous, incomplete file), multiple untagged streams of a type are the problem worth failing on - BUT only counting the
+    // ones that survive TO THE OUTPUT: an untagged track dropped by the language filter, by container/format (subtitles, subDroppedAnyReason), or by the
+    // remove_accessibility guard above never reaches a later plugin, so counting it would spuriously quarantine a file that processes fine.
+    // Resolves language via resolveLang (ffprobe tag, then mediaInfo fallback), so a language only mediaInfo supplies is not treated as blank here.
+    if (failBlankLangs) {
+        const streams = file.ffProbeData.streams || [];
+        const isUntagged = (s) => { const lang = resolveLang(s); return !lang || lang === 'und'; };
+        const fillNote = fillLanguage ? ` and would all be assigned "${fillLanguage}" by language_fill` : '';
+        // Every untagged track shares the same post-fill language (language_fill if set, else "und"), so "does it survive the language filter" is one check per
+        // type: kept when the language list is empty (keep-all) or contains that language. Mirrors the main loop's own keep/drop decision.
+        const untaggedWorkLang = fillLanguage || 'und';
+        const keptByLangFilter = (langs) => langs.length === 0 || langs.includes(untaggedWorkLang) || langs.includes(shortLang(untaggedWorkLang));
+        // An untagged accessibility track (audio-description / SDH) the remove_accessibility guard would drop is excluded too - mirrors the loop's own removal
+        // predicate. Untagged tracks resolve to untaggedWorkLang, so reuse the plainAudioLangs/plainSubLangs computed above.
+        const removedByAccess = (s, type) => applies(removeAccessible, type)
+            && (type === 'audio' ? isDescriptive(s) : isSdh(s))
+            && hasPlainSameLang(type === 'audio' ? plainAudioLangs : plainSubLangs, untaggedWorkLang);
+        const untaggedAudio = keptByLangFilter(audioLanguage)
+            ? streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s) && !removedByAccess(s, 'audio')).length : 0;
+        if (untaggedAudio > 1)
+            failFile(`${untaggedAudio} audio streams have no language tag${fillNote} — they may be different languages. Tag them manually and requeue or set language_fill_fail to false.`);
+        const untaggedSubs = keptByLangFilter(subLanguage)
+            ? streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'subtitle'
+                && !subDroppedAnyReason((s.codec_name || '').toLowerCase()) && isUntagged(s) && !removedByAccess(s, 'subtitle')).length : 0;
+        if (untaggedSubs > 1)
+            failFile(`${untaggedSubs} subtitle streams have no language tag${fillNote} — they may be different languages. Tag them manually and requeue or set language_fill_fail to false.`);
     }
 
     // Set up required variables.
@@ -884,8 +890,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 {
                     workDone += `☐Change title of stream ${i} (subtitle) from "${logSafe(streamTitle)}" to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${escMeta(newStreamTitle)}"`;
-                // Reconcile when mediaInfo has a title the ffstream tag lacks: the write updates both probes, so it settles in one pass - not a remux loop.
-                } else if(ffmedia && (ffstream.tags?.title ?? '') !== (ffmedia.Title ?? ''))
+                // Reconcile ONLY when the ffprobe tag is missing but mediaInfo has a title: the write adds the ffprobe tag so both probes agree next pass. The reverse
+                // (ffprobe has a title mediaInfo never reports) must NOT fire, or a container that never surfaces Title to mediaInfo would remux every pass.
+                } else if(ffmedia && !(ffstream.tags?.title) && (ffmedia.Title ?? '') !== '')
                 {
                     workDone += `☐Change title of stream ${i} (subtitle) - Found "${logSafe(ffstream.tags?.title ?? '')}" and "${logSafe(ffmedia?.Title ?? '')}" change to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${escMeta(newStreamTitle)}"`;
@@ -1000,8 +1007,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 {
                     workDone += `☐Change title of stream ${i} (audio) from "${logSafe(streamTitle)}" to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${escMeta(newStreamTitle)}"`;
-                // Reconcile when mediaInfo has a title the ffstream tag lacks: the write updates both probes, so it settles in one pass - not a remux loop.
-                } else if(ffmedia && (ffstream.tags?.title ?? '') !== (ffmedia.Title ?? ''))
+                // Reconcile ONLY when the ffprobe tag is missing but mediaInfo has a title: the write adds the ffprobe tag so both probes agree next pass. The reverse
+                // (ffprobe has a title mediaInfo never reports) must NOT fire, or a container that never surfaces Title to mediaInfo would remux every pass.
+                } else if(ffmedia && !(ffstream.tags?.title) && (ffmedia.Title ?? '') !== '')
                 {
                     workDone += `☐Change title of stream ${i} (audio) - Found "${logSafe(ffstream.tags?.title ?? '')}" and "${logSafe(ffmedia?.Title ?? '')}" change to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${escMeta(newStreamTitle)}"`;
@@ -1103,6 +1111,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // fonts if any such subtitle survives in the output; otherwise they are orphaned and removed. mp4 output never keeps fonts: ASS/SSA are converted to
         // mov_text (which needs no fonts) and mp4 cannot carry font attachments anyway, so dstContainer gates this to mkv. The source codec is read from
         // ffProbeData (it is still 'ass'/'ssa' there even when converted), which is why the mkv gate — not just the survivor check — is required.
+        // NOTE: if awk_sub_worker extracted a styled subtitle to a sidecar (remove_after_extract) and this plugin runs before the reimport, the ASS/SSA is gone from
+        // the container so its fonts read as orphaned and are removed here - reimport styled subs before an intervening clean_and_remux pass to keep their fonts.
         if (deferredFontIndices.length > 0) {
             const fontsNeeded = dstContainer === 'mkv' && file.ffProbeData.streams.some(s =>
                 (s.codec_type || '').toLowerCase() === 'subtitle'
@@ -1196,19 +1206,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (runRecover)
             convert = true;
 
-        // Re-stamp the recover intent on every remux while recover is requested, even when it already matches - notably across mkv->mp4, where mp4
-        // drops a custom tag unless -movflags use_metadata_tags is set. Skipping the re-stamp there would lose awk_recovered and re-trigger recovery
-        // on the next pass.
+        // Re-stamp the recover intent on every remux while recover is requested, even when it already matches (e.g. across mkv->mp4), so awk_recovered is refreshed
+        // and recovery doesn't re-trigger next pass. (The mp4 use_metadata_tags that makes any global tag persist is added for all mp4 remuxes below.)
         if (convert === true && recoverRequested) {
             if (runRecover)
                 workDone += `☐Stamp awk_recovered=${recoverIntent} - recovery re-runs only if a recover_bad_* mode changes\n`;
             extraArguments += ` -metadata "awk_recovered=${recoverIntent}"`;
-            if (dstContainer === 'mp4')
-                extraArguments += ' -movflags use_metadata_tags';
         }
 
         //Convert file if convert variable is set to true.
         if (convert === true) {
+            // mp4/mov drops GLOBAL custom tags on a -c copy remux unless use_metadata_tags is set - this plugin's own awk_recovered AND any awk_video/awk_sub_worker
+            // written by a sibling plugin. Add it for EVERY mp4 remux (not just recovery ones), matching the other four plugins, so those markers survive. This plugin
+            // runs first, so a marker it drops is gone before the plugin that wrote it re-reads it (e.g. sub_worker's sidecar-delete would then find no marker).
+            if (dstContainer === 'mp4')
+                extraArguments += ' -movflags use_metadata_tags';
             response.preset += `${fflags}${inputArgs},-map 0 -c copy${extraArguments}${globalOutputOpt}`;
             response.infoLog += workDone;
             const outSummary = file.ffProbeData.streams

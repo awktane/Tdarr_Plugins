@@ -1,4 +1,3 @@
-/* eslint-disable no-await-in-loop */
 const details = () => ({
     id: 'Tdarr_Plugin_awk_sub_worker',
     Stage: 'Pre-processing',
@@ -9,10 +8,10 @@ const details = () => ({
 
                 \\nmode=extract writes each embedded TEXT subtitle to a sidecar next to the video (native format: srt/ass/vtt) and, by default, removes those tracks from the file.
                 \\nmode=import muxes matching sidecars back into the file (restoring language, title, and disposition) and, by default, deletes the sidecar once it is safely embedded.
-                \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|default|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them.
+                \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '1.3.0',
+    Version: '1.4.0',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -45,14 +44,15 @@ const details = () => ({
             type: 'boolean',
             defaultValue: true,
             inputUI: { type: 'dropdown', options: ['true', 'false'] },
-            tooltip: `On extract, remove each text subtitle from the video after it is written to a sidecar. Off = write sidecars but keep the embedded tracks.`,
+            tooltip: `On extract, remove each text subtitle from the video after it is written to a sidecar. Off = write sidecars but keep the embedded tracks.
+                \\nNote: styled ASS/SSA rely on embedded fonts - if clean_and_remux runs between this extract and the reimport it removes those now-orphaned fonts, so reimport before an intervening clean_and_remux pass (or keep the styled track embedded).`,
         },
         {
             name: 'remove_sidecar_after_import',
             type: 'boolean',
             defaultValue: true,
             inputUI: { type: 'dropdown', options: ['true', 'false'] },
-            tooltip: `On import, delete each sidecar file once its content is confirmed embedded (a global awk_sub_worker marker plus a language+title+disposition match). Off = leave the sidecars in place.`,
+            tooltip: `On import, delete each sidecar whose basename is listed in the file's global awk_sub_worker marker (stamped by the prior mux pass). Tdarr only re-runs after a successful mux, so a listed sidecar is confirmed embedded. Off = leave the sidecars in place.`,
         },
     ],
 });
@@ -106,7 +106,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // disposition; each entry declares the valid stream types (streams), the keywords that also indicate it (each keyword lives on one flag so
     // title->flag promotion stays unambiguous), and the canonical title string (tag, null when never written). hasDisposition gates on codec_type,
     // matching keywords whole-token via matchesKeyword. Read by summariseStream, the stream-ordering sort keys, audio_clean's secondary-track
-    // detection, and clean_and_remux's title/flag tagging. Shared verbatim across all three awk plugins.
+    // detection, and clean_and_remux's title/flag tagging. Shared verbatim across all five awk plugins.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                            tag: 'Commentary'  },
         visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','dvs','audio description'], tag: 'Descriptive' },
@@ -183,7 +183,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= resolveCodecName  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the
     // _x variant when DTS:X is detected) and eac3 into eac3atmos. Used by audioQuality/losslessSource (audio_clean,
-    // stream_ordering) for scoring, and by summariseStream (all three) purely for accurate display labeling - a plugin
+    // stream_ordering) for scoring, and by summariseStream (all five) purely for accurate display labeling - a plugin
     // that doesn't score audio still benefits from showing "eac3atmos"/"dtsx" instead of a bare "eac3"/"dts" in its logs.
     // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't
     // tell the subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to
@@ -255,7 +255,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= resolveLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Resolve a stream's language: ffprobe tags.language, then mediaInfo Language (files often tag one probe but not the other), trimmed + lowercased. Empty
     // when neither reports it; callers wanting a placeholder use `resolveLang(s) || 'und'`.
-    const resolveLang = (s) => (s.tags?.language ?? (mediaInfoFor(s)?.Language ?? '')).trim().toLowerCase();
+    const resolveLang = (s) => { const t = (s.tags?.language || '').trim(); return (t || (mediaInfoFor(s)?.Language ?? '')).trim().toLowerCase(); };
     // -=-=-= resolveStreamBitrate  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // ffprobe first, then mediaInfo fallbacks: ffprobe can't read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V).
     // mediaInfo order: measured BitRate, declared BitRate_Nominal, then a bytes-based measurement (StreamSize bytes * 8 / Duration seconds) - the last is a
@@ -287,9 +287,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (s === 'mono') return 1;
         if (s === 'stereo' || s === 'downmix') return 2;
         if (s === 'quad') return 4;
-        const m = s.match(/(\d+)\.(\d+)/);                          // "5.1", "7.1(side)", "2.1" -> full channels + LFE
-        if (m) return Number(m[1]) + Number(m[2]);
-        const tokens = s.split(/[+\s,]+/).filter(Boolean);          // "FL+FR+FC+LFE+BL+BR" / "L R C LFE Ls Rs" -> count positions
+        const m = s.match(/(\d+)\.(\d+)(?:\.(\d+))?/);              // "5.1"->6, "7.1(side)"->8, "7.1.4" Atmos -> 12 (front + LFE + height)
+        if (m) return Number(m[1]) + Number(m[2]) + Number(m[3] || 0);
+        const tokens = s.split(/[+\s,]+/).filter((t) => t && !t.endsWith(':'));   // "FL+FR+FC+LFE" -> 4; drop MediaInfo ChannelPositions labels ("Front:", "Side:")
         return tokens.length > 1 ? tokens.length : 0;
     };
     const resolveChannels = (ffstream) => {
@@ -311,7 +311,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // /default and /forced read the REAL disposition flag only — a title keyword must not flip a selection flag (as forced already did).
     // The role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary lines up.
     // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Audio uses codecDisplayName so a DTS subtype
-    // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all three.
+    // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all five.
     const summariseStream = (s) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
@@ -321,7 +321,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const def = s.disposition?.default === 1 ? '/default' : '';
         if (type === 'video') {
             const vHeight = Number(s.height || mediaInfoFor(s)?.Height || 0);
-            const vTenbit = Number(s.bits_per_raw_sample || mediaInfoFor(s)?.BitDepth || 0) >= 10 || /10/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
+            const vTenbit = Number(s.bits_per_raw_sample || mediaInfoFor(s)?.BitDepth || 0) >= 10 || /p10(le|be)?$|10le|10be/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
             const vHdr = ['smpte2084', 'arib-std-b67'].includes((s.color_transfer || '').toLowerCase().trim());
             return `[video:${[codec, vHeight > 0 ? `${vHeight}p` : '', vTenbit ? '10bit' : '', vHdr ? 'hdr' : ''].filter(Boolean).join(' ')}${isCoverArt(s) ? '/cover' : ''}]`;
         }
@@ -416,7 +416,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Legacy/Plex filename tokens that normalise onto a canonical token above (parse-only; extract never writes them):
     // 'cc' is the closed-captions spelling of SDH, so an existing <name>.cc.srt still imports (restored as portable hearing_impaired).
     const DISP_ALIAS = { cc: 'sdh' };
-    const DISP_TOKENS = new Set([...DISPOSITIONS.map((d) => d.token), ...Object.keys(DISP_ALIAS)]);
+    // Parse-only tokens recognised so they aren't mis-read as the language, but carrying NO disposition: 'default' is muxer-managed, not a role we track or restore.
+    const DISP_IGNORE = new Set(['default']);
+    const DISP_TOKENS = new Set([...DISPOSITIONS.map((d) => d.token), ...Object.keys(DISP_ALIAS), ...DISP_IGNORE]);
     const dispFfOf = (token) => (DISPOSITIONS.find((d) => d.token === token) || {}).ff;
     // extract: one canonical token per role the stream's real flags carry (sdh covers hearing_impaired OR captions), deduped.
     const dispTokensOf = (s) => DISPOSITIONS.filter((d) => d.flags.some((f) => s.disposition?.[f] === 1)).map((d) => d.token);
@@ -485,7 +487,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         toks.shift();
         const rawDisp = [];
         while (toks.length && DISP_TOKENS.has(toks[toks.length - 1])) rawDisp.unshift(toks.pop());  // trailing dispositions, right-to-left
-        const dispTokens = [...new Set(rawDisp.map((t) => DISP_ALIAS[t] || t))];                    // normalise legacy tokens (cc->sdh), dedupe
+        const dispTokens = [...new Set(rawDisp.filter((t) => !DISP_IGNORE.has(t)).map((t) => DISP_ALIAS[t] || t))];   // drop ignored (default), normalise legacy (cc->sdh), dedupe
         if (!toks.length) return null;
         const lang = toks.pop();                                          // language is the next-from-right token
         if (!lang) return null;
@@ -534,7 +536,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const { enc } = TEXT_SUB[String(s.codec_name).toLowerCase()];
                 const name = sidecarBasename(s);
                 const full = path.join(libDir, name);
-                if (fs.existsSync(full)) { skipped += 1; response.infoLog += `☑Sidecar already exists, not overwriting: ${name}\n`; }
+                // An existing sidecar is preserved (never overwrite a user's on-disk edits) - but only if it has content. A 0-byte sidecar is the fingerprint of a
+                // prior extract ffmpeg aborted mid-write; trusting it and then stripping the embedded source would lose the subtitle, so re-extract it instead.
+                const existsNonEmpty = fs.existsSync(full) && (() => { try { return fs.statSync(full).size > 0; } catch { return false; } })();
+                if (existsNonEmpty) { skipped += 1; response.infoLog += `☑Sidecar already exists, not overwriting: ${name}\n`; }
                 else { sidecarOut += ` -map 0:${s.index} -c:s ${enc} "${full}"`; wrote += 1; response.infoLog += `☐Extract stream ${s.index} -> ${name}\n`; }
                 if (removeAfterExtract) removeIdx.push(s.index);
             }
@@ -543,7 +548,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
             let out = `${sidecarOut} -map 0`;
             for (const idx of removeIdx) out += ` -map -0:${idx}`;
-            out += ` -c copy${globalOutputOpt}`;
+            out += ' -c copy';
+            if (isMp4Family) out += ' -movflags use_metadata_tags';   // mp4 -c copy drops sibling plugins' global tags (awk_video/awk_recovered) without this - mirror the import branch
+            out += globalOutputOpt;
             response.preset = `,${out}`;
             response.processFile = true;
             const survivors = streams.filter((s) => !removeIdx.includes(s.index));

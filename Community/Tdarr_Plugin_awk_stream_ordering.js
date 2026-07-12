@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '2.12.0',
+    Version: '2.13.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -147,7 +147,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // disposition; each entry declares the valid stream types (streams), the keywords that also indicate it (each keyword lives on one flag so
     // title->flag promotion stays unambiguous), and the canonical title string (tag, null when never written). hasDisposition gates on codec_type,
     // matching keywords whole-token via matchesKeyword. Read by summariseStream, the stream-ordering sort keys, audio_clean's secondary-track
-    // detection, and clean_and_remux's title/flag tagging. Shared verbatim across all three awk plugins.
+    // detection, and clean_and_remux's title/flag tagging. Shared verbatim across all five awk plugins.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                            tag: 'Commentary'  },
         visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','dvs','audio description'], tag: 'Descriptive' },
@@ -224,7 +224,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= resolveCodecName  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the
     // _x variant when DTS:X is detected) and eac3 into eac3atmos. Used by audioQuality/losslessSource (audio_clean,
-    // stream_ordering) for scoring, and by summariseStream (all three) purely for accurate display labeling - a plugin
+    // stream_ordering) for scoring, and by summariseStream (all five) purely for accurate display labeling - a plugin
     // that doesn't score audio still benefits from showing "eac3atmos"/"dtsx" instead of a bare "eac3"/"dts" in its logs.
     // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't
     // tell the subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to
@@ -425,7 +425,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= resolveLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Resolve a stream's language: ffprobe tags.language, then mediaInfo Language (files often tag one probe but not the other), trimmed + lowercased. Empty
     // when neither reports it; callers wanting a placeholder use `resolveLang(s) || 'und'`.
-    const resolveLang = (s) => (s.tags?.language ?? (mediaInfoFor(s)?.Language ?? '')).trim().toLowerCase();
+    const resolveLang = (s) => { const t = (s.tags?.language || '').trim(); return (t || (mediaInfoFor(s)?.Language ?? '')).trim().toLowerCase(); };
     // -=-=-= resolveStreamBitrate  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // ffprobe first, then mediaInfo fallbacks: ffprobe can't read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V).
     // mediaInfo order: measured BitRate, declared BitRate_Nominal, then a bytes-based measurement (StreamSize bytes * 8 / Duration seconds) - the last is a
@@ -457,9 +457,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (s === 'mono') return 1;
         if (s === 'stereo' || s === 'downmix') return 2;
         if (s === 'quad') return 4;
-        const m = s.match(/(\d+)\.(\d+)/);                          // "5.1", "7.1(side)", "2.1" -> full channels + LFE
-        if (m) return Number(m[1]) + Number(m[2]);
-        const tokens = s.split(/[+\s,]+/).filter(Boolean);          // "FL+FR+FC+LFE+BL+BR" / "L R C LFE Ls Rs" -> count positions
+        const m = s.match(/(\d+)\.(\d+)(?:\.(\d+))?/);              // "5.1"->6, "7.1(side)"->8, "7.1.4" Atmos -> 12 (front + LFE + height)
+        if (m) return Number(m[1]) + Number(m[2]) + Number(m[3] || 0);
+        const tokens = s.split(/[+\s,]+/).filter((t) => t && !t.endsWith(':'));   // "FL+FR+FC+LFE" -> 4; drop MediaInfo ChannelPositions labels ("Front:", "Side:")
         return tokens.length > 1 ? tokens.length : 0;
     };
     const resolveChannels = (ffstream) => {
@@ -481,7 +481,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // /default and /forced read the REAL disposition flag only — a title keyword must not flip a selection flag (as forced already did).
     // The role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary lines up.
     // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Audio uses codecDisplayName so a DTS subtype
-    // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all three.
+    // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all five.
     const summariseStream = (s) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
@@ -491,7 +491,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const def = s.disposition?.default === 1 ? '/default' : '';
         if (type === 'video') {
             const vHeight = Number(s.height || mediaInfoFor(s)?.Height || 0);
-            const vTenbit = Number(s.bits_per_raw_sample || mediaInfoFor(s)?.BitDepth || 0) >= 10 || /10/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
+            const vTenbit = Number(s.bits_per_raw_sample || mediaInfoFor(s)?.BitDepth || 0) >= 10 || /p10(le|be)?$|10le|10be/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
             const vHdr = ['smpte2084', 'arib-std-b67'].includes((s.color_transfer || '').toLowerCase().trim());
             return `[video:${[codec, vHeight > 0 ? `${vHeight}p` : '', vTenbit ? '10bit' : '', vHdr ? 'hdr' : ''].filter(Boolean).join(' ')}${isCoverArt(s) ? '/cover' : ''}]`;
         }
@@ -671,7 +671,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // is a fixpoint. Promoting every default would lead with a lower-priority default on pass 1, then re-sort it once its default is stripped (a wasteful extra
         // reorder remux before it settles). undefined when no track is flagged default, so first_audio='default' then falls through to normal ordering. Identity-compared below.
         const winningDefault = audioFirst === 'default'
-            ? [...streams.filter(s => s.type === 'audio' && s.default)].sort((a, b) => audioKeyCompare(a, b) || a.index - b.index)[0]
+            ? streams.filter(s => s.type === 'audio' && s.default).sort((a, b) => audioKeyCompare(a, b) || a.index - b.index)[0]
             : undefined;
 
         //Sort the streams

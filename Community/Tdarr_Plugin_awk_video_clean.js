@@ -12,7 +12,7 @@ const details = () => ({
                      -Preserves static HDR10/HLG colour metadata; leaves Dolby Vision / HDR10+ files untouched by default (dynamic metadata can't survive a re-encode).\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '1.4.0',
+    Version: '1.5.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -188,7 +188,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // disposition; each entry declares the valid stream types (streams), the keywords that also indicate it (each keyword lives on one flag so
     // title->flag promotion stays unambiguous), and the canonical title string (tag, null when never written). hasDisposition gates on codec_type,
     // matching keywords whole-token via matchesKeyword. Read by summariseStream, the stream-ordering sort keys, audio_clean's secondary-track
-    // detection, and clean_and_remux's title/flag tagging. Shared verbatim across all three awk plugins.
+    // detection, and clean_and_remux's title/flag tagging. Shared verbatim across all five awk plugins.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                            tag: 'Commentary'  },
         visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','dvs','audio description'], tag: 'Descriptive' },
@@ -265,7 +265,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= resolveCodecName  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the
     // _x variant when DTS:X is detected) and eac3 into eac3atmos. Used by audioQuality/losslessSource (audio_clean,
-    // stream_ordering) for scoring, and by summariseStream (all three) purely for accurate display labeling - a plugin
+    // stream_ordering) for scoring, and by summariseStream (all five) purely for accurate display labeling - a plugin
     // that doesn't score audio still benefits from showing "eac3atmos"/"dtsx" instead of a bare "eac3"/"dts" in its logs.
     // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't
     // tell the subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to
@@ -337,7 +337,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= resolveLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Resolve a stream's language: ffprobe tags.language, then mediaInfo Language (files often tag one probe but not the other), trimmed + lowercased. Empty
     // when neither reports it; callers wanting a placeholder use `resolveLang(s) || 'und'`.
-    const resolveLang = (s) => (s.tags?.language ?? (mediaInfoFor(s)?.Language ?? '')).trim().toLowerCase();
+    const resolveLang = (s) => { const t = (s.tags?.language || '').trim(); return (t || (mediaInfoFor(s)?.Language ?? '')).trim().toLowerCase(); };
     // -=-=-= resolveStreamBitrate  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // ffprobe first, then mediaInfo fallbacks: ffprobe can't read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V).
     // mediaInfo order: measured BitRate, declared BitRate_Nominal, then a bytes-based measurement (StreamSize bytes * 8 / Duration seconds) - the last is a
@@ -369,9 +369,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (s === 'mono') return 1;
         if (s === 'stereo' || s === 'downmix') return 2;
         if (s === 'quad') return 4;
-        const m = s.match(/(\d+)\.(\d+)/);                          // "5.1", "7.1(side)", "2.1" -> full channels + LFE
-        if (m) return Number(m[1]) + Number(m[2]);
-        const tokens = s.split(/[+\s,]+/).filter(Boolean);          // "FL+FR+FC+LFE+BL+BR" / "L R C LFE Ls Rs" -> count positions
+        const m = s.match(/(\d+)\.(\d+)(?:\.(\d+))?/);              // "5.1"->6, "7.1(side)"->8, "7.1.4" Atmos -> 12 (front + LFE + height)
+        if (m) return Number(m[1]) + Number(m[2]) + Number(m[3] || 0);
+        const tokens = s.split(/[+\s,]+/).filter((t) => t && !t.endsWith(':'));   // "FL+FR+FC+LFE" -> 4; drop MediaInfo ChannelPositions labels ("Front:", "Side:")
         return tokens.length > 1 ? tokens.length : 0;
     };
     const resolveChannels = (ffstream) => {
@@ -393,7 +393,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // /default and /forced read the REAL disposition flag only — a title keyword must not flip a selection flag (as forced already did).
     // The role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary lines up.
     // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Audio uses codecDisplayName so a DTS subtype
-    // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all three.
+    // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all five.
     const summariseStream = (s) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
@@ -403,7 +403,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const def = s.disposition?.default === 1 ? '/default' : '';
         if (type === 'video') {
             const vHeight = Number(s.height || mediaInfoFor(s)?.Height || 0);
-            const vTenbit = Number(s.bits_per_raw_sample || mediaInfoFor(s)?.BitDepth || 0) >= 10 || /10/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
+            const vTenbit = Number(s.bits_per_raw_sample || mediaInfoFor(s)?.BitDepth || 0) >= 10 || /p10(le|be)?$|10le|10be/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
             const vHdr = ['smpte2084', 'arib-std-b67'].includes((s.color_transfer || '').toLowerCase().trim());
             return `[video:${[codec, vHeight > 0 ? `${vHeight}p` : '', vTenbit ? '10bit' : '', vHdr ? 'hdr' : ''].filter(Boolean).join(' ')}${isCoverArt(s) ? '/cover' : ''}]`;
         }
@@ -529,15 +529,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     // Cheap zero-encode presence verdict for a family on this platform: 'yes' (usable), 'no' (definitely not), or
-    // 'probe' (can't tell cheaply - confirm with one encode). videotoolbox = Mac only; nvenc = nvidia-smi; vaapi/qsv
-    // on Linux = /dev/dri; QSV on Windows and AMF anywhere have no cheap signal, so they need the confirm probe.
+    // 'probe' (can't tell cheaply - confirm with one encode). videotoolbox = Mac only; nvenc = nvidia-smi; vaapi on
+    // Linux = /dev/dri (vendor-agnostic). QSV always needs the confirm probe: Windows/AMF have no cheap signal, and on
+    // Linux /dev/dri only proves a GPU exists, not that it's an Intel one QSV can drive (AMD shares renderD128).
     const presenceOf = (family, cap, platform) => {
         switch (family) {
             case 'cpu': return 'yes';
             case 'videotoolbox': return platform === 'darwin' ? 'yes' : 'no';
             case 'nvenc': return cap.nvidia ? 'yes' : 'no';
             case 'vaapi': return cap.dri ? 'yes' : 'no';
-            case 'qsv': return platform === 'linux' ? (cap.dri ? 'yes' : 'no') : 'probe';
+            case 'qsv': return platform === 'linux' ? (cap.dri ? 'probe' : 'no') : 'probe';
             case 'amf': return 'probe';
             default: return 'no';
         }
@@ -604,6 +605,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         if (encoderOpt === 'auto' && !isGpuWorker) notes.push(`☐Encoder: ${ENCODER_NAME[codec].cpu} (auto, CPU worker).\n`);
         else if (encoderOpt === 'auto') notes.push(`☐Encoder: ${ENCODER_NAME[codec].cpu} (auto, no usable GPU encoder on this node).\n`);
+        else if (encoderOpt === 'cpu') notes.push(`☐Encoder: ${ENCODER_NAME[codec].cpu} (forced cpu, ${platform}${isGpuWorker ? ' gpu-worker' : ''}).\n`);
         return cpuChoice();
     };
 
@@ -649,7 +651,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const q = nativeQuality(codec, family, qNorm);
         const spd = nativeSpeed(codec, family, speed);
         let inputSide = '';
-        const parts = [`-c:v ${encoderName}`, q, spd];
+        const parts = [`-c:v:0 ${encoderName}`, q, spd];   // :v:0 = encode primary video only; any genuine secondary video stream stays copied
         const vf = [];
         const scale = (fmt) => { if (willDownscale) vf.push(`scale=-2:${outHeight}`); if (fmt) vf.push(fmt); };
 
@@ -659,7 +661,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             parts.push(wantTenbit ? getNvenc10BitFormatArg(file, { softwareFrames: true }).trim() : '-pix_fmt yuv420p');
         } else if (family === 'qsv') {
             scale();
-            if (wantTenbit) parts.push('-pix_fmt p010le', '-profile:v main10'); else parts.push('-pix_fmt nv12');
+            if (wantTenbit) { parts.push('-pix_fmt p010le'); if (codec === 'hevc') parts.push('-profile:v main10'); } else parts.push('-pix_fmt nv12');
         } else if (family === 'vaapi') {
             inputSide = '-vaapi_device /dev/dri/renderD128';
             scale(`format=${wantTenbit ? 'p010' : 'nv12'}`);
@@ -676,8 +678,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             parts.push(`-pix_fmt ${wantTenbit ? 'yuv420p10le' : 'yuv420p'}`);
         }
 
-        if (codec === 'hevc' && ['mp4', 'm4v', 'mov'].includes(dstContainer)) parts.push('-tag:v hvc1');   // Apple/QuickTime HEVC-in-mp4 playback
-        const vfArg = vf.length ? ` -vf "${vf.join(',')}"` : '';
+        if (codec === 'hevc' && ['mp4', 'm4v', 'mov'].includes(dstContainer)) parts.push('-tag:v:0 hvc1');   // Apple/QuickTime HEVC-in-mp4 playback (primary only)
+        const vfArg = vf.length ? ` -filter:v:0 "${vf.join(',')}"` : '';   // :v:0 - filtering a copied secondary video stream would error
         return { inputSide, videoOut: `${parts.filter(Boolean).join(' ')}${vfArg}` };
     };
 
@@ -690,11 +692,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
         failFile('No ffProbe stream data available for this file - the plugin cannot process it.');
 
-    // Parse inputs (scope -> tuning -> encoder -> guards -> meta). Numeric inputs are free text (parsed + range-checked);
+    // Parse inputs (scope -> tuning -> encoder -> guards). Numeric inputs are free text (parsed + range-checked);
     // only type:'string' dropdowns get an option guard (booleans are coerced by loadDefaultValues, so a guard is dead code).
     const codec = String(inputs.codec || 'hevc').toLowerCase().trim();
     const maxHeightOpt = String(inputs.max_height || 'original').toLowerCase().trim();
-    const speed = String(inputs.speed || 'medium').toLowerCase().trim();
+    const speed = String(inputs.speed || 'slow').toLowerCase().trim();
     const bitDepthOpt = String(inputs.bit_depth || 'source').toLowerCase().trim();
     const encoderOpt = String(inputs.encoder || 'auto').toLowerCase().trim();
     const guardHdr = String(inputs.guard_hdr || 'abort_dynamic').toLowerCase().trim();
@@ -777,8 +779,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const qualityForHeight = (h) => (h <= 576 ? qualitySd : h <= 720 ? quality720 : h <= 1080 ? quality1080 : quality4k);
         const qNorm = qualityForHeight(outHeight || srcHeight);
 
-        // Idempotency signature (codec-quality-maxheight-depth-version), stored as a container-global awk_video tag.
-        const videoSig = escMeta([targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, wantTenbit ? '10' : '8', `v${details().Version}`].join('-'));
+        // Idempotency signature (codec-quality-maxheight-depth-speed-version), stored as a container-global awk_video tag.
+        const videoSig = escMeta([targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, wantTenbit ? '10' : '8', `s${speed}`, `v${details().Version}`].join('-'));
         const priorSig = (() => {
             const tags = file.ffProbeData.format?.tags || {};
             const k = Object.keys(tags).find((kk) => kk.toLowerCase() === 'awk_video');   // matroska upper-cases tag keys on write
@@ -786,7 +788,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         })();
 
         // Guard: constant quality can't predict output size, so skip sources already below the bitrate floor (would risk growth).
-        if (guardMinKbps > 0) {
+        // A pending downscale is exempt - fewer pixels can't grow the file, and skipping here would silently defeat max_height.
+        if (guardMinKbps > 0 && !willDownscale) {
             const vbps = resolveStreamBitrate(primary) || 0;
             const vkbps = vbps > 0 ? Math.round(vbps / 1000) : 0;
             if (vkbps > 0 && vkbps < guardMinKbps) {
@@ -821,7 +824,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Resolve the encoder for THIS node (auto = best available, else forced with CPU fallback).
         const sel = selectEncoder({ codec, encoderOpt, otherArguments });
-        sel.notes.forEach((n) => { if (n.startsWith('☒') || n.startsWith('☐Encoder')) response.infoLog += n; });
+        sel.notes.forEach((n) => { response.infoLog += n; });
 
         // Build the video-encode args + assemble the full preset (<input-side>,<output-side>).
         const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file });
