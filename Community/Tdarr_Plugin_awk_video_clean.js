@@ -12,7 +12,7 @@ const details = () => ({
                      -Preserves static HDR10/HLG colour metadata; leaves Dolby Vision / HDR10+ files untouched by default (dynamic metadata can't survive a re-encode).\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '1.3.0',
+    Version: '1.4.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -136,16 +136,6 @@ const details = () => ({
             tooltip: `Re-encode files that are ALREADY the target codec?
                 \\nfalse (default): leave existing target-codec files alone (only convert other codecs). No wasted encodes.
                 \\ntrue: also re-encode existing target-codec files to enforce the quality/resolution target (e.g. shrink a library of already-HEVC files). An awk_video tag records the exact setting applied and stops it re-encoding the same file every pass.`,
-        },
-        {
-            name: 'method_verbose',
-            type: 'boolean',
-            defaultValue: false,
-            inputUI: {
-                type: 'dropdown',
-                options: ['false', 'true'],
-            },
-            tooltip: `Log extra diagnostics (why a file was skipped, the resolved encoder reasoning). "What changed" lines are always shown.`,
         },
     ],
 });
@@ -709,7 +699,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const encoderOpt = String(inputs.encoder || 'auto').toLowerCase().trim();
     const guardHdr = String(inputs.guard_hdr || 'abort_dynamic').toLowerCase().trim();
     const guardReprocess = String(inputs.guard_reprocess) === 'true';
-    const verbose = String(inputs.method_verbose) === 'true';
 
     const parseQuality = (v, name) => {
         const n = Number(String(v).trim());
@@ -832,7 +821,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Resolve the encoder for THIS node (auto = best available, else forced with CPU fallback).
         const sel = selectEncoder({ codec, encoderOpt, otherArguments });
-        sel.notes.forEach((n) => { if (verbose || n.startsWith('☒') || n.startsWith('☐Encoder')) response.infoLog += n; });
+        sel.notes.forEach((n) => { if (n.startsWith('☒') || n.startsWith('☐Encoder')) response.infoLog += n; });
 
         // Build the video-encode args + assemble the full preset (<input-side>,<output-side>).
         const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file });
