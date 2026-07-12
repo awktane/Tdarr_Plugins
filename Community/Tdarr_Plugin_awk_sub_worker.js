@@ -12,7 +12,7 @@ const details = () => ({
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|default|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '1.2.0',
+    Version: '1.3.0',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -400,20 +400,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const isTextSub = (codec) => Object.prototype.hasOwnProperty.call(TEXT_SUB, String(codec).toLowerCase());
     const TEXT_EXTS = ['srt', 'ass', 'vtt'];
 
-    // Dispositions encoded as filename tokens, in fixed order. `ff` is BOTH the ffprobe disposition key (detection)
-    // and the ffmpeg -disposition name (restore) - they share the same spelling. Read as RAW flags so a round-trip
-    // restores exactly the flags the source had (the human-readable role also survives inside the encoded title).
-    // `default` is deliberately NOT tracked: muxers auto-manage it (mp4 forces default on the first subtitle), so it
-    // is neither identity-stable nor ours to own - stream_ordering selects the default track as the final step.
+    // Dispositions encoded as filename tokens, in fixed order. `ff` is the ffmpeg -disposition name restored on import;
+    // `flags` are the ffprobe disposition keys that, when set on the source, emit this token on extract. They differ only
+    // for SDH: hearing_impaired and captions are the same closed-captions role, but captions has no Matroska flag and does
+    // not survive an mp4->mkv round-trip (the muxer silently drops +captions), so BOTH normalise to the container-portable
+    // hearing_impaired - extract emits a single 'sdh' token for either flag and import restores hearing_impaired. The
+    // human-readable role also survives in the encoded title. `default` is deliberately NOT tracked: muxers auto-manage it
+    // (mp4 forces default on the first subtitle), so it is neither identity-stable nor ours - stream_ordering picks it last.
     const DISPOSITIONS = [
-        { token: 'forced',      ff: 'forced' },
-        { token: 'sdh',         ff: 'hearing_impaired' },
-        { token: 'cc',          ff: 'captions' },
-        { token: 'commentary',  ff: 'comment' },
-        { token: 'descriptive', ff: 'descriptions' },
+        { token: 'forced',      ff: 'forced',           flags: ['forced'] },
+        { token: 'sdh',         ff: 'hearing_impaired', flags: ['hearing_impaired', 'captions'] },
+        { token: 'commentary',  ff: 'comment',          flags: ['comment'] },
+        { token: 'descriptive', ff: 'descriptions',     flags: ['descriptions'] },
     ];
-    const DISP_TOKENS = new Set(DISPOSITIONS.map((d) => d.token));
-    const dispTokensOf = (s) => DISPOSITIONS.filter((d) => s.disposition?.[d.ff] === 1).map((d) => d.token);
+    // Legacy/Plex filename tokens that normalise onto a canonical token above (parse-only; extract never writes them):
+    // 'cc' is the closed-captions spelling of SDH, so an existing <name>.cc.srt still imports (restored as portable hearing_impaired).
+    const DISP_ALIAS = { cc: 'sdh' };
+    const DISP_TOKENS = new Set([...DISPOSITIONS.map((d) => d.token), ...Object.keys(DISP_ALIAS)]);
+    const dispFfOf = (token) => (DISPOSITIONS.find((d) => d.token === token) || {}).ff;
+    // extract: one canonical token per role the stream's real flags carry (sdh covers hearing_impaired OR captions), deduped.
+    const dispTokensOf = (s) => DISPOSITIONS.filter((d) => d.flags.some((f) => s.disposition?.[f] === 1)).map((d) => d.token);
 
     // Reversibly encode a title into one filesystem-safe, dot-free filename token (Windows u Linux u Mac): keep a
     // conservative readable set as-is, percent-encode every other char's UTF-8 bytes (covers . / \ : * ? " < > | %
@@ -477,14 +483,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!toks.length || !/^s\d+$/.test(toks[0])) return null;         // order marker
         const index = parseInt(toks[0].slice(1), 10);
         toks.shift();
-        const dispTokens = [];
-        while (toks.length && DISP_TOKENS.has(toks[toks.length - 1])) dispTokens.unshift(toks.pop());  // trailing dispositions, right-to-left
+        const rawDisp = [];
+        while (toks.length && DISP_TOKENS.has(toks[toks.length - 1])) rawDisp.unshift(toks.pop());  // trailing dispositions, right-to-left
+        const dispTokens = [...new Set(rawDisp.map((t) => DISP_ALIAS[t] || t))];                    // normalise legacy tokens (cc->sdh), dedupe
         if (!toks.length) return null;
         const lang = toks.pop();                                          // language is the next-from-right token
         if (!lang) return null;
         if (toks.length > 1) return null;                                // 0 or 1 residual token = the encoded title
         const title = toks.length ? decodeTitle(toks[0]) : '';
-        return { name, index, lang, title, ext: extMatch[1].toLowerCase(), dispTokens, disp: DISPOSITIONS.filter((d) => dispTokens.includes(d.token)).map((d) => d.ff) };
+        return { name, index, lang, title, ext: extMatch[1].toLowerCase(), dispTokens, disp: [...new Set(dispTokens.map(dispFfOf).filter(Boolean))] };
     };
 
     const parseLangFilter = (v) => { const l = String(v || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean); return l.length ? new Set(l) : null; };
