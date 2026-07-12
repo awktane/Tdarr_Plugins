@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.12.0',
+    Version: '2.13.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -105,6 +105,7 @@ const details = () => ({
             },
             tooltip: `Specify codec for newly created stereo tracks. AAC and Opus are the most compatible choices for modern media servers and clients. EAC3 is useful for Dolby branding on compatible devices. AC3 is the most broadly compatible legacy choice.
                 \\naac_vbr uses libfdk_aac in VBR mode (-vbr 5, ~192-224 kb/s) for higher quality than native AAC CBR. Falls back to -vbr 4 (~128-144 kb/s) when codec_force is converting an existing stereo track whose bitrate is at or below 144 kb/s, matching the lower-information source.
+                \\nlibfdk_aac ships in the Linux/Windows builds but not the Mac one; on a node whose ffmpeg lacks it, aac_vbr automatically uses Apple's aac_at (AudioToolbox) VBR on Mac, or native aac 256 kb/s on any other build without it, so the file still processes.
                 \\nExisting AAC tracks are never re-encoded when aac_vbr is selected — the AAC family check prevents a generational loss for no gain.`,
         },        
         {
@@ -853,14 +854,60 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return ` -b:a:${idx} ${bps / 1000}k`;
     };
 
-    // Emit the encoder name and VBR arguments for an aac_vbr stereo track scoped to output index idx. Uses -vbr 4 (~128-144 kb/s) when the source stereo
-    // bitrate is at or below 144k — matching a lower-information source avoids wasting bits encoding silence-grade content at VBR 5 quality. Uses -vbr 5
-    // (~192-224 kb/s) for all other cases, including all downmix-created stereo tracks where the source is surround (its bitrate describes N channels, not 2,
-    // so 144k doesn't apply). isStereoSrc should be true only for codec_force codec-swap paths where the source is already 2ch.
+    // aac_vbr's preferred encoder is libfdk_aac (Linux/Windows jellyfin builds) but that is absent on the Mac build (--disable-libfdk-aac) and some custom builds.
+    // Because plugin inputs are library-wide, a mixed fleet can't pin codec_stereo per node, so we resolve THIS node's AAC encoders at runtime (mirrors
+    // video_clean's encoder probing): read an injected encoder list if the harness supplies one, else parse `ffmpeg -encoders` once into a Set. Memoized - the
+    // probe runs at most once per file and only when aacVbrArgsIdx is actually reached (no aac_vbr emission → no probe). A failed/undeterminable probe yields an
+    // empty set, so we degrade to native aac (which every build has) rather than emit an encoder that would hard-fail the file.
+    let _encoderSet;
+    let _aacVbrFallbackWarned = false;
+    const hasEncoder = (name) => {
+        if (_encoderSet === undefined) {
+            const cap = otherArguments && otherArguments.__awkCap;
+            if (cap && Array.isArray(cap.encoders)) {
+                _encoderSet = new Set(cap.encoders);
+            } else {
+                _encoderSet = new Set();
+                try {
+                    const { spawnSync } = require('child_process');
+                    const r = spawnSync((otherArguments && otherArguments.ffmpegPath) || 'ffmpeg', ['-hide_banner', '-encoders'], { encoding: 'utf8', timeout: 20000 });
+                    for (const line of String((r && r.stdout) || '').split('\n')) {
+                        const m = line.match(/^\s*[A-Z.]{6}\s+([A-Za-z0-9_]+)/);   // " A....D libfdk_aac  Fraunhofer FDK AAC"
+                        if (m) _encoderSet.add(m[1]);
+                    }
+                } catch (e) { /* leave empty → native aac fallback, which every build has */ }
+            }
+        }
+        return _encoderSet.has(name);
+    };
+
+    // Emit the encoder, rate args, and a log label for an aac_vbr stereo track scoped to output index idx, picking the best VBR AAC encoder THIS node has. The
+    // low-info test (an already-lean ≤144k stereo source being codec-swapped) selects the leaner VBR tier on every encoder, mirroring libfdk's -vbr 4 vs -vbr 5:
+    //   • libfdk_aac (Lin/Win)  -> -vbr 4/5                         the efficient default (~128-224 kb/s)
+    //   • aac_at    (Mac only)  -> -aac_at_mode vbr -q:a 1/0        Apple AudioToolbox, the platform's best VBR AAC when libfdk is absent
+    //   • native aac (any)      -> -b:a 256k CBR                    last-resort floor via encoderArgsIdx (-vbr is libfdk-private, so native aac can't VBR here)
+    // aac_at's top tier (q:a 0) runs a little heavier than libfdk -vbr 5 but is leaner + faster than native 256k; erring high keeps the fallback no worse than the
+    // source warranted. isStereoSrc should be true only for codec_force codec-swap paths where the source is already 2ch. Warns once per file when not using libfdk.
     const aacVbrArgsIdx = (idx, srcBps = 0, isStereoSrc = false) => {
-        const vbrLevel = (isStereoSrc && Number(srcBps) > 0 && Number(srcBps) <= 144000) ? 4 : 5;
-        const approxRate = vbrLevel === 4 ? '~128k' : '~192k';
-        return { encoder: 'libfdk_aac', args: ` -vbr:a:${idx} ${vbrLevel}`, approxRate };
+        const lowInfo = isStereoSrc && Number(srcBps) > 0 && Number(srcBps) <= 144000;
+        if (hasEncoder('libfdk_aac')) {
+            const vbrLevel = lowInfo ? 4 : 5;
+            return { encoder: 'libfdk_aac', args: ` -vbr:a:${idx} ${vbrLevel}`, approxRate: lowInfo ? '~128k' : '~192k', label: `libfdk VBR q${vbrLevel}` };
+        }
+        if (hasEncoder('aac_at')) {
+            if (!_aacVbrFallbackWarned) {
+                _aacVbrFallbackWarned = true;
+                response.infoLog += `☒codec_stereo=aac_vbr: no libfdk_aac on this node — using aac_at (AudioToolbox) VBR instead.\n`;
+            }
+            const q = lowInfo ? 1 : 0;
+            return { encoder: 'aac_at', args: ` -aac_at_mode:a:${idx} vbr -q:a:${idx} ${q}`, approxRate: lowInfo ? '~150k' : '~190k', label: `aac_at VBR q${q}` };
+        }
+        const bps = resolveBitrate('aac', 2);
+        if (!_aacVbrFallbackWarned) {
+            _aacVbrFallbackWarned = true;
+            response.infoLog += `☒codec_stereo=aac_vbr: no libfdk_aac or aac_at on this node — using native aac ${bps / 1000}k instead.\n`;
+        }
+        return { encoder: 'aac', args: encoderArgsIdx('aac', 2, idx), approxRate: `${bps / 1000}k`, label: 'native aac' };
     };
 
     // Resolve whether a source stream is lossless using the shared resolveCodecName resolution (same one audioQuality uses). Stored per-stream as
@@ -1523,8 +1570,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // Downmix changes channel count, so the source bitrate isn't a comparable floor — use the table target for 2ch only.
                 // aac_vbr downmixes always use VBR 5 since there is no comparable stereo source bitrate.
                 if (stereoCodec === 'aac_vbr') {
-                    const { encoder, args, approxRate } = aacVbrArgsIdx(outputAudioIdx);
-                    workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → aac stereo @ ${approxRate} (libfdk VBR q5, secondary)\n`;
+                    const { encoder, args, approxRate, label } = aacVbrArgsIdx(outputAudioIdx);
+                    workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → aac stereo @ ${approxRate} (${label}, secondary)\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
@@ -1599,8 +1646,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const newTitle = escMeta(buildTitle(ffstream, '2.0'));
                     // aac_vbr downmixes always use VBR 5 — source is surround, its bitrate describes N channels not 2.
                     if (stereoCodec === 'aac_vbr') {
-                        const { encoder, args, approxRate } = aacVbrArgsIdx(outputAudioIdx);
-                        workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → aac stereo @ ${approxRate} (libfdk VBR q5)\n`;
+                        const { encoder, args, approxRate, label } = aacVbrArgsIdx(outputAudioIdx);
+                        workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → aac stereo @ ${approxRate} (${label})\n`;
                         extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                         if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(streamLang)}"`;
                         modifiedAudioIdx.add(outputAudioIdx);
@@ -1620,8 +1667,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const newTitle = escMeta(buildTitle(ffstream, '2.0'));
                     // aac_vbr downmixes always use VBR 5 — source is surround, its bitrate describes N channels not 2.
                     if (stereoCodec === 'aac_vbr') {
-                        const { encoder, args, approxRate } = aacVbrArgsIdx(newStreamOutputIdx);
-                        workDone += `☐Stream ${ffstream.index}: Adding aac stereo @ ${approxRate} (libfdk VBR q5) from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
+                        const { encoder, args, approxRate, label } = aacVbrArgsIdx(newStreamOutputIdx);
+                        workDone += `☐Stream ${ffstream.index}: Adding aac stereo @ ${approxRate} (${label}) from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
                         extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${encoder}${args}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                         if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
                         newStreamOutputIdx++;
@@ -1700,8 +1747,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // bitrate isn't a comparable floor).
                             const newTitle = escMeta(buildTitle(ffstream, '2.0'));
                             if (stereoCodec === 'aac_vbr') {
-                                const { encoder, args, approxRate } = aacVbrArgsIdx(outputAudioIdx);
-                                workDone += `☐Stream ${ffstream.index}: Remixing ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} (${layoutName}, opus-incompatible) → aac stereo @ ${approxRate} (libfdk VBR q5)\n`;
+                                const { encoder, args, approxRate, label } = aacVbrArgsIdx(outputAudioIdx);
+                                workDone += `☐Stream ${ffstream.index}: Remixing ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} (${layoutName}, opus-incompatible) → aac stereo @ ${approxRate} (${label})\n`;
                                 extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                                 modifiedAudioIdx.add(outputAudioIdx);
                                 outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: 2, bps: 0, approxRate });
@@ -1718,7 +1765,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         } else if (targetCodec === 'aac_vbr') {
                             // aac_vbr stereo force: use VBR 4 for low-bitrate sources, VBR 5 otherwise.
                             // srcBitrate is meaningful here — this is a codec-swap, same channel count.
-                            const { encoder, args, approxRate } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true);
+                            const { encoder, args, approxRate, label } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true);
                             // No pre-filter (same channel count, no relabel) - measure the source directly. guardBlocks for this force already
                             // passed above (loudnorm rides on that guarantee - see stereoArg).
                             let aacVbrFilter = '';
@@ -1726,7 +1773,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                                 const { filter } = buildLoudnormFilter(ffstream.index, srcAudioIdx, '', LOUDNORM_PRESETS[loudnorm]);
                                 if (filter) aacVbrFilter = ` -filter:a:${outputAudioIdx} "${filter}"`;
                             }
-                            workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → aac stereo @ ${approxRate} (libfdk VBR q${srcBitrate > 0 && srcBitrate <= 144000 ? 4 : 5})\n`;
+                            workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → aac stereo @ ${approxRate} (${label})\n`;
                             extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${aacVbrFilter}`;
                             modifiedAudioIdx.add(outputAudioIdx);
                             outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: forceChannels, bps: 0, approxRate });
@@ -1797,8 +1844,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (downmixToTwo !== 'false' && !created2chLangs.has(lang) && !existingStereoLangs.has(lang)) {
                 const newTitle = escMeta(buildTitle(s, '2.0'));
                 if (stereoCodec === 'aac_vbr') {
-                    const { encoder, args, approxRate } = aacVbrArgsIdx(newStreamOutputIdx);
-                    workDone += `☐Stream ${s.index}: Adding aac stereo @ ${approxRate} (libfdk VBR q5) from ${srcCodec} ${s.channels}ch @ ${srcRateStr} (source dropped - libopus can't encode its layout)\n`;
+                    const { encoder, args, approxRate, label } = aacVbrArgsIdx(newStreamOutputIdx);
+                    workDone += `☐Stream ${s.index}: Adding aac stereo @ ${approxRate} (${label}) from ${srcCodec} ${s.channels}ch @ ${srcRateStr} (source dropped - libopus can't encode its layout)\n`;
                     extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${encoder}${args}${stereoArg(newStreamOutputIdx, s)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
                     appendedAudio.push({ srcStream: s, codec: 'aac', channels: 2, bps: 0, approxRate });
@@ -1876,8 +1923,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             const newTitle = escMeta(buildTitle(stream, '2.0'));
                             const sLang = resolveLang(stream);
                             if (stereoCodec === 'aac_vbr') {
-                                const { encoder, args, approxRate } = aacVbrArgsIdx(outputAudioIdx);
-                                workDone += `☐Stream ${stream.index}: Normalizing ${rawCodec} ${channels}ch (loudnorm=${loudnorm}) → aac stereo @ ${approxRate} (libfdk VBR; remixed - libopus can't encode a ${lay || `${channels}ch`} layout)\n`;
+                                const { encoder, args, approxRate, label } = aacVbrArgsIdx(outputAudioIdx);
+                                workDone += `☐Stream ${stream.index}: Normalizing ${rawCodec} ${channels}ch (loudnorm=${loudnorm}) → aac stereo @ ${approxRate} (${label}; remixed - libopus can't encode a ${lay || `${channels}ch`} layout)\n`;
                                 extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${stereoArg(outputAudioIdx, stream)}${loudnormStampArg(outputAudioIdx)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                                 if (sLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(sLang)}"`;
                                 outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: 2, bps: 0, approxRate });
@@ -1915,8 +1962,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
 
                 if (targetCodec === 'aac_vbr') {
-                    const { encoder, args, approxRate } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true);
-                    workDone += `☐Stream ${stream.index}: Normalizing ${rawCodec} ${channels}ch (loudnorm=${loudnorm}) → aac stereo @ ${approxRate} (libfdk VBR)\n`;
+                    const { encoder, args, approxRate, label } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true);
+                    workDone += `☐Stream ${stream.index}: Normalizing ${rawCodec} ${channels}ch (loudnorm=${loudnorm}) → aac stereo @ ${approxRate} (${label})\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args} -filter:a:${outputAudioIdx} "${filter}"${loudnormStampArg(outputAudioIdx)}`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels, bps: 0, approxRate });
