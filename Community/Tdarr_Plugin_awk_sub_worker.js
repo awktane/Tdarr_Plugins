@@ -12,7 +12,7 @@ const details = () => ({
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|default|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '1.1.1',
+    Version: '1.2.0',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -338,8 +338,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const forced = s.disposition?.forced === 1 ? '/forced' : '';
             return `[sub:${[lang, codec].filter(Boolean).join(' ')}${def}${forced}${role}]`;
         }
-        if (type === 'attachment')
-            return `[attach:${codec}]`;
+        if (type === 'attachment') {
+            // codec_name is frequently absent or 'none' on attachment streams (fonts especially), which would degrade an obviously-identifiable embedded font to
+            // [attach:unknown]. Fall back to the filename extension, then a font/image category from the mimetype - the same signals used to classify attachments.
+            let label = codec;
+            if (label === 'unknown' || label === 'none') {
+                const mime  = (s.tags?.mimetype || '').trim().toLowerCase();
+                const fname = (s.tags?.filename || '').trim().toLowerCase();
+                const ext   = fname.includes('.') ? fname.slice(fname.lastIndexOf('.') + 1) : '';
+                if (['ttf', 'otf', 'ttc', 'otc', 'pfb', 'pfa', 'woff', 'woff2', 'eot'].includes(ext)) label = ext;
+                else if (/font|truetype|opentype|sfnt/.test(mime)) label = 'font';
+                else if (mime.startsWith('image/')) label = 'image';
+                else if (ext) label = ext;
+            }
+            return `[attach:${label}]`;
+        }
         if (type === 'data')
             return `[data:${codec}]`;
         return `[${type || 'unknown'}:${codec}]`;

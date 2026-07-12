@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '2.11.0',
+    Version: '2.12.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -508,8 +508,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const forced = s.disposition?.forced === 1 ? '/forced' : '';
             return `[sub:${[lang, codec].filter(Boolean).join(' ')}${def}${forced}${role}]`;
         }
-        if (type === 'attachment')
-            return `[attach:${codec}]`;
+        if (type === 'attachment') {
+            // codec_name is frequently absent or 'none' on attachment streams (fonts especially), which would degrade an obviously-identifiable embedded font to
+            // [attach:unknown]. Fall back to the filename extension, then a font/image category from the mimetype - the same signals used to classify attachments.
+            let label = codec;
+            if (label === 'unknown' || label === 'none') {
+                const mime  = (s.tags?.mimetype || '').trim().toLowerCase();
+                const fname = (s.tags?.filename || '').trim().toLowerCase();
+                const ext   = fname.includes('.') ? fname.slice(fname.lastIndexOf('.') + 1) : '';
+                if (['ttf', 'otf', 'ttc', 'otc', 'pfb', 'pfa', 'woff', 'woff2', 'eot'].includes(ext)) label = ext;
+                else if (/font|truetype|opentype|sfnt/.test(mime)) label = 'font';
+                else if (mime.startsWith('image/')) label = 'image';
+                else if (ext) label = ext;
+            }
+            return `[attach:${label}]`;
+        }
         if (type === 'data')
             return `[data:${codec}]`;
         return `[${type || 'unknown'}:${codec}]`;

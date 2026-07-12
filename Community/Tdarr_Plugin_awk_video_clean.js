@@ -12,7 +12,7 @@ const details = () => ({
                      -Preserves static HDR10/HLG colour metadata; leaves Dolby Vision / HDR10+ files untouched by default (dynamic metadata can't survive a re-encode).\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '1.2.1',
+    Version: '1.3.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -430,8 +430,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const forced = s.disposition?.forced === 1 ? '/forced' : '';
             return `[sub:${[lang, codec].filter(Boolean).join(' ')}${def}${forced}${role}]`;
         }
-        if (type === 'attachment')
-            return `[attach:${codec}]`;
+        if (type === 'attachment') {
+            // codec_name is frequently absent or 'none' on attachment streams (fonts especially), which would degrade an obviously-identifiable embedded font to
+            // [attach:unknown]. Fall back to the filename extension, then a font/image category from the mimetype - the same signals used to classify attachments.
+            let label = codec;
+            if (label === 'unknown' || label === 'none') {
+                const mime  = (s.tags?.mimetype || '').trim().toLowerCase();
+                const fname = (s.tags?.filename || '').trim().toLowerCase();
+                const ext   = fname.includes('.') ? fname.slice(fname.lastIndexOf('.') + 1) : '';
+                if (['ttf', 'otf', 'ttc', 'otc', 'pfb', 'pfa', 'woff', 'woff2', 'eot'].includes(ext)) label = ext;
+                else if (/font|truetype|opentype|sfnt/.test(mime)) label = 'font';
+                else if (mime.startsWith('image/')) label = 'image';
+                else if (ext) label = ext;
+            }
+            return `[attach:${label}]`;
+        }
         if (type === 'data')
             return `[data:${codec}]`;
         return `[${type || 'unknown'}:${codec}]`;
