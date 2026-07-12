@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.11.0',
+    Version: '2.12.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -680,10 +680,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const dispKeysFor = (type) => Object.keys(dispositionTypes).filter(k => dispositionTypes[k].streams.includes(type));
     const titleTagsFor = (s) => [...new Set(dispKeysFor((s.codec_type || '').trim().toLowerCase())
         .filter(k => dispositionTypes[k].tag && hasDisposition(s, k)).map(k => dispositionTypes[k].tag))];
-    // tag_disposition: the tagged dispositions a stream matches by title (or flag) that aren't already a real
-    // flag - i.e. the keywords to promote into +flags. Same predicate for audio and subtitle, so keep it here.
-    const dispositionsToPromote = (s, type) => dispKeysFor(type)
-        .filter(key => dispositionTypes[key].tag && hasDisposition(s, key) && s.disposition?.[key] !== 1);
+    // tag_disposition: the tagged dispositions a stream matches by title (or flag) that aren't already a real flag - i.e. the keywords to promote into
+    // +flags. Same predicate for audio and subtitle, so keep it here. A promotion must be able to PERSIST in the destination container, or the flag never
+    // "takes" and the plugin re-promotes it on every pass (an infinite remux loop). Empirically (jellyfin-ffmpeg): Matroska has no captions/lyrics flag, and
+    // MP4/MOV has no original/lyrics flag - so a +flag for one of those is silently dropped by the muxer. captions is the SDH synonym of hearing_impaired
+    // (same 'SDH' tag) and hearing_impaired persists in both containers, so we promote hearing_impaired in captions' place rather than dropping the SDH role;
+    // a role with no storable flag in this container (lyrics anywhere; original into mp4) is skipped - its title keyword still drives the classifiers, summary
+    // and sort order, so nothing is lost but a redundant, non-persisting flag write. Dedupe by target so a track matching both SDH synonyms promotes once.
+    const unstorableDisp = { mkv: new Set(['captions', 'lyrics']), mp4: new Set(['original', 'lyrics']) };
+    const dispositionsToPromote = (s, type) => {
+        const out = []; const seen = new Set();
+        for (const key of dispKeysFor(type)) {
+            if (!dispositionTypes[key].tag || !hasDisposition(s, key)) continue;
+            const target = key === 'captions' ? 'hearing_impaired' : key;   // canonicalise the SDH synonym to the container-portable flag
+            if (s.disposition?.[target] === 1 || (unstorableDisp[dstContainer] || new Set()).has(target) || seen.has(target)) continue;
+            seen.add(target); out.push(target);
+        }
+        return out;
+    };
     // Single-word keywords stripped when recovering the channel/base portion of a title (multi-word
     // keywords like "hearing impaired" can't appear as a lone channel token, so they are skipped).
     const stripWords = new Set(Object.values(dispositionTypes).flatMap(d => d.keywords).filter(w => !w.includes(' ')));
