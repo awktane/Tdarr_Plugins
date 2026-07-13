@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.17.0',
+    Version: '2.18.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -127,6 +127,7 @@ const details = () => ({
                 options: ['disabled', 'multi-stereo', 'multi-stereo-error', 'channel', 'channel-error'],
             },
             tooltip: `If enabled then duplicate audio tracks (same language, same broad role) are reduced down to the highest quality option(s). Any stream newly created by downmix_to_six or downmix_to_stereo is always kept and is never collapsed against a different channel count it was created alongside (see below).
+                \\nCommentary and descriptive (visually-impaired) tracks are never treated as duplicates of each other - every such track is always kept, since two different commentaries (e.g. cast & crew vs directors) are distinct content even when both are titled "Commentary".
                 \\nThe "-error" variants use identical grouping/duplicate-detection logic to their non-error counterpart, but instead of deleting the lower quality duplicate(s) they abort the plugin run entirely (no streams are removed, no other changes in this run are applied) so the file can be inspected and tagged manually before being requeued.
                 \\n=====
                 \\nActions
@@ -1229,7 +1230,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The channel-count check protects the higher-channel duplicate under BOTH quality tiers ('enabled' and 'strict'), so 'strict' is genuinely ⊇ 'enabled'
         // (its documented "most protective" role) - there is no tier where 'strict' is less protective than 'enabled' for a channel-dropping dedup.
         const dedupeGuardBlocks = (removed, survivor) => {
-            if (removed.isTdarrSecondaryTrack || removed.isTdarrLangSecondary) return false;
+            if (removed.isTdarrLangSecondary) return false;   // a foreign-language MAIN track is deduped freely (secondary tracks never reach here - skipped in the loop)
             if (guardLossless === 'enabled' && removed.isTdarrLossless && !survivor.isTdarrLossless) return true;   // dropping the last lossless copy
             if (guardObjectAudio === 'enabled' && removed.isTdarrObjectAudio && !survivor.isTdarrObjectAudio) return true;   // dropping the last object-audio (Atmos/DTS:X) copy
             if (guardQuality !== 'disabled' && removed.channels > survivor.channels) return true;     // survivor has fewer channels (enabled AND strict)
@@ -1240,12 +1241,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // language lacks it) are computed AFTER dedup and the layout-drop pre-pass below, off the surviving (not-in-streamsToRemove) streams - so a track
         // those two removals take can't leave a stale "already exists" entry that wrongly suppresses a downmix backfill.
 
-        // Identify lower-quality duplicates. Within each group keep only the highest quality stream; the rest are marked for removal ('multi-stereo'/'channel')
-        // or, for the "-error" variants, abort the plugin immediately (no streams removed, no other changes applied). The "-error" suffix only changes what
-        // happens on a hit, never the grouping. Grouping key by mode:
-        //   'channel'/'channel-error' - (lang, exact channel count, primary/secondary): one track per distinct channel count survives (a 7.1, a 5.1 and
+        // Identify lower-quality duplicates among MAIN tracks only. Within each group keep only the highest quality stream; the rest are marked for removal
+        // ('multi-stereo'/'channel') or, for the "-error" variants, abort the plugin immediately (no streams removed, no other changes applied). Commentary/
+        // descriptive (secondary) tracks are exempt - never deduplicated (see the loop's early-continue), so two different commentaries are always both kept.
+        // The "-error" suffix only changes what happens on a hit, never the grouping. Grouping key by mode:
+        //   'channel'/'channel-error' - (lang, exact channel count): one track per distinct channel count survives (a 7.1, a 5.1 and
         //     a 2.0 of the same language are all kept).
-        //   'multi-stereo'/'multi-stereo-error' - (lang, broad surround-vs-stereo role, primary/secondary): collapses every surround variant of a
+        //   'multi-stereo'/'multi-stereo-error' - (lang, broad surround-vs-stereo role): collapses every surround variant of a
         //     language to a single best surround plus a single best stereo.
         //       Exception: when downmix_to_six is enabled the 5-6ch band is carved into its own role (not folded into "surround") so a
         //       downmix-created/pre-existing 5.1/5.0 is never removed in favour of a 7.1.
@@ -1279,6 +1281,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 (trustedRate(b) ? 1 : 0) - (trustedRate(a) ? 1 : 0) || b.isTdarrQuality - a.isTdarrQuality || b.channels - a.channels
                 || (b.isTdarrObjectAudio ? 1 : 0) - (a.isTdarrObjectAudio ? 1 : 0) || a.index - b.index);
             for (const s of byQuality) {
+                // Commentary/descriptive (secondary) tracks are never deduplicated: two different commentaries (e.g. cast & crew vs directors, often BOTH
+                // just titled "Commentary") are distinct content the grouping can't tell apart, so keep every one; only MAIN tracks are deduplicated.
+                if (s.isTdarrSecondaryTrack) continue;
                 let tier;
                 if (removeDuplicatesGroupBy === 'channel') {
                     tier = s.channels;
@@ -1289,10 +1294,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 } else {
                     tier = s.channels > 2 ? 'surround' : 'stereo';
                 }
-                // Group only by the genuine commentary/VI marker (isTdarrSecondaryTrack), NOT by lang-secondary. A foreign-language MAIN track and a
-                // foreign-language COMMENTARY track share the same language and channel count but are different content — keying on lang-secondary would
-                // collapse them together and wrongly delete the commentary.
-                const key = `${s.isTdarrCleanLang}|${tier}|${s.isTdarrSecondaryTrack}`;
+                // Only MAIN tracks reach here (secondaries skipped above), so lang + channel-tier fully identifies a duplicate group.
+                const key = `${s.isTdarrCleanLang}|${tier}`;
                 if (seen.has(key)) {
                     const kept = seen.get(key);
                     if (dedupeGuardBlocks(s, kept)) continue;
