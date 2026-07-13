@@ -11,7 +11,7 @@ const details = () => ({
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them. Import ALSO recognizes fresh Plex-native sidecars with no s<index> (e.g. <video>.en.forced.srt), anchoring on the language token.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '1.6.0',
+    Version: '1.999.0',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
