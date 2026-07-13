@@ -7,11 +7,11 @@ const details = () => ({
     Description: `Round-trips text subtitles between the container and Plex-style sidecar files so they can be reviewed/edited on disk.
 
                 \\nmode=extract writes each embedded TEXT subtitle to a sidecar next to the video (native format: srt/ass/vtt) and, by default, removes those tracks from the file.
-                \\nmode=import muxes matching sidecars back into the file (restoring language, title, and disposition) and, by default, deletes the sidecar once it is safely embedded.
-                \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them.
+                \\nmode=import muxes matching sidecars back into the file (restoring language, title, and disposition) and, by default, deletes the sidecar once it is safely embedded. Import never drops a subtitle - anything not already embedded is muxed in (a copy already present just becomes a duplicate, never a loss); method_deduplicate collapses byte-identical copies.
+                \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them. Import ALSO recognizes fresh Plex-native sidecars with no s<index> (e.g. <video>.en.forced.srt), anchoring on the language token.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '1.5.0',
+    Version: '1.6.0',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -54,12 +54,23 @@ const details = () => ({
             inputUI: { type: 'dropdown', options: ['true', 'false'] },
             tooltip: `On import, delete each sidecar whose basename is listed in the file's global awk_sub_worker marker (stamped by the prior mux pass). Tdarr only re-runs after a successful mux, so a listed sidecar is confirmed embedded. Off = leave the sidecars in place.`,
         },
+        {
+            name: 'method_deduplicate',
+            type: 'string',
+            defaultValue: 'enabled',
+            inputUI: { type: 'dropdown', options: ['disabled', 'enabled', 'enabled_delete'] },
+            tooltip: `On import, how to handle sidecar files that are BYTE-IDENTICAL to each other (the same subtitle saved under more than one name/flag). Content is compared, so genuinely different tracks - two commentaries, a real forced vs a full track - are always kept separately; only exact duplicates collapse.
+                \\nImport never drops a subtitle: a sidecar whose text isn't already embedded is always muxed in (if its content already exists in the file you simply get a duplicate track, never a loss).
+                \\ndisabled       - mux every sidecar as its own track, even byte-identical copies (you may get duplicate subtitles).
+                \\nenabled        - mux one track per byte-identical group, combining their flags (a byte-identical plain + SDH pair imports once, tagged SDH). All sidecar files are left on disk.
+                \\nenabled_delete - same as enabled, and once the muxed track is confirmed embedded, delete every sidecar file that was imported/deduplicated this pass (regardless of remove_sidecar_after_import). Non-destructive: the content survives in the embedded track.`,
+        },
     ],
 });
 
 // eslint-disable-next-line no-unused-vars
 const plugin = (file, librarySettings, inputs, otherArguments) => {
-    const lib = require('../methods/lib')(); const fs = require('fs'); const path = require('path');
+    const lib = require('../methods/lib')(); const fs = require('fs'); const path = require('path'); const crypto = require('crypto');
     // eslint-disable-next-line no-param-reassign
     inputs = lib.loadDefaultValues(inputs, details);
 
@@ -509,7 +520,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const libDir = path.dirname(libFilePath);
     const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '');
 
-    // sidecarBasename <-> parseSidecar are exact inverses. Name = <videoBase>.s<index>[.<encTitle>].<lang>[.<disp...>].<ext>.
+    // Recognize a filename token as a real language (2/3-letter ISO code or English name) so a Plex-native sidecar can be anchored on it without
+    // mis-reading an arbitrary token as a language. Normalizes via the shared langKey, then confirms it names a real language (Intl.DisplayNames
+    // with fallback:'none' returns undefined for non-languages). The DisplayNames instance is built once, on first use.
+    const langDisplay = (() => { let dn = null; return () => (dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' })); })();
+    const isKnownLang = (token) => { const k = langKey(token); if (!k) return false; try { return !!langDisplay().of(k); } catch (e) { return false; } };
+
+    // sidecarBasename <-> parseSidecar are exact inverses. Name = <videoBase>.s<index>[.<encTitle>].<lang>[.<disp...>].<ext>. parseSidecar ALSO
+    // accepts a Plex-native name with no s<index> (e.g. <videoBase>.en.forced.srt), anchored on a recognized <lang> token.
     const sidecarBasename = (s) => {
         const lang = resolveLang(s) || 'und';
         const disp = dispTokensOf(s);
@@ -525,25 +543,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!name.startsWith(`${videoBase}.`)) return null;
         const mid = name.slice(videoBase.length + 1, name.length - extMatch[0].length);
         const toks = mid.split('.');
-        if (!toks.length || !/^s\d+$/.test(toks[0])) return null;         // order marker
-        const index = parseInt(toks[0].slice(1), 10);
-        toks.shift();
+        if (!toks.length) return null;
+        // Our own sidecars lead with an s<index> order marker; a fresh Plex-native sidecar (Movie.en.forced.srt) has none. Consume the marker if
+        // present (index only keeps our names unique); otherwise index is null and the language token below MUST be a recognized language, so an
+        // unrelated .srt (Movie.backup.srt) is not mis-read as lang="backup" and imported as junk.
+        const ours = /^s\d+$/.test(toks[0]);
+        const index = ours ? parseInt(toks.shift().slice(1), 10) : null;
         const rawDisp = [];
         while (toks.length && DISP_TOKENS.has(toks[toks.length - 1])) rawDisp.unshift(toks.pop());  // trailing dispositions, right-to-left
         const dispTokens = [...new Set(rawDisp.filter((t) => !DISP_IGNORE.has(t)).map((t) => DISP_ALIAS[t] || t))];   // drop ignored (default), normalise legacy (cc->sdh), dedupe
         if (!toks.length) return null;
         const lang = toks.pop();                                          // language is the next-from-right token
         if (!lang) return null;
+        if (!ours && !isKnownLang(lang)) return null;                     // Plex-native has no s<index> anchor, so its language token must be real
         if (toks.length > 1) return null;                                // 0 or 1 residual token = the encoded title
         const title = toks.length ? decodeTitle(toks[0]) : '';
         return { name, index, lang, title, ext: extMatch[1].toLowerCase(), dispTokens, disp: [...new Set(dispTokens.map(dispFfOf).filter(Boolean))] };
     };
 
     const parseLangFilter = (v) => { const l = String(v || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean); return l.length ? new Set(l.map(langKey)) : null; };   // keys, so en/eng/English match
-    // Composite identity key that survives the round-trip (language | title | sorted-dispositions), used to match a
-    // sidecar to an embedded track (skip duplicate imports; confirm a sidecar is safely embedded before deleting it).
-    const keyOfStream = (s) => `${resolveLang(s) || 'und'}|${s.tags?.title || ''}|${dispTokensOf(s).slice().sort().join('+')}`;
-    const keyOfSidecar = (f) => `${f.lang}|${f.title}|${f.dispTokens.slice().sort().join('+')}`;
     // Synthetic stream so a not-yet-muxed sidecar renders through summariseStream in the expected-results line.
     const sidecarToStream = (f) => {
         const codec = f.ext === 'srt' ? 'subrip' : (f.ext === 'ass' ? 'ass' : 'webvtt');
@@ -555,6 +573,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams)) failFile('No ffProbe stream data available. Check your settings!');
     const mode = String(inputs.mode);
     if (mode !== 'extract' && mode !== 'import') failFile(`mode "${mode}" is invalid (expected extract or import). Check your settings!`);
+    if (!['disabled', 'enabled', 'enabled_delete'].includes(String(inputs.method_deduplicate))) failFile(`method_deduplicate "${inputs.method_deduplicate}" is invalid (expected disabled, enabled, or enabled_delete). Check your settings!`);
     if (file.fileMedium && file.fileMedium !== 'video') { response.infoLog += '☑Not a video file - skipping.\n'; return response; }
 
     const streams = file.ffProbeData.streams;
@@ -562,6 +581,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const skipCommentary = String(inputs.skip_commentary) === 'true';
     const removeAfterExtract = String(inputs.remove_after_extract) === 'true';
     const removeSidecarAfterImport = String(inputs.remove_sidecar_after_import) === 'true';
+    const dedupeMode = String(inputs.method_deduplicate);
     const dstContainer = String(file.container || '').toLowerCase().trim();
     const isMp4Family = ['mp4', 'm4v', 'mov', 'm4a'].includes(dstContainer);
 
@@ -616,24 +636,46 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .filter((f) => !(skipCommentary && f.dispTokens.includes('commentary')));
         if (!found.length) { response.infoLog += '☑No subtitle sidecars found to import.\n'; return response; }
 
+        // Sidecars are removed only after their content is confirmed embedded: remove_sidecar_after_import deletes everything we muxed, and
+        // method_deduplicate=enabled_delete additionally forces removal of every file consumed this pass (dedup group members included), regardless.
+        const deleteConfirmed = removeSidecarAfterImport || dedupeMode === 'enabled_delete';
         let deleted = 0;
-        if (removeSidecarAfterImport) {
+        if (deleteConfirmed) {
             for (const f of found.filter((x) => importedSet.has(x.name))) {
                 try { fs.unlinkSync(path.join(libDir, f.name)); deleted += 1; response.infoLog += `☑Deleted sidecar (embedded): ${f.name}\n`; }
                 catch (e) { response.infoLog += `☒Could not delete sidecar ${f.name}: ${e && e.message ? e.message : e}\n`; }
             }
         }
 
-        // toAdd = sidecars neither already embedded (fresh) nor muxed by the prior pass (excluded via the marker list).
-        const embeddedKeys = new Set(streams.filter((s) => (s.codec_type || '').toLowerCase() === 'subtitle' && isTextSub(s.codec_name)).map(keyOfStream));
+        // Import is NON-DESTRUCTIVE: every recognized sidecar not already handled by our own prior pass (marker) is muxed in. We do NOT suppress a
+        // sidecar just because an embedded sub shares its lang|title|disposition - metadata can't prove same content, and dropping a distinct track is
+        // data loss, whereas a redundant duplicate is not. Genuine duplication is collapsed by CONTENT instead (method_deduplicate, below).
         const existingSubCount = streams.filter((s) => (s.codec_type || '').toLowerCase() === 'subtitle').length;
-        const toAdd = found.filter((f) => !importedSet.has(f.name) && !embeddedKeys.has(keyOfSidecar(f)));
+        const candidates = found.filter((f) => !importedSet.has(f.name));
 
-        if (toAdd.length) {
-            // Mux the new sidecars. Extra -i inputs go on the OUTPUT side (main stays input 0). Stamp the GLOBAL marker
-            // with this pass's basenames (survives mp4 with use_metadata_tags); reQueue so the next pass confirms-and-deletes.
+        // Group candidates by byte-identical file content (disabled => every file is its own group). readFileSync can't fail for a file readdir just
+        // listed, but guard anyway: an unreadable file gets a unique key so it is imported on its own, never silently dropped or merged.
+        const contentKey = (f) => { try { return crypto.createHash('sha1').update(fs.readFileSync(path.join(libDir, f.name))).digest('hex'); } catch (e) { return `unreadable:${f.name}`; } };
+        const groups = [];
+        if (dedupeMode === 'disabled') { for (const f of candidates) groups.push([f]); }
+        else { const byHash = new Map(); for (const f of candidates) { const h = contentKey(f); let g = byHash.get(h); if (!g) { g = []; byHash.set(h, g); groups.push(g); } g.push(f); } }
+
+        // One import per group: union the members' disposition tokens (byte-identical plain + SDH -> SDH), and take the first non-"und" language and
+        // first non-empty title. The physical file muxed is the member with the most-specific dispositions (deterministic tie-break by name); its
+        // metadata is overridden by the merged values, so which identical copy we pick doesn't matter.
+        const merged = groups.map((g) => {
+            const dispTokens = [...new Set(g.flatMap((m) => m.dispTokens))];
+            const lang = (g.find((m) => m.lang && m.lang !== 'und') || g[0]).lang;
+            const title = g.map((m) => m.title).find(Boolean) || '';
+            const src = g.slice().sort((a, b) => b.dispTokens.length - a.dispTokens.length || (a.name < b.name ? -1 : 1))[0];
+            return { members: g, name: src.name, ext: src.ext, lang, title, dispTokens, disp: [...new Set(dispTokens.map(dispFfOf).filter(Boolean))] };
+        });
+
+        if (merged.length) {
+            // Mux one track per group. Extra -i inputs go on the OUTPUT side (main stays input 0). The marker lists EVERY consumed file (all group
+            // members) so a re-run never re-imports them and the confirm pass can delete the whole deduplicated set; reQueue only when a delete is due.
             let inputSide = ''; let extraMaps = ''; let meta = '';
-            toAdd.forEach((f, k) => {
+            merged.forEach((f, k) => {
                 const outIdx = existingSubCount + k;
                 inputSide += ` -sub_charenc UTF-8 -i "${path.join(libDir, f.name)}"`;
                 extraMaps += ` -map ${k + 1}:0`;
@@ -641,15 +683,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (f.title) meta += ` -metadata:s:s:${outIdx} "title=${escMeta(f.title)}"`;
                 if (f.disp.length) meta += ` -disposition:s:${outIdx} ${f.disp.join('+')}`;
                 if (isMp4Family) meta += ` -c:s:${outIdx} mov_text`;
+                if (f.members.length > 1) response.infoLog += `☑Deduplicated ${f.members.length} byte-identical sidecars -> ${f.name} (${f.lang}${f.dispTokens.length ? ` ${f.dispTokens.join('+')}` : ''})\n`;
                 response.infoLog += `☐Import ${f.name} -> subtitle ${outIdx} (${f.lang}${f.dispTokens.length ? ` ${f.dispTokens.join('+')}` : ''})\n`;
             });
-            let out = `${inputSide} -map 0${extraMaps} -c copy${meta} -metadata "awk_sub_worker=${encodeMarkerList(toAdd.map((f) => f.name))}"`;
+            const consumed = merged.flatMap((f) => f.members.map((m) => m.name));
+            let out = `${inputSide} -map 0${extraMaps} -c copy${meta} -metadata "awk_sub_worker=${encodeMarkerList(consumed)}"`;
             if (isMp4Family) out += ' -movflags use_metadata_tags';
             out += globalOutputOpt;
             response.preset = `,${out}`;
             response.processFile = true;
-            response.reQueueAfter = removeSidecarAfterImport;   // only re-run if a confirm-and-delete pass is needed
-            const expected = streams.concat(toAdd.map(sidecarToStream));
+            response.reQueueAfter = deleteConfirmed;   // re-run only to delete the now-embedded sidecars
+            const expected = streams.concat(merged.map(sidecarToStream));
             response.infoLog += `☑Expected results: ${expected.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
             return response;
         }
