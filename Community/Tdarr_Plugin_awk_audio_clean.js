@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.15.2',
+    Version: '2.16.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -788,6 +788,85 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .replace(/"/g, "'");               // double-quote → single-quote (safe inside the quoted value)
     // ===== END SHARED: ffmpeg metadata escaping =====
 
+    // ===== SHARED [audio_clean, clean_and_remux]: title canonicalization =====
+    // The canonical audio-title machinery both plugins share, so audio_clean's downmix titles come out already in clean_and_remux's tag_title form and a
+    // later clean_and_remux pass has nothing to reorder (no wasted remux). Canonical form: "<channel/downmix base> - <role tags>", base first and any
+    // disposition roles LAST (e.g. "5.1 -> 2.0 - Commentary"). canonicalAudioTitle is the entry point; the rest are its building blocks.
+    // -=-=-= channel-label vocab: channelTitleLabels / bareChannelRegex / downmixChannelRegex  [audio_clean, clean_and_remux] =-=-=-
+    //The channel labels we recognise/replace for tag_title - include 2.0 to allow us to overwrite that with stereo
+    const channelTitleLabels = ['7.1', '6.1', '5.1', '5.0', '4.0', '3.1', '3.0', '2.1', '2.0', 'stereo', 'mono'];
+    const channelLabelAlternation = channelTitleLabels.map(l => l.replace(/\./g, '\\.')).join('|');
+    //A bare channel title (the whole title is just a channel label) - we own these and may derive/overwrite them.
+    const bareChannelRegex = new RegExp(`^(${channelLabelAlternation})$`, 'i');
+    //A downmix/channel-derived base produced elsewhere (e.g. audio_clean "5.1 -> 2.0"): a bare channel label on BOTH sides of the "->". Requiring the left side
+    //to also be a channel label keeps a rich custom title that merely ends in "-> <channel>" (e.g. "Dolby Digital Plus / 7.1 / 48 kHz / 1024 kbps -> 2.0",
+    //which audio_clean builds by appending the downmix arrow to the source title) classified as custom - so it is left alone, not stripped and rewritten.
+    const downmixChannelRegex = new RegExp(`^(${channelLabelAlternation})\\s*->\\s*(${channelLabelAlternation})$`, 'i');
+    // -=-=-= channelLabel  [audio_clean, clean_and_remux] =-=-=-
+    // Map a channel count to our short label, honouring an LFE for the 3/4-channel ambiguity (3.1 vs 4.0, 2.1 vs 3.0). Callers resolve the count (ffprobe,
+    // mediaInfo, or layout via resolveChannels) and pass whether the layout string carries an LFE; a target-only caller (audio_clean naming a downmix
+    // result) passes the target count with hasLfe=false.
+    const channelLabel = (channels, hasLfe) => {
+        switch (channels) {
+            case 8: return '7.1';
+            case 7: return '6.1';
+            case 6: return '5.1';
+            case 5: return '5.0';
+            case 4: return hasLfe ? '3.1' : '4.0';
+            case 3: return hasLfe ? '2.1' : '3.0';
+            case 2: return 'Stereo';
+            case 1: return 'Mono';
+            default: return '';
+        }
+    };
+    // -=-=-= cleanStreamTitle  [audio_clean, clean_and_remux] =-=-=-
+    //Clean up titles - remove surrounding whitespace/quotes (no reason for them), and dedupe repeated segments ("Stereo / Stereo" -> "Stereo").
+    //Busy-title removal (>3 periods) is applied by callers AFTER tagging, not here - roles are captured into flags before an over-dotted title clears.
+    function cleanStreamTitle(rawTitle) {
+        let title = (rawTitle || '').trim().replace(/^["']+|["']+$/g, '');
+        if (title) {
+            const parts = title.split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
+            if (parts.length === 1) return parts[0];
+            // When all parts are the same word (case-insensitive), deduplicate to the first occurrence.
+            // "First part wins" is intentional: preserves the leading segment's casing (e.g. "Stereo / stereo"→"Stereo", "ENGLISH - English"→"ENGLISH").
+            if (parts.length > 1 && parts.every(p => p.toLowerCase() === parts[0].toLowerCase()))
+                return parts[0];
+        }
+        return title;
+    }
+    // -=-=-= dispKeysFor / titleTagsFor  [audio_clean, clean_and_remux] =-=-=-
+    // dispKeysFor: the dispositions valid on a stream type. titleTagsFor: the deduped canonical tag strings a stream matches (real flag OR title keyword, via
+    // hasDisposition), excluding untagged flags like default/cover-art. Both derive from the shared dispositionTypes table (single source of truth).
+    const dispKeysFor = (type) => Object.keys(dispositionTypes).filter(k => dispositionTypes[k].streams.includes(type));
+    const titleTagsFor = (s) => [...new Set(dispKeysFor((s.codec_type || '').trim().toLowerCase())
+        .filter(k => dispositionTypes[k].tag && hasDisposition(s, k)).map(k => dispositionTypes[k].tag))];
+    // -=-=-= stripWords / stripDispositionWords  [audio_clean, clean_and_remux] =-=-=-
+    // Single-word keywords stripped when recovering the channel/base portion of a title (multi-word
+    // keywords like "hearing impaired" can't appear as a lone channel token, so they are skipped).
+    const stripWords = new Set(Object.values(dispositionTypes).flatMap(d => d.keywords).filter(w => !w.includes(' ')));
+    // Drop disposition keywords and stray separators from a title, leaving the channel/downmix base.
+    // Splits on whitespace, keeps the "->" downmix arrow, drops lone separators and any keyword token.
+    const stripDispositionWords = (title) => (title || '')
+        .split(/\s+/)
+        .filter(tok => !['-', '/', '|', '•'].includes(tok)
+            && !stripWords.has(tok.replace(/^[^\w]+|[^\w]+$/g, '').toLowerCase()))
+        .join(' ')
+        .trim();
+    // -=-=-= canonicalAudioTitle  [audio_clean, clean_and_remux] =-=-=-
+    // Reduce a cleaned title to the canonical "<base> - <roles>" form. Ownership: an empty or bare-channel base is replaced by bareLabel (the stream's own
+    // channel label, or a downmix target's); a "<channel> -> <channel>" downmix base is kept verbatim; any other (custom) title is returned unchanged - we
+    // don't own it. roleTags (from titleTagsFor) are appended LAST. A bareLabel of '' (an unmappable channel count) leaves the title as-is rather than
+    // writing a bare "- Role".
+    const canonicalAudioTitle = (cleanedTitle, bareLabel, roleTags) => {
+        let base = stripDispositionWords(cleanedTitle);
+        if (!(!base || bareChannelRegex.test(base) || downmixChannelRegex.test(base))) return cleanedTitle;
+        if (!base || bareChannelRegex.test(base)) base = bareLabel;
+        if (!base) return cleanedTitle;
+        const suffix = roleTags.join(' ');
+        return suffix ? `${base} - ${suffix}` : base;
+    };
+    // ===== END SHARED: title canonicalization =====
+
     // Bail out gracefully on missing/partial probe data, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
         failFile('No ffProbe stream data available for this file - the plugin cannot process it.');
@@ -1355,16 +1434,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const outputAudioOverride = new Map();
         const appendedAudio = [];
 
-        // Build the title for a new or replaced track. The original track title is always preserved and the new channel count is appended with -> (e.g. a
-        // source titled "E-AC-3 Atmos 5.1" downmixed to stereo becomes "E-AC-3 Atmos 5.1 -> 2.0"). This keeps role words like "Commentary"/"Director's
-        // Commentary" visible after a downmix. When the source has no title the new channel count alone is used (e.g. "2.0"). If the title already ends in
-        // the target label (not preceded by a digit/dot, so "5.1" won't match "15.1") it is returned unchanged to avoid "... 2.0 -> 2.0".
+        // Build the title for a new or replaced track, in the canonical form clean_and_remux's tag_title converges on - so a subsequent clean_and_remux pass
+        // finds nothing to rewrite and the file settles without an extra remux. The channel/downmix base comes first and any disposition roles go LAST: a
+        // source "5.1 - Commentary" downmixed to stereo becomes "5.1 -> 2.0 - Commentary"; a bare "5.1" becomes "5.1 -> 2.0"; an untitled track becomes just
+        // the target label (e.g. "Stereo"); and a rich custom title clean_and_remux wouldn't own keeps its arrow-appended form ("Dolby TrueHD 7.1 -> 2.0").
+        // The raw arrow title is assembled first (source + "-> label", or the label alone when untitled; unchanged if it already ends in the target label, so
+        // no "... 2.0 -> 2.0"), then canonicalAudioTitle applies clean_and_remux's exact ownership/role rules. Roles come from the source flags via the shared
+        // titleTagsFor, and the target's bare label (e.g. "2.0" -> "Stereo") from the shared channelLabel, so both plugins always agree.
         const buildTitle = (srcStream, targetLabel) => {
             const origTitle = (srcStream.tags?.title || mediaInfoFor(srcStream)?.Title || '').trim();
-            if (!origTitle) return targetLabel;
             const escapedLabel = targetLabel.replace(/\./g, '\\.');
-            if (new RegExp(`(?:^|[^0-9.])${escapedLabel}$`).test(origTitle)) return origTitle;
-            return `${origTitle} -> ${targetLabel}`;
+            const raw = !origTitle ? targetLabel
+                : new RegExp(`(?:^|[^0-9.])${escapedLabel}$`).test(origTitle) ? origTitle
+                : `${origTitle} -> ${targetLabel}`;
+            const m = targetLabel.match(/(\d+)\.(\d+)(?:\.(\d+))?/);
+            const bareLabel = channelLabel(m ? (+m[1] + +m[2] + (+m[3] || 0)) : 0, false);
+            return canonicalAudioTitle(cleanStreamTitle(raw), bareLabel, titleTagsFor(srcStream));
         };
 
         // Lo/Ro stereo downmix matrices, generated from each source layout's exact channel order.

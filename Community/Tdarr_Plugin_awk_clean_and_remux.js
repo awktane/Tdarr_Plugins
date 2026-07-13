@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.13.1',
+    Version: '2.14.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -604,6 +604,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // language_fill, and neither counts as a survivor for the language_fill_fail untagged tally or the remove_accessibility plain-track guard.
     const subDroppedAnyReason = (codec) => subFormatDropped(codec) || imageSubDropped(codec);
 
+    // ===== SHARED [audio_clean, clean_and_remux]: title canonicalization =====
+    // The canonical audio-title machinery both plugins share, so audio_clean's downmix titles come out already in clean_and_remux's tag_title form and a
+    // later clean_and_remux pass has nothing to reorder (no wasted remux). Canonical form: "<channel/downmix base> - <role tags>", base first and any
+    // disposition roles LAST (e.g. "5.1 -> 2.0 - Commentary"). canonicalAudioTitle is the entry point; the rest are its building blocks.
+    // -=-=-= channel-label vocab: channelTitleLabels / bareChannelRegex / downmixChannelRegex  [audio_clean, clean_and_remux] =-=-=-
     //The channel labels we recognise/replace for tag_title - include 2.0 to allow us to overwrite that with stereo
     const channelTitleLabels = ['7.1', '6.1', '5.1', '5.0', '4.0', '3.1', '3.0', '2.1', '2.0', 'stereo', 'mono'];
     const channelLabelAlternation = channelTitleLabels.map(l => l.replace(/\./g, '\\.')).join('|');
@@ -613,25 +618,76 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //to also be a channel label keeps a rich custom title that merely ends in "-> <channel>" (e.g. "Dolby Digital Plus / 7.1 / 48 kHz / 1024 kbps -> 2.0",
     //which audio_clean builds by appending the downmix arrow to the source title) classified as custom - so it is left alone, not stripped and rewritten.
     const downmixChannelRegex = new RegExp(`^(${channelLabelAlternation})\\s*->\\s*(${channelLabelAlternation})$`, 'i');
-    // Channel layout string from ffprobe, falling back to mediaInfo (ChannelLayout/ChannelPositions) - lets us spot the LFE that separates 3.1 from 4.0 and
-    // 2.1 from 3.0 even when ffprobe omits channel_layout.
-    const channelLayoutStr = (ffstream) => {
-        const ffmedia = mediaInfoFor(ffstream);
-        return (ffstream.channel_layout || ffmedia?.ChannelLayout || ffmedia?.ChannelPositions || '').toLowerCase();
-    };
-    // Map an audio stream's channel count (ffprobe, or mediaInfo/layout via resolveChannels) to our short label, honouring LFE for the 3/4 channel ambiguity.
-    const channelLabel = (ffstream) => {
-        switch (resolveChannels(ffstream)) {
+    // -=-=-= channelLabel  [audio_clean, clean_and_remux] =-=-=-
+    // Map a channel count to our short label, honouring an LFE for the 3/4-channel ambiguity (3.1 vs 4.0, 2.1 vs 3.0). Callers resolve the count (ffprobe,
+    // mediaInfo, or layout via resolveChannels) and pass whether the layout string carries an LFE; a target-only caller (audio_clean naming a downmix
+    // result) passes the target count with hasLfe=false.
+    const channelLabel = (channels, hasLfe) => {
+        switch (channels) {
             case 8: return '7.1';
             case 7: return '6.1';
             case 6: return '5.1';
             case 5: return '5.0';
-            case 4: return channelLayoutStr(ffstream).includes('lfe') ? '3.1' : '4.0';
-            case 3: return channelLayoutStr(ffstream).includes('lfe') ? '2.1' : '3.0';
+            case 4: return hasLfe ? '3.1' : '4.0';
+            case 3: return hasLfe ? '2.1' : '3.0';
             case 2: return 'Stereo';
             case 1: return 'Mono';
             default: return '';
         }
+    };
+    // -=-=-= cleanStreamTitle  [audio_clean, clean_and_remux] =-=-=-
+    //Clean up titles - remove surrounding whitespace/quotes (no reason for them), and dedupe repeated segments ("Stereo / Stereo" -> "Stereo").
+    //Busy-title removal (>3 periods) is applied by callers AFTER tagging, not here - roles are captured into flags before an over-dotted title clears.
+    function cleanStreamTitle(rawTitle) {
+        let title = (rawTitle || '').trim().replace(/^["']+|["']+$/g, '');
+        if (title) {
+            const parts = title.split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
+            if (parts.length === 1) return parts[0];
+            // When all parts are the same word (case-insensitive), deduplicate to the first occurrence.
+            // "First part wins" is intentional: preserves the leading segment's casing (e.g. "Stereo / stereo"→"Stereo", "ENGLISH - English"→"ENGLISH").
+            if (parts.length > 1 && parts.every(p => p.toLowerCase() === parts[0].toLowerCase()))
+                return parts[0];
+        }
+        return title;
+    }
+    // -=-=-= dispKeysFor / titleTagsFor  [audio_clean, clean_and_remux] =-=-=-
+    // dispKeysFor: the dispositions valid on a stream type. titleTagsFor: the deduped canonical tag strings a stream matches (real flag OR title keyword, via
+    // hasDisposition), excluding untagged flags like default/cover-art. Both derive from the shared dispositionTypes table (single source of truth).
+    const dispKeysFor = (type) => Object.keys(dispositionTypes).filter(k => dispositionTypes[k].streams.includes(type));
+    const titleTagsFor = (s) => [...new Set(dispKeysFor((s.codec_type || '').trim().toLowerCase())
+        .filter(k => dispositionTypes[k].tag && hasDisposition(s, k)).map(k => dispositionTypes[k].tag))];
+    // -=-=-= stripWords / stripDispositionWords  [audio_clean, clean_and_remux] =-=-=-
+    // Single-word keywords stripped when recovering the channel/base portion of a title (multi-word
+    // keywords like "hearing impaired" can't appear as a lone channel token, so they are skipped).
+    const stripWords = new Set(Object.values(dispositionTypes).flatMap(d => d.keywords).filter(w => !w.includes(' ')));
+    // Drop disposition keywords and stray separators from a title, leaving the channel/downmix base.
+    // Splits on whitespace, keeps the "->" downmix arrow, drops lone separators and any keyword token.
+    const stripDispositionWords = (title) => (title || '')
+        .split(/\s+/)
+        .filter(tok => !['-', '/', '|', '•'].includes(tok)
+            && !stripWords.has(tok.replace(/^[^\w]+|[^\w]+$/g, '').toLowerCase()))
+        .join(' ')
+        .trim();
+    // -=-=-= canonicalAudioTitle  [audio_clean, clean_and_remux] =-=-=-
+    // Reduce a cleaned title to the canonical "<base> - <roles>" form. Ownership: an empty or bare-channel base is replaced by bareLabel (the stream's own
+    // channel label, or a downmix target's); a "<channel> -> <channel>" downmix base is kept verbatim; any other (custom) title is returned unchanged - we
+    // don't own it. roleTags (from titleTagsFor) are appended LAST. A bareLabel of '' (an unmappable channel count) leaves the title as-is rather than
+    // writing a bare "- Role".
+    const canonicalAudioTitle = (cleanedTitle, bareLabel, roleTags) => {
+        let base = stripDispositionWords(cleanedTitle);
+        if (!(!base || bareChannelRegex.test(base) || downmixChannelRegex.test(base))) return cleanedTitle;
+        if (!base || bareChannelRegex.test(base)) base = bareLabel;
+        if (!base) return cleanedTitle;
+        const suffix = roleTags.join(' ');
+        return suffix ? `${base} - ${suffix}` : base;
+    };
+    // ===== END SHARED: title canonicalization =====
+
+    // Channel layout string from ffprobe, falling back to mediaInfo (ChannelLayout/ChannelPositions) - lets us spot the LFE that separates 3.1 from 4.0 and
+    // 2.1 from 3.0 even when ffprobe omits channel_layout. Feeds channelLabel's hasLfe argument at the tag_title call site.
+    const channelLayoutStr = (ffstream) => {
+        const ffmedia = mediaInfoFor(ffstream);
+        return (ffstream.channel_layout || ffmedia?.ChannelLayout || ffmedia?.ChannelPositions || '').toLowerCase();
     };
 
     // Classify an attachment stream so we only ever remove things we can positively identify:
@@ -656,21 +712,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return 'other';
     };
 
-    //Clean up titles - remove surrounding whitespace/quotes (no reason for them), and dedupe repeated segments ("Stereo / Stereo" -> "Stereo").
-    //Busy-title removal (>3 periods) is applied by callers AFTER tagging, not here - roles are captured into flags before an over-dotted title clears.
-    function cleanStreamTitle(rawTitle) {
-        let title = (rawTitle || '').trim().replace(/^["']+|["']+$/g, '');
-        if (title) {
-            const parts = title.split(/\s*(?:\/|\||-|•)\s*/).map(p => p.trim().replace(/\s+/g, ' ')).filter(Boolean);
-            if (parts.length === 1) return parts[0];
-            // When all parts are the same word (case-insensitive), deduplicate to the first occurrence.
-            // "First part wins" is intentional: preserves the leading segment's casing (e.g. "Stereo / stereo"→"Stereo", "ENGLISH - English"→"ENGLISH").
-            if (parts.length > 1 && parts.every(p => p.toLowerCase() === parts[0].toLowerCase()))
-                return parts[0];
-        }
-        return title;
-    }
-
     // >3-period 'busy'/scene-release title test (>4 dot-segments). Callers apply it AFTER role tagging, per the cleanStreamTitle note.
     const tooManyPeriods = (s) => (s || '').trim().split('.').length > 4;
 
@@ -680,13 +721,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (unlike escMeta, which rewrites them for ffmpeg-argument safety). Display-only, never feeds ffmpeg.
     const logSafe = (value) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ');
 
-    // Disposition title/flag helpers.
-    // Everything derives from the shared dispositionTypes table (single source of truth). dispKeysFor: dispositions valid on a stream type. titleTagsFor: the
-    // deduped canonical tag strings a stream matches (flag or keyword, via the shared classifiers), excluding untagged flags like default/cover-art. Drives
-    // flag promotion and title rebuilding below.
-    const dispKeysFor = (type) => Object.keys(dispositionTypes).filter(k => dispositionTypes[k].streams.includes(type));
-    const titleTagsFor = (s) => [...new Set(dispKeysFor((s.codec_type || '').trim().toLowerCase())
-        .filter(k => dispositionTypes[k].tag && hasDisposition(s, k)).map(k => dispositionTypes[k].tag))];
     // tag_disposition: the tagged dispositions a stream matches by title (or flag) that aren't already a real flag - i.e. the keywords to promote into
     // +flags. Same predicate for audio and subtitle, so keep it here. A promotion must be able to PERSIST in the destination container, or the flag never
     // "takes" and the plugin re-promotes it on every pass (an infinite remux loop). Empirically (jellyfin-ffmpeg): Matroska has no captions/lyrics flag, and
@@ -707,17 +741,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return out;
     };
-    // Single-word keywords stripped when recovering the channel/base portion of a title (multi-word
-    // keywords like "hearing impaired" can't appear as a lone channel token, so they are skipped).
-    const stripWords = new Set(Object.values(dispositionTypes).flatMap(d => d.keywords).filter(w => !w.includes(' ')));
-    // Drop disposition keywords and stray separators from a title, leaving the channel/downmix base.
-    // Splits on whitespace, keeps the "->" downmix arrow, drops lone separators and any keyword token.
-    const stripDispositionWords = (title) => (title || '')
-        .split(/\s+/)
-        .filter(tok => !['-', '/', '|', '•'].includes(tok)
-            && !stripWords.has(tok.replace(/^[^\w]+|[^\w]+$/g, '').toLowerCase()))
-        .join(' ')
-        .trim();
 
     // Check if file is a video. If it isn't then exit plugin. This benign skip (processFile:false) must precede the per-file CONTENT checks below - the
     // language_fill_fail pre-check can failFile (quarantine), and a non-video file the plugin only means to skip must never be routed to the error queue.
@@ -992,22 +1015,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if(metaBusyTitleRemove && tooManyPeriods(newStreamTitle))
                     newStreamTitle = '';
 
-                //tag_title (audio): rebuilds the title as a channel/downmix base (only when we own it - see bareChannelRegex/downmixChannelRegex above)
-                //plus a disposition suffix. The suffix reads each role from the shared classifiers (real flag OR title keyword, via hasDisposition), so a
-                //title-only role like "5.1 Commentary" normalises to "5.1 - Commentary" and survives the reformat even when tag_disposition is off (that
-                //setting only governs whether the role is also promoted into a real flag, above).
-                if(applies(tagTitle, 'audio') && resolveChannels(ffstream)) {
-                    let base = stripDispositionWords(newStreamTitle);
-                    if(!base || bareChannelRegex.test(base) || downmixChannelRegex.test(base)) {
-                        if(!base || bareChannelRegex.test(base))
-                            base = channelLabel(ffstream);
-                        // channelLabel maps only 1–8 channels; a higher/unmappable count yields '' - skip the rebuild so we never write a bare "- Role" title.
-                        if(base) {
-                            const suffix = titleTagsFor(ffstream).join(' ');
-                            newStreamTitle = suffix ? `${base} - ${suffix}` : base;
-                        }
-                    }
-                }
+                //tag_title (audio): rebuilds the title as a channel/downmix base (only when we own it - see bareChannelRegex/downmixChannelRegex) plus a
+                //disposition suffix. The suffix reads each role from the shared classifiers (real flag OR title keyword, via hasDisposition), so a title-only
+                //role like "5.1 Commentary" normalises to "5.1 - Commentary" and survives the reformat even when tag_disposition is off (that setting only
+                //governs whether the role is also promoted into a real flag, above). Shared canonicalAudioTitle - audio_clean names its downmixes the same way.
+                if(applies(tagTitle, 'audio') && resolveChannels(ffstream))
+                    newStreamTitle = canonicalAudioTitle(newStreamTitle, channelLabel(resolveChannels(ffstream), channelLayoutStr(ffstream).includes('lfe')), titleTagsFor(ffstream));
 
                 //We trimmed the title above so newlines/spaces are removed. Ensure they're escaped before passing it to the command line.
                 if(newStreamTitle !== streamTitle)
