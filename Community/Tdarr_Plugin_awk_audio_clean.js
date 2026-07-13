@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.15.0',
+    Version: '2.15.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1958,12 +1958,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const buildOutputSummary = () => {
             const tokens = [];
             // Build an audio token for a VBR override/append, where the rate is an approximate string (e.g. '~192k') rather than a number summariseStream can
-            // format. Role comes from the shared classifiers on the original source stream.
+            // format. Only the rate diverges from summariseStream: the disposition suffix (default, then commentary/description, then dub/original) mirrors it
+            // exactly - read off the original source stream (an override preserves its disposition; an appended downmix inherits it from source) - so the output
+            // token carries the same markers as the input summary.
             const vbrAudioToken = (srcStream, channels, codec, approxRate) => {
                 const lang = resolveLang(srcStream);
                 const langStr = (lang && lang !== 'und') ? lang : '';
+                const def = srcStream.disposition?.default === 1 ? '/default' : '';
                 const role = isCommentary(srcStream) ? '/commentary' : (isDescriptive(srcStream) ? '/description' : '');
-                return `[audio:${[langStr, `${channels}ch`, codec, approxRate].filter(Boolean).join(' ')}${role}]`;
+                const prov = hasDisposition(srcStream, 'dub') ? '/dub' : (hasDisposition(srcStream, 'original') ? '/original' : '');
+                return `[audio:${[langStr, `${channels}ch`, codec, approxRate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
             };
             for (const s of file.ffProbeData.streams) {
                 const enriched = enrichStream(s);
