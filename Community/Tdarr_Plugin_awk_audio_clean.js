@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.16.0',
+    Version: '2.17.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -19,13 +19,13 @@ const details = () => ({
                 \\nStreams with no language tag are treated as though their language is "und". A track whose language is not in this list is treated as secondary - excluded from the primary downmix paths (downmix_to_six/downmix_to_stereo), never protected by guard_lossless/guard_quality/guard_object_audio, and instead handled by downmix_secondary_stereo.
                 \\nException: if the file has NO genuine (non-commentary, non-descriptive) track in a listed language, the language filter goes dormant and every genuine track is treated as primary - so a foreign-language-only file (e.g. Japanese-only when the list is English) keeps its surround instead of being downmixed. Commentary and descriptive tracks are always secondary regardless of language.
                 \\nException: guard_original, when enabled, keeps an 'original'-disposition track (a foreign film's original-language audio) primary even in an unlisted language - so it is protected as if its language were listed. See guard_original.
-                \\nThis list should include both two character and three character codes as this will successfully catch values like en, eng, en-US, en_US, and en.US.
+                \\nOne form is enough - en, eng, or English all match the same language (including region variants like en-US), so you don't need to list every variant.
                 \\nTracks with these languages will follow downmix_to_six, downmix_to_stereo, and codec_force
                 \\nExample:\\n
-                    en,eng,fr,fre,fra,und,mul,jpn,ja,zxx,mis\\n
-                    English, French, and Japanese (ISO-639-2 and ISO-639-1) (und = undefined, mul = multiple languages, zxx = no linguistic content, mis = missing language / no language code)
+                    eng,fra,jpn\\n
+                    English, French, and Japanese. The special codes und (undefined), mul (multiple), zxx (no linguistic content) and mis (no language code) are matched literally.
                 \\nExample:\\n
-                    en,eng,und\\n
+                    eng,und\\n
                     English and undefined`,
         },                
         {
@@ -773,6 +773,42 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const globalOutputOpt = ' -max_muxing_queue_size 9999 -flush_packets 0';
     // ===== END SHARED: stream / language / preset helpers =====
 
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language matching =====
+    // Normalize any language identifier to a stable comparison key so en / eng / EN / English / en-US - and ISO 639-2/B vs /T (fre vs fra) - all
+    // compare equal, letting each plugin's language-list input accept one form and match every equivalent tag. Node ships full ICU, so no table or
+    // module is needed. video_clean does no language matching, so it is the one plugin that does NOT carry this section.
+    // -=-=-= langNameIndex  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // Reverse map English language NAME -> 2-letter code (english->en), built once per run by probing every aa..zz pair (fallback:'none' returns
+    // undefined for the invalid pairs, leaving the 190 real ISO 639-1 languages). Lazily built on first spelled-out name, then memoised for the run.
+    const langNameIndex = (() => {
+        let idx = null;
+        return () => {
+            if (idx) return idx;
+            idx = {};
+            const dn = new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' });
+            for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {
+                const code = String.fromCharCode(a, b);
+                const name = dn.of(code);
+                if (name) idx[name.toLowerCase()] = code;
+            }
+            return idx;
+        };
+    })();
+    // -=-=-= langKey  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // Comparison key for a language token: lowercase/trim, strip any region/variant via shortLang, map a spelled-out English name to its code, then fold
+    // code variants with Intl.getCanonicalLocales (eng->en, fre/fra->fr). Undetermined / non-language tokens (und, mul, zxx, mis, reserved qaa-qtz) and
+    // anything unrecognised pass through unchanged, so they only ever match themselves.
+    const langKey = (x) => {
+        let s = shortLang(String(x || '').trim().toLowerCase());
+        if (!s) return '';
+        if (s.length >= 4 && langNameIndex()[s]) s = langNameIndex()[s];   // spelled-out English name -> its 2-letter code
+        try { return String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase(); } catch (e) { return s; }
+    };
+    // -=-=-= langListMatch  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // True when a stream's language matches any entry in a pre-normalised key list (keys = userList.map(langKey), computed once per plugin run).
+    const langListMatch = (streamLang, keys) => keys.includes(langKey(streamLang));
+    // ===== END SHARED: language matching =====
+
     // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: ffmpeg metadata escaping =====
     // -=-=-= escMeta  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
     // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array and hands it to child_process.spawn, so shell
@@ -1035,6 +1071,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // the one free-text input (downmix_language) has no fixed option set, and there are no type:'boolean' inputs. Every checked value fails the file on an
     // out-of-set value.
     const downmixLanguage = String(inputs.downmix_language).toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
+    const downmixLangKeys = downmixLanguage.map(langKey);   // normalised comparison keys (folds en/eng/english/en-US and 639-2/B vs /T)
     const downmixToSix = String(inputs.downmix_to_six).trim();
     const downmixToTwo = String(inputs.downmix_to_stereo).trim();
     const downmixSecondaryStereo = String(inputs.downmix_secondary_stereo).trim();
@@ -1117,12 +1154,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // languages to secondary. If nothing listed is present, the filter goes dormant - every non-commentary track is treated as primary, so a foreign-only
         // file keeps its surround instead of being downmixed. Commentary/descriptive tracks are secondary regardless and never count toward preferred-primary presence.
         const hasPreferredPrimary = downmixLanguage.length > 0
-            && audioStreams.some(s => !isSecondaryTrack(s) && downmixLanguage.includes(String(shortLang(resolveLang(s) || 'und'))));
+            && audioStreams.some(s => !isSecondaryTrack(s) && langListMatch(resolveLang(s) || 'und', downmixLangKeys));
 
         //Add secondary track flag and the cleaned language to each track
         audioStreams = audioStreams.map(item => {
             const fullLang = resolveLang(item) || 'und';
-            const cleanLang = String(shortLang(fullLang));
+            const cleanLang = langKey(fullLang);   // normalised key: en/eng/english/en-US all collapse, so dedup/priority/created-lang sets treat them as one
             // Enrich with mediaInfo bitrate before audioQuality scoring so that formats like DTS-HD MA (which ffprobe can't read a bitrate for in MP4/M4V
             // containers) score and display correctly.
             const enrichedItem = enrichStream(item);
@@ -1132,10 +1169,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // secondary path (downmix_secondary_stereo, codec_force) but are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo).
                 // When no listed-language primary is present the filter is dormant, so this stays false and the track is treated as primary. guard_original
                 // exempts an 'original'-disposition track: it stays primary in an unlisted language, getting the same protection a listed language would (see guard_original).
-                isTdarrLangSecondary: hasPreferredPrimary && !downmixLanguage.includes(cleanLang)
+                isTdarrLangSecondary: hasPreferredPrimary && !downmixLangKeys.includes(cleanLang)
                     && !(guardOriginal === 'enabled' && hasDisposition(item, 'original')),
                 isTdarrCleanLang: cleanLang,
-                isTdarrFullLang: fullLang,
                 isTdarrQuality: audioQuality(enrichedItem),
                 // Used by codec_force to suppress the source-bitrate floor in resolveBitrate for lossless sources. A lossless bitrate (e.g. 4 Mbps TrueHD) is not a
                 // comparable quantity for a perceptual encode and would otherwise pin the output at the codec ceiling for no audible gain.
@@ -1380,12 +1416,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .filter(s => channelMatch(s));
 
         workStreams.sort((a, b) => {
-            // language priority
-            let aLang = downmixLanguage.indexOf(a.isTdarrFullLang);
-            let bLang = downmixLanguage.indexOf(b.isTdarrFullLang);
-
-            if(aLang === -1) aLang = downmixLanguage.indexOf(a.isTdarrCleanLang);
-            if(bLang === -1) bLang = downmixLanguage.indexOf(b.isTdarrCleanLang);
+            // language priority (isTdarrCleanLang is the normalised key; downmixLangKeys is the normalised user list, so en/eng/english all rank together)
+            const aLang = downmixLangKeys.indexOf(a.isTdarrCleanLang);
+            const bLang = downmixLangKeys.indexOf(b.isTdarrCleanLang);
 
             const aRank = aLang === -1 ? 999 : aLang;
             const bRank = bLang === -1 ? 999 : bLang;

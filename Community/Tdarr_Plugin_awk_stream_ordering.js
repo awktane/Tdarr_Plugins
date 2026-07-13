@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '2.13.1',
+    Version: '2.14.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -44,8 +44,7 @@ const details = () => ({
             inputUI: { type: 'text' },
             tooltip: `Comma separated language priority list (e.g. eng,jpn,und). Listed languages sort first; blank (the default) skips language ordering.
                  \\nLanguages not in the list are not reordered by language - they sort by the other keys (role/codec/channel/quality) and keep their original order.
-                 \\nThis list should include both two character and three character codes as this will successfully catch values like en, eng, en-US, en_US, and en.US.
-                 \\nIf two character is provided in the list then languages formatted like en-US will be treated as en
+                 \\nOne form is enough - en, eng, or English all match the same language (including region variants like en-US), so you don't need to list every variant.
                  \\nExample: (order_channel descending and order_language eng,jpn)\\n
                  A file containing ger 2.0,fre 2.0,eng 2.0,jpn 2.0,eng 5.1,jpn 5.1 would be reordered eng 5.1,eng 2.0,jpn 5.1,jpn 2.0,ger 2.0,fre 2.0`,
         },
@@ -547,6 +546,42 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const globalOutputOpt = ' -max_muxing_queue_size 9999 -flush_packets 0';
     // ===== END SHARED: stream / language / preset helpers =====
 
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language matching =====
+    // Normalize any language identifier to a stable comparison key so en / eng / EN / English / en-US - and ISO 639-2/B vs /T (fre vs fra) - all
+    // compare equal, letting each plugin's language-list input accept one form and match every equivalent tag. Node ships full ICU, so no table or
+    // module is needed. video_clean does no language matching, so it is the one plugin that does NOT carry this section.
+    // -=-=-= langNameIndex  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // Reverse map English language NAME -> 2-letter code (english->en), built once per run by probing every aa..zz pair (fallback:'none' returns
+    // undefined for the invalid pairs, leaving the 190 real ISO 639-1 languages). Lazily built on first spelled-out name, then memoised for the run.
+    const langNameIndex = (() => {
+        let idx = null;
+        return () => {
+            if (idx) return idx;
+            idx = {};
+            const dn = new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' });
+            for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {
+                const code = String.fromCharCode(a, b);
+                const name = dn.of(code);
+                if (name) idx[name.toLowerCase()] = code;
+            }
+            return idx;
+        };
+    })();
+    // -=-=-= langKey  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // Comparison key for a language token: lowercase/trim, strip any region/variant via shortLang, map a spelled-out English name to its code, then fold
+    // code variants with Intl.getCanonicalLocales (eng->en, fre/fra->fr). Undetermined / non-language tokens (und, mul, zxx, mis, reserved qaa-qtz) and
+    // anything unrecognised pass through unchanged, so they only ever match themselves.
+    const langKey = (x) => {
+        let s = shortLang(String(x || '').trim().toLowerCase());
+        if (!s) return '';
+        if (s.length >= 4 && langNameIndex()[s]) s = langNameIndex()[s];   // spelled-out English name -> its 2-letter code
+        try { return String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase(); } catch (e) { return s; }
+    };
+    // -=-=-= langListMatch  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // True when a stream's language matches any entry in a pre-normalised key list (keys = userList.map(langKey), computed once per plugin run).
+    const langListMatch = (streamLang, keys) => keys.includes(langKey(streamLang));
+    // ===== END SHARED: language matching =====
+
     // Bail out gracefully on missing/partial probe data, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
         failFile('No ffProbe stream data available for this file - the plugin cannot process it.');
@@ -573,6 +608,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const audioFirst = inputs.first_audio;       // 'language' (baseline) | 'original' | 'default' | 'descriptive'
         const subtitleFirst = inputs.first_subtitle; // 'normal' (baseline) | 'default' | 'sdh' | 'descriptive'
         const preferredLanguages = (inputs.order_language || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
+        const preferredLangKeys = preferredLanguages.map(langKey);   // normalised keys: en/eng/english/en-US and 639-2/B vs /T all rank together
         const codecFirstList = (inputs.order_codec || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
 
         // Parse an order mode ('descending' | 'descending <=N' | 'ascending' | 'disabled') into {enabled, dir, cap}. The '<=N' suffix caps descending: a stream
@@ -593,9 +629,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const qualCap = (qualityOrder.enabled && qualityOrder.dir === 'descending') ? qualityOrder.cap : Infinity;
         const overCap = (s) => s.channels > chanCap || s.capBitrate > qualCap;
 
-        const getLangRank = (lang, shortlang) => {
-            let idx = preferredLanguages.indexOf(lang);
-            if (idx === -1) idx = preferredLanguages.indexOf(shortlang);
+        const getLangRank = (lang) => {
+            const idx = preferredLangKeys.indexOf(langKey(lang));
             return idx === -1 ? 999 : idx;
         };
 
@@ -603,8 +638,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // (over EITHER cap -> tail) -> channel (direction) -> quality (direction). Returns 0 when every key ties. The cap ONLY partitions; within each partition
         // channel/quality keep their requested direction, so a 'descending <=N' list stays fully descending - the cap just shifts which serveable track leads.
         const audioKeyCompare = (a, b) => {
-            const aRank = getLangRank(a.lang, a.shortlang);
-            const bRank = getLangRank(b.lang, b.shortlang);
+            const aRank = getLangRank(a.lang);
+            const bRank = getLangRank(b.lang);
             if (aRank !== bRank) return aRank - bRank;
             //A commentary stream could be descriptive but it would still be a commentary
             const aRole = a.commentary ? 2 : (a.descriptive ? 1 : 0);
@@ -633,8 +668,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // formats are scored/displayed from the more accurate mediaInfo value.
             const enrichedStream = enrichStream(ffstream);
             const streamLang = resolveLang(ffstream) || 'und';
-            const streamLangShort = shortLang(streamLang);
-                
+
             const streamType = (ffstream.codec_type || '').trim().toLowerCase();
             // Resolve the canonical codec once (resolveCodecName does a probe-join + string work); order_codec membership can't change between list entries.
             const canon = streamType === 'audio' ? resolveCodecName(enrichedStream) : '';
@@ -645,7 +679,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 stream: enrichedStream,
                 type: streamType,
                 lang: streamLang,
-                shortlang: streamLangShort,
                 channels: enrichedStream.channels || 0,
                 // Resolved bitrate in bps (shared resolveStreamBitrate fallback, via enrichStream). order_quality sorts by the audioquality score but CAPS by
                 // raw bitrate ('descending <=1024k'), so the cap threshold needs the actual bitrate, not the score.
@@ -719,8 +752,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     return a.forced ? -1 : 1;
 
                 //Language priority next (forced already handled above).
-                const aRank = getLangRank(a.lang, a.shortlang);
-                const bRank = getLangRank(b.lang, b.shortlang);
+                const aRank = getLangRank(a.lang);
+                const bRank = getLangRank(b.lang);
 
                 if (aRank !== bRank)
                     return aRank - bRank;

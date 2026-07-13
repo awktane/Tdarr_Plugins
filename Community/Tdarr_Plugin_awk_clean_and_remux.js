@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.14.0',
+    Version: '2.15.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -42,12 +42,13 @@ const details = () => ({
             inputUI: { type: 'text' },
             tooltip: `Specify language tags here for the audio tracks you'd like to keep. If blank then no tracks will be removed.
                 \\nStreams with no language tag are treated as though they had language_fill as their language or "und" if language_fill isn't set
-                \\nThis list should include both two character and three character codes as this will successfully catch unusual values like en, eng, en-US, en_US, and en.US
+                \\nOne form is enough - en, eng, or English all match the same language (including region variants like en-US), so you don't need to list every variant.
                 \\nExample:\\n
-                    en,eng,fr,fre,fra,und,mul,jpn,ja,zxx,mis
-                    \\nEnglish, French, and Japanese (ISO-639-2 and ISO-639-1) (und = undefined, mul = multiple languages, zxx = no linguistic content, mis = missing language / no language code)
+                    eng,fra,jpn
+                    \\nEnglish, French, and Japanese.
+                \\nThe special codes und (undefined), mul (multiple languages), zxx (no linguistic content) and mis (no language code) are matched literally - include them to keep such tracks.
                 \\nExample:\\n
-                    en,eng,und
+                    eng,und
                     \\nEnglish and both audio streams marked as und or with no language set.`,
         },
         {
@@ -57,12 +58,13 @@ const details = () => ({
             inputUI: { type: 'text' },
             tooltip: `Specify language tags here for the subtitle tracks you'd like to keep. If blank then no tracks will be removed.
                 \\nStreams with no language tag are treated as though they had language_fill as their language or "und" if language_fill isn't set
-                \\nThis list should include both two character and three character codes as this will successfully catch unusual values like en, eng, en-US, en_US, and en.US
+                \\nOne form is enough - en, eng, or English all match the same language (including region variants like en-US), so you don't need to list every variant.
                 \\nExample:\\n
-                    en,eng,fr,fre,fra,und,mul,mis
-                    \\nEnglish and French (ISO-639-2 and ISO-639-1) (und = undefined, mul = multiple languages, mis = unusual language)
+                    eng,fra
+                    \\nEnglish and French.
+                \\nThe special codes und (undefined), mul (multiple languages) and mis (no language code) are matched literally - include them if you want to keep such tracks.
                 \\nExample:\\n
-                    en,eng,und
+                    eng,und
                     \\nEnglish and both subtitles marked as und or with no language set`,
         },
         {
@@ -117,6 +119,20 @@ const details = () => ({
                 \\nSubtitle: only titles we own (empty or already just role words) are set to the role tag(s), e.g. "SDH" or "Forced Commentary"; custom subtitle titles are left untouched.
                 \\nRole tags come from the track's real disposition flags and title keywords (Commentary, Descriptive, SDH, Forced, Lyrics, Dub, Original). The default flag is intentionally not surfaced.`,
         },        
+        {
+            name: 'tag_language',
+            type: 'string',
+            defaultValue: 'invalid',
+            inputUI: {
+                type: 'dropdown',
+                options: ['disabled', 'invalid', 'strict'],
+            },
+            tooltip: `Standardise the language tag on tracks that already HAVE one (to set a language on UNtagged tracks use language_fill instead). Fixes tags that would be lost or misread - e.g. the full word "English" becomes "eng", and a 2-letter code like "en" becomes 3-letter when the output is mp4 (mp4 cannot store 2-letter codes and silently drops the language on remux). Applies to video, audio and subtitle streams. Output form follows method_tag_language.
+                \\ndisabled: never change an existing language tag.
+                \\ninvalid (default): only fix tags that are non-standard or won't store correctly in the output container - spelled-out names, wrong case, and 2-letter/region codes headed to mp4. Tags that already store cleanly (e.g. eng, or en/fre into mkv) are left alone.
+                \\nstrict: rewrite every language tag to the exact method_tag_language standard, even valid ones (en becomes eng, and fre/fra are folded to your chosen bibliographic/terminologic form).
+                \\nUndetermined / non-language codes (und, mul, zxx, mis) are always left untouched.`,
+        },
         {
             name: 'remove_accessibility',
             type: 'string',
@@ -193,6 +209,20 @@ const details = () => ({
                  \\nlight (risk-free): -fflags +ignidx and -err_detect ignore_err - ignores a broken/corrupt index (AVI idx1, MOV/MP4 sample tables) and keeps reading past detected errors instead of failing. Drops no frames.
                  \\naggressive: additionally -fflags +discardcorrupt - drops packets flagged corrupt, which may cause small video/audio blips where the damage is.
                  \\nThe mode actually applied is recorded in an awk_recovered tag. Recovery re-runs only when a recover_bad_* mode changes, then settles.`,
+        },
+        {
+            name: 'method_tag_language',
+            type: 'string',
+            defaultValue: 'container',
+            inputUI: {
+                type: 'dropdown',
+                options: ['639-2/b', '639-2/t', 'container'],
+            },
+            tooltip: `Which language-code standard tag_language writes (only takes effect when tag_language is not disabled). Affects mainly the ~20 languages with two 3-letter codes (e.g. French fre/fra, German ger/deu) plus the 2-vs-3-letter choice; you can still type any form in the language lists regardless.
+                \\nBy convention Matroska (mkv) uses ISO-639-2/B and mp4's mdhd box uses ISO-639-2/T; both containers accept either form.
+                \\ncontainer (default): write each container its native form - 2-letter (en, fr) for mkv, 3-letter terminologic (eng, fra) for mp4. Most spec-accurate per container.
+                \\n639-2/t: terminologic 3-letter codes everywhere - fra, deu, zho (matches mp4's mdhd; 3-letter is also the common mkv convention).
+                \\n639-2/b ("mkv classic"): bibliographic 3-letter codes everywhere - fre, ger, chi.`,
         },
     ],
 });
@@ -516,6 +546,42 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const globalOutputOpt = ' -max_muxing_queue_size 9999 -flush_packets 0';
     // ===== END SHARED: stream / language / preset helpers =====
 
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language matching =====
+    // Normalize any language identifier to a stable comparison key so en / eng / EN / English / en-US - and ISO 639-2/B vs /T (fre vs fra) - all
+    // compare equal, letting each plugin's language-list input accept one form and match every equivalent tag. Node ships full ICU, so no table or
+    // module is needed. video_clean does no language matching, so it is the one plugin that does NOT carry this section.
+    // -=-=-= langNameIndex  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // Reverse map English language NAME -> 2-letter code (english->en), built once per run by probing every aa..zz pair (fallback:'none' returns
+    // undefined for the invalid pairs, leaving the 190 real ISO 639-1 languages). Lazily built on first spelled-out name, then memoised for the run.
+    const langNameIndex = (() => {
+        let idx = null;
+        return () => {
+            if (idx) return idx;
+            idx = {};
+            const dn = new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' });
+            for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {
+                const code = String.fromCharCode(a, b);
+                const name = dn.of(code);
+                if (name) idx[name.toLowerCase()] = code;
+            }
+            return idx;
+        };
+    })();
+    // -=-=-= langKey  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // Comparison key for a language token: lowercase/trim, strip any region/variant via shortLang, map a spelled-out English name to its code, then fold
+    // code variants with Intl.getCanonicalLocales (eng->en, fre/fra->fr). Undetermined / non-language tokens (und, mul, zxx, mis, reserved qaa-qtz) and
+    // anything unrecognised pass through unchanged, so they only ever match themselves.
+    const langKey = (x) => {
+        let s = shortLang(String(x || '').trim().toLowerCase());
+        if (!s) return '';
+        if (s.length >= 4 && langNameIndex()[s]) s = langNameIndex()[s];   // spelled-out English name -> its 2-letter code
+        try { return String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase(); } catch (e) { return s; }
+    };
+    // -=-=-= langListMatch  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // True when a stream's language matches any entry in a pre-normalised key list (keys = userList.map(langKey), computed once per plugin run).
+    const langListMatch = (streamLang, keys) => keys.includes(langKey(streamLang));
+    // ===== END SHARED: language matching =====
+
     // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: ffmpeg metadata escaping =====
     // -=-=-= escMeta  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
     // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array and hands it to child_process.spawn, so shell
@@ -564,17 +630,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const fillLanguage = (inputs.language_fill ? inputs.language_fill.toLowerCase().trim() : '');
     const subLanguage = inputs.language_sub.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
     const audioLanguage = inputs.language_audio.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
+    // Pre-normalise the user language lists to comparison keys once (langKey folds en/eng/english/en-US and 639-2/B vs /T) - the filters match against these.
+    const subLangKeys = subLanguage.map(langKey);
+    const audioLangKeys = audioLanguage.map(langKey);
     const failBlankLangs = String(inputs.language_fill_fail) === 'true';
     const removeAccessible = String(inputs.remove_accessibility || 'disabled').toLowerCase();
+    const tagLanguage = String(inputs.tag_language || 'invalid').toLowerCase();
+    const methodTagLanguage = String(inputs.method_tag_language || 'container').toLowerCase();
 
     // Value checks continue in Inputs order (container already checked above): language_fill is format-checked and cross-checked against language_sub/
     // language_audio, then the remaining dropdowns are checked against their option set (free-text and boolean inputs need no check - see above).
     if(fillLanguage && fillLanguage.length !== 3)
         failFile(`fillLanguage is not a 3 character ISO-639-2 language code. It should follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes`);
     // If fillLanguage is set it should be a track that's kept (checked per-type so one type can legitimately exclude it).
-    if(fillLanguage && subLanguage.length > 0 && !subLanguage.includes(fillLanguage))
+    if(fillLanguage && subLanguage.length > 0 && !subLangKeys.includes(langKey(fillLanguage)))
         failFile(`You have specified that blank tracks should be tagged as ${fillLanguage}. You have not included it in language_sub which indirectly will remove untagged subtitle streams.`);
-    if(fillLanguage && audioLanguage.length > 0 && !audioLanguage.includes(fillLanguage))
+    if(fillLanguage && audioLanguage.length > 0 && !audioLangKeys.includes(langKey(fillLanguage)))
         failFile(`You have specified that blank tracks should be tagged as ${fillLanguage}. You have not included it in language_audio which indirectly will remove untagged audio streams.`);
     if(!['disabled', 'subtitle', 'audio', 'both'].includes(removeAccessible))
         failFile(`Somehow invalid remove_accessibility option provided. Check your settings!`);
@@ -582,10 +653,90 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`Somehow invalid tag_disposition option provided. Check your settings!`);
     if(!['disabled', 'audio', 'subtitle', 'both'].includes(tagTitle))
         failFile(`Somehow invalid tag_title option provided. Check your settings!`);
+    if(!['disabled', 'invalid', 'strict'].includes(tagLanguage))
+        failFile(`Somehow invalid tag_language option provided. Check your settings!`);
+    if(!['639-2/b', '639-2/t', 'container'].includes(methodTagLanguage))
+        failFile(`Somehow invalid method_tag_language option provided. Check your settings!`);
     if(!['disabled', 'light', 'aggressive'].includes(recoverTs))
         failFile(`Somehow invalid recover_bad_timestamps option provided. Check your settings!`);
     if(!['disabled', 'light', 'aggressive'].includes(recoverData))
         failFile(`Somehow invalid recover_bad_data option provided. Check your settings!`);
+
+    // ====== LANGUAGE TAG CANONICALIZATION ======
+    // Local to clean_and_remux (the only plugin that WRITES container language tags); langKey/langListMatch (matching) are shared, these write-side helpers are
+    // not. Verified on this build: mp4's mdhd stores only a lowercase 3-letter ISO 639-2 code (2-letter / uppercase / region are silently dropped,
+    // so a plain mkv->mp4 remux of an "en"-tagged stream loses its language), mkv stores any recognised code; und/mul/zxx/mis are never rewritten.
+    // ISO 639-1 (2-letter) -> ISO 639-2/T (terminologic 3-letter), complete for every current 639-1 code; each row verified to name the same language via ICU.
+    const ISO639_1_TO_2 = {
+        aa:'aar',ab:'abk',ae:'ave',af:'afr',ak:'aka',am:'amh',an:'arg',ar:'ara',as:'asm',av:'ava',ay:'aym',az:'aze',ba:'bak',be:'bel',bg:'bul',
+        bh:'bih',bi:'bis',bm:'bam',bn:'ben',bo:'bod',br:'bre',bs:'bos',ca:'cat',ce:'che',ch:'cha',co:'cos',cr:'cre',cs:'ces',cu:'chu',cv:'chv',
+        cy:'cym',da:'dan',de:'deu',dv:'div',dz:'dzo',ee:'ewe',el:'ell',en:'eng',eo:'epo',es:'spa',et:'est',eu:'eus',fa:'fas',ff:'ful',fi:'fin',
+        fj:'fij',fo:'fao',fr:'fra',fy:'fry',ga:'gle',gd:'gla',gl:'glg',gn:'grn',gu:'guj',gv:'glv',ha:'hau',he:'heb',hi:'hin',ho:'hmo',hr:'hrv',
+        ht:'hat',hu:'hun',hy:'hye',hz:'her',ia:'ina',id:'ind',ie:'ile',ig:'ibo',ii:'iii',ik:'ipk',io:'ido',is:'isl',it:'ita',iu:'iku',ja:'jpn',
+        jv:'jav',ka:'kat',kg:'kon',ki:'kik',kj:'kua',kk:'kaz',kl:'kal',km:'khm',kn:'kan',ko:'kor',kr:'kau',ks:'kas',ku:'kur',kv:'kom',kw:'cor',
+        ky:'kir',la:'lat',lb:'ltz',lg:'lug',li:'lim',ln:'lin',lo:'lao',lt:'lit',lu:'lub',lv:'lav',mg:'mlg',mh:'mah',mi:'mri',mk:'mkd',ml:'mal',
+        mn:'mon',mr:'mar',ms:'msa',mt:'mlt',my:'mya',na:'nau',nb:'nob',nd:'nde',ne:'nep',ng:'ndo',nl:'nld',nn:'nno',no:'nor',nr:'nbl',nv:'nav',
+        ny:'nya',oc:'oci',oj:'oji',om:'orm',or:'ori',os:'oss',pa:'pan',pi:'pli',pl:'pol',ps:'pus',pt:'por',qu:'que',rm:'roh',rn:'run',ro:'ron',
+        ru:'rus',rw:'kin',sa:'san',sc:'srd',sd:'snd',se:'sme',sg:'sag',si:'sin',sk:'slk',sl:'slv',sm:'smo',sn:'sna',so:'som',sq:'sqi',sr:'srp',
+        ss:'ssw',st:'sot',su:'sun',sv:'swe',sw:'swa',ta:'tam',te:'tel',tg:'tgk',th:'tha',ti:'tir',tk:'tuk',tl:'tgl',tn:'tsn',to:'ton',tr:'tur',
+        ts:'tso',tt:'tat',tw:'twi',ty:'tah',ug:'uig',uk:'ukr',ur:'urd',uz:'uzb',ve:'ven',vi:'vie',vo:'vol',wa:'wln',wo:'wol',xh:'xho',yi:'yid',
+        yo:'yor',za:'zha',zh:'zho',zu:'zul',
+    };
+    // The 20 languages whose 639-2/B (bibliographic) code differs from /T above, keyed by 639-1. method_tag_language=639-2/b uses these; /t uses the table.
+    const ISO639_2_B = {
+        sq:'alb',hy:'arm',eu:'baq',bo:'tib',my:'bur',zh:'chi',cs:'cze',nl:'dut',ka:'geo',de:'ger',el:'gre',is:'ice',mk:'mac',mi:'mao',ms:'may',
+        fa:'per',ro:'rum',sk:'slo',cy:'wel',fr:'fre',
+    };
+    // Undetermined / non-language codes we never rewrite (und, mul, zxx, mis, reserved qaa-qtz).
+    const isNonLang = (k) => k === 'und' || k === 'mul' || k === 'zxx' || k === 'mis' || /^q[a-t][a-z]$/.test(k);
+    // The canonical language code to WRITE, per method_tag_language + destination container. '' => leave as-is (undetermined / non-language / unmappable).
+    const toCanonicalTag = (x) => {
+        const key = langKey(x);
+        if (!key || isNonLang(key)) return '';
+        const three = (wantB) => {
+            if (key.length !== 2) return key;                        // already a 3-letter-only code (fil, yue) -> canonical as-is
+            const t = ISO639_1_TO_2[key];
+            if (!t) return key;
+            return wantB ? (ISO639_2_B[key] || t) : t;
+        };
+        if (methodTagLanguage === 'container') return dstContainer === 'mp4' ? three(false) : key;   // mkv: 2-letter BCP-47; mp4: 639-2/T
+        return three(methodTagLanguage === '639-2/b');                                               // single form for both containers
+    };
+    // Recognised language name for a tag's primary subtag, or '' - tells a real code (en, eng) from a spelled-out name ("english") or garbage.
+    const langName = (tag) => {
+        try { return new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }).of(shortLang(String(tag).toLowerCase())) || ''; }
+        catch (e) { return ''; }
+    };
+    // True when an already-present tag stores cleanly in dstContainer AS a recognised code (drives tag_language=invalid: leave these, fix the rest).
+    const storesCleanly = (rawTag) => {
+        const s = String(rawTag || '').trim();
+        if (!s || isNonLang(langKey(s))) return true;               // blank / non-language -> not a rewrite candidate
+        if (!langName(s)) return false;                             // spelled-out name or garbage -> fix
+        if (s !== s.toLowerCase()) return false;                    // uppercase -> mp4 drops it / non-standard casing -> fix
+        return dstContainer === 'mp4' ? /^[a-z]{3}$/.test(s) : /^[a-z]{2,3}$/.test(s);   // mp4 needs lowercase 3-letter; mkv keeps a bare 2/3-letter code
+    };
+    // Language tag to WRITE for a kept video/audio/subtitle stream, plus the language to filter on. Blank container tag + language_fill (audio/subtitle only):
+    // fill it (canonical when tag_language on, else raw fill). Non-blank: canonicalise per tag_language (invalid = only tags storesCleanly rejects; strict =
+    // every tag). und/non-language is never written and und-fill is skipped, so it can't perpetually re-remux. Returns { workLang, meta, log }.
+    const canonicalLangMeta = (typeLetter, perTypeIdx, ffstream, streamIdx, typeName, allowFill) => {
+        const rawTag = (ffstream.tags?.language || '').trim();
+        const sl = resolveLang(ffstream);
+        const blank = !sl || sl === 'und';
+        let workLang = sl || 'und', desired = '';
+        if (blank && allowFill && fillLanguage && langKey(fillLanguage) !== 'und') {
+            workLang = fillLanguage;
+            desired = tagLanguage !== 'disabled' ? toCanonicalTag(fillLanguage) : fillLanguage;
+        } else if (!blank && tagLanguage !== 'disabled' && (tagLanguage === 'strict' || !storesCleanly(rawTag))) {
+            desired = toCanonicalTag(sl);
+        }
+        const compareTo = blank ? '' : rawTag;
+        if (!desired || desired === compareTo) return { workLang, meta: '', log: '' };
+        const log = blank
+            ? `☐Language blank on ${typeName} stream ${streamIdx} - setting to "${desired}"\n`
+            : `☐Standardise ${typeName} language on stream ${streamIdx} - "${rawTag}" to "${desired}"\n`;
+        return { workLang, meta: ` -metadata:s:${typeLetter}:${perTypeIdx} "language=${escMeta(desired)}"`, log };
+    };
+    // ====== END LANGUAGE TAG CANONICALIZATION ======
 
     // Subtitle codecs dropped purely by container/format, regardless of language - never assigned language_fill (counted separately by the
     // language_fill_fail check below). alwaysDropSubs is unmuxable by BOTH containers: eia_608 (closed-caption data embedded in the video
@@ -758,7 +909,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const plainAudioLangs = new Set();
     const plainSubLangs = new Set();
     const isPlainTrack = (s) => !isCommentary(s) && !isDescriptive(s) && !isSdh(s) && !isLyrics(s);
-    const hasPlainSameLang = (set, wl) => set.has(wl) || set.has(shortLang(wl));
+    const hasPlainSameLang = (set, wl) => set.has(langKey(wl));
     const resolveWorkLang = (s) => {
         const sl = resolveLang(s);
         return (fillLanguage && (!sl || sl === 'und')) ? fillLanguage : (sl || 'und');
@@ -769,10 +920,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if ((t !== 'audio' && t !== 'subtitle') || !isPlainTrack(s)) continue;
             if (t === 'subtitle' && subDroppedAnyReason((s.codec_name || '').toLowerCase())) continue;
             const wl = resolveWorkLang(s);
-            const langs = t === 'audio' ? audioLanguage : subLanguage;
-            if (langs.length > 0 && !langs.includes(wl) && !langs.includes(shortLang(wl))) continue;
+            const langKeys = t === 'audio' ? audioLangKeys : subLangKeys;
+            if (langKeys.length > 0 && !langListMatch(wl, langKeys)) continue;
             const set = t === 'audio' ? plainAudioLangs : plainSubLangs;
-            set.add(wl); set.add(shortLang(wl));
+            set.add(langKey(wl));
         }
     }
 
@@ -789,17 +940,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Every untagged track shares the same post-fill language (language_fill if set, else "und"), so "does it survive the language filter" is one check per
         // type: kept when the language list is empty (keep-all) or contains that language. Mirrors the main loop's own keep/drop decision.
         const untaggedWorkLang = fillLanguage || 'und';
-        const keptByLangFilter = (langs) => langs.length === 0 || langs.includes(untaggedWorkLang) || langs.includes(shortLang(untaggedWorkLang));
+        const keptByLangFilter = (keys) => keys.length === 0 || langListMatch(untaggedWorkLang, keys);
         // An untagged accessibility track (audio-description / SDH) the remove_accessibility guard would drop is excluded too - mirrors the loop's own removal
         // predicate. Untagged tracks resolve to untaggedWorkLang, so reuse the plainAudioLangs/plainSubLangs computed above.
         const removedByAccess = (s, type) => applies(removeAccessible, type)
             && (type === 'audio' ? isDescriptive(s) : isSdh(s))
             && hasPlainSameLang(type === 'audio' ? plainAudioLangs : plainSubLangs, untaggedWorkLang);
-        const untaggedAudio = keptByLangFilter(audioLanguage)
+        const untaggedAudio = keptByLangFilter(audioLangKeys)
             ? streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s) && !removedByAccess(s, 'audio')).length : 0;
         if (untaggedAudio > 1)
             failFile(`${untaggedAudio} audio streams have no language tag${fillNote} — they may be different languages. Tag them manually and requeue or set language_fill_fail to false.`);
-        const untaggedSubs = keptByLangFilter(subLanguage)
+        const untaggedSubs = keptByLangFilter(subLangKeys)
             ? streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'subtitle'
                 && !subDroppedAnyReason((s.codec_name || '').toLowerCase()) && isUntagged(s) && !removedByAccess(s, 'subtitle')).length : 0;
         if (untaggedSubs > 1)
@@ -865,15 +1016,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     workDone += `☐Remove stream ${i} - image-based subtitle, remove_mkv_imagesubs (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
                 } else {
-                    //Rescue any we can by filling in the language before deciding whether to remove it
-                    if (fillLanguage && (!streamLang || streamLang === 'und')) {
-                        workDone += `☐Language blank on stream ${i} - setting subtitle language to "${fillLanguage}"\n`;
-                        metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "language=${escMeta(fillLanguage)}"`;
-                        workLang = fillLanguage;
+                    // Fill a blank language and/or standardise the tag (tag_language) before deciding whether to remove it.
+                    {
+                        const lm = canonicalLangMeta('s', subtitleStreamIndex, ffstream, i, 'subtitle', true);
+                        workLang = lm.workLang;
+                        if (lm.meta) { workDone += lm.log; metadataCommand += lm.meta; }
                     }
 
                     //If the subtitle is a language that should be removed then remove it regardless of other settings.
-                    if(subLanguage.length > 0 && !subLanguage.includes(workLang) && !subLanguage.includes(shortLang(workLang))) {
+                    if(subLanguage.length > 0 && !langListMatch(workLang, subLangKeys)) {
                         workDone += `☐Remove stream ${i} - subtitle language (${streamLang})\n`;
                         delStream = true;
                     } else if (applies(removeAccessible, 'subtitle') && isSdh(ffstream) && hasPlainSameLang(plainSubLangs, workLang)) {
@@ -973,15 +1124,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //Start with zero based index for audio streams. This is only used when changing metadata.
                 audioStreamIndex++;
 
-                //Rescue any we can by filling in the language before deciding whether to remove it
-                if (fillLanguage && (!streamLang || streamLang === 'und')) {
-                    workDone += `☐Language blank on audio stream ${i} - setting to "${fillLanguage}"\n`;
-                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} "language=${escMeta(fillLanguage)}"`;
-                    workLang = fillLanguage;
+                // Fill a blank language and/or standardise the tag (tag_language) before deciding whether to remove it.
+                {
+                    const lm = canonicalLangMeta('a', audioStreamIndex, ffstream, i, 'audio', true);
+                    workLang = lm.workLang;
+                    if (lm.meta) { workDone += lm.log; metadataCommand += lm.meta; }
                 }
 
                 //If the audio is a language that should be removed then remove it regardless of other settings.
-                if(audioLanguage.length > 0 && !audioLanguage.includes(workLang) && !audioLanguage.includes(shortLang(workLang))) {
+                if(audioLanguage.length > 0 && !langListMatch(workLang, audioLangKeys)) {
                     workDone += `☐Remove stream ${i} - audio language (${streamLang})\n`;
                     delStream = true;
                 } else if (applies(removeAccessible, 'audio') && isDescriptive(ffstream) && hasPlainSameLang(plainAudioLangs, workLang)) {
@@ -1068,6 +1219,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     videoStreamIndex--;
                     continue;
                 }            
+
+                // Standardise the video language tag (tag_language): video carries the same mdhd language field, so e.g. a 2-letter code is dropped by mp4.
+                {
+                    const lm = canonicalLangMeta('v', videoStreamIndex, ffstream, i, 'video', false);
+                    if (lm.meta) { workDone += lm.log; metadataCommand += lm.meta; }
+                }
 
                 // HEVC in mp4 must carry the hvc1 fourcc or Apple/QuickTime won't decode it - a plain remux writes hev1. Tag the retained HEVC video stream
                 // when the output is mp4 and it isn't already hvc1: this converges after one heal (an already-hvc1 file is a no-op, never a perpetual remux).

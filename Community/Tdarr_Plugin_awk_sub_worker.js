@@ -11,7 +11,7 @@ const details = () => ({
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '1.4.1',
+    Version: '1.5.0',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -28,8 +28,8 @@ const details = () => ({
             type: 'string',
             defaultValue: '',
             inputUI: { type: 'text' },
-            tooltip: `Optional comma-separated language codes to act on (matched verbatim against the track/sidecar language, e.g. eng,jpn). Blank = all languages.
-                \\nExample:\\neng,fre`,
+            tooltip: `Optional comma-separated languages to act on (e.g. eng,jpn). Blank = all languages. One form is enough - en, eng, or English all match the same language (including region variants like en-US), so you don't need to list every variant.
+                \\nExample:\\neng,fra`,
         },
         {
             name: 'skip_commentary',
@@ -377,6 +377,42 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const globalOutputOpt = ' -max_muxing_queue_size 9999 -flush_packets 0';
     // ===== END SHARED: stream / language / preset helpers =====
 
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language matching =====
+    // Normalize any language identifier to a stable comparison key so en / eng / EN / English / en-US - and ISO 639-2/B vs /T (fre vs fra) - all
+    // compare equal, letting each plugin's language-list input accept one form and match every equivalent tag. Node ships full ICU, so no table or
+    // module is needed. video_clean does no language matching, so it is the one plugin that does NOT carry this section.
+    // -=-=-= langNameIndex  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // Reverse map English language NAME -> 2-letter code (english->en), built once per run by probing every aa..zz pair (fallback:'none' returns
+    // undefined for the invalid pairs, leaving the 190 real ISO 639-1 languages). Lazily built on first spelled-out name, then memoised for the run.
+    const langNameIndex = (() => {
+        let idx = null;
+        return () => {
+            if (idx) return idx;
+            idx = {};
+            const dn = new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' });
+            for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {
+                const code = String.fromCharCode(a, b);
+                const name = dn.of(code);
+                if (name) idx[name.toLowerCase()] = code;
+            }
+            return idx;
+        };
+    })();
+    // -=-=-= langKey  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // Comparison key for a language token: lowercase/trim, strip any region/variant via shortLang, map a spelled-out English name to its code, then fold
+    // code variants with Intl.getCanonicalLocales (eng->en, fre/fra->fr). Undetermined / non-language tokens (und, mul, zxx, mis, reserved qaa-qtz) and
+    // anything unrecognised pass through unchanged, so they only ever match themselves.
+    const langKey = (x) => {
+        let s = shortLang(String(x || '').trim().toLowerCase());
+        if (!s) return '';
+        if (s.length >= 4 && langNameIndex()[s]) s = langNameIndex()[s];   // spelled-out English name -> its 2-letter code
+        try { return String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase(); } catch (e) { return s; }
+    };
+    // -=-=-= langListMatch  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // True when a stream's language matches any entry in a pre-normalised key list (keys = userList.map(langKey), computed once per plugin run).
+    const langListMatch = (streamLang, keys) => keys.includes(langKey(streamLang));
+    // ===== END SHARED: language matching =====
+
     // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: ffmpeg metadata escaping =====
     // -=-=-= escMeta  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
     // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array and hands it to child_process.spawn, so shell
@@ -503,7 +539,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { name, index, lang, title, ext: extMatch[1].toLowerCase(), dispTokens, disp: [...new Set(dispTokens.map(dispFfOf).filter(Boolean))] };
     };
 
-    const parseLangFilter = (v) => { const l = String(v || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean); return l.length ? new Set(l) : null; };
+    const parseLangFilter = (v) => { const l = String(v || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean); return l.length ? new Set(l.map(langKey)) : null; };   // keys, so en/eng/English match
     // Composite identity key that survives the round-trip (language | title | sorted-dispositions), used to match a
     // sidecar to an embedded track (skip duplicate imports; confirm a sidecar is safely embedded before deleting it).
     const keyOfStream = (s) => `${resolveLang(s) || 'und'}|${s.tags?.title || ''}|${dispTokensOf(s).slice().sort().join('+')}`;
@@ -535,7 +571,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (mode === 'extract') {
             // ============= EXTRACT: embedded text subs -> sidecars (+ optional removal) =============
             const eligible = streams.filter((s) => (s.codec_type || '').toLowerCase() === 'subtitle' && isTextSub(s.codec_name)
-                && !(skipCommentary && isCommentary(s)) && !(langFilter && !langFilter.has(resolveLang(s) || 'und')));
+                && !(skipCommentary && isCommentary(s)) && !(langFilter && !langFilter.has(langKey(resolveLang(s) || 'und'))));
             if (!eligible.length) { response.infoLog += '☑No text subtitles to extract.\n'; return response; }
 
             let sidecarOut = ''; const removeIdx = []; let wrote = 0; let skipped = 0;
@@ -576,7 +612,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let entries;
         try { entries = fs.readdirSync(libDir); } catch (e) { failFile(`Cannot read the library directory to find sidecars: ${e && e.message ? e.message : e}`); }
         const found = entries.map(parseSidecar).filter(Boolean)
-            .filter((f) => !(langFilter && !langFilter.has(f.lang)))
+            .filter((f) => !(langFilter && !langFilter.has(langKey(f.lang))))
             .filter((f) => !(skipCommentary && f.dispTokens.includes('commentary')));
         if (!found.length) { response.infoLog += '☑No subtitle sidecars found to import.\n'; return response; }
 
