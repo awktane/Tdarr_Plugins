@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.999.8',
+    Version: '2.999.9',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -931,16 +931,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const ac3Presets = [32000, 40000, 48000, 56000, 64000, 80000, 96000, 112000, 128000,
                         160000, 192000, 224000, 256000, 320000, 384000, 448000, 512000, 576000, 640000];
 
+    // Per-codec channel-count ceiling of ffmpeg's native encoders (ac3/eac3 cap at 6ch, aac/opus at 8ch). One source for the codec_force targetMaxCh limit, the targetTable
+    // bitrate-ladder cap, and loudnorm's channel ceiling below, so those can't drift; aac_vbr folds to aac (anything that isn't ac3/eac3 is 8).
+    const codecMaxCh = (codec) => (codec === 'ac3' || codec === 'eac3') ? 6 : 8;
+    // Fold the aac_vbr pseudo-codec onto the real aac family for scoring/limit/target lookups (aac_vbr is only an encoder choice, not a distinct codec). One local source for
+    // the six non-shared fold sites below; the two inside the shared audio-scoring section keep the idiom inline (byte-identical across carriers, so they can't drift).
+    const aacFamily = (codec) => codec === 'aac_vbr' ? 'aac' : codec;
     // Transcode target bitrate (bps) for a codec + channel count, from the shared CODEC_TARGET_BPS table (aac_vbr shares aac's targets; ac3/eac3 cap at 6ch).
     // For these encodable codecs the ladder IS the scoring transparent point (scoreThresholds reads the same table), and it serves as the FLOOR for a
     // transcode - the actual target is max(thisTable, source). AC3/EAC3 CBR fixed-preset: mono 192k, stereo 224k, 3ch 320k, 4ch 384k, 5ch 448k, 6ch 640k
     // (640k is the Blu-ray 5.1 standard and the AC3/EAC3 codec ceiling).
     const targetTable = (codec, channels) => {
         const ch = Math.max(1, Number(channels) || 1);
-        const family = codec === 'aac_vbr' ? 'aac' : codec;
+        const family = aacFamily(codec);
         const tbl = CODEC_TARGET_BPS[family];
         if (!tbl) return 0;
-        const cap = (family === 'ac3' || family === 'eac3') ? 6 : 8;
+        const cap = codecMaxCh(family);
         return tbl[Math.min(ch, cap)] ?? tbl[cap];
     };
 
@@ -975,7 +981,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const src = Number(srcBps) || 0;
         let bps = floor;
         if (src > 0 && !srcLossless) {
-            const family = codec === 'aac_vbr' ? 'aac' : codec;
+            const family = aacFamily(codec);
             const targetQuality = audioQuality({ codec_name: family, channels, bit_rate: src });
             if (targetQuality >= srcQuality) {
                 // Guard passed: target codec scores >= the source at the source bitrate. Track the source exactly (no pad), floored at the perceptual minimum.
@@ -1227,7 +1233,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (guardObjectAudio === 'enabled' && stream.isTdarrObjectAudio) return true;   // Atmos/DTS:X/MPEG-H object layer has no ffmpeg encoder
             if (guardQuality === 'disabled') return false;
             if (Number(targetChannels) < Number(srcChannels)) return true;       // the operation drops channels
-            const family = targetCodec === 'aac_vbr' ? 'aac' : targetCodec;      // aac_vbr scores as the aac family
+            const family = aacFamily(targetCodec);      // aac_vbr scores as the aac family
             // Predict the bitrate the same-channel force branch actually emits, then score it. aac_vbr emits libfdk VBR (~128k q4 for a <=144k source, else ~192k
             // q5; see aacVbrArgsIdx), NOT resolveBitrate's CBR target — predict the VBR rate directly for aac_vbr or the guard would overstate the delivered quality.
             const srcBps = Number(stream.bit_rate) || 0;
@@ -1419,7 +1425,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //Remove any tracks that we won't use based on channel count, etc.
         // aac_vbr is treated as the aac family for codec-identity checks — ffprobe always reports codec_name 'aac' regardless of which encoder produced the
         // track, so comparing against 'aac_vbr' directly would never match and would needlessly re-encode existing AAC tracks.
-        const stereoCodecFamily = stereoCodec === 'aac_vbr' ? 'aac' : stereoCodec;
+        const stereoCodecFamily = aacFamily(stereoCodec);
         const channelMatch = (stream) => {
             //8 channel
             if(stream.channels > 6 && (downmixToSix === 'false') && (downmixToTwo === 'false') && (forceCodec === 'all' && ((stream?.codec_name ?? '').trim().toLowerCase() === surroundCodec)))
@@ -1613,8 +1619,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             quiet_room: { I: -16, LRA: 6,  TP: -1.5 },
         };
         const LOUDNORM_TOLERANCE_LU = 1;
-        // Codecs loudnorm can leave a track in without converging it, and each one's channel-count ceiling (mirrors codec_force's targetMaxCh below).
-        const LOUDNORM_MAX_CH = { ac3: 6, eac3: 6, aac: 8, opus: 8 };
 
         // Run ffmpeg as a synchronous child process to measure one audio stream's loudness (analysis-only, audio-only, no output written). Returns
         // { stats } with the measured EBU R128 JSON fields (input_i/input_tp/input_lra/input_thresh/target_offset), or { error } on any failure - a
@@ -1842,7 +1846,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const isStereo = forceChannels <= 2;
                 const targetCodec = isStereo ? stereoCodec : surroundCodec;
                 // aac_vbr is only valid for stereo; for family-identity checks compare against 'aac'.
-                const targetCodecFamily = targetCodec === 'aac_vbr' ? 'aac' : targetCodec;
+                const targetCodecFamily = aacFamily(targetCodec);
 
                 if (ffstreamCodec !== targetCodecFamily) {
                     const shouldForce =
@@ -1851,7 +1855,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         (forceCodec === '6below' && isStereo) ||
                         (forceCodec === '2below' && isStereo);
 
-                    const targetMaxCh = ({ ac3: 6, eac3: 6, aac: 8, aac_vbr: 8, opus: 8 })[targetCodec] ?? 8;
+                    const targetMaxCh = codecMaxCh(targetCodec);
 
                     if (shouldForce && forceChannels > targetMaxCh) {
                         verboseDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodecFamily} - ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} exceeds the ${targetMaxCh}ch limit for ${targetCodecFamily}. Enable downmix_to_six to create a 5.1 from it first.\n`;
@@ -2013,8 +2017,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // outside this plugin's encodable domain (e.g. a kept DTS-core or MP3 track).
                 const configuredCodec = isStereo ? stereoCodec : surroundCodec;
                 const targetCodec = ['ac3', 'eac3', 'aac', 'opus'].includes(rawCodec) ? rawCodec : configuredCodec;
-                const targetFamily = targetCodec === 'aac_vbr' ? 'aac' : targetCodec;
-                const maxCh = LOUDNORM_MAX_CH[targetFamily] ?? 8;
+                const targetFamily = aacFamily(targetCodec);
+                const maxCh = codecMaxCh(targetFamily);
                 if (channels > maxCh) {
                     verboseDone += `☒Stream ${stream.index}: Skipping loudnorm - ${rawCodec} ${channels}ch exceeds the ${maxCh}ch limit for ${targetFamily}.\n`;
                     continue;

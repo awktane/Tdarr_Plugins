@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.999.10',
+    Version: '2.999.11',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -797,6 +797,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // and hdmv_text_subtitle (both decode-only for mp4; hdmv_text_subtitle copies into mkv fine).
     const alwaysDropSubs  = ['eia_608', 'ttml', 'xsub', 'dvb_teletext'];
     const mp4OnlyDropSubs = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'arib_caption', 'hdmv_text_subtitle'];
+    // Legacy PC/fansub text codecs with no Matroska CodecID and no native mp4 support: a bare -c copy would fail the remux, but ffmpeg decodes them as text, so BOTH
+    // container branches below convert them (mkv -> srt, mp4 -> mov_text). Hoisted once so the two branches can't drift (a codec added to one list but not the other aborts a remux).
+    const legacyTextSubs = ['microdvd', 'mpl2', 'jacosub', 'sami', 'realtext', 'subviewer', 'subviewer1', 'vplayer', 'pjs'];
     const subFormatDropped = (codec) => alwaysDropSubs.includes(codec)
         || (dstContainer === 'mp4' && mp4OnlyDropSubs.includes(codec));
     // Image-based subtitles (PGS/VobSub/DVB) mkv muxes natively; remove_imagesubs governs them (mp4 drops them via mp4OnlyDropSubs regardless). xsub is image-based
@@ -1101,6 +1104,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             //This will be added to the ffmpeg command if metadata needs to be changed. It will be built up as needed.
             let metadataCommand = '';
             let delStream = false;
+            // Factored per-stream metadata emitters (per-iteration closures over this stream's ffstream/i/metadataCommand): the handler_name canonicalisation (mkv wipes it - it
+            // can confuse mkv title display; mp4 sets the per-type handler) and the encoder-junk strip were copy-pasted across the subtitle/audio/video branches. Branch-specific
+            // bits (title tagging, hvc1, busy-title, comment removal) stay inline; wipeReason carries video's extra "problems for titles in mkv" note so the log stays byte-identical.
+            const emitHandlerMeta = (typeLetter, idx, typeWord, handlerName, wipeReason = '') => {
+                if (dstContainer === 'mkv' && ffstream.tags?.handler_name) {
+                    workDone += `☐Wiping handler_name tag from ${i}${wipeReason} (${typeWord}) "${logSafe(ffstream.tags?.handler_name)}"\n`;
+                    metadataCommand += ` -metadata:s:${typeLetter}:${idx} "handler_name="`;
+                } else if (dstContainer === 'mp4' && ffstream.tags?.handler_name !== handlerName) {
+                    workDone += `☐Setting handler_name tag from ${i} (${typeWord}) to ${handlerName} "${logSafe(ffstream.tags?.handler_name)}"\n`;
+                    metadataCommand += ` -metadata:s:${typeLetter}:${idx} "handler_name=${handlerName}"`;
+                }
+            };
+            const emitJunkMeta = (typeLetter, idx, typeWord) => {
+                const j = streamJunkClears(ffstream, typeLetter, idx);
+                if (j) { workDone += `☐Remove encoder tag(s) from stream ${i} (${typeWord})\n`; metadataCommand += j; }
+            };
 
             if(ffstreamType === 'subtitle') {
                 //Start with zero based index for subtitle streams. This is only used when converting subtitle formats or changing metadata
@@ -1190,28 +1209,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${escMeta(newStreamTitle)}"`;
                 }
 
-                //The set_handler isn't needed at all for mkv and can cause some oddness with the title
-                if(dstContainer === 'mkv' && ffstream.tags?.handler_name) {
-                    workDone += `☐Wiping handler_name tag from ${i} (subtitle) "${logSafe(ffstream.tags?.handler_name)}"\n`;
-                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "handler_name="`;
-                } else if(dstContainer === 'mp4' && ffstream.tags?.handler_name !== 'SubtitleHandler') {
-                    workDone += `☐Setting handler_name tag from ${i} (subtitle) to SubtitleHandler "${logSafe(ffstream.tags?.handler_name)}"\n`;
-                    metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "handler_name=SubtitleHandler"`;
-                }
+                emitHandlerMeta('s', subtitleStreamIndex, 'subtitle', 'SubtitleHandler');
 
                 if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
                     workDone += `☐Remove comment from stream ${i} (subtitle) "${logSafe(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "comment="`;
                 }
 
-                const subJunk = streamJunkClears(ffstream, 's', subtitleStreamIndex);
-                if(subJunk) { workDone += `☐Remove encoder tag(s) from stream ${i} (subtitle)\n`; metadataCommand += subJunk; }
+                emitJunkMeta('s', subtitleStreamIndex, 'subtitle');
                 
                 // mkv: mov_text is a QuickTime-only format that most players won't render in mkv — convert to srt. mkv keeps subrip/ass/ssa/webvtt/text +
                 //      the bitmap codecs (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle, hdmv_text_subtitle) natively. The legacy PC/fansub text formats below
                 //      (microdvd, mpl2, jacosub, sami, realtext, subviewer, vplayer, pjs) have NO Matroska CodecID either, so a bare -c copy would fail the whole
                 //      remux — ffmpeg decodes them as text, so convert to srt too. xsub has no CodecID and is not decodable text, so it is dropped above (alwaysDropSubs).
-                if((dstContainer === 'mkv') && ['mov_text', 'microdvd', 'mpl2', 'jacosub', 'sami', 'realtext', 'subviewer', 'subviewer1', 'vplayer', 'pjs'].includes(ffstreamCodec)) {
+                if((dstContainer === 'mkv') && ['mov_text', ...legacyTextSubs].includes(ffstreamCodec)) {
                     workDone += `☐Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} subtitle to srt\n`;
                     extraArguments += metadataCommand+` -c:s:${subtitleStreamIndex} srt`;
                     subCodecOverride.set(ffstream.index, 'srt');
@@ -1222,7 +1233,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // mp4: only mov_text is natively supported. All decodable text subtitle codecs must be converted to it — the common ones (subrip/srt/ass/ssa/
                 //      webvtt/text) plus the legacy PC/fansub formats (microdvd, mpl2, jacosub, sami, realtext, subviewer, vplayer, pjs) that ffmpeg decodes as
                 //      text; without this they would hit the bare -c copy and fail the whole remux. text is raw UTF-8 that ffmpeg normalises to subrip on mux.
-                if((dstContainer === 'mp4') && ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'text', 'microdvd', 'mpl2', 'jacosub', 'sami', 'realtext', 'subviewer', 'subviewer1', 'vplayer', 'pjs'].includes(ffstreamCodec)) {
+                if((dstContainer === 'mp4') && ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'text', ...legacyTextSubs].includes(ffstreamCodec)) {
                     workDone += `☐Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} subtitle to mov_text\n`;
                     extraArguments += metadataCommand+` -c:s:${subtitleStreamIndex} mov_text`;
                     subCodecOverride.set(ffstream.index, 'mov_text');
@@ -1308,22 +1319,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${escMeta(newStreamTitle)}"`;
                 }
 
-                //The set_handler isn't needed at all for mkv and can cause some oddness with the title
-                if(dstContainer === 'mkv' && ffstream.tags?.handler_name) {
-                    workDone += `☐Wiping handler_name tag from ${i} (audio) "${logSafe(ffstream.tags?.handler_name)}"\n`;
-                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} "handler_name="`;
-                } else if(dstContainer === 'mp4' && ffstream.tags?.handler_name !== 'SoundHandler') {
-                    workDone += `☐Setting handler_name tag from ${i} (audio) to SoundHandler "${logSafe(ffstream.tags?.handler_name)}"\n`;
-                    metadataCommand += ` -metadata:s:a:${audioStreamIndex} "handler_name=SoundHandler"`;
-                }
+                emitHandlerMeta('a', audioStreamIndex, 'audio', 'SoundHandler');
 
                 if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
                     workDone += `☐Remove comment from audio stream ${i} (audio) "${logSafe(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "comment="`;
                 }
 
-                const audioJunk = streamJunkClears(ffstream, 'a', audioStreamIndex);
-                if(audioJunk) { workDone += `☐Remove encoder tag(s) from stream ${i} (audio)\n`; metadataCommand += audioJunk; }
+                emitJunkMeta('a', audioStreamIndex, 'audio');
                     
                 if (metadataCommand !== '') {
                     extraArguments += metadataCommand;
@@ -1369,14 +1372,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:v:${videoStreamIndex} "title="`;
                 }
 
-                //The set_handler isn't needed at all for mkv and can cause some oddness with the title
-                if(dstContainer === 'mkv' && ffstream.tags?.handler_name) {
-                    workDone += `☐Wiping handler_name tag from ${i} as it can cause problems for titles in mkv (video) "${logSafe(ffstream.tags?.handler_name)}"\n`;
-                    metadataCommand += ` -metadata:s:v:${videoStreamIndex} "handler_name="`;
-                } else if(dstContainer === 'mp4' && ffstream.tags?.handler_name !== 'VideoHandler') {
-                    workDone += `☐Setting handler_name tag from ${i} (video) to VideoHandler "${logSafe(ffstream.tags?.handler_name)}"\n`;
-                    metadataCommand += ` -metadata:s:v:${videoStreamIndex} "handler_name=VideoHandler"`;
-                }
+                emitHandlerMeta('v', videoStreamIndex, 'video', 'VideoHandler', ' as it can cause problems for titles in mkv');
 
                 const videoJunk = streamJunkClears(ffstream, 'v', videoStreamIndex);
                 if(videoJunk) { workDone += `☐Remove encoder tag(s) from stream ${i} (video)\n`; metadataCommand += videoJunk; }
