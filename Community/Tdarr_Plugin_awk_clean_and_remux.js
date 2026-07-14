@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.999.6',
+    Version: '2.999.7',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -805,11 +805,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // beyond subFormatDropped, used by subDroppedAnyReason for the language_fill tally + accessibility plain-track guard.
     const imageSubDropped = (codec) => isImageSub(codec) && (removeImageSubs === 'all' || removeImageSubs === 'export');
     // Hidden dot-prefixed sidecar name for an exported image subtitle: ".<video>.s<index>.<lang>[.forced].<ext>". The leading dot makes Plex/Jellyfin ignore it (Jellyfin
-    // skips **/.* ; Plex ignores .sup/.mks by extension). lang is restricted to the language-code charset so a crafted tag can't inject a path separator or break the quote.
+    // skips **/.* ; Plex ignores .sup/.mks by extension). Both metadata-derived name parts are made safe for the quoted "${path}" in the export preset: lang is restricted
+    // to the language-code charset, and imageBase (the source basename) has any " / control char stripped so a crafted video filename can't close the quote and inject args.
     const path = require('path');
     const libFile = otherArguments?.originalLibraryFile?.file || file.file;
     const libDir = path.dirname(libFile);
-    const imageBase = path.basename(libFile).replace(/\.[^.]+$/, '');
+    const imageBase = path.basename(libFile).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '');
     const imageSidecarName = (ffstream, ext) => {
         const lang = (resolveLang(ffstream) || 'und').replace(/[^a-z0-9-]/g, '') || 'und';
         const forced = ffstream.disposition?.forced === 1 ? '.forced' : '';

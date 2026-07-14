@@ -11,7 +11,7 @@ const details = () => ({
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them. Import ALSO recognizes fresh Plex-native sidecars with no s<index> (e.g. <video>.en.forced.srt), anchoring on the language token.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '1.999.4',
+    Version: '1.999.5',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -517,7 +517,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // fall back to file.file so the plugin still works when a caller (or the test harness) omits originalLibraryFile.
     const libFilePath = otherArguments?.originalLibraryFile?.file || file.file || '';
     const libDir = path.dirname(libFilePath);
-    const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '');
+    // Strip any " / control char from the source basename: it is interpolated into the quoted "${full}" sidecar path in the extract preset, where a " would close the
+    // quote and inject ffmpeg args (lang/disp/ext are separately safe). We create these files, so sanitising is safe; parseSidecar reads the sanitised name back unchanged.
+    const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '');
 
     // Recognize a filename token as a real language (2/3-letter ISO code or English name) so a Plex-native sidecar can be anchored on it without
     // mis-reading an arbitrary token as a language. Normalizes via the shared langKey, then confirms it names a real language (Intl.DisplayNames
@@ -655,7 +657,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // sidecar just because an embedded sub shares its lang|title|disposition - metadata can't prove same content, and dropping a distinct track is
         // data loss, whereas a redundant duplicate is not. Genuine duplication is collapsed by CONTENT instead (method_deduplicate, below).
         const existingSubCount = streams.filter((s) => (s.codec_type || '').toLowerCase() === 'subtitle').length;
-        const candidates = found.filter((f) => !importedSet.has(f.name));
+        // The import muxes each sidecar as -i "${libDir}/${name}"; a " or control char in that real on-disk path would close the quote and inject ffmpeg args, and unlike a
+        // name we generate it must match the file byte-for-byte, so it can't be sanitised - skip it instead (a Plex-native/user file we can't safely reference), never break out.
+        const candidates = found.filter((f) => !importedSet.has(f.name)).filter((f) => {
+            if (!/["\x00-\x1f\x7f]/.test(path.join(libDir, f.name))) return true;
+            response.infoLog += `☒Skipping sidecar with an unsafe filename (contains a quote or control character), cannot import safely: ${f.name}\n`;
+            return false;
+        });
 
         // Group candidates by byte-identical file content (disabled => every file is its own group). readFileSync can't fail for a file readdir just
         // listed, but guard anyway: an unreadable file gets a unique key so it is imported on its own, never silently dropped or merged.
