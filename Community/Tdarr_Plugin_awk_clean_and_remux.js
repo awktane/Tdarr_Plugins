@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.999.8',
+    Version: '2.999.9',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -676,7 +676,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Value checks continue in Inputs order (container already checked above): language_fill is format-checked and cross-checked against language_sub/
     // language_audio, then the remaining dropdowns are checked against their option set (free-text and boolean inputs need no check - see above).
-    if(fillLanguage && fillLanguage.length !== 3)
+    if(fillLanguage && !/^[a-z]{3}$/.test(fillLanguage))
         failFile(`fillLanguage is not a 3 character ISO-639-2 language code. It should follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes`);
     // If fillLanguage is set it should be a track that's kept (checked per-type so one type can legitimately exclude it).
     if(fillLanguage && subLanguage.length > 0 && !subLangKeys.includes(langKey(fillLanguage)))
@@ -705,10 +705,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`Somehow invalid remove_imagesubs option provided. Check your settings!`);
 
     // ====== LANGUAGE TAG CANONICALIZATION ======
-    // Local to clean_and_remux (the only plugin that WRITES container language tags); langKey/langListMatch (matching) are shared, these write-side helpers are
-    // not. Verified on this build: mp4's mdhd stores only a lowercase 3-letter ISO 639-2 code (2-letter / uppercase / region are silently dropped,
-    // so a plain mkv->mp4 remux of an "en"-tagged stream loses its language), mkv stores any recognised code; und/mul/zxx/mis are never rewritten.
-    // ISO 639-1 (2-letter) -> ISO 639-2/T (terminologic 3-letter), complete for every current 639-1 code; each row verified to name the same language via ICU.
+    // Write-side helpers: this is the only plugin that WRITES container language tags via tag_language/language_fill; langKey/langListMatch (matching) are shared, the
+    // ISO639_2_B/toCanonicalTag write-side logic below is clean_and_remux-only. Verified on this build: mp4's mdhd stores only a lowercase 3-letter ISO 639-2 code (2-letter /
+    // uppercase / region are silently dropped, so a plain mkv->mp4 remux of an "en"-tagged stream loses its language), mkv stores any recognised code; und/mul/zxx/mis are never rewritten.
+    // ===== SHARED [clean_and_remux, sub_worker]: iso639-1 to iso639-2 map =====
+    // -=-=-= ISO639_1_TO_2  [clean_and_remux, sub_worker] =-=-=-
+    // ISO 639-1 (2-letter) -> ISO 639-2/T (terminologic 3-letter), complete for every current 639-1 code; each row verified to name the same language via ICU. Both writers map
+    // to /T for an mp4 target (its mdhd stores only a 3-letter code): clean_and_remux via toCanonicalTag/method_tag_language, sub_worker via to6392T on subtitle import.
     const ISO639_1_TO_2 = {
         aa:'aar',ab:'abk',ae:'ave',af:'afr',ak:'aka',am:'amh',an:'arg',ar:'ara',as:'asm',av:'ava',ay:'aym',az:'aze',ba:'bak',be:'bel',bg:'bul',
         bh:'bih',bi:'bis',bm:'bam',bn:'ben',bo:'bod',br:'bre',bs:'bos',ca:'cat',ce:'che',ch:'cha',co:'cos',cr:'cre',cs:'ces',cu:'chu',cv:'chv',
@@ -724,6 +727,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ts:'tso',tt:'tat',tw:'twi',ty:'tah',ug:'uig',uk:'ukr',ur:'urd',uz:'uzb',ve:'ven',vi:'vie',vo:'vol',wa:'wln',wo:'wol',xh:'xho',yi:'yid',
         yo:'yor',za:'zha',zh:'zho',zu:'zul',
     };
+    // ===== END SHARED: iso639-1 to iso639-2 map =====
     // The 20 languages whose 639-2/B (bibliographic) code differs from /T above, keyed by 639-1. method_tag_language=639-2/b uses these; /t uses the table.
     const ISO639_2_B = {
         sq:'alb',hy:'arm',eu:'baq',bo:'tib',my:'bur',zh:'chi',cs:'cze',nl:'dut',ka:'geo',de:'ger',el:'gre',is:'ice',mk:'mac',mi:'mao',ms:'may',
@@ -1035,8 +1039,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const removedByAccess = (s, type) => applies(removeAccessible, type)
             && (type === 'audio' ? isDescriptive(s) : isSdh(s))
             && hasPlainSameLang(type === 'audio' ? plainAudioLangs : plainSubLangs, untaggedWorkLang);
-        const untaggedAudio = keptByLangFilter(audioLangKeys)
-            ? streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s) && !removedByAccess(s, 'audio')).length : 0;
+        // guard_original independently rescues an untagged 'original'-disposition audio track from the language filter (main loop), so it reaches the output even when the
+        // filter would drop the untagged language. Count those too, else 2+ guard-rescued ambiguous untagged tracks slip past the very collision this quarantine prevents.
+        const audioSurvivesFilter = keptByLangFilter(audioLangKeys);
+        const guardRescuesUntagged = guardOriginal === 'enabled' && audioLangKeys.length > 0 && !audioSurvivesFilter;
+        const untaggedAudio = streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s) && !removedByAccess(s, 'audio')
+            && (audioSurvivesFilter || (guardRescuesUntagged && hasDisposition(s, 'original')))).length;
         if (untaggedAudio > 1)
             failFile(`${untaggedAudio} audio streams have no language tag${fillNote} — they may be different languages. Tag them manually and requeue or set language_fill_fail to false.`);
         const untaggedSubs = keptByLangFilter(subLangKeys)
