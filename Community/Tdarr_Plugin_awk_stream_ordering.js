@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '2.999.6',
+    Version: '2.999.7',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -95,12 +95,51 @@ const details = () => ({
                 demoted. The cap only applies to descending (ascending already puts the smallest first).
                 \\nSet to disabled to skip quality ordering entirely. If both order_channel and order_quality are disabled, audio is not reordered by channels or quality (language/role/order_codec still apply).`
         },
+        {
+            name: 'method_mp4_faststart',
+            type: 'string',
+            defaultValue: 'enabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['enabled', 'disabled'],
+            },
+            tooltip: `mp4/mov only: write the moov atom (the index) at the FRONT of the file so players start and seek instantly on progressive download / remote direct-play. mkv is unaffected.
+                \\nRuns as this plugin's normal reorder remux when there is reordering to do, and otherwise forces a single lossless -c copy remux to relocate the index when the file isn't already front-loaded (detected without decoding). Already-fronted files are left untouched, so it settles after one pass and never loops.
+                \\nenabled (default): front-load the mp4 moov atom. Cost is one extra read/write of the file the first time it's needed.
+                \\ndisabled: leave the moov atom wherever the source muxer put it.`,
+        },
     ],
 });
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const plugin = (file, librarySettings, inputs, otherArguments) => {
     const lib = require('../methods/lib')();
+    const fs = require('fs');
+    // True if the mp4 already has moov before mdat (front-loaded), so method_mp4_faststart needn't remux it. Reads only top-level box headers (a few 16-byte reads,
+    // seeking by box size) - no ffmpeg spawn, no full-file read. otherArguments.__awkMoovFront overrides for the harness (which has no real file on disk). Fail-safe: any
+    // read/parse anomaly returns true (treat as fronted -> skip) so we never loop on a file we can't inspect.
+    const moovBeforeMdat = (filePath, oa) => {
+        const inj = oa?.__awkMoovFront;
+        if (inj !== undefined) return inj === true;
+        let fd;
+        try {
+            fd = fs.openSync(filePath, 'r');
+            const head = Buffer.alloc(16);
+            let pos = 0;
+            for (let i = 0; i < 100; i++) {
+                const n = fs.readSync(fd, head, 0, 16, pos);
+                if (n < 8) return true;
+                let size = head.readUInt32BE(0);
+                const type = head.toString('latin1', 4, 8);
+                if (size === 1) size = Number(head.readBigUInt64BE(8));   // 64-bit largesize
+                if (type === 'moov') return true;
+                if (type === 'mdat') return false;
+                if (size < 8) return true;                                // malformed / size-0 (extends to EOF)
+                pos += size;
+            }
+            return true;
+        } catch { return true; } finally { if (fd !== undefined) fs.closeSync(fd); }
+    };
     // eslint-disable-next-line @typescript-eslint/no-unused-vars,no-param-reassign
     inputs = lib.loadDefaultValues(inputs, details);
 
@@ -597,6 +636,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile('order_quality has not been configured, please configure required options.');
     if(!['normal', 'default', 'sdh', 'descriptive'].includes(inputs.first_subtitle))
         failFile('first_subtitle has not been configured, please configure required options.');
+    if(!['enabled', 'disabled'].includes(String(inputs.method_mp4_faststart || 'enabled').toLowerCase()))
+        failFile('Somehow invalid method_mp4_faststart option provided. Check your settings!');
 
     // One guard around all the reordering work below: a deliberate failFile abort (AwkFailFile) rethrows unchanged, and any UNEXPECTED error fails the
     // file too — annotated and carrying the full infoLog — instead of silently skipping. (Earlier input validation runs before this and fails via failFile.)
@@ -623,6 +664,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
         const channelOrder = parseOrderMode(inputs.order_channel);
         const qualityOrder = parseOrderMode(inputs.order_quality);
+        const methodFaststart = String(inputs.method_mp4_faststart || 'enabled').toLowerCase();
         // Union-of-caps demotion: a track over EITHER the channel cap OR the quality cap is demoted below every under-all-caps track, so the fully-serveable
         // track leads - e.g. a 5.1 that's under the <=6 channel cap but over the <=1024k quality cap is still demoted, not kept above a stereo. A finite cap
         // exists only in a 'descending <=N' mode (plain descending/ascending/disabled don't cap -> Infinity). Channel caps by channel count; quality by capBitrate.
@@ -808,16 +850,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
-        if (!changed && dispositionArgs === '') {
+        // method_mp4_faststart: front-load the mp4 moov atom. A plain ride-along isn't enough (we skip when order is already correct), so detect the moov position
+        // (spawn-free; __awkMoovFront overrides for the harness) and force a one-time remux when faststart is on, the output is an mp4-family container, and the file
+        // isn't already fronted. moovBeforeMdat is fail-safe (unreadable/odd -> treated as fronted), so this settles after one pass and never loops.
+        const isMp4Family = ['mp4', 'mov', 'm4v', 'm4a'].includes(String(file.container).toLowerCase());
+        const faststartOn = methodFaststart === 'enabled';
+        const needsFront = faststartOn && isMp4Family && !moovBeforeMdat(file.file, otherArguments);
+
+        if (!changed && dispositionArgs === '' && !needsFront) {
             response.infoLog += '☑Streams already in desired order.\n';
             return response;
         }
 
         response.processFile = true;
         response.reQueueAfter = true;
-        // mp4/mov muxers drop a custom GLOBAL metadata tag (e.g. clean_and_remux's awk_recovered, set upstream) on a -c copy remux unless told to keep it,
-        // which would re-trigger recovery on the next pass. Preserve it on the mov family.
-        const mp4KeepTags = ['mp4', 'mov', 'm4v', 'm4a'].includes(String(file.container).toLowerCase()) ? ' -movflags use_metadata_tags' : '';
+        if (needsFront && !changed && dispositionArgs === '')
+            response.infoLog += '☐Remux to front-load the mp4 moov atom (method_mp4_faststart)\n';
+        // mp4/mov muxers drop a custom GLOBAL metadata tag (e.g. clean_and_remux's awk_recovered, set upstream) on a -c copy remux unless told to keep it, which would
+        // re-trigger recovery on the next pass. Preserve it on the mov family, and append +faststart when method_mp4_faststart is on so the moov atom leads the file.
+        const mp4KeepTags = isMp4Family ? ` -movflags use_metadata_tags${faststartOn ? '+faststart' : ''}` : '';
         response.preset = `,${ffmpegMap} -c copy${dispositionArgs}${globalOutputOpt}${mp4KeepTags}`;
         if (dispositionArgs !== '')
             response.infoLog += '☐Set the first audio track as the sole default.\n';

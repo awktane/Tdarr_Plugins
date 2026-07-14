@@ -12,12 +12,12 @@ const details = () => ({
                      -Option to modify metadata to remove metadata comments and titles with too many periods\n\n
                      -Automatically deduplicates titles reducing "Stereo / Stereo" down to "Stereo" or "English - English" down to "English"\n\n
                      -Optionally rebuilds audio and/or subtitle titles from their disposition roles and imports title keywords into the real ffmpeg disposition flags\n\n
-                     -Forcefully removes unsupported image based subtitles and optionally removes all image based subtitles from mkv to reduce the need for transcoding\n\n
+                     -Forcefully removes unsupported image based subtitles; optionally removes all image based subtitles, or exports them to hidden OCR sidecars, via remove_imagesubs\n\n
                      -Converts unsupported subtitles to a supported format\n\n
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.999.5',
+    Version: '2.999.6',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -143,7 +143,7 @@ const details = () => ({
             },
             tooltip: `Remove accessibility tracks. Choose which stream types to apply to: disabled, subtitle, audio, or both.
                 \\nSubtitle removes SDH / Closed Caption tracks (for the deaf/hard-of-hearing). Audio removes audio-description tracks (visual_impaired, for the blind). Detected by the real ffmpeg disposition flag or by keywords in the title/handler/description.
-                \\nSafety: a track is only removed when a "plain" track of the same language survives - one carrying no commentary/descriptive/SDH/lyrics role (and, for subtitles, in a format the output container keeps and not stripped by remove_mkv_imagesubs). So extras are removed, never the last usable track.`,
+                \\nSafety: a track is only removed when a "plain" track of the same language survives - one carrying no commentary/descriptive/SDH/lyrics role (and, for subtitles, in a format the output container keeps and not stripped by remove_imagesubs). So extras are removed, never the last usable track.`,
         },
         {
             name: 'remove_comments',
@@ -169,16 +169,33 @@ const details = () => ({
                 This.Title.Has.Too.Many.Periods would have title set to blank`,
         },
         {
-            name: 'remove_mkv_imagesubs',
-            type: 'boolean',
-            defaultValue: false,
+            name: 'remove_junk_tags',
+            type: 'string',
+            defaultValue: 'disabled',
             inputUI: {
                 type: 'dropdown',
-                options: ['false','true'],
+                options: ['disabled', 'encoder', 'descriptive'],
             },
-            tooltip: `Should image-based (bitmap) subtitles be removed from mkv output? Applies only when the container is mkv - mp4 already drops these formats.
-                \\nRemoves hdmv_pgs_subtitle (Blu-ray PGS), dvd_subtitle (VobSub), and dvb_subtitle - picture subtitles mkv keeps by default. They can't be searched, restyled, or converted to text without OCR, so this strips them when you only want text subtitles.
-                \\nText subtitles (subrip, srt, ass, ssa, webvtt, mov_text) are never affected. xsub is always removed regardless of this setting because it can't be muxed into mkv.`,
+            tooltip: `Strip junk metadata tags the file carries (both container-global and per-stream). Only tags actually present are cleared, so files without them are untouched (no needless remux).
+                \\ndisabled (default): leave all tags.
+                \\nencoder: remove only encoder/muxer provenance tags nobody reads - encoded_by, and per-stream encoder (a leftover "Lavc.../HandBrake" tag). Safe on any library.
+                \\ndescriptive: also remove descriptive movie/TV metadata and iTunes/app flags - genre, date, description, synopsis, show, network, season/episode, media_type, artist, album, composer, copyright, keywords, compilation, sort-order keys, etc.
+                \\nAlways kept: title and comment (handled by remove_busytitle / remove_comments), stream language tags, per-track bitrate statistics (BPS), the container-level encoder tag (muxer-managed), and creation date.
+                \\nNote: a Plex library set to read local media assets DOES read some mp4 descriptive tags (genre/date/description/show/etc.) - use descriptive only if you don't rely on in-file metadata.`,
+        },
+        {
+            name: 'remove_imagesubs',
+            type: 'string',
+            defaultValue: 'unsupported',
+            inputUI: {
+                type: 'dropdown',
+                options: ['unsupported', 'all', 'export'],
+            },
+            tooltip: `What to do with image-based (bitmap) subtitles - hdmv_pgs_subtitle (Blu-ray PGS), dvd_subtitle (VobSub), dvb_subtitle. They can't be searched, restyled, or turned into text without OCR.
+                \\nunsupported (default): keep them where the container carries them (mkv), drop them only where it can't (mp4 can't store these). Matches the previous default behaviour.
+                \\nall: remove all image-based subtitles from any container (use when you only want text subtitles). Same as the old remove_mkv_imagesubs=true.
+                \\nexport: save each image subtitle to a hidden sidecar next to the video (PGS -> ".<name>.<lang>.sup", VobSub/DVB -> ".<name>.<lang>.mks") and then remove it. The leading dot keeps Plex/Jellyfin from indexing it; run an external OCR tool on the sidecars to produce .srt, then reimport with awk_sub_worker. One-way - these are never reimported by this plugin.
+                \\nText subtitles are never affected. xsub is always removed (no Matroska CodecID) and is not exported.`,
         },
         {
             name: 'recover_bad_timestamps',
@@ -209,6 +226,19 @@ const details = () => ({
                  \\nlight (risk-free): -fflags +ignidx and -err_detect ignore_err - ignores a broken/corrupt index (AVI idx1, MOV/MP4 sample tables) and keeps reading past detected errors instead of failing. Drops no frames.
                  \\naggressive: additionally -fflags +discardcorrupt - drops packets flagged corrupt, which may cause small video/audio blips where the damage is.
                  \\nThe mode actually applied is recorded in an awk_recovered tag. Recovery re-runs only when a recover_bad_* mode changes, then settles.`,
+        },
+        {
+            name: 'guard_original',
+            type: 'string',
+            defaultValue: 'disabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['disabled', 'enabled'],
+            },
+            tooltip: `Protect a foreign film's ORIGINAL-language audio track from being removed by the language_audio filter when its language isn't in your list.
+                \\nKeys off the ffmpeg "original" disposition flag OR an "original" keyword in the track title/handler (the same signal audio_clean's guard_original uses). A track with neither marker is not protected - this only rescues a properly-flagged original track, not a bare native-language track.
+                \\ndisabled (default): the original track follows normal language_audio handling (removed if its language isn't listed).
+                \\nenabled: keep an original-disposition audio track regardless of language_audio - so a jpn-only original track survives an eng-only filter instead of being dropped (or, if it were the last audio track, quarantining the file).`,
         },
         {
             name: 'method_tag_language',
@@ -601,7 +631,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile('No ffProbe stream data available for this file - the plugin cannot process it.');
 
     // Input validation. Order mirrors the Inputs array in details(); only type:'string' inputs are checked - free-text inputs (language_audio, language_sub)
-    // have no fixed option set, and type:'boolean' inputs (language_fill_fail, remove_comments/remove_busytitle, remove_mkv_imagesubs) are coerced to a real
+    // have no fixed option set, and type:'boolean' inputs (language_fill_fail, remove_comments/remove_busytitle) are coerced to a real
     // true/false by loadDefaultValues (any out-of-set value becomes false), so a guard on them would be dead code. container is validated first (input #1) and
     // before the dstContainer parse below so an empty value fails cleanly rather than throwing a raw TypeError. Remaining checks run after all inputs parse.
     if (!inputs.container || inputs.container === '')
@@ -629,7 +659,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const applies = (opt, type) => opt === 'both' || opt === type;
     const metaCommentRemove = String(inputs.remove_comments) === 'true';
     const metaBusyTitleRemove = String(inputs.remove_busytitle) === 'true';
-    const cleanMkvImageSubs = String(inputs.remove_mkv_imagesubs) === 'true';
+    const removeImageSubs = String(inputs.remove_imagesubs || 'unsupported').toLowerCase();
 
     const fillLanguage = (inputs.language_fill ? inputs.language_fill.toLowerCase().trim() : '');
     const subLanguage = inputs.language_sub.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
@@ -641,6 +671,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const removeAccessible = String(inputs.remove_accessibility || 'disabled').toLowerCase();
     const tagLanguage = String(inputs.tag_language || 'invalid').toLowerCase();
     const methodTagLanguage = String(inputs.method_tag_language || 'container').toLowerCase();
+    const guardOriginal = String(inputs.guard_original || 'disabled').toLowerCase();
+    const junkTags = String(inputs.remove_junk_tags || 'disabled').toLowerCase();
 
     // Value checks continue in Inputs order (container already checked above): language_fill is format-checked and cross-checked against language_sub/
     // language_audio, then the remaining dropdowns are checked against their option set (free-text and boolean inputs need no check - see above).
@@ -665,6 +697,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`Somehow invalid recover_bad_timestamps option provided. Check your settings!`);
     if(!['disabled', 'light', 'aggressive'].includes(recoverData))
         failFile(`Somehow invalid recover_bad_data option provided. Check your settings!`);
+    if(!['disabled', 'enabled'].includes(guardOriginal))
+        failFile(`Somehow invalid guard_original option provided. Check your settings!`);
+    if(!['disabled', 'encoder', 'descriptive'].includes(junkTags))
+        failFile(`Somehow invalid remove_junk_tags option provided. Check your settings!`);
+    if(!['unsupported', 'all', 'export'].includes(removeImageSubs))
+        failFile(`Somehow invalid remove_imagesubs option provided. Check your settings!`);
 
     // ====== LANGUAGE TAG CANONICALIZATION ======
     // Local to clean_and_remux (the only plugin that WRITES container language tags); langKey/langListMatch (matching) are shared, these write-side helpers are
@@ -756,13 +794,50 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const mp4OnlyDropSubs = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'arib_caption', 'hdmv_text_subtitle'];
     const subFormatDropped = (codec) => alwaysDropSubs.includes(codec)
         || (dstContainer === 'mp4' && mp4OnlyDropSubs.includes(codec));
-    // Image-based subtitles mkv natively muxes and would otherwise keep - PGS/VobSub/DVB. Removed only when remove_mkv_imagesubs is on and the output is
-    // mkv (mp4 already drops these via mp4OnlyDropSubs). xsub is image-based too but is unmuxable in mkv, so it lives in alwaysDropSubs and is always removed.
+    // Image-based subtitles (PGS/VobSub/DVB) mkv muxes natively; remove_imagesubs governs them (mp4 drops them via mp4OnlyDropSubs regardless). xsub is image-based
+    // too but has no Matroska CodecID, so it lives in alwaysDropSubs (always removed) and is NOT exportable to .mks. IMAGE_SUB maps each exportable image codec to its
+    // native sidecar container: PGS -> raw .sup, VobSub/DVB -> a single-stream Matroska .mks (no vobsub muxer exists), both via -c:s copy. The .mks output needs an
+    // explicit -f matroska - ffmpeg only auto-detects the matroska muxer from a .mkv extension, not .mks (verified); the .sup muxer auto-detects from the extension.
     const imageSubCodecs = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle'];
-    const imageSubDropped = (codec) => cleanMkvImageSubs && dstContainer === 'mkv' && imageSubCodecs.includes(codec);
-    // A subtitle removed regardless of language - by container/format (subFormatDropped) or by remove_mkv_imagesubs (imageSubDropped). Neither is ever assigned
+    const IMAGE_SUB = { hdmv_pgs_subtitle: { ext: 'sup', fmt: 'sup' }, dvd_subtitle: { ext: 'mks', fmt: 'matroska' }, dvb_subtitle: { ext: 'mks', fmt: 'matroska' } };
+    const isImageSub = (codec) => imageSubCodecs.includes(codec);
+    // 'all'/'export' drop every image sub; 'unsupported' relies on subFormatDropped (container-forced) alone. imageSubDropped is the remove_imagesubs-specific drop
+    // beyond subFormatDropped, used by subDroppedAnyReason for the language_fill tally + accessibility plain-track guard.
+    const imageSubDropped = (codec) => isImageSub(codec) && (removeImageSubs === 'all' || removeImageSubs === 'export');
+    // Hidden dot-prefixed sidecar name for an exported image subtitle: ".<video>.s<index>.<lang>[.forced].<ext>". The leading dot makes Plex/Jellyfin ignore it (Jellyfin
+    // skips **/.* ; Plex ignores .sup/.mks by extension). lang is restricted to the language-code charset so a crafted tag can't inject a path separator or break the quote.
+    const path = require('path');
+    const libFile = otherArguments?.originalLibraryFile?.file || file.file;
+    const libDir = path.dirname(libFile);
+    const imageBase = path.basename(libFile).replace(/\.[^.]+$/, '');
+    const imageSidecarName = (ffstream, ext) => {
+        const lang = (resolveLang(ffstream) || 'und').replace(/[^a-z0-9-]/g, '') || 'und';
+        const forced = ffstream.disposition?.forced === 1 ? '.forced' : '';
+        return `.${imageBase}.s${ffstream.index}.${lang}${forced}.${ext}`;
+    };
+    // A subtitle removed regardless of language - by container/format (subFormatDropped) or by remove_imagesubs (imageSubDropped). Neither is ever assigned
     // language_fill, and neither counts as a survivor for the language_fill_fail untagged tally or the remove_accessibility plain-track guard.
     const subDroppedAnyReason = (codec) => subFormatDropped(codec) || imageSubDropped(codec);
+
+    // remove_junk_tags: two-tier container-tag cleanup. 'encoder' = pure encoder/muxer provenance; 'descriptive' (superset) adds iTunes/app flags + descriptive movie/TV
+    // metadata. Always kept: title/comment (own inputs), awk_* markers (idempotency), creation_time, the mkv BPS/statistics family (mediaInfo derives per-track bitrate
+    // from BPS - stripping degrades audio_clean's downstream scoring), the functional per-stream tags (language/title/description/handler_name/comment/filename/mimetype),
+    // and the GLOBAL 'encoder' tag (muxer-managed: mp4 re-stamps ©too=Lavf, mkv writes its own WritingApp every mux, so stripping it would loop). Per-stream 'encoder'
+    // (a leftover Lavc/HandBrake per-track tag) is NOT muxer-re-added on -c copy, so it IS stripped. Matched case-insensitively (mkv keys are UPPERCASE), present-only.
+    const JUNK_ENCODER_GLOBAL = new Set(['encoded_by']);
+    const JUNK_DESCRIPTIVE = new Set(['compilation', 'gapless_playback', 'hd_video', 'purchase_date', 'sort_name', 'sort_album', 'sort_album_artist', 'sort_artist',
+        'sort_composer', 'sort_show', 'genre', 'date', 'description', 'synopsis', 'show', 'episode_id', 'network', 'episode_sort', 'season_number', 'media_type', 'artist',
+        'album', 'album_artist', 'composer', 'grouping', 'lyrics', 'copyright', 'keywords']);
+    const JUNK_PERSTREAM = new Set(['encoded_by', 'encoder']);   // only encoder-tier keys are safe per-stream (descriptive per-stream tags are functional, kept)
+    const junkGlobalStrip = (lowerKey) => junkTags !== 'disabled' && (JUNK_ENCODER_GLOBAL.has(lowerKey) || (junkTags === 'descriptive' && JUNK_DESCRIPTIVE.has(lowerKey)));
+    // Per-stream encoder/encoded_by clears (both non-disabled tiers). Returns the -metadata:s: args; caller logs + appends. escMeta guards the probe-derived key.
+    const streamJunkClears = (ffstream, typeLetter, idx) => {
+        if (junkTags === 'disabled') return '';
+        let meta = '';
+        for (const k of Object.keys(ffstream.tags || {}))
+            if (JUNK_PERSTREAM.has(k.toLowerCase())) meta += ` -metadata:s:${typeLetter}:${idx} "${escMeta(k)}="`;
+        return meta;
+    };
 
     // ===== SHARED [audio_clean, clean_and_remux]: title canonicalization =====
     // The canonical audio-title machinery both plugins share, so audio_clean's downmix titles come out already in clean_and_remux's tag_title form and a
@@ -913,7 +988,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // remove_accessibility safety guard.
     // (subDroppedAnyReason/subtitle drop lists defined earlier) A "plain" track carries no commentary/descriptive/SDH/lyrics role - a genuine main audio or
     // dialogue subtitle. remove_accessibility removes an accessibility track (SDH/CC subtitle, audio-description audio) only when its language still has a plain
-    // track that SURVIVES the language, format, and remove_mkv_imagesubs filters, so we strip extras, never the last usable track. resolveWorkLang mirrors the
+    // track that SURVIVES the language, format, and remove_imagesubs filters, so we strip extras, never the last usable track. resolveWorkLang mirrors the
     // loop's language resolution. Computed BEFORE the language_fill_fail pre-check so that check can exclude the accessibility tracks this guard will drop.
     const plainAudioLangs = new Set();
     const plainSubLangs = new Set();
@@ -968,6 +1043,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Set up required variables.
     let extraArguments = '';
+    let sidecarOut = '';   // remove_imagesubs=export: accumulates the per-image-sub sidecar outputs, prepended to the main output in the preset below.
     let fflags = '';
     let inputArgs = '';   // recovery args that must precede -i (e.g. -err_detect); placed on the input side of the preset
     let workDone = '';
@@ -1016,15 +1092,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //Start with zero based index for subtitle streams. This is only used when converting subtitle formats or changing metadata
                 subtitleStreamIndex++;
 
-                // Remove subtitles the container/format can't carry first, since language doesn't matter for those (see alwaysDropSubs/mp4OnlyDropSubs
-                // above), then any remove_mkv_imagesubs image-subtitle removal - neither case depends on language.
-                if (subFormatDropped(ffstreamCodec)) {
+                // Image subs (PGS/VobSub/DVB) are governed by remove_imagesubs: 'unsupported' drops them only where the container can't carry them (mp4), 'all' drops them
+                // from any container, 'export' saves each to a hidden dot-prefixed sidecar (PGS->.sup, VobSub/DVB->.mks, both ignored by Plex/Jellyfin) before dropping.
+                // Non-image subs the container can't carry (ttml/eia_608/xsub/dvb_teletext, or mp4 arib/hdmv_text) are dropped by subFormatDropped as before. A kept image
+                // sub (unsupported + carriable) and every non-image sub then fall through to the language/accessibility filters below.
+                if (isImageSub(ffstreamCodec) && imageSubDropped(ffstreamCodec)) {
+                    // remove_imagesubs = all/export drops the image sub explicitly; export first saves a hidden dot-prefixed sidecar for external OCR.
+                    if (removeImageSubs === 'export') {
+                        const sc = IMAGE_SUB[ffstreamCodec];   // { ext, fmt } - .mks needs an explicit -f matroska; .sup auto-detects from the extension
+                        const sidecarName = imageSidecarName(ffstream, sc.ext);
+                        sidecarOut += ` -map 0:${ffstream.index} -c:s copy -f ${sc.fmt} "${path.join(libDir, sidecarName)}"`;
+                        workDone += `☐Export image subtitle stream ${i} -> ${sidecarName} for external OCR (before drop)\n`;
+                    }
+                    workDone += `☐Remove stream ${i} - image-based subtitle, remove_imagesubs=${removeImageSubs} (${ffstreamType}-${ffstreamCodec})\n`;
+                    delStream = true;
+                } else if (subFormatDropped(ffstreamCodec)) {
+                    // Container/format can't carry it (image subs on mp4, or xsub/ttml/eia_608/dvb_teletext / mp4 arib/hdmv_text) - dropped regardless of remove_imagesubs.
                     workDone += `☐Remove stream ${i} - unsupported (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
-                } else if (imageSubDropped(ffstreamCodec)) {
-                    workDone += `☐Remove stream ${i} - image-based subtitle, remove_mkv_imagesubs (${ffstreamType}-${ffstreamCodec})\n`;
-                    delStream = true;
-                } else {
+                }
+
+                if (!delStream) {
                     // Fill a blank language and/or standardise the tag (tag_language) before deciding whether to remove it.
                     {
                         const lm = canonicalLangMeta('s', subtitleStreamIndex, ffstream, i, 'subtitle', true);
@@ -1101,6 +1189,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     workDone += `☐Remove comment from stream ${i} (subtitle) "${logSafe(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "comment="`;
                 }
+
+                const subJunk = streamJunkClears(ffstream, 's', subtitleStreamIndex);
+                if(subJunk) { workDone += `☐Remove encoder tag(s) from stream ${i} (subtitle)\n`; metadataCommand += subJunk; }
                 
                 // mkv: mov_text is a QuickTime-only format that most players won't render in mkv — convert to srt. mkv keeps subrip/ass/ssa/webvtt/text +
                 //      the bitmap codecs (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle, hdmv_text_subtitle) natively. The legacy PC/fansub text formats below
@@ -1141,8 +1232,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (lm.meta) { workDone += lm.log; metadataCommand += lm.meta; }
                 }
 
+                //guard_original: an unlisted-language audio track carrying the 'original' role (real flag or title keyword) is protected from the language filter.
+                //Must gate the removal below (before the audioDropped/audioStreamIndex bookkeeping) so a rescued last-audio track also avoids the strip-all-audio quarantine.
+                const guardedOriginal = guardOriginal === 'enabled' && audioLanguage.length > 0
+                    && !langListMatch(workLang, audioLangKeys) && hasDisposition(ffstream, 'original');
+                if(guardedOriginal)
+                    workDone += `☑Keep stream ${i} - original-language audio protected by guard_original (${streamLang})\n`;
+
                 //If the audio is a language that should be removed then remove it regardless of other settings.
-                if(audioLanguage.length > 0 && !langListMatch(workLang, audioLangKeys)) {
+                if(audioLanguage.length > 0 && !langListMatch(workLang, audioLangKeys) && !guardedOriginal) {
                     workDone += `☐Remove stream ${i} - audio language (${streamLang})\n`;
                     delStream = true;
                 } else if (applies(removeAccessible, 'audio') && isDescriptive(ffstream) && hasPlainSameLang(plainAudioLangs, workLang)) {
@@ -1209,6 +1307,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     workDone += `☐Remove comment from audio stream ${i} (audio) "${logSafe(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "comment="`;
                 }
+
+                const audioJunk = streamJunkClears(ffstream, 'a', audioStreamIndex);
+                if(audioJunk) { workDone += `☐Remove encoder tag(s) from stream ${i} (audio)\n`; metadataCommand += audioJunk; }
                     
                 if (metadataCommand !== '') {
                     extraArguments += metadataCommand;
@@ -1262,6 +1363,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     workDone += `☐Setting handler_name tag from ${i} (video) to VideoHandler "${logSafe(ffstream.tags?.handler_name)}"\n`;
                     metadataCommand += ` -metadata:s:v:${videoStreamIndex} "handler_name=VideoHandler"`;
                 }
+
+                const videoJunk = streamJunkClears(ffstream, 'v', videoStreamIndex);
+                if(videoJunk) { workDone += `☐Remove encoder tag(s) from stream ${i} (video)\n`; metadataCommand += videoJunk; }
                 
                 if (metadataCommand !== '') {
                     extraArguments += metadataCommand;
@@ -1337,6 +1441,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             convert = true;
         }
 
+        // remove_junk_tags (global): clear encoder-provenance / descriptive container tags actually present (case-insensitive; title/comment/creation_time/awk_* kept).
+        if (junkTags !== 'disabled')
+            for (const k of Object.keys(file.ffProbeData.format?.tags || {})) {
+                const lk = k.toLowerCase();
+                if (lk === 'title' || lk === 'comment' || lk === 'creation_time' || lk.startsWith('awk_')) continue;
+                if (junkGlobalStrip(lk)) {
+                    workDone += `☐Remove ${k} tag from file (remove_junk_tags=${junkTags})\n`;
+                    extraArguments += ` -metadata "${escMeta(k)}="`;
+                    convert = true;
+                }
+            }
+
         //Check if remuxing is required due to container change
         if (srcContainer !== dstContainer) {
             workDone += `☐Remux file (${srcContainer}->${dstContainer})\n`;
@@ -1408,7 +1524,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // runs first, so a marker it drops is gone before the plugin that wrote it re-reads it (e.g. sub_worker's sidecar-delete would then find no marker).
             if (dstContainer === 'mp4')
                 extraArguments += ' -movflags use_metadata_tags';
-            response.preset += `${fflags}${inputArgs},-map 0 -c copy${extraArguments}${globalOutputOpt}`;
+            response.preset += `${fflags}${inputArgs},${sidecarOut} -map 0 -c copy${extraArguments}${globalOutputOpt}`;
             response.infoLog += workDone;
             const outSummary = file.ffProbeData.streams
                 .map(s => ({ s: enrichStream(s), idx: s.index }))
