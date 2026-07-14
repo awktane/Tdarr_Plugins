@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.999.6',
+    Version: '2.999.7',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1298,6 +1298,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // Commentary/descriptive (secondary) tracks are never deduplicated: two different commentaries (e.g. cast & crew vs directors, often BOTH
                 // just titled "Commentary") are distinct content the grouping can't tell apart, so keep every one; only MAIN tracks are deduplicated.
                 if (s.isTdarrSecondaryTrack) continue;
+                // An untagged (und) track is never deduplicated: langKey folds every untagged track to 'und', so two untagged tracks of DIFFERENT real languages would
+                // collide on und|tier and the lower-scored one would be silently dropped - the only copy of a language lost. Language can't prove same content (mirrors the
+                // secondary exemption above). clean_and_remux's language_fill_fail vets untagged audio when it runs first, but audio_clean is independently runnable, so guard here too.
+                if (s.isTdarrCleanLang === 'und') continue;
                 let tier;
                 if (removeDuplicatesGroupBy === 'channel') {
                     tier = s.channels;

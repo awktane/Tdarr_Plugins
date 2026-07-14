@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.999.7',
+    Version: '2.999.8',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -925,6 +925,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const ffmedia = mediaInfoFor(ffstream);
         return (ffstream.channel_layout || ffmedia?.ChannelLayout || ffmedia?.ChannelPositions || '').toLowerCase();
     };
+    // ffprobe's canonical layout strings for 2.1 and 3.1 are literally "2.1"/"3.1" - no "lfe" substring - so a plain .includes('lfe') misses them and channelLabel would
+    // mislabel (and clobber) a 2.1 track as 3.0 / a 3.1 as 4.0. Treat a nonzero digit after the first dot ("2.1","3.1","5.1","7.1.4") as an LFE too, alongside the verbose
+    // "FL+FR+LFE" form. Only channelLabel's 3ch (2.1 vs 3.0) and 4ch (3.1 vs 4.0) cases read hasLfe, so 6/8-ch labels are unaffected.
+    const layoutHasLfe = (ffstream) => { const s = channelLayoutStr(ffstream); return /lfe/.test(s) || /^\d+\.[1-9]/.test(s.trim()); };
 
     // Classify an attachment stream so we only ever remove things we can positively identify:
     //   'image' - cover art / poster (mjpeg/png/gif/bmp, image/* mimetype, or an image filename). Always removed.
@@ -1280,7 +1284,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //role like "5.1 Commentary" normalises to "5.1 - Commentary" and survives the reformat even when tag_disposition is off (that setting only
                 //governs whether the role is also promoted into a real flag, above). Shared canonicalAudioTitle - audio_clean names its downmixes the same way.
                 if(applies(tagTitle, 'audio') && resolveChannels(ffstream))
-                    newStreamTitle = canonicalAudioTitle(newStreamTitle, channelLabel(resolveChannels(ffstream), channelLayoutStr(ffstream).includes('lfe')), titleTagsFor(ffstream));
+                    newStreamTitle = canonicalAudioTitle(newStreamTitle, channelLabel(resolveChannels(ffstream), layoutHasLfe(ffstream)), titleTagsFor(ffstream));
 
                 //We trimmed the title above so newlines/spaces are removed. Ensure they're escaped before passing it to the command line.
                 if(newStreamTitle !== streamTitle)

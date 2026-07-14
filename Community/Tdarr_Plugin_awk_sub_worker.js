@@ -11,7 +11,7 @@ const details = () => ({
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them. Import ALSO recognizes fresh Plex-native sidecars with no s<index> (e.g. <video>.en.forced.srt), anchoring on the language token.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '1.999.5',
+    Version: '1.999.6',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -560,7 +560,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const lang = toks.pop();                                          // language is the next-from-right token
         if (!lang) return null;
         if (!ours && !isKnownLang(lang)) return null;                     // Plex-native has no s<index> anchor, so its language token must be real
-        if (toks.length > 1) return null;                                // 0 or 1 residual token = the encoded title
+        // A real Plex sidecar names the FULL video basename then lang[.disp] - it never carries a title token. So for a non-ours name any residual token is actually the tail
+        // of a LONGER sibling video's basename (Avatar.Extended.en.srt vs Avatar.mkv): reject it, or the shorter video would mux the sibling's subtitle. Our s<index> names keep their title.
+        if (!ours && toks.length) return null;
+        if (toks.length > 1) return null;                                // 0 or 1 residual token = the encoded title (our own s<index> sidecars only)
         const title = toks.length ? decodeTitle(toks[0]) : '';
         return { name, index, lang, title, ext: extMatch[1].toLowerCase(), dispTokens, disp: [...new Set(dispTokens.map(dispFfOf).filter(Boolean))] };
     };
