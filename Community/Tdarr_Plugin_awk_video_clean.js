@@ -12,7 +12,7 @@ const details = () => ({
                      -Preserves static HDR10/HLG colour metadata; leaves Dolby Vision / HDR10+ files untouched by default (dynamic metadata can't survive a re-encode).\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '1.999.0',
+    Version: '1.999.2',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -786,8 +786,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const qualityForHeight = (h) => (h <= 576 ? qualitySd : h <= 720 ? quality720 : h <= 1080 ? quality1080 : quality4k);
         const qNorm = qualityForHeight(outHeight || srcHeight);
 
-        // Idempotency signature (codec-quality-maxheight-depth-speed-version), stored as a container-global awk_video tag.
-        const videoSig = escMeta([targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, wantTenbit ? '10' : '8', `s${speed}`, `v${details().Version}`].join('-'));
+        // Idempotency signature: a settings fingerprint (codec-quality-maxheight-depth-speed) that determines the encode output, stored as a container-global
+        // awk_video tag. The plugin version is appended for forensics (which build wrote this file, so a future bug could re-target its outputs) but is NOT part
+        // of the match - like audio_clean's awk_loudnorm tag - so a version bump (e.g. the coordinated MAJOR) never invalidates the fence and forces a lossy
+        // generational re-encode of an otherwise-identical file.
+        const videoSigCore = escMeta([targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, wantTenbit ? '10' : '8', `s${speed}`].join('-'));
+        const videoSig = `${videoSigCore}-v${escMeta(details().Version)}`;
         const priorSig = (() => {
             const tags = file.ffProbeData.format?.tags || {};
             const k = Object.keys(tags).find((kk) => kk.toLowerCase() === 'awk_video');   // matroska upper-cases tag keys on write
@@ -817,7 +821,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         } else if (!depthOk) {
             reason = `bit depth ${srcIs10 ? '10' : '8'} -> ${wantTenbit ? '10' : '8'}`;
         } else if (guardReprocess) {
-            if (priorSig !== '' && priorSig === videoSig) {
+            if (priorSig !== '' && priorSig.replace(/-v[^-]*$/, '') === videoSigCore) {   // match the settings core only; the stored -v<version> suffix is forensic, not part of the fence
                 response.infoLog += `☑Already processed by awk_video at this setting (${videoSig}). Nothing to do.\n`;
                 response.processFile = false;
                 return response;
