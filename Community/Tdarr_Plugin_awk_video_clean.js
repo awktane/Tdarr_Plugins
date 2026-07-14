@@ -12,7 +12,7 @@ const details = () => ({
                      -Preserves static HDR10/HLG colour metadata; leaves Dolby Vision / HDR10+ files untouched by default (dynamic metadata can't survive a re-encode).\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '1.999.5',
+    Version: '1.999.6',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -336,6 +336,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
     // ===== END SHARED: codec name resolution =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4-family container =====
+    // -=-=-= isMp4Family  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The mp4/mov container family whose -c copy needs `-movflags use_metadata_tags` to keep sibling plugins' GLOBAL awk_* markers through the remux (dropping one re-triggers
+    // work upstream). One source so the four writers can't drift on the set (video_clean's video-only hvc1 gate is deliberately mp4/m4v/mov WITHOUT m4a and stays separate).
+    const isMp4Family = (container) => ['mp4', 'm4v', 'mov', 'm4a'].includes(String(container || '').toLowerCase());
+    // ===== END SHARED: mp4-family container =====
+    // ===== SHARED [clean_and_remux, video_clean, audio_clean, sub_worker]: case-insensitive tag lookup =====
+    // -=-=-= getTagCI  [clean_and_remux, video_clean, audio_clean, sub_worker] =-=-=-
+    // Look up a tag value case-insensitively - matroska UPPER-CASES tag keys on write, so a plugin reading its sibling's awk_* marker gets an uppercased key back. Returns the
+    // raw value (or '' if absent); callers trim/decode as needed. One source so the four plugins that read each other's markers can't drift on the lookup convention.
+    const getTagCI = (tags, name) => { const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === name); return hit === undefined ? '' : String(tags[hit] ?? ''); };
+    // ===== END SHARED: case-insensitive tag lookup =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream / language / preset helpers =====
     // -=-=-= mediaInfoFor  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -410,8 +422,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const lang = langRaw !== 'und' ? langRaw : '';
         const def = s.disposition?.default === 1 ? '/default' : '';
         if (type === 'video') {
-            const vHeight = Number(s.height || mediaInfoFor(s)?.Height || 0);
-            const vTenbit = Number(s.bits_per_raw_sample || mediaInfoFor(s)?.BitDepth || 0) >= 10 || /p10(le|be)?$|10le|10be/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
+            const vmi = mediaInfoFor(s);
+            const vHeight = Number(s.height || vmi?.Height || 0);
+            const vTenbit = Number(s.bits_per_raw_sample || vmi?.BitDepth || 0) >= 10 || /p10(le|be)?$|10le|10be/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
             const vHdr = ['smpte2084', 'arib-std-b67'].includes((s.color_transfer || '').toLowerCase().trim());
             return `[video:${[codec, vHeight > 0 ? `${vHeight}p` : '', vTenbit ? '10bit' : '', vHdr ? 'hdr' : ''].filter(Boolean).join(' ')}${isCoverArt(s) ? '/cover' : ''}]`;
         }
@@ -782,8 +795,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // output - verified against the real ffmpeg for libx265/libsvtav1/videotoolbox, including through the
         // scale filter - so static HDR10/HLG survives without any explicit colour flags. Dynamic metadata (Dolby
         // Vision / HDR10+) CANNOT survive a re-encode, so by default such files are left untouched.
-        const trc = (primary.color_transfer || '').toLowerCase().trim();
-        const isHdr = trc === 'smpte2084' || trc === 'arib-std-b67';
         const hdrFmt = String(mi?.HDR_Format || mi?.HDR_Format_Compatibility || '').toLowerCase();
         const isDynamicHdr = hdrFmt.includes('dolby vision') || hdrFmt.includes('hdr10+') || hdrFmt.includes('smpte st 2094');
         if (isDynamicHdr && guardHdr === 'abort_dynamic') {
@@ -805,11 +816,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // generational re-encode of an otherwise-identical file.
         const videoSigCore = escMeta([targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, wantTenbit ? '10' : '8', `s${speed}`].join('-'));
         const videoSig = `${videoSigCore}-v${escMeta(details().Version)}`;
-        const priorSig = (() => {
-            const tags = file.ffProbeData.format?.tags || {};
-            const k = Object.keys(tags).find((kk) => kk.toLowerCase() === 'awk_video');   // matroska upper-cases tag keys on write
-            return k ? String(tags[k] ?? '').trim() : '';
-        })();
+        const priorSig = getTagCI(file.ffProbeData.format?.tags || {}, 'awk_video').trim();
 
         // Guard: constant quality can't predict output size, so skip sources already below the bitrate floor (would risk growth).
         // A pending downscale is exempt - fewer pixels can't grow the file, and skipping here would silently defeat max_height.
@@ -856,14 +863,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy`;
         for (const s of videoStreams) if (isCoverArt(s)) out += ` -map -0:${s.index}`;   // drop embedded cover-art/still-image "video" streams
         out += ` -metadata "awk_video=${videoSig}"`;
-        if (['mp4', 'm4v', 'mov', 'm4a'].includes(dstContainer)) out += ' -movflags use_metadata_tags';   // keep the global tag through an mp4/mov copy
+        if (isMp4Family(dstContainer)) out += ' -movflags use_metadata_tags';   // keep the global tag through an mp4/mov copy
         out += globalOutputOpt;
 
         response.preset = `${enc.inputSide},${out}`;
         response.processFile = true;
         response.infoLog += `☐Transcoding video: ${reason} @ ${sel.encoderName} q${Math.round(qNorm)}${wantTenbit ? ' 10-bit' : ''}.\n`;
         // Predicted output summary: the re-encoded primary video token, cover-art video dropped, everything else copied unchanged.
-        const outVideoToken = `[video:${targetCodecName} ${outHeight || srcHeight}p${wantTenbit ? ' 10bit' : ''}${isHdr ? ' hdr' : ''}]`;
+        // Predict the re-encoded stream and render it through the shared summariseStream (single source of truth for the [video:...] token) so the Expected-results line matches
+        // the input-summary format exactly; bits_per_raw_sample is set explicitly with pix_fmt/profile cleared so 8/10-bit is exact, and an unknown height is omitted (no bare "0p").
+        const outStream = { ...primary, codec_name: targetCodecName, height: outHeight || srcHeight, bits_per_raw_sample: wantTenbit ? 10 : 8, pix_fmt: '', profile: '' };
+        const outVideoToken = summariseStream(outStream);
         const outSummary = file.ffProbeData.streams
             .filter((s) => !(isCoverArt(s) && (s.codec_type || '').trim().toLowerCase() === 'video'))
             .map((s) => (s === primary ? outVideoToken : summariseStream(enrichStream(s))))

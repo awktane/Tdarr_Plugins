@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.999.9',
+    Version: '2.999.10',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -522,6 +522,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
     // ===== END SHARED: codec name resolution =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4-family container =====
+    // -=-=-= isMp4Family  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The mp4/mov container family whose -c copy needs `-movflags use_metadata_tags` to keep sibling plugins' GLOBAL awk_* markers through the remux (dropping one re-triggers
+    // work upstream). One source so the four writers can't drift on the set (video_clean's video-only hvc1 gate is deliberately mp4/m4v/mov WITHOUT m4a and stays separate).
+    const isMp4Family = (container) => ['mp4', 'm4v', 'mov', 'm4a'].includes(String(container || '').toLowerCase());
+    // ===== END SHARED: mp4-family container =====
+    // ===== SHARED [clean_and_remux, video_clean, audio_clean, sub_worker]: case-insensitive tag lookup =====
+    // -=-=-= getTagCI  [clean_and_remux, video_clean, audio_clean, sub_worker] =-=-=-
+    // Look up a tag value case-insensitively - matroska UPPER-CASES tag keys on write, so a plugin reading its sibling's awk_* marker gets an uppercased key back. Returns the
+    // raw value (or '' if absent); callers trim/decode as needed. One source so the four plugins that read each other's markers can't drift on the lookup convention.
+    const getTagCI = (tags, name) => { const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === name); return hit === undefined ? '' : String(tags[hit] ?? ''); };
+    // ===== END SHARED: case-insensitive tag lookup =====
 
     // ===== SHARED [audio_clean, stream_ordering]: audio codec scoring =====
     // -=-=-= codecInfo  [audio_clean, stream_ordering] =-=-=-
@@ -727,8 +739,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const lang = langRaw !== 'und' ? langRaw : '';
         const def = s.disposition?.default === 1 ? '/default' : '';
         if (type === 'video') {
-            const vHeight = Number(s.height || mediaInfoFor(s)?.Height || 0);
-            const vTenbit = Number(s.bits_per_raw_sample || mediaInfoFor(s)?.BitDepth || 0) >= 10 || /p10(le|be)?$|10le|10be/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
+            const vmi = mediaInfoFor(s);
+            const vHeight = Number(s.height || vmi?.Height || 0);
+            const vTenbit = Number(s.bits_per_raw_sample || vmi?.BitDepth || 0) >= 10 || /p10(le|be)?$|10le|10be/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
             const vHdr = ['smpte2084', 'arib-std-b67'].includes((s.color_transfer || '').toLowerCase().trim());
             return `[video:${[codec, vHeight > 0 ? `${vHeight}p` : '', vTenbit ? '10bit' : '', vHdr ? 'hdr' : ''].filter(Boolean).join(' ')}${isCoverArt(s) ? '/cover' : ''}]`;
         }
@@ -1673,9 +1686,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // "tv-2.8.0") but matched on the preset portion ONLY - the version rides along unused today, kept in reserve for if a
         // future bug fix ever needs to distinguish "measured/corrected by a version with a known bug" from a trustworthy one.
         // Matroska uppercases unrecognized custom tag names on write (confirmed against the real ffmpeg binary), so read-back
-        // must be case-insensitive - mirrors clean_and_remux's existing awk_recovered lookup pattern exactly.
-        const readLoudnormTag = (stream) => String(Object.entries(stream.tags || {})
-            .find(([k]) => k.toLowerCase() === 'awk_loudnorm')?.[1] ?? '').trim();
+        const readLoudnormTag = (stream) => getTagCI(stream.tags || {}, 'awk_loudnorm').trim();
         const loudnormTagMatchesPreset = (stream) => readLoudnormTag(stream).split('-')[0] === loudnorm;
         const loudnormTagValue = () => `${loudnorm}-${details().Version}`;
         // Only Matroska persists arbitrary per-stream tags through a -c copy remux; the mov/mp4/m4a muxers silently DROP a
@@ -2158,7 +2169,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // mp4/mov muxers drop a custom GLOBAL metadata tag (e.g. clean_and_remux's awk_recovered, set upstream) on a -c copy remux unless told to keep it,
             // which would re-trigger recovery on the next pass. Preserve it. (Per-stream custom tags like awk_loudnorm are NOT rescued by this flag - verified
             // against the real mov muxer - which is why loudnorm caches on Matroska only; see loudnormTagPersists.)
-            const mp4KeepTags = ['mp4', 'mov', 'm4v', 'm4a'].includes(String(file.container).toLowerCase()) ? ' -movflags use_metadata_tags' : '';
+            const mp4KeepTags = isMp4Family(file.container) ? ' -movflags use_metadata_tags' : '';
             response.preset += `,-map 0 -c copy${extraArguments}${globalOutputOpt}${mp4KeepTags}`;
             // workDone (what changed) always shows, matching pre-method_verbose behavior exactly. verboseDone (why something DIDN'T change - guard
             // blocks, ceiling/missing-data skips) is the part method_verbose gates - the diagnostic negative-space, not the status of real changes.

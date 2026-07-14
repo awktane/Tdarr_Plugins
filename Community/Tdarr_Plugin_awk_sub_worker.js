@@ -11,7 +11,7 @@ const details = () => ({
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them. Import ALSO recognizes fresh Plex-native sidecars with no s<index> (e.g. <video>.en.forced.srt), anchoring on the language token.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '1.999.8',
+    Version: '1.999.9',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -265,6 +265,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
     // ===== END SHARED: codec name resolution =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4-family container =====
+    // -=-=-= isMp4Family  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The mp4/mov container family whose -c copy needs `-movflags use_metadata_tags` to keep sibling plugins' GLOBAL awk_* markers through the remux (dropping one re-triggers
+    // work upstream). One source so the four writers can't drift on the set (video_clean's video-only hvc1 gate is deliberately mp4/m4v/mov WITHOUT m4a and stays separate).
+    const isMp4Family = (container) => ['mp4', 'm4v', 'mov', 'm4a'].includes(String(container || '').toLowerCase());
+    // ===== END SHARED: mp4-family container =====
+    // ===== SHARED [clean_and_remux, video_clean, audio_clean, sub_worker]: case-insensitive tag lookup =====
+    // -=-=-= getTagCI  [clean_and_remux, video_clean, audio_clean, sub_worker] =-=-=-
+    // Look up a tag value case-insensitively - matroska UPPER-CASES tag keys on write, so a plugin reading its sibling's awk_* marker gets an uppercased key back. Returns the
+    // raw value (or '' if absent); callers trim/decode as needed. One source so the four plugins that read each other's markers can't drift on the lookup convention.
+    const getTagCI = (tags, name) => { const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === name); return hit === undefined ? '' : String(tags[hit] ?? ''); };
+    // ===== END SHARED: case-insensitive tag lookup =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream / language / preset helpers =====
     // -=-=-= mediaInfoFor  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -339,8 +351,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const lang = langRaw !== 'und' ? langRaw : '';
         const def = s.disposition?.default === 1 ? '/default' : '';
         if (type === 'video') {
-            const vHeight = Number(s.height || mediaInfoFor(s)?.Height || 0);
-            const vTenbit = Number(s.bits_per_raw_sample || mediaInfoFor(s)?.BitDepth || 0) >= 10 || /p10(le|be)?$|10le|10be/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
+            const vmi = mediaInfoFor(s);
+            const vHeight = Number(s.height || vmi?.Height || 0);
+            const vTenbit = Number(s.bits_per_raw_sample || vmi?.BitDepth || 0) >= 10 || /p10(le|be)?$|10le|10be/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
             const vHdr = ['smpte2084', 'arib-std-b67'].includes((s.color_transfer || '').toLowerCase().trim());
             return `[video:${[codec, vHeight > 0 ? `${vHeight}p` : '', vTenbit ? '10bit' : '', vHdr ? 'hdr' : ''].filter(Boolean).join(' ')}${isCoverArt(s) ? '/cover' : ''}]`;
         }
@@ -616,7 +629,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const removeSidecarAfterImport = String(inputs.remove_sidecar_after_import) === 'true';
     const dedupeMode = String(inputs.method_deduplicate);
     const dstContainer = String(file.container || '').toLowerCase().trim();
-    const isMp4Family = ['mp4', 'm4v', 'mov', 'm4a'].includes(dstContainer);
+    const isMp4 = isMp4Family(dstContainer);   // shared checker; cached once for this container
 
     try {
         response.infoLog += `☐Input streams: ${streams.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
@@ -645,7 +658,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let out = `${sidecarOut} -map 0`;
             for (const idx of removeIdx) out += ` -map -0:${idx}`;
             out += ' -c copy';
-            if (isMp4Family) out += ' -movflags use_metadata_tags';   // mp4 -c copy drops sibling plugins' global tags (awk_video/awk_recovered) without this - mirror the import branch
+            if (isMp4) out += ' -movflags use_metadata_tags';   // mp4 -c copy drops sibling plugins' global tags (awk_video/awk_recovered) without this - mirror the import branch
             out += globalOutputOpt;
             response.preset = `,${out}`;
             response.processFile = true;
@@ -658,9 +671,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The global marker VALUE lists the basenames muxed in the prior pass, so pass 2 deletes exactly what pass 1
         // embedded (never a pre-existing collision) and never re-adds them - robust even where a container drops
         // per-stream title/default (mp4). Tdarr only re-runs after a SUCCESSFUL mux, so a listed sidecar is safely in.
-        const globalTags = file.ffProbeData.format?.tags || {};
-        const markerKey = Object.keys(globalTags).find((k) => k.toLowerCase() === 'awk_sub_worker');
-        const importedSet = new Set(markerKey ? decodeMarkerList(globalTags[markerKey]) : []);
+        const importedSet = new Set(decodeMarkerList(getTagCI(file.ffProbeData.format?.tags || {}, 'awk_sub_worker')));
 
         let entries;
         try { entries = fs.readdirSync(libDir); } catch (e) { failFile(`Cannot read the library directory to find sidecars: ${e && e.message ? e.message : e}`); }
@@ -720,16 +731,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const outIdx = existingSubCount + k;
                 inputSide += ` -sub_charenc UTF-8 -i "${path.join(libDir, f.name)}"`;
                 extraMaps += ` -map ${k + 1}:0`;
-                meta += ` -metadata:s:s:${outIdx} "language=${escMeta(isMp4Family ? to6392T(f.lang) : f.lang)}"`;
+                meta += ` -metadata:s:s:${outIdx} "language=${escMeta(isMp4 ? to6392T(f.lang) : f.lang)}"`;
                 if (f.title) meta += ` -metadata:s:s:${outIdx} "title=${escMeta(f.title)}"`;
                 if (f.disp.length) meta += ` -disposition:s:${outIdx} ${f.disp.join('+')}`;
-                if (isMp4Family) meta += ` -c:s:${outIdx} mov_text`;
+                if (isMp4) meta += ` -c:s:${outIdx} mov_text`;
                 if (f.members.length > 1) response.infoLog += `☑Deduplicated ${f.members.length} byte-identical sidecars -> ${f.name} (${f.lang}${f.dispTokens.length ? ` ${f.dispTokens.join('+')}` : ''})\n`;
                 response.infoLog += `☐Import ${f.name} -> subtitle ${outIdx} (${f.lang}${f.dispTokens.length ? ` ${f.dispTokens.join('+')}` : ''})\n`;
             });
             const consumed = merged.flatMap((f) => f.members.map((m) => m.name));
             let out = `${inputSide} -map 0${extraMaps} -c copy${meta} -metadata "awk_sub_worker=${encodeMarkerList(consumed)}"`;
-            if (isMp4Family) out += ' -movflags use_metadata_tags';
+            if (isMp4) out += ' -movflags use_metadata_tags';
             out += globalOutputOpt;
             response.preset = `,${out}`;
             response.processFile = true;

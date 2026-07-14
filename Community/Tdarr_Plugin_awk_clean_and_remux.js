@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.999.11',
+    Version: '2.999.12',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -453,6 +453,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
     // ===== END SHARED: codec name resolution =====
+    // ===== SHARED [clean_and_remux, video_clean, audio_clean, sub_worker]: case-insensitive tag lookup =====
+    // -=-=-= getTagCI  [clean_and_remux, video_clean, audio_clean, sub_worker] =-=-=-
+    // Look up a tag value case-insensitively - matroska UPPER-CASES tag keys on write, so a plugin reading its sibling's awk_* marker gets an uppercased key back. Returns the
+    // raw value (or '' if absent); callers trim/decode as needed. One source so the four plugins that read each other's markers can't drift on the lookup convention.
+    const getTagCI = (tags, name) => { const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === name); return hit === undefined ? '' : String(tags[hit] ?? ''); };
+    // ===== END SHARED: case-insensitive tag lookup =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream / language / preset helpers =====
     // -=-=-= mediaInfoFor  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -527,8 +533,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const lang = langRaw !== 'und' ? langRaw : '';
         const def = s.disposition?.default === 1 ? '/default' : '';
         if (type === 'video') {
-            const vHeight = Number(s.height || mediaInfoFor(s)?.Height || 0);
-            const vTenbit = Number(s.bits_per_raw_sample || mediaInfoFor(s)?.BitDepth || 0) >= 10 || /p10(le|be)?$|10le|10be/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
+            const vmi = mediaInfoFor(s);
+            const vHeight = Number(s.height || vmi?.Height || 0);
+            const vTenbit = Number(s.bits_per_raw_sample || vmi?.BitDepth || 0) >= 10 || /p10(le|be)?$|10le|10be/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
             const vHdr = ['smpte2084', 'arib-std-b67'].includes((s.color_transfer || '').toLowerCase().trim());
             return `[video:${[codec, vHeight > 0 ? `${vHeight}p` : '', vTenbit ? '10bit' : '', vHdr ? 'hdr' : ''].filter(Boolean).join(' ')}${isCoverArt(s) ? '/cover' : ''}]`;
         }
@@ -1480,9 +1487,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // but keeps the compared value byte-identical to what gets written to awk_recovered below.
         const recoverSig = [recoverTs !== 'disabled' && `ts-${recoverTs}`, recoverData !== 'disabled' && `data-${recoverData}`].filter(Boolean).join('+');
         const recoverIntent = escMeta(recoverSig);
-        // Read case-insensitively on the key (matroska upper-cases tag keys on write; the value is preserved).
-        const recoveredTag = String(Object.entries(file.ffProbeData.format?.tags || {})
-            .find(([k]) => k.toLowerCase() === 'awk_recovered')?.[1] ?? '').trim();
+        const recoveredTag = getTagCI(file.ffProbeData.format?.tags || {}, 'awk_recovered').trim();
         const intentMatches = recoveredTag !== '' && recoveredTag === recoverIntent;
         // A real container change (e.g. mkv->mp4) already remuxes and is a one-shot (a fixed config makes
         // srcContainer==dstContainer afterward), so recovery can ride along regardless of the tag without looping.

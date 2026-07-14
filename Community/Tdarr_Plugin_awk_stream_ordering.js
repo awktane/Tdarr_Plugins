@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '2.999.8',
+    Version: '2.999.9',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -333,6 +333,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
     // ===== END SHARED: codec name resolution =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4-family container =====
+    // -=-=-= isMp4Family  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The mp4/mov container family whose -c copy needs `-movflags use_metadata_tags` to keep sibling plugins' GLOBAL awk_* markers through the remux (dropping one re-triggers
+    // work upstream). One source so the four writers can't drift on the set (video_clean's video-only hvc1 gate is deliberately mp4/m4v/mov WITHOUT m4a and stays separate).
+    const isMp4Family = (container) => ['mp4', 'm4v', 'mov', 'm4a'].includes(String(container || '').toLowerCase());
+    // ===== END SHARED: mp4-family container =====
 
     // ===== SHARED [audio_clean, stream_ordering]: audio codec scoring =====
     // -=-=-= codecInfo  [audio_clean, stream_ordering] =-=-=-
@@ -538,8 +544,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const lang = langRaw !== 'und' ? langRaw : '';
         const def = s.disposition?.default === 1 ? '/default' : '';
         if (type === 'video') {
-            const vHeight = Number(s.height || mediaInfoFor(s)?.Height || 0);
-            const vTenbit = Number(s.bits_per_raw_sample || mediaInfoFor(s)?.BitDepth || 0) >= 10 || /p10(le|be)?$|10le|10be/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
+            const vmi = mediaInfoFor(s);
+            const vHeight = Number(s.height || vmi?.Height || 0);
+            const vTenbit = Number(s.bits_per_raw_sample || vmi?.BitDepth || 0) >= 10 || /p10(le|be)?$|10le|10be/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
             const vHdr = ['smpte2084', 'arib-std-b67'].includes((s.color_transfer || '').toLowerCase().trim());
             return `[video:${[codec, vHeight > 0 ? `${vHeight}p` : '', vTenbit ? '10bit' : '', vHdr ? 'hdr' : ''].filter(Boolean).join(' ')}${isCoverArt(s) ? '/cover' : ''}]`;
         }
@@ -854,9 +861,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // method_mp4_faststart: front-load the mp4 moov atom. A plain ride-along isn't enough (we skip when order is already correct), so detect the moov position
         // (spawn-free; __awkMoovFront overrides for the harness) and force a one-time remux when faststart is on, the output is an mp4-family container, and the file
         // isn't already fronted. moovBeforeMdat is fail-safe (unreadable/odd -> treated as fronted), so this settles after one pass and never loops.
-        const isMp4Family = ['mp4', 'mov', 'm4v', 'm4a'].includes(String(file.container).toLowerCase());
+        const isMp4 = isMp4Family(file.container);   // shared checker; cached once for this container
         const faststartOn = methodFaststart === 'enabled';
-        const needsFront = faststartOn && isMp4Family && !moovBeforeMdat(file.file, otherArguments);
+        const needsFront = faststartOn && isMp4 && !moovBeforeMdat(file.file, otherArguments);
 
         if (!changed && dispositionArgs === '' && !needsFront) {
             response.infoLog += '☑Streams already in desired order.\n';
@@ -869,7 +876,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += '☐Remux to front-load the mp4 moov atom (method_mp4_faststart)\n';
         // mp4/mov muxers drop a custom GLOBAL metadata tag (e.g. clean_and_remux's awk_recovered, set upstream) on a -c copy remux unless told to keep it, which would
         // re-trigger recovery on the next pass. Preserve it on the mov family, and append +faststart when method_mp4_faststart is on so the moov atom leads the file.
-        const mp4KeepTags = isMp4Family ? ` -movflags use_metadata_tags${faststartOn ? '+faststart' : ''}` : '';
+        const mp4KeepTags = isMp4 ? ` -movflags use_metadata_tags${faststartOn ? '+faststart' : ''}` : '';
         response.preset = `,${ffmpegMap} -c copy${dispositionArgs}${globalOutputOpt}${mp4KeepTags}`;
         if (dispositionArgs !== '')
             response.infoLog += '☐Set the first audio track as the sole default.\n';
