@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.999.0',
+    Version: '2.999.3',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -541,6 +541,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ape:         { score: 100, lossless: true },
         tak:         { score: 100, lossless: true },
         tta:         { score: 100, lossless: true },
+        wmalossless: { score: 100, lossless: true },
         mlp:         { score: 99,  lossless: true },
 
         // Dolby family
@@ -569,6 +570,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ac3:         { score: 84,  minimum:     192000 },  // encodable
         atrac:       { score: 83,  transparent: 192000 },
         wma:         { score: 82,  transparent: 192000 },
+        wmapro:      { score: 82,  transparent: 256000 },
         mpc:         { score: 82,  transparent: 220000 },
 
         // Older codecs

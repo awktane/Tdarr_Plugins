@@ -11,7 +11,7 @@ const details = () => ({
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them. Import ALSO recognizes fresh Plex-native sidecars with no s<index> (e.g. <video>.en.forced.srt), anchoring on the language token.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '1.999.1',
+    Version: '1.999.3',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -636,7 +636,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         try { entries = fs.readdirSync(libDir); } catch (e) { failFile(`Cannot read the library directory to find sidecars: ${e && e.message ? e.message : e}`); }
         const found = entries.map(parseSidecar).filter(Boolean)
             .filter((f) => !(langFilter && !langFilter.has(langKey(f.lang))))
-            .filter((f) => !(skipCommentary && f.dispTokens.includes('commentary')));
+            // Match extract's isCommentary (flag OR title keyword): a sidecar whose commentary role sits only in its decoded title (no disposition token) must
+            // also be skipped, else skip_commentary would exclude it on extract but re-mux it on import (a Plex-native/manual sidecar or a title-only source).
+            .filter((f) => !(skipCommentary && (f.dispTokens.includes('commentary') || matchesKeyword(String(f.title || '').toLowerCase(), dispositionTypes.comment.keywords))));
         if (!found.length) { response.infoLog += '☑No subtitle sidecars found to import.\n'; return response; }
 
         // Sidecars are removed only after their content is confirmed embedded: remove_sidecar_after_import deletes everything we muxed, and

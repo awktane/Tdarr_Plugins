@@ -12,7 +12,7 @@ const details = () => ({
                      -Preserves static HDR10/HLG colour metadata; leaves Dolby Vision / HDR10+ files untouched by default (dynamic metadata can't survive a re-encode).\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '1.999.2',
+    Version: '1.999.3',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -623,7 +623,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // mirrors the proven community plugins (Migz nvenc -cq:v, Boosh qsv -global_quality, vaapi -qp, amf -qp_i/-qp_p).
     const nativeQuality = (codec, family, qNorm) => {
         let q = Math.round(qNorm);
+        // Clamp to each scale's real range so an out-of-range quality input can't emit a CRF/QP ffmpeg rejects (e.g. libx265 -crf 52 errors). AV1 (libsvtav1
+        // CQ) goes 0-63; every other emit - libx264/libx265 -crf, nvenc -cq, qsv -global_quality, vaapi/amf -qp - caps at ~0-51. videotoolbox remaps q anyway.
         if (codec === 'av1') q = Math.max(0, Math.min(63, q + 8));
+        else q = Math.max(0, Math.min(51, q));
         switch (family) {
             case 'cpu': return `-crf ${q}`;                                   // libx264 / libx265 / libsvtav1 all take -crf
             case 'nvenc': return `-rc:v vbr -cq:v ${q} -b:v 0`;               // constant-quality NVENC (VBR envelope off)
@@ -762,7 +765,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Bit depth: source-detected (raw sample depth, or a 10-bit pixel format / profile), overridable. H.264 is always 8-bit.
         const pixFmt = (primary.pix_fmt || '').toLowerCase();
         const profile = (primary.profile || '').toLowerCase();
-        const srcIs10 = Number(primary.bits_per_raw_sample || mi?.BitDepth || 0) >= 10 || pixFmt.includes('10') || profile.includes('10');
+        const srcIs10 = Number(primary.bits_per_raw_sample || mi?.BitDepth || 0) >= 10 || /p10(le|be)?$|10le|10be/.test(pixFmt) || profile.includes('10');
         const wantTenbit = codec === 'h264' ? false : (bitDepthOpt === '10' || (bitDepthOpt === 'source' && srcIs10));
 
         // HDR: ffmpeg auto-propagates the source's colour metadata (primaries/transfer/matrix) to the re-encoded

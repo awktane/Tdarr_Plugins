@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '2.999.0',
+    Version: '2.999.3',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -313,6 +313,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ape:         { score: 100, lossless: true },
         tak:         { score: 100, lossless: true },
         tta:         { score: 100, lossless: true },
+        wmalossless: { score: 100, lossless: true },
         mlp:         { score: 99,  lossless: true },
 
         // Dolby family
@@ -341,6 +342,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ac3:         { score: 84,  minimum:     192000 },  // encodable
         atrac:       { score: 83,  transparent: 192000 },
         wma:         { score: 82,  transparent: 192000 },
+        wmapro:      { score: 82,  transparent: 256000 },
         mpc:         { score: 82,  transparent: 220000 },
 
         // Older codecs
