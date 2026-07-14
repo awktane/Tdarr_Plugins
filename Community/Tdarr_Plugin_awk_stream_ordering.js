@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '2.999.7',
+    Version: '2.999.8',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -265,6 +265,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['wmav',   'wma'],
         ['atrac',  'atrac'],
         ['mpegh',  'mpegh3d'],   // ffmpeg reports MPEG-H 3D Audio as mpegh_3d_audio; map it to the codecInfo key so it scores + gets object-audio protection
+        ['aac_latm', 'aac'],     // AAC in MPEG-TS/LATM (broadcast/DVR .ts captures) reports codec_name aac_latm; fold to aac so it scores + displays as AAC, not an unknown codec
     ];
     // -=-=-= resolveCodecName  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the

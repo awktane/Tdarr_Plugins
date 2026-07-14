@@ -11,7 +11,7 @@ const details = () => ({
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them. Import ALSO recognizes fresh Plex-native sidecars with no s<index> (e.g. <video>.en.forced.srt), anchoring on the language token.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '1.999.7',
+    Version: '1.999.8',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -197,6 +197,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['wmav',   'wma'],
         ['atrac',  'atrac'],
         ['mpegh',  'mpegh3d'],   // ffmpeg reports MPEG-H 3D Audio as mpegh_3d_audio; map it to the codecInfo key so it scores + gets object-audio protection
+        ['aac_latm', 'aac'],     // AAC in MPEG-TS/LATM (broadcast/DVR .ts captures) reports codec_name aac_latm; fold to aac so it scores + displays as AAC, not an unknown codec
     ];
     // -=-=-= resolveCodecName  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the
