@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.999.4',
+    Version: '2.999.5',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -707,10 +707,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return three(methodTagLanguage === '639-2/b');                                               // single form for both containers
     };
     // Recognised language name for a tag's primary subtag, or '' - tells a real code (en, eng) from a spelled-out name ("english") or garbage.
-    const langName = (tag) => {
-        try { return new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }).of(shortLang(String(tag).toLowerCase())) || ''; }
-        catch (e) { return ''; }
-    };
+    // DisplayNames is memoised in a closure (built once, then reused) - it is called once per tagged stream via storesCleanly, and a fresh ICU instance per call
+    // is wasteful. Mirrors sub_worker's langDisplay.
+    const langName = (() => {
+        let dn = null;
+        return (tag) => {
+            try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(shortLang(String(tag).toLowerCase())) || ''; }
+            catch (e) { return ''; }
+        };
+    })();
     // True when an already-present tag stores cleanly in dstContainer AS a recognised code (drives tag_language=invalid: leave these, fix the rest).
     const storesCleanly = (rawTag) => {
         const s = String(rawTag || '').trim();

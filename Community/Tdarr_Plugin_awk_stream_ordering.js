@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '2.999.4',
+    Version: '2.999.5',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -639,8 +639,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // (over EITHER cap -> tail) -> channel (direction) -> quality (direction). Returns 0 when every key ties. The cap ONLY partitions; within each partition
         // channel/quality keep their requested direction, so a 'descending <=N' list stays fully descending - the cap just shifts which serveable track leads.
         const audioKeyCompare = (a, b) => {
-            const aRank = getLangRank(a.lang);
-            const bRank = getLangRank(b.lang);
+            const aRank = a.langRank;
+            const bRank = b.langRank;
             if (aRank !== bRank) return aRank - bRank;
             //A commentary stream could be descriptive but it would still be a commentary
             const aRole = a.commentary ? 2 : (a.descriptive ? 1 : 0);
@@ -680,6 +680,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 stream: enrichedStream,
                 type: streamType,
                 lang: streamLang,
+                // Language sort rank precomputed once here (getLangRank -> langKey -> Intl.getCanonicalLocales is expensive), not per O(n log n) comparison -
+                // mirrors audio_clean's isTdarrCleanLang precompute and the parseOrderMode-once discipline. Read as a.langRank/b.langRank in the comparators.
+                langRank: getLangRank(streamLang),
                 channels: enrichedStream.channels || 0,
                 // Resolved bitrate in bps (shared resolveStreamBitrate fallback, via enrichStream). order_quality sorts by the audioquality score but CAPS by
                 // raw bitrate ('descending <=1024k'), so the cap threshold needs the actual bitrate, not the score.
@@ -753,8 +756,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     return a.forced ? -1 : 1;
 
                 //Language priority next (forced already handled above).
-                const aRank = getLangRank(a.lang);
-                const bRank = getLangRank(b.lang);
+                const aRank = a.langRank;
+                const bRank = b.langRank;
 
                 if (aRank !== bRank)
                     return aRank - bRank;
