@@ -12,7 +12,7 @@ const details = () => ({
                      -Preserves static HDR10/HLG colour metadata; leaves Dolby Vision / HDR10+ files untouched by default (dynamic metadata can't survive a re-encode).\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '1.999.3',
+    Version: '1.999.4',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -447,10 +447,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return `[${type || 'unknown'}:${codec}]`;
     };
 
-    // -=-=-= shortLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Short language code: strip any region/variant suffix so 'en-US', 'en_US', 'en.US' all compare as 'en'.
-    const shortLang = (l) => l.replace(/[-_.].*$/, '');
-
     // -=-=-= globalOutputOpt  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Output-side ffmpeg options applied to EVERY run (the place for any universal muxer/output flag). Two flags: -max_muxing_queue_size 9999 raises the
     // muxer packet-buffer ceiling for ffmpeg's "Too many packets buffered" interleave error (chiefly a transcode/recovery concern; mostly vestigial on
@@ -473,6 +469,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .replace(/\\/g, '/')               // backslash → forward-slash (inert, readable)
         .replace(/"/g, "'");               // double-quote → single-quote (safe inside the quoted value)
     // ===== END SHARED: ffmpeg metadata escaping =====
+
+    // ===== SHARED [audio_clean, video_clean]: ffmpeg encoder probe =====
+    // -=-=-= parseFfmpegEncoders  [audio_clean, video_clean] =-=-=-
+    // Parse `ffmpeg -hide_banner -encoders` stdout into a Set of encoder names. Each encoder row is "<6 flag chars> <name>  <description>" (e.g.
+    // " V....D hevc_nvenc  NVIDIA NVENC hevc encoder"); the leading [A-Z.]{6} flag block + whitespace gate the name capture so the banner/header/blank lines are
+    // skipped. Shared by video_clean's per-node capability probe (queryCapabilities) and audio_clean's aac_vbr availability check (hasEncoder) so the row-parse
+    // regex cannot drift between them; the spawn itself stays at each call site (their surrounding capability objects differ).
+    const parseFfmpegEncoders = (stdout) => {
+        const set = new Set();
+        for (const line of String(stdout || '').split('\n')) {
+            const m = line.match(/^\s*[A-Z.]{6}\s+([A-Za-z0-9_]+)/);   // "<6 flag chars> <name>  <desc>"
+            if (m) set.add(m[1]);
+        }
+        return set;
+    };
+    // ===== END SHARED: ffmpeg encoder probe =====
 
     const os = require('os');
     const fs = require('fs');
@@ -506,10 +518,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const cap = { encoders: new Set(), nvidia: false, dri: false };
         try {
             const r = childProcess.spawnSync(ff, ['-hide_banner', '-encoders'], { encoding: 'utf8', timeout: 20000 });
-            for (const line of String(r.stdout || '').split('\n')) {
-                const m = line.match(/^\s*[A-Z.]{6}\s+([A-Za-z0-9_]+)/);   // " V....D hevc_nvenc  NVIDIA NVENC hevc encoder"
-                if (m) cap.encoders.add(m[1]);
-            }
+            cap.encoders = parseFfmpegEncoders(r.stdout);
         } catch (e) { /* leave encoders empty -> everything falls back to CPU */ }
         try {
             const r = childProcess.spawnSync('nvidia-smi', ['--query-gpu=name', '--format=csv,noheader'], { encoding: 'utf8', timeout: 8000 });
@@ -738,7 +747,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
 
     if (file.fileMedium !== 'video') {
-        response.infoLog += '☒File is not a video.\n';
+        response.infoLog += '☑File is not a video.\n';
         response.processFile = false;
         return response;
     }

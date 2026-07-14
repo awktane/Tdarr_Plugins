@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.999.3',
+    Version: '2.999.4',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -764,10 +764,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return `[${type || 'unknown'}:${codec}]`;
     };
 
-    // -=-=-= shortLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Short language code: strip any region/variant suffix so 'en-US', 'en_US', 'en.US' all compare as 'en'.
-    const shortLang = (l) => l.replace(/[-_.].*$/, '');
-
     // -=-=-= globalOutputOpt  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Output-side ffmpeg options applied to EVERY run (the place for any universal muxer/output flag). Two flags: -max_muxing_queue_size 9999 raises the
     // muxer packet-buffer ceiling for ffmpeg's "Too many packets buffered" interleave error (chiefly a transcode/recovery concern; mostly vestigial on
@@ -780,6 +776,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Normalize any language identifier to a stable comparison key so en / eng / EN / English / en-US - and ISO 639-2/B vs /T (fre vs fra) - all
     // compare equal, letting each plugin's language-list input accept one form and match every equivalent tag. Node ships full ICU, so no table or
     // module is needed. video_clean does no language matching, so it is the one plugin that does NOT carry this section.
+    // -=-=-= shortLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // Short language code: strip any region/variant suffix so 'en-US', 'en_US', 'en.US' all compare as 'en'.
+    const shortLang = (l) => l.replace(/[-_.].*$/, '');
     // -=-=-= langNameIndex  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // Reverse map English language NAME -> 2-letter code (english->en), built once per run by probing every aa..zz pair (fallback:'none' returns
     // undefined for the invalid pairs, leaving the 190 real ISO 639-1 languages). Lazily built on first spelled-out name, then memoised for the run.
@@ -826,6 +825,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .replace(/\\/g, '/')               // backslash → forward-slash (inert, readable)
         .replace(/"/g, "'");               // double-quote → single-quote (safe inside the quoted value)
     // ===== END SHARED: ffmpeg metadata escaping =====
+
+    // ===== SHARED [audio_clean, video_clean]: ffmpeg encoder probe =====
+    // -=-=-= parseFfmpegEncoders  [audio_clean, video_clean] =-=-=-
+    // Parse `ffmpeg -hide_banner -encoders` stdout into a Set of encoder names. Each encoder row is "<6 flag chars> <name>  <description>" (e.g.
+    // " V....D hevc_nvenc  NVIDIA NVENC hevc encoder"); the leading [A-Z.]{6} flag block + whitespace gate the name capture so the banner/header/blank lines are
+    // skipped. Shared by video_clean's per-node capability probe (queryCapabilities) and audio_clean's aac_vbr availability check (hasEncoder) so the row-parse
+    // regex cannot drift between them; the spawn itself stays at each call site (their surrounding capability objects differ).
+    const parseFfmpegEncoders = (stdout) => {
+        const set = new Set();
+        for (const line of String(stdout || '').split('\n')) {
+            const m = line.match(/^\s*[A-Z.]{6}\s+([A-Za-z0-9_]+)/);   // "<6 flag chars> <name>  <desc>"
+            if (m) set.add(m[1]);
+        }
+        return set;
+    };
+    // ===== END SHARED: ffmpeg encoder probe =====
 
     // ===== SHARED [audio_clean, clean_and_remux]: title canonicalization =====
     // The canonical audio-title machinery both plugins share, so audio_clean's downmix titles come out already in clean_and_remux's tag_title form and a
@@ -1009,10 +1024,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 try {
                     const { spawnSync } = require('child_process');
                     const r = spawnSync((otherArguments && otherArguments.ffmpegPath) || 'ffmpeg', ['-hide_banner', '-encoders'], { encoding: 'utf8', timeout: 20000 });
-                    for (const line of String((r && r.stdout) || '').split('\n')) {
-                        const m = line.match(/^\s*[A-Z.]{6}\s+([A-Za-z0-9_]+)/);   // " A....D libfdk_aac  Fraunhofer FDK AAC"
-                        if (m) _encoderSet.add(m[1]);
-                    }
+                    _encoderSet = parseFfmpegEncoders(r && r.stdout);
                 } catch (e) { /* leave empty → native aac fallback, which every build has */ }
             }
         }
@@ -1129,7 +1141,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Check if file is a video. If it isn't then exit plugin (before the no-audio check, so a non-video reports "not a video", not "no audio streams").
     if (file.fileMedium !== 'video') {
-        response.infoLog += '☒File is not a video. \n';
+        response.infoLog += '☑File is not a video. \n';
         response.processFile = false;
         return response;
     }
@@ -1137,7 +1149,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //We really only care about the audio streams
     let audioStreams = file.ffProbeData.streams.filter(stream => (stream?.codec_type ?? '').trim().toLowerCase() === 'audio');
     if (audioStreams.length === 0) {
-        response.infoLog += '☒Video file has no audio streams to manage.\n';
+        response.infoLog += '☑Video file has no audio streams to manage.\n';
         return response;
     }
 
