@@ -11,7 +11,7 @@ const details = () => ({
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them. Import ALSO recognizes fresh Plex-native sidecars with no s<index> (e.g. <video>.en.forced.srt), anchoring on the language token.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '1.999.0',
+    Version: '1.999.1',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -529,7 +529,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // sidecarBasename <-> parseSidecar are exact inverses. Name = <videoBase>.s<index>[.<encTitle>].<lang>[.<disp...>].<ext>. parseSidecar ALSO
     // accepts a Plex-native name with no s<index> (e.g. <videoBase>.en.forced.srt), anchored on a recognized <lang> token.
     const sidecarBasename = (s) => {
-        const lang = resolveLang(s) || 'und';
+        // lang is the only metadata-derived filename component read raw (title is percent-encoded via encodeTitle, disp/ext are fixed enums), so restrict
+        // it to the language-code charset: a crafted container tag must not inject path separators/.. (traversal outside libDir) or a " that breaks out of
+        // the quoted "${full}" in the extract preset. parseSidecar round-trips unchanged - valid codes (en/eng/pt-br) are already within [a-z0-9-].
+        const lang = (resolveLang(s) || 'und').replace(/[^a-z0-9-]/g, '') || 'und';
         const disp = dispTokensOf(s);
         const { ext } = TEXT_SUB[String(s.codec_name).toLowerCase()];
         const rawTitle = s.tags?.title || '';
