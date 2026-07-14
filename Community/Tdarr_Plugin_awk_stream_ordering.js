@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '2.999.5',
+    Version: '2.999.6',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -84,7 +84,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['descending', 'descending <=1024k', 'ascending', 'disabled'],
             },
-            tooltip: `Audio quality ordering preference - streams are ordered by channel then rating of codec/bitrate. Generally descending is recommended.
+            tooltip: `Audio quality ordering preference - orders streams by their computed quality score (codec + bitrate vs transparent). Generally descending is recommended.
                 \\nExample:\\n
                     descending: 640k,128k
                 \\nExample:\\n
@@ -635,7 +635,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return idx === -1 ? 999 : idx;
         };
 
-        // Audio ordering below first_audio, shared by the sort AND the winning-default pre-pass (#7): language -> role -> order_codec -> the union cap partition
+        // Audio ordering below first_audio, shared by the sort AND the winning-default pre-pass: language -> role -> order_codec -> the union cap partition
         // (over EITHER cap -> tail) -> channel (direction) -> quality (direction). Returns 0 when every key ties. The cap ONLY partitions; within each partition
         // channel/quality keep their requested direction, so a 'descending <=N' list stays fully descending - the cap just shifts which serveable track leads.
         const audioKeyCompare = (a, b) => {
@@ -710,7 +710,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             });
         }
 
-        // #7 (first_audio='default'): only ONE audio track can remain default (the normalisation below marks the first sorted audio the sole default). So promote
+        // first_audio='default': only ONE audio track can remain default (the normalisation below marks the first sorted audio the sole default). So promote
         // the SINGLE default track that WINS the normal ordering, not every default flag - then the emitted order already matches the post-normalisation state and
         // is a fixpoint. Promoting every default would lead with a lower-priority default on pass 1, then re-sort it once its default is stripped (a wasteful extra
         // reorder remux before it settles). undefined when no track is flagged default, so first_audio='default' then falls through to normal ordering. Identity-compared below.

@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.999.4',
+    Version: '2.999.6',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -273,7 +273,7 @@ const details = () => ({
                 never protected. See downmix_language.
                 \\nNote: object-audio detection is best-effort - Atmos on E-AC-3 is reliable, but DTS:X relies on a MediaInfo field its own maintainers
                 note is incomplete for an undocumented format, so a real DTS:X track may occasionally not be recognized (it never false-positives). A
-                recognized object-audio track is also PREFERRED over an otherwise-equal plain track when remove_duplicates picks which to keep.
+                recognized object-audio track is also PREFERRED over an otherwise-equal plain track when method_deduplicate picks which to keep.
                 \\n=====
                 \\nActions
                 \\n=====
@@ -997,7 +997,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     // Per-codec audio argument string scoped to a specific output stream index (e.g. -b:a:2 instead of -b:a). ffmpeg accepts the stream-qualified forms; we use
-    // them so each track gets its own settings when a single command touches several. Mirrors encoderArgs but with :idx suffixes. srcLossless and srcQuality
+    // them so each track gets its own settings when a single command touches several. srcLossless and srcQuality
     // are forwarded to resolveBitrate (srcLossless skips the source cap for lossless sources; srcQuality gates the guarded source-cap on the force path).
     const encoderArgsIdx = (codec, channels, idx, srcBps = 0, srcLossless = false, srcQuality = Infinity) => {
         const bps = resolveBitrate(codec, channels, srcBps, srcLossless, srcQuality);
@@ -1983,11 +1983,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // ===== END LAYOUT-DROP DOWNMIX DERIVATIVES =====
 
         // ===== LOUDNORM: untouched tracks =====
-        // Tracks none of the 12 sites above touched at all (the common case - already the right codec/channels, nothing else needed). Runs over
+        // Tracks none of the downmix/force/remix sites above touched at all (the common case - already the right codec/channels, nothing else needed). Runs over
         // EVERY kept audio stream directly (not workStreams/candidateStreams, which exist for codec_force/downmix_secondary_stereo's own narrower
         // eligibility and would silently exclude secondary/commentary tracks under default settings) - guard_lossless/guard_quality/guard_object_audio are the only scope gate.
-        // A track ALSO being modified by one of the 12 sites above rides on that same re-encode instead (each site's own stereoArg/layoutFilter/
-        // inline block calls buildLoudnormFilter directly - see the Branch A comments at those call sites); this loop only handles the leftovers.
+        // A track ALSO being modified by one of the sites above rides on that same re-encode instead (each site's own stereoArg/layoutFilter/
+        // inline block calls buildLoudnormFilter directly at its own emit point); this loop only handles the leftovers.
         if (loudnorm !== 'disabled') {
             const preset = LOUDNORM_PRESETS[loudnorm];
             for (const stream of audioStreams) {
