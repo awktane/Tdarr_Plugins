@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.999.13',
+    Version: '2.999.14',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -192,8 +192,8 @@ const details = () => ({
                 options: ['unsupported', 'all', 'export'],
             },
             tooltip: `What to do with image-based (bitmap) subtitles - hdmv_pgs_subtitle (Blu-ray PGS), dvd_subtitle (VobSub), dvb_subtitle. They can't be searched, restyled, or turned into text without OCR.
-                \\nunsupported (default): keep them where the container carries them (mkv), drop them only where it can't (mp4 can't store these). Matches the previous default behaviour.
-                \\nall: remove all image-based subtitles from any container (use when you only want text subtitles). Same as the old remove_mkv_imagesubs=true.
+                \\nunsupported (default): keep them where the container carries them (mkv), drop them only where it can't (mp4 can't store these).
+                \\nall: remove all image-based subtitles from any container (use when you only want text subtitles).
                 \\nexport: save each image subtitle to a hidden sidecar next to the video (PGS -> ".<name>.<lang>.sup", VobSub/DVB -> ".<name>.<lang>.mks") and then remove it. The leading dot keeps Plex/Jellyfin from indexing it; run an external OCR tool on the sidecars to produce .srt, then reimport with awk_sub_worker. One-way - these are never reimported by this plugin.
                 \\nText subtitles are never affected. xsub is always removed (no Matroska CodecID) and is not exported.`,
         },
@@ -228,19 +228,6 @@ const details = () => ({
                  \\nThe mode actually applied is recorded in an awk_recovered tag. Recovery re-runs only when a recover_bad_* mode changes, then settles.`,
         },
         {
-            name: 'guard_original',
-            type: 'string',
-            defaultValue: 'disabled',
-            inputUI: {
-                type: 'dropdown',
-                options: ['disabled', 'enabled'],
-            },
-            tooltip: `Protect a foreign film's ORIGINAL-language audio track from being removed by the language_audio filter when its language isn't in your list.
-                \\nKeys off the ffmpeg "original" disposition flag OR an "original" keyword in the track title/handler (the same signal audio_clean's guard_original uses). A track with neither marker is not protected - this only rescues a properly-flagged original track, not a bare native-language track.
-                \\ndisabled (default): the original track follows normal language_audio handling (removed if its language isn't listed).
-                \\nenabled: keep an original-disposition audio track regardless of language_audio - so a jpn-only original track survives an eng-only filter instead of being dropped (or, if it were the last audio track, quarantining the file).`,
-        },
-        {
             name: 'method_tag_language',
             type: 'string',
             defaultValue: 'container',
@@ -253,6 +240,19 @@ const details = () => ({
                 \\ncontainer (default): write each container its native form - 2-letter (en, fr) for mkv, 3-letter terminologic (eng, fra) for mp4. Most spec-accurate per container.
                 \\n639-2/t: terminologic 3-letter codes everywhere - fra, deu, zho (matches mp4's mdhd; 3-letter is also the common mkv convention).
                 \\n639-2/b ("mkv classic"): bibliographic 3-letter codes everywhere - fre, ger, chi.`,
+        },
+        {
+            name: 'guard_original',
+            type: 'string',
+            defaultValue: 'disabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['disabled', 'enabled'],
+            },
+            tooltip: `Protect a foreign film's ORIGINAL-language audio track from being removed by the language_audio filter when its language isn't in your list.
+                \\nKeys off the ffmpeg "original" disposition flag OR an "original" keyword in the track title/handler (the same signal audio_clean's guard_original uses). A track with neither marker is not protected - this only rescues a properly-flagged original track, not a bare native-language track.
+                \\ndisabled (default): the original track follows normal language_audio handling (removed if its language isn't listed).
+                \\nenabled: keep an original-disposition audio track regardless of language_audio - so a jpn-only original track survives an eng-only filter instead of being dropped (or, if it were the last audio track, quarantining the file).`,
         },
     ],
 });

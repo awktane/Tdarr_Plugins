@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.999.11',
+    Version: '2.999.12',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -321,7 +321,7 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\nIf enabled  - (Default) Also log every track that was protected or skipped, and why - the negative space alongside the real changes.
-                \\nIf disabled - Only log tracks that actually changed. Close to the plugin's classic output - no explanation for tracks left alone.`,
+                \\nIf disabled - Only log tracks that actually changed - no explanation for tracks left alone.`,
         },
     ],
 });
@@ -988,7 +988,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // source only re-encode detail a lossy source already discarded. The guard defaults OFF (srcQuality = Infinity) so only the codec_force same-channel path
     // opts in; downmix callers pass no srcBps and stay on the floor, and lossless sources skip the branch (their bitrate isn't a comparable perceptual quantity
     // - a 4 Mbps TrueHD into eac3 should target the floor, not its own rate). A pathological sub-minimum source is floored at the codec's channel-scaled
-    // minimum. When the guard fails (target less efficient), a higher-than-floor lossy source still raises the target (unchanged old behavior). Result is
+    // minimum. When the guard fails (target less efficient), a higher-than-floor lossy source still raises the target. Result is
     // clamped to the codec ceiling, then for AC3 ONLY snapped UP to the nearest valid preset: ffmpeg rounds an AC3 request to the NEAREST preset (can round
     // down), so we round up ourselves to guarantee the emitted rate is never below target and the log matches what ffmpeg produces; eac3/aac/opus honour
     // arbitrary rates (verified) and are emitted as-is.
@@ -1159,7 +1159,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`Somehow invalid guardOriginal option provided. Check your settings!`);
 
     let extraArguments = '';
-    let workDone = '';       // "this changed" lines (transcode/add/remix/normalize/remove) - always shown, matching pre-method_verbose behavior.
+    let workDone = '';       // "this changed" lines (transcode/add/remix/normalize/remove) - always shown, regardless of method_verbose.
     let verboseDone = '';    // "this DIDN'T change, and why" lines (guard blocks, ceiling/missing-data skips) - shown only when method_verbose='enabled'.
     let convert = false;
 
@@ -2175,7 +2175,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // against the real mov muxer - which is why loudnorm caches on Matroska only; see loudnormTagPersists.)
             const mp4KeepTags = isMp4Family(file.container) ? ' -movflags use_metadata_tags' : '';
             response.preset += `,-map 0 -c copy${extraArguments}${globalOutputOpt}${mp4KeepTags}`;
-            // workDone (what changed) always shows, matching pre-method_verbose behavior exactly. verboseDone (why something DIDN'T change - guard
+            // workDone (what changed) always shows, regardless of method_verbose. verboseDone (why something DIDN'T change - guard
             // blocks, ceiling/missing-data skips) is the part method_verbose gates - the diagnostic negative-space, not the status of real changes.
             response.infoLog += workDone;
             if (methodVerbose === 'enabled') response.infoLog += verboseDone;
