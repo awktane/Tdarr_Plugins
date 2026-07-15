@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '3.0.0',
+    Version: '3.1.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -837,6 +837,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const langListMatch = (streamLang, keys) => keys.includes(langKey(streamLang));
     // ===== END SHARED: language list match =====
 
+    // audio_clean-local IDENTITY key: like langKey but KEEPS the region/script subtag, so pt-BR and pt-PT are DISTINCT identities (both survive dedup, each gets its own
+    // downmix) while eng/en/English/en-US still fold their BASE (eng==en, but en != en-US). Used ONLY for dedup grouping and the one-downmix-per-language sets; all
+    // matching/filtering stays on the folded langKey. Non-language/untagged/malformed tokens fall back to langKey, so 'und' stays 'und' and the dedup exemption holds.
+    const langIdentityKey = (x) => {
+        let s = String(x || '').trim().toLowerCase().replace(/[_.]/g, '-');
+        if (!s) return '';
+        if (s.length >= 4 && langNameIndex()[s]) s = langNameIndex()[s];   // spelled-out English name -> its 2-letter code (no region on a spelled-out name)
+        try { return String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase(); } catch (e) { return langKey(x); }
+    };
+
     // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: ffmpeg metadata escaping =====
     // -=-=-= escMeta  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
     // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array and hands it to child_process.spawn, so shell
@@ -1207,7 +1217,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //Add secondary track flag and the cleaned language to each track
         audioStreams = audioStreams.map(item => {
             const fullLang = resolveLang(item) || 'und';
-            const cleanLang = langKey(fullLang);   // normalised key: en/eng/english/en-US all collapse, so dedup/priority/created-lang sets treat them as one
+            const cleanLang = langKey(fullLang);              // folded MATCH key (en/eng/english/en-US/pt-BR all collapse): drives language filtering, lang-secondary, priority
+            const identityLang = langIdentityKey(fullLang);   // region-preserving IDENTITY key (pt-BR != pt-PT, but eng==en): drives dedup grouping + the one-downmix-per-language sets
             // Enrich with mediaInfo bitrate before audioQuality scoring so that formats like DTS-HD MA (which ffprobe can't read a bitrate for in MP4/M4V
             // containers) score and display correctly.
             const enrichedItem = enrichStream(item);
@@ -1220,6 +1231,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 isTdarrLangSecondary: hasPreferredPrimary && !downmixLangKeys.includes(cleanLang)
                     && !(guardOriginal === 'enabled' && hasDisposition(item, 'original')),
                 isTdarrCleanLang: cleanLang,
+                isTdarrIdentityLang: identityLang,
                 isTdarrQuality: audioQuality(enrichedItem),
                 // Used by codec_force to suppress the source-bitrate floor in resolveBitrate for lossless sources. A lossless bitrate (e.g. 4 Mbps TrueHD) is not a
                 // comparable quantity for a perceptual encode and would otherwise pin the output at the codec ceiling for no audible gain.
@@ -1345,22 +1357,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 } else {
                     tier = s.channels > 2 ? 'surround' : 'stereo';
                 }
-                // Only MAIN tracks reach here (secondaries skipped above), so lang + channel-tier fully identifies a duplicate group.
-                const key = `${s.isTdarrCleanLang}|${tier}`;
+                // Only MAIN tracks reach here (secondaries skipped above), so region-distinct identity-lang + channel-tier fully identifies a duplicate group (pt-BR != pt-PT).
+                const key = `${s.isTdarrIdentityLang}|${tier}`;
                 if (seen.has(key)) {
                     const kept = seen.get(key);
                     if (dedupeGuardBlocks(s, kept)) continue;
                     if (removeDuplicatesErrorMode) {
                         const rmRate = hasKnownRate(s) ? ` @ ${Math.round(Number(s.bit_rate) / 1000)} kb/s` : '';
                         const keptRate = hasKnownRate(kept) ? ` @ ${Math.round(Number(kept.bit_rate) / 1000)} kb/s` : '';
-                        failFile(`Stream ${s.index}: Duplicate audio track detected (${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang}${rmRate}) alongside stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate}) under method_deduplicate="${removeDuplicatesBy}". Aborting - tag/remove tracks manually and requeue, or switch method_deduplicate to a non-error mode.`);
+                        failFile(`Stream ${s.index}: Duplicate audio track detected (${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrIdentityLang}${rmRate}) alongside stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate}) under method_deduplicate="${removeDuplicatesBy}". Aborting - tag/remove tracks manually and requeue, or switch method_deduplicate to a non-error mode.`);
                     }
                     streamsToRemove.add(s.index);
                     // Show the removed track's bitrate and the kept track's for contrast — duplicates are
                     // decided by quality score (largely bitrate-driven), so this makes the choice transparent.
                     const rmRate = hasKnownRate(s) ? ` @ ${Math.round(Number(s.bit_rate) / 1000)} kb/s` : '';
                     const keptRate = hasKnownRate(kept) ? ` @ ${Math.round(Number(kept.bit_rate) / 1000)} kb/s` : '';
-                    workDone += `☐Stream ${s.index}: Removing duplicate (lower quality ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang}${rmRate}) - keeping stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate})\n`;
+                    workDone += `☐Stream ${s.index}: Removing duplicate (lower quality ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrIdentityLang}${rmRate}) - keeping stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate})\n`;
                 } else
                     seen.set(key, s);
             }
@@ -1427,11 +1439,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Now that dedup + the layout-drop pre-pass have finalised streamsToRemove, snapshot which languages still have a primary stereo / 5.1-6ch track
         // among the SURVIVORS, so downmix_to_stereo/downmix_to_six only create one for a language that genuinely lacks it (a removed track can't leave a
-        // stale entry). isTdarrCleanLang (normalised short code, e.g. 'en' for 'en-US') matches created2chLangs/ffstreamLangKey. Channels 2 = stereo;
+        // stale entry). isTdarrIdentityLang (region-distinct, e.g. 'pt-br' vs 'pt-pt') matches created2chLangs/ffstreamLangKey, so each region variant gets its own. Channels 2 = stereo;
         // >4 && <=6 = any 5-6 channel primary (5.0/5.1, and the rare 4.1 which is also 5 channels) without catching 4.0 (4ch) or 7.1 (8ch).
         const survivingPrimaryAudio = audioStreams.filter(s => !streamsToRemove.has(s.index) && !s.isTdarrSecondaryTrack && !s.isTdarrLangSecondary);
-        const existingStereoLangs = new Set(survivingPrimaryAudio.filter(s => s.channels === 2).map(s => s.isTdarrCleanLang));
-        const existingSixLangs = new Set(survivingPrimaryAudio.filter(s => s.channels > 4 && s.channels <= 6).map(s => s.isTdarrCleanLang));
+        const existingStereoLangs = new Set(survivingPrimaryAudio.filter(s => s.channels === 2).map(s => s.isTdarrIdentityLang));
+        const existingSixLangs = new Set(survivingPrimaryAudio.filter(s => s.channels > 4 && s.channels <= 6).map(s => s.isTdarrIdentityLang));
 
         // inputAudioIdxMap: 0-based audio-type index within the INPUT file (for -map 0:a:N).
         // outputAudioIdxMap: 0-based audio-type index within the OUTPUT (for -c:a:N and -metadata:s:a:N).
@@ -1747,7 +1759,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 continue;
             }
 
-            const ffstreamLangKey = ffstream.isTdarrCleanLang;
+            const ffstreamLangKey = ffstream.isTdarrIdentityLang;
 
             // Human-readable source bitrate for the operation log. Falls back to the known target bitrate for our own output codecs (common for
             // freshly-transcoded tracks where the muxer omits per-stream bitrate), or 'unknown bitrate' otherwise.
@@ -1976,7 +1988,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // or already have one among survivors (existing*Langs), so a redundant dropped source produces nothing. Mirrors the downmix add branches (title,
         // codec, loudnorm via stereoArg / the 5.1 filter). These new tracks are opus-safe (stereo -> codec_stereo; a -ac 6 downmix yields a 5.1 layout).
         for (const s of layoutDroppedDeriveSources) {
-            const lang = s.isTdarrCleanLang;
+            const lang = s.isTdarrIdentityLang;
             const srcAudioIdx = inputAudioIdxMap.get(s.index);
             if (srcAudioIdx === undefined) continue;
             const streamLang = resolveLang(s);

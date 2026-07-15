@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.0.0',
+    Version: '3.1.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -233,13 +233,14 @@ const details = () => ({
             defaultValue: 'container',
             inputUI: {
                 type: 'dropdown',
-                options: ['639-2/b', '639-2/t', 'container'],
+                options: ['639-2/b', '639-2/t', 'container', 'bcp47'],
             },
             tooltip: `Which language-code standard tag_language writes (only takes effect when tag_language is not disabled). Affects mainly the ~20 languages with two 3-letter codes (e.g. French fre/fra, German ger/deu) plus the 2-vs-3-letter choice; you can still type any form in the language lists regardless.
                 \\nBy convention Matroska (mkv) uses ISO-639-2/B and mp4's mdhd box uses ISO-639-2/T; both containers accept either form.
                 \\ncontainer (default): write each container its native form - 2-letter (en, fr) for mkv, 3-letter terminologic (eng, fra) for mp4. Most spec-accurate per container.
                 \\n639-2/t: terminologic 3-letter codes everywhere - fra, deu, zho (matches mp4's mdhd; 3-letter is also the common mkv convention).
-                \\n639-2/b ("mkv classic"): bibliographic 3-letter codes everywhere - fre, ger, chi.`,
+                \\n639-2/b ("mkv classic"): bibliographic 3-letter codes everywhere - fre, ger, chi.
+                \\nbcp47: like container on mp4 (3-letter terminologic) but on mkv keeps the full BCP-47 tag - a region (ISO-3166) subtag like pt-BR/es-419 or a script (ISO-15924) subtag like zh-Hans; mp4 can't store a region so it still folds to 3-letter (por).`,
         },
         {
             name: 'guard_original',
@@ -695,8 +696,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Value checks continue in Inputs order (container already checked above): language_fill is format-checked and cross-checked against language_sub/
     // language_audio, then the remaining dropdowns are checked against their option set (free-text and boolean inputs need no check - see above).
-    if(fillLanguage && !/^[a-z]{3}$/.test(fillLanguage))
-        failFile(`fillLanguage is not a 3 character ISO-639-2 language code. It should follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes`);
+    // language_fill accepts any recognised language in any form - langKey folds en/eng/English/en-US/pt-BR to a base code - or a valid special/private code
+    // (und/mul/zxx/mis/qaa-qtz, mirroring isNonLang); an unrecognised token (typo/garbage) fails the file so a bad fill can't be written and then demote a stream downstream.
+    if(fillLanguage) {
+        const fk = langKey(fillLanguage);
+        const knownFill = fk === 'und' || fk === 'mul' || fk === 'zxx' || fk === 'mis' || /^q[a-t][a-z]$/.test(fk)
+            || (() => { try { return !!new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }).of(fk); } catch (e) { return false; } })();
+        if(!knownFill)
+            failFile(`language_fill "${inputs.language_fill}" is not a recognised language. Use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz).`);
+    }
     // If fillLanguage is set it should be a track that's kept (checked per-type so one type can legitimately exclude it).
     if(fillLanguage && subLanguage.length > 0 && !subLangKeys.includes(langKey(fillLanguage)))
         failFile(`You have specified that blank tracks should be tagged as ${fillLanguage}. You have not included it in language_sub which indirectly will remove untagged subtitle streams.`);
@@ -710,7 +718,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`Somehow invalid tag_title option provided. Check your settings!`);
     if(!['disabled', 'invalid', 'strict'].includes(tagLanguage))
         failFile(`Somehow invalid tag_language option provided. Check your settings!`);
-    if(!['639-2/b', '639-2/t', 'container'].includes(methodTagLanguage))
+    if(!['639-2/b', '639-2/t', 'container', 'bcp47'].includes(methodTagLanguage))
         failFile(`Somehow invalid method_tag_language option provided. Check your settings!`);
     if(!['disabled', 'light', 'aggressive'].includes(recoverTs))
         failFile(`Somehow invalid recover_bad_timestamps option provided. Check your settings!`);
@@ -764,8 +772,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!t) return key;
             return wantB ? (ISO639_2_B[key] || t) : t;
         };
-        if (methodTagLanguage === 'container') return dstContainer === 'mp4' ? three(false) : key;   // mkv: 2-letter BCP-47; mp4: 639-2/T
-        return three(methodTagLanguage === '639-2/b');                                               // single form for both containers
+        if (methodTagLanguage === 'bcp47')     return dstContainer === 'mp4' ? three(false) : (canonicalRegionTag(x) || key);   // mkv: keep region/script (pt-BR); mp4: 639-2/T
+        if (methodTagLanguage === 'container') return dstContainer === 'mp4' ? three(false) : key;                              // mkv: 2-letter BCP-47 (region folded); mp4: 639-2/T
+        return three(methodTagLanguage === '639-2/b');                                                                          // single 3-letter form for both containers
     };
     // Recognised language name for a tag's primary subtag, or '' - tells a real code (en, eng) from a spelled-out name ("english") or garbage.
     // DisplayNames is memoised in a closure (built once, then reused) - it is called once per tagged stream via storesCleanly, and a fresh ICU instance per call
@@ -777,11 +786,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             catch (e) { return ''; }
         };
     })();
+    // Canonical BCP-47 tag keeping the region/script subtag (mkv write side, bcp47 method only); '' for a bare code, non-language, or unrecognised region tag.
+    // getCanonicalLocales folds+cases the base and keeps region/script (por-BR->pt-BR, PT-br->pt-BR, eng-US->en-US, zh-Hans, es-419); langName rejects a garbage
+    // base (xx-YY) and getCanonicalLocales throws on malformed input (_ . normalised to - first). container / 639-2 / mp4 targets never call this (they fold region).
+    const canonicalRegionTag = (x) => {
+        const raw = String(x || '').trim().toLowerCase().replace(/[_.]/g, '-');
+        if (!raw.includes('-')) return '';                          // bare code -> existing 2-letter / 639-2 path
+        if (!langName(raw)) return '';                              // unrecognised base -> fold via existing path
+        try { const c = Intl.getCanonicalLocales(raw)[0] || ''; return c.includes('-') ? c : ''; }
+        catch (e) { return ''; }
+    };
     // True when an already-present tag stores cleanly in dstContainer AS a recognised code (drives tag_language=invalid: leave these, fix the rest).
     const storesCleanly = (rawTag) => {
         const s = String(rawTag || '').trim();
         if (!s || isNonLang(langKey(s))) return true;               // blank / non-language -> not a rewrite candidate
         if (!langName(s)) return false;                             // spelled-out name or garbage -> fix
+        // mkv: a recognised region/script-qualified tag (pt-BR, zh-Hans) stores fine as-is - invalid leaves it, strict enforces the method. mp4 falls through and folds it to 639-2/T.
+        if (dstContainer !== 'mp4' && /[-_.]/.test(s)) return true;
         if (s !== s.toLowerCase()) return false;                    // uppercase -> mp4 drops it / non-standard casing -> fix
         return dstContainer === 'mp4' ? /^[a-z]{3}$/.test(s) : /^[a-z]{2,3}$/.test(s);   // mp4 needs lowercase 3-letter; mkv keeps a bare 2/3-letter code
     };
