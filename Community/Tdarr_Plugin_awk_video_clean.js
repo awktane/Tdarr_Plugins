@@ -9,10 +9,10 @@ const details = () => ({
                      -Auto-selects the best available encoder on EACH node at runtime: queries the ffmpeg build + a cheap hardware-presence check (no trial-encode ladder), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Force a specific encoder or leave it on auto.\n\n
                      -Constant-quality (CRF/CQ) tiered by resolution, normalized so the same setting yields comparable quality on every encoder.\n\n
                      -Optionally caps resolution (e.g. 4K -> 1080p), re-deriving the quality tier for the output height.\n\n
-                     -Preserves static HDR10/HLG colour metadata; leaves Dolby Vision / HDR10+ files untouched by default (dynamic metadata can't survive a re-encode).\n\n
+                     -HDR-aware (method_hdr): preserves static HDR10/HLG; by default leaves Dolby Vision / HDR10+ untouched (dynamic metadata can't survive a re-encode), can strip just the dynamic layer, or tonemap all HDR down to SDR for SDR-only playback.\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '2.0.0',
+    Version: '2.1.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -108,22 +108,23 @@ const details = () => ({
         {
             name: 'guard_min_bitrate',
             type: 'string',
-            defaultValue: '0',
+            defaultValue: '1000',
             inputUI: { type: 'text' },
-            tooltip: `Skip files whose current video bitrate is already below this (kbps). 0 disables the guard.
+            tooltip: `Skip files whose current video bitrate is already below this (kbps). 0 disables the guard; the default 1000 leaves genuinely lean sources alone (rarely triggers - most content sits well above 1000 kbps at any resolution).
                 \\nConstant-quality encoding can't predict the output size, so re-encoding an already-lean source can GROW it. This floor leaves already-efficient files untouched. Example: 2500 skips anything already under 2500 kbps.`,
         },
         {
-            name: 'guard_hdr',
+            name: 'method_hdr',
             type: 'string',
-            defaultValue: 'abort_dynamic',
+            defaultValue: 'preserve',
             inputUI: {
                 type: 'dropdown',
-                options: ['abort_dynamic', 'allow_dynamic'],
+                options: ['preserve', 'strip_dynamic', 'tonemap_sdr'],
             },
-            tooltip: `How to handle Dolby Vision / HDR10+ (dynamic HDR) files. Static HDR10/HLG colour metadata is always carried through the encode automatically (nothing to configure).
-                \\nabort_dynamic (recommended): leave Dolby Vision / HDR10+ files untouched - their dynamic metadata can't survive a re-encode, so transcoding would degrade them.
-                \\nallow_dynamic: transcode them anyway, keeping only the base HDR10 layer (accepts the loss of the dynamic Dolby Vision / HDR10+ layer).`,
+            tooltip: `How to handle HDR video. Static HDR10/HLG colour metadata is always carried through the encode automatically; this controls dynamic HDR (Dolby Vision / HDR10+) and whether to keep HDR at all.
+                \\npreserve (recommended): leave Dolby Vision / HDR10+ files untouched - their dynamic metadata can't survive a re-encode, so transcoding would degrade them. Static HDR10/HLG is transcoded normally (HDR kept).
+                \\nstrip_dynamic: transcode Dolby Vision / HDR10+ anyway, keeping only the base HDR10 layer (accepts the loss of the dynamic layer). Static HDR10/HLG unaffected (kept).
+                \\ntonemap_sdr: tonemap ALL HDR (static and dynamic) down to SDR (bt709) via ffmpeg's tonemapx. For SDR-only playback chains - makes HDR look correct on non-HDR displays and avoids the media server re-tonemapping on every playback. Lossy and one-way (the HDR master is discarded in this output), so leave on preserve if you watch on HDR displays. Respects bit_depth (8-bit SDR unless you set bit_depth=10).`,
         },
         {
             name: 'guard_reprocess',
@@ -686,14 +687,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Decode is kept on software frames (nvenc via the shared nvdecPreset helper) so a single CPU scale filter and
     // -pix_fmt path work uniformly across families; VAAPI is the exception - it needs its frames uploaded, so it
     // carries an explicit device + format,hwupload filter. Returns { inputSide, videoOut }.
-    const buildVideoArgs = ({ family, encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file }) => {
+    const buildVideoArgs = ({ family, encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file, tonemap }) => {
         const { getNvdecHwaccelPreset, getNvenc10BitFormatArg } = require('../methods/nvdecPreset');
         const q = nativeQuality(codec, family, qNorm);
         const spd = nativeSpeed(codec, family, speed);
         let inputSide = '';
         const parts = [`-c:v:0 ${encoderName}`, q, spd];   // :v:0 = encode primary video only; any genuine secondary video stream stays copied
         const vf = [];
-        const scale = (fmt) => { if (willDownscale) vf.push(`scale=-2:${outHeight}`); if (fmt) vf.push(fmt); };
+        // scale then (optional) HDR->SDR tonemap must precede any pixel-format/hwupload step (vaapi uploads to the GPU); tonemapx is self-contained (emits bt709
+        // tags itself - verified) and bit depth is set by the family -pix_fmt below, so no trailing format filter or explicit colour flags are needed.
+        const scale = (fmt) => {
+            if (willDownscale) vf.push(`scale=-2:${outHeight}`);
+            if (tonemap) vf.push('tonemapx=tonemap=bt2390:transfer=bt709:matrix=bt709:primaries=bt709:range=tv');
+            if (fmt) vf.push(fmt);
+        };
 
         if (family === 'nvenc') {
             inputSide = getNvdecHwaccelPreset(file, { softwareFrames: true });   // '-hwaccel cuda' (system-memory frames) or '' for software decode
@@ -739,7 +746,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const speed = String(inputs.speed || 'slow').toLowerCase().trim();
     const bitDepthOpt = String(inputs.bit_depth || 'source').toLowerCase().trim();
     const encoderOpt = String(inputs.encoder || 'auto').toLowerCase().trim();
-    const guardHdr = String(inputs.guard_hdr || 'abort_dynamic').toLowerCase().trim();
+    const methodHdr = String(inputs.method_hdr || 'preserve').toLowerCase().trim();
     const guardReprocess = String(inputs.guard_reprocess) === 'true';
 
     const parseQuality = (v, name) => {
@@ -762,7 +769,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!['slow', 'medium', 'fast'].includes(speed)) failFile('Somehow invalid speed option provided. Check your settings!');
     if (!['source', '8', '10'].includes(bitDepthOpt)) failFile('Somehow invalid bit_depth option provided. Check your settings!');
     if (!['auto', 'nvenc', 'qsv', 'vaapi', 'videotoolbox', 'amf', 'cpu'].includes(encoderOpt)) failFile('Somehow invalid encoder option provided. Check your settings!');
-    if (!['abort_dynamic', 'allow_dynamic'].includes(guardHdr)) failFile('Somehow invalid guard_hdr option provided. Check your settings!');
+    if (!['preserve', 'strip_dynamic', 'tonemap_sdr'].includes(methodHdr)) failFile('Somehow invalid method_hdr option provided. Check your settings!');
 
     // Input summary is always logged.
     response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
@@ -797,22 +804,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const srcIs10 = is10Bit(primary, mi);
         const wantTenbit = codec === 'h264' ? false : (bitDepthOpt === '10' || (bitDepthOpt === 'source' && srcIs10));
 
-        // HDR: ffmpeg auto-propagates the source's colour metadata (primaries/transfer/matrix) to the re-encoded
-        // output - verified against the real ffmpeg for libx265/libsvtav1/videotoolbox, including through the
-        // scale filter - so static HDR10/HLG survives without any explicit colour flags. Dynamic metadata (Dolby
-        // Vision / HDR10+) CANNOT survive a re-encode, so by default such files are left untouched. Detect it from
-        // BOTH probes (mediaInfo HDR_Format, plus ffprobe's own DOVI / HDR10+ side_data or a DV codec tag): this guard
-        // is the one place a single-probe false negative is destructive - it would silently re-encode and drop the DV layer.
+        // HDR (method_hdr): ffmpeg auto-propagates the source's colour metadata (primaries/transfer/matrix) to the re-encoded output - verified against the real
+        // ffmpeg for libx265/libsvtav1/videotoolbox, incl. through the scale filter - so static HDR10/HLG survives with no explicit colour flags. Dynamic metadata
+        // (Dolby Vision / HDR10+) CANNOT survive a re-encode: 'preserve' leaves such files untouched; 'strip_dynamic' transcodes them keeping the base HDR10 layer;
+        // 'tonemap_sdr' flattens ALL HDR (static + dynamic) to SDR via tonemapx (which emits correct bt709 tags itself - verified - so still no explicit colour flags,
+        // and folds Dolby Vision metadata in via apply_dovi). Dynamic HDR is detected from BOTH probes (mediaInfo HDR_Format, plus ffprobe DOVI / HDR10+ side_data or a
+        // DV codec tag) - a single-probe false negative here is destructive under 'preserve'. isHdr (any HDR incl. static, via colour transfer) gates tonemapping.
         const hdrFmt = String(mi?.HDR_Format || mi?.HDR_Format_Compatibility || '').toLowerCase();
         const dvSideData = Array.isArray(primary.side_data_list) ? primary.side_data_list : [];
         const ffprobeDynamicHdr = dvSideData.some((sd) => /dovi|dolby vision|smpte ?2094|hdr dynamic metadata/.test(String(sd?.side_data_type || '').toLowerCase()))
             || /^(dvhe|dvh1|dvav|dva1|dav1)$/.test(String(primary.codec_tag_string || '').toLowerCase().trim());
         const isDynamicHdr = hdrFmt.includes('dolby vision') || hdrFmt.includes('hdr10+') || hdrFmt.includes('smpte st 2094') || ffprobeDynamicHdr;
-        if (isDynamicHdr && guardHdr === 'abort_dynamic') {
-            response.infoLog += '☒Dynamic HDR (Dolby Vision / HDR10+) detected - it cannot survive a re-encode, so the file is left untouched. Set guard_hdr to "allow_dynamic" to transcode anyway (keeps only the base HDR10 layer).\n';
+        const srcXfer = (primary.color_transfer || mi?.transfer_characteristics || '').toLowerCase().trim();
+        const isHdr = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'].includes(srcXfer) || !!String(mi?.HDR_Format || '').trim() || isDynamicHdr;
+        if (isDynamicHdr && methodHdr === 'preserve') {
+            response.infoLog += '☒Dynamic HDR (Dolby Vision / HDR10+) detected - it cannot survive a re-encode, so the file is left untouched. Set method_hdr to "strip_dynamic" to transcode (keeps the base HDR10 layer) or "tonemap_sdr" to tonemap it to SDR.\n';
             response.processFile = false;
             return response;
         }
+        const tonemap = methodHdr === 'tonemap_sdr' && isHdr;   // flatten HDR -> SDR (also a re-encode reason even when the source is already the target codec, below)
 
         // Resolution / downscale (only ever downscales) and the quality tier for the OUTPUT height.
         const maxH = maxHeightOpt === 'original' ? 0 : Number(maxHeightOpt);
@@ -825,7 +835,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // awk_video tag. The plugin version is appended for forensics (which build wrote this file, so a future bug could re-target its outputs) but is NOT part
         // of the match - like audio_clean's awk_loudnorm tag - so a version bump (e.g. the coordinated MAJOR) never invalidates the fence and forces a lossy
         // generational re-encode of an otherwise-identical file.
-        const videoSigCore = escMeta([targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, wantTenbit ? '10' : '8', `s${speed}`].join('-'));
+        const videoSigCore = escMeta([targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, wantTenbit ? '10' : '8', `s${speed}`, ...(tonemap ? ['sdr'] : [])].join('-'));
         const videoSig = `${videoSigCore}-v${escMeta(details().Version)}`;
         const priorSig = getTagCI(file.ffProbeData.format?.tags || {}, 'awk_video').trim();
 
@@ -851,6 +861,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             reason = `downscale ${srcHeight}p -> ${outHeight}p`;
         } else if (!depthOk) {
             reason = `bit depth ${srcIs10 ? '10' : '8'} -> ${wantTenbit ? '10' : '8'}`;
+        } else if (tonemap) {
+            reason = 'tonemap HDR -> SDR';
         } else if (guardReprocess) {
             if (priorSig !== '' && priorSig.replace(/-v[^-]*$/, '') === videoSigCore) {   // match the settings core only; the stored -v<version> suffix is forensic, not part of the fence
                 response.infoLog += `☑Already processed by awk_video at this setting (${videoSig}). Nothing to do.\n`;
@@ -869,7 +881,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         sel.notes.forEach((n) => { response.infoLog += n; });
 
         // Build the video-encode args + assemble the full preset (<input-side>,<output-side>).
-        const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file });
+        const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file, tonemap });
 
         let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy`;
         for (const s of videoStreams) if (isCoverArt(s)) out += ` -map -0:${s.index}`;   // drop embedded cover-art/still-image "video" streams
@@ -884,6 +896,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Predict the re-encoded stream and render it through the shared summariseStream (single source of truth for the [video:...] token) so the Expected-results line matches
         // the input-summary format exactly; bits_per_raw_sample is set explicitly with pix_fmt/profile cleared so 8/10-bit is exact, and an unknown height is omitted (no bare "0p").
         const outStream = { ...primary, codec_name: targetCodecName, height: outHeight || srcHeight, bits_per_raw_sample: wantTenbit ? 10 : 8, pix_fmt: '', profile: '' };
+        // A tonemapped output is SDR: mark bt709 transfer and detach the source mediaInfo (index -1 -> no StreamOrder match) so the predicted token shows no 'hdr'.
+        if (tonemap) { outStream.color_transfer = 'bt709'; outStream.index = -1; }
         const outVideoToken = summariseStream(outStream);
         const outSummary = file.ffProbeData.streams
             .filter((s) => !(isCoverArt(s) && (s.codec_type || '').trim().toLowerCase() === 'video'))
