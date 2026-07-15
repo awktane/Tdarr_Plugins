@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.999.16',
+    Version: '2.999.17',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1037,6 +1037,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
     }
 
+    // Summarise the input streams exactly as they arrived, before any removal/remux/quarantine, using the shared bracket helper. This plugin runs first, so it
+    // captures the file as received; reading it alongside the stream-ordering plugin's output line shows where a file came from and where it ended up. Emitted
+    // before the language_fill_fail pre-check so a quarantine there carries the same input picture the strip-all-audio/video quarantines do. Starts with ☐.
+    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
+
     // language_fill_fail pre-check: when >1 untagged stream of a type WILL REACH THE OUTPUT, they can't be told apart by language - abort so the user can tag them
     // manually and requeue (language_fill_fail=false instead lets processing continue). Whether the blanks get filled to the same language (a downstream dedupe-
     // collision risk) or stay "und" (an ambiguous, incomplete file), multiple untagged streams of a type are the problem worth failing on - BUT only counting the
@@ -1093,11 +1098,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Font attachments whose removal is deferred until after the main loop, when we know which subtitle streams survive. Decided here (not inline) because an
     // attachment can appear before its subtitles in the file, so we cannot know whether a styled subtitle survives at the moment we reach the attachment.
     const deferredFontIndices = [];
-
-    // Summarise the input streams exactly as they arrived, before any removal/remux, using the shared bracket helper. This plugin runs first, so it captures
-    // the file as received; reading it alongside the stream-ordering plugin's output line shows where a file came from and where it ended up. Starts with ☐
-    // as it details the state we are about to act on.
-    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
 
     // One guard around all the real work (the per-stream loop plus the font/metadata/preset build below): a deliberate failFile abort (AwkFailFile)
     // rethrows unchanged, and any UNEXPECTED error fails the file too — annotated and carrying the full infoLog — instead of silently skipping. (Earlier
@@ -1547,6 +1547,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 extraArguments += ' -movflags use_metadata_tags';
             response.preset += `${fflags}${inputArgs},${sidecarOut} -map 0 -c copy${extraArguments}${globalOutputOpt}`;
             response.infoLog += workDone;
+            // Predicted output: re-renders the input streams with the two mutations this summary tracks - removedIndices filtering and subCodecOverride (converted
+            // subtitle codec). It does NOT reflect queued language fills / tag_language standardization: those emit only a -metadata:s:...language= arg and never
+            // mutate the ffprobe object summariseStream reads, so a track whose blank/looser tag will be rewritten still shows its pre-change lang token here.
             const outSummary = file.ffProbeData.streams
                 .map(s => ({ s: enrichStream(s), idx: s.index }))
                 .filter(({ idx }) => !removedIndices.has(idx))
