@@ -11,7 +11,7 @@ const details = () => ({
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them. Import ALSO recognizes fresh Plex-native sidecars with no s<index> (e.g. <video>.en.forced.srt), anchoring on the language token.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '1.999.11',
+    Version: '1.999.12',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -520,6 +520,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     let titleTruncated = false;
     const encodeTitleCapped = (rawTitle, fixedLen) => {
         let raw = String(rawTitle);
+        // Bound the work: the name budget is 255 bytes and encodeTitle emits >= 1 byte per raw char, so any raw title longer
+        // than 255 chars can never fit - trimming it up front makes the fit loop O(cap) instead of O(N^2) on a crafted multi-KB
+        // title (untrusted container metadata), losing only chars the loop would trim anyway (output identical, still flagged).
+        if (raw.length > 255) { raw = raw.slice(0, 255); titleTruncated = true; }
         let enc = encodeTitle(raw);
         while (raw.length > 0 && Buffer.byteLength(`${enc}${'.'.repeat(fixedLen ? 1 : 0)}`, 'utf8') + fixedLen > 255) { raw = raw.slice(0, -1); enc = encodeTitle(raw); titleTruncated = true; }
         return enc;
@@ -737,7 +741,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.infoLog += `☐Import ${f.name} -> subtitle ${outIdx} (${f.lang}${f.dispTokens.length ? ` ${f.dispTokens.join('+')}` : ''})\n`;
             });
             const consumed = merged.flatMap((f) => f.members.map((m) => m.name));
-            let out = `${inputSide} -map 0${extraMaps} -c copy${meta} -metadata "awk_sub_worker=${encodeMarkerList(consumed)}"`;
+            // Carry prior-pass marks forward in KEEP mode so a kept-but-already-embedded sidecar stays in the skip set across
+            // incremental passes (otherwise the next pass re-imports it as a duplicate track). In delete mode those files were
+            // just unlinked above, so nothing prior survives - the marker is exactly this pass's consumed (what the confirm pass deletes).
+            const priorStillPresent = deleteConfirmed ? [] : found.filter((f) => importedSet.has(f.name)).map((f) => f.name);
+            const markList = [...new Set([...consumed, ...priorStillPresent])];
+            let out = `${inputSide} -map 0${extraMaps} -c copy${meta} -metadata "awk_sub_worker=${encodeMarkerList(markList)}"`;
             if (isMp4) out += ' -movflags use_metadata_tags';
             out += globalOutputOpt;
             response.preset = `,${out}`;
