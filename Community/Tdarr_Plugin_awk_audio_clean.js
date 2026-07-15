@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '3.1.0',
+    Version: '3.2.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -170,15 +170,16 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
+                \\nLRA is the loudness range - the spread between the quiet and loud parts. A higher LRA preserves more dynamics; a lower LRA compresses them: cinema (15) keeps the most, tv (11) is in the middle, quiet_room (6) is the most compressed. The correction is baked into the re-encode (not a per-playback toggle).
                 \\nIf disabled   - no loudness measurement or correction; every other audio_clean option is unaffected.
                 \\nIf tv         - -16 LUFS integrated, LRA 11, true peak -1.5 dBTP. General home viewing, matches typical streaming-platform loudness.
-                \\nIf cinema     - -23 LUFS integrated, LRA 15, true peak -1.0 dBTP. EBU R128 broadcast standard, preserves more theatrical dynamic range.
-                \\nIf quiet_room - -16 LUFS integrated, LRA 6, true peak -1.5 dBTP. Tighter dynamic range so dialogue stays audible without volume-riding loud scenes.`,
+                \\nIf cinema     - -23 LUFS integrated, LRA 15, true peak -1.0 dBTP. EBU R128 broadcast standard, preserves the most theatrical dynamic range.
+                \\nIf quiet_room - -16 LUFS integrated, LRA 6, true peak -1.5 dBTP. The most compressed of the three - great for late-night or shared-space listening (loud scenes don't spike and quiet dialogue stays audible without riding the volume), for small or limited speakers (laptop/phone/TV/soundbar) that can't reproduce a wide dynamic range anyway, and for noisy rooms. The trade-off: it discards the track's original theatrical dynamics, so prefer tv/cinema on a capable system in a quiet room.`,
         },
         {
             name: 'method_stereo_downmix',
             type: 'string',
-            defaultValue: 'dialogue',
+            defaultValue: 'default',
             inputUI: {
                 type: 'dropdown',
                 options: ['dialogue','default'],
@@ -187,8 +188,8 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nIf default  - ffmpeg's built in downmix (-ac 2). Simple, but the auto leveling can sound quiet with buried dialogue.
-                \\nIf dialogue - applies a Lo/Ro downmix matrix (center kept at -3 dB, LFE dropped) so dialogue stays clear and the overall level stays up.
+                \\nIf default (default) - ffmpeg's built-in downmix (-ac 2). The standard, least-surprising fold; auto leveling can occasionally sound quiet with buried dialogue.
+                \\nIf dialogue - applies a Lo/Ro downmix matrix (center kept at -3 dB, LFE dropped) so dialogue stays clear and the level stays up, at the cost of a more opinionated fold that shifts the spatial image.
                 \\nFalls back to default automatically for unusual layouts such as 2.1 and 3.0.`,
         },
         {
