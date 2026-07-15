@@ -12,7 +12,7 @@ const details = () => ({
                      -Preserves static HDR10/HLG colour metadata; leaves Dolby Vision / HDR10+ files untouched by default (dynamic metadata can't survive a re-encode).\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '1.999.7',
+    Version: '1.999.8',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -425,7 +425,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const vmi = mediaInfoFor(s);
             const vHeight = Number(s.height || vmi?.Height || 0);
             const vTenbit = Number(s.bits_per_raw_sample || vmi?.BitDepth || 0) >= 10 || /p10(le|be)?$|10le|10be/.test(s.pix_fmt || '') || /10/.test(s.profile || '');
-            const vHdr = ['smpte2084', 'arib-std-b67'].includes((s.color_transfer || '').toLowerCase().trim());
+            const vXfer = (s.color_transfer || vmi?.transfer_characteristics || '').toLowerCase().trim();
+            const vHdr = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'].includes(vXfer) || !!String(vmi?.HDR_Format || '').trim();
             return `[video:${[codec, vHeight > 0 ? `${vHeight}p` : '', vTenbit ? '10bit' : '', vHdr ? 'hdr' : ''].filter(Boolean).join(' ')}${isCoverArt(s) ? '/cover' : ''}]`;
         }
         if (type === 'audio') {
@@ -794,9 +795,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // HDR: ffmpeg auto-propagates the source's colour metadata (primaries/transfer/matrix) to the re-encoded
         // output - verified against the real ffmpeg for libx265/libsvtav1/videotoolbox, including through the
         // scale filter - so static HDR10/HLG survives without any explicit colour flags. Dynamic metadata (Dolby
-        // Vision / HDR10+) CANNOT survive a re-encode, so by default such files are left untouched.
+        // Vision / HDR10+) CANNOT survive a re-encode, so by default such files are left untouched. Detect it from
+        // BOTH probes (mediaInfo HDR_Format, plus ffprobe's own DOVI / HDR10+ side_data or a DV codec tag): this guard
+        // is the one place a single-probe false negative is destructive - it would silently re-encode and drop the DV layer.
         const hdrFmt = String(mi?.HDR_Format || mi?.HDR_Format_Compatibility || '').toLowerCase();
-        const isDynamicHdr = hdrFmt.includes('dolby vision') || hdrFmt.includes('hdr10+') || hdrFmt.includes('smpte st 2094');
+        const dvSideData = Array.isArray(primary.side_data_list) ? primary.side_data_list : [];
+        const ffprobeDynamicHdr = dvSideData.some((sd) => /dovi|dolby vision|smpte ?2094|hdr dynamic metadata/.test(String(sd?.side_data_type || '').toLowerCase()))
+            || /^(dvhe|dvh1|dvav|dva1|dav1)$/.test(String(primary.codec_tag_string || '').toLowerCase().trim());
+        const isDynamicHdr = hdrFmt.includes('dolby vision') || hdrFmt.includes('hdr10+') || hdrFmt.includes('smpte st 2094') || ffprobeDynamicHdr;
         if (isDynamicHdr && guardHdr === 'abort_dynamic') {
             response.infoLog += '☒Dynamic HDR (Dolby Vision / HDR10+) detected - it cannot survive a re-encode, so the file is left untouched. Set guard_hdr to "allow_dynamic" to transcode anyway (keeps only the base HDR10 layer).\n';
             response.processFile = false;
