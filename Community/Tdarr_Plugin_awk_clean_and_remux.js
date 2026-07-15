@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '2.999.18',
+    Version: '2.999.19',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -206,7 +206,7 @@ const details = () => ({
                 options: ['disabled', 'light', 'aggressive'],
             },
             tooltip: `Fix a broken presentation timeline: stutter, audio/video desync, or ffmpeg errors like "first pts value must set", "Timestamps are unset in a packet for stream", "Non-monotonous DTS in output stream", or "DTS out of order".
-                 \\nTry light first; if the error persists switch to aggressive. Changing the mode re-runs recovery once on already-processed files, then settles.
+                 \\nTry light first; if the error persists switch to aggressive.
                  \\ndisabled: no timestamp recovery.
                  \\nlight (risk-free): -fflags +genpts and -avoid_negative_ts make_zero - regenerates missing PTS and shifts negative start times to zero. Touches no frame data.
                  \\naggressive: additionally -fflags +igndts - ignores the source DTS and fully rebuilds the timeline (fixes "Non-monotonous DTS"). Can produce odd results, so only use it if light didn't help.
@@ -221,7 +221,7 @@ const details = () => ({
                 options: ['disabled', 'light', 'aggressive'],
             },
             tooltip: `Push a structurally damaged file through: visible/audible glitches, the job aborting on this file, won't seek, or a wrong duration.
-                 \\nTry light first; if it doesn't help switch to aggressive. Changing the mode re-runs recovery once on already-processed files, then settles.
+                 \\nTry light first; if it doesn't help switch to aggressive.
                  \\ndisabled: no data recovery.
                  \\nlight (risk-free): -fflags +ignidx and -err_detect ignore_err - ignores a broken/corrupt index (AVI idx1, MOV/MP4 sample tables) and keeps reading past detected errors instead of failing. Drops no frames.
                  \\naggressive: additionally -fflags +discardcorrupt - drops packets flagged corrupt, which may cause small video/audio blips where the damage is.
@@ -454,8 +454,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
     // ===== END SHARED: codec name resolution =====
-    // ===== SHARED [clean_and_remux, video_clean, audio_clean, sub_worker]: case-insensitive tag lookup =====
-    // -=-=-= getTagCI  [clean_and_remux, video_clean, audio_clean, sub_worker] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: case-insensitive tag lookup =====
+    // -=-=-= getTagCI  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
     // Look up a tag value case-insensitively - matroska UPPER-CASES tag keys on write, so a plugin reading its sibling's awk_* marker gets an uppercased key back. Returns the
     // raw value (or '' if absent); callers trim/decode as needed. One source so the four plugins that read each other's markers can't drift on the lookup convention.
     const getTagCI = (tags, name) => { const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === name); return hit === undefined ? '' : String(tags[hit] ?? ''); };
@@ -660,7 +660,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const dstContainer = inputs.container.toLowerCase().trim();
     // Membership guard (mirrors the sibling string-dropdown guards below): all container-specific logic branches on the literals mkv/mp4, so an out-of-set value
     // (only reachable via a hand-edited/imported config) would silently fall through to a generic remux into an unsupported container - a runtime ffmpeg muxer
-    // error instead of a clean quarantine. Fail up front with the plugin's own infoLog, exactly like the seven guards after the input parses.
+    // error instead of a clean quarantine. Fail up front with the plugin's own infoLog, exactly like the sibling dropdown guards after the input parses.
     if(!['mkv', 'mp4'].includes(dstContainer))
         failFile('Somehow invalid container option provided (expected mkv or mp4). Check your settings!');
     response.container = `.${dstContainer}`;

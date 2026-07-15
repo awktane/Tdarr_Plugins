@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '2.999.15',
+    Version: '2.999.16',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -15,7 +15,7 @@ const details = () => ({
             type: 'string',
             defaultValue: '',
             inputUI: { type: 'text' },
-            tooltip: `Specify language tags here for the audio tracks you'd like to transcode. If blank then all tracks will be considered. Tracks in languages not listed will not be considered for the downmix_to_six, downmix_to_stereo options, nor guard_lossless/guard_quality/guard_object_audio.
+            tooltip: `Specify language tags here for the audio tracks you'd like to transcode. If blank then all tracks will be considered.
                 \\nStreams with no language tag are treated as though their language is "und". A track whose language is not in this list is treated as secondary - excluded from the primary downmix paths (downmix_to_six/downmix_to_stereo), never protected by guard_lossless/guard_quality/guard_object_audio, and instead handled by downmix_secondary_stereo.
                 \\nException: if the file has NO genuine (non-commentary, non-descriptive) track in a listed language, the language filter goes dormant and every genuine track is treated as primary - so a foreign-language-only file (e.g. Japanese-only when the list is English) keeps its surround instead of being downmixed. Commentary and descriptive tracks are always secondary regardless of language.
                 \\nException: guard_original, when enabled, keeps an 'original'-disposition track (a foreign film's original-language audio) primary even in an unlisted language - so it is protected as if its language were listed. See guard_original.
@@ -529,8 +529,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // work upstream). One source so the four writers can't drift on the set (video_clean's video-only hvc1 gate is deliberately mp4/m4v/mov WITHOUT m4a and stays separate).
     const isMp4Family = (container) => ['mp4', 'm4v', 'mov', 'm4a'].includes(String(container || '').toLowerCase());
     // ===== END SHARED: mp4-family container =====
-    // ===== SHARED [clean_and_remux, video_clean, audio_clean, sub_worker]: case-insensitive tag lookup =====
-    // -=-=-= getTagCI  [clean_and_remux, video_clean, audio_clean, sub_worker] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: case-insensitive tag lookup =====
+    // -=-=-= getTagCI  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
     // Look up a tag value case-insensitively - matroska UPPER-CASES tag keys on write, so a plugin reading its sibling's awk_* marker gets an uppercased key back. Returns the
     // raw value (or '' if absent); callers trim/decode as needed. One source so the four plugins that read each other's markers can't drift on the lookup convention.
     const getTagCI = (tags, name) => { const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === name); return hit === undefined ? '' : String(tags[hit] ?? ''); };
@@ -1694,11 +1694,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return { filter: preFilter ? `${preFilter},${corrected}` : corrected, changed: true };
         };
 
-        // Caching tag for Branch B only (a track untouched by anything else this run - the only case where "nothing about this
+        // Caching tag for the untouched-track path only (a track untouched by anything else this run - the only case where "nothing about this
         // stream changed since we last checked it" is actually guaranteed). Written as "<preset>-<plugin version>" (e.g.
         // "tv-2.8.0") but matched on the preset portion ONLY - the version rides along unused today, kept in reserve for if a
         // future bug fix ever needs to distinguish "measured/corrected by a version with a known bug" from a trustworthy one.
-        // Matroska uppercases unrecognized custom tag names on write (confirmed against the real ffmpeg binary), so read-back
+        // Matroska uppercases unrecognized custom tag names on write (confirmed against the real ffmpeg binary), so read-back must be case-insensitive:
+        // readLoudnormTag goes through the shared getTagCI helper.
         const readLoudnormTag = (stream) => getTagCI(stream.tags || {}, 'awk_loudnorm').trim();
         const loudnormTagMatchesPreset = (stream) => readLoudnormTag(stream).split('-')[0] === loudnorm;
         const loudnormTagValue = () => `${loudnorm}-${details().Version}`;
@@ -2052,7 +2053,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
 
-                // Cache check: this stream isn't being touched by anything else this run (Branch B), so if it already carries a
+                // Cache check: this stream isn't being touched by anything else this run, so if it already carries a
                 // tag matching the CURRENT preset, its content hasn't changed since we last measured/corrected it against this
                 // exact target - trust it and skip the measurement subprocess entirely. A stale tag from a DIFFERENT preset (or
                 // no tag at all) falls through to a fresh measurement below.

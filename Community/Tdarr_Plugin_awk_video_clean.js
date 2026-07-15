@@ -12,7 +12,7 @@ const details = () => ({
                      -Preserves static HDR10/HLG colour metadata; leaves Dolby Vision / HDR10+ files untouched by default (dynamic metadata can't survive a re-encode).\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '1.999.10',
+    Version: '1.999.11',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -101,7 +101,7 @@ const details = () => ({
                 options: ['auto', 'nvenc', 'qsv', 'vaapi', 'videotoolbox', 'amf', 'cpu'],
             },
             tooltip: `Which encoder to use on each node.
-                \\nauto (recommended): each node picks the best available encoder for its hardware - GPU workers use the node's GPU (NVENC/QSV/VAAPI/VideoToolbox/AMF) if present, CPU workers and GPU-less nodes use the software encoder. This is what makes one plugin work across a mixed fleet.
+                \\nauto (recommended): each node picks the best available encoder for its hardware - GPU workers use the node's GPU (NVENC/QSV/VAAPI/VideoToolbox/AMF) if present, CPU workers and GPU-less nodes use the software encoder.
                 \\nA specific value forces that encoder on every node; a node that can't run it (wrong GPU, wrong OS) falls back to the software encoder and logs it. Only pin this on a uniform fleet.
                 \\ncpu forces the software encoder (libx265/libx264/libsvtav1) everywhere.`,
         },
@@ -343,8 +343,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // work upstream). One source so the four writers can't drift on the set (video_clean's video-only hvc1 gate is deliberately mp4/m4v/mov WITHOUT m4a and stays separate).
     const isMp4Family = (container) => ['mp4', 'm4v', 'mov', 'm4a'].includes(String(container || '').toLowerCase());
     // ===== END SHARED: mp4-family container =====
-    // ===== SHARED [clean_and_remux, video_clean, audio_clean, sub_worker]: case-insensitive tag lookup =====
-    // -=-=-= getTagCI  [clean_and_remux, video_clean, audio_clean, sub_worker] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: case-insensitive tag lookup =====
+    // -=-=-= getTagCI  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
     // Look up a tag value case-insensitively - matroska UPPER-CASES tag keys on write, so a plugin reading its sibling's awk_* marker gets an uppercased key back. Returns the
     // raw value (or '' if absent); callers trim/decode as needed. One source so the four plugins that read each other's markers can't drift on the lookup convention.
     const getTagCI = (tags, name) => { const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === name); return hit === undefined ? '' : String(tags[hit] ?? ''); };

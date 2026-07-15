@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '2.999.13',
+    Version: '2.999.14',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -639,8 +639,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
         failFile('No ffProbe stream data available for this file - the plugin cannot process it.');
 
-    // Value checks, in Inputs order. order_language/order_codec are free-text (no fixed option set), so only first_audio, first_subtitle, order_channel and
-    // order_quality have a fixed option set to validate.
+    // Value checks. The two free-text inputs (order_language/order_codec) have no fixed option set; the five dropdowns (first_audio, first_subtitle,
+    // order_channel, order_quality, method_mp4_faststart) each have one, validated below.
     if(!['language', 'original', 'default', 'descriptive'].includes(inputs.first_audio))
         failFile('first_audio has not been configured, please configure required options.');
     if(!['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled'].includes(inputs.order_channel))
