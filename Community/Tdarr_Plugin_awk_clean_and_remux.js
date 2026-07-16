@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.1.0',
+    Version: '3.2.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -801,8 +801,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const s = String(rawTag || '').trim();
         if (!s || isNonLang(langKey(s))) return true;               // blank / non-language -> not a rewrite candidate
         if (!langName(s)) return false;                             // spelled-out name or garbage -> fix
-        // mkv: a recognised region/script-qualified tag (pt-BR, zh-Hans) stores fine as-is - invalid leaves it, strict enforces the method. mp4 falls through and folds it to 639-2/T.
-        if (dstContainer !== 'mp4' && /[-_.]/.test(s)) return true;
+        // mkv: only an ALREADY-canonical region/script tag (pt-BR, zh-Hans) stores cleanly; a non-canonical one (EN-US, en_us, pt-br) is repaired (invalid keeps the
+        // region and canonicalises it, strict enforces the method form). mp4 falls through and folds any region tag to 639-2/T.
+        if (dstContainer !== 'mp4' && /[-_.]/.test(s)) return canonicalRegionTag(s) === s;
         if (s !== s.toLowerCase()) return false;                    // uppercase -> mp4 drops it / non-standard casing -> fix
         return dstContainer === 'mp4' ? /^[a-z]{3}$/.test(s) : /^[a-z]{2,3}$/.test(s);   // mp4 needs lowercase 3-letter; mkv keeps a bare 2/3-letter code
     };
@@ -818,7 +819,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             workLang = fillLanguage;
             desired = tagLanguage !== 'disabled' ? toCanonicalTag(fillLanguage) : fillLanguage;
         } else if (!blank && tagLanguage !== 'disabled' && (tagLanguage === 'strict' || !storesCleanly(rawTag))) {
-            desired = toCanonicalTag(sl);
+            // strict enforces the method form (folds region under container/639-2); invalid only repairs syntax, so a recognised region/script tag keeps its region
+            // (canonicalised: en_us -> en-US, pt-br -> pt-BR) on mkv. mp4 can't store a region, so it still folds to 639-2/T via toCanonicalTag.
+            const repairRegion = tagLanguage === 'invalid' && dstContainer !== 'mp4' ? canonicalRegionTag(sl) : '';
+            desired = repairRegion || toCanonicalTag(sl);
         }
         const compareTo = blank ? '' : rawTag;
         if (!desired || desired === compareTo) return { workLang, meta: '', log: '' };
