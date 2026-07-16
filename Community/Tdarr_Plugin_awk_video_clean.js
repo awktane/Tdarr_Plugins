@@ -12,7 +12,7 @@ const details = () => ({
                      -HDR-aware (method_hdr): preserves static HDR10/HLG; by default leaves Dolby Vision / HDR10+ untouched (dynamic metadata can't survive a re-encode), can strip just the dynamic layer, or GPU-tonemap all HDR down to SDR (one consistent look across NVIDIA/Intel/AMD/Apple nodes) for SDR-only playback.\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '2.2.0',
+    Version: '2.3.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -124,7 +124,7 @@ const details = () => ({
             tooltip: `How to handle HDR video. Static HDR10/HLG colour metadata is always carried through the encode automatically; this controls dynamic HDR (Dolby Vision / HDR10+) and whether to keep HDR at all.
                 \\npreserve (recommended): leave Dolby Vision / HDR10+ files untouched - their dynamic metadata can't survive a re-encode, so transcoding would degrade them. Static HDR10/HLG is transcoded normally (HDR kept).
                 \\nstrip_dynamic: transcode Dolby Vision / HDR10+ anyway, keeping only the base HDR10 layer (accepts the loss of the dynamic layer). Static HDR10/HLG unaffected (kept).
-                \\ntonemap_sdr: tonemap ALL HDR (static and dynamic) down to SDR (bt709). For SDR-only playback chains - makes HDR look correct on non-HDR displays and avoids the media server re-tonemapping on every playback. The tonemap runs GPU-accelerated on whichever hardware the node's encoder uses (NVIDIA/Intel/AMD/Apple, one consistent look across your fleet), falling back to CPU only if no GPU tonemap is available. Lossy and one-way (the HDR master is discarded in this output), so leave on preserve if you watch on HDR displays. Respects bit_depth (8-bit SDR unless you set bit_depth=10).`,
+                \\ntonemap_sdr: tonemap ALL HDR (static and dynamic) down to SDR (bt709). For SDR-only playback chains - makes HDR look correct on non-HDR displays and avoids the media server re-tonemapping on every playback. The tonemap runs GPU-accelerated on whichever hardware the node's encoder uses (NVIDIA/Intel/AMD/Apple, one consistent look across your fleet), falling back to CPU only if no GPU tonemap is available. Lossy and one-way (the HDR master is discarded in this output), so leave on preserve if you watch on HDR displays. Follows bit_depth: with 'source' (default) a 10-bit HDR master tonemaps to 10-bit SDR; set bit_depth=8 to force 8-bit SDR for maximum playback compatibility.`,
         },
         {
             name: 'guard_reprocess',
@@ -720,7 +720,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Decode is kept on software frames (nvenc via the shared nvdecPreset helper) so a single CPU scale filter and
     // -pix_fmt path work uniformly across families; VAAPI is the exception - it needs its frames uploaded, so it
     // carries an explicit device + format,hwupload filter. Returns { inputSide, videoOut }.
-    const buildVideoArgs = ({ family, encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file, tonemap, tonemapBackend }) => {
+    const buildVideoArgs = ({ family, encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams }) => {
         const { getNvdecHwaccelPreset, getNvenc10BitFormatArg } = require('../methods/nvdecPreset');
         const q = nativeQuality(codec, family, qNorm);
         const spd = nativeSpeed(codec, family, speed);
@@ -738,7 +738,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const tmDevice = `-init_hw_device ${tonemapBackend}=tm -filter_hw_device tm`;   // single-device families: replaces any hwaccel decode (island does the GPU work)
         const scale = (fmt) => {   // optional downscale, then the tonemap island (GPU) or tonemapx (CPU), then an optional trailing format filter
             if (willDownscale) vf.push(`scale=-2:${outHeight}`);
-            if (tonemap) vf.push(useGpuTm ? gpuIsland : cpuTonemap);
+            if (tonemap) vf.push(tonemapSetparams + (useGpuTm ? gpuIsland : cpuTonemap));
             if (fmt) vf.push(fmt);
         };
 
@@ -755,7 +755,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (useGpuTm) {   // two devices: opencl tonemaps, frames download to software, then re-upload to vaapi for the encoder (proven on Intel)
                 inputSide = '-init_hw_device opencl=ocl -init_hw_device vaapi=va:/dev/dri/renderD128';
                 if (willDownscale) vf.push(`scale=-2:${outHeight}`);
-                vf.push(`format=p010le,hwupload=derive_device=opencl,tonemap_opencl=tonemap=bt2390:t=bt709:m=bt709:p=bt709:r=tv:format=${outFmt},hwdownload,format=${outFmt},hwupload=derive_device=vaapi`);
+                vf.push(`${tonemapSetparams}format=p010le,hwupload=derive_device=opencl,tonemap_opencl=tonemap=bt2390:t=bt709:m=bt709:p=bt709:r=tv:format=${outFmt},hwdownload,format=${outFmt},hwupload=derive_device=vaapi`);
             } else {
                 inputSide = '-vaapi_device /dev/dri/renderD128';
                 scale(`format=${wantTenbit ? 'p010' : 'nv12'}`);
@@ -874,6 +874,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return response;
         }
         const tonemap = methodHdr === 'tonemap_sdr' && isHdr;   // flatten HDR -> SDR (also a re-encode reason even when the source is already the target codec, below)
+        // A tonemap_* filter REJECTS a frame whose decoded transfer isn't a known HDR curve ("unsupported transfer function"), and the island carries no explicit
+        // tags. When HDR is known only from mediaInfo / dynamic metadata but the stream's own transfer is absent (a container-stripped VUI), stamp the inferred HDR
+        // curve onto the island so the filter has a valid HDR input; a transfer already present on the stream is left untouched (the decoded frame carries it).
+        const tonemapSetparams = (tonemap && !srcXfer)
+            ? `setparams=color_trc=${/hlg|log-gamma|b67/.test(hdrFmt) ? 'arib-std-b67' : 'smpte2084'}:color_primaries=bt2020:colorspace=bt2020nc,`
+            : '';
 
         // Resolution / downscale (only ever downscales) and the quality tier for the OUTPUT height.
         const maxH = maxHeightOpt === 'original' ? 0 : Number(maxHeightOpt);
@@ -885,14 +891,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Idempotency signature: a settings fingerprint (codec-quality-maxheight-depth-speed) that determines the encode output, stored as a container-global
         // awk_video tag. The plugin version is appended for forensics (which build wrote this file, so a future bug could re-target its outputs) but is NOT part
         // of the match - like audio_clean's awk_loudnorm tag - so a version bump (e.g. the coordinated MAJOR) never invalidates the fence and forces a lossy
-        // generational re-encode of an otherwise-identical file.
-        const videoSigCore = escMeta([targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, wantTenbit ? '10' : '8', `s${speed}`, ...(tonemap ? ['sdr'] : [])].join('-'));
+        // generational re-encode of an otherwise-identical file. The 'sdr' token keys on the tonemap_sdr SETTING, not the per-run tonemap activation: a tonemapped
+        // output is itself SDR, so keying on the activation would drop the token when the file is re-checked and defeat the fence - the setting is stable across the HDR->SDR flatten.
+        const videoSigCore = escMeta([targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, wantTenbit ? '10' : '8', `s${speed}`, ...(methodHdr === 'tonemap_sdr' ? ['sdr'] : [])].join('-'));
         const videoSig = `${videoSigCore}-v${escMeta(details().Version)}`;
         const priorSig = getTagCI(file.ffProbeData.format?.tags || {}, 'awk_video').trim();
 
         // Guard: constant quality can't predict output size, so skip sources already below the bitrate floor (would risk growth).
-        // A pending downscale is exempt - fewer pixels can't grow the file, and skipping here would silently defeat max_height.
-        if (guardMinKbps > 0 && !willDownscale) {
+        // A pending downscale or tonemap is exempt - both are requested transforms (not efficiency re-encodes), and skipping here would silently defeat max_height / tonemap_sdr.
+        if (guardMinKbps > 0 && !willDownscale && !tonemap) {
             const vbps = resolveStreamBitrate(primary) || 0;
             const vkbps = vbps > 0 ? Math.round(vbps / 1000) : 0;
             if (vkbps > 0 && vkbps < guardMinKbps) {
@@ -938,7 +945,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             : `☐Tonemapping HDR -> SDR via ${tonemapBackend} (GPU-accelerated).\n`;
 
         // Build the video-encode args + assemble the full preset (<input-side>,<output-side>).
-        const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file, tonemap, tonemapBackend });
+        const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams });
 
         let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy`;
         for (const s of videoStreams) if (isCoverArt(s)) out += ` -map -0:${s.index}`;   // drop embedded cover-art/still-image "video" streams
