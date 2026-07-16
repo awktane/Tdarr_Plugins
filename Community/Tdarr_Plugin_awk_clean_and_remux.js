@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.2.0',
+    Version: '3.3.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -167,21 +167,6 @@ const details = () => ({
                 \\nNote this also checks the handler_name for the same thing.
                 \\nExample:\\n
                 This.Title.Has.Too.Many.Periods would have title set to blank`,
-        },
-        {
-            name: 'remove_junk_tags',
-            type: 'string',
-            defaultValue: 'disabled',
-            inputUI: {
-                type: 'dropdown',
-                options: ['disabled', 'encoder', 'descriptive'],
-            },
-            tooltip: `Strip junk metadata tags the file carries (both container-global and per-stream). Only tags actually present are cleared, so files without them are untouched (no needless remux).
-                \\ndisabled (default): leave all tags.
-                \\nencoder: remove only encoder/muxer provenance tags nobody reads - encoded_by, and per-stream encoder (a leftover "Lavc.../HandBrake" tag). Safe on any library.
-                \\ndescriptive: also remove descriptive movie/TV metadata and iTunes/app flags - genre, date, description, synopsis, show, network, season/episode, media_type, artist, album, composer, copyright, keywords, compilation, sort-order keys, etc.
-                \\nAlways kept: title and comment (handled by remove_busytitle / remove_comments), stream language tags, per-track bitrate statistics (BPS), the container-level encoder tag (muxer-managed), and creation date.
-                \\nNote: a Plex library set to read local media assets DOES read some mp4 descriptive tags (genre/date/description/show/etc.) - use descriptive only if you don't rely on in-file metadata.`,
         },
         {
             name: 'remove_imagesubs',
@@ -631,8 +616,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const langListMatch = (streamLang, keys) => keys.includes(langKey(streamLang));
     // ===== END SHARED: language list match =====
 
-    // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: ffmpeg metadata escaping =====
-    // -=-=-= escMeta  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
+    // -=-=-= escMeta  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array and hands it to child_process.spawn, so shell
     // metacharacters ($ ` ; |) are inert and reach ffmpeg as literal metadata bytes. The only injection vector is breaking out of the quoted value to
     // inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper) or a control character. Tdarr's tokenizer strips quotes with no
@@ -692,7 +677,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const tagLanguage = String(inputs.tag_language || 'invalid').toLowerCase();
     const methodTagLanguage = String(inputs.method_tag_language || 'container').toLowerCase();
     const guardOriginal = String(inputs.guard_original || 'disabled').toLowerCase();
-    const junkTags = String(inputs.remove_junk_tags || 'disabled').toLowerCase();
 
     // Value checks continue in Inputs order (container already checked above): language_fill is format-checked and cross-checked against language_sub/
     // language_audio, then the remaining dropdowns are checked against their option set (free-text and boolean inputs need no check - see above).
@@ -726,8 +710,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`Somehow invalid recover_bad_data option provided. Check your settings!`);
     if(!['disabled', 'enabled'].includes(guardOriginal))
         failFile(`Somehow invalid guard_original option provided. Check your settings!`);
-    if(!['disabled', 'encoder', 'descriptive'].includes(junkTags))
-        failFile(`Somehow invalid remove_junk_tags option provided. Check your settings!`);
     if(!['unsupported', 'all', 'export'].includes(removeImageSubs))
         failFile(`Somehow invalid remove_imagesubs option provided. Check your settings!`);
 
@@ -870,26 +852,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // A subtitle removed regardless of language - by container/format (subFormatDropped) or by remove_imagesubs (imageSubDropped). Neither is ever assigned
     // language_fill, and neither counts as a survivor for the language_fill_fail untagged tally or the remove_accessibility plain-track guard.
     const subDroppedAnyReason = (codec) => subFormatDropped(codec) || imageSubDropped(codec);
-
-    // remove_junk_tags: two-tier container-tag cleanup. 'encoder' = pure encoder/muxer provenance; 'descriptive' (superset) adds iTunes/app flags + descriptive movie/TV
-    // metadata. Always kept: title/comment (own inputs), awk_* markers (idempotency), creation_time, the mkv BPS/statistics family (mediaInfo derives per-track bitrate
-    // from BPS - stripping degrades audio_clean's downstream scoring), the functional per-stream tags (language/title/description/handler_name/comment/filename/mimetype),
-    // and the GLOBAL 'encoder' tag (muxer-managed: mp4 re-stamps ©too=Lavf, mkv writes its own WritingApp every mux, so stripping it would loop). Per-stream 'encoder'
-    // (a leftover Lavc/HandBrake per-track tag) is NOT muxer-re-added on -c copy, so it IS stripped. Matched case-insensitively (mkv keys are UPPERCASE), present-only.
-    const JUNK_ENCODER_GLOBAL = new Set(['encoded_by']);
-    const JUNK_DESCRIPTIVE = new Set(['compilation', 'gapless_playback', 'hd_video', 'purchase_date', 'sort_name', 'sort_album', 'sort_album_artist', 'sort_artist',
-        'sort_composer', 'sort_show', 'genre', 'date', 'description', 'synopsis', 'show', 'episode_id', 'network', 'episode_sort', 'season_number', 'media_type', 'artist',
-        'album', 'album_artist', 'composer', 'grouping', 'lyrics', 'copyright', 'keywords']);
-    const JUNK_PERSTREAM = new Set(['encoded_by', 'encoder']);   // only encoder-tier keys are safe per-stream (descriptive per-stream tags are functional, kept)
-    const junkGlobalStrip = (lowerKey) => junkTags !== 'disabled' && (JUNK_ENCODER_GLOBAL.has(lowerKey) || (junkTags === 'descriptive' && JUNK_DESCRIPTIVE.has(lowerKey)));
-    // Per-stream encoder/encoded_by clears (both non-disabled tiers). Returns the -metadata:s: args; caller logs + appends. escMeta guards the probe-derived key.
-    const streamJunkClears = (ffstream, typeLetter, idx) => {
-        if (junkTags === 'disabled') return '';
-        let meta = '';
-        for (const k of Object.keys(ffstream.tags || {}))
-            if (JUNK_PERSTREAM.has(k.toLowerCase())) meta += ` -metadata:s:${typeLetter}:${idx} "${escMeta(k)}="`;
-        return meta;
-    };
 
     // ===== SHARED [audio_clean, clean_and_remux]: title canonicalization =====
     // The canonical audio-title machinery both plugins share, so audio_clean's downmix titles come out already in clean_and_remux's tag_title form and a
@@ -1147,9 +1109,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             //This will be added to the ffmpeg command if metadata needs to be changed. It will be built up as needed.
             let metadataCommand = '';
             let delStream = false;
-            // Factored per-stream metadata emitters (per-iteration closures over this stream's ffstream/i/metadataCommand): the handler_name canonicalisation (mkv wipes it - it
-            // can confuse mkv title display; mp4 sets the per-type handler) and the encoder-junk strip were copy-pasted across the subtitle/audio/video branches. Branch-specific
-            // bits (title tagging, hvc1, busy-title, comment removal) stay inline; wipeReason carries video's extra "problems for titles in mkv" note so the log stays byte-identical.
+            // Factored per-stream metadata emitter (a per-iteration closure over this stream's ffstream/i/metadataCommand): the handler_name canonicalisation (mkv wipes it - it
+            // can confuse mkv title display; mp4 sets the per-type handler) was copy-pasted across the subtitle/audio/video branches. Branch-specific bits (title tagging, hvc1,
+            // busy-title, comment removal) stay inline; wipeReason carries video's extra "problems for titles in mkv" note so the log stays byte-identical.
             const emitHandlerMeta = (typeLetter, idx, typeWord, handlerName, wipeReason = '') => {
                 if (dstContainer === 'mkv' && ffstream.tags?.handler_name) {
                     workDone += `☐Wiping handler_name tag from ${i}${wipeReason} (${typeWord}) "${logSafe(ffstream.tags?.handler_name)}"\n`;
@@ -1158,10 +1120,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     workDone += `☐Setting handler_name tag from ${i} (${typeWord}) to ${handlerName} "${logSafe(ffstream.tags?.handler_name)}"\n`;
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "handler_name=${handlerName}"`;
                 }
-            };
-            const emitJunkMeta = (typeLetter, idx, typeWord) => {
-                const j = streamJunkClears(ffstream, typeLetter, idx);
-                if (j) { workDone += `☐Remove encoder tag(s) from stream ${i} (${typeWord})\n`; metadataCommand += j; }
             };
 
             if(ffstreamType === 'subtitle') {
@@ -1259,8 +1217,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "comment="`;
                 }
 
-                emitJunkMeta('s', subtitleStreamIndex, 'subtitle');
-                
                 // mkv: mov_text is a QuickTime-only format that most players won't render in mkv — convert to srt. mkv keeps subrip/ass/ssa/webvtt/text +
                 //      the bitmap codecs (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle, hdmv_text_subtitle) natively. The legacy PC/fansub text formats below
                 //      (microdvd, mpl2, jacosub, sami, realtext, subviewer, vplayer, pjs) have NO Matroska CodecID either, so a bare -c copy would fail the whole
@@ -1370,8 +1326,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "comment="`;
                 }
 
-                emitJunkMeta('a', audioStreamIndex, 'audio');
-                    
                 if (metadataCommand !== '') {
                     extraArguments += metadataCommand;
                     convert = true;
@@ -1418,9 +1372,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 emitHandlerMeta('v', videoStreamIndex, 'video', 'VideoHandler', ' as it can cause problems for titles in mkv');
 
-                const videoJunk = streamJunkClears(ffstream, 'v', videoStreamIndex);
-                if(videoJunk) { workDone += `☐Remove encoder tag(s) from stream ${i} (video)\n`; metadataCommand += videoJunk; }
-                
                 if (metadataCommand !== '') {
                     extraArguments += metadataCommand;
                     convert = true;
@@ -1494,18 +1445,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             extraArguments += ` -metadata "title="`;
             convert = true;
         }
-
-        // remove_junk_tags (global): clear encoder-provenance / descriptive container tags actually present (case-insensitive; title/comment/creation_time/awk_* kept).
-        if (junkTags !== 'disabled')
-            for (const k of Object.keys(file.ffProbeData.format?.tags || {})) {
-                const lk = k.toLowerCase();
-                if (lk === 'title' || lk === 'comment' || lk === 'creation_time' || lk.startsWith('awk_')) continue;
-                if (junkGlobalStrip(lk)) {
-                    workDone += `☐Remove ${k} tag from file (remove_junk_tags=${junkTags})\n`;
-                    extraArguments += ` -metadata "${escMeta(k)}="`;
-                    convert = true;
-                }
-            }
 
         //Check if remuxing is required due to container change
         if (srcContainer !== dstContainer) {

@@ -477,8 +477,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const globalOutputOpt = ' -max_muxing_queue_size 9999 -flush_packets 0';
     // ===== END SHARED: stream / language / preset helpers =====
 
-    // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: ffmpeg metadata escaping =====
-    // -=-=-= escMeta  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
+    // -=-=-= escMeta  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array and hands it to child_process.spawn, so shell
     // metacharacters ($ ` ; |) are inert and reach ffmpeg as literal metadata bytes. The only injection vector is breaking out of the quoted value to
     // inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper) or a control character. Tdarr's tokenizer strips quotes with no

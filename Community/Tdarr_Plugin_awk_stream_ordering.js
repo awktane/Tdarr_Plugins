@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '3.0.0',
+    Version: '3.1.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -36,6 +36,21 @@ const details = () => ({
                 \\ndefault: lift the track flagged default (ffmpeg 'default' disposition) to the top of its language.
                 \\nsdh: lift SDH tracks (Subtitles for the Deaf and Hard-of-Hearing) to the top of their language.
                 \\ndescriptive: lift descriptive tracks to the top of their language.`,
+        },
+        {
+            name: 'remove_junk_tags',
+            type: 'string',
+            defaultValue: 'disabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['disabled', 'encoder', 'descriptive'],
+            },
+            tooltip: `Strip junk metadata tags the file carries (both container-global and per-stream), riding this plugin's reorder remux so no extra pass is needed. Only tags actually present are cleared, so files without them are untouched. Runs last, so it also clears the per-stream encoder tag a video/audio re-encode leaves behind - which a first-in-stack plugin could only catch on a later pass.
+                \\ndisabled (default): leave all tags.
+                \\nencoder: remove only encoder/muxer provenance tags nobody reads - encoded_by, and per-stream encoder (a leftover "Lavc.../HandBrake" tag). Safe on any library.
+                \\ndescriptive: also remove descriptive movie/TV metadata and iTunes/app flags - genre, date, description, synopsis, show, network, season/episode, media_type, artist, album, composer, copyright, keywords, compilation, sort-order keys, etc.
+                \\nAlways kept: title and comment, stream language tags, per-track bitrate statistics (BPS), the container-level encoder tag (muxer-managed), and creation date.
+                \\nNote: a Plex library set to read local media assets DOES read some mp4 descriptive tags (genre/date/description/show/etc.) - use descriptive only if you don't rely on in-file metadata.`,
         },
         {
             name: 'order_language',
@@ -599,6 +614,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const globalOutputOpt = ' -max_muxing_queue_size 9999 -flush_packets 0';
     // ===== END SHARED: stream / language / preset helpers =====
 
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
+    // -=-=-= escMeta  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array and hands it to child_process.spawn, so shell
+    // metacharacters ($ ` ; |) are inert and reach ffmpeg as literal metadata bytes. The only injection vector is breaking out of the quoted value to
+    // inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper) or a control character. Tdarr's tokenizer strips quotes with no
+    // reliable backslash-escape convention, so we substitute rather than strip:
+    //    backslash          -> forward-slash (readable, inert)
+    //    double-quote       -> single-quote (safe inside the quoted value; preserves titles like "Director's Cut" and "AC3/Stereo")
+    //    control characters -> space (avoids fusing words that a bare delete would join).
+    const escMeta = (value) => String(value || '')
+        .replace(/[\x00-\x1f\x7f]/g, ' ')  // control characters (newlines, null bytes, etc.) → space
+        .replace(/\\/g, '/')               // backslash → forward-slash (inert, readable)
+        .replace(/"/g, "'");               // double-quote → single-quote (safe inside the quoted value)
+    // ===== END SHARED: ffmpeg metadata escaping =====
+
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language matching =====
     // Normalize any language identifier to a stable comparison key so en / eng / EN / English / en-US - and ISO 639-2/B vs /T (fre vs fra) - all
     // compare equal, letting each plugin's language-list input accept one form and match every equivalent tag. Node ships full ICU, so no table or
@@ -649,6 +679,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile('order_quality has not been configured, please configure required options.');
     if(!['normal', 'default', 'sdh', 'descriptive'].includes(inputs.first_subtitle))
         failFile('first_subtitle has not been configured, please configure required options.');
+    if(!['disabled', 'encoder', 'descriptive'].includes(String(inputs.remove_junk_tags || 'disabled').toLowerCase()))
+        failFile('Somehow invalid remove_junk_tags option provided. Check your settings!');
     if(!['enabled', 'disabled'].includes(String(inputs.method_mp4_faststart || 'enabled').toLowerCase()))
         failFile('Somehow invalid method_mp4_faststart option provided. Check your settings!');
 
@@ -715,6 +747,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (qualityOrder.enabled && a.audioquality !== b.audioquality)
                 return qualityOrder.dir === 'ascending' ? a.audioquality - b.audioquality : b.audioquality - a.audioquality;
             return 0;
+        };
+
+        // remove_junk_tags: strip encoder/muxer-provenance (+ optional descriptive) tags on the reorder remux. Two tiers: 'encoder' = pure provenance (global encoded_by;
+        // per-stream encoder/encoded_by); 'descriptive' (superset) also drops iTunes/movie-TV container tags. Always kept: title/comment, awk_* markers (idempotency),
+        // creation_time, the mkv BPS/statistics family (mediaInfo derives per-track bitrate from it), the functional per-stream tags, and the GLOBAL 'encoder' tag
+        // (muxer-managed: every mux re-stamps it, so stripping would loop). Per-stream 'encoder' - including the fresh Lavc tag a video/audio re-encode stamps upstream -
+        // is NOT re-added on a -c copy, so running last clears it in the SAME remux (a first-in-stack plugin could only catch it a pass later). Case-insensitive, present-only.
+        const junkTags = String(inputs.remove_junk_tags || 'disabled').toLowerCase();
+        const JUNK_ENCODER_GLOBAL = new Set(['encoded_by']);
+        const JUNK_DESCRIPTIVE = new Set(['compilation', 'gapless_playback', 'hd_video', 'purchase_date', 'sort_name', 'sort_album', 'sort_album_artist', 'sort_artist',
+            'sort_composer', 'sort_show', 'genre', 'date', 'description', 'synopsis', 'show', 'episode_id', 'network', 'episode_sort', 'season_number', 'media_type', 'artist',
+            'album', 'album_artist', 'composer', 'grouping', 'lyrics', 'copyright', 'keywords']);
+        const JUNK_PERSTREAM = new Set(['encoded_by', 'encoder']);   // only encoder-tier keys are safe per-stream (descriptive per-stream tags are functional, kept)
+        const junkGlobalStrip = (lowerKey) => junkTags !== 'disabled' && (JUNK_ENCODER_GLOBAL.has(lowerKey) || (junkTags === 'descriptive' && JUNK_DESCRIPTIVE.has(lowerKey)));
+        // Per-stream encoder/encoded_by clears for the stream at OUTPUT index outIdx (post-reorder position, which -metadata:s:<index> targets). escMeta guards the probe-derived key.
+        const streamJunkClears = (ffstream, outIdx) => {
+            if (junkTags === 'disabled') return '';
+            let meta = '';
+            for (const k of Object.keys(ffstream.tags || {}))
+                if (JUNK_PERSTREAM.has(k.toLowerCase())) meta += ` -metadata:s:${outIdx} "${escMeta(k)}="`;
+            return meta;
         };
 
         const streams = [];
@@ -840,6 +893,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //matching what our ordering rules chose. Additive +default/-default preserves forced/commentary/etc; subtitle/video untouched.
         let ffmpegMap = '';
         let dispositionArgs = '';
+        let junkArgs = '';
+        let junkLog = '';
         let changed = false;
         let audioIndex = -1;
 
@@ -848,6 +903,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Compare against each stream's ORIGINAL array position, not its absolute ffprobe index, so a file already in the desired order but with
             // non-contiguous indices (e.g. 0,1,3 after an upstream drop) isn't remuxed pointlessly. -map still uses the absolute index above.
             if (streams[i].origPos !== i) changed = true;
+
+            // remove_junk_tags (per-stream): clear encoder/encoded_by on this stream, keyed on its OUTPUT index i (a within-type reorder moves a track's per-type
+            // position, so -metadata:s must use the post-sort index, not the source one). Present-only, so a clean stream adds nothing and never forces a mux alone.
+            const streamJunk = streamJunkClears(streams[i].stream, i);
+            if (streamJunk) { junkArgs += streamJunk; junkLog += `☐Remove encoder tag(s) from ${streams[i].type} stream (remove_junk_tags=${junkTags})\n`; }
 
             if (streams[i].type === 'audio') {
                 audioIndex++;
@@ -863,6 +923,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
+        // remove_junk_tags (global): clear encoder-provenance / descriptive container tags present (case-insensitive; title/comment/creation_time/awk_* kept). escMeta guards the key.
+        if (junkTags !== 'disabled')
+            for (const k of Object.keys(file.ffProbeData.format?.tags || {})) {
+                const lk = k.toLowerCase();
+                if (lk === 'title' || lk === 'comment' || lk === 'creation_time' || lk.startsWith('awk_')) continue;
+                if (junkGlobalStrip(lk)) { junkArgs += ` -metadata "${escMeta(k)}="`; junkLog += `☐Remove ${k} tag from file (remove_junk_tags=${junkTags})\n`; }
+            }
+
         // method_mp4_faststart: front-load the mp4 moov atom. A plain ride-along isn't enough (we skip when order is already correct), so detect the moov position
         // (spawn-free; __awkMoovFront overrides for the harness) and force a one-time remux when faststart is on, the output is an mp4-family container, and the file
         // isn't already fronted. moovBeforeMdat is fail-safe (unreadable/odd -> treated as fronted), so this settles after one pass and never loops.
@@ -870,7 +938,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const faststartOn = methodFaststart === 'enabled';
         const needsFront = faststartOn && isMp4 && !moovBeforeMdat(file.file, otherArguments);
 
-        if (!changed && dispositionArgs === '' && !needsFront) {
+        if (!changed && dispositionArgs === '' && !needsFront && junkArgs === '') {
             response.infoLog += '☑Streams already in desired order.\n';
             return response;
         }
@@ -882,9 +950,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // mp4/mov muxers drop a custom GLOBAL metadata tag (e.g. clean_and_remux's awk_recovered, set upstream) on a -c copy remux unless told to keep it, which would
         // re-trigger recovery on the next pass. Preserve it on the mov family, and append +faststart when method_mp4_faststart is on so the moov atom leads the file.
         const mp4KeepTags = isMp4 ? ` -movflags use_metadata_tags${faststartOn ? '+faststart' : ''}` : '';
-        response.preset = `,${ffmpegMap} -c copy${dispositionArgs}${globalOutputOpt}${mp4KeepTags}`;
+        response.preset = `,${ffmpegMap} -c copy${dispositionArgs}${junkArgs}${globalOutputOpt}${mp4KeepTags}`;
         if (dispositionArgs !== '')
             response.infoLog += '☐Set the first audio track as the sole default.\n';
+        response.infoLog += junkLog;
         response.infoLog += `☑Expected results: ${streams.map(s => summariseStream(s.stream)).join('')}\n`;
 
         return response;
