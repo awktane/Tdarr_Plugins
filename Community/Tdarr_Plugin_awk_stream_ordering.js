@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '3.2.0',
+    Version: '3.2.1',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -36,21 +36,6 @@ const details = () => ({
                 \\ndefault: lift the track flagged default (ffmpeg 'default' disposition) to the top of its language.
                 \\nsdh: lift SDH tracks (Subtitles for the Deaf and Hard-of-Hearing) to the top of their language.
                 \\ndescriptive: lift descriptive tracks to the top of their language.`,
-        },
-        {
-            name: 'remove_junk_tags',
-            type: 'string',
-            defaultValue: 'disabled',
-            inputUI: {
-                type: 'dropdown',
-                options: ['disabled', 'encoder', 'descriptive'],
-            },
-            tooltip: `Strip junk metadata tags the file carries (both container-global and per-stream), riding this plugin's reorder remux so no extra pass is needed. Only tags actually present are cleared, so files without them are untouched. Runs last, so it also clears the per-stream encoder tag a video/audio re-encode leaves behind - which a first-in-stack plugin could only catch on a later pass.
-                \\ndisabled (default): leave all tags.
-                \\nencoder: remove only encoder/muxer provenance tags nobody reads - encoded_by, and per-stream encoder (a leftover "Lavc.../HandBrake" tag). Safe on any library.
-                \\ndescriptive: also remove descriptive movie/TV metadata and iTunes/app flags - genre, date, description, synopsis, show, network, season/episode, media_type, artist, album, composer, copyright, keywords, compilation, sort-order keys, etc.
-                \\nAlways kept: title and comment, stream language tags, per-track bitrate statistics (BPS), the container-level encoder tag (muxer-managed), and creation date.
-                \\nNote: a Plex library set to read local media assets DOES read some mp4 descriptive tags (genre/date/description/show/etc.) - use descriptive only if you don't rely on in-file metadata.`,
         },
         {
             name: 'order_language',
@@ -109,6 +94,21 @@ const details = () => ({
                 stays in the requested descending order; ordering within each group is by the quality score. If order_channel also caps, a track over EITHER cap is
                 demoted. The cap only applies to descending (ascending already puts the smallest first).
                 \\nSet to disabled to skip quality ordering entirely. If both order_channel and order_quality are disabled, audio is not reordered by channels or quality (language/role/order_codec still apply).`
+        },
+        {
+            name: 'remove_junk_tags',
+            type: 'string',
+            defaultValue: 'disabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['disabled', 'encoder', 'descriptive'],
+            },
+            tooltip: `Strip junk metadata tags the file carries (both container-global and per-stream), riding this plugin's reorder remux so no extra pass is needed. Only tags actually present are cleared, so files without them are untouched. Runs last, so it also clears the per-stream encoder tag a video/audio re-encode leaves behind - which a first-in-stack plugin could only catch on a later pass.
+                \\ndisabled (default): leave all tags.
+                \\nencoder: remove only encoder/muxer provenance tags nobody reads - encoded_by, and per-stream encoder (a leftover "Lavc.../HandBrake" tag). Safe on any library.
+                \\ndescriptive: also remove descriptive movie/TV metadata and iTunes/app flags - genre, date, description, synopsis, show, network, season/episode, media_type, artist, album, composer, copyright, keywords, compilation, sort-order keys, etc.
+                \\nAlways kept: title and comment, stream language tags, per-track bitrate statistics (BPS), the container-level encoder tag (muxer-managed), and creation date.
+                \\nNote: a Plex library set to read local media assets DOES read some mp4 descriptive tags (genre/date/description/show/etc.) - use descriptive only if you don't rely on in-file metadata.`,
         },
         {
             name: 'method_mp4_faststart',

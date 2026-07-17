@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.4.0',
+    Version: '3.4.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -183,6 +183,34 @@ const details = () => ({
                 \\nText subtitles are never affected. xsub is always removed (no Matroska CodecID) and is not exported.`,
         },
         {
+            name: 'method_tag_language',
+            type: 'string',
+            defaultValue: 'container',
+            inputUI: {
+                type: 'dropdown',
+                options: ['639-2/b', '639-2/t', 'container', 'bcp47'],
+            },
+            tooltip: `Which language-code standard tag_language writes (only takes effect when tag_language is not disabled). Affects mainly the ~20 languages with two 3-letter codes (e.g. French fre/fra, German ger/deu) plus the 2-vs-3-letter choice; you can still type any form in the language lists regardless.
+                \\nBy convention Matroska (mkv) uses ISO-639-2/B and mp4's mdhd box uses ISO-639-2/T; both containers accept either form.
+                \\ncontainer (default): write each container its native form - 2-letter (en, fr) for mkv, 3-letter terminologic (eng, fra) for mp4. Most spec-accurate per container.
+                \\n639-2/t: terminologic 3-letter codes everywhere - fra, deu, zho (matches mp4's mdhd; 3-letter is also the common mkv convention).
+                \\n639-2/b ("mkv classic"): bibliographic 3-letter codes everywhere - fre, ger, chi.
+                \\nbcp47: like container on mp4 (3-letter terminologic) but on mkv keeps the full BCP-47 tag - a region (ISO-3166) subtag like pt-BR/es-419 or a script (ISO-15924) subtag like zh-Hans; mp4 can't store a region so it still folds to 3-letter (por).`,
+        },
+        {
+            name: 'guard_original',
+            type: 'string',
+            defaultValue: 'disabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['disabled', 'enabled'],
+            },
+            tooltip: `Protect a foreign film's ORIGINAL-language audio track from being removed by the language_audio filter when its language isn't in your list.
+                \\nKeys off the ffmpeg "original" disposition flag OR an "original" keyword in the track title/handler (the same signal audio_clean's guard_original uses). A track with neither marker is not protected - this only rescues a properly-flagged original track, not a bare native-language track.
+                \\ndisabled (default): the original track follows normal language_audio handling (removed if its language isn't listed).
+                \\nenabled: keep an original-disposition audio track regardless of language_audio - so a jpn-only original track survives an eng-only filter instead of being dropped (or, if it were the last audio track, quarantining the file).`,
+        },
+        {
             name: 'recover_bad_timestamps',
             type: 'string',
             defaultValue: 'disabled',
@@ -211,34 +239,6 @@ const details = () => ({
                  \\nlight (risk-free): -fflags +ignidx and -err_detect ignore_err - ignores a broken/corrupt index (AVI idx1, MOV/MP4 sample tables) and keeps reading past detected errors instead of failing. Drops no frames.
                  \\naggressive: additionally -fflags +discardcorrupt - drops packets flagged corrupt, which may cause small video/audio blips where the damage is.
                  \\nThe mode actually applied is recorded in an awk_recovered tag. Recovery re-runs only when a recover_bad_* mode changes, then settles.`,
-        },
-        {
-            name: 'method_tag_language',
-            type: 'string',
-            defaultValue: 'container',
-            inputUI: {
-                type: 'dropdown',
-                options: ['639-2/b', '639-2/t', 'container', 'bcp47'],
-            },
-            tooltip: `Which language-code standard tag_language writes (only takes effect when tag_language is not disabled). Affects mainly the ~20 languages with two 3-letter codes (e.g. French fre/fra, German ger/deu) plus the 2-vs-3-letter choice; you can still type any form in the language lists regardless.
-                \\nBy convention Matroska (mkv) uses ISO-639-2/B and mp4's mdhd box uses ISO-639-2/T; both containers accept either form.
-                \\ncontainer (default): write each container its native form - 2-letter (en, fr) for mkv, 3-letter terminologic (eng, fra) for mp4. Most spec-accurate per container.
-                \\n639-2/t: terminologic 3-letter codes everywhere - fra, deu, zho (matches mp4's mdhd; 3-letter is also the common mkv convention).
-                \\n639-2/b ("mkv classic"): bibliographic 3-letter codes everywhere - fre, ger, chi.
-                \\nbcp47: like container on mp4 (3-letter terminologic) but on mkv keeps the full BCP-47 tag - a region (ISO-3166) subtag like pt-BR/es-419 or a script (ISO-15924) subtag like zh-Hans; mp4 can't store a region so it still folds to 3-letter (por).`,
-        },
-        {
-            name: 'guard_original',
-            type: 'string',
-            defaultValue: 'disabled',
-            inputUI: {
-                type: 'dropdown',
-                options: ['disabled', 'enabled'],
-            },
-            tooltip: `Protect a foreign film's ORIGINAL-language audio track from being removed by the language_audio filter when its language isn't in your list.
-                \\nKeys off the ffmpeg "original" disposition flag OR an "original" keyword in the track title/handler (the same signal audio_clean's guard_original uses). A track with neither marker is not protected - this only rescues a properly-flagged original track, not a bare native-language track.
-                \\ndisabled (default): the original track follows normal language_audio handling (removed if its language isn't listed).
-                \\nenabled: keep an original-disposition audio track regardless of language_audio - so a jpn-only original track survives an eng-only filter instead of being dropped (or, if it were the last audio track, quarantining the file).`,
         },
     ],
 });

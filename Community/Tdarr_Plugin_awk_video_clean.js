@@ -12,7 +12,7 @@ const details = () => ({
                      -HDR-aware (method_hdr): preserves static HDR10/HLG; by default leaves Dolby Vision / HDR10+ untouched (dynamic metadata can't survive a re-encode), can strip just the dynamic layer, or GPU-tonemap all HDR down to SDR (one consistent look across NVIDIA/Intel/AMD/Apple nodes) for SDR-only playback.\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '2.4.0',
+    Version: '2.4.1',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -106,14 +106,6 @@ const details = () => ({
                 \\ncpu forces the software encoder (libx265/libx264/libsvtav1) everywhere.`,
         },
         {
-            name: 'guard_min_bitrate',
-            type: 'string',
-            defaultValue: '1000',
-            inputUI: { type: 'text' },
-            tooltip: `Skip files whose current video bitrate is already below this (kbps). 0 disables the guard; the default 1000 leaves genuinely lean sources alone (rarely triggers - most content sits well above 1000 kbps at any resolution).
-                \\nConstant-quality encoding can't predict the output size, so re-encoding an already-lean source can GROW it. This floor leaves already-efficient files untouched. Example: 2500 skips anything already under 2500 kbps.`,
-        },
-        {
             name: 'method_hdr',
             type: 'string',
             defaultValue: 'preserve',
@@ -125,6 +117,14 @@ const details = () => ({
                 \\npreserve (recommended): leave Dolby Vision / HDR10+ files untouched - their dynamic metadata can't survive a re-encode, so transcoding would degrade them. Static HDR10/HLG is transcoded normally (HDR kept).
                 \\nstrip_dynamic: transcode Dolby Vision / HDR10+ anyway, keeping only the base HDR10 layer (accepts the loss of the dynamic layer). Static HDR10/HLG unaffected (kept).
                 \\ntonemap_sdr: tonemap ALL HDR (static and dynamic) down to SDR (bt709). For SDR-only playback chains - makes HDR look correct on non-HDR displays and avoids the media server re-tonemapping on every playback. The tonemap runs GPU-accelerated on whichever hardware the node's encoder uses (NVIDIA/Intel/AMD/Apple, one consistent look across your fleet), falling back to CPU only if no GPU tonemap is available. Lossy and one-way (the HDR master is discarded in this output), so leave on preserve if you watch on HDR displays. Follows bit_depth: with 'source' (default) a 10-bit HDR master tonemaps to 10-bit SDR; set bit_depth=8 to force 8-bit SDR for maximum playback compatibility.`,
+        },
+        {
+            name: 'guard_min_bitrate',
+            type: 'string',
+            defaultValue: '1000',
+            inputUI: { type: 'text' },
+            tooltip: `Skip files whose current video bitrate is already below this (kbps). 0 disables the guard; the default 1000 leaves genuinely lean sources alone (rarely triggers - most content sits well above 1000 kbps at any resolution).
+                \\nConstant-quality encoding can't predict the output size, so re-encoding an already-lean source can GROW it. This floor leaves already-efficient files untouched. Example: 2500 skips anything already under 2500 kbps.`,
         },
         {
             name: 'guard_reprocess',
