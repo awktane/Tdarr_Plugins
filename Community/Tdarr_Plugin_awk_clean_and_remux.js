@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.999.0',
+    Version: '3.999.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -72,13 +72,14 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['single-or-error', 'force-any'],
             },
-            tooltip: `What to do when more than one audio or subtitle stream has no language tag.
-                \\nMultiple untagged streams of the same type can't be told apart by language — the only way to know is by listening. If language_fill is set they'd all be assigned the same language; either way a subsequent plugin may treat them as duplicates and remove one, causing silent content loss (e.g. deleting the only Japanese track because it was tagged the same as English). This runs before the remux, so it aborts without spending the mux.
+            tooltip: `Only applies when language_fill is set. It decides what to do when language_fill would assign the SAME language to more than one untagged audio or subtitle stream of a type.
+                \\nThose streams can't be told apart by language — the only way to know is by listening — so filling them identically lets a later plugin treat them as duplicates and remove one, causing silent content loss (e.g. deleting the only Japanese track because it was tagged the same as English). With language_fill blank the streams keep "und" (audio_clean's dedup skips und, so nothing collides) and this setting does nothing.
+                \\nThis is not the "which track is the original language" check — for that, enable guard_audio_language. This runs before the remux, so any abort costs no mux.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nIf single-or-error - (Default) one untagged stream of a type is fine and gets language_fill; two or more abort the file to the error queue. Tag them manually and requeue.
-                \\nIf force-any       - processing continues however many are untagged; any missing languages will be filled by language_fill, which could let later logic remove one of the tracks as a lower-quality duplicate.`,
+                \\nIf single-or-error - (Default) a single untagged stream of a type is filled and kept; two or more abort the file to the error queue. Tag them manually and requeue.
+                \\nIf force-any       - fill and keep them all, however many there are, never aborting. Warning: several tracks sharing one filled language can let later logic drop one as a lower-quality duplicate.`,
         },
         {
             name: 'tag_disposition',
@@ -1039,32 +1040,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             failFile(`[guard_audio_language=${guardAudioLanguage}] ${genuineLangs.size} audio languages (${[...genuineLangs].join(', ')}) and none marked original - one of them could be the original language; mark the original track and requeue, or set guard_audio_language=disabled`);
     }
 
-    // language_fill_mode pre-check: when >1 untagged stream of a type WILL REACH THE OUTPUT, they can't be told apart by language - abort so the user can tag
-    // them manually and requeue (force-any instead lets processing continue). Whether the blanks get filled to the same language (a downstream dedupe-collision
-    // risk) or stay "und" (an ambiguous, incomplete file), multiple untagged streams of a type are the problem worth failing on - BUT only counting the ones
-    // that survive TO THE OUTPUT: an untagged subtitle dropped by the language filter, by container/format (subDroppedAnyReason), or by the remove_sub_sdh
-    // guard above never reaches a later plugin, so counting it would spuriously quarantine a file that processes fine. This plugin never drops audio, so every
-    // untagged audio stream reaches the output and counts.
-    // Resolves language via resolveLang (ffprobe tag, then mediaInfo fallback), so a language only mediaInfo supplies is not treated as blank here.
-    if (fillMode === 'single-or-error') {
+    // language_fill_mode pre-check - only relevant WHEN language_fill will assign a real language. That is the one case where multiple untagged streams of a type
+    // are a hazard: language_fill tags them all IDENTICALLY, and a later plugin can then treat them as duplicates and remove one (silent content loss). Left
+    // untagged (no language_fill, or language_fill=und) they stay "und", which audio_clean's dedup skips - so there is no collision to guard against and this does
+    // nothing. The separate "several audio languages, none marked original" concern is guard_audio_language's (opt-in), not re-litigated here. Counts only untagged
+    // streams that WILL REACH THE OUTPUT: an untagged subtitle dropped by the language filter, by container/format (subDroppedAnyReason), or by the remove_sub_sdh
+    // guard above never reaches a later plugin. This plugin never drops audio, so every untagged audio stream reaches the output and counts. Resolves language via
+    // resolveLang (ffprobe tag, then mediaInfo fallback), so a language only mediaInfo supplies is not treated as blank here.
+    if (fillMode === 'single-or-error' && fillLanguage && langKey(fillLanguage) !== 'und') {
         const streams = file.ffProbeData.streams || [];
         const isUntagged = (s) => { const lang = resolveLang(s); return !lang || lang === 'und'; };
-        const fillNote = fillLanguage ? ` and would all be assigned "${fillLanguage}" by language_fill` : '';
-        // Every untagged track shares the same post-fill language (language_fill if set, else "und"), so "does it survive the subtitle filter" is one check:
-        // kept when the language list is empty (keep-all) or contains that language. Mirrors the main loop's own keep/drop decision.
-        const untaggedWorkLang = fillLanguage || 'und';
-        const keptByLangFilter = (keys) => keys.length === 0 || langListMatch(untaggedWorkLang, keys);
-        // An untagged SDH subtitle the remove_sub_sdh guard would drop is excluded too - mirrors the loop's own removal predicate. Untagged tracks resolve to
-        // untaggedWorkLang, so reuse the plainSubLangs computed above.
-        const removedBySdh = (s) => removeSubSdh === 'enabled' && isSdh(s) && hasPlainSameLang(plainSubLangs, untaggedWorkLang);
+        // Inside this block language_fill assigns fillLanguage to every untagged track, so "does it survive the subtitle filter" is one check: kept when the
+        // language list is empty (keep-all) or contains fillLanguage. Mirrors the main loop's own keep/drop decision.
+        const keptByLangFilter = (keys) => keys.length === 0 || langListMatch(fillLanguage, keys);
+        // An untagged SDH subtitle the remove_sub_sdh guard would drop is excluded too - mirrors the loop's own removal predicate (untagged tracks resolve to fillLanguage).
+        const removedBySdh = (s) => removeSubSdh === 'enabled' && isSdh(s) && hasPlainSameLang(plainSubLangs, fillLanguage);
         const untaggedAudio = streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s)).length;
         if (untaggedAudio > 1)
-            failFile(`[language_fill_mode=${fillMode}] ${untaggedAudio} audio streams have no language tag${fillNote} - may be different languages; tag them manually and requeue, or set language_fill_mode=force-any`);
+            failFile(`[language_fill_mode=${fillMode}] ${untaggedAudio} audio streams have no language tag and would all be assigned "${fillLanguage}" by language_fill - may be different languages; tag them manually and requeue, or set language_fill_mode=force-any`);
         const untaggedSubs = keptByLangFilter(subLangKeys)
             ? streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'subtitle'
                 && !subDroppedAnyReason((s.codec_name || '').toLowerCase()) && isUntagged(s) && !removedBySdh(s)).length : 0;
         if (untaggedSubs > 1)
-            failFile(`[language_fill_mode=${fillMode}] ${untaggedSubs} subtitle streams have no language tag${fillNote} - may be different languages; tag them manually and requeue, or set language_fill_mode=force-any`);
+            failFile(`[language_fill_mode=${fillMode}] ${untaggedSubs} subtitle streams have no language tag and would all be assigned "${fillLanguage}" by language_fill - may be different languages; tag them manually and requeue, or set language_fill_mode=force-any`);
     }
 
     // Set up required variables.
