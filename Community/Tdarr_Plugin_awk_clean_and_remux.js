@@ -36,22 +36,6 @@ const details = () => ({
                 \\nmp4 additionally removes the image-based subtitles mkv keeps (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle), plus arib_caption and hdmv_text_subtitle. Text-based subtitles (subrip, srt, ass, ssa, webvtt, text) are converted to mov_text. Genpts may be required to fix timestamps. HEVC video is tagged hvc1 so Apple/QuickTime can play it.`,
         },
         {
-            name: 'language_sub',
-            type: 'string',
-            defaultValue: '',
-            inputUI: { type: 'text' },
-            tooltip: `Specify language tags here for the subtitle tracks you'd like to keep. If blank then no tracks will be removed.
-                \\nStreams with no language tag are treated as though they had language_fill as their language or "und" if language_fill isn't set
-                \\nOne form is enough - en, eng, or English all match the same language (including region variants like en-US), so you don't need to list every variant.
-                \\nExample:\\n
-                    eng,fra
-                    \\nEnglish and French.
-                \\nThe special codes und (undefined), mul (multiple languages) and mis (no language code) are matched literally - include them if you want to keep such tracks.
-                \\nExample:\\n
-                    eng,und
-                    \\nEnglish and both subtitles marked as und or with no language set`,
-        },
-        {
             name: 'language_fill',
             type: 'string',
             defaultValue: '',
@@ -82,6 +66,22 @@ const details = () => ({
                 \\nIf force-any       - fill and keep them all, however many there are, never aborting. Warning: several tracks sharing one filled language can let later logic drop one as a lower-quality duplicate.`,
         },
         {
+            name: 'language_sub',
+            type: 'string',
+            defaultValue: '',
+            inputUI: { type: 'text' },
+            tooltip: `Specify language tags here for the subtitle tracks you'd like to keep. If blank then no tracks will be removed.
+                \\nStreams with no language tag are treated as though they had language_fill as their language or "und" if language_fill isn't set
+                \\nOne form is enough - en, eng, or English all match the same language (including region variants like en-US), so you don't need to list every variant.
+                \\nExample:\\n
+                    eng,fra
+                    \\nEnglish and French.
+                \\nThe special codes und (undefined), mul (multiple languages) and mis (no language code) are matched literally - include them if you want to keep such tracks.
+                \\nExample:\\n
+                    eng,und
+                    \\nEnglish and both subtitles marked as und or with no language set`,
+        },
+        {
             name: 'tag_disposition',
             type: 'string',
             defaultValue: 'disabled',
@@ -94,19 +94,6 @@ const details = () => ({
                 \\nAudio surfaces Commentary/Descriptive/Dub/Original; subtitle surfaces Commentary/Descriptive/SDH/Forced/Lyrics. This makes the flags the source of truth. Pair it with tag_title so title-only keywords are captured into the flags before the title is rebuilt.
                 \\nDoes not touch the default flag - that is managed by track order in the stream ordering plugin.`,
         },
-        {
-            name: 'tag_title',
-            type: 'string',
-            defaultValue: 'disabled',
-            inputUI: {
-                type: 'dropdown',
-                options: ['disabled', 'audio', 'subtitle', 'both'],
-            },
-            tooltip: `Rebuild stream titles from what the track actually is. Choose which stream types to apply to: disabled, audio, subtitle, or both.
-                \\nAudio: builds a channel-based title (7.1, 6.1, 5.1, 5.0, 4.0, 3.1, 3.0, 2.1, Stereo, Mono) with any disposition roles appended, e.g. "5.1 - Commentary" or "5.1 -> 2.0 - Descriptive".
-                \\nSubtitle: only titles we own (empty or already just role words) are set to the role tag(s), e.g. "SDH" or "Forced Commentary"; custom subtitle titles are left untouched.
-                \\nRole tags come from the track's real disposition flags and title keywords (Commentary, Descriptive, SDH, Forced, Lyrics, Dub, Original). The default flag is intentionally not surfaced.`,
-        },        
         {
             name: 'tag_language',
             type: 'string',
@@ -122,26 +109,17 @@ const details = () => ({
                 \\nUndetermined / non-language codes (und, mul, zxx, mis) are always left untouched.`,
         },
         {
-            name: 'remove_sub_sdh',
+            name: 'tag_title',
             type: 'string',
             defaultValue: 'disabled',
             inputUI: {
                 type: 'dropdown',
-                options: ['disabled', 'enabled'],
+                options: ['disabled', 'audio', 'subtitle', 'both'],
             },
-            tooltip: `Remove SDH / Closed Caption subtitles (for the deaf/hard-of-hearing). Detected by the real ffmpeg disposition flag or by keywords in the title/handler/description.
-                \\nSafety: a track is only removed when a "plain" subtitle of the same language survives - one carrying no commentary/descriptive/SDH/lyrics role, in a format the output container keeps and not stripped by remove_imagesubs. So extras are removed, never the last usable track.
-                \\nAudio-description (visual_impaired) audio is not handled here - audio_clean's method_secondary owns it, along with commentary and M&E.`,
-        },
-        {
-            name: 'remove_comments',
-            type: 'boolean',
-            defaultValue: false,
-            inputUI: {
-                type: 'dropdown',
-                options: ['false','true'],
-            },
-            tooltip: `Should comments be removed from all streams? These are not usually shown by players and often contain unnecessary information.`,
+            tooltip: `Rebuild stream titles from what the track actually is. Choose which stream types to apply to: disabled, audio, subtitle, or both.
+                \\nAudio: builds a channel-based title (7.1, 6.1, 5.1, 5.0, 4.0, 3.1, 3.0, 2.1, Stereo, Mono) with any disposition roles appended, e.g. "5.1 - Commentary" or "5.1 -> 2.0 - Descriptive".
+                \\nSubtitle: only titles we own (empty or already just role words) are set to the role tag(s), e.g. "SDH" or "Forced Commentary"; custom subtitle titles are left untouched.
+                \\nRole tags come from the track's real disposition flags and title keywords (Commentary, Descriptive, SDH, Forced, Lyrics, Dub, Original). The default flag is intentionally not surfaced.`,
         },
         {
             name: 'remove_busytitle',
@@ -157,6 +135,16 @@ const details = () => ({
                 This.Title.Has.Too.Many.Periods would have title set to blank`,
         },
         {
+            name: 'remove_comments',
+            type: 'boolean',
+            defaultValue: false,
+            inputUI: {
+                type: 'dropdown',
+                options: ['false','true'],
+            },
+            tooltip: `Should comments be removed from all streams? These are not usually shown by players and often contain unnecessary information.`,
+        },
+        {
             name: 'remove_imagesubs',
             type: 'string',
             defaultValue: 'unsupported',
@@ -169,6 +157,18 @@ const details = () => ({
                 \\nall: remove all image-based subtitles from any container (use when you only want text subtitles).
                 \\nexport: save each image subtitle to a hidden sidecar next to the video (PGS -> ".<name>.<lang>.sup", VobSub/DVB -> ".<name>.<lang>.mks") and then remove it. The leading dot keeps Plex/Jellyfin from indexing it; run an external OCR tool on the sidecars to produce .srt, then reimport with awk_sub_worker. One-way - these are never reimported by this plugin.
                 \\nText subtitles are never affected. xsub is always removed (no Matroska CodecID) and is not exported.`,
+        },
+        {
+            name: 'remove_sub_sdh',
+            type: 'string',
+            defaultValue: 'disabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['disabled', 'enabled'],
+            },
+            tooltip: `Remove SDH / Closed Caption subtitles (for the deaf/hard-of-hearing). Detected by the real ffmpeg disposition flag or by keywords in the title/handler/description.
+                \\nSafety: a track is only removed when a "plain" subtitle of the same language survives - one carrying no commentary/descriptive/SDH/lyrics role, in a format the output container keeps and not stripped by remove_imagesubs. So extras are removed, never the last usable track.
+                \\nAudio-description (visual_impaired) audio is not handled here - audio_clean's method_secondary owns it, along with commentary and M&E.`,
         },
         {
             name: 'method_tag_language',

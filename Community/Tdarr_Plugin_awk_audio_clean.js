@@ -7,9 +7,22 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '3.999.0',
+    Version: '3.999.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
+        {
+            name: 'language_stereo',
+            type: 'string',
+            defaultValue: '',
+            inputUI: { type: 'text' },
+            tooltip: `Languages to keep, but downmixed to stereo - a dub you want available without spending the space on its surround. Each surround track in one of these languages is transcoded in place to a single stereo codec_stereo track (using the stereo_downmix matrix); a track already at 2 channels or fewer is left alone.
+                \\nBlank (default) means no language is forced to stereo. Same matching rules as language_surround - one form is enough, und/mul/zxx/mis are matched literally.
+                \\nThese tracks are never protected by guard_lossless/guard_quality/guard_object_audio, so the downmix always happens.
+                \\nA language in BOTH this list and language_surround is treated as surround.
+                \\nExample:\\n
+                    spa,deu\\n
+                    Keep the Spanish and German dubs, but only in stereo`,
+        },
         {
             name: 'language_surround',
             type: 'string',
@@ -28,19 +41,6 @@ const details = () => ({
                 \\nExample:\\n
                     eng,und\\n
                     English and undefined`,
-        },
-        {
-            name: 'language_stereo',
-            type: 'string',
-            defaultValue: '',
-            inputUI: { type: 'text' },
-            tooltip: `Languages to keep, but downmixed to stereo - a dub you want available without spending the space on its surround. Each surround track in one of these languages is transcoded in place to a single stereo codec_stereo track (using the stereo_downmix matrix); a track already at 2 channels or fewer is left alone.
-                \\nBlank (default) means no language is forced to stereo. Same matching rules as language_surround - one form is enough, und/mul/zxx/mis are matched literally.
-                \\nThese tracks are never protected by guard_lossless/guard_quality/guard_object_audio, so the downmix always happens.
-                \\nA language in BOTH this list and language_surround is treated as surround.
-                \\nExample:\\n
-                    spa,deu\\n
-                    Keep the Spanish and German dubs, but only in stereo`,
         },
         {
             name: 'language_unlisted',
@@ -92,7 +92,7 @@ const details = () => ({
                 \\nIf false   - no new 2 channel track is created from surround channel
                 \\nIf replace - a new 2 channel track with codec codec_stereo replaces the higher channel track used to create it unless it was created by downmix_to_six.
                 \\nIf true    - a new 2 channel track with codec_stereo will be created from a higher channel track and both will be kept`,
-        },        
+        },
         {
             name: 'method_secondary',
             type: 'string',
@@ -126,7 +126,7 @@ const details = () => ({
                 \\nIf 2below - Streams with two or fewer channels will be transcoded to codec_stereo (unless protected by guard_lossless/guard_quality/guard_object_audio). Anything above that will be left in its original codec.
                 \\nIf 6below - Streams with six or fewer channels will be transcoded to codec_surround (unless protected by guard_lossless/guard_quality/guard_object_audio). Tracks with two or fewer channel will be converted to codec_stereo.
                 \\nIf all   - Like 6below but also transcodes surround tracks above six channels, each subject to its codec's channel limit (ac3/eac3 6ch, aac/opus 8ch). guard_lossless/guard_quality/guard_object_audio still apply in every mode - a track they protect is left in its source codec; 'all' differs from 6below only by the channel-count threshold.`,
-        },                
+        },
         {
             name: 'codec_stereo',
             type: 'string',
@@ -139,7 +139,7 @@ const details = () => ({
                 \\naac_vbr uses libfdk_aac in VBR mode (-vbr 5, ~192-224 kb/s) for higher quality than native AAC CBR. Falls back to -vbr 4 (~128-144 kb/s) when codec_force is converting an existing stereo track whose bitrate is at or below 144 kb/s, matching the lower-information source.
                 \\nlibfdk_aac ships in the Linux/Windows builds but not the Mac one; on a node whose ffmpeg lacks it, aac_vbr automatically uses Apple's aac_at (AudioToolbox) VBR on Mac, or native aac 256 kb/s on any other build without it, so the file still processes.
                 \\nExisting AAC tracks are never re-encoded when aac_vbr is selected — the AAC family check prevents a generational loss for no gain.`,
-        },        
+        },
         {
             name: 'codec_surround',
             type: 'string',
@@ -149,6 +149,21 @@ const details = () => ({
                 options: ['aac','ac3','eac3','opus'],
             },
             tooltip: `Specify codec for newly created surround tracks. Note that both AC3 and EAC3 are limited to 6 channels (5.1) by ffmpeg's native encoders. Opus supports up to 8 channels.`,
+        },
+        {
+            name: 'method_dedup_region',
+            type: 'string',
+            defaultValue: 'fold',
+            inputUI: {
+                type: 'dropdown',
+                options: ['fold', 'distinct'],
+            },
+            tooltip: `How a region/script-qualified language tag (pt-BR, pt-PT, en-US, zh-Hans) is grouped for deduplication and the one-downmix-per-language sets. Only matters when two tracks share a base language but differ by region or script; a plain tag (eng, en) is unaffected.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nIf fold (default) - a base language and all its regional variants are ONE language: en and en-US collapse, and pt-BR + pt-PT are the same Portuguese - so a duplicate is removed and only one downmix is created. Best for most libraries, where a region tag is cosmetic.
+                \\nIf distinct       - each region/script variant is its own language: pt-BR and pt-PT both survive dedup (different dubs) and each gets its own downmix, and en-US stays separate from en. Choose this only if you deliberately keep multiple regional dubs of one language.`,
         },
         {
             name: 'method_deduplicate',
@@ -179,19 +194,20 @@ const details = () => ({
                 \\nIf channel-error or multi-stereo-error - aborts the run if it finds duplicates as per the categories above; no streams are removed and no other changes from this run are applied.`,
         },
         {
-            name: 'method_region_dedup',
+            name: 'method_layout_err',
             type: 'string',
-            defaultValue: 'fold',
+            defaultValue: 'keep',
             inputUI: {
                 type: 'dropdown',
-                options: ['fold', 'distinct'],
+                options: ['keep','drop','remix'],
             },
-            tooltip: `How a region/script-qualified language tag (pt-BR, pt-PT, en-US, zh-Hans) is grouped for deduplication and the one-downmix-per-language sets. Only matters when two tracks share a base language but differ by region or script; a plain tag (eng, en) is unaffected.
+            tooltip: `What to do when a track can't be written in the target codec because of its channel layout. This happens only when codec_surround is opus and a track's layout is one libopus can't encode (e.g. 2.1, 4.0, 4.1, 6.0, 7.0, 7.1(wide)) - reached either because codec_force is sending that track to opus, or because method_loudnorm has to re-encode a kept track whose own codec ffmpeg can't encode (e.g. a DTS core) and it converges to codec_surround. Left unhandled, ffmpeg aborts the whole job on that track. A layout that just needs relabeling (5.0(side) -> 5.0, 6.1(back) -> 6.1) is ALWAYS relabeled losslessly regardless of this setting. AC3/EAC3/AAC accept every layout, so this only matters when codec_surround is opus.
                 \\n=====
-                \\nActions
+                \\nActions (only for a layout with no lossless relabel)
                 \\n=====
-                \\nIf fold (default) - a base language and all its regional variants are ONE language: en and en-US collapse, and pt-BR + pt-PT are the same Portuguese - so a duplicate is removed and only one downmix is created. Best for most libraries, where a region tag is cosmetic.
-                \\nIf distinct       - each region/script variant is its own language: pt-BR and pt-PT both survive dedup (different dubs) and each gets its own downmix, and en-US stays separate from en. Choose this only if you deliberately keep multiple regional dubs of one language.`,
+                \\nIf keep  - the track is left in its source codec (not written as opus). Safe default: nothing fails and no audio is lost; a loudnorm-only run just leaves that one track un-normalized.
+                \\nIf drop  - the track is removed entirely. The last remaining audio track is never dropped (falls back to keep). A stereo/5.1 a downmix would derive from that track is still created.
+                \\nIf remix - the track is downmixed to a codec_stereo stereo (using method_stereo_downmix), with loudness applied when method_loudnorm is active. Defers to downmix_to_stereo / the stereo tier (language_stereo, language_unlisted=stereo, method_secondary=stereo) when they already convert the track, and falls back to keep rather than create a duplicate stereo.`,
         },
         {
             name: 'method_loudnorm',
@@ -240,22 +256,6 @@ const details = () => ({
                 \\nFalls back to default automatically for unusual layouts such as 2.1 and 3.0.`,
         },
         {
-            name: 'method_layout_err',
-            type: 'string',
-            defaultValue: 'keep',
-            inputUI: {
-                type: 'dropdown',
-                options: ['keep','drop','remix'],
-            },
-            tooltip: `What to do when a track can't be written in the target codec because of its channel layout. This happens only when codec_surround is opus and a track's layout is one libopus can't encode (e.g. 2.1, 4.0, 4.1, 6.0, 7.0, 7.1(wide)) - reached either because codec_force is sending that track to opus, or because method_loudnorm has to re-encode a kept track whose own codec ffmpeg can't encode (e.g. a DTS core) and it converges to codec_surround. Left unhandled, ffmpeg aborts the whole job on that track. A layout that just needs relabeling (5.0(side) -> 5.0, 6.1(back) -> 6.1) is ALWAYS relabeled losslessly regardless of this setting. AC3/EAC3/AAC accept every layout, so this only matters when codec_surround is opus.
-                \\n=====
-                \\nActions (only for a layout with no lossless relabel)
-                \\n=====
-                \\nIf keep  - the track is left in its source codec (not written as opus). Safe default: nothing fails and no audio is lost; a loudnorm-only run just leaves that one track un-normalized.
-                \\nIf drop  - the track is removed entirely. The last remaining audio track is never dropped (falls back to keep). A stereo/5.1 a downmix would derive from that track is still created.
-                \\nIf remix - the track is downmixed to a codec_stereo stereo (using method_stereo_downmix), with loudness applied when method_loudnorm is active. Defers to downmix_to_stereo / the stereo tier (language_stereo, language_unlisted=stereo, method_secondary=stereo) when they already convert the track, and falls back to keep rather than create a duplicate stereo.`,
-        },
-        {
             name: 'guard_lossless',
             type: 'string',
             defaultValue: 'enabled',
@@ -278,31 +278,6 @@ const details = () => ({
                 \\n=====
                 \\nIf enabled  - (Default) Protect lossless sources from every operation above.
                 \\nIf disabled - No lossless-specific protection; guard_quality (if enabled) still evaluates every operation on its own terms.`,
-        },
-        {
-            name: 'guard_quality',
-            type: 'string',
-            defaultValue: 'enabled',
-            inputUI: {
-                type: 'dropdown',
-                options: ['enabled','strict','disabled'],
-            },
-            tooltip: `Protect a track from a destructive operation (downmix_to_six / downmix_to_stereo 'replace', codec_force, duplicate removal, and method_loudnorm)
-                whenever the operation reduces channel count OR a lossy source's predicted quality drop is significant - independent of guard_lossless
-                and guard_object_audio below. Protection is earned PER OPERATION against that operation's real target codec/channels - not a single "best track" flag.
-                A guarded downmix 'replace' becomes 'add'; a guarded codec_force/method_loudnorm is skipped; a guarded duplicate is kept instead of removed.
-                codec_force='all' does not override this - a guarded track is left alone in every force mode. Only a genuine track kept at surround is
-                protected: secondary tracks never are, and neither is a track already sent to stereo or delete. See language_surround.
-                \\n=====
-                \\nActions
-                \\n=====
-                \\nIf enabled  - (Default) Protect when the operation reduces channel count, or a lossy source's predicted quality drop is more than ~7
-                points. A comparable-codec swap such as 640k E-AC-3 to 640k AC3 (or a full-rate 1.5 Mbps DTS 5.1 to 640k AC3) is allowed through, while
-                flattening a Dolby Atmos or DTS-HD source to 640k AC3 is kept. Allows AC3 to EAC3 at equal quality.
-                \\nIf strict   - Like enabled, but a lossy source is protected on ANY predicted drop, however small (the most protective tier) - use it
-                to keep a track even for a marginal quality difference. It protects the same ~1.5 Mbps DTS 5.1 forced to 640k AC3 that enabled would
-                let through. Because a downmix always drops channels, a downmix 'replace' always behaves as 'add' under either enabled or strict.
-                \\nIf disabled - No channel-count or quality-margin protection; guard_lossless (if enabled) still protects lossless sources on its own.`,
         },
         {
             name: 'guard_object_audio',
@@ -352,6 +327,31 @@ const details = () => ({
                 \\n=====
                 \\nIf enabled  - Keep an unlisted-language original track at surround, and never delete it.
                 \\nIf disabled - (Default) The original track follows normal unlisted-language handling - language_unlisted may downmix or delete it.`,
+        },
+        {
+            name: 'guard_quality',
+            type: 'string',
+            defaultValue: 'enabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['enabled','strict','disabled'],
+            },
+            tooltip: `Protect a track from a destructive operation (downmix_to_six / downmix_to_stereo 'replace', codec_force, duplicate removal, and method_loudnorm)
+                whenever the operation reduces channel count OR a lossy source's predicted quality drop is significant - independent of guard_lossless
+                and guard_object_audio below. Protection is earned PER OPERATION against that operation's real target codec/channels - not a single "best track" flag.
+                A guarded downmix 'replace' becomes 'add'; a guarded codec_force/method_loudnorm is skipped; a guarded duplicate is kept instead of removed.
+                codec_force='all' does not override this - a guarded track is left alone in every force mode. Only a genuine track kept at surround is
+                protected: secondary tracks never are, and neither is a track already sent to stereo or delete. See language_surround.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nIf enabled  - (Default) Protect when the operation reduces channel count, or a lossy source's predicted quality drop is more than ~7
+                points. A comparable-codec swap such as 640k E-AC-3 to 640k AC3 (or a full-rate 1.5 Mbps DTS 5.1 to 640k AC3) is allowed through, while
+                flattening a Dolby Atmos or DTS-HD source to 640k AC3 is kept. Allows AC3 to EAC3 at equal quality.
+                \\nIf strict   - Like enabled, but a lossy source is protected on ANY predicted drop, however small (the most protective tier) - use it
+                to keep a track even for a marginal quality difference. It protects the same ~1.5 Mbps DTS 5.1 forced to 640k AC3 that enabled would
+                let through. Because a downmix always drops channels, a downmix 'replace' always behaves as 'add' under either enabled or strict.
+                \\nIf disabled - No channel-count or quality-margin protection; guard_lossless (if enabled) still protects lossless sources on its own.`,
         },
     ],
 });
@@ -1181,7 +1181,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const stereoCodec = String(inputs.codec_stereo).trim();
     const forceCodec = String(inputs.codec_force).trim();
     const removeDuplicatesBy = String(inputs.method_deduplicate).trim();
-    const regionDedup = String(inputs.method_region_dedup).trim();
+    const regionDedup = String(inputs.method_dedup_region).trim();
     const stereoDownmix = String(inputs.method_stereo_downmix).trim();
     const methodLayoutErr = String(inputs.method_layout_err).trim();
     const loudnorm = String(inputs.method_loudnorm).trim();
@@ -1207,7 +1207,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if(!['disabled','multi-stereo','multi-stereo-error','channel','channel-error'].includes(removeDuplicatesBy))
         failFile(`[method_deduplicate=${removeDuplicatesBy}] invalid value, check your settings`);
     if(!['fold','distinct'].includes(regionDedup))
-        failFile(`[method_region_dedup=${regionDedup}] invalid value, check your settings`);
+        failFile(`[method_dedup_region=${regionDedup}] invalid value, check your settings`);
     if(!['default','dialogue'].includes(stereoDownmix))
         failFile(`[method_stereo_downmix=${stereoDownmix}] invalid value, check your settings`);
     if(!['keep','drop','remix'].includes(methodLayoutErr))
@@ -1267,7 +1267,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         audioStreams = audioStreams.map(item => {
             const fullLang = resolveLang(item) || 'und';
             const cleanLang = langKey(fullLang);              // folded MATCH key (en/eng/english/en-US/pt-BR all collapse): drives language matching, tier, priority
-            // Dedup / one-downmix-per-language grouping key. method_region_dedup=distinct keeps the region/script subtag (pt-BR != pt-PT, en-US != en); the default 'fold'
+            // Dedup / one-downmix-per-language grouping key. method_dedup_region=distinct keeps the region/script subtag (pt-BR != pt-PT, en-US != en); the default 'fold'
             // reuses the folded match key so every regional variant collapses to one language.
             const regionKey = regionDedup === 'distinct' ? langIdentityKey(fullLang) : cleanLang;
             // Enrich with mediaInfo bitrate before audioQuality scoring so that formats like DTS-HD MA (which ffprobe can't read a bitrate for in MP4/M4V
@@ -1418,7 +1418,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 } else {
                     tier = s.channels > 2 ? 'surround' : 'stereo';
                 }
-                // Only MAIN tracks reach here (secondaries skipped above), so the region-grouping key + channel-tier fully identifies a duplicate group (region-distinct only when method_region_dedup=distinct).
+                // Only MAIN tracks reach here (secondaries skipped above), so the region-grouping key + channel-tier fully identifies a duplicate group (region-distinct only when method_dedup_region=distinct).
                 const key = `${s.isTdarrRegionKey}|${tier}`;
                 if (seen.has(key)) {
                     const kept = seen.get(key);
@@ -1535,7 +1535,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Now that dedup + the layout-drop pre-pass have finalised streamsToRemove, snapshot which languages still have a primary stereo / 5.1-6ch track
         // among the SURVIVORS, so downmix_to_stereo/downmix_to_six only create one for a language that genuinely lacks it (a removed track can't leave a
-        // stale entry). isTdarrRegionKey (the same key dedup grouped on - region-distinct only when method_region_dedup=distinct) matches created2chLangs/ffstreamLangKey. Channels 2 = stereo;
+        // stale entry). isTdarrRegionKey (the same key dedup grouped on - region-distinct only when method_dedup_region=distinct) matches created2chLangs/ffstreamLangKey. Channels 2 = stereo;
         // >4 && <=6 = any 5-6 channel primary (5.0/5.1, and the rare 4.1 which is also 5 channels) without catching 4.0 (4ch) or 7.1 (8ch).
         const survivingPrimaryAudio = audioStreams.filter(s => !streamsToRemove.has(s.index) && !s.isTdarrSecondaryTrack && s.isTdarrTier === 'surround');
         const existingStereoLangs = new Set(survivingPrimaryAudio.filter(s => s.channels === 2).map(s => s.isTdarrRegionKey));
