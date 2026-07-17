@@ -42,6 +42,18 @@ const details = () => ({
                 \\ncpu forces the software encoder (libx265/libx264/libsvtav1) everywhere.`,
         },
         {
+            name: 'force_bit_depth',
+            type: 'string',
+            defaultValue: 'source',
+            inputUI: {
+                type: 'dropdown',
+                options: ['source', '8', '10'],
+            },
+            tooltip: `Output bit depth.
+                \\nsource: match the source (keeps 10-bit 10-bit, 8-bit 8-bit). Recommended.
+                \\n8 / 10: force it. H.264 is always 8-bit regardless (10-bit H.264 breaks device compatibility, which is the reason to pick H.264).`,
+        },
+        {
             name: 'max_height',
             type: 'string',
             defaultValue: 'original',
@@ -52,18 +64,6 @@ const details = () => ({
             tooltip: `Cap the output resolution by height (only ever downscales, never upscales). The quality tier is re-derived for the new height.
                 \\noriginal: keep the source resolution.
                 \\n1080: downscale anything taller than 1080p to 1080p (the classic "shrink 4K to 1080p to save space"). 720 / 480 likewise. 2160 / 1440 cap only larger sources.`,
-        },
-        {
-            name: 'quality_bit_depth',
-            type: 'string',
-            defaultValue: 'source',
-            inputUI: {
-                type: 'dropdown',
-                options: ['source', '8', '10'],
-            },
-            tooltip: `Output bit depth.
-                \\nsource: match the source (keeps 10-bit 10-bit, 8-bit 8-bit). Recommended.
-                \\n8 / 10: force it. H.264 is always 8-bit regardless (10-bit H.264 breaks device compatibility, which is the reason to pick H.264).`,
         },
         {
             name: 'quality_sd',
@@ -116,7 +116,7 @@ const details = () => ({
             tooltip: `How to handle HDR video. Static HDR10/HLG colour metadata is always carried through the encode automatically; this controls dynamic HDR (Dolby Vision / HDR10+) and whether to keep HDR at all.
                 \\npreserve (recommended): leave Dolby Vision / HDR10+ files untouched - their dynamic metadata can't survive a re-encode, so transcoding would degrade them. Static HDR10/HLG is transcoded normally (HDR kept).
                 \\nstrip_dynamic: transcode Dolby Vision / HDR10+ anyway, keeping only the base HDR10 layer (accepts the loss of the dynamic layer). Static HDR10/HLG unaffected (kept).
-                \\ntonemap_sdr: tonemap ALL HDR (static and dynamic) down to SDR (bt709). For SDR-only playback chains - makes HDR look correct on non-HDR displays and avoids the media server re-tonemapping on every playback. The tonemap runs GPU-accelerated on whichever hardware the node's encoder uses (NVIDIA/Intel/AMD/Apple, one consistent look across your fleet), falling back to CPU only if no GPU tonemap is available. Lossy and one-way (the HDR master is discarded in this output), so leave on preserve if you watch on HDR displays. Follows quality_bit_depth: with 'source' (default) a 10-bit HDR master tonemaps to 10-bit SDR; set quality_bit_depth=8 to force 8-bit SDR for maximum playback compatibility.`,
+                \\ntonemap_sdr: tonemap ALL HDR (static and dynamic) down to SDR (bt709). For SDR-only playback chains - makes HDR look correct on non-HDR displays and avoids the media server re-tonemapping on every playback. The tonemap runs GPU-accelerated on whichever hardware the node's encoder uses (NVIDIA/Intel/AMD/Apple, one consistent look across your fleet), falling back to CPU only if no GPU tonemap is available. Lossy and one-way (the HDR master is discarded in this output), so leave on preserve if you watch on HDR displays. Follows force_bit_depth: with 'source' (default) a 10-bit HDR master tonemaps to 10-bit SDR; set force_bit_depth=8 to force 8-bit SDR for maximum playback compatibility.`,
         },
         {
             name: 'guard_min_bitrate',
@@ -800,7 +800,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const codec = String(inputs.codec || 'hevc').toLowerCase().trim();
     const maxHeightOpt = String(inputs.max_height || 'original').toLowerCase().trim();
     const speed = String(inputs.speed || 'slow').toLowerCase().trim();
-    const bitDepthOpt = String(inputs.quality_bit_depth || 'source').toLowerCase().trim();
+    const bitDepthOpt = String(inputs.force_bit_depth || 'source').toLowerCase().trim();
     const encoderOpt = String(inputs.encoder || 'auto').toLowerCase().trim();
     const methodHdr = String(inputs.method_hdr || 'preserve').toLowerCase().trim();
     const guardReprocess = String(inputs.guard_reprocess) === 'true';
@@ -823,7 +823,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!['hevc', 'h264', 'av1'].includes(codec)) failFile(`[codec=${codec}] invalid value, check your settings`);
     if (!['original', '2160', '1440', '1080', '720', '480'].includes(maxHeightOpt)) failFile(`[max_height=${maxHeightOpt}] invalid value, check your settings`);
     if (!['slow', 'medium', 'fast'].includes(speed)) failFile(`[speed=${speed}] invalid value, check your settings`);
-    if (!['source', '8', '10'].includes(bitDepthOpt)) failFile(`[quality_bit_depth=${bitDepthOpt}] invalid value, check your settings`);
+    if (!['source', '8', '10'].includes(bitDepthOpt)) failFile(`[force_bit_depth=${bitDepthOpt}] invalid value, check your settings`);
     if (!['auto', 'nvenc', 'qsv', 'vaapi', 'videotoolbox', 'amf', 'cpu'].includes(encoderOpt)) failFile(`[encoder=${encoderOpt}] invalid value, check your settings`);
     if (!['preserve', 'strip_dynamic', 'tonemap_sdr'].includes(methodHdr)) failFile(`[method_hdr=${methodHdr}] invalid value, check your settings`);
 
@@ -919,7 +919,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const alreadyTargetCodec = srcCodecName === targetCodecName;
         const depthOk = wantTenbit === srcIs10;
         // Every transform that actually applies (a single transcode can satisfy several at once) → one self-describing value tag; the setting each names
-        // (codec / max_height / quality_bit_depth / method_hdr) is obvious from the value. guard_reprocess is the exclusive fallback: it forces a re-encode only
+        // (codec / max_height / force_bit_depth / method_hdr) is obvious from the value. guard_reprocess is the exclusive fallback: it forces a re-encode only
         // when NO transform is otherwise needed.
         const reasonTags = [
             !alreadyTargetCodec && targetCodecName,
