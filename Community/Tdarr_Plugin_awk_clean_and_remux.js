@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.3.0',
+    Version: '3.4.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -571,6 +571,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ffmpeg 7.x which auto-sizes the queue, but cheap insurance); -flush_packets 0 buffers muxer writes instead of flushing per packet - the throughput-
     // optimal choice for FILE muxing (helps high-latency/network temp storage, negligible cost when local), so it is always applied, not exposed as a toggle.
     const globalOutputOpt = ' -max_muxing_queue_size 9999 -flush_packets 0';
+
+    // -=-=-= streamTag  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // infoLog stream tag: the SOURCE ffprobe index of the stream a line concerns, as a fixed 5-char field so columns line up ([s 0],[s 9],[s10],[s99];
+    // an index >=100 widens to [s100]). Sits right after the status symbol, before any [input=value] tag. Used only where a line is about ONE source
+    // stream - omitted on whole-file summaries and on brand-new/appended streams (imports, downmix appends) that have no source index of their own.
+    const streamTag = (index) => `[s${String(index).padStart(2, ' ')}]`;
     // ===== END SHARED: stream / language / preset helpers =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language matching =====
@@ -633,14 +639,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Bail out gracefully on missing/partial probe data, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
-        failFile('No ffProbe stream data available for this file - the plugin cannot process it.');
+        failFile('No ffProbe stream data available for this file - the plugin cannot process it');
 
     // Input validation. Order mirrors the Inputs array in details(); only type:'string' inputs are checked - free-text inputs (language_audio, language_sub)
     // have no fixed option set, and type:'boolean' inputs (language_fill_fail, remove_comments/remove_busytitle) are coerced to a real
     // true/false by loadDefaultValues (any out-of-set value becomes false), so a guard on them would be dead code. container is validated first (input #1) and
     // before the dstContainer parse below so an empty value fails cleanly rather than throwing a raw TypeError. Remaining checks run after all inputs parse.
     if (!inputs.container || inputs.container === '')
-        failFile('Container has not been configured, please configure required options.');
+        failFile(`[container=${inputs.container || ''}] not configured, check your settings`);
 
     const srcContainer = file.container.toLowerCase().trim();
     const dstContainer = inputs.container.toLowerCase().trim();
@@ -648,7 +654,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (only reachable via a hand-edited/imported config) would silently fall through to a generic remux into an unsupported container - a runtime ffmpeg muxer
     // error instead of a clean quarantine. Fail up front with the plugin's own infoLog, exactly like the sibling dropdown guards after the input parses.
     if(!['mkv', 'mp4'].includes(dstContainer))
-        failFile('Somehow invalid container option provided (expected mkv or mp4). Check your settings!');
+        failFile(`[container=${dstContainer}] invalid value, check your settings`);
     response.container = `.${dstContainer}`;
 
     // Recovery modes: two symptom dropdowns, each disabled/light/aggressive. light = no-data-loss flags only; aggressive adds the side-effect ones.
@@ -687,31 +693,31 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const knownFill = fk === 'und' || fk === 'mul' || fk === 'zxx' || fk === 'mis' || /^q[a-t][a-z]$/.test(fk)
             || (() => { try { return !!new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }).of(fk); } catch (e) { return false; } })();
         if(!knownFill)
-            failFile(`language_fill "${inputs.language_fill}" is not a recognised language. Use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz).`);
+            failFile(`[language_fill=${inputs.language_fill}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
     }
     // If fillLanguage is set it should be a track that's kept (checked per-type so one type can legitimately exclude it).
     if(fillLanguage && subLanguage.length > 0 && !subLangKeys.includes(langKey(fillLanguage)))
-        failFile(`You have specified that blank tracks should be tagged as ${fillLanguage}. You have not included it in language_sub which indirectly will remove untagged subtitle streams.`);
+        failFile(`[language_fill=${fillLanguage}] not in language_sub - untagged subtitle streams would be removed; add it to language_sub or clear language_fill`);
     if(fillLanguage && audioLanguage.length > 0 && !audioLangKeys.includes(langKey(fillLanguage)))
-        failFile(`You have specified that blank tracks should be tagged as ${fillLanguage}. You have not included it in language_audio which indirectly will remove untagged audio streams.`);
+        failFile(`[language_fill=${fillLanguage}] not in language_audio - untagged audio streams would be removed; add it to language_audio or clear language_fill`);
     if(!['disabled', 'subtitle', 'audio', 'both'].includes(removeAccessible))
-        failFile(`Somehow invalid remove_accessibility option provided. Check your settings!`);
+        failFile(`[remove_accessibility=${removeAccessible}] invalid value, check your settings`);
     if(!['disabled', 'audio', 'subtitle', 'both'].includes(tagDisposition))
-        failFile(`Somehow invalid tag_disposition option provided. Check your settings!`);
+        failFile(`[tag_disposition=${tagDisposition}] invalid value, check your settings`);
     if(!['disabled', 'audio', 'subtitle', 'both'].includes(tagTitle))
-        failFile(`Somehow invalid tag_title option provided. Check your settings!`);
+        failFile(`[tag_title=${tagTitle}] invalid value, check your settings`);
     if(!['disabled', 'invalid', 'strict'].includes(tagLanguage))
-        failFile(`Somehow invalid tag_language option provided. Check your settings!`);
+        failFile(`[tag_language=${tagLanguage}] invalid value, check your settings`);
     if(!['639-2/b', '639-2/t', 'container', 'bcp47'].includes(methodTagLanguage))
-        failFile(`Somehow invalid method_tag_language option provided. Check your settings!`);
+        failFile(`[method_tag_language=${methodTagLanguage}] invalid value, check your settings`);
     if(!['disabled', 'light', 'aggressive'].includes(recoverTs))
-        failFile(`Somehow invalid recover_bad_timestamps option provided. Check your settings!`);
+        failFile(`[recover_bad_timestamps=${recoverTs}] invalid value, check your settings`);
     if(!['disabled', 'light', 'aggressive'].includes(recoverData))
-        failFile(`Somehow invalid recover_bad_data option provided. Check your settings!`);
+        failFile(`[recover_bad_data=${recoverData}] invalid value, check your settings`);
     if(!['disabled', 'enabled'].includes(guardOriginal))
-        failFile(`Somehow invalid guard_original option provided. Check your settings!`);
+        failFile(`[guard_original=${guardOriginal}] invalid value, check your settings`);
     if(!['unsupported', 'all', 'export'].includes(removeImageSubs))
-        failFile(`Somehow invalid remove_imagesubs option provided. Check your settings!`);
+        failFile(`[remove_imagesubs=${removeImageSubs}] invalid value, check your settings`);
 
     // ====== LANGUAGE TAG CANONICALIZATION ======
     // Write-side helpers: this is the only plugin that WRITES container language tags via tag_language/language_fill; langKey/langListMatch (matching) are shared, the
@@ -792,7 +798,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Language tag to WRITE for a kept video/audio/subtitle stream, plus the language to filter on. Blank container tag + language_fill (audio/subtitle only):
     // fill it (canonical when tag_language on, else raw fill). Non-blank: canonicalise per tag_language (invalid = only tags storesCleanly rejects; strict =
     // every tag). und/non-language is never written and und-fill is skipped, so it can't perpetually re-remux. Returns { workLang, meta, log }.
-    const canonicalLangMeta = (typeLetter, perTypeIdx, ffstream, streamIdx, typeName, allowFill) => {
+    const canonicalLangMeta = (typeLetter, perTypeIdx, ffstream, typeName, allowFill) => {
         const rawTag = (ffstream.tags?.language || '').trim();
         const sl = resolveLang(ffstream);
         const blank = !sl || sl === 'und';
@@ -809,8 +815,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const compareTo = blank ? '' : rawTag;
         if (!desired || desired === compareTo) return { workLang, meta: '', log: '' };
         const log = blank
-            ? `☐Language blank on ${typeName} stream ${streamIdx} - setting to "${desired}"\n`
-            : `☐Standardise ${typeName} language on stream ${streamIdx} - "${rawTag}" to "${desired}"\n`;
+            ? `☐${streamTag(ffstream.index)}[language_fill=${fillLanguage}] Language blank on ${typeName} stream - setting to "${desired}"\n`
+            : `☐${streamTag(ffstream.index)}[tag_language=${tagLanguage}] Standardise ${typeName} language - "${rawTag}" to "${desired}"\n`;
         return { workLang, meta: ` -metadata:s:${typeLetter}:${perTypeIdx} "language=${escMeta(desired)}"`, log };
     };
     // ====== END LANGUAGE TAG CANONICALIZATION ======
@@ -998,7 +1004,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Check if file is a video. If it isn't then exit plugin. This benign skip (processFile:false) must precede the per-file CONTENT checks below - the
     // language_fill_fail pre-check can failFile (quarantine), and a non-video file the plugin only means to skip must never be routed to the error queue.
     if (file.fileMedium !== 'video') {
-        response.infoLog += '☑File is not a video. \n';
+        response.infoLog += '☑File is not a video\n';
         response.processFile = false;
         return response;
     }
@@ -1060,12 +1066,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const untaggedAudio = streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s) && !removedByAccess(s, 'audio')
             && (audioSurvivesFilter || (guardRescuesUntagged && hasDisposition(s, 'original')))).length;
         if (untaggedAudio > 1)
-            failFile(`${untaggedAudio} audio streams have no language tag${fillNote} — they may be different languages. Tag them manually and requeue or set language_fill_fail to false.`);
+            failFile(`[language_fill_fail=true] ${untaggedAudio} audio streams have no language tag${fillNote} - may be different languages; tag them manually and requeue, or set language_fill_fail=false`);
         const untaggedSubs = keptByLangFilter(subLangKeys)
             ? streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'subtitle'
                 && !subDroppedAnyReason((s.codec_name || '').toLowerCase()) && isUntagged(s) && !removedByAccess(s, 'subtitle')).length : 0;
         if (untaggedSubs > 1)
-            failFile(`${untaggedSubs} subtitle streams have no language tag${fillNote} — they may be different languages. Tag them manually and requeue or set language_fill_fail to false.`);
+            failFile(`[language_fill_fail=true] ${untaggedSubs} subtitle streams have no language tag${fillNote} - may be different languages; tag them manually and requeue, or set language_fill_fail=false`);
     }
 
     // Set up required variables.
@@ -1114,10 +1120,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // busy-title, comment removal) stay inline; wipeReason carries video's extra "problems for titles in mkv" note so the log stays byte-identical.
             const emitHandlerMeta = (typeLetter, idx, typeWord, handlerName, wipeReason = '') => {
                 if (dstContainer === 'mkv' && ffstream.tags?.handler_name) {
-                    workDone += `☐Wiping handler_name tag from ${i}${wipeReason} (${typeWord}) "${logSafe(ffstream.tags?.handler_name)}"\n`;
+                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Wiping handler_name tag${wipeReason} (${typeWord}) "${logSafe(ffstream.tags?.handler_name)}"\n`;
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "handler_name="`;
                 } else if (dstContainer === 'mp4' && ffstream.tags?.handler_name !== handlerName) {
-                    workDone += `☐Setting handler_name tag from ${i} (${typeWord}) to ${handlerName} "${logSafe(ffstream.tags?.handler_name)}"\n`;
+                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Setting handler_name tag (${typeWord}) to ${handlerName} "${logSafe(ffstream.tags?.handler_name)}"\n`;
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "handler_name=${handlerName}"`;
                 }
             };
@@ -1136,30 +1142,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         const sc = IMAGE_SUB[ffstreamCodec];   // { ext, fmt } - .mks needs an explicit -f matroska; .sup auto-detects from the extension
                         const sidecarName = imageSidecarName(ffstream, sc.ext);
                         sidecarOut += ` -map 0:${ffstream.index} -c:s copy -f ${sc.fmt} "${path.join(libDir, sidecarName)}"`;
-                        workDone += `☐Export image subtitle stream ${i} -> ${sidecarName} for external OCR (before drop)\n`;
+                        workDone += `☐${streamTag(ffstream.index)}[remove_imagesubs=export] Export image subtitle -> ${sidecarName} for external OCR (before drop)\n`;
                     }
-                    workDone += `☐Remove stream ${i} - image-based subtitle, remove_imagesubs=${removeImageSubs} (${ffstreamType}-${ffstreamCodec})\n`;
+                    workDone += `☐${streamTag(ffstream.index)}[remove_imagesubs=${removeImageSubs}] Remove image-based subtitle (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
                 } else if (subFormatDropped(ffstreamCodec)) {
-                    // Container/format can't carry it (image subs on mp4, or xsub/ttml/eia_608/dvb_teletext / mp4 arib/hdmv_text) - dropped regardless of remove_imagesubs.
-                    workDone += `☐Remove stream ${i} - unsupported (${ffstreamType}-${ffstreamCodec})\n`;
+                    // Container/format can't carry it. alwaysDropSubs (eia_608/ttml/xsub/dvb_teletext) drop in ANY container - no setting governs them, so no tag; the
+                    // rest (image subs, arib/hdmv_text on mp4) drop only because of the chosen container, so they carry [container=<dst>].
+                    const dropCause = alwaysDropSubs.includes(ffstreamCodec) ? '' : `[container=${dstContainer}]`;
+                    workDone += `☐${streamTag(ffstream.index)}${dropCause} Remove unsupported (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
                 }
 
                 if (!delStream) {
                     // Fill a blank language and/or standardise the tag (tag_language) before deciding whether to remove it.
                     {
-                        const lm = canonicalLangMeta('s', subtitleStreamIndex, ffstream, i, 'subtitle', true);
+                        const lm = canonicalLangMeta('s', subtitleStreamIndex, ffstream, 'subtitle', true);
                         workLang = lm.workLang;
                         if (lm.meta) { workDone += lm.log; metadataCommand += lm.meta; }
                     }
 
                     //If the subtitle is a language that should be removed then remove it regardless of other settings.
                     if(subLanguage.length > 0 && !langListMatch(workLang, subLangKeys)) {
-                        workDone += `☐Remove stream ${i} - subtitle language (${streamLang})\n`;
+                        workDone += `☐${streamTag(ffstream.index)}[language_sub=${inputs.language_sub}] Remove subtitle language (${streamLang})\n`;
                         delStream = true;
                     } else if (applies(removeAccessible, 'subtitle') && isSdh(ffstream) && hasPlainSameLang(plainSubLangs, workLang)) {
-                        workDone += `☐Remove stream ${i} - accessibility subtitle SDH/CC (${logSafe(roleTextLower(ffstream))})\n`;
+                        workDone += `☐${streamTag(ffstream.index)}[remove_accessibility=${removeAccessible}] Remove accessibility subtitle SDH/CC (${logSafe(roleTextLower(ffstream))})\n`;
                         delStream = true;
                     }
                 }
@@ -1175,45 +1183,50 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 //Remove surrounding whitespace, single/double quotes (no reason for them). Busy-title clearing happens after tag_disposition (below).
                 let newStreamTitle = cleanStreamTitle(streamTitle);
+                const titleCauses = [];   // the settings that actually changed the title, for a compound [tag]; empty = automatic whitespace/quote trim (no setting)
 
                 //tag_disposition: import any surfaced disposition keyword found in the title into the real flag (additive so existing flags are kept).
                 if(applies(tagDisposition, 'subtitle')) {
                     const promote = dispositionsToPromote(ffstream, 'subtitle');
                     if(promote.length > 0) {
-                        workDone += `☐Set disposition on stream ${i} (subtitle) from title - ${promote.map(k => dispositionTypes[k].tag).join(' ')}\n`;
+                        workDone += `☐${streamTag(ffstream.index)}[tag_disposition=${tagDisposition}] Set disposition (subtitle) from title - ${promote.map(k => dispositionTypes[k].tag).join(' ')}\n`;
                         metadataCommand += ` -disposition:s:${subtitleStreamIndex} ${promote.map(k => `+${k}`).join('')}`;
                     }
                 }
 
                 //Busy-title removal: now that tag_disposition (above) has captured any role keywords into the real flags, clear an over-dotted title so
                 //tag_title (below) re-names it by the usual rules - it drops in and is treated exactly as a blank title would be.
-                if(metaBusyTitleRemove && tooManyPeriods(newStreamTitle))
+                if(metaBusyTitleRemove && tooManyPeriods(newStreamTitle)) {
                     newStreamTitle = '';
+                    titleCauses.push('remove_busytitle=true');
+                }
 
                 //tag_title (subtitle): titles we own (empty/role-only, incl. a just-cleared busy title) get the role tag(s). Custom titles are left untouched.
                 if(applies(tagTitle, 'subtitle')) {
                     const tags = titleTagsFor(ffstream);
-                    if(tags.length > 0 && !stripDispositionWords(newStreamTitle))
+                    if(tags.length > 0 && !stripDispositionWords(newStreamTitle)) {
                         newStreamTitle = tags.join(' ');
+                        titleCauses.push(`tag_title=${tagTitle}`);
+                    }
                 }
 
                 //We trimmed the title above so if it contains newlines or spaces they'll be removed. Make sure title is set at both metadata and stream levels
                 if(newStreamTitle !== streamTitle)
                 {
-                    workDone += `☐Change title of stream ${i} (subtitle) from "${logSafe(streamTitle)}" to "${logSafe(newStreamTitle)}"\n`;
+                    workDone += `☐${streamTag(ffstream.index)}${titleCauses.length ? `[${titleCauses.join('][')}]` : ''} Change title (subtitle) "${logSafe(streamTitle)}" -> "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${escMeta(newStreamTitle)}"`;
                 // Reconcile ONLY when the ffprobe tag is missing but mediaInfo has a title: the write adds the ffprobe tag so both probes agree next pass. The reverse
                 // (ffprobe has a title mediaInfo never reports) must NOT fire, or a container that never surfaces Title to mediaInfo would remux every pass.
                 } else if(ffmedia && !(ffstream.tags?.title) && (ffmedia.Title ?? '') !== '')
                 {
-                    workDone += `☐Change title of stream ${i} (subtitle) - Found "${logSafe(ffstream.tags?.title ?? '')}" and "${logSafe(ffmedia?.Title ?? '')}" change to "${logSafe(newStreamTitle)}"\n`;
+                    workDone += `☐${streamTag(ffstream.index)} Change title (subtitle) - found "${logSafe(ffstream.tags?.title ?? '')}" and "${logSafe(ffmedia?.Title ?? '')}" change to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "title=${escMeta(newStreamTitle)}"`;
                 }
 
                 emitHandlerMeta('s', subtitleStreamIndex, 'subtitle', 'SubtitleHandler');
 
                 if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
-                    workDone += `☐Remove comment from stream ${i} (subtitle) "${logSafe(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
+                    workDone += `☐${streamTag(ffstream.index)}[remove_comments=true] Remove comment (subtitle) "${logSafe(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
                     metadataCommand += ` -metadata:s:s:${subtitleStreamIndex} "comment="`;
                 }
 
@@ -1222,7 +1235,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //      (microdvd, mpl2, jacosub, sami, realtext, subviewer, vplayer, pjs) have NO Matroska CodecID either, so a bare -c copy would fail the whole
                 //      remux — ffmpeg decodes them as text, so convert to srt too. xsub has no CodecID and is not decodable text, so it is dropped above (alwaysDropSubs).
                 if((dstContainer === 'mkv') && ['mov_text', ...legacyTextSubs].includes(ffstreamCodec)) {
-                    workDone += `☐Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} subtitle to srt\n`;
+                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Unsupported codec - converting ${ffstreamCodec} subtitle to srt\n`;
                     extraArguments += metadataCommand+` -c:s:${subtitleStreamIndex} srt`;
                     subCodecOverride.set(ffstream.index, 'srt');
                     convert = true;
@@ -1233,7 +1246,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //      webvtt/text) plus the legacy PC/fansub formats (microdvd, mpl2, jacosub, sami, realtext, subviewer, vplayer, pjs) that ffmpeg decodes as
                 //      text; without this they would hit the bare -c copy and fail the whole remux. text is raw UTF-8 that ffmpeg normalises to subrip on mux.
                 if((dstContainer === 'mp4') && ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'text', ...legacyTextSubs].includes(ffstreamCodec)) {
-                    workDone += `☐Codec unsupported for ${dstContainer} in ${i} - converting ${ffstreamCodec} subtitle to mov_text\n`;
+                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Unsupported codec - converting ${ffstreamCodec} subtitle to mov_text\n`;
                     extraArguments += metadataCommand+` -c:s:${subtitleStreamIndex} mov_text`;
                     subCodecOverride.set(ffstream.index, 'mov_text');
                     convert = true;
@@ -1251,7 +1264,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 // Fill a blank language and/or standardise the tag (tag_language) before deciding whether to remove it.
                 {
-                    const lm = canonicalLangMeta('a', audioStreamIndex, ffstream, i, 'audio', true);
+                    const lm = canonicalLangMeta('a', audioStreamIndex, ffstream, 'audio', true);
                     workLang = lm.workLang;
                     if (lm.meta) { workDone += lm.log; metadataCommand += lm.meta; }
                 }
@@ -1261,14 +1274,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const guardedOriginal = guardOriginal === 'enabled' && audioLanguage.length > 0
                     && !langListMatch(workLang, audioLangKeys) && hasDisposition(ffstream, 'original');
                 if(guardedOriginal)
-                    workDone += `☑Keep stream ${i} - original-language audio protected by guard_original (${streamLang})\n`;
+                    workDone += `☑${streamTag(ffstream.index)}[guard_original=${guardOriginal}] Keep original-language audio (${streamLang})\n`;
 
                 //If the audio is a language that should be removed then remove it regardless of other settings.
                 if(audioLanguage.length > 0 && !langListMatch(workLang, audioLangKeys) && !guardedOriginal) {
-                    workDone += `☐Remove stream ${i} - audio language (${streamLang})\n`;
+                    workDone += `☐${streamTag(ffstream.index)}[language_audio=${inputs.language_audio}] Remove audio language (${streamLang})\n`;
                     delStream = true;
                 } else if (applies(removeAccessible, 'audio') && isDescriptive(ffstream) && hasPlainSameLang(plainAudioLangs, workLang)) {
-                    workDone += `☐Remove stream ${i} - audio description (${logSafe(roleTextLower(ffstream))})\n`;
+                    workDone += `☐${streamTag(ffstream.index)}[remove_accessibility=${removeAccessible}] Remove audio description (${logSafe(roleTextLower(ffstream))})\n`;
                     delStream = true;
                 }
 
@@ -1283,46 +1296,51 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 //Remove surrounding whitespace, single/double quotes (no reason for them). Busy-title clearing happens after tag_disposition (below).
                 let newStreamTitle = cleanStreamTitle(streamTitle);
+                const titleCauses = [];   // the settings that actually changed the title, for a compound [tag]; empty = automatic whitespace/quote trim (no setting)
 
                 //tag_disposition: import any surfaced disposition keyword found in the title into the real flag (additive so existing flags are kept).
                 if(applies(tagDisposition, 'audio')) {
                     const promote = dispositionsToPromote(ffstream, 'audio');
                     if(promote.length > 0) {
-                        workDone += `☐Set disposition on stream ${i} (audio) from title - ${promote.map(k => dispositionTypes[k].tag).join(' ')}\n`;
+                        workDone += `☐${streamTag(ffstream.index)}[tag_disposition=${tagDisposition}] Set disposition (audio) from title - ${promote.map(k => dispositionTypes[k].tag).join(' ')}\n`;
                         metadataCommand += ` -disposition:a:${audioStreamIndex} ${promote.map(k => `+${k}`).join('')}`;
                     }
                 }
 
                 //Busy-title removal: now that tag_disposition (above) has captured any role keywords into the real flags, clear an over-dotted title so
                 //tag_title (below) re-names it by the usual rules - it drops in and is treated as a blank title (an empty base becomes the channel label).
-                if(metaBusyTitleRemove && tooManyPeriods(newStreamTitle))
+                if(metaBusyTitleRemove && tooManyPeriods(newStreamTitle)) {
                     newStreamTitle = '';
+                    titleCauses.push('remove_busytitle=true');
+                }
 
                 //tag_title (audio): rebuilds the title as a channel/downmix base (only when we own it - see bareChannelRegex/downmixChannelRegex) plus a
                 //disposition suffix. The suffix reads each role from the shared classifiers (real flag OR title keyword, via hasDisposition), so a title-only
                 //role like "5.1 Commentary" normalises to "5.1 - Commentary" and survives the reformat even when tag_disposition is off (that setting only
                 //governs whether the role is also promoted into a real flag, above). Shared canonicalAudioTitle - audio_clean names its downmixes the same way.
                 const audioCh = applies(tagTitle, 'audio') ? resolveChannels(ffstream) : 0;
-                if(audioCh)
-                    newStreamTitle = canonicalAudioTitle(newStreamTitle, channelLabel(audioCh, layoutHasLfe(ffstream)), titleTagsFor(ffstream));
+                if(audioCh) {
+                    const rebuilt = canonicalAudioTitle(newStreamTitle, channelLabel(audioCh, layoutHasLfe(ffstream)), titleTagsFor(ffstream));
+                    if(rebuilt !== newStreamTitle) { newStreamTitle = rebuilt; titleCauses.push(`tag_title=${tagTitle}`); }
+                }
 
                 //We trimmed the title above so newlines/spaces are removed. Ensure they're escaped before passing it to the command line.
                 if(newStreamTitle !== streamTitle)
                 {
-                    workDone += `☐Change title of stream ${i} (audio) from "${logSafe(streamTitle)}" to "${logSafe(newStreamTitle)}"\n`;
+                    workDone += `☐${streamTag(ffstream.index)}${titleCauses.length ? `[${titleCauses.join('][')}]` : ''} Change title (audio) "${logSafe(streamTitle)}" -> "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${escMeta(newStreamTitle)}"`;
                 // Reconcile ONLY when the ffprobe tag is missing but mediaInfo has a title: the write adds the ffprobe tag so both probes agree next pass. The reverse
                 // (ffprobe has a title mediaInfo never reports) must NOT fire, or a container that never surfaces Title to mediaInfo would remux every pass.
                 } else if(ffmedia && !(ffstream.tags?.title) && (ffmedia.Title ?? '') !== '')
                 {
-                    workDone += `☐Change title of stream ${i} (audio) - Found "${logSafe(ffstream.tags?.title ?? '')}" and "${logSafe(ffmedia?.Title ?? '')}" change to "${logSafe(newStreamTitle)}"\n`;
+                    workDone += `☐${streamTag(ffstream.index)} Change title (audio) - found "${logSafe(ffstream.tags?.title ?? '')}" and "${logSafe(ffmedia?.Title ?? '')}" change to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "title=${escMeta(newStreamTitle)}"`;
                 }
 
                 emitHandlerMeta('a', audioStreamIndex, 'audio', 'SoundHandler');
 
                 if((metaCommentRemove === true) && (ffstream.tags?.comment || ffmedia?.Comment)) {
-                    workDone += `☐Remove comment from audio stream ${i} (audio) "${logSafe(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
+                    workDone += `☐${streamTag(ffstream.index)}[remove_comments=true] Remove comment (audio) "${logSafe(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
                     metadataCommand += ` -metadata:s:a:${audioStreamIndex} "comment="`;
                 }
 
@@ -1337,7 +1355,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 const isImageCodec = IMAGE_CODECS.includes(ffstreamCodec);
                 if (isCoverArt(ffstream)) {
-                    workDone += `☐Remove stream ${i} - ${isImageCodec ? 'image' : 'cover-art/thumbnail'} stream (${ffstreamType}-${ffstreamCodec})\n`;
+                    workDone += `☐${streamTag(ffstream.index)} Remove ${isImageCodec ? 'image' : 'cover-art/thumbnail'} (${ffstreamType}-${ffstreamCodec})\n`;
                     extraArguments += ` -map -0:${ffstream.index}`;
                     removedIndices.add(ffstream.index);
                     convert = true;
@@ -1348,25 +1366,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 // Standardise the video language tag (tag_language): video carries the same mdhd language field, so e.g. a 2-letter code is dropped by mp4.
                 {
-                    const lm = canonicalLangMeta('v', videoStreamIndex, ffstream, i, 'video', false);
+                    const lm = canonicalLangMeta('v', videoStreamIndex, ffstream, 'video', false);
                     if (lm.meta) { workDone += lm.log; metadataCommand += lm.meta; }
                 }
 
                 // HEVC in mp4 must carry the hvc1 fourcc or Apple/QuickTime won't decode it - a plain remux writes hev1. Tag the retained HEVC video stream
                 // when the output is mp4 and it isn't already hvc1: this converges after one heal (an already-hvc1 file is a no-op, never a perpetual remux).
                 if (dstContainer === 'mp4' && ffstreamCodec === 'hevc' && (ffstream.codec_tag_string || '').toLowerCase() !== 'hvc1') {
-                    workDone += `☐Tag stream ${i} (video) as hvc1 - HEVC-in-mp4 needs the hvc1 fourcc for Apple/QuickTime playback\n`;
+                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Tag video as hvc1 - HEVC-in-mp4 needs the hvc1 fourcc for Apple/QuickTime playback\n`;
                     extraArguments += ` -tag:v:${videoStreamIndex} hvc1`;
                     convert = true;
                 }
 
                 if(metaCommentRemove === true && (ffstream.tags?.comment || ffmedia?.Comment)) {
-                    workDone += `☐Remove comment from stream ${i} (video) "${logSafe(ffstream.tags?.comment ?? ffmedia?.Comment ?? '')}"\n`;
+                    workDone += `☐${streamTag(ffstream.index)}[remove_comments=true] Remove comment (video) "${logSafe(ffstream.tags?.comment ?? ffmedia?.Comment ?? '')}"\n`;
                     metadataCommand += ` -metadata:s:v:${videoStreamIndex} "comment="`;
                 }
 
                 if(metaBusyTitleRemove === true && (tooManyPeriods(ffstream.tags?.title ?? '') || tooManyPeriods(ffmedia?.Title ?? ''))) {
-                    workDone += `☐Remove title from stream ${i} (video) "${logSafe((ffstream.tags?.title ?? '').trim())}" and "${logSafe((ffmedia?.Title ?? '').trim())}"\n`;
+                    workDone += `☐${streamTag(ffstream.index)}[remove_busytitle=true] Remove title (video) "${logSafe((ffstream.tags?.title ?? '').trim())}" and "${logSafe((ffmedia?.Title ?? '').trim())}"\n`;
                     metadataCommand += ` -metadata:s:v:${videoStreamIndex} "title="`;
                 }
 
@@ -1380,7 +1398,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             } else if(ffstreamType === 'attachment') {
                 const kind = attachmentKind(ffstream);
                 if (kind === 'image') {
-                    workDone += `☐Remove stream ${i} - cover-art attachment (${ffstreamType}-${ffstreamCodec})\n`;
+                    workDone += `☐${streamTag(ffstream.index)} Remove cover-art attachment (${ffstreamType}-${ffstreamCodec})\n`;
                     extraArguments += ` -map -0:${ffstream.index}`;
                     removedIndices.add(ffstream.index);
                     convert = true;
@@ -1393,7 +1411,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 // 'other' - unidentifiable attachment, leave it untouched (see attachmentKind).
             } else if ((ffstreamType === 'data') || ['data','bin_data','tmcd'].includes(ffstreamCodec)) {
-                workDone += `☐Remove stream ${i} - data stream (${ffstreamType}-${ffstreamCodec})\n`;
+                workDone += `☐${streamTag(ffstream.index)} Remove data stream (${ffstreamType}-${ffstreamCodec})\n`;
                 extraArguments += ` -map -0:${ffstream.index}`;
                 removedIndices.add(ffstream.index);
                 convert = true;
@@ -1419,7 +1437,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 for (const idx of deferredFontIndices) {
                     const fontStream = file.ffProbeData.streams.find(s => s.index === idx);
                     const fname = (fontStream?.tags?.filename || '').trim();
-                    workDone += `☐Remove stream ${idx} - orphaned font attachment (no ASS/SSA subtitle uses it)${fname ? ` "${logSafe(fname)}"` : ''}\n`;
+                    workDone += `☐${streamTag(idx)} Remove orphaned font attachment (no ASS/SSA subtitle uses it)${fname ? ` "${logSafe(fname)}"` : ''}\n`;
                     extraArguments += ` -map -0:${idx}`;
                     removedIndices.add(idx);
                     convert = true;
@@ -1428,27 +1446,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         if(videoDropped > 0 && videoStreamIndex === -1)
-            failFile('Removing specified streams would leave the file without any video streams. Check to make sure file contains valid streams.');
+            failFile('Removing the specified streams would leave the file with no video streams - check your removal settings');
 
         if(audioDropped > 0 && audioStreamIndex === -1)
-            failFile('Removing specified streams would leave the file without any audio streams. Check to make sure file contains valid streams.');
+            failFile('Removing the specified streams would leave the file with no audio streams - check your removal settings');
 
         //Now the file level metadata can be cleaned up if needed.
         if((metaCommentRemove === true) && file.ffProbeData.format?.tags?.comment) {
-            workDone += `☐Remove comment from file "${logSafe(file.ffProbeData.format?.tags?.comment)}"\n`;
+            workDone += `☐[remove_comments=true] Remove comment from file "${logSafe(file.ffProbeData.format?.tags?.comment)}"\n`;
             extraArguments += ` -metadata "comment="`;
             convert = true;
         }
 
         if((metaBusyTitleRemove === true) && tooManyPeriods(file.ffProbeData.format?.tags?.title ?? '')) {
-            workDone += `☐Remove title from file "${logSafe((file.ffProbeData.format?.tags?.title ?? '').trim())}"\n`;
+            workDone += `☐[remove_busytitle=true] Remove title from file "${logSafe((file.ffProbeData.format?.tags?.title ?? '').trim())}"\n`;
             extraArguments += ` -metadata "title="`;
             convert = true;
         }
 
         //Check if remuxing is required due to container change
         if (srcContainer !== dstContainer) {
-            workDone += `☐Remux file (${srcContainer}->${dstContainer})\n`;
+            workDone += `☐[container=${dstContainer}] Remux file from ${srcContainer}\n`;
             convert = true;
         }
 
@@ -1529,8 +1547,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.processFile = true;
         } else {
             if (recoverRequested && intentMatches)
-                response.infoLog += `☑Already recovered with these options (awk_recovered=${recoveredTag}) - skipping to avoid reprocessing. Change a recover_bad_* mode to run again.\n`;
-            response.infoLog += `☑File is already ${dstContainer} and contains no streams requiring removal or conversion.\n`;
+                response.infoLog += `☑Already recovered with these options (awk_recovered=${recoveredTag}) - skipping to avoid reprocessing; change a recover_bad_* mode to run again\n`;
+            response.infoLog += `☑File is already ${dstContainer} and contains no streams requiring removal or conversion\n`;
             response.processFile = false;
         }
         return response;

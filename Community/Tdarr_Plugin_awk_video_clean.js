@@ -12,7 +12,7 @@ const details = () => ({
                      -HDR-aware (method_hdr): preserves static HDR10/HLG; by default leaves Dolby Vision / HDR10+ untouched (dynamic metadata can't survive a re-encode), can strip just the dynamic layer, or GPU-tonemap all HDR down to SDR (one consistent look across NVIDIA/Intel/AMD/Apple nodes) for SDR-only playback.\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '2.3.0',
+    Version: '2.4.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -475,6 +475,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ffmpeg 7.x which auto-sizes the queue, but cheap insurance); -flush_packets 0 buffers muxer writes instead of flushing per packet - the throughput-
     // optimal choice for FILE muxing (helps high-latency/network temp storage, negligible cost when local), so it is always applied, not exposed as a toggle.
     const globalOutputOpt = ' -max_muxing_queue_size 9999 -flush_packets 0';
+
+    // -=-=-= streamTag  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // infoLog stream tag: the SOURCE ffprobe index of the stream a line concerns, as a fixed 5-char field so columns line up ([s 0],[s 9],[s10],[s99];
+    // an index >=100 widens to [s100]). Sits right after the status symbol, before any [input=value] tag. Used only where a line is about ONE source
+    // stream - omitted on whole-file summaries and on brand-new/appended streams (imports, downmix appends) that have no source index of their own.
+    const streamTag = (index) => `[s${String(index).padStart(2, ' ')}]`;
     // ===== END SHARED: stream / language / preset helpers =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
@@ -648,16 +654,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (family === 'cpu') break;   // reached the fallback
             const encoderName = ENCODER_NAME[codec][family];
             if (!encoderName) {   // e.g. AV1 has no videotoolbox encoder
-                if (encoderOpt === family) notes.push(`☒${family} has no ${codec} encoder; using ${ENCODER_NAME[codec].cpu}.\n`);
+                if (encoderOpt === family) notes.push(`☒[encoder=${encoderOpt}] no ${codec} encoder for this family; using ${ENCODER_NAME[codec].cpu}\n`);
                 continue;
             }
             if (!cap.encoders.has(encoderName)) {   // ffmpeg build doesn't ship it (e.g. no nvenc in the Mac build)
-                if (encoderOpt === family) notes.push(`☒${encoderName} is not in this ffmpeg build on this node; using ${ENCODER_NAME[codec].cpu}.\n`);
+                if (encoderOpt === family) notes.push(`☒[encoder=${encoderOpt}] ${encoderName} is not in this ffmpeg build on this node; using ${ENCODER_NAME[codec].cpu}\n`);
                 continue;
             }
             const presence = presenceOf(family, cap, platform);
             if (presence === 'no') {
-                if (encoderOpt === family) notes.push(`☒${family} hardware not detected on this node; using ${ENCODER_NAME[codec].cpu}.\n`);
+                if (encoderOpt === family) notes.push(`☒[encoder=${encoderOpt}] hardware not detected on this node; using ${ENCODER_NAME[codec].cpu}\n`);
                 continue;
             }
             // Confirm with one probe when presence is ambiguous, and always for AV1 hardware (generation can't be inferred).
@@ -666,17 +672,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const probeIn = family === 'vaapi' ? '-vaapi_device /dev/dri/renderD128' : '';
                 const probeFilter = family === 'vaapi' ? 'format=nv12,hwupload' : '';
                 if (!confirm(encoderName, probeIn, probeFilter)) {
-                    if (encoderOpt === family) notes.push(`☒${encoderName} did not initialise on this node; using ${ENCODER_NAME[codec].cpu}.\n`);
+                    if (encoderOpt === family) notes.push(`☒[encoder=${encoderOpt}] ${encoderName} did not initialise on this node; using ${ENCODER_NAME[codec].cpu}\n`);
                     continue;
                 }
             }
-            notes.push(`☐Encoder: ${encoderName} (${encoderOpt === 'auto' ? 'auto' : 'forced'}, ${platform}${isGpuWorker ? ' gpu-worker' : ''}).\n`);
+            notes.push(`☐[encoder=${encoderOpt}] Encoder: ${encoderName} (${platform}${isGpuWorker ? ' gpu-worker' : ''})\n`);
             return { family, encoderName, notes };
         }
 
-        if (encoderOpt === 'auto' && !isGpuWorker) notes.push(`☐Encoder: ${ENCODER_NAME[codec].cpu} (auto, CPU worker).\n`);
-        else if (encoderOpt === 'auto') notes.push(`☐Encoder: ${ENCODER_NAME[codec].cpu} (auto, no usable GPU encoder on this node).\n`);
-        else if (encoderOpt === 'cpu') notes.push(`☐Encoder: ${ENCODER_NAME[codec].cpu} (forced cpu, ${platform}${isGpuWorker ? ' gpu-worker' : ''}).\n`);
+        if (encoderOpt === 'auto' && !isGpuWorker) notes.push(`☐[encoder=${encoderOpt}] Encoder: ${ENCODER_NAME[codec].cpu} (CPU worker)\n`);
+        else if (encoderOpt === 'auto') notes.push(`☐[encoder=${encoderOpt}] Encoder: ${ENCODER_NAME[codec].cpu} (no usable GPU encoder on this node)\n`);
+        else if (encoderOpt === 'cpu') notes.push(`☐[encoder=${encoderOpt}] Encoder: ${ENCODER_NAME[codec].cpu} (${platform}${isGpuWorker ? ' gpu-worker' : ''})\n`);
         return cpuChoice();
     };
 
@@ -787,7 +793,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Bail out gracefully on missing/partial probe data rather than a TypeError on the first streams access.
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
-        failFile('No ffProbe stream data available for this file - the plugin cannot process it.');
+        failFile('No ffProbe stream data available for this file - the plugin cannot process it');
 
     // Parse inputs (scope -> tuning -> encoder -> guards). Numeric inputs are free text (parsed + range-checked);
     // only type:'string' dropdowns get an option guard (booleans are coerced by loadDefaultValues, so a guard is dead code).
@@ -801,7 +807,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     const parseQuality = (v, name) => {
         const n = Number(String(v).trim());
-        if (!Number.isFinite(n) || n < 0 || n > 63) failFile(`${name} must be a number between 0 and 63. Check your settings!`);
+        if (!Number.isFinite(n) || n < 0 || n > 63) failFile(`[${name}=${v}] must be a number between 0 and 63, check your settings`);
         return n;
     };
     const qualitySd = parseQuality(inputs.quality_sd, 'quality_sd');
@@ -810,22 +816,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const quality4k = parseQuality(inputs.quality_4k, 'quality_4k');
     const guardMinKbps = (() => {
         const n = Number(String(inputs.guard_min_bitrate).trim());
-        if (!Number.isFinite(n) || n < 0) failFile('guard_min_bitrate must be a non-negative number (kbps). Check your settings!');
+        if (!Number.isFinite(n) || n < 0) failFile(`[guard_min_bitrate=${inputs.guard_min_bitrate}] must be a non-negative number (kbps), check your settings`);
         return n;
     })();
 
-    if (!['hevc', 'h264', 'av1'].includes(codec)) failFile('Somehow invalid codec option provided. Check your settings!');
-    if (!['original', '2160', '1440', '1080', '720', '480'].includes(maxHeightOpt)) failFile('Somehow invalid max_height option provided. Check your settings!');
-    if (!['slow', 'medium', 'fast'].includes(speed)) failFile('Somehow invalid speed option provided. Check your settings!');
-    if (!['source', '8', '10'].includes(bitDepthOpt)) failFile('Somehow invalid bit_depth option provided. Check your settings!');
-    if (!['auto', 'nvenc', 'qsv', 'vaapi', 'videotoolbox', 'amf', 'cpu'].includes(encoderOpt)) failFile('Somehow invalid encoder option provided. Check your settings!');
-    if (!['preserve', 'strip_dynamic', 'tonemap_sdr'].includes(methodHdr)) failFile('Somehow invalid method_hdr option provided. Check your settings!');
+    if (!['hevc', 'h264', 'av1'].includes(codec)) failFile(`[codec=${codec}] invalid value, check your settings`);
+    if (!['original', '2160', '1440', '1080', '720', '480'].includes(maxHeightOpt)) failFile(`[max_height=${maxHeightOpt}] invalid value, check your settings`);
+    if (!['slow', 'medium', 'fast'].includes(speed)) failFile(`[speed=${speed}] invalid value, check your settings`);
+    if (!['source', '8', '10'].includes(bitDepthOpt)) failFile(`[bit_depth=${bitDepthOpt}] invalid value, check your settings`);
+    if (!['auto', 'nvenc', 'qsv', 'vaapi', 'videotoolbox', 'amf', 'cpu'].includes(encoderOpt)) failFile(`[encoder=${encoderOpt}] invalid value, check your settings`);
+    if (!['preserve', 'strip_dynamic', 'tonemap_sdr'].includes(methodHdr)) failFile(`[method_hdr=${methodHdr}] invalid value, check your settings`);
 
     // Input summary is always logged.
     response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
 
     if (file.fileMedium !== 'video') {
-        response.infoLog += '☑File is not a video.\n';
+        response.infoLog += '☑File is not a video\n';
         response.processFile = false;
         return response;
     }
@@ -835,7 +841,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const videoStreams = file.ffProbeData.streams.filter((s) => (s.codec_type || '').trim().toLowerCase() === 'video');
         const primary = videoStreams.find((s) => !isCoverArt(s));
         if (!primary) {
-            response.infoLog += '☑No encodable video stream found (cover-art / still images only). Nothing to do.\n';
+            response.infoLog += '☑No encodable video stream found (cover-art / still images only)\n';
             response.processFile = false;
             return response;
         }
@@ -869,7 +875,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const srcXfer = (primary.color_transfer || mi?.transfer_characteristics || '').toLowerCase().trim();
         const isHdr = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'].includes(srcXfer) || !!String(mi?.HDR_Format || '').trim() || isDynamicHdr;
         if (isDynamicHdr && methodHdr === 'preserve') {
-            response.infoLog += '☒Dynamic HDR (Dolby Vision / HDR10+) detected - it cannot survive a re-encode, so the file is left untouched. Set method_hdr to "strip_dynamic" to transcode (keeps the base HDR10 layer) or "tonemap_sdr" to tonemap it to SDR.\n';
+            response.infoLog += `☒${streamTag(primary.index)}[method_hdr=preserve] Dynamic HDR (Dolby Vision / HDR10+) detected - cannot survive a re-encode, left untouched; set method_hdr=strip_dynamic to transcode (keeps the base HDR10 layer) or method_hdr=tonemap_sdr to tonemap to SDR\n`;
             response.processFile = false;
             return response;
         }
@@ -903,7 +909,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const vbps = resolveStreamBitrate(primary) || 0;
             const vkbps = vbps > 0 ? Math.round(vbps / 1000) : 0;
             if (vkbps > 0 && vkbps < guardMinKbps) {
-                response.infoLog += `☑Source video bitrate ${vkbps}k is below guard_min_bitrate ${guardMinKbps}k - already efficient, leaving untouched.\n`;
+                response.infoLog += `☑${streamTag(primary.index)}[guard_min_bitrate=${guardMinKbps}] Source video bitrate ${vkbps}k is below the ${guardMinKbps}k floor - already efficient, left untouched\n`;
                 response.processFile = false;
                 return response;
             }
@@ -912,24 +918,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Decide whether a video re-encode is warranted (video-only: container-only or ordering changes are other plugins' jobs).
         const alreadyTargetCodec = srcCodecName === targetCodecName;
         const depthOk = wantTenbit === srcIs10;
-        let reason = '';
-        if (!alreadyTargetCodec) {
-            reason = `codec ${srcCodecName || 'unknown'} -> ${targetCodecName}`;
-        } else if (willDownscale) {
-            reason = `downscale ${srcHeight}p -> ${outHeight}p`;
-        } else if (!depthOk) {
-            reason = `bit depth ${srcIs10 ? '10' : '8'} -> ${wantTenbit ? '10' : '8'}`;
-        } else if (tonemap) {
-            reason = 'tonemap HDR -> SDR';
+        // Every transform that actually applies (a single transcode can satisfy several at once) → one self-describing value tag; the setting each names
+        // (codec / max_height / bit_depth / method_hdr) is obvious from the value. guard_reprocess is the exclusive fallback: it forces a re-encode only
+        // when NO transform is otherwise needed.
+        const reasonTags = [
+            !alreadyTargetCodec && targetCodecName,
+            willDownscale && `${outHeight}p`,
+            !depthOk && (wantTenbit ? '10-bit' : '8-bit'),
+            tonemap && 'tonemap_sdr',
+        ].filter(Boolean);
+        let encodeTag;
+        if (reasonTags.length > 0) {
+            encodeTag = `[${reasonTags.join('][')}]`;
         } else if (guardReprocess) {
             if (priorSig !== '' && priorSig.replace(/-v[^-]*$/, '') === videoSigCore) {   // match the settings core only; the stored -v<version> suffix is forensic, not part of the fence
-                response.infoLog += `☑Already processed by awk_video at this setting (${videoSig}). Nothing to do.\n`;
+                response.infoLog += `☑[guard_reprocess=true] Already processed by awk_video at this setting (${videoSig})\n`;
                 response.processFile = false;
                 return response;
             }
-            reason = `reprocess existing ${targetCodecName} to quality target`;
+            encodeTag = '[guard_reprocess=true]';
         } else {
-            response.infoLog += `☑Video is already ${targetCodecName}${srcHeight ? ` ${srcHeight}p` : ''}${srcIs10 ? ' 10-bit' : ''} and within limits. Nothing to do.\n`;
+            response.infoLog += `☑${streamTag(primary.index)} Video is already ${targetCodecName}${srcHeight ? ` ${srcHeight}p` : ''}${srcIs10 ? ' 10-bit' : ''} and within limits\n`;
             response.processFile = false;
             return response;
         }
@@ -941,8 +950,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Route the tonemap to the GPU filter matching this node's encoder (one consistent family across platforms), or CPU tonemapx if no GPU tonemap initialises.
         const tonemapBackend = tonemap ? resolveTonemapBackend({ family: sel.family, otherArguments }) : null;
         if (tonemap) response.infoLog += tonemapBackend === 'cpu'
-            ? '☒Tonemapping HDR -> SDR on CPU (tonemapx) - no GPU tonemap available on this node; the result may differ slightly from GPU-tonemapped nodes.\n'
-            : `☐Tonemapping HDR -> SDR via ${tonemapBackend} (GPU-accelerated).\n`;
+            ? `☒${streamTag(primary.index)}[method_hdr=tonemap_sdr] Tonemapping HDR -> SDR on CPU (tonemapx) - no GPU tonemap available on this node; result may differ slightly from GPU-tonemapped nodes\n`
+            : `☐${streamTag(primary.index)}[method_hdr=tonemap_sdr] Tonemapping HDR -> SDR via ${tonemapBackend} (GPU-accelerated)\n`;
 
         // Build the video-encode args + assemble the full preset (<input-side>,<output-side>).
         const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams });
@@ -955,7 +964,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         response.preset = `${enc.inputSide},${out}`;
         response.processFile = true;
-        response.infoLog += `☐Transcoding video: ${reason} @ ${sel.encoderName} q${Math.round(qNorm)}${wantTenbit ? ' 10-bit' : ''}.\n`;
+        response.infoLog += `☐${streamTag(primary.index)}${encodeTag} Transcoding video @ ${sel.encoderName} q${Math.round(qNorm)}\n`;
         // Predicted output summary: the re-encoded primary video token, cover-art video dropped, everything else copied unchanged.
         // Predict the re-encoded stream and render it through the shared summariseStream (single source of truth for the [video:...] token) so the Expected-results line matches
         // the input-summary format exactly; bits_per_raw_sample is set explicitly with pix_fmt/profile cleared so 8/10-bit is exact, and an unknown height is omitted (no bare "0p").

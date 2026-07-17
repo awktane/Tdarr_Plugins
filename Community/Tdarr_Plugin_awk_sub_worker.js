@@ -11,7 +11,7 @@ const details = () => ({
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them. Import ALSO recognizes fresh Plex-native sidecars with no s<index> (e.g. <video>.en.forced.srt), anchoring on the language token.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '2.0.0',
+    Version: '2.1.0',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -403,6 +403,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ffmpeg 7.x which auto-sizes the queue, but cheap insurance); -flush_packets 0 buffers muxer writes instead of flushing per packet - the throughput-
     // optimal choice for FILE muxing (helps high-latency/network temp storage, negligible cost when local), so it is always applied, not exposed as a toggle.
     const globalOutputOpt = ' -max_muxing_queue_size 9999 -flush_packets 0';
+
+    // -=-=-= streamTag  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // infoLog stream tag: the SOURCE ffprobe index of the stream a line concerns, as a fixed 5-char field so columns line up ([s 0],[s 9],[s10],[s99];
+    // an index >=100 widens to [s100]). Sits right after the status symbol, before any [input=value] tag. Used only where a line is about ONE source
+    // stream - omitted on whole-file summaries and on brand-new/appended streams (imports, downmix appends) that have no source index of their own.
+    const streamTag = (index) => `[s${String(index).padStart(2, ' ')}]`;
     // ===== END SHARED: stream / language / preset helpers =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language matching =====
@@ -624,11 +630,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     // ---- guards + input validation (before the try, per the suite's failFile convention) ----
-    if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams)) failFile('No ffProbe stream data available. Check your settings!');
+    if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams)) failFile('No ffProbe stream data available, cannot process this file');
     const mode = String(inputs.mode);
-    if (mode !== 'extract' && mode !== 'import') failFile(`mode "${mode}" is invalid (expected extract or import). Check your settings!`);
-    if (!['disabled', 'enabled', 'enabled_delete'].includes(String(inputs.method_deduplicate))) failFile(`method_deduplicate "${inputs.method_deduplicate}" is invalid (expected disabled, enabled, or enabled_delete). Check your settings!`);
-    if (file.fileMedium && file.fileMedium !== 'video') { response.infoLog += '☑Not a video file - skipping.\n'; return response; }
+    if (mode !== 'extract' && mode !== 'import') failFile(`[mode=${mode}] invalid value, check your settings`);
+    if (!['disabled', 'enabled', 'enabled_delete'].includes(String(inputs.method_deduplicate))) failFile(`[method_deduplicate=${inputs.method_deduplicate}] invalid value, check your settings`);
+    if (file.fileMedium && file.fileMedium !== 'video') { response.infoLog += '☑Not a video file - skipping\n'; return response; }
 
     const streams = file.ffProbeData.streams;
     const langFilter = parseLangFilter(inputs.only_languages);
@@ -646,7 +652,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // ============= EXTRACT: embedded text subs -> sidecars (+ optional removal) =============
             const eligible = streams.filter((s) => (s.codec_type || '').toLowerCase() === 'subtitle' && isTextSub(s.codec_name)
                 && !(skipCommentary && isCommentary(s)) && !(langFilter && !langFilter.has(langKey(resolveLang(s) || 'und'))));
-            if (!eligible.length) { response.infoLog += '☑No text subtitles to extract.\n'; return response; }
+            if (!eligible.length) { response.infoLog += '☑No text subtitles to extract\n'; return response; }
 
             let sidecarOut = ''; const removeIdx = []; let wrote = 0; let skipped = 0;
             for (const s of eligible) {
@@ -656,12 +662,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // An existing sidecar is preserved (never overwrite a user's on-disk edits) - but only if it has content. A 0-byte sidecar is the fingerprint of a
                 // prior extract ffmpeg aborted mid-write; trusting it and then stripping the embedded source would lose the subtitle, so re-extract it instead.
                 const existsNonEmpty = fs.existsSync(full) && (() => { try { return fs.statSync(full).size > 0; } catch { return false; } })();
-                if (existsNonEmpty) { skipped += 1; response.infoLog += `☑Sidecar already exists, not overwriting: ${name}\n`; }
-                else { sidecarOut += ` -map 0:${s.index} -c:s ${enc} "${full}"`; wrote += 1; response.infoLog += `☐Extract stream ${s.index} -> ${name}\n`; }
+                if (existsNonEmpty) { skipped += 1; response.infoLog += `☑${streamTag(s.index)} Sidecar already exists, not overwriting: ${name}\n`; }
+                else { sidecarOut += ` -map 0:${s.index} -c:s ${enc} "${full}"`; wrote += 1; response.infoLog += `☐${streamTag(s.index)} Extract -> ${name}\n`; }
                 if (removeAfterExtract) removeIdx.push(s.index);
             }
-            if (titleTruncated) response.infoLog += '☒A subtitle title was too long for the filename and was truncated.\n';
-            if (!wrote && !removeIdx.length) { response.infoLog += '☑All eligible subtitles already extracted.\n'; return response; }
+            if (titleTruncated) response.infoLog += '☒A subtitle title was too long for the filename and was truncated\n';
+            if (!wrote && !removeIdx.length) { response.infoLog += '☑All eligible subtitles already extracted\n'; return response; }
 
             let out = `${sidecarOut} -map 0`;
             for (const idx of removeIdx) out += ` -map -0:${idx}`;
@@ -688,16 +694,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Match extract's isCommentary (flag OR title keyword): a sidecar whose commentary role sits only in its decoded title (no disposition token) must
             // also be skipped, else skip_commentary would exclude it on extract but re-mux it on import (a Plex-native/manual sidecar or a title-only source).
             .filter((f) => !(skipCommentary && (f.dispTokens.includes('commentary') || matchesKeyword(String(f.title || '').toLowerCase(), dispositionTypes.comment.keywords))));
-        if (!found.length) { response.infoLog += '☑No subtitle sidecars found to import.\n'; return response; }
+        if (!found.length) { response.infoLog += '☑No subtitle sidecars found to import\n'; return response; }
 
         // Sidecars are removed only after their content is confirmed embedded: remove_sidecar_after_import deletes everything we muxed, and
         // method_deduplicate=enabled_delete additionally forces removal of every file consumed this pass (dedup group members included), regardless.
         const deleteConfirmed = removeSidecarAfterImport || dedupeMode === 'enabled_delete';
+        // Which toggle triggered the delete, for the log tag: remove_sidecar_after_import is the direct "delete after import"; otherwise it is method_deduplicate=enabled_delete.
+        const delReason = removeSidecarAfterImport ? 'remove_sidecar_after_import=true' : 'method_deduplicate=enabled_delete';
         let deleted = 0;
         if (deleteConfirmed) {
             for (const f of found.filter((x) => importedSet.has(x.name))) {
-                try { fs.unlinkSync(path.join(libDir, f.name)); deleted += 1; response.infoLog += `☑Deleted sidecar (embedded): ${f.name}\n`; }
-                catch (e) { response.infoLog += `☒Could not delete sidecar ${f.name}: ${e && e.message ? e.message : e}\n`; }
+                try { fs.unlinkSync(path.join(libDir, f.name)); deleted += 1; response.infoLog += `☑[${delReason}] Deleted sidecar (embedded): ${f.name}\n`; }
+                catch (e) { response.infoLog += `☒[${delReason}] Could not delete sidecar ${f.name}: ${e && e.message ? e.message : e}\n`; }
             }
         }
 
@@ -743,7 +751,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (f.title) meta += ` -metadata:s:s:${outIdx} "title=${escMeta(f.title)}"`;
                 if (f.disp.length) meta += ` -disposition:s:${outIdx} ${f.disp.join('+')}`;
                 if (isMp4) meta += ` -c:s:${outIdx} mov_text`;
-                if (f.members.length > 1) response.infoLog += `☑Deduplicated ${f.members.length} byte-identical sidecars -> ${f.name} (${f.lang}${f.dispTokens.length ? ` ${f.dispTokens.join('+')}` : ''})\n`;
+                if (f.members.length > 1) response.infoLog += `☑[method_deduplicate=${dedupeMode}] Deduplicated ${f.members.length} byte-identical sidecars -> ${f.name} (${f.lang}${f.dispTokens.length ? ` ${f.dispTokens.join('+')}` : ''})\n`;
                 response.infoLog += `☐Import ${f.name} -> subtitle ${outIdx} (${f.lang}${f.dispTokens.length ? ` ${f.dispTokens.join('+')}` : ''})\n`;
             });
             const consumed = merged.flatMap((f) => f.members.map((m) => m.name));
@@ -763,7 +771,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return response;
         }
 
-        if (!deleted) response.infoLog += importedSet.size ? '☑Sidecars already imported; nothing to do.\n' : '☑All matching subtitles already present; nothing to import.\n';
+        if (!deleted) response.infoLog += importedSet.size ? '☑Sidecars already imported; nothing to do\n' : '☑All matching subtitles already present; nothing to import\n';
         return response;
     } catch (err) {
         failUnexpected(err);

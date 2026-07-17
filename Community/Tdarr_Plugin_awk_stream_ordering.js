@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default.\n`,
-    Version: '3.1.0',
+    Version: '3.2.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -452,7 +452,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //Check if we can't identify the codec. If we can't then notify once per codec
         if(!(codec in codecInfo) && !unknownCodecs.has(codec)) {
             unknownCodecs.add(codec);
-            response.infoLog += `☒Stream ${stream.index}: Unknown audio codec "${codec}", using generic quality weighting.\n`;
+            response.infoLog += `☒${streamTag(stream.index)} Unknown audio codec "${codec}", using generic quality weighting\n`;
         }
 
         //This is a pretty weak way to score an unknown codec
@@ -470,7 +470,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (bitrate <= 0) {
             if (CODEC_TARGET_BPS[codec === 'aac_vbr' ? 'aac' : codec])
                 return info.score;
-            response.infoLog += `☒Stream ${stream.index}: No bitrate reported for ${codec}, assuming nominal quality.\n`;
+            response.infoLog += `☒${streamTag(stream.index)} No bitrate reported for ${codec}, assuming nominal quality\n`;
             return info.score - (maxPenalty / 2);
         }
 
@@ -612,6 +612,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ffmpeg 7.x which auto-sizes the queue, but cheap insurance); -flush_packets 0 buffers muxer writes instead of flushing per packet - the throughput-
     // optimal choice for FILE muxing (helps high-latency/network temp storage, negligible cost when local), so it is always applied, not exposed as a toggle.
     const globalOutputOpt = ' -max_muxing_queue_size 9999 -flush_packets 0';
+
+    // -=-=-= streamTag  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // infoLog stream tag: the SOURCE ffprobe index of the stream a line concerns, as a fixed 5-char field so columns line up ([s 0],[s 9],[s10],[s99];
+    // an index >=100 widens to [s100]). Sits right after the status symbol, before any [input=value] tag. Used only where a line is about ONE source
+    // stream - omitted on whole-file summaries and on brand-new/appended streams (imports, downmix appends) that have no source index of their own.
+    const streamTag = (index) => `[s${String(index).padStart(2, ' ')}]`;
     // ===== END SHARED: stream / language / preset helpers =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
@@ -667,22 +673,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Bail out gracefully on missing/partial probe data, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
-        failFile('No ffProbe stream data available for this file - the plugin cannot process it.');
+        failFile('No ffProbe stream data available for this file - the plugin cannot process it');
 
     // Value checks. The two free-text inputs (order_language/order_codec) have no fixed option set; the five dropdowns (first_audio, first_subtitle,
     // order_channel, order_quality, method_mp4_faststart) each have one, validated below.
     if(!['language', 'original', 'default', 'descriptive'].includes(inputs.first_audio))
-        failFile('first_audio has not been configured, please configure required options.');
+        failFile(`[first_audio=${inputs.first_audio}] invalid value, check your settings`);
     if(!['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled'].includes(inputs.order_channel))
-        failFile('order_channel has not been configured, please configure required options.');
+        failFile(`[order_channel=${inputs.order_channel}] invalid value, check your settings`);
     if(!['descending', 'descending <=1024k', 'ascending', 'disabled'].includes(inputs.order_quality))
-        failFile('order_quality has not been configured, please configure required options.');
+        failFile(`[order_quality=${inputs.order_quality}] invalid value, check your settings`);
     if(!['normal', 'default', 'sdh', 'descriptive'].includes(inputs.first_subtitle))
-        failFile('first_subtitle has not been configured, please configure required options.');
+        failFile(`[first_subtitle=${inputs.first_subtitle}] invalid value, check your settings`);
     if(!['disabled', 'encoder', 'descriptive'].includes(String(inputs.remove_junk_tags || 'disabled').toLowerCase()))
-        failFile('Somehow invalid remove_junk_tags option provided. Check your settings!');
+        failFile(`[remove_junk_tags=${inputs.remove_junk_tags}] invalid value, check your settings`);
     if(!['enabled', 'disabled'].includes(String(inputs.method_mp4_faststart || 'enabled').toLowerCase()))
-        failFile('Somehow invalid method_mp4_faststart option provided. Check your settings!');
+        failFile(`[method_mp4_faststart=${inputs.method_mp4_faststart}] invalid value, check your settings`);
 
     // One guard around all the reordering work below: a deliberate failFile abort (AwkFailFile) rethrows unchanged, and any UNEXPECTED error fails the
     // file too — annotated and carrying the full infoLog — instead of silently skipping. (Earlier input validation runs before this and fails via failFile.)
@@ -907,7 +913,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // remove_junk_tags (per-stream): clear encoder/encoded_by on this stream, keyed on its OUTPUT index i (a within-type reorder moves a track's per-type
             // position, so -metadata:s must use the post-sort index, not the source one). Present-only, so a clean stream adds nothing and never forces a mux alone.
             const streamJunk = streamJunkClears(streams[i].stream, i);
-            if (streamJunk) { junkArgs += streamJunk; junkLog += `☐Remove encoder tag(s) from ${streams[i].type} stream (remove_junk_tags=${junkTags})\n`; }
+            if (streamJunk) { junkArgs += streamJunk; junkLog += `☐${streamTag(streams[i].index)}[remove_junk_tags=${junkTags}] Remove encoder tag(s) from ${streams[i].type} stream\n`; }
 
             if (streams[i].type === 'audio') {
                 audioIndex++;
@@ -928,7 +934,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             for (const k of Object.keys(file.ffProbeData.format?.tags || {})) {
                 const lk = k.toLowerCase();
                 if (lk === 'title' || lk === 'comment' || lk === 'creation_time' || lk.startsWith('awk_')) continue;
-                if (junkGlobalStrip(lk)) { junkArgs += ` -metadata "${escMeta(k)}="`; junkLog += `☐Remove ${k} tag from file (remove_junk_tags=${junkTags})\n`; }
+                if (junkGlobalStrip(lk)) { junkArgs += ` -metadata "${escMeta(k)}="`; junkLog += `☐[remove_junk_tags=${junkTags}] Remove ${k} tag from file\n`; }
             }
 
         // method_mp4_faststart: front-load the mp4 moov atom. A plain ride-along isn't enough (we skip when order is already correct), so detect the moov position
@@ -939,20 +945,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const needsFront = faststartOn && isMp4 && !moovBeforeMdat(file.file, otherArguments);
 
         if (!changed && dispositionArgs === '' && !needsFront && junkArgs === '') {
-            response.infoLog += '☑Streams already in desired order.\n';
+            response.infoLog += '☑Streams already in desired order\n';
             return response;
         }
 
         response.processFile = true;
         response.reQueueAfter = true;
         if (needsFront && !changed && dispositionArgs === '')
-            response.infoLog += '☐Remux to front-load the mp4 moov atom (method_mp4_faststart)\n';
+            response.infoLog += `☐[method_mp4_faststart=${methodFaststart}] Remux to front-load the mp4 moov atom\n`;
         // mp4/mov muxers drop a custom GLOBAL metadata tag (e.g. clean_and_remux's awk_recovered, set upstream) on a -c copy remux unless told to keep it, which would
         // re-trigger recovery on the next pass. Preserve it on the mov family, and append +faststart when method_mp4_faststart is on so the moov atom leads the file.
         const mp4KeepTags = isMp4 ? ` -movflags use_metadata_tags${faststartOn ? '+faststart' : ''}` : '';
         response.preset = `,${ffmpegMap} -c copy${dispositionArgs}${junkArgs}${globalOutputOpt}${mp4KeepTags}`;
         if (dispositionArgs !== '')
-            response.infoLog += '☐Set the first audio track as the sole default.\n';
+            response.infoLog += '☐Set the first audio track as the sole default\n';
         response.infoLog += junkLog;
         response.infoLog += `☑Expected results: ${streams.map(s => summariseStream(s.stream)).join('')}\n`;
 

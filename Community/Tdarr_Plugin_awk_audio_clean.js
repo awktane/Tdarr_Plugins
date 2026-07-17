@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '3.3.1',
+    Version: '3.4.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -321,24 +321,6 @@ const details = () => ({
                 \\nIf enabled  - Treat an unlisted-language original track as a listed-language primary (keeps its surround under the default guards).
                 \\nIf disabled - (Default) The original track follows normal unlisted-language handling - it may be downmixed like any other secondary track.`,
         },
-        {
-            name: 'method_verbose',
-            type: 'string',
-            defaultValue: 'enabled',
-            inputUI: {
-                type: 'dropdown',
-                options: ['enabled', 'disabled'],
-            },
-            tooltip: `Control whether the log explains tracks that DIDN'T change, on top of the tracks that did. Every actual change (transcoding,
-                adding, remixing, normalizing, removing a duplicate) is always logged regardless of this setting - that part matches the log you see
-                today. This only affects the extra diagnostic layer: why a guard protected a track, why a layout couldn't be forced, why a track was
-                skipped - useful for tracing which of your settings is doing something you didn't expect, without digging through the code.
-                \\n=====
-                \\nActions
-                \\n=====
-                \\nIf enabled  - (Default) Also log every track that was protected or skipped, and why - the negative space alongside the real changes.
-                \\nIf disabled - Only log tracks that actually changed - no explanation for tracks left alone.`,
-        },
     ],
 });
 
@@ -648,7 +630,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //Check if we can't identify the codec. If we can't then notify once per codec
         if(!(codec in codecInfo) && !unknownCodecs.has(codec)) {
             unknownCodecs.add(codec);
-            response.infoLog += `☒Stream ${stream.index}: Unknown audio codec "${codec}", using generic quality weighting.\n`;
+            response.infoLog += `☒${streamTag(stream.index)} Unknown audio codec "${codec}", using generic quality weighting\n`;
         }
 
         //This is a pretty weak way to score an unknown codec
@@ -666,7 +648,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (bitrate <= 0) {
             if (CODEC_TARGET_BPS[codec === 'aac_vbr' ? 'aac' : codec])
                 return info.score;
-            response.infoLog += `☒Stream ${stream.index}: No bitrate reported for ${codec}, assuming nominal quality.\n`;
+            response.infoLog += `☒${streamTag(stream.index)} No bitrate reported for ${codec}, assuming nominal quality\n`;
             return info.score - (maxPenalty / 2);
         }
 
@@ -808,6 +790,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ffmpeg 7.x which auto-sizes the queue, but cheap insurance); -flush_packets 0 buffers muxer writes instead of flushing per packet - the throughput-
     // optimal choice for FILE muxing (helps high-latency/network temp storage, negligible cost when local), so it is always applied, not exposed as a toggle.
     const globalOutputOpt = ' -max_muxing_queue_size 9999 -flush_packets 0';
+
+    // -=-=-= streamTag  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // infoLog stream tag: the SOURCE ffprobe index of the stream a line concerns, as a fixed 5-char field so columns line up ([s 0],[s 9],[s10],[s99];
+    // an index >=100 widens to [s100]). Sits right after the status symbol, before any [input=value] tag. Used only where a line is about ONE source
+    // stream - omitted on whole-file summaries and on brand-new/appended streams (imports, downmix appends) that have no source index of their own.
+    const streamTag = (index) => `[s${String(index).padStart(2, ' ')}]`;
     // ===== END SHARED: stream / language / preset helpers =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language matching =====
@@ -975,7 +963,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Bail out gracefully on missing/partial probe data, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
-        failFile('No ffProbe stream data available for this file - the plugin cannot process it.');
+        failFile('No ffProbe stream data available for this file - the plugin cannot process it');
 
     // AC3 valid CBR presets in bps. ffmpeg rounds an AC3 request to the NEAREST of these (can round DOWN); resolveBitrate snaps UP to a preset itself so the
     // emitted rate is never below target and the log matches what ffmpeg produces. EAC3/AAC/Opus honour arbitrary rates (verified) and are NOT snapped.
@@ -1111,7 +1099,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (hasEncoder('aac_at')) {
             if (!_aacVbrFallbackWarned) {
                 _aacVbrFallbackWarned = true;
-                response.infoLog += `☒codec_stereo=aac_vbr: no libfdk_aac on this node — using aac_at (AudioToolbox) VBR instead.\n`;
+                response.infoLog += `☒[codec_stereo=aac_vbr] no libfdk_aac on this node - using aac_at (AudioToolbox) VBR instead\n`;
             }
             const q = lowInfo ? 1 : 0;
             return { encoder: 'aac_at', args: ` -aac_at_mode:a:${idx} vbr -q:a:${idx} ${q}`, approxRate: lowInfo ? '~150k' : '~190k', label: `aac_at VBR q${q}` };
@@ -1119,7 +1107,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const bps = resolveBitrate('aac', channels);
         if (!_aacVbrFallbackWarned) {
             _aacVbrFallbackWarned = true;
-            response.infoLog += `☒codec_stereo=aac_vbr: no libfdk_aac or aac_at on this node — using native aac ${bps / 1000}k instead.\n`;
+            response.infoLog += `☒[codec_stereo=aac_vbr] no libfdk_aac or aac_at on this node - using native aac ${bps / 1000}k instead\n`;
         }
         return { encoder: 'aac', args: encoderArgsIdx('aac', channels, idx), approxRate: `${bps / 1000}k`, label: 'native aac' };
     };
@@ -1162,53 +1150,50 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const stereoDownmix = String(inputs.method_stereo_downmix).trim();
     const methodLayoutErr = String(inputs.method_layout_err).trim();
     const loudnorm = String(inputs.method_loudnorm).trim();
-    const methodVerbose = String(inputs.method_verbose).trim();
     const guardQuality = String(inputs.guard_quality).trim();
     const guardLossless = String(inputs.guard_lossless).trim();
     const guardObjectAudio = String(inputs.guard_object_audio).trim();
     const guardOriginal = String(inputs.guard_original).trim();
 
     if(!['false','replace','true'].includes(downmixToSix))
-        failFile(`Somehow invalid downmixToSix option provided. Check your settings!`);
+        failFile(`[downmix_to_six=${downmixToSix}] invalid value, check your settings`);
     if(!['false','replace','true'].includes(downmixToTwo))
-        failFile(`Somehow invalid downmixToStereo option provided. Check your settings!`);
+        failFile(`[downmix_to_stereo=${downmixToTwo}] invalid value, check your settings`);
     if(!['false','true'].includes(downmixSecondaryStereo))
-        failFile(`Somehow invalid downmixSecondaryStereo option provided. Check your settings!`);
+        failFile(`[downmix_secondary_stereo=${downmixSecondaryStereo}] invalid value, check your settings`);
     if(!['ac3','eac3','aac','opus'].includes(surroundCodec))
-        failFile(`Somehow invalid surroundCodec option provided. Check your settings!`);
+        failFile(`[codec_surround=${surroundCodec}] invalid value, check your settings`);
     if(!['ac3','eac3','aac','aac_vbr','opus'].includes(stereoCodec))
-        failFile(`Somehow invalid stereoCodec option provided. Check your settings!`);
+        failFile(`[codec_stereo=${stereoCodec}] invalid value, check your settings`);
     if(!['false','6below','2below','all'].includes(forceCodec))
-        failFile(`Somehow invalid forceCodec option provided. Check your settings!`);
+        failFile(`[codec_force=${forceCodec}] invalid value, check your settings`);
     if(!['disabled','multi-stereo','multi-stereo-error','channel','channel-error'].includes(removeDuplicatesBy))
-        failFile(`Somehow invalid removeDuplicatesBy option provided. Check your settings!`);
+        failFile(`[method_deduplicate=${removeDuplicatesBy}] invalid value, check your settings`);
     if(!['fold','distinct'].includes(regionDedup))
-        failFile(`Somehow invalid method_region_dedup option provided. Check your settings!`);
+        failFile(`[method_region_dedup=${regionDedup}] invalid value, check your settings`);
     if(!['default','dialogue'].includes(stereoDownmix))
-        failFile(`Somehow invalid stereoDownmix option provided. Check your settings!`);
+        failFile(`[method_stereo_downmix=${stereoDownmix}] invalid value, check your settings`);
     if(!['keep','drop','remix'].includes(methodLayoutErr))
-        failFile(`Somehow invalid methodLayoutErr option provided. Check your settings!`);
+        failFile(`[method_layout_err=${methodLayoutErr}] invalid value, check your settings`);
     if(!['disabled','tv','cinema','quiet_room'].includes(loudnorm))
-        failFile(`Somehow invalid loudnorm option provided. Check your settings!`);
-    if(!['enabled','disabled'].includes(methodVerbose))
-        failFile(`Somehow invalid methodVerbose option provided. Check your settings!`);
+        failFile(`[method_loudnorm=${loudnorm}] invalid value, check your settings`);
     if(!['enabled','strict','disabled'].includes(guardQuality))
-        failFile(`Somehow invalid guardQuality option provided. Check your settings!`);
+        failFile(`[guard_quality=${guardQuality}] invalid value, check your settings`);
     if(!['enabled','disabled'].includes(guardLossless))
-        failFile(`Somehow invalid guardLossless option provided. Check your settings!`);
+        failFile(`[guard_lossless=${guardLossless}] invalid value, check your settings`);
     if(!['enabled','disabled'].includes(guardObjectAudio))
-        failFile(`Somehow invalid guardObjectAudio option provided. Check your settings!`);
+        failFile(`[guard_object_audio=${guardObjectAudio}] invalid value, check your settings`);
     if(!['enabled','disabled'].includes(guardOriginal))
-        failFile(`Somehow invalid guardOriginal option provided. Check your settings!`);
+        failFile(`[guard_original=${guardOriginal}] invalid value, check your settings`);
 
     let extraArguments = '';
-    let workDone = '';       // "this changed" lines (transcode/add/remix/normalize/remove) - always shown, regardless of method_verbose.
-    let verboseDone = '';    // "this DIDN'T change, and why" lines (guard blocks, ceiling/missing-data skips) - shown only when method_verbose='enabled'.
+    let workDone = '';       // "this changed" lines (transcode/add/remix/normalize/remove).
+    let skipDone = '';       // "this DIDN'T change, and why" lines (guard blocks, ceiling/missing-data skips). Both buffers are always logged.
     let convert = false;
 
     // Check if file is a video. If it isn't then exit plugin (before the no-audio check, so a non-video reports "not a video", not "no audio streams").
     if (file.fileMedium !== 'video') {
-        response.infoLog += '☑File is not a video. \n';
+        response.infoLog += '☑File is not a video\n';
         response.processFile = false;
         return response;
     }
@@ -1216,7 +1201,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //We really only care about the audio streams
     let audioStreams = file.ffProbeData.streams.filter(stream => (stream?.codec_type ?? '').trim().toLowerCase() === 'audio');
     if (audioStreams.length === 0) {
-        response.infoLog += '☑Video file has no audio streams to manage.\n';
+        response.infoLog += '☑Video file has no audio streams to manage\n';
         return response;
     }
 
@@ -1392,14 +1377,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (removeDuplicatesErrorMode) {
                         const rmRate = hasKnownRate(s) ? ` @ ${Math.round(Number(s.bit_rate) / 1000)} kb/s` : '';
                         const keptRate = hasKnownRate(kept) ? ` @ ${Math.round(Number(kept.bit_rate) / 1000)} kb/s` : '';
-                        failFile(`Stream ${s.index}: Duplicate audio track detected (${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrRegionKey}${rmRate}) alongside stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate}) under method_deduplicate="${removeDuplicatesBy}". Aborting - tag/remove tracks manually and requeue, or switch method_deduplicate to a non-error mode.`);
+                        failFile(`${streamTag(s.index)}[method_deduplicate=${removeDuplicatesBy}] Duplicate audio track (${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrRegionKey}${rmRate}) alongside stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate}) - aborting; tag/remove tracks manually and requeue, or switch method_deduplicate to a non-error mode`);
                     }
                     streamsToRemove.add(s.index);
                     // Show the removed track's bitrate and the kept track's for contrast — duplicates are
                     // decided by quality score (largely bitrate-driven), so this makes the choice transparent.
                     const rmRate = hasKnownRate(s) ? ` @ ${Math.round(Number(s.bit_rate) / 1000)} kb/s` : '';
                     const keptRate = hasKnownRate(kept) ? ` @ ${Math.round(Number(kept.bit_rate) / 1000)} kb/s` : '';
-                    workDone += `☐Stream ${s.index}: Removing duplicate (lower quality ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrRegionKey}${rmRate}) - keeping stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate})\n`;
+                    workDone += `☐${streamTag(s.index)}[method_deduplicate=${removeDuplicatesBy}] Removing duplicate (lower quality ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrRegionKey}${rmRate}) - keeping stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate})\n`;
                 } else
                     seen.set(key, s);
             }
@@ -1455,7 +1440,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                               : (downmixToTwo === 'replace' || (ch > 6 && downmixToSix === 'replace'))) continue;
                 if (countSurvivingAudio() <= 1) continue;                                    // never drop the last audio track
                 streamsToRemove.add(s.index);
-                workDone += `☒Stream ${s.index}: Dropping - libopus can't encode a ${s.channel_layout || `${ch}ch`} layout (method_layout_err=drop).\n`;   // this IS a change (removal) - always shown
+                workDone += `☒${streamTag(s.index)}[method_layout_err=${methodLayoutErr}] Dropping - libopus can't encode a ${s.channel_layout || `${ch}ch`} layout\n`;   // this IS a change (removal)
                 // Remember a dropped source a downmix (add/'true' mode) would derive from, so its stereo/5.1 still gets created even though the source
                 // itself is gone (see the post-loop pass below). 'replace' modes already deferred above (they convert the source in place), so only the
                 // 'true'/add cases reach here. Secondary tracks are handled by downmix_secondary_stereo in place, never derived, so they're excluded.
@@ -1533,7 +1518,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         });
 
         if (workStreams.length === 0 && streamsToRemove.size === 0 && loudnorm === 'disabled') {
-            response.infoLog += '☑ No audio tracks require changes.\n';
+            response.infoLog += '☑No audio tracks require changes\n';
             return response;
         }
 
@@ -1721,7 +1706,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const buildLoudnormFilter = (streamIndex, srcAudioIdx, preFilter, preset) => {
             const analysis = measureLoudness(srcAudioIdx, preFilter, preset);
             if (analysis.error)
-                failFile(`Stream ${streamIndex}: loudnorm analysis pass failed (${analysis.error}). If this file has known corruption, try clean_and_remux's recover_bad_timestamps/recover_bad_data first - if the codec itself is unsupported, that won't help.`);
+                failFile(`${streamTag(streamIndex)}[method_loudnorm=${loudnorm}] loudnorm analysis pass failed (${analysis.error}) - if this file has known corruption, try clean_and_remux's recover_bad_timestamps/recover_bad_data first; if the codec itself is unsupported, that won't help`);
             const { stats } = analysis;
             // A digitally-silent track measures input_i="-inf" (and target_offset="inf"); Number("-inf") is NaN (JS parses
             // "Infinity", not "inf"), which would defeat the tolerance test AND then bake a literal measured_I=-inf into the
@@ -1779,10 +1764,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Guard: if either index is missing the stream wasn't tracked correctly — skip rather than emitting a broken argument like -c:a:undefined
             // which ffmpeg will reject with a cryptic error.
             if (outputAudioIdx === undefined || srcAudioIdx === undefined) {
-                // Always shown (workDone, not verboseDone): this is a should-never-happen internal-tracking defect, not routine
-                // diagnostic negative-space — it means a user-configured op on this stream is silently skipped, so surface it
-                // even when method_verbose='disabled'.
-                workDone += `☒Stream ${ffstream.index}: Could not resolve audio index mapping, skipping.\n`;
+                // A should-never-happen internal-tracking defect (not routine diagnostic negative-space): a user-configured op on this
+                // stream is silently skipped. Logged via workDone as a real problem.
+                workDone += `☒${streamTag(ffstream.index)} Could not resolve audio index mapping, skipping\n`;
                 continue;
             }
 
@@ -1809,7 +1793,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const newTitle = escMeta(buildTitle(ffstream, '2.0'));
                 // Downmix changes channel count, so the source bitrate isn't a comparable floor - stereoEnc uses the 2ch table target (aac_vbr uses plain VBR 5).
                 const e = stereoEnc(outputAudioIdx);
-                workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${e.logCodec} stereo @ ${e.rate} (${e.label ? `${e.label}, ` : ''}secondary)\n`;
+                workDone += `☐${streamTag(ffstream.index)}[downmix_secondary_stereo=${downmixSecondaryStereo}] Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${e.logCodec} stereo @ ${e.rate} (${e.label ? `${e.label}, ` : ''}secondary)\n`;
                 extraArguments += ` -c:a:${outputAudioIdx} ${e.frag}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                 if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(streamLang)}"`;
                 modifiedAudioIdx.add(outputAudioIdx);
@@ -1835,7 +1819,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         const { filter } = buildLoudnormFilter(ffstream.index, srcAudioIdx, 'aformat=channel_layouts=5.1', LOUDNORM_PRESETS[loudnorm]);
                         sixFilter = ` -filter:a:${outputAudioIdx} "${filter}"`;
                     }
-                    workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s\n`;
+                    workDone += `☐${streamTag(ffstream.index)}[downmix_to_six=${downmixToSix}] Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${audioEncoder(surroundCodec)}${dstBitArg}${sixFilter} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
@@ -1852,7 +1836,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         const { filter } = buildLoudnormFilter(ffstream.index, srcAudioIdx, 'aformat=channel_layouts=5.1', LOUDNORM_PRESETS[loudnorm]);
                         sixFilter = ` -filter:a:${newStreamOutputIdx} "${filter}"`;
                     }
-                    workDone += `☐Stream ${ffstream.index}: Adding ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
+                    workDone += `☐${streamTag(ffstream.index)}[downmix_to_six=${downmixToSix}] Adding ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
                     extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${audioEncoder(surroundCodec)}${dstBitArg}${sixFilter} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
                     newStreamOutputIdx++;
@@ -1875,7 +1859,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const newTitle = escMeta(buildTitle(ffstream, '2.0'));
                     // Downmix source is surround; its bitrate describes N channels not 2, so stereoEnc uses the 2ch table target (aac_vbr uses plain VBR 5).
                     const e = stereoEnc(outputAudioIdx);
-                    workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${e.logCodec} stereo @ ${e.rate}${e.label ? ` (${e.label})` : ''}\n`;
+                    workDone += `☐${streamTag(ffstream.index)}[downmix_to_stereo=${downmixToTwo}] Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${e.logCodec} stereo @ ${e.rate}${e.label ? ` (${e.label})` : ''}\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${e.frag}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(streamLang)}"`;
                     modifiedAudioIdx.add(outputAudioIdx);
@@ -1886,7 +1870,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const newTitle = escMeta(buildTitle(ffstream, '2.0'));
                     // Downmix source is surround; its bitrate describes N channels not 2, so stereoEnc uses the 2ch table target (aac_vbr uses plain VBR 5).
                     const e = stereoEnc(newStreamOutputIdx);
-                    workDone += `☐Stream ${ffstream.index}: Adding ${e.logCodec} stereo @ ${e.rate}${e.label ? ` (${e.label})` : ''} from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
+                    workDone += `☐${streamTag(ffstream.index)}[downmix_to_stereo=${downmixToTwo}] Adding ${e.logCodec} stereo @ ${e.rate}${e.label ? ` (${e.label})` : ''} from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
                     extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${e.frag}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                     if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
                     newStreamOutputIdx++;
@@ -1905,7 +1889,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // measure is left untouched rather than guessed, since a wrong count could route it to a codec that can't hold its real channels and fail.
             const forceChannels = (forceCodec !== 'false' && !modifiedAudioIdx.has(outputAudioIdx)) ? resolveChannels(ffstream) : -1;
             if (forceChannels === 0)
-                verboseDone += `☒Stream ${ffstream.index}: Skipping codec_force - no channel count in ffprobe, mediaInfo, or channel layout; can't safely choose a target codec or verify its channel limit.\n`;
+                skipDone += `☒${streamTag(ffstream.index)}[codec_force=${forceCodec}] Skipping - no channel count in ffprobe, mediaInfo, or channel layout; can't safely choose a target codec or verify its channel limit\n`;
             if (forceChannels > 0) {
                 const isStereo = forceChannels <= 2;
                 const targetCodec = isStereo ? stereoCodec : surroundCodec;
@@ -1922,10 +1906,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const targetMaxCh = codecMaxCh(targetCodec);
 
                     if (shouldForce && forceChannels > targetMaxCh) {
-                        verboseDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodecFamily} - ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} exceeds the ${targetMaxCh}ch limit for ${targetCodecFamily}. Enable downmix_to_six to create a 5.1 from it first.\n`;
+                        skipDone += `☒${streamTag(ffstream.index)}[codec_force=${forceCodec}] Not forcing ${targetCodecFamily} - ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} exceeds the ${targetMaxCh}ch limit for ${targetCodecFamily}; enable downmix_to_six to create a 5.1 from it first\n`;
                     } else if (shouldForce && guardBlocks(ffstream, targetCodec, forceChannels, forceChannels)) {
                         // guard_lossless/guard_quality/guard_object_audio: forcing this codec would irreversibly lose detail the target can't hold (lossless source, or quality tier scores it lower). Leave it.
-                        verboseDone += `☒Stream ${ffstream.index}: Not forcing ${targetCodecFamily} - would lose detail vs ${codecDisplayName(ffstream)} ${forceChannels}ch @ ${srcRateStr} (guard_lossless=${guardLossless}, guard_quality=${guardQuality}, guard_object_audio=${guardObjectAudio}); left as ${ffstreamCodec}.\n`;
+                        skipDone += `☒${streamTag(ffstream.index)}[codec_force=${forceCodec}] Not forcing ${targetCodecFamily} - would lose detail vs ${codecDisplayName(ffstream)} ${forceChannels}ch @ ${srcRateStr} (guard_lossless=${guardLossless}, guard_quality=${guardQuality}, guard_object_audio=${guardObjectAudio}); left as ${ffstreamCodec}\n`;
                     } else if (shouldForce) {
                         // Guard the force-to-opus path against libopus-incompatible layouts (method_layout_err). Only opus is affected - AC3/EAC3/AAC
                         // take any layout. `forced` gates the run's convert flag so a keep/defer makes no change (and doesn't cause a needless re-run).
@@ -1949,14 +1933,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             if (remixDefer) why = ' (a stereo already exists for this language)';
                             else if (methodLayoutErr === 'drop') why = countSurvivingAudio() <= 1 ? ' (kept - it is the last audio track)' : ' (kept - no downmix converted it to an opus-safe layout)';
                             else why = ', enable a downmix option or set method_layout_err to drop/remix';
-                            verboseDone += `☒Stream ${ffstream.index}: Not forcing opus - libopus can't encode a ${layoutName} layout; left as ${ffstreamCodec}${why}.\n`;
+                            skipDone += `☒${streamTag(ffstream.index)}[codec_force=${forceCodec}] Not forcing opus - libopus can't encode a ${layoutName} layout; left as ${ffstreamCodec}${why}\n`;
                         } else if (opusBad && methodLayoutErr === 'remix' && !relabel) {
                             // remix→stereo: downmix in place to a codec_stereo track (NOT opus) so it stays stereo-codec-consistent and idempotent (a stereo
                             // opus would be re-forced to codec_stereo next run). Mirrors downmix_secondary_stereo; the 2ch table target (surround source
                             // bitrate isn't a comparable floor).
                             const newTitle = escMeta(buildTitle(ffstream, '2.0'));
                             const e = stereoEnc(outputAudioIdx);
-                            workDone += `☐Stream ${ffstream.index}: Remixing ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} (${layoutName}, opus-incompatible) → ${e.logCodec} stereo @ ${e.rate}${e.label ? ` (${e.label})` : ''}\n`;
+                            workDone += `☐${streamTag(ffstream.index)}[method_layout_err=${methodLayoutErr}] Remixing ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} (${layoutName}, opus-incompatible) → ${e.logCodec} stereo @ ${e.rate}${e.label ? ` (${e.label})` : ''}\n`;
                             extraArguments += ` -c:a:${outputAudioIdx} ${e.frag}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                             modifiedAudioIdx.add(outputAudioIdx);
                             outputAudioOverride.set(outputAudioIdx, e.record);
@@ -1973,7 +1957,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                                 const { filter } = buildLoudnormFilter(ffstream.index, srcAudioIdx, '', LOUDNORM_PRESETS[loudnorm]);
                                 if (filter) aacVbrFilter = ` -filter:a:${outputAudioIdx} "${filter}"`;
                             }
-                            workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → aac stereo @ ${approxRate} (${label})\n`;
+                            workDone += `☐${streamTag(ffstream.index)}[codec_force=${forceCodec}] Transcoding ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → aac stereo @ ${approxRate} (${label})\n`;
                             extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${aacVbrFilter}`;
                             modifiedAudioIdx.add(outputAudioIdx);
                             outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: forceChannels, bps: 0, approxRate });
@@ -1996,7 +1980,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             }
                             const dstBitArg = encoderArgsIdx(targetCodec, forceChannels, outputAudioIdx, srcBitrate, ffstream.isTdarrLossless, ffstream.isTdarrQuality);
                             const dstBitStr = resolveBitrate(targetCodec, forceChannels, srcBitrate, ffstream.isTdarrLossless, ffstream.isTdarrQuality);
-                            workDone += `☐Stream ${ffstream.index}: Transcoding ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → ${targetCodec} ${forceChannels}ch @ ${dstBitStr / 1000} kb/s${note}\n`;
+                            workDone += `☐${streamTag(ffstream.index)}[codec_force=${forceCodec}] Transcoding ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → ${targetCodec} ${forceChannels}ch @ ${dstBitStr / 1000} kb/s${note}\n`;
                             extraArguments += ` -c:a:${outputAudioIdx} ${audioEncoder(targetCodec)}${dstBitArg}${layoutFilter}`;
                             modifiedAudioIdx.add(outputAudioIdx);
                             outputAudioOverride.set(outputAudioIdx, { codec: targetCodec, channels: forceChannels, bps: dstBitStr });
@@ -2032,7 +2016,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const { filter } = buildLoudnormFilter(s.index, srcAudioIdx, 'aformat=channel_layouts=5.1', LOUDNORM_PRESETS[loudnorm]);
                     sixFilter = ` -filter:a:${newStreamOutputIdx} "${filter}"`;
                 }
-                workDone += `☐Stream ${s.index}: Adding ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s from ${srcCodec} ${s.channels}ch @ ${srcRateStr} (source dropped - libopus can't encode its layout)\n`;
+                workDone += `☐${streamTag(s.index)}[downmix_to_six=${downmixToSix}] Adding ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s from ${srcCodec} ${s.channels}ch @ ${srcRateStr} (source dropped - libopus can't encode its layout)\n`;
                 extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${audioEncoder(surroundCodec)}${dstBitArg}${sixFilter} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                 if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
                 appendedAudio.push({ srcStream: s, codec: surroundCodec, channels: 6, bps: dstBitStr });
@@ -2044,7 +2028,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (downmixToTwo !== 'false' && !created2chLangs.has(lang) && !existingStereoLangs.has(lang)) {
                 const newTitle = escMeta(buildTitle(s, '2.0'));
                 const e = stereoEnc(newStreamOutputIdx);
-                workDone += `☐Stream ${s.index}: Adding ${e.logCodec} stereo @ ${e.rate}${e.label ? ` (${e.label})` : ''} from ${srcCodec} ${s.channels}ch @ ${srcRateStr} (source dropped - libopus can't encode its layout)\n`;
+                workDone += `☐${streamTag(s.index)}[downmix_to_stereo=${downmixToTwo}] Adding ${e.logCodec} stereo @ ${e.rate}${e.label ? ` (${e.label})` : ''} from ${srcCodec} ${s.channels}ch @ ${srcRateStr} (source dropped - libopus can't encode its layout)\n`;
                 extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${e.frag}${stereoArg(newStreamOutputIdx, s)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
                 if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
                 appendedAudio.push({ srcStream: s, ...e.record });
@@ -2071,7 +2055,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 const channels = resolveChannels(stream);
                 if (channels <= 0) {
-                    verboseDone += `☒Stream ${stream.index}: Skipping loudnorm - no channel count in ffprobe, mediaInfo, or channel layout; can't safely choose a target codec or verify its channel limit.\n`;
+                    skipDone += `☒${streamTag(stream.index)}[method_loudnorm=${loudnorm}] Skipping - no channel count in ffprobe, mediaInfo, or channel layout; can't safely choose a target codec or verify its channel limit\n`;
                     continue;
                 }
                 const rawCodec = (stream.codec_name || '').trim().toLowerCase();
@@ -2084,11 +2068,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const targetFamily = aacFamily(targetCodec);
                 const maxCh = codecMaxCh(targetFamily);
                 if (channels > maxCh) {
-                    verboseDone += `☒Stream ${stream.index}: Skipping loudnorm - ${rawCodec} ${channels}ch exceeds the ${maxCh}ch limit for ${targetFamily}.\n`;
+                    skipDone += `☒${streamTag(stream.index)}[method_loudnorm=${loudnorm}] Skipping - ${rawCodec} ${channels}ch exceeds the ${maxCh}ch limit for ${targetFamily}\n`;
                     continue;
                 }
                 if (guardBlocks(stream, targetCodec, channels, channels)) {
-                    verboseDone += `☒Stream ${stream.index}: Not normalizing - would lose detail vs ${codecDisplayName(stream)} ${channels}ch (guard_lossless=${guardLossless}, guard_quality=${guardQuality}, guard_object_audio=${guardObjectAudio}); left as ${rawCodec}.\n`;
+                    skipDone += `☒${streamTag(stream.index)}[method_loudnorm=${loudnorm}] Not normalizing - would lose detail vs ${codecDisplayName(stream)} ${channels}ch (guard_lossless=${guardLossless}, guard_quality=${guardQuality}, guard_object_audio=${guardObjectAudio}); left as ${rawCodec}\n`;
                     continue;
                 }
 
@@ -2114,7 +2098,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             const newTitle = escMeta(buildTitle(stream, '2.0'));
                             const sLang = resolveLang(stream);
                             const e = stereoEnc(outputAudioIdx);
-                            workDone += `☐Stream ${stream.index}: Normalizing ${rawCodec} ${channels}ch (loudnorm=${loudnorm}) → ${e.logCodec} stereo @ ${e.rate} (${e.label ? `${e.label}; ` : ''}remixed - libopus can't encode a ${lay || `${channels}ch`} layout)\n`;
+                            workDone += `☐${streamTag(stream.index)}[method_loudnorm=${loudnorm}] Normalizing ${rawCodec} ${channels}ch → ${e.logCodec} stereo @ ${e.rate} (${e.label ? `${e.label}; ` : ''}remixed - libopus can't encode a ${lay || `${channels}ch`} layout)\n`;
                             extraArguments += ` -c:a:${outputAudioIdx} ${e.frag}${stereoArg(outputAudioIdx, stream)}${loudnormStampArg(outputAudioIdx)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                             if (sLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(sLang)}"`;
                             outputAudioOverride.set(outputAudioIdx, e.record);
@@ -2122,7 +2106,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             convert = true;
                             continue;
                         } else {
-                            verboseDone += `☒Stream ${stream.index}: Not normalizing - libopus can't encode a ${lay || `${channels}ch`} layout; left as ${rawCodec} (method_layout_err=${methodLayoutErr}).\n`;
+                            skipDone += `☒${streamTag(stream.index)}[method_loudnorm=${loudnorm}] Not normalizing - libopus can't encode a ${lay || `${channels}ch`} layout; left as ${rawCodec} (method_layout_err=${methodLayoutErr})\n`;
                             continue;
                         }
                     }
@@ -2136,7 +2120,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // (a true no-op) - stamping there would just remux every reprocess forever without ever caching (see
                     // loudnormTagPersists above).
                     if (loudnormTagPersists) {
-                        workDone += `☐Stream ${stream.index}: Stamping awk_loudnorm=${loudnorm} (already within tolerance) - future runs skip re-measuring while loudnorm stays "${loudnorm}"\n`;
+                        workDone += `☐${streamTag(stream.index)}[method_loudnorm=${loudnorm}] Stamping awk_loudnorm=${loudnorm} (already within tolerance) - future runs skip re-measuring while loudnorm stays "${loudnorm}"\n`;
                         extraArguments += loudnormStampArg(outputAudioIdx);
                         convert = true;
                     }
@@ -2145,7 +2129,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 if (targetCodec === 'aac_vbr') {
                     const { encoder, args, approxRate, label } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true, channels);
-                    workDone += `☐Stream ${stream.index}: Normalizing ${rawCodec} ${channels}ch (loudnorm=${loudnorm}) → aac stereo @ ${approxRate} (${label})\n`;
+                    workDone += `☐${streamTag(stream.index)}[method_loudnorm=${loudnorm}] Normalizing ${rawCodec} ${channels}ch → aac stereo @ ${approxRate} (${label})\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args} -filter:a:${outputAudioIdx} "${filter}"${loudnormStampArg(outputAudioIdx)}`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels, bps: 0, approxRate });
@@ -2154,7 +2138,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const dstBitStr = resolveBitrate(targetCodec, channels, srcBitrate, stream.isTdarrLossless, stream.isTdarrQuality);
                     const srcRateStr = srcBitrate > 0 ? `${Math.round(srcBitrate / 1000)} kb/s` : 'unknown bitrate';
                     const note = targetCodec !== rawCodec ? ` (converged from ${rawCodec})` : '';
-                    workDone += `☐Stream ${stream.index}: Normalizing ${rawCodec} ${channels}ch @ ${srcRateStr} → ${targetCodec} ${channels}ch @ ${dstBitStr / 1000} kb/s (loudnorm=${loudnorm})${note}\n`;
+                    workDone += `☐${streamTag(stream.index)}[method_loudnorm=${loudnorm}] Normalizing ${rawCodec} ${channels}ch @ ${srcRateStr} → ${targetCodec} ${channels}ch @ ${dstBitStr / 1000} kb/s${note}\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${audioEncoder(targetCodec)}${dstBitArg} -filter:a:${outputAudioIdx} "${filter}"${loudnormStampArg(outputAudioIdx)}`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     outputAudioOverride.set(outputAudioIdx, { codec: targetCodec, channels, bps: dstBitStr });
@@ -2224,16 +2208,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // against the real mov muxer - which is why loudnorm caches on Matroska only; see loudnormTagPersists.)
             const mp4KeepTags = isMp4Family(file.container) ? ' -movflags use_metadata_tags' : '';
             response.preset += `,-map 0 -c copy${extraArguments}${globalOutputOpt}${mp4KeepTags}`;
-            // workDone (what changed) always shows, regardless of method_verbose. verboseDone (why something DIDN'T change - guard
-            // blocks, ceiling/missing-data skips) is the part method_verbose gates - the diagnostic negative-space, not the status of real changes.
+            // workDone (what changed) and skipDone (why something DIDN'T change - guard blocks, ceiling/missing-data
+            // skips, the diagnostic negative-space) are both always logged.
             response.infoLog += workDone;
-            if (methodVerbose === 'enabled') response.infoLog += verboseDone;
+            response.infoLog += skipDone;
             response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;
             response.processFile = true;
         } else {
             if (workDone) response.infoLog += workDone;
-            if (methodVerbose === 'enabled' && verboseDone) response.infoLog += verboseDone;
-            response.infoLog += `☑Audio already has the correct formats available.\n`;
+            if (skipDone) response.infoLog += skipDone;
+            response.infoLog += `☑Audio already has the correct formats available\n`;
             response.processFile = false;
         }
         return response;
