@@ -7,7 +7,9 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `Prepares the file for any next steps including remuxing to mp4/mkv\n\n
                      -Identify and remove data streams and image/cover-art streams (by codec, or by attached_pic/still_image/timed_thumbnails disposition)\n\n
-                     -Optionally removes any subtitle or audio tracks that are not in the specified language(s)\n\n
+                     -Optionally removes any subtitle tracks that are not in the specified language(s) via language_sub (audio language filtering is audio_clean's job)\n\n
+                     -Standardises the stored language tag per container (tag_language / method_tag_language) and fills missing or und tags from language_fill - the only awk plugin that WRITES language tags\n\n
+                     -Optional pre-mux early warning (guard_audio_language) that aborts a multi-language file whose original audio track isn't marked, before any downstream encoding work\n\n
                      -Optionally removes SDH/CC accessibility subtitles via remove_sub_sdh (audio-description audio is audio_clean's method_secondary)\n\n
                      -Option to modify metadata to remove metadata comments and titles with too many periods\n\n
                      -Automatically deduplicates titles reducing "Stereo / Stereo" down to "Stereo" or "English - English" down to "English"\n\n
@@ -17,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.999.1',
+    Version: '3.999.2',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -203,21 +205,6 @@ const details = () => ({
                 \\nIf disabled - (Default) no check; audio_clean handles whatever it finds.`,
         },
         {
-            name: 'recover_bad_timestamps',
-            type: 'string',
-            defaultValue: 'disabled',
-            inputUI: {
-                type: 'dropdown',
-                options: ['disabled', 'light', 'aggressive'],
-            },
-            tooltip: `Fix a broken presentation timeline: stutter, audio/video desync, or ffmpeg errors like "first pts value must set", "Timestamps are unset in a packet for stream", "Non-monotonous DTS in output stream", or "DTS out of order".
-                 \\nTry light first; if the error persists switch to aggressive.
-                 \\ndisabled: no timestamp recovery.
-                 \\nlight (risk-free): -fflags +genpts and -avoid_negative_ts make_zero - regenerates missing PTS and shifts negative start times to zero. Touches no frame data.
-                 \\naggressive: additionally -fflags +igndts - ignores the source DTS and fully rebuilds the timeline (fixes "Non-monotonous DTS"). Can produce odd results, so only use it if light didn't help.
-                 \\nThe mode actually applied is recorded in an awk_recovered tag. Recovery re-runs only when a recover_bad_* mode changes, then settles (it won't reprocess every pass). Container-forced timestamp fixes for ts/avi/mpg/mpeg still always apply.`,
-        },
-        {
             name: 'recover_bad_data',
             type: 'string',
             defaultValue: 'disabled',
@@ -231,6 +218,21 @@ const details = () => ({
                  \\nlight (risk-free): -fflags +ignidx and -err_detect ignore_err - ignores a broken/corrupt index (AVI idx1, MOV/MP4 sample tables) and keeps reading past detected errors instead of failing. Drops no frames.
                  \\naggressive: additionally -fflags +discardcorrupt - drops packets flagged corrupt, which may cause small video/audio blips where the damage is.
                  \\nThe mode actually applied is recorded in an awk_recovered tag. Recovery re-runs only when a recover_bad_* mode changes, then settles.`,
+        },
+        {
+            name: 'recover_bad_timestamps',
+            type: 'string',
+            defaultValue: 'disabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['disabled', 'light', 'aggressive'],
+            },
+            tooltip: `Fix a broken presentation timeline: stutter, audio/video desync, or ffmpeg errors like "first pts value must set", "Timestamps are unset in a packet for stream", "Non-monotonous DTS in output stream", or "DTS out of order".
+                 \\nTry light first; if the error persists switch to aggressive.
+                 \\ndisabled: no timestamp recovery.
+                 \\nlight (risk-free): -fflags +genpts and -avoid_negative_ts make_zero - regenerates missing PTS and shifts negative start times to zero. Touches no frame data.
+                 \\naggressive: additionally -fflags +igndts - ignores the source DTS and fully rebuilds the timeline (fixes "Non-monotonous DTS"). Can produce odd results, so only use it if light didn't help.
+                 \\nThe mode actually applied is recorded in an awk_recovered tag. Recovery re-runs only when a recover_bad_* mode changes, then settles (it won't reprocess every pass). Container-forced timestamp fixes for ts/avi/mpg/mpeg still always apply.`,
         },
     ],
 });

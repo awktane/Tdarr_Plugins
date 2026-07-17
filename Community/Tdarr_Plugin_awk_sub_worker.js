@@ -10,8 +10,9 @@ const details = () => ({
                 \\nmode=import muxes matching sidecars back into the file (restoring language, title, and disposition) and, by default, deletes the sidecar once it is safely embedded. Import never drops a subtitle - anything not already embedded is muxed in (a copy already present just becomes a duplicate, never a loss); method_deduplicate collapses byte-identical copies.
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them. Import ALSO recognizes fresh Plex-native sidecars with no s<index> (e.g. <video>.en.forced.srt), anchoring on the language token.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
+                \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all) and skip_commentary (omit commentary tracks). method_deduplicate controls how import handles byte-identical sidecars: disabled keeps every copy, enabled collapses each byte-identical group to one track (merging their flags), enabled_delete does the same and also deletes every consumed sidecar once embedded (regardless of remove_sidecar_after_import).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '2.1.0',
+    Version: '2.1.1',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {

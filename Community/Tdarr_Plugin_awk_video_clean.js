@@ -5,14 +5,14 @@ const details = () => ({
     Name: 'Transcode video to an efficient codec at a target quality, auto-selecting the best encoder per node.',
     Type: 'Video',
     Operation: 'Transcode',
-    Description: `Re-encodes the video stream to a modern codec (HEVC/H.264/AV1) at a resolution-tiered constant quality, optionally downscaling, and touches nothing else (audio and subtitles are copied).\n\n
+    Description: `Re-encodes the video stream to a modern codec (HEVC/H.264/AV1) at a resolution-tiered constant quality - keeping the source bit depth by default or forcing 8-/10-bit (force_bit_depth) - optionally downscaling; audio and subtitles are copied unchanged (embedded cover-art video is dropped).\n\n
                      -Auto-selects the best available encoder on EACH node at runtime: queries the ffmpeg build + a cheap hardware-presence check (no trial-encode ladder), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Force a specific encoder or leave it on auto.\n\n
-                     -Constant-quality (CRF/CQ) tiered by resolution, normalized so the same setting yields comparable quality on every encoder.\n\n
+                     -Constant-quality (CRF/CQ) tiered by resolution, normalized so the same setting yields comparable quality on every encoder; an encoder-speed control (slow/medium/fast) trades encode time for a smaller file at the same quality.\n\n
                      -Optionally caps resolution (e.g. 4K -> 1080p), re-deriving the quality tier for the output height.\n\n
                      -HDR-aware (method_hdr): preserves static HDR10/HLG; by default leaves Dolby Vision / HDR10+ untouched (dynamic metadata can't survive a re-encode), can strip just the dynamic layer, or GPU-tonemap all HDR down to SDR (one consistent look across NVIDIA/Intel/AMD/Apple nodes) for SDR-only playback.\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '2.4.2',
+    Version: '2.4.3',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
