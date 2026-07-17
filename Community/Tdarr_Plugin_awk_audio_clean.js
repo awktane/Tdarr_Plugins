@@ -7,27 +7,58 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin cleans up the audio tracks. There are options to downmix and convert tracks based on channel count and language.\n\n
                   Ensure options are set directly as this can be destructive especially with incorrectly tagged audio tracks`,
-    Version: '3.4.0',
+    Version: '3.999.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
-            name: 'downmix_language',
+            name: 'language_surround',
             type: 'string',
             defaultValue: '',
             inputUI: { type: 'text' },
-            tooltip: `Specify language tags here for the audio tracks you'd like to transcode. If blank then all tracks will be considered.
-                \\nStreams with no language tag are treated as though their language is "und". A track whose language is not in this list is treated as secondary - excluded from the primary downmix paths (downmix_to_six/downmix_to_stereo), never protected by guard_lossless/guard_quality/guard_object_audio, and instead handled by downmix_secondary_stereo.
-                \\nException: if the file has NO genuine (non-commentary, non-descriptive) track in a listed language, the language filter goes dormant and every genuine track is treated as primary - so a foreign-language-only file (e.g. Japanese-only when the list is English) keeps its surround instead of being downmixed. Commentary and descriptive tracks are always secondary regardless of language.
-                \\nException: guard_original, when enabled, keeps an 'original'-disposition track (a foreign film's original-language audio) primary even in an unlisted language - so it is protected as if its language were listed. See guard_original.
+            tooltip: `Languages to keep at full quality (surround). These follow downmix_to_six, downmix_to_stereo and codec_force, and are protected by guard_lossless/guard_quality/guard_object_audio. If blank then every language is treated as surround.
+                \\nStreams with no language tag are treated as though their language is "und".
                 \\nOne form is enough - en, eng, or English all match the same language (including region variants like en-US), so you don't need to list every variant.
-                \\nTracks with these languages will follow downmix_to_six, downmix_to_stereo, and codec_force
+                \\nA language in neither language_surround nor language_stereo is "unlisted" and follows language_unlisted. A language listed in BOTH lists is treated as surround (this list wins).
+                \\nException - dormancy: if NO genuine (non-commentary, non-descriptive) track matches language_surround or language_stereo, the language settings go dormant and every genuine track is kept at surround, with language_unlisted=delete suppressed - so a foreign-language-only file (e.g. Japanese-only when the lists say English) keeps all of its audio instead of losing it.
+                \\nException - guard_original, when enabled, keeps an 'original'-disposition track (a foreign film's original-language audio) at surround even in an unlisted language, and vetoes deleting it. See guard_original.
+                \\nCommentary, descriptive and M&E tracks are secondary regardless of language - they follow method_secondary, not these lists.
                 \\nExample:\\n
                     eng,fra,jpn\\n
                     English, French, and Japanese. The special codes und (undefined), mul (multiple), zxx (no linguistic content) and mis (no language code) are matched literally.
                 \\nExample:\\n
                     eng,und\\n
                     English and undefined`,
-        },                
+        },
+        {
+            name: 'language_stereo',
+            type: 'string',
+            defaultValue: '',
+            inputUI: { type: 'text' },
+            tooltip: `Languages to keep, but downmixed to stereo - a dub you want available without spending the space on its surround. Each surround track in one of these languages is transcoded in place to a single stereo codec_stereo track (using the stereo_downmix matrix); a track already at 2 channels or fewer is left alone.
+                \\nBlank (default) means no language is forced to stereo. Same matching rules as language_surround - one form is enough, und/mul/zxx/mis are matched literally.
+                \\nThese tracks are never protected by guard_lossless/guard_quality/guard_object_audio, so the downmix always happens.
+                \\nA language in BOTH this list and language_surround is treated as surround.
+                \\nExample:\\n
+                    spa,deu\\n
+                    Keep the Spanish and German dubs, but only in stereo`,
+        },
+        {
+            name: 'language_unlisted',
+            type: 'string',
+            defaultValue: 'surround',
+            inputUI: {
+                type: 'dropdown',
+                options: ['surround', 'stereo', 'delete'],
+            },
+            tooltip: `What to do with a genuine track whose language is in NEITHER language_surround nor language_stereo. Only applies when at least one track DOES match one of those lists - otherwise dormancy keeps everything at surround (see language_surround).
+                \\nCommentary/descriptive/M&E tracks are not covered here - they follow method_secondary.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nIf surround - (Default) an unlisted language is kept at full quality, exactly as if it were in language_surround. Nothing is lost; use this until you trust your lists.
+                \\nIf stereo   - an unlisted language is kept but downmixed to stereo, exactly as if it were in language_stereo.
+                \\nIf delete   - an unlisted language is removed from the file. A track is only removed when a plain (non-commentary/descriptive/M&E) track of the SAME language survives, and never if it would leave the file with no audio at all. guard_original vetoes the delete for an 'original'-flagged track.`,
+        },
         {
             name: 'downmix_to_six',
             type: 'string',
@@ -36,7 +67,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['false', 'replace', 'true'],
             },
-            tooltip: `Specify if we should downmix a 5.1 track if one doesn't already exist from the best quality higher channel track for that language (from downmix_language if specified) that is not a secondary track (commentary, descriptive, etc).
+            tooltip: `Specify if we should downmix a 5.1 track if one doesn't already exist from the best quality higher channel track for that language (from language_surround if specified) that is not a secondary track (commentary, descriptive, etc).
                 \\nIf a 5.1 track for the same language already exists or if no higher channel track exists then no new 6 channel track is created.
                 \\n=====
                 \\nActions
@@ -63,20 +94,21 @@ const details = () => ({
                 \\nIf true    - a new 2 channel track with codec_stereo will be created from a higher channel track and both will be kept`,
         },        
         {
-            name: 'downmix_secondary_stereo',
+            name: 'method_secondary',
             type: 'string',
-            defaultValue: 'false',
+            defaultValue: 'surround',
             inputUI: {
                 type: 'dropdown',
-                options: ['false', 'true'],
+                options: ['surround', 'stereo', 'delete'],
             },
-            tooltip: `Should commentary, visual impaired tracks, and other secondary tracks be downmixed to stereo? Unlike the primary downmix options, each surround secondary track is transcoded in place to stereo independently — one stereo per secondary track, preserving all of them. This would normally be false.
-                \nThese tracks are never protected by guard_lossless/guard_quality/guard_object_audio, so an enabled secondary downmix always transcodes them in place.
+            tooltip: `What to do with SECONDARY tracks - commentary, visual impaired (audio description) and M&E tracks. This is a role, not a language: a secondary track follows this setting whatever its language, and never language_surround/language_stereo/language_unlisted.
+                \\nUnlike the language downmix paths, each surround secondary track is handled in place and independently - one stereo per secondary track, preserving all of them. Secondary tracks are never protected by guard_lossless/guard_quality/guard_object_audio, so stereo always transcodes them.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nIf false - secondary tracks are left untouched
-                \\nIf true  - each secondary track with more than 2 channels is transcoded in place to a stereo codec_stereo track (using the stereo_downmix matrix).`,
+                \\nIf surround - (Default) secondary tracks are left at their source channels, untouched by the downmix paths (codec_force and method_loudnorm still apply).
+                \\nIf stereo   - each secondary track with more than 2 channels is transcoded in place to a stereo codec_stereo track (using the stereo_downmix matrix).
+                \\nIf delete   - secondary tracks are removed. Safety: a track is only removed when a plain (non-commentary/descriptive/M&E) track of the SAME language survives, and never if it would leave the file with no audio at all - so the only track of a file, or a lone audio-description track with no plain track in its language, is always kept.`,
         },
         {
             name: 'codec_force',
@@ -221,7 +253,7 @@ const details = () => ({
                 \\n=====
                 \\nIf keep  - the track is left in its source codec (not written as opus). Safe default: nothing fails and no audio is lost; a loudnorm-only run just leaves that one track un-normalized.
                 \\nIf drop  - the track is removed entirely. The last remaining audio track is never dropped (falls back to keep). A stereo/5.1 a downmix would derive from that track is still created.
-                \\nIf remix - the track is downmixed to a codec_stereo stereo (using method_stereo_downmix), with loudness applied when method_loudnorm is active. Defers to downmix_to_stereo / downmix_secondary_stereo when they already convert the track, and falls back to keep rather than create a duplicate stereo.`,
+                \\nIf remix - the track is downmixed to a codec_stereo stereo (using method_stereo_downmix), with loudness applied when method_loudnorm is active. Defers to downmix_to_stereo / the stereo tier (language_stereo, language_unlisted=stereo, method_secondary=stereo) when they already convert the track, and falls back to keep rather than create a duplicate stereo.`,
         },
         {
             name: 'guard_lossless',
@@ -235,8 +267,9 @@ const details = () => ({
                 whenever its SOURCE is lossless (TrueHD, DTS-HD MA, FLAC, PCM, etc.) - independent of guard_quality and guard_object_audio, so disabling
                 quality-based protection never accidentally exposes a lossless master too; you have to turn this off on purpose. A guarded downmix 'replace'
                 becomes 'add' (the source is kept and the downmix is added alongside); a guarded codec_force/method_loudnorm is skipped (left in its source
-                codec); a guarded duplicate is kept instead of removed. Commentary/descriptive tracks and unlisted-language tracks (while the
-                downmix_language filter is active) are never protected - the language filter and secondary status take precedence. See downmix_language.
+                codec); a guarded duplicate is kept instead of removed. Only a genuine track kept at surround is protected: secondary (commentary/descriptive/
+                M&E) tracks never are, and neither is a track you already sent to stereo or delete via language_stereo/language_unlisted/method_secondary -
+                protecting a track from the very downmix you asked for would be nonsense. See language_surround.
                 \\nNote: disabling this alone does not guarantee a lossless source gets touched - guard_quality's own quality-margin math still runs
                 using that source's (near-maximum) quality score, and in practice will usually still block a conversion to any lossy codec unless
                 guard_quality is ALSO relaxed. The three guards (guard_quality, this, guard_object_audio) are fully independent, not a fallback chain.
@@ -258,8 +291,8 @@ const details = () => ({
                 whenever the operation reduces channel count OR a lossy source's predicted quality drop is significant - independent of guard_lossless
                 and guard_object_audio below. Protection is earned PER OPERATION against that operation's real target codec/channels - not a single "best track" flag.
                 A guarded downmix 'replace' becomes 'add'; a guarded codec_force/method_loudnorm is skipped; a guarded duplicate is kept instead of removed.
-                codec_force='all' does not override this - a guarded track is left alone in every force mode. Commentary/descriptive tracks and
-                unlisted-language tracks (while the downmix_language filter is active) are never protected. See downmix_language.
+                codec_force='all' does not override this - a guarded track is left alone in every force mode. Only a genuine track kept at surround is
+                protected: secondary tracks never are, and neither is a track already sent to stereo or delete. See language_surround.
                 \\n=====
                 \\nActions
                 \\n=====
@@ -285,8 +318,8 @@ const details = () => ({
                 channel bed, silently discarding the height/object information - the same irreversible loss guard_lossless prevents for lossless
                 masters, but for LOSSY object-audio carriers that guard_lossless doesn't cover (Atmos on E-AC-3 and DTS:X on DTS core/HR are lossy).
                 Atmos/DTS:X on a lossless carrier (TrueHD, DTS-HD MA) is already covered by guard_lossless. A guarded downmix 'replace' becomes 'add';
-                a guarded codec_force/method_loudnorm is skipped; a guarded duplicate is kept. Commentary/descriptive and unlisted-language tracks are
-                never protected. See downmix_language.
+                a guarded codec_force/method_loudnorm is skipped; a guarded duplicate is kept. Only a genuine track kept at surround is protected: secondary
+                tracks never are, and neither is a track already sent to stereo or delete. See language_surround.
                 \\nNote: object-audio detection is best-effort - Atmos on E-AC-3 is reliable, but DTS:X relies on a MediaInfo field its own maintainers
                 note is incomplete for an undocumented format, so a real DTS:X track may occasionally not be recognized (it never false-positives). A
                 recognized object-audio track is also PREFERRED over an otherwise-equal plain track when method_deduplicate picks which to keep.
@@ -304,22 +337,21 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['disabled','enabled'],
             },
-            tooltip: `Protect a foreign film's ORIGINAL-language track from being downmixed away just because its language isn't in downmix_language. A track
-                carrying the ffmpeg 'original' disposition (or an "original" title) whose language is NOT listed is normally demoted to secondary - excluded
-                from the primary downmix paths and downmixed in place by downmix_secondary_stereo, protected by none of the guards. When enabled, such a track
-                is instead treated exactly as if its language WERE in downmix_language - the same level of protection a listed language gets, no more. In
-                practice guard_quality (whose channel-drop rule flips a downmix 'replace' to 'add') keeps the surround, downmix_secondary_stereo no longer
-                downmixes it in place, and guard_lossless/guard_object_audio apply normally.
-                \\nOnly affects an 'original' track in an UNLISTED language while a listed-language primary is also present (e.g. a Japanese 5.1 original beside
-                an English dub with downmix_language=eng); an original already in a listed language, or a foreign-only file whose language filter is dormant, is
-                already primary and unchanged. The track must be identifiable as original (the 'original' flag or an "original" title) - an untagged foreign
-                track has no signal to key off. Commentary/descriptive tracks are unaffected: this clears only the language demotion, never the role demotion.
-                See downmix_language.
+            tooltip: `Protect a foreign film's ORIGINAL-language track from being downmixed or deleted just because its language is in neither language_surround
+                nor language_stereo. A track carrying the ffmpeg 'original' disposition (or an "original" title) whose language is unlisted normally follows
+                language_unlisted - so it can be downmixed to stereo, or removed outright, along with every other unlisted language. When enabled, such a track
+                is instead kept at surround exactly as if its language WERE in language_surround - the same treatment a listed language gets, no more. That also
+                vetoes language_unlisted=delete for it: an original track is never the one you meant to throw away.
+                \\nOnly affects an 'original' track in an UNLISTED language while a wanted language is also present (e.g. a Japanese 5.1 original beside an
+                English dub with language_surround=eng); an original already in a listed language, or a foreign-only file whose language settings are dormant,
+                is already kept at surround and unchanged. The track must be identifiable as original (the 'original' flag or an "original" title) - an untagged
+                foreign track has no signal to key off, so nothing here can rescue it. Commentary/descriptive/M&E tracks are unaffected: this clears only the
+                LANGUAGE decision, never the role one, so an 'original' commentary still follows method_secondary. See language_surround.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nIf enabled  - Treat an unlisted-language original track as a listed-language primary (keeps its surround under the default guards).
-                \\nIf disabled - (Default) The original track follows normal unlisted-language handling - it may be downmixed like any other secondary track.`,
+                \\nIf enabled  - Keep an unlisted-language original track at surround, and never delete it.
+                \\nIf disabled - (Default) The original track follows normal unlisted-language handling - language_unlisted may downmix or delete it.`,
         },
     ],
 });
@@ -1135,13 +1167,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const objectAudioSource = (stream) => codecInfo[resolveCodecName(stream)]?.objectAudio === true;
 
     // Parse + validate inputs. Order here mirrors the Inputs array in details() so the two never drift. Only type:'string' dropdowns are validated here -
-    // the one free-text input (downmix_language) has no fixed option set, and there are no type:'boolean' inputs. Every checked value fails the file on an
-    // out-of-set value.
-    const downmixLanguage = String(inputs.downmix_language).toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
-    const downmixLangKeys = downmixLanguage.map(langKey);   // normalised comparison keys (folds en/eng/english/en-US and 639-2/B vs /T)
+    // the two free-text inputs (language_surround, language_stereo) have no fixed option set, and there are no type:'boolean' inputs. Every checked value
+    // fails the file on an out-of-set value.
+    const langSurround = String(inputs.language_surround).toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
+    const langSurroundKeys = langSurround.map(langKey);     // normalised comparison keys (folds en/eng/english/en-US and 639-2/B vs /T)
+    const langStereo = String(inputs.language_stereo).toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
+    const langStereoKeys = langStereo.map(langKey);
+    const langUnlisted = String(inputs.language_unlisted).trim();
     const downmixToSix = String(inputs.downmix_to_six).trim();
     const downmixToTwo = String(inputs.downmix_to_stereo).trim();
-    const downmixSecondaryStereo = String(inputs.downmix_secondary_stereo).trim();
+    const methodSecondary = String(inputs.method_secondary).trim();
     const surroundCodec = String(inputs.codec_surround).trim();
     const stereoCodec = String(inputs.codec_stereo).trim();
     const forceCodec = String(inputs.codec_force).trim();
@@ -1155,12 +1190,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const guardObjectAudio = String(inputs.guard_object_audio).trim();
     const guardOriginal = String(inputs.guard_original).trim();
 
+    if(!['surround','stereo','delete'].includes(langUnlisted))
+        failFile(`[language_unlisted=${langUnlisted}] invalid value, check your settings`);
     if(!['false','replace','true'].includes(downmixToSix))
         failFile(`[downmix_to_six=${downmixToSix}] invalid value, check your settings`);
     if(!['false','replace','true'].includes(downmixToTwo))
         failFile(`[downmix_to_stereo=${downmixToTwo}] invalid value, check your settings`);
-    if(!['false','true'].includes(downmixSecondaryStereo))
-        failFile(`[downmix_secondary_stereo=${downmixSecondaryStereo}] invalid value, check your settings`);
+    if(!['surround','stereo','delete'].includes(methodSecondary))
+        failFile(`[method_secondary=${methodSecondary}] invalid value, check your settings`);
     if(!['ac3','eac3','aac','opus'].includes(surroundCodec))
         failFile(`[codec_surround=${surroundCodec}] invalid value, check your settings`);
     if(!['ac3','eac3','aac','aac_vbr','opus'].includes(stereoCodec))
@@ -1215,33 +1252,44 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // A secondary track is any commentary, visually-impaired/descriptive, or music-and-effects (clean_effects) track — the shared classifiers cover the
         // disposition flags and the title keywords. A distinct M&E (dialogue-free) mix must never be deduped away as a duplicate of the main mix. Lyrics/songs
-        // are subtitle-only, so they never apply to an audio stream.
+        // are subtitle-only, so they never apply to an audio stream. Secondary is a ROLE: such a track follows method_secondary whatever its language.
         const isSecondaryTrack = (stream) => isCommentary(stream) || isDescriptive(stream) || hasDisposition(stream, 'clean_effects');
 
-        // hasPreferredPrimary: does any genuine (non-commentary/descriptive) track sit in a listed language? Only then does the language filter demote unlisted
-        // languages to secondary. If nothing listed is present, the filter goes dormant - every non-commentary track is treated as primary, so a foreign-only
-        // file keeps its surround instead of being downmixed. Commentary/descriptive tracks are secondary regardless and never count toward preferred-primary presence.
-        const hasPreferredPrimary = downmixLanguage.length > 0
-            && audioStreams.some(s => !isSecondaryTrack(s) && langListMatch(resolveLang(s) || 'und', downmixLangKeys));
+        // Dormancy: does any genuine (non-secondary) track sit in a language the user actually asked for (language_surround or language_stereo)? Only then do
+        // the language settings act on unlisted languages. If nothing wanted is present they go dormant - every genuine track is kept at surround and
+        // language_unlisted=delete is suppressed - so a foreign-only file (Japanese-only when the lists say English) keeps all of its audio instead of losing
+        // it. Secondary tracks never count toward presence: they follow method_secondary, not the lists.
+        const hasWantedLang = (langSurroundKeys.length > 0 || langStereoKeys.length > 0)
+            && audioStreams.some(s => !isSecondaryTrack(s) && (langListMatch(resolveLang(s) || 'und', langSurroundKeys)
+                || langListMatch(resolveLang(s) || 'und', langStereoKeys)));
 
-        //Add secondary track flag and the cleaned language to each track
+        //Add secondary track flag, the cleaned language and the resolved tier to each track
         audioStreams = audioStreams.map(item => {
             const fullLang = resolveLang(item) || 'und';
-            const cleanLang = langKey(fullLang);              // folded MATCH key (en/eng/english/en-US/pt-BR all collapse): drives language filtering, lang-secondary, priority
+            const cleanLang = langKey(fullLang);              // folded MATCH key (en/eng/english/en-US/pt-BR all collapse): drives language matching, tier, priority
             // Dedup / one-downmix-per-language grouping key. method_region_dedup=distinct keeps the region/script subtag (pt-BR != pt-PT, en-US != en); the default 'fold'
             // reuses the folded match key so every regional variant collapses to one language.
             const regionKey = regionDedup === 'distinct' ? langIdentityKey(fullLang) : cleanLang;
             // Enrich with mediaInfo bitrate before audioQuality scoring so that formats like DTS-HD MA (which ffprobe can't read a bitrate for in MP4/M4V
             // containers) score and display correctly.
             const enrichedItem = enrichStream(item);
+            const secondary = isSecondaryTrack(item);
+            // The track's TIER - what happens to it: 'surround' (kept at full quality, the only tier eligible for the downmix_to_* paths and the guards),
+            // 'stereo' (kept, transcoded in place to stereo) or 'delete' (removed, subject to the delete safety below). Role wins the axis: a secondary track
+            // follows method_secondary whatever its language. A genuine track follows its language bucket - language_surround, language_stereo, or
+            // language_unlisted for a language in neither list. Dormancy pins every genuine track to surround. guard_original keeps an 'original'-flagged
+            // track at surround in an unlisted language, which also vetoes deleting it (see guard_original); it clears only the LANGUAGE decision, never the
+            // role one, so an 'original' commentary still follows method_secondary.
+            let tier;
+            if (secondary) tier = methodSecondary;
+            else if (langSurroundKeys.includes(cleanLang)) tier = 'surround';    // a language in BOTH lists is surround - this list wins the overlap
+            else if (langStereoKeys.includes(cleanLang)) tier = 'stereo';
+            else if (!hasWantedLang) tier = 'surround';                          // dormant - nothing the user asked for is present, so keep everything
+            else if (guardOriginal === 'enabled' && hasDisposition(item, 'original')) tier = 'surround';
+            else tier = langUnlisted;
             return { ...enrichedItem,
-                isTdarrSecondaryTrack: isSecondaryTrack(item),
-                // Language-secondary: track language is not in downmixLanguage AND a listed-language primary exists (hasPreferredPrimary). These follow the
-                // secondary path (downmix_secondary_stereo, codec_force) but are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo).
-                // When no listed-language primary is present the filter is dormant, so this stays false and the track is treated as primary. guard_original
-                // exempts an 'original'-disposition track: it stays primary in an unlisted language, getting the same protection a listed language would (see guard_original).
-                isTdarrLangSecondary: hasPreferredPrimary && !downmixLangKeys.includes(cleanLang)
-                    && !(guardOriginal === 'enabled' && hasDisposition(item, 'original')),
+                isTdarrSecondaryTrack: secondary,
+                isTdarrTier: tier,
                 isTdarrCleanLang: cleanLang,
                 isTdarrRegionKey: regionKey,
                 isTdarrQuality: audioQuality(enrichedItem),
@@ -1253,20 +1301,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
         });
 
-        // candidateStreams: the pool for workStreams. Lang-secondary tracks (unlisted language) are included here so codec_force
-        // and downmix_secondary_stereo can act on them. They are excluded from the primary downmix paths (downmix_to_six, downmix_to_stereo) in the processing
-        // loop below. Secondary and lang-secondary tracks are only dropped from the pool when there is genuinely nothing to do with them:
-        // downmix_secondary_stereo is false AND codec_force is false. When codec_force is set they stay so the force-codec path can standardize their codec
-        // too (e.g. codec_force='all' must touch every track, including commentary and unlisted-language tracks).
+        // candidateStreams: the pool for workStreams. A track earns a place when there is genuinely something to do with it - it is a genuine surround track
+        // (the only kind eligible for downmix_to_six/downmix_to_stereo), or its tier is 'stereo' (the in-place stereo downmix), or codec_force is set, which
+        // must be able to standardize the codec of EVERY track including commentary and unlisted-language ones (e.g. codec_force='all' must touch them all).
+        // Anything with nothing to do is dropped from the pool. ('delete'-tier tracks may remain here harmlessly - workStreams filters streamsToRemove below.)
         let candidateStreams = audioStreams;
-        if (downmixSecondaryStereo === 'false' && forceCodec === 'false')
-            candidateStreams = candidateStreams.filter(stream => !stream.isTdarrSecondaryTrack && !stream.isTdarrLangSecondary);
+        if (forceCodec === 'false')
+            candidateStreams = candidateStreams.filter(stream => stream.isTdarrTier === 'stereo'
+                || (!stream.isTdarrSecondaryTrack && stream.isTdarrTier === 'surround'));
 
         // guard_lossless/guard_quality/guard_object_audio: block a destructive operation on a track ONLY when it would irreversibly lose detail the
         // destination format can't hold. Protection is earned PER OPERATION — each decision site calls guardBlocks with its own real target codec/channels —
-        // not assigned to a single "best" track. Secondary (commentary/descriptive) and lang-secondary (unlisted language, filter active) tracks are never
-        // protected: the language filter and secondary status win (isTdarrLangSecondary is only set when a listed-language primary exists, so a dormant filter
-        // leaves a foreign-only track primary and protectable). The THREE guards are fully independent (no fallback chain): guard_lossless alone decides
+        // not assigned to a single "best" track. Only a genuine track at tier 'surround' is protectable: a secondary (commentary/descriptive/M&E) track never
+        // is, and neither is a track the user has already asked to shrink or drop (tier 'stereo'/'delete') - protecting it from the very downmix that was
+        // requested would be nonsense. A dormant language setting leaves a foreign-only track at 'surround', so it stays protectable. The THREE guards are
+        // fully independent (no fallback chain): guard_lossless alone decides
         // whether a lossless SOURCE is protected; guard_object_audio alone decides whether an Atmos/DTS:X/MPEG-H object-audio source is protected (ffmpeg has
         // no encoder for the object layer, so any re-encode flattens it - this covers the LOSSY object-audio carriers guard_lossless can't, e.g. E-AC-3 Atmos);
         // guard_quality alone decides the channel-drop rule and the quality-margin math below, regardless of the other two. Disabling guard_lossless with
@@ -1278,7 +1327,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // exceed the margin to protect) - preserving the force-DTS-to-ac3 behaviour.
         const QUALITY_MARGIN = 7;
         const guardBlocks = (stream, targetCodec, targetChannels, srcChannels) => {
-            if (stream.isTdarrSecondaryTrack || stream.isTdarrLangSecondary) return false;
+            if (stream.isTdarrSecondaryTrack || stream.isTdarrTier !== 'surround') return false;
             if (guardLossless === 'enabled' && stream.isTdarrLossless) return true;         // lossless detail can't survive any lossy re-encode
             if (guardObjectAudio === 'enabled' && stream.isTdarrObjectAudio) return true;   // Atmos/DTS:X/MPEG-H object layer has no ffmpeg encoder
             if (guardQuality === 'disabled') return false;
@@ -1301,7 +1350,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The channel-count check protects the higher-channel duplicate under BOTH quality tiers ('enabled' and 'strict'), so 'strict' is genuinely ⊇ 'enabled'
         // (its documented "most protective" role) - there is no tier where 'strict' is less protective than 'enabled' for a channel-dropping dedup.
         const dedupeGuardBlocks = (removed, survivor) => {
-            if (removed.isTdarrLangSecondary) return false;   // a foreign-language MAIN track is deduped freely (secondary tracks never reach here - skipped in the loop)
+            if (removed.isTdarrTier !== 'surround') return false;   // a track already headed for stereo/delete is deduped freely (secondary tracks never reach here - skipped in the loop)
             if (guardLossless === 'enabled' && removed.isTdarrLossless && !survivor.isTdarrLossless) return true;   // dropping the last lossless copy
             if (guardObjectAudio === 'enabled' && removed.isTdarrObjectAudio && !survivor.isTdarrObjectAudio) return true;   // dropping the last object-audio (Atmos/DTS:X) copy
             if (guardQuality !== 'disabled' && removed.channels > survivor.channels) return true;     // survivor has fewer channels (enabled AND strict)
@@ -1327,7 +1376,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //       Both exceptions only apply while the matching downmix option is enabled and use the same channel bands as existingSixLangs/
         //       existingStereoLangs, so dedup can't disagree with and re-trigger the downmix creation guards - a disagreement would create an
         //       infinite create/remove loop between the two options.
-        // Note: dedup runs across ALL audio streams regardless of downmix_language/downmix_secondary_stereo (those govern transcoding candidates, not what's a
+        // Note: dedup runs across ALL audio streams regardless of the language settings (those govern each track's tier, not what's a
         // genuine duplicate - a duplicate in a non-preferred language is still a duplicate). guard_lossless/guard_quality/guard_object_audio (dedupeGuardBlocks) keep a duplicate whose removal
         // would lose detail the survivor can't hold (a last lossless copy, or a higher-channel track under quality) instead of removing it, and never -errors on it.
         const removeDuplicatesErrorMode = removeDuplicatesBy === 'multi-stereo-error' || removeDuplicatesBy === 'channel-error';
@@ -1409,6 +1458,41 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Audio streams still present (not in streamsToRemove), read at call time so it reflects dedup + pre-pass removals - backs the never-drop-last-track guard.
         const countSurvivingAudio = () => file.ffProbeData.streams.filter(a => (a?.codec_type || '').toLowerCase() === 'audio' && !streamsToRemove.has(a.index)).length;
 
+        // ====== TIER DELETES ======
+        // language_unlisted=delete / method_secondary=delete. Runs before the layout-drop pre-pass (so an already-deleted track isn't dropped twice) and before
+        // existingStereoLangs/existingSixLangs below (so a deleted track can't leave a stale "already exists" entry that suppresses a downmix backfill).
+        // The two deletes carry DIFFERENT safety nets, because they fail differently:
+        //   language_unlisted=delete removes a whole unwanted language, so it must NOT require another track of that language to survive - that rule would make
+        //     the option inert, since an unwanted dub is normally the only track of its language. Its safety is dormancy (hasWantedLang) + the never-empty floor.
+        //   method_secondary=delete removes an EXTRA, so it keeps the fall-back rule: only remove it when a plain (non-secondary) track of the SAME language
+        //     survives to fall back on - a lone audio-description track, or the only track of its language, is kept.
+        // Both are floored by countSurvivingAudio() > 1: no delete may ever leave the file with no audio at all.
+        const delToken = (s) => `${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrCleanLang}`;
+        // Language deletes resolve FIRST, so the plain-language fall-back set the role deletes read below reflects what actually survives them.
+        for (const s of audioStreams) {
+            if (s.isTdarrTier !== 'delete' || s.isTdarrSecondaryTrack || streamsToRemove.has(s.index)) continue;
+            if (countSurvivingAudio() <= 1) {
+                skipDone += `☒${streamTag(s.index)}[language_unlisted=delete] Not removing ${delToken(s)} - it is the last audio track\n`;
+                continue;
+            }
+            streamsToRemove.add(s.index);
+            workDone += `☐${streamTag(s.index)}[language_unlisted=delete] Removing ${delToken(s)} - not in language_surround or language_stereo\n`;
+        }
+        const plainLangsSurviving = new Set(audioStreams.filter(s => !s.isTdarrSecondaryTrack && !streamsToRemove.has(s.index)).map(s => s.isTdarrCleanLang));
+        for (const s of audioStreams) {
+            if (s.isTdarrTier !== 'delete' || !s.isTdarrSecondaryTrack || streamsToRemove.has(s.index)) continue;
+            if (!plainLangsSurviving.has(s.isTdarrCleanLang)) {
+                skipDone += `☒${streamTag(s.index)}[method_secondary=delete] Not removing ${delToken(s)} - no plain ${s.isTdarrCleanLang} track survives to fall back on\n`;
+                continue;
+            }
+            if (countSurvivingAudio() <= 1) {
+                skipDone += `☒${streamTag(s.index)}[method_secondary=delete] Not removing ${delToken(s)} - it is the last audio track\n`;
+                continue;
+            }
+            streamsToRemove.add(s.index);
+            workDone += `☐${streamTag(s.index)}[method_secondary=delete] Removing secondary ${delToken(s)}\n`;
+        }
+
         // A source the layout-drop pre-pass removes may have been the SOLE source a downmix would have derived a track from - dropping it must not
         // silently lose that derivative. Each such dropped source is recorded here and its stereo/5.1 derivative is created after the main loop, but
         // only when the language didn't otherwise get one (so a redundant dropped source adds nothing). See the post-loop derivative pass below.
@@ -1433,18 +1517,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // A downmix that will process this track keeps it out of the drop pile — whether it converts in place (replace, unguarded) or flips to 'add'
                 // (guarded: source kept + a derivative added), the track SURVIVES, so defer the drop to the loop; only a track NO downmix touches is truly dropped.
                 // Must NOT gate this on guardBlocks: a guarded replace flips to 'add', which keeps the source — dropping it here would delete it before that add runs
-                // (a data-loss regression). primary: downmix_to_stereo=replace (any >2ch) or downmix_to_six=replace (>6ch → 5.1); secondary: downmix_secondary_stereo.
+                // (a data-loss regression). surround tier: downmix_to_stereo=replace (any >2ch) or downmix_to_six=replace (>6ch → 5.1); stereo tier: the in-place downmix.
                 // The per-language one-shot (created2chLangs/six) is dynamic and can't be predicted here; a pre-empted downmix lands the track in the loop keep fallback.
-                 const secondary = s.isTdarrSecondaryTrack || s.isTdarrLangSecondary;
-                if (secondary ? downmixSecondaryStereo === 'true'
-                              : (downmixToTwo === 'replace' || (ch > 6 && downmixToSix === 'replace'))) continue;
+                const stereoPath = s.isTdarrTier === 'stereo';                                   // the in-place stereo downmix converts it anyway
+                const surroundPath = !s.isTdarrSecondaryTrack && s.isTdarrTier === 'surround';   // only a genuine surround track reaches downmix_to_*
+                if (stereoPath || (surroundPath && (downmixToTwo === 'replace' || (ch > 6 && downmixToSix === 'replace')))) continue;
                 if (countSurvivingAudio() <= 1) continue;                                    // never drop the last audio track
                 streamsToRemove.add(s.index);
                 workDone += `☒${streamTag(s.index)}[method_layout_err=${methodLayoutErr}] Dropping - libopus can't encode a ${s.channel_layout || `${ch}ch`} layout\n`;   // this IS a change (removal)
                 // Remember a dropped source a downmix (add/'true' mode) would derive from, so its stereo/5.1 still gets created even though the source
                 // itself is gone (see the post-loop pass below). 'replace' modes already deferred above (they convert the source in place), so only the
-                // 'true'/add cases reach here. Secondary tracks are handled by downmix_secondary_stereo in place, never derived, so they're excluded.
-                if (!secondary && (downmixToTwo !== 'false' || (ch > 6 && downmixToSix !== 'false')))
+                // 'true'/add cases reach here. Only a genuine surround track derives: a 'stereo'-tier track is converted in place, never derived from.
+                if (surroundPath && (downmixToTwo !== 'false' || (ch > 6 && downmixToSix !== 'false')))
                     layoutDroppedDeriveSources.push(s);
             }
         }
@@ -1453,7 +1537,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // among the SURVIVORS, so downmix_to_stereo/downmix_to_six only create one for a language that genuinely lacks it (a removed track can't leave a
         // stale entry). isTdarrRegionKey (the same key dedup grouped on - region-distinct only when method_region_dedup=distinct) matches created2chLangs/ffstreamLangKey. Channels 2 = stereo;
         // >4 && <=6 = any 5-6 channel primary (5.0/5.1, and the rare 4.1 which is also 5 channels) without catching 4.0 (4ch) or 7.1 (8ch).
-        const survivingPrimaryAudio = audioStreams.filter(s => !streamsToRemove.has(s.index) && !s.isTdarrSecondaryTrack && !s.isTdarrLangSecondary);
+        const survivingPrimaryAudio = audioStreams.filter(s => !streamsToRemove.has(s.index) && !s.isTdarrSecondaryTrack && s.isTdarrTier === 'surround');
         const existingStereoLangs = new Set(survivingPrimaryAudio.filter(s => s.channels === 2).map(s => s.isTdarrRegionKey));
         const existingSixLangs = new Set(survivingPrimaryAudio.filter(s => s.channels > 4 && s.channels <= 6).map(s => s.isTdarrRegionKey));
 
@@ -1494,16 +1578,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .filter(s => channelMatch(s));
 
         workStreams.sort((a, b) => {
-            // language priority (isTdarrCleanLang is the normalised key; downmixLangKeys is the normalised user list, so en/eng/english all rank together)
-            const aLang = downmixLangKeys.indexOf(a.isTdarrCleanLang);
-            const bLang = downmixLangKeys.indexOf(b.isTdarrCleanLang);
+            // language priority: the languages the user most wants (language_surround), in the order they listed them. isTdarrCleanLang is the normalised key
+            // and langSurroundKeys the normalised user list, so en/eng/english all rank together. A stereo-tier or unlisted language ranks last.
+            const aLang = langSurroundKeys.indexOf(a.isTdarrCleanLang);
+            const bLang = langSurroundKeys.indexOf(b.isTdarrCleanLang);
 
             const aRank = aLang === -1 ? 999 : aLang;
             const bRank = bLang === -1 ? 999 : bLang;
             if (aRank !== bRank) return aRank - bRank;
 
-            const aRole = (a.isTdarrSecondaryTrack || a.isTdarrLangSecondary) ? 1 : 0;
-            const bRole = (b.isTdarrSecondaryTrack || b.isTdarrLangSecondary) ? 1 : 0;
+            // a full-quality genuine track outranks anything demoted to stereo or any secondary (commentary/descriptive/M&E) track
+            const aRole = (a.isTdarrSecondaryTrack || a.isTdarrTier !== 'surround') ? 1 : 0;
+            const bRole = (b.isTdarrSecondaryTrack || b.isTdarrTier !== 'surround') ? 1 : 0;
             if (aRole !== bRole) return aRole - bRole;
 
             // channel ordering
@@ -1782,18 +1868,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     return tb > 0 ? `~${tb / 1000} kb/s` : 'unknown bitrate';
                 })();
 
-            // Secondary tracks (commentary, VI, etc.) and lang-secondary tracks (unlisted language) get the stereo-only path and never trigger the
-            // primary downmix (downmix_to_six/two).
-            if (ffstream.isTdarrSecondaryTrack || ffstream.isTdarrLangSecondary) {
-            // ---- SECONDARY: DOWNMIX TO STEREO ----
-            // Each secondary surround track is transcoded in place independently — one stereo per secondary track, preserving all of them.
-            // guard_lossless/guard_quality/guard_object_audio never protect secondary or lang-secondary tracks (guardBlocks short-circuits false for them), so there is no guarded-source
-            // case here: an enabled secondary downmix always transcodes in place.
-            if (downmixSecondaryStereo !== 'false' && ffstream.channels > 2 && !modifiedAudioIdx.has(outputAudioIdx)) {
+            // A secondary track (commentary, VI, M&E) and any track demoted to the stereo tier take the in-place stereo path, and never trigger the surround
+            // downmix (downmix_to_six/two) - only a genuine tier-'surround' track reaches those.
+            if (ffstream.isTdarrSecondaryTrack || ffstream.isTdarrTier !== 'surround') {
+            // ---- STEREO TIER: DOWNMIX IN PLACE ----
+            // Each such surround track is transcoded in place independently — one stereo per track, preserving all of them. ONLY tier 'stereo' converts: a
+            // secondary track left at method_secondary=surround falls through untouched here (codec_force/method_loudnorm may still act on it further down).
+            // guard_lossless/guard_quality/guard_object_audio never protect a secondary or a non-surround-tier track (guardBlocks short-circuits false for
+            // them), so there is no guarded-source case here: the stereo tier always transcodes in place.
+            if (ffstream.isTdarrTier === 'stereo' && ffstream.channels > 2 && !modifiedAudioIdx.has(outputAudioIdx)) {
                 const newTitle = escMeta(buildTitle(ffstream, '2.0'));
                 // Downmix changes channel count, so the source bitrate isn't a comparable floor - stereoEnc uses the 2ch table target (aac_vbr uses plain VBR 5).
                 const e = stereoEnc(outputAudioIdx);
-                workDone += `☐${streamTag(ffstream.index)}[downmix_secondary_stereo=${downmixSecondaryStereo}] Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${e.logCodec} stereo @ ${e.rate} (${e.label ? `${e.label}, ` : ''}secondary)\n`;
+                // Thread the setting that actually put this track on the stereo tier, so the log names the input the user would go change.
+                const tierTag = ffstream.isTdarrSecondaryTrack ? `method_secondary=${methodSecondary}`
+                    : (langStereoKeys.includes(ffstream.isTdarrCleanLang) ? 'language_stereo' : `language_unlisted=${langUnlisted}`);
+                workDone += `☐${streamTag(ffstream.index)}[${tierTag}] Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${e.logCodec} stereo @ ${e.rate} (${e.label ? `${e.label}, ` : ''}${ffstream.isTdarrSecondaryTrack ? 'secondary' : 'stereo tier'})\n`;
                 extraArguments += ` -c:a:${outputAudioIdx} ${e.frag}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                 if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(streamLang)}"`;
                 modifiedAudioIdx.add(outputAudioIdx);
@@ -1936,7 +2026,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             skipDone += `☒${streamTag(ffstream.index)}[codec_force=${forceCodec}] Not forcing opus - libopus can't encode a ${layoutName} layout; left as ${ffstreamCodec}${why}\n`;
                         } else if (opusBad && methodLayoutErr === 'remix' && !relabel) {
                             // remix→stereo: downmix in place to a codec_stereo track (NOT opus) so it stays stereo-codec-consistent and idempotent (a stereo
-                            // opus would be re-forced to codec_stereo next run). Mirrors downmix_secondary_stereo; the 2ch table target (surround source
+                            // opus would be re-forced to codec_stereo next run). Mirrors the in-place stereo tier; the 2ch table target (surround source
                             // bitrate isn't a comparable floor).
                             const newTitle = escMeta(buildTitle(ffstream, '2.0'));
                             const e = stereoEnc(outputAudioIdx);
@@ -2041,7 +2131,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // ===== LOUDNORM: untouched tracks =====
         // Tracks none of the downmix/force/remix sites above touched at all (the common case - already the right codec/channels, nothing else needed). Runs over
-        // EVERY kept audio stream directly (not workStreams/candidateStreams, which exist for codec_force/downmix_secondary_stereo's own narrower
+        // EVERY kept audio stream directly (not workStreams/candidateStreams, which exist for codec_force/the stereo tier's own narrower
         // eligibility and would silently exclude secondary/commentary tracks under default settings) - guard_lossless/guard_quality/guard_object_audio are the only scope gate.
         // A track ALSO being modified by one of the sites above rides on that same re-encode instead (each site's own stereoArg/layoutFilter/
         // inline block calls buildLoudnormFilter directly at its own emit point); this loop only handles the leftovers.

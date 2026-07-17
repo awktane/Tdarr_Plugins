@@ -8,7 +8,7 @@ const details = () => ({
     Description: `Prepares the file for any next steps including remuxing to mp4/mkv\n\n
                      -Identify and remove data streams and image/cover-art streams (by codec, or by attached_pic/still_image/timed_thumbnails disposition)\n\n
                      -Optionally removes any subtitle or audio tracks that are not in the specified language(s)\n\n
-                     -Optionally removes accessibility tracks (SDH/CC subtitles, audio-description audio) via remove_accessibility\n\n
+                     -Optionally removes SDH/CC accessibility subtitles via remove_sub_sdh (audio-description audio is audio_clean's method_secondary)\n\n
                      -Option to modify metadata to remove metadata comments and titles with too many periods\n\n
                      -Automatically deduplicates titles reducing "Stereo / Stereo" down to "Stereo" or "English - English" down to "English"\n\n
                      -Optionally rebuilds audio and/or subtitle titles from their disposition roles and imports title keywords into the real ffmpeg disposition flags\n\n
@@ -17,7 +17,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.4.1',
+    Version: '3.999.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -34,22 +34,6 @@ const details = () => ({
                 \\n=====
                 \\nmkv removes eia_608, ttml, xsub, dvb_teletext, and any other subtitle format the mkv muxer can't carry. mov_text is converted to srt for compatibility.
                 \\nmp4 additionally removes the image-based subtitles mkv keeps (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle), plus arib_caption and hdmv_text_subtitle. Text-based subtitles (subrip, srt, ass, ssa, webvtt, text) are converted to mov_text. Genpts may be required to fix timestamps. HEVC video is tagged hvc1 so Apple/QuickTime can play it.`,
-        },
-        {
-            name: 'language_audio',
-            type: 'string',
-            defaultValue: '',
-            inputUI: { type: 'text' },
-            tooltip: `Specify language tags here for the audio tracks you'd like to keep. If blank then no tracks will be removed.
-                \\nStreams with no language tag are treated as though they had language_fill as their language or "und" if language_fill isn't set
-                \\nOne form is enough - en, eng, or English all match the same language (including region variants like en-US), so you don't need to list every variant.
-                \\nExample:\\n
-                    eng,fra,jpn
-                    \\nEnglish, French, and Japanese.
-                \\nThe special codes und (undefined), mul (multiple languages), zxx (no linguistic content) and mis (no language code) are matched literally - include them to keep such tracks.
-                \\nExample:\\n
-                    eng,und
-                    \\nEnglish and both audio streams marked as und or with no language set.`,
         },
         {
             name: 'language_sub',
@@ -73,7 +57,7 @@ const details = () => ({
             defaultValue: '',
             inputUI: { type: 'text' },
             tooltip: `Specify language tag here to force upon subtitle/audio tracks that are missing a language tag. Blank language or und tracks will be filled with this language tag.
-                \\nTakes precedence over language_audio/language_sub if track language is und or blank.
+                \\nTakes precedence over language_sub if track language is und or blank.
                 \\nMust follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes
                 \\nExample:\\n
                     eng
@@ -81,18 +65,21 @@ const details = () => ({
                     jpn`,
         },
         {
-            name: 'language_fill_fail',
-            type: 'boolean',
-            defaultValue: true,
+            name: 'language_fill_mode',
+            type: 'string',
+            defaultValue: 'single-or-error',
             inputUI: {
                 type: 'dropdown',
-                options: ['true', 'false'],
+                options: ['single-or-error', 'force-any'],
             },
-            tooltip: `If more than one audio or subtitle stream has no language tag, should processing be aborted?
-                \\nMultiple untagged streams of the same type can't be told apart by language — the only way to know is by listening. If language_fill is set they'd all be assigned the same language; either way a subsequent plugin may treat them as duplicates and remove one, causing silent content loss (e.g. deleting the only Japanese track because it was tagged the same as English).
-                \\nIf true  - processing is aborted and the file is sent to the error queue. Tag the streams manually and requeue.
-                \\nIf false - processing continues; any missing languages will be filled by language_fill which could cause logic to remove one of the tracks as lower quality, etc.`,
-        },        
+            tooltip: `What to do when more than one audio or subtitle stream has no language tag.
+                \\nMultiple untagged streams of the same type can't be told apart by language — the only way to know is by listening. If language_fill is set they'd all be assigned the same language; either way a subsequent plugin may treat them as duplicates and remove one, causing silent content loss (e.g. deleting the only Japanese track because it was tagged the same as English). This runs before the remux, so it aborts without spending the mux.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nIf single-or-error - (Default) one untagged stream of a type is fine and gets language_fill; two or more abort the file to the error queue. Tag them manually and requeue.
+                \\nIf force-any       - processing continues however many are untagged; any missing languages will be filled by language_fill, which could let later logic remove one of the tracks as a lower-quality duplicate.`,
+        },
         {
             name: 'tag_disposition',
             type: 'string',
@@ -134,16 +121,16 @@ const details = () => ({
                 \\nUndetermined / non-language codes (und, mul, zxx, mis) are always left untouched.`,
         },
         {
-            name: 'remove_accessibility',
+            name: 'remove_sub_sdh',
             type: 'string',
             defaultValue: 'disabled',
             inputUI: {
                 type: 'dropdown',
-                options: ['disabled', 'subtitle', 'audio', 'both'],
+                options: ['disabled', 'enabled'],
             },
-            tooltip: `Remove accessibility tracks. Choose which stream types to apply to: disabled, subtitle, audio, or both.
-                \\nSubtitle removes SDH / Closed Caption tracks (for the deaf/hard-of-hearing). Audio removes audio-description tracks (visual_impaired, for the blind). Detected by the real ffmpeg disposition flag or by keywords in the title/handler/description.
-                \\nSafety: a track is only removed when a "plain" track of the same language survives - one carrying no commentary/descriptive/SDH/lyrics role (and, for subtitles, in a format the output container keeps and not stripped by remove_imagesubs). So extras are removed, never the last usable track.`,
+            tooltip: `Remove SDH / Closed Caption subtitles (for the deaf/hard-of-hearing). Detected by the real ffmpeg disposition flag or by keywords in the title/handler/description.
+                \\nSafety: a track is only removed when a "plain" subtitle of the same language survives - one carrying no commentary/descriptive/SDH/lyrics role, in a format the output container keeps and not stripped by remove_imagesubs. So extras are removed, never the last usable track.
+                \\nAudio-description (visual_impaired) audio is not handled here - audio_clean's method_secondary owns it, along with commentary and M&E.`,
         },
         {
             name: 'remove_comments',
@@ -198,17 +185,21 @@ const details = () => ({
                 \\nbcp47: like container on mp4 (3-letter terminologic) but on mkv keeps the full BCP-47 tag - a region (ISO-3166) subtag like pt-BR/es-419 or a script (ISO-15924) subtag like zh-Hans; mp4 can't store a region so it still folds to 3-letter (por).`,
         },
         {
-            name: 'guard_original',
+            name: 'guard_audio_language',
             type: 'string',
             defaultValue: 'disabled',
             inputUI: {
                 type: 'dropdown',
                 options: ['disabled', 'enabled'],
             },
-            tooltip: `Protect a foreign film's ORIGINAL-language audio track from being removed by the language_audio filter when its language isn't in your list.
-                \\nKeys off the ffmpeg "original" disposition flag OR an "original" keyword in the track title/handler (the same signal audio_clean's guard_original uses). A track with neither marker is not protected - this only rescues a properly-flagged original track, not a bare native-language track.
-                \\ndisabled (default): the original track follows normal language_audio handling (removed if its language isn't listed).
-                \\nenabled: keep an original-disposition audio track regardless of language_audio - so a jpn-only original track survives an eng-only filter instead of being dropped (or, if it were the last audio track, quarantining the file).`,
+            tooltip: `An EARLY WARNING for multi-language files whose original language isn't marked. audio_clean is what actually keeps or drops audio by language, but it can only trust a track marked 'original' - it has no way to tell which of several untagged languages is the real original. This checks for that risk here, BEFORE the remux, so a file that needs your attention costs you nothing to find out about.
+                \\nWhen enabled: if the file has MORE THAN ONE audio language among its genuine (non-commentary/descriptive) tracks and NO audio track is marked original (the ffmpeg 'original' disposition flag, or an "original" keyword in the title/handler), the file is aborted to the error queue. Mark the original track and requeue - audio_clean's guard_original can then protect it.
+                \\nLanguages are compared folded, so en/eng/English/en-US count as one; an untagged track counts as its own "und" language. A file with a single audio language, or one that already marks its original, passes untouched.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nIf enabled  - abort a multi-language file that marks no original, so you can tag it before audio_clean acts on it.
+                \\nIf disabled - (Default) no check; audio_clean handles whatever it finds.`,
         },
         {
             name: 'recover_bad_timestamps',
@@ -641,8 +632,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
         failFile('No ffProbe stream data available for this file - the plugin cannot process it');
 
-    // Input validation. Order mirrors the Inputs array in details(); only type:'string' inputs are checked - free-text inputs (language_audio, language_sub)
-    // have no fixed option set, and type:'boolean' inputs (language_fill_fail, remove_comments/remove_busytitle) are coerced to a real
+    // Input validation. Order mirrors the Inputs array in details(); only type:'string' inputs are checked - free-text inputs (language_sub, language_fill)
+    // have no fixed option set, and type:'boolean' inputs (remove_comments/remove_busytitle) are coerced to a real
     // true/false by loadDefaultValues (any out-of-set value becomes false), so a guard on them would be dead code. container is validated first (input #1) and
     // before the dstContainer parse below so an empty value fails cleanly rather than throwing a raw TypeError. Remaining checks run after all inputs parse.
     if (!inputs.container || inputs.container === '')
@@ -674,18 +665,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     const fillLanguage = (inputs.language_fill ? inputs.language_fill.toLowerCase().trim() : '');
     const subLanguage = inputs.language_sub.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
-    const audioLanguage = inputs.language_audio.toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
-    // Pre-normalise the user language lists to comparison keys once (langKey folds en/eng/english/en-US and 639-2/B vs /T) - the filters match against these.
+    // Pre-normalise the user language list to comparison keys once (langKey folds en/eng/english/en-US and 639-2/B vs /T) - the filter matches against these.
     const subLangKeys = subLanguage.map(langKey);
-    const audioLangKeys = audioLanguage.map(langKey);
-    const failBlankLangs = String(inputs.language_fill_fail) === 'true';
-    const removeAccessible = String(inputs.remove_accessibility || 'disabled').toLowerCase();
+    const fillMode = String(inputs.language_fill_mode || 'single-or-error').toLowerCase();
+    const removeSubSdh = String(inputs.remove_sub_sdh || 'disabled').toLowerCase();
     const tagLanguage = String(inputs.tag_language || 'invalid').toLowerCase();
     const methodTagLanguage = String(inputs.method_tag_language || 'container').toLowerCase();
-    const guardOriginal = String(inputs.guard_original || 'disabled').toLowerCase();
+    const guardAudioLanguage = String(inputs.guard_audio_language || 'disabled').toLowerCase();
 
-    // Value checks continue in Inputs order (container already checked above): language_fill is format-checked and cross-checked against language_sub/
-    // language_audio, then the remaining dropdowns are checked against their option set (free-text and boolean inputs need no check - see above).
+    // Value checks continue in Inputs order (container already checked above): language_fill is format-checked and cross-checked against language_sub,
+    // then the remaining dropdowns are checked against their option set (free-text and boolean inputs need no check - see above).
     // language_fill accepts any recognised language in any form - langKey folds en/eng/English/en-US/pt-BR to a base code - or a valid special/private code
     // (und/mul/zxx/mis/qaa-qtz, mirroring isNonLang); an unrecognised token (typo/garbage) fails the file so a bad fill can't be written and then demote a stream downstream.
     if(fillLanguage) {
@@ -695,13 +684,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if(!knownFill)
             failFile(`[language_fill=${inputs.language_fill}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
     }
-    // If fillLanguage is set it should be a track that's kept (checked per-type so one type can legitimately exclude it).
+    // If fillLanguage is set it should be a subtitle that's kept. (There is no audio equivalent: audio_clean owns audio language now, and it reads the tag
+    // this plugin has already written rather than language_fill itself, so there is nothing here to cross-check against.)
     if(fillLanguage && subLanguage.length > 0 && !subLangKeys.includes(langKey(fillLanguage)))
         failFile(`[language_fill=${fillLanguage}] not in language_sub - untagged subtitle streams would be removed; add it to language_sub or clear language_fill`);
-    if(fillLanguage && audioLanguage.length > 0 && !audioLangKeys.includes(langKey(fillLanguage)))
-        failFile(`[language_fill=${fillLanguage}] not in language_audio - untagged audio streams would be removed; add it to language_audio or clear language_fill`);
-    if(!['disabled', 'subtitle', 'audio', 'both'].includes(removeAccessible))
-        failFile(`[remove_accessibility=${removeAccessible}] invalid value, check your settings`);
+    if(!['single-or-error', 'force-any'].includes(fillMode))
+        failFile(`[language_fill_mode=${fillMode}] invalid value, check your settings`);
+    if(!['disabled', 'enabled'].includes(removeSubSdh))
+        failFile(`[remove_sub_sdh=${removeSubSdh}] invalid value, check your settings`);
     if(!['disabled', 'audio', 'subtitle', 'both'].includes(tagDisposition))
         failFile(`[tag_disposition=${tagDisposition}] invalid value, check your settings`);
     if(!['disabled', 'audio', 'subtitle', 'both'].includes(tagTitle))
@@ -714,8 +704,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`[recover_bad_timestamps=${recoverTs}] invalid value, check your settings`);
     if(!['disabled', 'light', 'aggressive'].includes(recoverData))
         failFile(`[recover_bad_data=${recoverData}] invalid value, check your settings`);
-    if(!['disabled', 'enabled'].includes(guardOriginal))
-        failFile(`[guard_original=${guardOriginal}] invalid value, check your settings`);
+    if(!['disabled', 'enabled'].includes(guardAudioLanguage))
+        failFile(`[guard_audio_language=${guardAudioLanguage}] invalid value, check your settings`);
     if(!['unsupported', 'all', 'export'].includes(removeImageSubs))
         failFile(`[remove_imagesubs=${removeImageSubs}] invalid value, check your settings`);
 
@@ -822,7 +812,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ====== END LANGUAGE TAG CANONICALIZATION ======
 
     // Subtitle codecs dropped purely by container/format, regardless of language - never assigned language_fill (counted separately by the
-    // language_fill_fail check below). alwaysDropSubs is unmuxable by BOTH containers: eia_608 (closed-caption data embedded in the video
+    // language_fill_mode check below). alwaysDropSubs is unmuxable by BOTH containers: eia_608 (closed-caption data embedded in the video
     // bitstream, not a real subtitle stream) and ttml (no working ffmpeg encoder/muxer path) either way; xsub and dvb_teletext have no Matroska
     // CodecID, so mkv rejects them too. mp4OnlyDropSubs muxes fine in mkv but not mp4: the image-based PGS/VobSub/DVB formats, plus arib_caption
     // and hdmv_text_subtitle (both decode-only for mp4; hdmv_text_subtitle copies into mkv fine).
@@ -856,7 +846,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return `.${imageBase}.s${ffstream.index}.${lang}${forced}.${ext}`;
     };
     // A subtitle removed regardless of language - by container/format (subFormatDropped) or by remove_imagesubs (imageSubDropped). Neither is ever assigned
-    // language_fill, and neither counts as a survivor for the language_fill_fail untagged tally or the remove_accessibility plain-track guard.
+    // language_fill, and neither counts as a survivor for the language_fill_mode untagged tally or the remove_sub_sdh plain-track guard.
     const subDroppedAnyReason = (codec) => subFormatDropped(codec) || imageSubDropped(codec);
 
     // ===== SHARED [audio_clean, clean_and_remux]: title canonicalization =====
@@ -1002,19 +992,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     // Check if file is a video. If it isn't then exit plugin. This benign skip (processFile:false) must precede the per-file CONTENT checks below - the
-    // language_fill_fail pre-check can failFile (quarantine), and a non-video file the plugin only means to skip must never be routed to the error queue.
+    // language_fill_mode / guard_audio_language pre-checks can failFile (quarantine), and a non-video file the plugin only means to skip must never be routed to the error queue.
     if (file.fileMedium !== 'video') {
         response.infoLog += '☑File is not a video\n';
         response.processFile = false;
         return response;
     }
 
-    // remove_accessibility safety guard.
-    // (subDroppedAnyReason/subtitle drop lists defined earlier) A "plain" track carries no commentary/descriptive/SDH/lyrics role - a genuine main audio or
-    // dialogue subtitle. remove_accessibility removes an accessibility track (SDH/CC subtitle, audio-description audio) only when its language still has a plain
-    // track that SURVIVES the language, format, and remove_imagesubs filters, so we strip extras, never the last usable track. resolveWorkLang mirrors the
-    // loop's language resolution. Computed BEFORE the language_fill_fail pre-check so that check can exclude the accessibility tracks this guard will drop.
-    const plainAudioLangs = new Set();
+    // remove_sub_sdh safety guard.
+    // (subDroppedAnyReason/subtitle drop lists defined earlier) A "plain" subtitle carries no commentary/descriptive/SDH/lyrics role - a genuine dialogue
+    // subtitle. remove_sub_sdh removes an SDH/CC subtitle only when its language still has a plain subtitle that SURVIVES the language, format, and
+    // remove_imagesubs filters, so we strip extras, never the last usable track. resolveWorkLang mirrors the loop's language resolution. Computed BEFORE the
+    // language_fill_mode pre-check so that check can exclude the SDH tracks this guard will drop. Audio has no equivalent here: audio_clean's method_secondary
+    // owns audio-description removal and carries its own plain-same-language fall-back rule.
     const plainSubLangs = new Set();
     const isPlainTrack = (s) => !isCommentary(s) && !isDescriptive(s) && !isSdh(s) && !isLyrics(s);
     const hasPlainSameLang = (set, wl) => set.has(langKey(wl));
@@ -1022,56 +1012,59 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const sl = resolveLang(s);
         return (fillLanguage && (!sl || sl === 'und')) ? fillLanguage : (sl || 'und');
     };
-    if (removeAccessible !== 'disabled') {
+    if (removeSubSdh === 'enabled') {
         for (const s of (file.ffProbeData?.streams || [])) {
-            const t = (s.codec_type || '').trim().toLowerCase();
-            if ((t !== 'audio' && t !== 'subtitle') || !isPlainTrack(s)) continue;
-            if (t === 'subtitle' && subDroppedAnyReason((s.codec_name || '').toLowerCase())) continue;
+            if ((s.codec_type || '').trim().toLowerCase() !== 'subtitle' || !isPlainTrack(s)) continue;
+            if (subDroppedAnyReason((s.codec_name || '').toLowerCase())) continue;
             const wl = resolveWorkLang(s);
-            const langKeys = t === 'audio' ? audioLangKeys : subLangKeys;
-            if (langKeys.length > 0 && !langListMatch(wl, langKeys)) continue;
-            const set = t === 'audio' ? plainAudioLangs : plainSubLangs;
-            set.add(langKey(wl));
+            if (subLangKeys.length > 0 && !langListMatch(wl, subLangKeys)) continue;
+            plainSubLangs.add(langKey(wl));
         }
     }
 
     // Summarise the input streams exactly as they arrived, before any removal/remux/quarantine, using the shared bracket helper. This plugin runs first, so it
     // captures the file as received; reading it alongside the stream-ordering plugin's output line shows where a file came from and where it ended up. Emitted
-    // before the language_fill_fail pre-check so a quarantine there carries the same input picture the strip-all-audio/video quarantines do. Starts with ☐.
+    // before the guard_audio_language / language_fill_mode pre-checks so a quarantine there carries the same input picture the no-video quarantine does. Starts with ☐.
     response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
 
-    // language_fill_fail pre-check: when >1 untagged stream of a type WILL REACH THE OUTPUT, they can't be told apart by language - abort so the user can tag them
-    // manually and requeue (language_fill_fail=false instead lets processing continue). Whether the blanks get filled to the same language (a downstream dedupe-
-    // collision risk) or stay "und" (an ambiguous, incomplete file), multiple untagged streams of a type are the problem worth failing on - BUT only counting the
-    // ones that survive TO THE OUTPUT: an untagged track dropped by the language filter, by container/format (subtitles, subDroppedAnyReason), or by the
-    // remove_accessibility guard above never reaches a later plugin, so counting it would spuriously quarantine a file that processes fine.
+    // guard_audio_language: an early warning, evaluated BEFORE the remux so a file that needs attention costs nothing to find out about. audio_clean decides
+    // what audio to keep, but it can only trust a track MARKED 'original' - it has no way to tell which of several untagged languages is the real one. So when
+    // this file carries more than one genuine audio language and marks no original, abort and let the user tag it. Languages fold through langKey (en/eng/
+    // English/en-US are one language); an untagged track counts as its own "und". Commentary/descriptive tracks are excluded - a foreign-language commentary is
+    // normal and says nothing about which track is the original.
+    if (guardAudioLanguage === 'enabled') {
+        const audioStreams = (file.ffProbeData.streams || []).filter((s) => (s?.codec_type || '').toLowerCase() === 'audio');
+        const genuineLangs = new Set(audioStreams.filter((s) => !isCommentary(s) && !isDescriptive(s)).map((s) => langKey(resolveWorkLang(s))));
+        if (genuineLangs.size > 1 && !audioStreams.some((s) => hasDisposition(s, 'original')))
+            failFile(`[guard_audio_language=${guardAudioLanguage}] ${genuineLangs.size} audio languages (${[...genuineLangs].join(', ')}) and none marked original - one of them could be the original language; mark the original track and requeue, or set guard_audio_language=disabled`);
+    }
+
+    // language_fill_mode pre-check: when >1 untagged stream of a type WILL REACH THE OUTPUT, they can't be told apart by language - abort so the user can tag
+    // them manually and requeue (force-any instead lets processing continue). Whether the blanks get filled to the same language (a downstream dedupe-collision
+    // risk) or stay "und" (an ambiguous, incomplete file), multiple untagged streams of a type are the problem worth failing on - BUT only counting the ones
+    // that survive TO THE OUTPUT: an untagged subtitle dropped by the language filter, by container/format (subDroppedAnyReason), or by the remove_sub_sdh
+    // guard above never reaches a later plugin, so counting it would spuriously quarantine a file that processes fine. This plugin never drops audio, so every
+    // untagged audio stream reaches the output and counts.
     // Resolves language via resolveLang (ffprobe tag, then mediaInfo fallback), so a language only mediaInfo supplies is not treated as blank here.
-    if (failBlankLangs) {
+    if (fillMode === 'single-or-error') {
         const streams = file.ffProbeData.streams || [];
         const isUntagged = (s) => { const lang = resolveLang(s); return !lang || lang === 'und'; };
         const fillNote = fillLanguage ? ` and would all be assigned "${fillLanguage}" by language_fill` : '';
-        // Every untagged track shares the same post-fill language (language_fill if set, else "und"), so "does it survive the language filter" is one check per
-        // type: kept when the language list is empty (keep-all) or contains that language. Mirrors the main loop's own keep/drop decision.
+        // Every untagged track shares the same post-fill language (language_fill if set, else "und"), so "does it survive the subtitle filter" is one check:
+        // kept when the language list is empty (keep-all) or contains that language. Mirrors the main loop's own keep/drop decision.
         const untaggedWorkLang = fillLanguage || 'und';
         const keptByLangFilter = (keys) => keys.length === 0 || langListMatch(untaggedWorkLang, keys);
-        // An untagged accessibility track (audio-description / SDH) the remove_accessibility guard would drop is excluded too - mirrors the loop's own removal
-        // predicate. Untagged tracks resolve to untaggedWorkLang, so reuse the plainAudioLangs/plainSubLangs computed above.
-        const removedByAccess = (s, type) => applies(removeAccessible, type)
-            && (type === 'audio' ? isDescriptive(s) : isSdh(s))
-            && hasPlainSameLang(type === 'audio' ? plainAudioLangs : plainSubLangs, untaggedWorkLang);
-        // guard_original independently rescues an untagged 'original'-disposition audio track from the language filter (main loop), so it reaches the output even when the
-        // filter would drop the untagged language. Count those too, else 2+ guard-rescued ambiguous untagged tracks slip past the very collision this quarantine prevents.
-        const audioSurvivesFilter = keptByLangFilter(audioLangKeys);
-        const guardRescuesUntagged = guardOriginal === 'enabled' && audioLangKeys.length > 0 && !audioSurvivesFilter;
-        const untaggedAudio = streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s) && !removedByAccess(s, 'audio')
-            && (audioSurvivesFilter || (guardRescuesUntagged && hasDisposition(s, 'original')))).length;
+        // An untagged SDH subtitle the remove_sub_sdh guard would drop is excluded too - mirrors the loop's own removal predicate. Untagged tracks resolve to
+        // untaggedWorkLang, so reuse the plainSubLangs computed above.
+        const removedBySdh = (s) => removeSubSdh === 'enabled' && isSdh(s) && hasPlainSameLang(plainSubLangs, untaggedWorkLang);
+        const untaggedAudio = streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s)).length;
         if (untaggedAudio > 1)
-            failFile(`[language_fill_fail=true] ${untaggedAudio} audio streams have no language tag${fillNote} - may be different languages; tag them manually and requeue, or set language_fill_fail=false`);
+            failFile(`[language_fill_mode=${fillMode}] ${untaggedAudio} audio streams have no language tag${fillNote} - may be different languages; tag them manually and requeue, or set language_fill_mode=force-any`);
         const untaggedSubs = keptByLangFilter(subLangKeys)
             ? streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'subtitle'
-                && !subDroppedAnyReason((s.codec_name || '').toLowerCase()) && isUntagged(s) && !removedByAccess(s, 'subtitle')).length : 0;
+                && !subDroppedAnyReason((s.codec_name || '').toLowerCase()) && isUntagged(s) && !removedBySdh(s)).length : 0;
         if (untaggedSubs > 1)
-            failFile(`[language_fill_fail=true] ${untaggedSubs} subtitle streams have no language tag${fillNote} - may be different languages; tag them manually and requeue, or set language_fill_fail=false`);
+            failFile(`[language_fill_mode=${fillMode}] ${untaggedSubs} subtitle streams have no language tag${fillNote} - may be different languages; tag them manually and requeue, or set language_fill_mode=force-any`);
     }
 
     // Set up required variables.
@@ -1081,7 +1074,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     let inputArgs = '';   // recovery args that must precede -i (e.g. -err_detect); placed on the input side of the preset
     let workDone = '';
     let convert = false;
-    let audioDropped = 0;
     let videoDropped = 0;
     let subtitleStreamIndex = -1;
     let audioStreamIndex = -1;
@@ -1166,8 +1158,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if(subLanguage.length > 0 && !langListMatch(workLang, subLangKeys)) {
                         workDone += `☐${streamTag(ffstream.index)}[language_sub=${inputs.language_sub}] Remove subtitle language (${streamLang})\n`;
                         delStream = true;
-                    } else if (applies(removeAccessible, 'subtitle') && isSdh(ffstream) && hasPlainSameLang(plainSubLangs, workLang)) {
-                        workDone += `☐${streamTag(ffstream.index)}[remove_accessibility=${removeAccessible}] Remove accessibility subtitle SDH/CC (${logSafe(roleTextLower(ffstream))})\n`;
+                    } else if (removeSubSdh === 'enabled' && isSdh(ffstream) && hasPlainSameLang(plainSubLangs, workLang)) {
+                        workDone += `☐${streamTag(ffstream.index)}[remove_sub_sdh=${removeSubSdh}] Remove accessibility subtitle SDH/CC (${logSafe(roleTextLower(ffstream))})\n`;
                         delStream = true;
                     }
                 }
@@ -1269,30 +1261,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (lm.meta) { workDone += lm.log; metadataCommand += lm.meta; }
                 }
 
-                //guard_original: an unlisted-language audio track carrying the 'original' role (real flag or title keyword) is protected from the language filter.
-                //Must gate the removal below (before the audioDropped/audioStreamIndex bookkeeping) so a rescued last-audio track also avoids the strip-all-audio quarantine.
-                const guardedOriginal = guardOriginal === 'enabled' && audioLanguage.length > 0
-                    && !langListMatch(workLang, audioLangKeys) && hasDisposition(ffstream, 'original');
-                if(guardedOriginal)
-                    workDone += `☑${streamTag(ffstream.index)}[guard_original=${guardOriginal}] Keep original-language audio (${streamLang})\n`;
-
-                //If the audio is a language that should be removed then remove it regardless of other settings.
-                if(audioLanguage.length > 0 && !langListMatch(workLang, audioLangKeys) && !guardedOriginal) {
-                    workDone += `☐${streamTag(ffstream.index)}[language_audio=${inputs.language_audio}] Remove audio language (${streamLang})\n`;
-                    delStream = true;
-                } else if (applies(removeAccessible, 'audio') && isDescriptive(ffstream) && hasPlainSameLang(plainAudioLangs, workLang)) {
-                    workDone += `☐${streamTag(ffstream.index)}[remove_accessibility=${removeAccessible}] Remove audio description (${logSafe(roleTextLower(ffstream))})\n`;
-                    delStream = true;
-                }
-
-                if(delStream === true) {
-                    extraArguments += ` -map -0:${ffstream.index}`;
-                    removedIndices.add(ffstream.index);
-                    convert = true;
-                    audioDropped++;
-                    audioStreamIndex--;
-                    continue;
-                }
+                // This plugin never removes an audio stream - audio_clean owns every audio keep/drop decision (language via language_surround/language_stereo/
+                // language_unlisted, role via method_secondary), so audio only ever gets metadata work here.
 
                 //Remove surrounding whitespace, single/double quotes (no reason for them). Busy-title clearing happens after tag_disposition (below).
                 let newStreamTitle = cleanStreamTitle(streamTitle);
@@ -1447,9 +1417,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         if(videoDropped > 0 && videoStreamIndex === -1)
             failFile('Removing the specified streams would leave the file with no video streams - check your removal settings');
-
-        if(audioDropped > 0 && audioStreamIndex === -1)
-            failFile('Removing the specified streams would leave the file with no audio streams - check your removal settings');
 
         //Now the file level metadata can be cleaned up if needed.
         if((metaCommentRemove === true) && file.ffProbeData.format?.tags?.comment) {
