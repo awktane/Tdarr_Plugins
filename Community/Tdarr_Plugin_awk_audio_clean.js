@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '3.999.3',
+    Version: '3.999.4',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1174,6 +1174,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const langStereo = String(inputs.language_stereo).toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
     const langStereoKeys = langStereo.map(langKey);
     const langUnlisted = String(inputs.language_unlisted).trim();
+    // Case-preserving language read for the metadata WRITES on transcoded/appended streams below. resolveLang lowercases (correct for its matching KEYS), but writing
+    // that would degrade clean_and_remux's canonical BCP-47 region/script case (pt-BR -> pt-br) and trip a later re-repair remux, so the writes read the stored tag
+    // verbatim (ffprobe tag, then mediaInfo), preserving case. audio_clean never NORMALISES a language tag - that is clean_and_remux's job.
+    const langForWrite = (s) => (s.tags?.language || '').trim() || (mediaInfoFor(s)?.Language ?? '').trim();
     const downmixToSix = String(inputs.downmix_to_six).trim();
     const downmixToTwo = String(inputs.downmix_to_stereo).trim();
     const downmixSecondary = String(inputs.downmix_secondary).trim();
@@ -1843,7 +1847,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         for (let i = 0; i < workStreams.length; i++) {
             const ffstream = workStreams[i];
             const ffstreamCodec = (ffstream.codec_name || '').toLowerCase();
-            const streamLang = resolveLang(ffstream);
+            const streamLang = langForWrite(ffstream);
             const outputAudioIdx = outputAudioIdxMap.get(ffstream.index);
             const srcAudioIdx = inputAudioIdxMap.get(ffstream.index);
 
@@ -2092,7 +2096,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const lang = s.isTdarrRegionKey;
             const srcAudioIdx = inputAudioIdxMap.get(s.index);
             if (srcAudioIdx === undefined) continue;
-            const streamLang = resolveLang(s);
+            const streamLang = langForWrite(s);
             const srcBitrate = Number(s.bit_rate || 0);
             const srcRateStr = srcBitrate > 0 ? `${Math.round(srcBitrate / 1000)} kb/s` : 'unknown bitrate';
             const srcCodec = (s.codec_name || 'unknown').trim().toLowerCase();
@@ -2186,7 +2190,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             loudnormRelabel = `channelmap=map=${relabel.map}:channel_layout=${relabel.layout}`;   // lossless relabel to an opus-safe layout, chained ahead of loudnorm
                         } else if (methodLayoutErr === 'remix') {
                             const newTitle = escMeta(buildTitle(stream, '2.0'));
-                            const sLang = resolveLang(stream);
+                            const sLang = langForWrite(stream);
                             const e = stereoEnc(outputAudioIdx);
                             workDone += `☐${streamTag(stream.index)}[method_loudnorm=${loudnorm}] Normalizing ${rawCodec} ${channels}ch → ${e.logCodec} stereo @ ${e.rate} (${e.label ? `${e.label}; ` : ''}remixed - libopus can't encode a ${lay || `${channels}ch`} layout)\n`;
                             extraArguments += ` -c:a:${outputAudioIdx} ${e.frag}${stereoArg(outputAudioIdx, stream)}${loudnormStampArg(outputAudioIdx)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
