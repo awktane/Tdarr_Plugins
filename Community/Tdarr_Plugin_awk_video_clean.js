@@ -12,7 +12,7 @@ const details = () => ({
                      -HDR-aware (method_hdr): preserves static HDR10/HLG; by default leaves Dolby Vision / HDR10+ untouched (dynamic metadata can't survive a re-encode), can strip just the dynamic layer, or GPU-tonemap all HDR down to SDR (one consistent look across NVIDIA/Intel/AMD/Apple nodes) for SDR-only playback.\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '2.4.6',
+    Version: '2.4.7',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -881,6 +881,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const isHdr = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'].includes(srcXfer) || !!String(mi?.HDR_Format || '').trim() || isDynamicHdr;
         if (isDynamicHdr && methodHdr === 'preserve') {
             response.infoLog += `☒${streamTag(primary.index)}[method_hdr=preserve] Dynamic HDR (Dolby Vision / HDR10+) detected - cannot survive a re-encode, left untouched; set method_hdr=strip_dynamic to transcode (keeps the base HDR10 layer) or method_hdr=tonemap_sdr to tonemap to SDR\n`;
+            response.processFile = false;
+            return response;
+        }
+        // Dynamic HDR (Dolby Vision) whose base carries NO standard HDR transfer of its own - a single-layer DV, e.g. profile 5: an IPT-PQ-C2 base with no smpte2084/HLG tag.
+        // strip_dynamic keeps the base HDR10/HLG layer via ffmpeg's colour auto-propagation, but there is no standard transfer to propagate, so the re-encode emits an untagged,
+        // mis-coloured picture. So skip and point at tonemap_sdr (the only ffmpeg-native safe flatten; a proper DV->profile-8 conversion needs dovi_tool, out of this plugin's
+        // scope). The transfer - not the DOVI bl_signal_compatibility_id - is the reliable signal: a compat_id-0 stream that DOES carry a PQ transfer (a mislabelled base) keeps
+        // it and re-encodes fine, while profile 7/8/10 all carry smpte2084/HLG and are unaffected. HDR10+ always carries smpte2084, so it is never caught here.
+        const dvNoBaseLayer = isDynamicHdr && !['smpte2084', 'arib-std-b67', 'pq', 'hlg'].includes(srcXfer);
+        if (methodHdr === 'strip_dynamic' && dvNoBaseLayer) {
+            response.infoLog += `☒${streamTag(primary.index)}[method_hdr=strip_dynamic] Single-layer Dolby Vision with no HDR10 base layer (e.g. profile 5) - stripping the dynamic metadata would leave a mis-coloured picture with no HDR fallback, left untouched; set method_hdr=tonemap_sdr to flatten it to SDR\n`;
             response.processFile = false;
             return response;
         }
