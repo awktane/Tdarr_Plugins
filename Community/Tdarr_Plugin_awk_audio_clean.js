@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '3.999.6',
+    Version: '3.999.7',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1124,8 +1124,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //   • native aac (any)      -> -b:a 256k CBR                    last-resort floor via encoderArgsIdx (-vbr is libfdk-private, so native aac can't VBR here)
     // aac_at's top tier (q:a 0) runs a little heavier than libfdk -vbr 5 but is leaner + faster than native 256k; erring high keeps the fallback no worse than the
     // source warranted. isStereoSrc should be true only for codec_force codec-swap paths where the source is already 2ch. Warns once per file when not using libfdk.
+    // Single source for the aac_vbr low-info boundary and its predicted delivered rate, shared by aacVbrArgsIdx (picks the VBR level) and guardBlocks (scores the
+    // delivered quality) so the two can't drift: a stereo source at/below this bitrate emits libfdk -vbr 4 (~128k), above it -vbr 5 (~192k).
+    const AAC_VBR_LOWINFO_BPS = 144000;
+    const aacVbrPredictedBps = (srcBps) => (Number(srcBps) > 0 && Number(srcBps) <= AAC_VBR_LOWINFO_BPS) ? 128000 : 192000;
     const aacVbrArgsIdx = (idx, srcBps = 0, isStereoSrc = false, channels = 2) => {
-        const lowInfo = isStereoSrc && Number(srcBps) > 0 && Number(srcBps) <= 144000;
+        const lowInfo = isStereoSrc && Number(srcBps) > 0 && Number(srcBps) <= AAC_VBR_LOWINFO_BPS;
         if (hasEncoder('libfdk_aac')) {
             const vbrLevel = lowInfo ? 4 : 5;
             return { encoder: 'libfdk_aac', args: ` -vbr:a:${idx} ${vbrLevel}`, approxRate: lowInfo ? '~128k' : '~192k', label: `libfdk VBR q${vbrLevel}` };
@@ -1339,11 +1343,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (guardQuality === 'disabled') return false;
             if (Number(targetChannels) < Number(srcChannels)) return true;       // the operation drops channels
             const family = aacFamily(targetCodec);      // aac_vbr scores as the aac family
-            // Predict the bitrate the same-channel force branch actually emits, then score it. aac_vbr emits libfdk VBR (~128k q4 for a <=144k source, else ~192k
-            // q5; see aacVbrArgsIdx), NOT resolveBitrate's CBR target — predict the VBR rate directly for aac_vbr or the guard would overstate the delivered quality.
+            // Predict the bitrate the same-channel force branch actually emits, then score it. aac_vbr emits libfdk VBR (see aacVbrPredictedBps / aacVbrArgsIdx), NOT
+            // resolveBitrate's CBR target — predict the VBR rate directly for aac_vbr or the guard would overstate the delivered quality.
             const srcBps = Number(stream.bit_rate) || 0;
             const predBps = targetCodec === 'aac_vbr'
-                ? (srcBps > 0 && srcBps <= 144000 ? 128000 : 192000)
+                ? aacVbrPredictedBps(srcBps)
                 : resolveBitrate(family, targetChannels, srcBps, false, stream.isTdarrQuality);
             const predQuality = audioQuality({ codec_name: family, channels: targetChannels, bit_rate: predBps });
             const margin = guardQuality === 'strict' ? 0 : QUALITY_MARGIN;
