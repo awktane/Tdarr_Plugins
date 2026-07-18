@@ -9,10 +9,10 @@ const details = () => ({
                      -Auto-selects the best available encoder on EACH node at runtime: queries the ffmpeg build + a cheap hardware-presence check (no trial-encode ladder), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Force a specific encoder or leave it on auto.\n\n
                      -Constant-quality (CRF/CQ) tiered by resolution, normalized so the same setting yields comparable quality on every encoder; an encoder-speed control (slow/medium/fast) trades encode time for a smaller file at the same quality.\n\n
                      -Optionally caps resolution (e.g. 4K -> 1080p), re-deriving the quality tier for the output height.\n\n
-                     -HDR-aware (method_hdr): preserves static HDR10/HLG; by default leaves Dolby Vision / HDR10+ untouched (dynamic metadata can't survive a re-encode), can strip just the dynamic layer, or GPU-tonemap all HDR down to SDR (one consistent look across NVIDIA/Intel/AMD/Apple nodes) for SDR-only playback.\n\n
+                     -HDR-aware (method_hdr): preserves static HDR10/HLG; by default leaves Dolby Vision / HDR10+ untouched, can keep Dolby Vision through the encode via libx265 (preserve_dv - forces CPU; HDR10+ can't be kept), strip just the dynamic layer to HDR10, or GPU-tonemap all HDR down to SDR (one consistent look across NVIDIA/Intel/AMD/Apple nodes) for SDR-only playback.\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '2.4.7',
+    Version: '2.999.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -111,10 +111,11 @@ const details = () => ({
             defaultValue: 'preserve',
             inputUI: {
                 type: 'dropdown',
-                options: ['preserve', 'strip_dynamic', 'tonemap_sdr'],
+                options: ['preserve', 'preserve_dv', 'strip_dynamic', 'tonemap_sdr'],
             },
             tooltip: `How to handle HDR video. Static HDR10/HLG colour metadata is always carried through the encode automatically; this controls dynamic HDR (Dolby Vision / HDR10+) and whether to keep HDR at all.
-                \\npreserve (recommended): leave Dolby Vision / HDR10+ files untouched - their dynamic metadata can't survive a re-encode, so transcoding would degrade them. Static HDR10/HLG is transcoded normally (HDR kept).
+                \\npreserve (recommended): leave Dolby Vision / HDR10+ files untouched (transcoding would drop HDR10+ dynamic metadata; to keep Dolby Vision through a transcode use preserve_dv instead). Static HDR10/HLG is transcoded normally (HDR kept).
+                \\npreserve_dv: transcode Dolby Vision sources but carry the DV RPU through the encode (the output stays Dolby Vision). Only the libx265 software encoder can do this - every hardware HEVC encoder drops the RPU - so a node on encoder=auto is forced to CPU for these files (slower), and a forced hardware encoder is overridden. Needs an HEVC target and 10-bit; a non-HEVC target falls back to strip_dynamic. HDR10+ is not carried (no ffmpeg-native path). Only re-encodes when there's another reason to (downscale / bit-depth / guard_reprocess) - an already-HEVC DV file left as-is keeps its DV untouched.
                 \\nstrip_dynamic: transcode Dolby Vision / HDR10+ anyway, keeping only the base HDR10 layer (accepts the loss of the dynamic layer). Static HDR10/HLG unaffected (kept).
                 \\ntonemap_sdr: tonemap ALL HDR (static and dynamic) down to SDR (bt709). For SDR-only playback chains - makes HDR look correct on non-HDR displays and avoids the media server re-tonemapping on every playback. The tonemap runs GPU-accelerated on whichever hardware the node's encoder uses (NVIDIA/Intel/AMD/Apple, one consistent look across your fleet), falling back to CPU only if no GPU tonemap is available. Lossy and one-way (the HDR master is discarded in this output), so leave on preserve if you watch on HDR displays. Follows force_bit_depth: with 'source' (default) a 10-bit HDR master tonemaps to 10-bit SDR; set force_bit_depth=8 to force 8-bit SDR for maximum playback compatibility.`,
         },
@@ -629,7 +630,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Resolve the encoder for THIS node. Returns { family, encoderName, notes:[infoLog lines] }. Honors an explicit
     // encoder input (force on this node, CPU fallback if unavailable) or 'auto' (best available). Tests may inject a
     // capability object + platform/workerType via otherArguments.__awkCap to avoid any real ffmpeg/nvidia-smi spawn.
-    const selectEncoder = ({ codec, encoderOpt, otherArguments }) => {
+    const selectEncoder = ({ codec, encoderOpt, otherArguments, forceCpu }) => {
         const inj = otherArguments && otherArguments.__awkCap;
         const platform = (inj && inj.platform) || os.platform();
         const workerType = String((otherArguments && otherArguments.workerType) || '').toLowerCase();
@@ -643,6 +644,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             : confirmEncode(ffmpegPath, encoderName, inputSide, filter));
         const notes = [];
         const cpuChoice = () => ({ family: 'cpu', encoderName: ENCODER_NAME[codec].cpu, notes });
+        if (forceCpu) {   // Dolby Vision preservation: HW HEVC encoders drop the RPU, so libx265 is the only option regardless of node/pin
+            notes.push(`☐[encoder=${encoderOpt}] Encoder: ${ENCODER_NAME[codec].cpu} (forced for Dolby Vision - hardware encoders drop the RPU)\n`);
+            return cpuChoice();
+        }
 
         // Candidate families: an explicit pick is tried first (then CPU); 'auto' tries the platform's HW list only on a
         // GPU worker (CPU workers stay on software so slow encodes don't land on the GPU), then CPU.
@@ -731,7 +736,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Decode is kept on software frames (nvenc via the shared nvdecPreset helper) so a single CPU scale filter and
     // -pix_fmt path work uniformly across families; VAAPI is the exception - it needs its frames uploaded, so it
     // carries an explicit device + format,hwupload filter. Returns { inputSide, videoOut }.
-    const buildVideoArgs = ({ family, encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams }) => {
+    const buildVideoArgs = ({ family, encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase }) => {
         const { getNvdecHwaccelPreset, getNvenc10BitFormatArg } = require('../methods/nvdecPreset');
         const q = nativeQuality(codec, family, qNorm);
         const spd = nativeSpeed(codec, family, speed);
@@ -784,9 +789,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         } else {   // cpu
             scale();
             parts.push(`-pix_fmt ${wantTenbit ? 'yuv420p10le' : 'yuv420p'}`);
+            if (preserveDv) {   // libx265 carries the decoded DV RPU through the encode; x265's DV coding needs VBV/HRD (bare CRF errors -22), so add a generous per-tier VBV ceiling
+                const dvVbvK = outHeight > 1080 ? 100000 : outHeight > 720 ? 40000 : outHeight > 576 ? 20000 : 10000;
+                parts.push('-dolbyvision:v:0 1', '-strict unofficial', `-maxrate:v:0 ${dvVbvK}k`, `-bufsize:v:0 ${dvVbvK * 2}k`);
+            }
         }
 
-        if (codec === 'hevc' && ['mp4', 'm4v', 'mov'].includes(dstContainer)) parts.push('-tag:v:0 hvc1');   // Apple/QuickTime HEVC-in-mp4 playback (primary only)
+        if (codec === 'hevc' && ['mp4', 'm4v', 'mov'].includes(dstContainer)) parts.push(preserveDvNoBase ? '-tag:v:0 dvh1' : '-tag:v:0 hvc1');   // hvc1 = Apple/QuickTime HEVC-in-mp4 (primary only); a no-base DV (e.g. profile 5) needs dvh1 or the DV box is dropped
         const vfArg = vf.length ? ` -filter:v:0 "${vf.join(',')}"` : '';   // :v:0 - filtering a copied secondary video stream would error
         return { inputSide, videoOut: `${parts.filter(Boolean).join(' ')}${vfArg}` };
     };
@@ -830,7 +839,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!['slow', 'medium', 'fast'].includes(speed)) failFile(`[speed=${speed}] invalid value, check your settings`);
     if (!['source', '8', '10'].includes(bitDepthOpt)) failFile(`[force_bit_depth=${bitDepthOpt}] invalid value, check your settings`);
     if (!['auto', 'nvenc', 'qsv', 'vaapi', 'videotoolbox', 'amf', 'cpu'].includes(encoderOpt)) failFile(`[encoder=${encoderOpt}] invalid value, check your settings`);
-    if (!['preserve', 'strip_dynamic', 'tonemap_sdr'].includes(methodHdr)) failFile(`[method_hdr=${methodHdr}] invalid value, check your settings`);
+    if (!['preserve', 'preserve_dv', 'strip_dynamic', 'tonemap_sdr'].includes(methodHdr)) failFile(`[method_hdr=${methodHdr}] invalid value, check your settings`);
 
     // Input summary is always logged.
     response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
@@ -863,7 +872,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Bit depth: source-detected (raw sample depth, or a 10-bit pixel format / profile), overridable. H.264 is always 8-bit. Shares the is10Bit helper with
         // summariseStream's 10bit token so the re-encode depth decision and the logged token can't drift.
         const srcIs10 = is10Bit(primary, mi);
-        const wantTenbit = codec === 'h264' ? false : (bitDepthOpt === '10' || (bitDepthOpt === 'source' && srcIs10));
+        let wantTenbit = codec === 'h264' ? false : (bitDepthOpt === '10' || (bitDepthOpt === 'source' && srcIs10));   // let: preserve_dv forces 10-bit (DV is inherently 10-bit)
 
         // HDR (method_hdr): ffmpeg auto-propagates the source's colour metadata (primaries/transfer/matrix) to the re-encoded output - verified against the real
         // ffmpeg for libx265/libsvtav1/videotoolbox, incl. through the scale filter - so static HDR10/HLG survives with no explicit colour flags. Dynamic metadata
@@ -874,9 +883,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // 'preserve'. isHdr (any HDR incl. static, via colour transfer) gates tonemapping.
         const hdrFmt = String(mi?.HDR_Format || mi?.HDR_Format_Compatibility || '').toLowerCase();
         const dvSideData = Array.isArray(primary.side_data_list) ? primary.side_data_list : [];
-        const ffprobeDynamicHdr = dvSideData.some((sd) => /dovi|dolby vision|smpte ?2094|hdr dynamic metadata/.test(String(sd?.side_data_type || '').toLowerCase()))
-            || /^(dvhe|dvh1|dvav|dva1|dav1)$/.test(String(primary.codec_tag_string || '').toLowerCase().trim());
+        const dvCodecTag = /^(dvhe|dvh1|dvav|dva1|dav1)$/.test(String(primary.codec_tag_string || '').toLowerCase().trim());
+        const ffprobeDynamicHdr = dvSideData.some((sd) => /dovi|dolby vision|smpte ?2094|hdr dynamic metadata/.test(String(sd?.side_data_type || '').toLowerCase())) || dvCodecTag;
         const isDynamicHdr = hdrFmt.includes('dolby vision') || hdrFmt.includes('hdr10+') || hdrFmt.includes('smpte st 2094') || ffprobeDynamicHdr;
+        // DOVI configuration record (ffprobe side_data) -> accurate profile-aware logging + a DV-specific signal. isDynamicHdr also matches HDR10+, which has no
+        // RPU-preservation path, so preserve_dv keys on dvSignal (DV specifically). dvLabel names the profile for logs: 8.x carries a compat id (8.1 HDR10 / 8.4 HLG).
+        const doviRec = dvSideData.find((sd) => /dovi configuration record/i.test(String(sd?.side_data_type || '')));
+        const dovi = doviRec ? { profile: Number(doviRec.dv_profile), compatId: Number(doviRec.dv_bl_signal_compatibility_id), elPresent: doviRec.el_present_flag === 1 } : null;
+        const dvLabel = dovi && Number.isFinite(dovi.profile)
+            ? `Dolby Vision Profile ${dovi.profile}${dovi.profile === 8 && Number.isFinite(dovi.compatId) ? `.${dovi.compatId}` : ''}${dovi.elPresent ? ' (dual-layer)' : ''}`
+            : 'Dolby Vision';
+        const dvSignal = !!dovi || dvCodecTag || hdrFmt.includes('dolby vision');   // Dolby Vision specifically (excludes HDR10+)
         const srcXfer = (primary.color_transfer || mi?.transfer_characteristics || '').toLowerCase().trim();
         const isHdr = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'].includes(srcXfer) || !!String(mi?.HDR_Format || '').trim() || isDynamicHdr;
         if (isDynamicHdr && methodHdr === 'preserve') {
@@ -891,9 +908,35 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // it and re-encodes fine, while profile 7/8/10 all carry smpte2084/HLG and are unaffected. HDR10+ always carries smpte2084, so it is never caught here.
         const dvNoBaseLayer = isDynamicHdr && !['smpte2084', 'arib-std-b67', 'pq', 'hlg'].includes(srcXfer);
         if (methodHdr === 'strip_dynamic' && dvNoBaseLayer) {
-            response.infoLog += `☒${streamTag(primary.index)}[method_hdr=strip_dynamic] Single-layer Dolby Vision with no HDR10 base layer (e.g. profile 5) - stripping the dynamic metadata would leave a mis-coloured picture with no HDR fallback, left untouched; set method_hdr=tonemap_sdr to flatten it to SDR\n`;
+            response.infoLog += `☒${streamTag(primary.index)}[method_hdr=strip_dynamic] ${dvLabel} with no HDR10 base layer - stripping the dynamic metadata would leave a mis-coloured picture with no HDR fallback, left untouched; set method_hdr=tonemap_sdr to flatten it to SDR\n`;
             response.processFile = false;
             return response;
+        }
+        // preserve_dv: transcode DV but carry the RPU through the encode. Only libx265 can (every HW HEVC encoder drops it), and H.264/AV1 have no ffmpeg-native DV
+        // path, so it needs an HEVC source AND HEVC target. Keys on dvSignal (DV specifically), not isDynamicHdr (which also matches unpreservable HDR10+).
+        const preserveDvWanted = dvSignal && methodHdr === 'preserve_dv';
+        const preserveDv = preserveDvWanted && codec === 'hevc' && srcCodecName === 'hevc';
+        // No cross-compatible base (compat id 0 / no surviving HDR transfer, e.g. profile 5): the mp4 output needs the dvh1 tag - hvc1 drops the DV box entirely (verified);
+        // a stream WITH a base (8.1 HDR10 / 8.4 HLG) keeps hvc1 so non-DV players still get the HDR10/HLG fallback.
+        const preserveDvNoBase = preserveDv && (dvNoBaseLayer || (!!dovi && dovi.compatId === 0));
+        // libx265 rejects the IPT-C2 colour matrix ("Matrix Coefficients must be ... ictcp") that some no-base DV carries (e.g. profile 5/20 with an explicit ipt-c2 matrix),
+        // so it can be neither preserved nor re-encoded - skip rather than emit a command that errors the file, and point at tonemap_sdr (the only ffmpeg-native flatten).
+        if (preserveDv && (primary.color_space || mi?.matrix_coefficients || '').toLowerCase().trim() === 'ipt-c2') {
+            response.infoLog += `☒${streamTag(primary.index)}[method_hdr=preserve_dv] ${dvLabel} uses the IPT-C2 colour matrix that libx265 cannot re-encode - left untouched; set method_hdr=tonemap_sdr to flatten it to SDR\n`;
+            response.processFile = false;
+            return response;
+        }
+        if (preserveDvWanted && !preserveDv) {   // DV can't be preserved into a non-HEVC codec (or from a non-HEVC DV source) - degrade to strip_dynamic semantics
+            if (dvNoBaseLayer) {   // no HDR10 base to keep (e.g. profile 5) - same unsafe strip as strip_dynamic's P5 case, so skip and point at tonemap_sdr
+                response.infoLog += `☒${streamTag(primary.index)}[codec=${codec}][method_hdr=preserve_dv] ${dvLabel} cannot be preserved into ${codec} and has no HDR10 base - left untouched; set codec=hevc to keep the DV RPU or method_hdr=tonemap_sdr to flatten to SDR\n`;
+                response.processFile = false;
+                return response;
+            }
+            response.infoLog += `☒${streamTag(primary.index)}[codec=${codec}][method_hdr=preserve_dv] ${dvLabel} cannot be preserved into ${codec} (the DV RPU survives only through libx265/HEVC) - transcoding the base HDR10 layer only, dropping the DV metadata\n`;
+        }
+        if (preserveDv && !wantTenbit) {   // DV is inherently 10-bit; an 8-bit output would break it
+            response.infoLog += `☒${streamTag(primary.index)}[force_bit_depth=${bitDepthOpt}][method_hdr=preserve_dv] Dolby Vision requires 10-bit - keeping 10-bit output (ignoring the 8-bit request)\n`;
+            wantTenbit = true;
         }
         const tonemap = methodHdr === 'tonemap_sdr' && isHdr;   // flatten HDR -> SDR (also a re-encode reason even when the source is already the target codec, below)
         // A tonemap_* filter REJECTS a frame whose decoded transfer isn't a known HDR curve ("unsupported transfer function"), and the island carries no explicit
@@ -915,7 +958,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // of the match - like audio_clean's awk_loudnorm tag - so a version bump (e.g. the coordinated MAJOR) never invalidates the fence and forces a lossy
         // generational re-encode of an otherwise-identical file. The 'sdr' token keys on the tonemap_sdr SETTING, not the per-run tonemap activation: a tonemapped
         // output is itself SDR, so keying on the activation would drop the token when the file is re-checked and defeat the fence - the setting is stable across the HDR->SDR flatten.
-        const videoSigCore = escMeta([targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, wantTenbit ? '10' : '8', `s${speed}`, ...(methodHdr === 'tonemap_sdr' ? ['sdr'] : [])].join('-'));
+        const videoSigCore = escMeta([targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, wantTenbit ? '10' : '8', `s${speed}`, ...(methodHdr === 'tonemap_sdr' ? ['sdr'] : []), ...(preserveDv ? ['dv'] : [])].join('-'));
         const videoSig = `${videoSigCore}-v${escMeta(details().Version)}`;
         const priorSig = getTagCI(file.ffProbeData.format?.tags || {}, 'awk_video').trim();
 
@@ -959,8 +1002,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return response;
         }
 
-        // Resolve the encoder for THIS node (auto = best available, else forced with CPU fallback).
-        const sel = selectEncoder({ codec, encoderOpt, otherArguments });
+        // Resolve the encoder for THIS node (auto = best available, else forced with CPU fallback). preserve_dv forces libx265 - only it keeps the DV RPU.
+        if (preserveDv) response.infoLog += `☐${streamTag(primary.index)}[method_hdr=preserve_dv] ${dvLabel} - keeping the DV RPU through the re-encode (libx265)\n`;
+        if (preserveDv && encoderOpt !== 'auto' && encoderOpt !== 'cpu')
+            response.infoLog += `☒${streamTag(primary.index)}[encoder=${encoderOpt}][method_hdr=preserve_dv] Forced encoder overridden to ${ENCODER_NAME[codec].cpu} - ${encoderOpt} would drop the Dolby Vision RPU\n`;
+        const sel = selectEncoder({ codec, encoderOpt, otherArguments, forceCpu: preserveDv });
         sel.notes.forEach((n) => { response.infoLog += n; });
 
         // Route the tonemap to the GPU filter matching this node's encoder (one consistent family across platforms), or CPU tonemapx if no GPU tonemap initialises.
@@ -970,7 +1016,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             : `☐${streamTag(primary.index)}[method_hdr=tonemap_sdr] Tonemapping HDR -> SDR via ${tonemapBackend} (GPU-accelerated)\n`;
 
         // Build the video-encode args + assemble the full preset (<input-side>,<output-side>).
-        const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams });
+        const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, codec, qNorm, speed, wantTenbit, willDownscale, outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase });
 
         let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy`;
         for (const s of videoStreams) if (isCoverArt(s)) out += ` -map -0:${s.index}`;   // drop embedded cover-art/still-image "video" streams
