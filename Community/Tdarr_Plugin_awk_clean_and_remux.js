@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.999.4',
+    Version: '3.999.5',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -677,14 +677,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const methodTagLanguage = String(inputs.method_tag_language || 'container').toLowerCase();
     const guardAudioLanguage = String(inputs.guard_audio_language || 'disabled').toLowerCase();
 
+    // Recognised language name for a tag's primary subtag, or '' - tells a real code (en, eng) from a spelled-out name ("english") or garbage. DisplayNames is memoised
+    // in a closure (built once, reused) - called for the language_fill validation below and once per tagged stream via storesCleanly. Mirrors sub_worker's langDisplay.
+    const langName = (() => {
+        let dn = null;
+        return (tag) => {
+            try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(shortLang(String(tag).toLowerCase())) || ''; }
+            catch (e) { return ''; }
+        };
+    })();
+
     // Value checks continue in Inputs order (container already checked above): language_fill is format-checked and cross-checked against language_sub,
     // then the remaining dropdowns are checked against their option set (free-text and boolean inputs need no check - see above).
     // language_fill accepts any recognised language in any form - langKey folds en/eng/English/en-US/pt-BR to a base code - or a valid special/private code
     // (und/mul/zxx/mis/qaa-qtz, mirroring isNonLang); an unrecognised token (typo/garbage) fails the file so a bad fill can't be written and then demote a stream downstream.
     if(fillLanguage) {
         const fk = langKey(fillLanguage);
-        const knownFill = fk === 'und' || fk === 'mul' || fk === 'zxx' || fk === 'mis' || /^q[a-t][a-z]$/.test(fk)
-            || (() => { try { return !!new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }).of(fk); } catch (e) { return false; } })();
+        const knownFill = fk === 'und' || fk === 'mul' || fk === 'zxx' || fk === 'mis' || /^q[a-t][a-z]$/.test(fk) || !!langName(fk);
         if(!knownFill)
             failFile(`[language_fill=${inputs.language_fill}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
     }
@@ -758,16 +767,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (methodTagLanguage === 'container') return dstContainer === 'mp4' ? three(false) : key;                              // mkv: 2-letter BCP-47 (region folded); mp4: 639-2/T
         return three(methodTagLanguage === '639-2/b');                                                                          // single 3-letter form for both containers
     };
-    // Recognised language name for a tag's primary subtag, or '' - tells a real code (en, eng) from a spelled-out name ("english") or garbage.
-    // DisplayNames is memoised in a closure (built once, then reused) - it is called once per tagged stream via storesCleanly, and a fresh ICU instance per call
-    // is wasteful. Mirrors sub_worker's langDisplay.
-    const langName = (() => {
-        let dn = null;
-        return (tag) => {
-            try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(shortLang(String(tag).toLowerCase())) || ''; }
-            catch (e) { return ''; }
-        };
-    })();
     // Canonical BCP-47 tag keeping the region/script subtag (mkv write side, bcp47 method only); '' for a bare code, non-language, or unrecognised region tag.
     // getCanonicalLocales folds+cases the base and keeps region/script (por-BR->pt-BR, PT-br->pt-BR, eng-US->en-US, zh-Hans, es-419); langName rejects a garbage
     // base (xx-YY) and getCanonicalLocales throws on malformed input (_ . normalised to - first). container / 639-2 / mp4 targets never call this (they fold region).
