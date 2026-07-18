@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.999.2',
+    Version: '3.999.3',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -687,7 +687,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if(!knownFill)
             failFile(`[language_fill=${inputs.language_fill}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
     }
-    // If fillLanguage is set it should be a subtitle that's kept. (There is no audio equivalent: audio_clean owns audio language now, and it reads the tag
+    // If fillLanguage is set it should be a subtitle that's kept. (There is no audio equivalent: audio_clean owns audio language, and it reads the tag
     // this plugin has already written rather than language_fill itself, so there is nothing here to cross-check against.)
     if(fillLanguage && subLanguage.length > 0 && !subLangKeys.includes(langKey(fillLanguage)))
         failFile(`[language_fill=${fillLanguage}] not in language_sub - untagged subtitle streams would be removed; add it to language_sub or clear language_fill`);
@@ -703,10 +703,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`[tag_language=${tagLanguage}] invalid value, check your settings`);
     if(!['639-2/b', '639-2/t', 'container', 'bcp47'].includes(methodTagLanguage))
         failFile(`[method_tag_language=${methodTagLanguage}] invalid value, check your settings`);
-    if(!['disabled', 'light', 'aggressive'].includes(recoverTs))
-        failFile(`[recover_bad_timestamps=${recoverTs}] invalid value, check your settings`);
     if(!['disabled', 'light', 'aggressive'].includes(recoverData))
         failFile(`[recover_bad_data=${recoverData}] invalid value, check your settings`);
+    if(!['disabled', 'light', 'aggressive'].includes(recoverTs))
+        failFile(`[recover_bad_timestamps=${recoverTs}] invalid value, check your settings`);
     if(!['disabled', 'enabled'].includes(guardAudioLanguage))
         failFile(`[guard_audio_language=${guardAudioLanguage}] invalid value, check your settings`);
     if(!['unsupported', 'all', 'export'].includes(removeImageSubs))
@@ -1108,7 +1108,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let metadataCommand = '';
             let delStream = false;
             // Factored per-stream metadata emitter (a per-iteration closure over this stream's ffstream/i/metadataCommand): the handler_name canonicalisation (mkv wipes it - it
-            // can confuse mkv title display; mp4 sets the per-type handler) was copy-pasted across the subtitle/audio/video branches. Branch-specific bits (title tagging, hvc1,
+            // can confuse mkv title display; mp4 sets the per-type handler) is common to the subtitle/audio/video branches. Branch-specific bits (title tagging, hvc1,
             // busy-title, comment removal) stay inline; wipeReason carries video's extra "problems for titles in mkv" note so the log stays byte-identical.
             const emitHandlerMeta = (typeLetter, idx, typeWord, handlerName, wipeReason = '') => {
                 if (dstContainer === 'mkv' && ffstream.tags?.handler_name) {
