@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '3.999.7',
+    Version: '3.999.8',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1849,6 +1849,41 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return ` -filter:a:${idx} "${filter}"`;
         };
 
+        // Emit an APPENDED downmix track (a brand-new stream via -map 0:a:N; the source survives elsewhere): encoder+bitrate+loudnorm, the -c:a/filter/title/-metadata
+        // emit, the appendedAudio record, created*Langs registration, and the newStreamOutputIdx/convert bookkeeping. Shared by the downmix_to_six/_stereo 'add' branches
+        // AND the layout-drop derivatives so the four append sites can't drift. srcCodecStr is the source's display codec at each site; logSuffix carries the layout-drop
+        // "(source dropped ...)" note. An appended track is an unconditional lossy re-encode, so loudnorm always rides it (no guardBlocks - see the callers).
+        const append6ch = (srcStream, srcAudioIdx, srcCodecStr, srcRateStr, langKeyVal, logSuffix) => {
+            const newTitle = escMeta(buildTitle(srcStream, '5.1'));
+            const dstBitArg = encoderArgsIdx(surroundCodec, 6, newStreamOutputIdx);
+            const dstBitStr = resolveBitrate(surroundCodec, 6);
+            let sixFilter = ` -ac:a:${newStreamOutputIdx} 6`;
+            if (loudnorm !== 'disabled') {
+                const { filter } = buildLoudnormFilter(srcStream.index, srcAudioIdx, 'aformat=channel_layouts=5.1', LOUDNORM_PRESETS[loudnorm]);
+                sixFilter = ` -filter:a:${newStreamOutputIdx} "${filter}"`;
+            }
+            workDone += `☐${streamTag(srcStream.index)}[downmix_to_six=${downmixToSix}] Adding ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s from ${srcCodecStr} ${srcStream.channels}ch @ ${srcRateStr}${logSuffix}\n`;
+            extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${audioEncoder(surroundCodec)}${dstBitArg}${sixFilter} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+            const wl = langForWrite(srcStream);
+            if (wl) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(wl)}"`;
+            newStreamOutputIdx++;
+            appendedAudio.push({ srcStream, codec: surroundCodec, channels: 6, bps: dstBitStr });
+            created6chLangs.add(langKeyVal);
+            convert = true;
+        };
+        const append2ch = (srcStream, srcAudioIdx, srcCodecStr, srcRateStr, langKeyVal, logSuffix) => {
+            const newTitle = escMeta(buildTitle(srcStream, '2.0'));
+            const e = stereoEnc(newStreamOutputIdx);
+            workDone += `☐${streamTag(srcStream.index)}[downmix_to_stereo=${downmixToTwo}] Adding ${e.logCodec} stereo @ ${e.rate}${e.label ? ` (${e.label})` : ''} from ${srcCodecStr} ${srcStream.channels}ch @ ${srcRateStr}${logSuffix}\n`;
+            extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${e.frag}${stereoArg(newStreamOutputIdx, srcStream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+            const wl = langForWrite(srcStream);
+            if (wl) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(wl)}"`;
+            newStreamOutputIdx++;
+            appendedAudio.push({ srcStream, ...e.record });
+            created2chLangs.add(langKeyVal);
+            convert = true;
+        };
+
         for (let i = 0; i < workStreams.length; i++) {
             const ffstream = workStreams[i];
             const ffstreamCodec = (ffstream.codec_name || '').toLowerCase();
@@ -1926,22 +1961,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     created6chLangs.add(ffstreamLangKey);
                     convert = true;
                 } else if (sixMode === 'true') {
-                    const dstBitArg = encoderArgsIdx(surroundCodec, 6, newStreamOutputIdx);
-                    const dstBitStr = resolveBitrate(surroundCodec, 6);
-                    // Brand-new appended derivative (the source survives untouched elsewhere in the output) - loudnorm applies unconditionally, no
-                    // guardBlocks check: this stream is an unconditional lossy re-encode by construction regardless of what the guard would say.
-                    let sixFilter = ` -ac:a:${newStreamOutputIdx} 6`;
-                    if (loudnorm !== 'disabled') {
-                        const { filter } = buildLoudnormFilter(ffstream.index, srcAudioIdx, 'aformat=channel_layouts=5.1', LOUDNORM_PRESETS[loudnorm]);
-                        sixFilter = ` -filter:a:${newStreamOutputIdx} "${filter}"`;
-                    }
-                    workDone += `☐${streamTag(ffstream.index)}[downmix_to_six=${downmixToSix}] Adding ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
-                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${audioEncoder(surroundCodec)}${dstBitArg}${sixFilter} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
-                    if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
-                    newStreamOutputIdx++;
-                    appendedAudio.push({ srcStream: ffstream, codec: surroundCodec, channels: 6, bps: dstBitStr });
-                    created6chLangs.add(ffstreamLangKey);
-                    convert = true;
+                    append6ch(ffstream, srcAudioIdx, ffstreamCodec, srcRateStr, ffstreamLangKey, '');
                 }
             }
 
@@ -1966,16 +1986,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     created2chLangs.add(ffstreamLangKey);
                     convert = true;
                 } else if (twoMode === 'true' || (twoMode === 'replace' && modifiedAudioIdx.has(outputAudioIdx))) {
-                    const newTitle = escMeta(buildTitle(ffstream, '2.0'));
-                    // Downmix source is surround; its bitrate describes N channels not 2, so stereoEnc uses the 2ch table target (aac_vbr uses plain VBR 5).
-                    const e = stereoEnc(newStreamOutputIdx);
-                    workDone += `☐${streamTag(ffstream.index)}[downmix_to_stereo=${downmixToTwo}] Adding ${e.logCodec} stereo @ ${e.rate}${e.label ? ` (${e.label})` : ''} from ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr}\n`;
-                    extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${e.frag}${stereoArg(newStreamOutputIdx, ffstream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
-                    if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
-                    newStreamOutputIdx++;
-                    appendedAudio.push({ srcStream: ffstream, ...e.record });
-                    created2chLangs.add(ffstreamLangKey);
-                    convert = true;
+                    append2ch(ffstream, srcAudioIdx, ffstreamCodec, srcRateStr, ffstreamLangKey, '');
                 }
                 }
             }
@@ -2101,39 +2112,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const lang = s.isTdarrRegionKey;
             const srcAudioIdx = inputAudioIdxMap.get(s.index);
             if (srcAudioIdx === undefined) continue;
-            const streamLang = langForWrite(s);
             const srcBitrate = Number(s.bit_rate || 0);
             const srcRateStr = srcBitrate > 0 ? `${Math.round(srcBitrate / 1000)} kb/s` : 'unknown bitrate';
             const srcCodec = (s.codec_name || 'unknown').trim().toLowerCase();
             // 5.1 derivative from a >6ch source (downmix_to_six), when the language still lacks one.
             if (s.channels > 6 && downmixToSix !== 'false' && !created6chLangs.has(lang) && !existingSixLangs.has(lang)) {
-                const newTitle = escMeta(buildTitle(s, '5.1'));
-                const dstBitArg = encoderArgsIdx(surroundCodec, 6, newStreamOutputIdx);
-                const dstBitStr = resolveBitrate(surroundCodec, 6);
-                let sixFilter = ` -ac:a:${newStreamOutputIdx} 6`;
-                if (loudnorm !== 'disabled') {
-                    const { filter } = buildLoudnormFilter(s.index, srcAudioIdx, 'aformat=channel_layouts=5.1', LOUDNORM_PRESETS[loudnorm]);
-                    sixFilter = ` -filter:a:${newStreamOutputIdx} "${filter}"`;
-                }
-                workDone += `☐${streamTag(s.index)}[downmix_to_six=${downmixToSix}] Adding ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s from ${srcCodec} ${s.channels}ch @ ${srcRateStr} (source dropped - libopus can't encode its layout)\n`;
-                extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${audioEncoder(surroundCodec)}${dstBitArg}${sixFilter} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
-                if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
-                appendedAudio.push({ srcStream: s, codec: surroundCodec, channels: 6, bps: dstBitStr });
-                newStreamOutputIdx++;
-                created6chLangs.add(lang);
-                convert = true;
+                append6ch(s, srcAudioIdx, srcCodec, srcRateStr, lang, " (source dropped - libopus can't encode its layout)");
             }
             // Stereo derivative (downmix_to_stereo), when the language still lacks one.
             if (downmixToTwo !== 'false' && !created2chLangs.has(lang) && !existingStereoLangs.has(lang)) {
-                const newTitle = escMeta(buildTitle(s, '2.0'));
-                const e = stereoEnc(newStreamOutputIdx);
-                workDone += `☐${streamTag(s.index)}[downmix_to_stereo=${downmixToTwo}] Adding ${e.logCodec} stereo @ ${e.rate}${e.label ? ` (${e.label})` : ''} from ${srcCodec} ${s.channels}ch @ ${srcRateStr} (source dropped - libopus can't encode its layout)\n`;
-                extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${e.frag}${stereoArg(newStreamOutputIdx, s)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
-                if (streamLang) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(streamLang)}"`;
-                appendedAudio.push({ srcStream: s, ...e.record });
-                newStreamOutputIdx++;
-                created2chLangs.add(lang);
-                convert = true;
+                append2ch(s, srcAudioIdx, srcCodec, srcRateStr, lang, " (source dropped - libopus can't encode its layout)");
             }
         }
         // ===== END LAYOUT-DROP DOWNMIX DERIVATIVES =====
