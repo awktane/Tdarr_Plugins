@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.999.9',
+    Version: '3.999.10',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -132,7 +132,6 @@ const details = () => ({
                 options: ['false','true'],
             },
             tooltip: `Should audio/subtitle metadata titles be removed if they contain more than 3 periods? This removes most invalid or unnecessary titles that are added by some sources.
-                \\nNote this also checks the handler_name for the same thing.
                 \\nExample:\\n
                 This.Title.Has.Too.Many.Periods would have title set to blank`,
         },

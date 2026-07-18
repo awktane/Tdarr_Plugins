@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '3.999.9',
+    Version: '3.999.10',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1166,9 +1166,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { frag: `${audioEncoder(stereoCodec)}${encoderArgsIdx(stereoCodec, 2, idx)}`, logCodec: stereoCodec, rate: `${bps / 1000} kb/s`, label: '', record: { codec: stereoCodec, channels: 2, bps } };
     };
 
-    // Resolve whether a source stream is lossless using the shared resolveCodecName resolution (same one audioQuality uses). Stored per-stream as
-    // isTdarrLossless to avoid repeating the resolution at emission. Used only by codec_force to gate the source-bitrate floor in resolveBitrate — downmix
-    // paths don't pass a source bitrate so they are unaffected regardless of this flag.
+    // Resolve whether a source stream is lossless using the shared resolveCodecName resolution (same one audioQuality uses). Stored per-stream as isTdarrLossless to avoid repeating
+    // the resolution at emission. Read by guard_lossless (its guardBlocks skip + the "never drop the last lossless copy" dedup rule), by the dedup sort's trustedRate ranking, and as
+    // the source-lossless flag that suppresses resolveBitrate's source-bitrate floor on the codec_force / loudnorm encode paths (downmix paths pass no source bitrate, so are unaffected).
     const losslessSource = (stream) => codecInfo[resolveCodecName(stream)]?.lossless === true;
 
     // Resolve whether a source stream carries object-audio metadata (Atmos / DTS:X / MPEG-H) that ffmpeg cannot reconstruct on re-encode - keyed off the
@@ -1717,7 +1717,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let peakR = 0;
             let hasNonFront = false; // any channel beyond FL/FR/LFE that needs explicit panning
 
-            channelList.forEach((spk, i) => {
+            channelList.forEach((spk) => {
                 const g = SPEAKER_GAINS[spk];
                 if (!g) return; // unknown speaker name — skip (shouldn't happen for canonical layouts)
                 if (spk !== 'FL' && spk !== 'FR' && spk !== 'LFE') hasNonFront = true;
