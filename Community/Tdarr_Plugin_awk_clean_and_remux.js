@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.999.8',
+    Version: '3.999.9',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -65,7 +65,7 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\nIf single-or-error - (Default) a single untagged stream of a type is filled and kept; two or more abort the file to the error queue. Tag them manually and requeue.
-                \\nIf force-any       - fill and keep them all, however many there are, never aborting. Warning: several tracks sharing one filled language can let later logic drop one as a lower-quality duplicate.`,
+                \\nIf force-any       - fill and keep them all, however many there are, never aborting (accepts the duplicate-collision risk described above).`,
         },
         {
             name: 'language_sub',
@@ -795,17 +795,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (s !== s.toLowerCase()) return false;                    // uppercase -> mp4 drops it / non-standard casing -> fix
         return dstContainer === 'mp4' ? /^[a-z]{3}$/.test(s) : /^[a-z]{2,3}$/.test(s);   // mp4 needs lowercase 3-letter; mkv keeps a bare 2/3-letter code
     };
-    // Language tag to WRITE for a kept video/audio/subtitle stream, plus the language to filter on. Blank container tag + language_fill (audio/subtitle only):
-    // fill it (canonical when tag_language on, else raw fill). Non-blank: canonicalise per tag_language (invalid = only tags storesCleanly rejects; strict =
-    // every tag). und/non-language is never written and und-fill is skipped, so it can't perpetually re-remux. Returns { workLang, meta, log }.
+    // A blank/und stream adopts language_fill only when filling is allowed for that stream and the fill is a real language (langKey 'und' fills nothing, so an und-fill can't
+    // perpetually re-remux). Single predicate so the language the remove_sub_sdh pre-check filters on (resolveWorkLang) and the tag canonicalLangMeta writes derive from the SAME rule.
+    const fillApplies = (sl, allowFill) => allowFill && fillLanguage && langKey(fillLanguage) !== 'und' && (!sl || sl === 'und');
+    // Language tag to WRITE for a kept video/audio/subtitle stream, plus the language to filter on. Blank container tag + language_fill (audio/subtitle only): fill it (canonical
+    // form always for mp4 - its mdhd stores only a 3-letter code - and when tag_language is on for mkv; else the raw fill on mkv, which round-trips it). Non-blank: canonicalise
+    // per tag_language (invalid = only tags storesCleanly rejects; strict = every tag). und/non-language is never written. Returns { workLang, meta, log }.
     const canonicalLangMeta = (typeLetter, perTypeIdx, ffstream, typeName, allowFill) => {
         const rawTag = (ffstream.tags?.language || '').trim();
         const sl = resolveLang(ffstream);
         const blank = !sl || sl === 'und';
-        let workLang = sl || 'und', desired = '';
-        if (blank && allowFill && fillLanguage && langKey(fillLanguage) !== 'und') {
-            workLang = fillLanguage;
-            desired = tagLanguage !== 'disabled' ? toCanonicalTag(fillLanguage) : fillLanguage;
+        const filled = fillApplies(sl, allowFill);
+        let workLang = filled ? fillLanguage : (sl || 'und'), desired = '';
+        if (filled) {
+            // A fill is a WRITE of a new tag, so its emitted form must round-trip in the destination container. mp4's mdhd stores only a lowercase 3-letter code, so fold through
+            // toCanonicalTag even when tag_language=disabled - a raw 'en'/'english'/'pt-BR' is dropped on the mp4 mux, leaving the stream blank and re-filling forever; mkv round-trips the raw form.
+            desired = tagLanguage !== 'disabled' ? toCanonicalTag(fillLanguage) : (dstContainer === 'mp4' ? toCanonicalTag(fillLanguage) : fillLanguage);
         } else if (!blank && tagLanguage !== 'disabled' && (tagLanguage === 'strict' || !storesCleanly(rawTag))) {
             // strict enforces the method form (folds region under container/639-2); invalid only repairs syntax, so a recognised region/script tag keeps its region
             // (canonicalised: en_us -> en-US, pt-br -> pt-BR) on mkv. mp4 can't store a region, so it still folds to 639-2/T via toCanonicalTag.
@@ -1011,16 +1016,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // remove_sub_sdh safety guard.
     // (subDroppedAnyReason/subtitle drop lists defined earlier) A "plain" subtitle carries no commentary/descriptive/SDH/lyrics role - a genuine dialogue
     // subtitle. remove_sub_sdh removes an SDH/CC subtitle only when its language still has a plain subtitle that SURVIVES the language, format, and
-    // remove_imagesubs filters, so we strip extras, never the last usable track. resolveWorkLang mirrors the loop's language resolution. Computed BEFORE the
-    // language_fill_mode pre-check so that check can exclude the SDH tracks this guard will drop. Audio has no equivalent here: audio_clean's method_secondary
-    // owns audio-description removal and carries its own plain-same-language fall-back rule.
+    // remove_imagesubs filters, so we strip extras, never the last usable track. resolveWorkLang shares canonicalLangMeta's fillApplies rule so the language this guard filters on
+    // and the tag that gets written can't drift. Computed BEFORE the language_fill_mode pre-check so that check can exclude the SDH tracks this guard will drop. Audio has no
+    // equivalent here: audio_clean's method_secondary owns audio-description removal and carries its own plain-same-language fall-back rule.
     const plainSubLangs = new Set();
     const isPlainTrack = (s) => !isCommentary(s) && !isDescriptive(s) && !isSdh(s) && !isLyrics(s);
     const hasPlainSameLang = (set, wl) => set.has(langKey(wl));
-    const resolveWorkLang = (s) => {
-        const sl = resolveLang(s);
-        return (fillLanguage && (!sl || sl === 'und')) ? fillLanguage : (sl || 'und');
-    };
+    const resolveWorkLang = (s) => { const sl = resolveLang(s); return fillApplies(sl, true) ? fillLanguage : (sl || 'und'); };
     if (removeSubSdh === 'enabled') {
         for (const s of (file.ffProbeData?.streams || [])) {
             if ((s.codec_type || '').trim().toLowerCase() !== 'subtitle' || !isPlainTrack(s)) continue;
