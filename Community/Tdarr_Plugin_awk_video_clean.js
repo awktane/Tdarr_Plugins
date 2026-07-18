@@ -12,7 +12,7 @@ const details = () => ({
                      -HDR-aware (method_hdr): preserves static HDR10/HLG; by default leaves Dolby Vision / HDR10+ untouched (dynamic metadata can't survive a re-encode), can strip just the dynamic layer, or GPU-tonemap all HDR down to SDR (one consistent look across NVIDIA/Intel/AMD/Apple nodes) for SDR-only playback.\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '2.4.3',
+    Version: '2.4.4',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -124,7 +124,7 @@ const details = () => ({
             defaultValue: '1000',
             inputUI: { type: 'text' },
             tooltip: `Skip files whose current video bitrate is already below this (kbps). 0 disables the guard; the default 1000 leaves genuinely lean sources alone (rarely triggers - most content sits well above 1000 kbps at any resolution).
-                \\nConstant-quality encoding can't predict the output size, so re-encoding an already-lean source can GROW it. This floor leaves already-efficient files untouched. Example: 2500 skips anything already under 2500 kbps.`,
+                \\nConstant-quality encoding can't predict the output size, so re-encoding an already-lean source can GROW it. Example: 2500 skips anything already under 2500 kbps.`,
         },
         {
             name: 'guard_reprocess',
@@ -865,8 +865,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // (Dolby Vision / HDR10+) CANNOT survive a re-encode: 'preserve' leaves such files untouched; 'strip_dynamic' transcodes them keeping the base HDR10 layer;
         // 'tonemap_sdr' flattens ALL HDR (static + dynamic) to SDR via a GPU tonemap that rides the node's encoder (cuda/opencl/videotoolbox - one consistent family)
         // or CPU tonemapx fallback; the tonemap_* filters emit correct bt709 tags themselves (verified) so still no explicit colour flags. Dynamic HDR is detected from
-        // BOTH probes (mediaInfo HDR_Format, plus ffprobe DOVI / HDR10+ side_data or a
-        // DV codec tag) - a single-probe false negative here is destructive under 'preserve'. isHdr (any HDR incl. static, via colour transfer) gates tonemapping.
+        // BOTH probes (mediaInfo HDR_Format, plus ffprobe DOVI / HDR10+ side_data or a DV codec tag) - a single-probe false negative here is destructive under
+        // 'preserve'. isHdr (any HDR incl. static, via colour transfer) gates tonemapping.
         const hdrFmt = String(mi?.HDR_Format || mi?.HDR_Format_Compatibility || '').toLowerCase();
         const dvSideData = Array.isArray(primary.side_data_list) ? primary.side_data_list : [];
         const ffprobeDynamicHdr = dvSideData.some((sd) => /dovi|dolby vision|smpte ?2094|hdr dynamic metadata/.test(String(sd?.side_data_type || '').toLowerCase()))

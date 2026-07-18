@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart) - both ride the reorder remux, so no extra pass.\n`,
-    Version: '3.2.2',
+    Version: '3.2.3',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -675,8 +675,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
         failFile('No ffProbe stream data available for this file - the plugin cannot process it');
 
-    // Value checks. The two free-text inputs (order_language/order_codec) have no fixed option set; the five dropdowns (first_audio, first_subtitle,
-    // order_channel, order_quality, method_mp4_faststart) each have one, validated below.
+    // Value checks. The two free-text inputs (order_language/order_codec) have no fixed option set; the six dropdowns (first_audio, first_subtitle,
+    // order_channel, order_quality, remove_junk_tags, method_mp4_faststart) each have one, validated below.
     if(!['language', 'original', 'default', 'descriptive'].includes(inputs.first_audio))
         failFile(`[first_audio=${inputs.first_audio}] invalid value, check your settings`);
     if(!['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled'].includes(inputs.order_channel))
