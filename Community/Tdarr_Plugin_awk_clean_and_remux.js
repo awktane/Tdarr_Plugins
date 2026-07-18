@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.999.5',
+    Version: '3.999.6',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -677,15 +677,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const methodTagLanguage = String(inputs.method_tag_language || 'container').toLowerCase();
     const guardAudioLanguage = String(inputs.guard_audio_language || 'disabled').toLowerCase();
 
-    // Recognised language name for a tag's primary subtag, or '' - tells a real code (en, eng) from a spelled-out name ("english") or garbage. DisplayNames is memoised
-    // in a closure (built once, reused) - called for the language_fill validation below and once per tagged stream via storesCleanly. Mirrors sub_worker's langDisplay.
-    const langName = (() => {
+    // ===== SHARED [clean_and_remux, sub_worker]: language display name =====
+    // -=-=-= langDisplayName  [clean_and_remux, sub_worker] =-=-=-
+    // Memoised ICU DisplayNames (built once, reused): the recognised English name for an ALREADY-normalised language code, or '' for a non-language/unrecognised code. A
+    // fresh ICU instance per call is wasteful. Each caller normalises the token first - clean_and_remux via shortLang (tag recognition), sub_worker via langKey (sidecar).
+    const langDisplayName = (() => {
         let dn = null;
-        return (tag) => {
-            try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(shortLang(String(tag).toLowerCase())) || ''; }
-            catch (e) { return ''; }
-        };
+        return (code) => { try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(code) || ''; } catch (e) { return ''; } };
     })();
+    // ===== END SHARED: language display name =====
+    // Recognised language name for a tag's primary subtag, or '' - tells a real code (en, eng) from a spelled-out name ("english") or garbage (via shortLang, so a
+    // spelled-out name or region tag folds to its base first). Used by the language_fill validation below and once per tagged stream via storesCleanly.
+    const langName = (tag) => langDisplayName(shortLang(String(tag).toLowerCase()));
 
     // Value checks continue in Inputs order (container already checked above): language_fill is format-checked and cross-checked against language_sub,
     // then the remaining dropdowns are checked against their option set (free-text and boolean inputs need no check - see above).

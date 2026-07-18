@@ -12,7 +12,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all) and skip_commentary (omit commentary tracks). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled/enabled_delete modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '2.1.3',
+    Version: '2.1.4',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -554,8 +554,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Recognize a filename token as a real language (2/3-letter ISO code or English name) so a Plex-native sidecar can be anchored on it without
     // mis-reading an arbitrary token as a language. Normalizes via the shared langKey, then confirms it names a real language (Intl.DisplayNames
     // with fallback:'none' returns undefined for non-languages). The DisplayNames instance is built once, on first use.
-    const langDisplay = (() => { let dn = null; return () => (dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' })); })();
-    const isKnownLang = (token) => { const k = langKey(token); if (!k) return false; try { return !!langDisplay().of(k); } catch (e) { return false; } };
+    // ===== SHARED [clean_and_remux, sub_worker]: language display name =====
+    // -=-=-= langDisplayName  [clean_and_remux, sub_worker] =-=-=-
+    // Memoised ICU DisplayNames (built once, reused): the recognised English name for an ALREADY-normalised language code, or '' for a non-language/unrecognised code. A
+    // fresh ICU instance per call is wasteful. Each caller normalises the token first - clean_and_remux via shortLang (tag recognition), sub_worker via langKey (sidecar).
+    const langDisplayName = (() => {
+        let dn = null;
+        return (code) => { try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(code) || ''; } catch (e) { return ''; } };
+    })();
+    // ===== END SHARED: language display name =====
+    const isKnownLang = (token) => { const k = langKey(token); if (!k) return false; return !!langDisplayName(k); };
 
     // ===== SHARED [clean_and_remux, sub_worker]: iso639-1 to iso639-2 map =====
     // -=-=-= ISO639_1_TO_2  [clean_and_remux, sub_worker] =-=-=-
