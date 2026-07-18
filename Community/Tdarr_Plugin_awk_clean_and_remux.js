@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.999.7',
+    Version: '3.999.8',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1346,12 +1346,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (lm.meta) { workDone += lm.log; metadataCommand += lm.meta; }
                 }
 
-                // HEVC in mp4 must carry the hvc1 fourcc or Apple/QuickTime won't decode it - a plain remux writes hev1. Tag the retained HEVC video stream
-                // when the output is mp4 and it isn't already hvc1: this converges after one heal (an already-hvc1 file is a no-op, never a perpetual remux).
-                if (dstContainer === 'mp4' && ffstreamCodec === 'hevc' && (ffstream.codec_tag_string || '').toLowerCase() !== 'hvc1') {
+                // A Dolby Vision HEVC stream carries a dvhe/dvh1 (etc.) fourcc / a DOVI configuration record, NOT hvc1 - and this is a -c copy path, so its own tag is
+                // already correct. Forcing hvc1 onto it drops the DV configuration box and demotes the file to plain HEVC (verified: the output ffprobes as "Invalid
+                // data found"), undoing what video_clean's preserve_dv protects. Detect DV both-probe (fourcc / mediaInfo HDR_Format / ffprobe side_data) and leave its
+                // tag untouched. (video_clean re-encodes, so it makes the finer dvh1-vs-hvc1 choice; here the safe action on a mere remux is to not retag DV at all.)
+                const isDolbyVision = /^(dvhe|dvh1|dvav|dva1|dav1)$/.test((ffstream.codec_tag_string || '').toLowerCase().trim())
+                    || String(ffmedia?.HDR_Format || ffmedia?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
+                    || (Array.isArray(ffstream.side_data_list) ? ffstream.side_data_list : []).some(sd => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
+
+                // HEVC in mp4 must carry the hvc1 fourcc or Apple/QuickTime won't decode it - a plain remux writes hev1. Tag the retained HEVC video stream when the
+                // output is mp4 and it isn't already hvc1 (and isn't Dolby Vision): this converges after one heal (an already-hvc1 file is a no-op, never a perpetual remux).
+                if (dstContainer === 'mp4' && ffstreamCodec === 'hevc' && !isDolbyVision && (ffstream.codec_tag_string || '').toLowerCase() !== 'hvc1') {
                     workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Tag video as hvc1 - HEVC-in-mp4 needs the hvc1 fourcc for Apple/QuickTime playback\n`;
                     extraArguments += ` -tag:v:${videoStreamIndex} hvc1`;
                     convert = true;
+                }
+
+                // Dolby Vision in mp4: the dvcC/dvvC configuration boxes are "unofficial" in ISO mp4, so ffmpeg's muxer only writes them under -strict unofficial. Without it a
+                // -c copy remux keeps the in-band RPU + the dvhe tag but DROPS those boxes, weakening DV detection (verified on the real profile-5 sample). Add the flag so any remux
+                // this plugin performs preserves DV fully. It only SHAPES a remux another change already triggered - it does not set convert, since an untouched file keeps its boxes.
+                if (dstContainer === 'mp4' && ffstreamCodec === 'hevc' && isDolbyVision && !/ -strict unofficial\b/.test(extraArguments)) {
+                    extraArguments += ' -strict unofficial';
                 }
 
                 if(metaCommentRemove === true && (ffstream.tags?.comment || ffmedia?.Comment)) {
