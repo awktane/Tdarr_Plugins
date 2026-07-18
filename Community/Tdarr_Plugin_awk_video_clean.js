@@ -12,7 +12,7 @@ const details = () => ({
                      -HDR-aware (method_hdr): preserves static HDR10/HLG; by default leaves Dolby Vision / HDR10+ untouched, can keep Dolby Vision through the encode via libx265 (preserve_dv - forces CPU; HDR10+ can't be kept), strip just the dynamic layer to HDR10, or GPU-tonemap all HDR down to SDR (one consistent look across NVIDIA/Intel/AMD/Apple nodes) for SDR-only playback.\n\n
                      -Skips files that are already the target codec (unless guard_reprocess is on), already below the bitrate floor, or already processed at this exact setting (an awk_video tag fences re-encode loops).\n\n
                      -Adds -tag:v hvc1 for HEVC in mp4 so Apple/QuickTime plays it. Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '2.999.0',
+    Version: '2.999.1',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -66,6 +66,20 @@ const details = () => ({
                 \\n1080: downscale anything taller than 1080p to 1080p (the classic "shrink 4K to 1080p to save space"). 720 / 480 likewise. 2160 / 1440 cap only larger sources.`,
         },
         {
+            name: 'method_hdr',
+            type: 'string',
+            defaultValue: 'preserve',
+            inputUI: {
+                type: 'dropdown',
+                options: ['preserve', 'preserve_dv', 'strip_dynamic', 'tonemap_sdr'],
+            },
+            tooltip: `How to handle HDR video. Static HDR10/HLG colour metadata is always carried through the encode automatically; this controls dynamic HDR (Dolby Vision / HDR10+) and whether to keep HDR at all.
+                \\npreserve (recommended): leave Dolby Vision / HDR10+ files untouched (transcoding would drop HDR10+ dynamic metadata; to keep Dolby Vision through a transcode use preserve_dv instead). Static HDR10/HLG is transcoded normally (HDR kept).
+                \\npreserve_dv: transcode Dolby Vision sources but carry the DV RPU through the encode (the output stays Dolby Vision). Only the libx265 software encoder can do this - every hardware HEVC encoder drops the RPU - so a node on encoder=auto is forced to CPU for these files (slower), and a forced hardware encoder is overridden. Needs an HEVC target and 10-bit; a non-HEVC target falls back to strip_dynamic. HDR10+ is not carried (no ffmpeg-native path). Only re-encodes when there's another reason to (downscale / bit-depth / guard_reprocess) - an already-HEVC DV file left as-is keeps its DV untouched.
+                \\nstrip_dynamic: transcode Dolby Vision / HDR10+ anyway, keeping only the base HDR10 layer (accepts the loss of the dynamic layer). Static HDR10/HLG unaffected (kept).
+                \\ntonemap_sdr: tonemap ALL HDR (static and dynamic) down to SDR (bt709). For SDR-only playback chains - makes HDR look correct on non-HDR displays and avoids the media server re-tonemapping on every playback. The tonemap runs GPU-accelerated on whichever hardware the node's encoder uses (NVIDIA/Intel/AMD/Apple, one consistent look across your fleet), falling back to CPU only if no GPU tonemap is available. Lossy and one-way (the HDR master is discarded in this output), so leave on preserve if you watch on HDR displays. Follows force_bit_depth: with 'source' (default) a 10-bit HDR master tonemaps to 10-bit SDR; set force_bit_depth=8 to force 8-bit SDR for maximum playback compatibility.`,
+        },
+        {
             name: 'quality_sd',
             type: 'string',
             defaultValue: '21',
@@ -104,20 +118,6 @@ const details = () => ({
             },
             tooltip: `Encoder speed vs. efficiency. Slower spends more CPU/GPU time for a smaller file at the same quality.
                 \\nMaps to each encoder's native preset (libx265 slow/medium/fast, libsvtav1 4/6/8, NVENC p7/p5/p3, QSV veryslow/medium/veryfast, ...). VAAPI/VideoToolbox have no comparable knob and ignore this.`,
-        },
-        {
-            name: 'method_hdr',
-            type: 'string',
-            defaultValue: 'preserve',
-            inputUI: {
-                type: 'dropdown',
-                options: ['preserve', 'preserve_dv', 'strip_dynamic', 'tonemap_sdr'],
-            },
-            tooltip: `How to handle HDR video. Static HDR10/HLG colour metadata is always carried through the encode automatically; this controls dynamic HDR (Dolby Vision / HDR10+) and whether to keep HDR at all.
-                \\npreserve (recommended): leave Dolby Vision / HDR10+ files untouched (transcoding would drop HDR10+ dynamic metadata; to keep Dolby Vision through a transcode use preserve_dv instead). Static HDR10/HLG is transcoded normally (HDR kept).
-                \\npreserve_dv: transcode Dolby Vision sources but carry the DV RPU through the encode (the output stays Dolby Vision). Only the libx265 software encoder can do this - every hardware HEVC encoder drops the RPU - so a node on encoder=auto is forced to CPU for these files (slower), and a forced hardware encoder is overridden. Needs an HEVC target and 10-bit; a non-HEVC target falls back to strip_dynamic. HDR10+ is not carried (no ffmpeg-native path). Only re-encodes when there's another reason to (downscale / bit-depth / guard_reprocess) - an already-HEVC DV file left as-is keeps its DV untouched.
-                \\nstrip_dynamic: transcode Dolby Vision / HDR10+ anyway, keeping only the base HDR10 layer (accepts the loss of the dynamic layer). Static HDR10/HLG unaffected (kept).
-                \\ntonemap_sdr: tonemap ALL HDR (static and dynamic) down to SDR (bt709). For SDR-only playback chains - makes HDR look correct on non-HDR displays and avoids the media server re-tonemapping on every playback. The tonemap runs GPU-accelerated on whichever hardware the node's encoder uses (NVIDIA/Intel/AMD/Apple, one consistent look across your fleet), falling back to CPU only if no GPU tonemap is available. Lossy and one-way (the HDR master is discarded in this output), so leave on preserve if you watch on HDR displays. Follows force_bit_depth: with 'source' (default) a 10-bit HDR master tonemaps to 10-bit SDR; set force_bit_depth=8 to force 8-bit SDR for maximum playback compatibility.`,
         },
         {
             name: 'guard_min_bitrate',
@@ -895,7 +895,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             : 'Dolby Vision';
         const dvSignal = !!dovi || dvCodecTag || hdrFmt.includes('dolby vision');   // Dolby Vision specifically (excludes HDR10+)
         const srcXfer = (primary.color_transfer || mi?.transfer_characteristics || '').toLowerCase().trim();
-        const isHdr = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'].includes(srcXfer) || !!String(mi?.HDR_Format || '').trim() || isDynamicHdr;
+        // The complete set of HDR transfer curves: ffmpeg's two HDR color_trc enums (smpte2084 = PQ, arib-std-b67 = HLG) plus the MediaInfo spellings (pq, hlg). Single source for the
+        // three HDR-curve tests below (isHdr, dvNoBaseLayer, the tonemap setparams gate). summariseStream's shared 'vHdr' token carries a byte-identical copy - keep the two in lockstep.
+        const HDR_TRANSFERS = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'];
+        const isHdr = HDR_TRANSFERS.includes(srcXfer) || !!String(mi?.HDR_Format || '').trim() || isDynamicHdr;
         if (isDynamicHdr && methodHdr === 'preserve') {
             response.infoLog += `☒${streamTag(primary.index)}[method_hdr=preserve] Dynamic HDR (Dolby Vision / HDR10+) detected - cannot survive a re-encode, left untouched; set method_hdr=strip_dynamic to transcode (keeps the base HDR10 layer) or method_hdr=tonemap_sdr to tonemap to SDR\n`;
             response.processFile = false;
@@ -906,7 +909,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // mis-coloured picture. So skip and point at tonemap_sdr (the only ffmpeg-native safe flatten; a proper DV->profile-8 conversion needs dovi_tool, out of this plugin's
         // scope). The transfer - not the DOVI bl_signal_compatibility_id - is the reliable signal: a compat_id-0 stream that DOES carry a PQ transfer (a mislabelled base) keeps
         // it and re-encodes fine, while profile 7/8/10 all carry smpte2084/HLG and are unaffected. HDR10+ always carries smpte2084, so it is never caught here.
-        const dvNoBaseLayer = isDynamicHdr && !['smpte2084', 'arib-std-b67', 'pq', 'hlg'].includes(srcXfer);
+        const dvNoBaseLayer = isDynamicHdr && !HDR_TRANSFERS.includes(srcXfer);
         if (methodHdr === 'strip_dynamic' && dvNoBaseLayer) {
             response.infoLog += `☒${streamTag(primary.index)}[method_hdr=strip_dynamic] ${dvLabel} with no HDR10 base layer - stripping the dynamic metadata would leave a mis-coloured picture with no HDR fallback, left untouched; set method_hdr=tonemap_sdr to flatten it to SDR\n`;
             response.processFile = false;
@@ -939,10 +942,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             wantTenbit = true;
         }
         const tonemap = methodHdr === 'tonemap_sdr' && isHdr;   // flatten HDR -> SDR (also a re-encode reason even when the source is already the target codec, below)
-        // A tonemap_* filter REJECTS a frame whose decoded transfer isn't a known HDR curve ("unsupported transfer function"), and the island carries no explicit
-        // tags. When HDR is known only from mediaInfo / dynamic metadata but the stream's own transfer is absent (a container-stripped VUI), stamp the inferred HDR
-        // curve onto the island so the filter has a valid HDR input; a transfer already present on the stream is left untouched (the decoded frame carries it).
-        const tonemapSetparams = (tonemap && !srcXfer)
+        // A tonemap_* filter REJECTS a frame whose decoded transfer isn't a known HDR curve ("unsupported transfer function"), and the island carries no explicit tags. When HDR is
+        // known (from mediaInfo / dynamic metadata) but the stream's own transfer is NOT a recognised HDR curve - absent (a container-stripped VUI) OR present-but-non-HDR (e.g. a
+        // mislabelled bt2020-10 on a DV/HDR stream) - stamp the inferred HDR curve onto the island so the filter has a valid HDR input. A real HDR10/HLG stream already reports
+        // smpte2084/arib-std-b67 (in HDR_TRANSFERS), so it is left untouched (the decoded frame already carries the right transfer). Keying on absent-only would let a wrong-but-present
+        // transfer reach the filter unstamped and error the file.
+        const tonemapSetparams = (tonemap && !HDR_TRANSFERS.includes(srcXfer))
             ? `setparams=color_trc=${/hlg|log-gamma|b67/.test(hdrFmt) ? 'arib-std-b67' : 'smpte2084'}:color_primaries=bt2020:colorspace=bt2020nc,`
             : '';
 
