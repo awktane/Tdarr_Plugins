@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart) - both ride the reorder remux, so no extra pass.\n`,
-    Version: '3.2.4',
+    Version: '3.2.5',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -560,6 +560,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary lines up.
     // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Audio uses codecDisplayName so a DTS subtype
     // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all five.
+    // -=-=-= FONT_EXTS + isFontMime  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Embedded-font filename extensions + a font-mimetype test, shared by summariseStream's [attach:...] token and clean_and_remux's attachmentKind font classification.
+    const FONT_EXTS = ['ttf', 'otf', 'ttc', 'otc', 'pfb', 'pfa', 'woff', 'woff2', 'eot'];
+    const isFontMime = (mime) => /font|truetype|opentype|sfnt/.test(mime);
     const summariseStream = (s) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
@@ -596,8 +600,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const mime  = (s.tags?.mimetype || '').trim().toLowerCase();
                 const fname = (s.tags?.filename || '').trim().toLowerCase();
                 const ext   = fname.includes('.') ? fname.slice(fname.lastIndexOf('.') + 1) : '';
-                if (['ttf', 'otf', 'ttc', 'otc', 'pfb', 'pfa', 'woff', 'woff2', 'eot'].includes(ext)) label = ext;
-                else if (/font|truetype|opentype|sfnt/.test(mime)) label = 'font';
+                if (FONT_EXTS.includes(ext)) label = ext;
+                else if (isFontMime(mime)) label = 'font';
                 else if (mime.startsWith('image/')) label = 'image';
                 else if (ext) label = ext;
             }
