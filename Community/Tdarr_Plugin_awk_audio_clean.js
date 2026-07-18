@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '3.999.4',
+    Version: '3.999.5',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -15,7 +15,7 @@ const details = () => ({
             type: 'string',
             defaultValue: '',
             inputUI: { type: 'text' },
-            tooltip: `Languages to keep, but downmixed to stereo - a dub you want available without spending the space on its surround. Each surround track in one of these languages is transcoded in place to a single stereo codec_stereo track (using the stereo_downmix matrix); a track already at 2 channels or fewer is left alone.
+            tooltip: `Languages to keep, but downmixed to stereo - a dub you want available without spending the space on its surround. Each surround track in one of these languages is transcoded in place to a single stereo codec_stereo track (using the method_stereo_downmix matrix); a track already at 2 channels or fewer is left alone.
                 \\nBlank (default) means no language is forced to stereo. Same matching rules as language_surround - one form is enough, und/mul/zxx/mis are matched literally.
                 \\nThese tracks are never protected by guard_lossless/guard_quality/guard_object_audio, so the downmix always happens.
                 \\nA language in BOTH this list and language_surround is treated as surround.
@@ -73,7 +73,7 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\nIf surround - (Default) secondary tracks are left at their source channels, untouched by the downmix paths (codec_force and method_loudnorm still apply).
-                \\nIf stereo   - each secondary track with more than 2 channels is transcoded in place to a stereo codec_stereo track (using the stereo_downmix matrix).
+                \\nIf stereo   - each secondary track with more than 2 channels is transcoded in place to a stereo codec_stereo track (using the method_stereo_downmix matrix).
                 \\nIf delete   - secondary tracks are removed. Safety: a track is only removed when a plain (non-commentary/descriptive/M&E) track of the SAME language survives, and never if it would leave the file with no audio at all - so the only track of a file, or a lone audio-description track with no plain track in its language, is always kept.`,
         },
         {
@@ -1410,7 +1410,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (s.isTdarrSecondaryTrack) continue;
                 // An untagged (und) track is never deduplicated: langKey folds every untagged track to 'und', so two untagged tracks of DIFFERENT real languages would
                 // collide on und|tier and the lower-scored one would be silently dropped - the only copy of a language lost. Language can't prove same content (mirrors the
-                // secondary exemption above). clean_and_remux's language_fill_fail vets untagged audio when it runs first, but audio_clean is independently runnable, so guard here too.
+                // secondary exemption above). clean_and_remux's language_fill_mode vets untagged audio when it runs first, but audio_clean is independently runnable, so guard here too.
                 if (s.isTdarrCleanLang === 'und') continue;
                 let tier;
                 if (removeDuplicatesGroupBy === 'channel') {
@@ -1809,9 +1809,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
 
         // Caching tag for the untouched-track path only (a track untouched by anything else this run - the only case where "nothing about this
-        // stream changed since we last checked it" is actually guaranteed). Written as "<preset>-<plugin version>" (e.g.
-        // "tv-2.8.0") but matched on the preset portion ONLY - the version rides along unused today, kept in reserve for if a
-        // future bug fix ever needs to distinguish "measured/corrected by a version with a known bug" from a trustworthy one.
+        // stream changed since we last checked it" is actually guaranteed). Written as "<preset>-<plugin version>" but matched on the preset portion
+        // ONLY - the version rides along unused today, reserved in case a future fix must distinguish a cache written by a known-buggy version.
         // Matroska uppercases unrecognized custom tag names on write (confirmed against the real ffmpeg binary), so read-back must be case-insensitive:
         // readLoudnormTag goes through the shared getTagCI helper.
         const readLoudnormTag = (stream) => getTagCI(stream.tags || {}, 'awk_loudnorm').trim();
