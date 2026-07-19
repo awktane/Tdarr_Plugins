@@ -12,7 +12,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all) and skip_commentary (omit commentary tracks). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled/enabled_delete modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '2.999.1',
+    Version: '2.999.2',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -186,7 +186,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last;
     // summariseStream flags them /cover.
     const IMAGE_CODECS = ['mjpeg', 'mjpegb', 'png', 'apng', 'gif', 'bmp', 'webp', 'tiff'];
-    // A stream is cover art / a still image when its codec is an image codec OR it carries a cover-art disposition (attached_pic/still_image/timed_thumbnails).
     const isCoverArt = (s) => IMAGE_CODECS.includes((s.codec_name || '').trim().toLowerCase())
         || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails');
     // ===== END SHARED: image / cover-art codecs =====
@@ -331,8 +330,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const ff = Number(ffstream.channels || 0);
         if (ff > 0) return ff;
         const ffmedia = mediaInfoFor(ffstream);
-        const mi = Number(ffmedia?.Channels || 0);
-        if (mi > 0) return mi;
+        const miChannels = Number(ffmedia?.Channels || 0);
+        if (miChannels > 0) return miChannels;
         return channelsFromLayout(ffstream.channel_layout || ffmedia?.ChannelLayout || ffmedia?.ChannelPositions);
     };
 
@@ -434,7 +433,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (idx) return idx;
             idx = {};
             const dn = new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' });
-            for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {
+            for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {   // 97-122 = ASCII a-z: every 2-letter combo
                 const code = String.fromCharCode(a, b);
                 const name = dn.of(code);
                 if (name) idx[name.toLowerCase()] = code;
@@ -658,7 +657,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { codec_type: 'subtitle', codec_name: codec, index: -1, tags: { language: f.lang, title: f.title }, disposition };
     };
 
-    // ---- guards + input validation (before the try, per the suite's failFile convention) ----
+    // ============= guards + input validation (before the try, per the suite's failFile convention) =============
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams)) failFile('No ffProbe stream data available, cannot process this file');
     const mode = String(inputs.mode);
     if (mode !== 'extract' && mode !== 'import') failFile(`[mode=${mode}] invalid value, check your settings`);
@@ -676,6 +675,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Preserve Dolby Vision's dvcC/dvvC boxes on either -c copy remux below (see isDolbyVisionVideo) - a plain copy of a DV HEVC stream drops them, demoting DV to plain HEVC.
     const dvVideoStream = streams.find((s) => (s.codec_type || '').toLowerCase() === 'video');
     const dvStrictArg = (isMp4 && dvVideoStream && (dvVideoStream.codec_name || '').toLowerCase() === 'hevc' && isDolbyVisionVideo(dvVideoStream, mediaInfoFor(dvVideoStream))) ? ' -strict unofficial' : '';
+    // Finalize a built output-side arg string into response.preset: append the DV strict flag, then (mp4 only) -movflags use_metadata_tags so a -c copy keeps
+    // sibling plugins' global awk_* tags (awk_video/awk_recovered), then the universal output options. Shared by the extract and import branches so their tails can't drift.
+    const finishPreset = (out) => {
+        let full = out + dvStrictArg;
+        if (isMp4) full += ' -movflags use_metadata_tags';
+        full += globalOutputOpt;
+        response.preset = `,${full}`;
+        response.processFile = true;
+    };
 
     try {
         response.infoLog += `☐Input streams: ${streams.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
@@ -704,11 +712,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let out = `${sidecarOut} -map 0`;
             for (const idx of removeIdx) out += ` -map -0:${idx}`;
             out += ' -c copy';
-            out += dvStrictArg;
-            if (isMp4) out += ' -movflags use_metadata_tags';   // mp4 -c copy drops sibling plugins' global tags (awk_video/awk_recovered) without this - mirror the import branch
-            out += globalOutputOpt;
-            response.preset = `,${out}`;
-            response.processFile = true;
+            finishPreset(out);
             const survivors = streams.filter((s) => !removeIdx.includes(s.index));
             response.infoLog += `☑Expected results: ${survivors.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
             return response;
@@ -805,11 +809,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const priorStillPresent = deleteConfirmed ? [] : found.filter((f) => importedSet.has(f.name)).map((f) => f.name);
             const markList = [...new Set([...consumed, ...priorStillPresent])];
             let out = `${inputSide} -map 0${extraMaps} -c copy${meta} -metadata "awk_sub_worker=${encodeMarkerList(markList)}"`;
-            out += dvStrictArg;
-            if (isMp4) out += ' -movflags use_metadata_tags';
-            out += globalOutputOpt;
-            response.preset = `,${out}`;
-            response.processFile = true;
+            finishPreset(out);
             response.reQueueAfter = deleteConfirmed;   // re-run only to delete the now-embedded sidecars
             const expected = streams.concat(merged.map(sidecarToStream));
             response.infoLog += `☑Expected results: ${expected.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
@@ -821,7 +821,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     } catch (err) {
         failUnexpected(err);
     }
-    return response;
 };
 
 module.exports.details = details;

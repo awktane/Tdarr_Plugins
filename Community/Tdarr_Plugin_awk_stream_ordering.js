@@ -5,8 +5,8 @@ const details = () => ({
     Name: 'Re-order streams video, audio, subtitle, then anything else',
     Type: 'Any',
     Operation: 'Transcode',
-    Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can promote the default, SDH or descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart) - both ride the reorder remux, so no extra pass.\n`,
-    Version: '3.999.2',
+    Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can promote the default, SDH or descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time it's needed).\n`,
+    Version: '3.999.3',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -91,8 +91,8 @@ const details = () => ({
                     ascending: 128k,640k
                 \\ndescending <=1024k caps by bitrate: tracks above 1024k (lossless-scale TrueHD/DTS-HD MA, including a lossless track whose bitrate is unknown) are
                 demoted to the END so the client's auto-pick leads with a manageable track it can serve without a heavy transcode, not the huge one. The demoted tail
-                stays in the requested descending order; ordering within each group is by the quality score. If order_channel also caps, a track over EITHER cap is
-                demoted. The cap only applies to descending (ascending already puts the smallest first).
+                stays in the requested descending order; ordering within each group is by the quality score. Also demoted if order_channel caps and this
+                track is over that cap too (see order_channel).
                 \\nSet to disabled to skip quality ordering entirely. If both order_channel and order_quality are disabled, audio is not reordered by channels or quality (language/role/order_codec still apply).`
         },
         {
@@ -133,15 +133,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // True if the mp4 already has moov before mdat (front-loaded), so method_mp4_faststart needn't remux it. Reads only top-level box headers (a few 16-byte reads,
     // seeking by box size) - no ffmpeg spawn, no full-file read. otherArguments.__awkMoovFront overrides for the harness (which has no real file on disk). Fail-safe: any
     // read/parse anomaly returns true (treat as fronted -> skip) so we never loop on a file we can't inspect.
-    const moovBeforeMdat = (filePath, oa) => {
-        const inj = oa?.__awkMoovFront;
+    const moovBeforeMdat = (filePath, otherArgs) => {
+        const inj = otherArgs?.__awkMoovFront;
         if (inj !== undefined) return inj === true;
         let fd;
         try {
             fd = fs.openSync(filePath, 'r');
             const head = Buffer.alloc(16);
             let pos = 0;
-            for (let i = 0; i < 100; i++) {
+            // Safety bound against a pathological/corrupt box chain - exceeding it is treated as already-fronted (fail-safe).
+            const MAX_MP4_TOP_LEVEL_BOXES = 100;
+            for (let i = 0; i < MAX_MP4_TOP_LEVEL_BOXES; i++) {
                 const n = fs.readSync(fd, head, 0, 16, pos);
                 if (n < 8) return true;
                 let size = head.readUInt32BE(0);
@@ -268,7 +270,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last;
     // summariseStream flags them /cover.
     const IMAGE_CODECS = ['mjpeg', 'mjpegb', 'png', 'apng', 'gif', 'bmp', 'webp', 'tiff'];
-    // A stream is cover art / a still image when its codec is an image codec OR it carries a cover-art disposition (attached_pic/still_image/timed_thumbnails).
     const isCoverArt = (s) => IMAGE_CODECS.includes((s.codec_name || '').trim().toLowerCase())
         || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails');
     // ===== END SHARED: image / cover-art codecs =====
@@ -436,6 +437,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // its 2-channel codecInfo.transparent baseline by (ch/2)^0.65. minimum is a uniform MIN_RATIO fraction of transparent for every codec, so no
     // hand-tuned floor can land on top of a standard reduced-rate mode (e.g. half-rate DTS @768k).
     const MIN_RATIO = 0.4;
+    const CHANNEL_SCALE_EXPONENT = 0.65;   // perceptual quality-vs-channel-count curve exponent: transparent scales by (ch/2)^this - shared by scoreThresholds and (in audio_clean) resolveBitrate so the two cannot drift
     const scoreThresholds = (codec, channels) => {
         const family = codec === 'aac_vbr' ? 'aac' : codec;
         const tbl = CODEC_TARGET_BPS[family];
@@ -444,7 +446,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const cap = (family === 'ac3' || family === 'eac3') ? 6 : 8;
             transparent = tbl[Math.min(Math.max(1, Number(channels) || 1), cap)] ?? tbl[cap];
         } else {
-            transparent = (codecInfo[codec]?.transparent ?? 320000) * Math.pow(Math.max(2, Number(channels) || 2) / 2, 0.65);
+            transparent = (codecInfo[codec]?.transparent ?? 320000) * Math.pow(Math.max(2, Number(channels) || 2) / 2, CHANNEL_SCALE_EXPONENT);
         }
         return { minimum: transparent * MIN_RATIO, transparent };
     };
@@ -541,8 +543,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const ff = Number(ffstream.channels || 0);
         if (ff > 0) return ff;
         const ffmedia = mediaInfoFor(ffstream);
-        const mi = Number(ffmedia?.Channels || 0);
-        if (mi > 0) return mi;
+        const miChannels = Number(ffmedia?.Channels || 0);
+        if (miChannels > 0) return miChannels;
         return channelsFromLayout(ffstream.channel_layout || ffmedia?.ChannelLayout || ffmedia?.ChannelPositions);
     };
 
@@ -659,7 +661,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (idx) return idx;
             idx = {};
             const dn = new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' });
-            for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {
+            for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {   // 97-122 = ASCII a-z: every 2-letter combo
                 const code = String.fromCharCode(a, b);
                 const name = dn.of(code);
                 if (name) idx[name.toLowerCase()] = code;
@@ -696,18 +698,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Value checks. The two free-text inputs (order_language/order_codec) have no fixed option set; the six dropdowns (audio_first, subtitle_first,
     // order_channel, order_quality, remove_junk_tags, method_mp4_faststart) each have one, validated below.
-    if(!['language', 'original', 'default', 'descriptive'].includes(inputs.audio_first))
-        failFile(`[audio_first=${inputs.audio_first}] invalid value, check your settings`);
-    if(!['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled'].includes(inputs.order_channel))
-        failFile(`[order_channel=${inputs.order_channel}] invalid value, check your settings`);
-    if(!['descending', 'descending <=1024k', 'ascending', 'disabled'].includes(inputs.order_quality))
-        failFile(`[order_quality=${inputs.order_quality}] invalid value, check your settings`);
-    if(!['normal', 'default', 'sdh', 'descriptive'].includes(inputs.subtitle_first))
-        failFile(`[subtitle_first=${inputs.subtitle_first}] invalid value, check your settings`);
-    if(!['disabled', 'encoder', 'descriptive'].includes(String(inputs.remove_junk_tags || 'disabled').toLowerCase()))
-        failFile(`[remove_junk_tags=${inputs.remove_junk_tags}] invalid value, check your settings`);
-    if(!['enabled', 'disabled'].includes(String(inputs.method_mp4_faststart || 'enabled').toLowerCase()))
-        failFile(`[method_mp4_faststart=${inputs.method_mp4_faststart}] invalid value, check your settings`);
+    // [inputName, valueToTest, validOptions] - remove_junk_tags/method_mp4_faststart pre-normalize (String(...).toLowerCase()) before the membership check; the
+    // other four test the raw input. The failFile message always shows the RAW inputs[name]. Checked top-to-bottom, failing on the first invalid value.
+    const dropdownChecks = [
+        ['audio_first',          inputs.audio_first,                                             ['language', 'original', 'default', 'descriptive']],
+        ['order_channel',        inputs.order_channel,                                           ['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled']],
+        ['order_quality',        inputs.order_quality,                                           ['descending', 'descending <=1024k', 'ascending', 'disabled']],
+        ['subtitle_first',       inputs.subtitle_first,                                          ['normal', 'default', 'sdh', 'descriptive']],
+        ['remove_junk_tags',     String(inputs.remove_junk_tags || 'disabled').toLowerCase(),   ['disabled', 'encoder', 'descriptive']],
+        ['method_mp4_faststart', String(inputs.method_mp4_faststart || 'enabled').toLowerCase(), ['enabled', 'disabled']],
+    ];
+    for (const [name, value, opts] of dropdownChecks)
+        if (!opts.includes(value)) failFile(`[${name}=${inputs[name]}] invalid value, check your settings`);
 
     // One guard around all the reordering work below: a deliberate failFile abort (AwkFailFile) rethrows unchanged, and any UNEXPECTED error fails the
     // file too — annotated and carrying the full infoLog — instead of silently skipping. (Earlier input validation runs before this and fails via failFile.)
@@ -759,7 +761,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const bRole = b.commentary ? 2 : (b.descriptive ? 1 : 0);
             if (aRole !== bRole) return aRole - bRole;
             //order_codec tier — preferred codecs form one group above the rest; this only promotes the group, each still ordered by channel/quality below.
-            if (codecFirstList.length > 0 && a.codecmatch !== b.codecmatch) return a.codecmatch ? -1 : 1;
+            if (codecFirstList.length > 0 && a.codecMatch !== b.codecMatch) return a.codecMatch ? -1 : 1;
             //Union cap partition: an over-EITHER-cap track is demoted to the tail. The tail and the lead group each keep the channel/quality direction below.
             if (chanCap < Infinity || qualCap < Infinity) {
                 const aOver = overCap(a), bOver = overCap(b);
@@ -768,9 +770,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             //Channel (skipped when disabled): the cap already partitioned above, so this is a plain direction sort by channel count.
             if (channelOrder.enabled && a.channels !== b.channels)
                 return channelOrder.dir === 'ascending' ? a.channels - b.channels : b.channels - a.channels;
-            //Quality (skipped when disabled): orders by the audioquality score in the requested direction.
-            if (qualityOrder.enabled && a.audioquality !== b.audioquality)
-                return qualityOrder.dir === 'ascending' ? a.audioquality - b.audioquality : b.audioquality - a.audioquality;
+            //Quality (skipped when disabled): orders by the audioQuality score in the requested direction.
+            if (qualityOrder.enabled && a.audioQuality !== b.audioQuality)
+                return qualityOrder.dir === 'ascending' ? a.audioQuality - b.audioQuality : b.audioQuality - a.audioQuality;
             return 0;
         };
 
@@ -817,7 +819,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // mirrors audio_clean's isTdarrCleanLang precompute and the parseOrderMode-once discipline. Read as a.langRank/b.langRank in the comparators.
                 langRank: getLangRank(streamLang),
                 channels: enrichedStream.channels || 0,
-                // Resolved bitrate in bps (shared resolveStreamBitrate fallback, via enrichStream). order_quality sorts by the audioquality score but CAPS by
+                // Resolved bitrate in bps (shared resolveStreamBitrate fallback, via enrichStream). order_quality sorts by the audioQuality score but CAPS by
                 // raw bitrate ('descending <=1024k'), so the cap threshold needs the actual bitrate, not the score.
                 bitrate: enrichedStream.bit_rate || 0,
                 // Bitrate the order_quality cap compares against: a LOSSLESS track whose bitrate neither probe reports (0) is still a heavy, hard-to-serve
@@ -826,9 +828,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 capBitrate: (streamType === 'audio' && !(enrichedStream.bit_rate > 0) && codecInfo[canon]?.lossless === true) ? Infinity : (enrichedStream.bit_rate || 0),
                 forced: ffstream?.disposition?.forced === 1,
                 // Only score audio: scoring video/subtitle/data would spam bogus "unknown codec"/"invalid bitrate" notices, and quality is only used to sort audio.
-                audioquality: streamType === 'audio' ? audioQuality(enrichedStream) : 0,
+                audioQuality: streamType === 'audio' ? audioQuality(enrichedStream) : 0,
                 // Does this audio stream's canonical codec match order_codec? Family-prefix: "dts" catches dtsma/dtshr/dtsexpress, "eac3" catches eac3atmos.
-                codecmatch: canon !== '' && codecFirstList.some(c => canon.startsWith(c)),
+                codecMatch: canon !== '' && codecFirstList.some(c => canon.startsWith(c)),
                 default: ffstream?.disposition?.default === 1,
                 original: hasDisposition(ffstream, 'original'),   // for audio_first='original': promote the original-language track above language
 
@@ -851,64 +853,60 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             ? streams.filter(s => s.type === 'audio' && s.default).sort((a, b) => audioKeyCompare(a, b) || a.index - b.index)[0]
             : undefined;
 
-        //Sort the streams
+        // Per-type comparators (pure: read only a/b and the closed-over read-only audioFirst/subtitleFirst/winningDefault/audioKeyCompare). Each returns 0 on a
+        // full tie, so the sort dispatcher below falls through to source-index order.
+        // Video: cover art / posters / thumbnails sort last.
+        const compareVideoStreams = (a, b) => (a.coverArt !== b.coverArt) ? (a.coverArt ? 1 : -1) : 0;
+        // Audio: audio_first promotes ONE track above every audio key (including language). Only one value is active, so at most one clause fires; each is a no-op
+        // when no track qualifies, falling through to the normal ordering. original: keeps a foreign film's original audio first (and default), not a dub. default:
+        // keeps the source's flagged-default audio first - promoting only the WINNING default (winningDefault) so the result is idempotent. descriptive: lifts the
+        // audio-description track first (and, via normalisation, makes it the default). Then language, role, order_codec, union cap, channel + quality via audioKeyCompare.
+        const compareAudioStreams = (a, b) => {
+            if (audioFirst === 'original' && a.original !== b.original)
+                return a.original ? -1 : 1;
+            if (audioFirst === 'default') {
+                const aWin = a === winningDefault, bWin = b === winningDefault;
+                if (aWin !== bWin) return aWin ? -1 : 1;
+            }
+            if (audioFirst === 'descriptive' && a.descriptive !== b.descriptive)
+                return a.descriptive ? -1 : 1;
+            return audioKeyCompare(a, b);
+        };
+        // Subtitle: forced first, then language priority (forced already handled), then subtitle_first promotes the default/SDH/descriptive subtitle to the top of
+        // THEIR language (below forced + language, above the normal role order), then the normal role order (normal, lyrics/songs, SDH, descriptive, commentary).
+        const compareSubtitleStreams = (a, b) => {
+            if (a.forced !== b.forced)
+                return a.forced ? -1 : 1;
+            const aRank = a.langRank;
+            const bRank = b.langRank;
+            if (aRank !== bRank)
+                return aRank - bRank;
+            if (subtitleFirst === 'default' && a.default !== b.default)
+                return a.default ? -1 : 1;
+            else if (subtitleFirst === 'sdh' && a.sdh !== b.sdh)
+                return a.sdh ? -1 : 1;
+            else if (subtitleFirst === 'descriptive' && a.descriptive !== b.descriptive)
+                return a.descriptive ? -1 : 1;
+            const aRole = a.commentary ? 4 : (a.descriptive ? 3 : (a.sdh ? 2 : (a.lyrics ? 1 : 0)));
+            const bRole = b.commentary ? 4 : (b.descriptive ? 3 : (b.sdh ? 2 : (b.lyrics ? 1 : 0)));
+            if (aRole !== bRole)
+                return aRole - bRole;
+            return 0;
+        };
+
+        //Sort the streams: stream-type precedence, then the per-type comparator, then source-index order as the final tie-break.
         streams.sort((a, b) => {
-            //Stream Type
             const aOrder = streamOrder[a.type] ?? 99;
             const bOrder = streamOrder[b.type] ?? 99;
 
             if (aOrder !== bOrder)
                 return aOrder - bOrder;
 
-            //Video (but cover art / posters / thumbnails go last)
-            if (a.type === 'video') {
-                if (a.coverArt !== b.coverArt)
-                    return a.coverArt ? 1 : -1;
-            //Audio
-            } else if(a.type === 'audio') {
-                //audio_first promotes ONE track above every audio key (including language). Only one value is active, so at most one clause fires; each is a no-op
-                //when no track qualifies, falling through to the normal ordering. original: keeps a foreign film's original audio first (and default), not a dub.
-                //default: keeps the source's flagged-default audio first - promoting only the WINNING default (winningDefault) so the result is idempotent.
-                //descriptive: lifts the audio-description track first (and, via normalisation, makes it the default).
-                if (audioFirst === 'original' && a.original !== b.original)
-                    return a.original ? -1 : 1;
-                if (audioFirst === 'default') {
-                    const aWin = a === winningDefault, bWin = b === winningDefault;
-                    if (aWin !== bWin) return aWin ? -1 : 1;
-                }
-                if (audioFirst === 'descriptive' && a.descriptive !== b.descriptive)
-                    return a.descriptive ? -1 : 1;
-
-                //Language, role, order_codec, the union cap partition, then channel + quality — all in audioKeyCompare (shared with the winning-default pre-pass).
-                const c = audioKeyCompare(a, b);
-                if (c !== 0) return c;
-            //Subtitles
-            } else if (a.type === 'subtitle') {
-                //Forced always first
-                if (a.forced !== b.forced)
-                    return a.forced ? -1 : 1;
-
-                //Language priority next (forced already handled above).
-                const aRank = a.langRank;
-                const bRank = b.langRank;
-
-                if (aRank !== bRank)
-                    return aRank - bRank;
-
-                //subtitle_first promotes the default/SDH/descriptive subtitle to the top of THEIR language (below forced + language, above the normal role order).
-                if (subtitleFirst === 'default' && a.default !== b.default)
-                    return a.default ? -1 : 1;
-                else if (subtitleFirst === 'sdh' && a.sdh !== b.sdh)
-                    return a.sdh ? -1 : 1;
-                else if (subtitleFirst === 'descriptive' && a.descriptive !== b.descriptive)
-                    return a.descriptive ? -1 : 1;
-
-                //Normal, lyrics/songs, SDH, descriptive, commentary - subtitle_first overrides the default/SDH/descriptive position within the language
-                const aRole = a.commentary ? 4 : (a.descriptive ? 3 : (a.sdh ? 2 : (a.lyrics ? 1 : 0)));
-                const bRole = b.commentary ? 4 : (b.descriptive ? 3 : (b.sdh ? 2 : (b.lyrics ? 1 : 0)));
-                if (aRole !== bRole)
-                    return aRole - bRole;
-            }
+            let cmp = 0;
+            if (a.type === 'video') cmp = compareVideoStreams(a, b);
+            else if (a.type === 'audio') cmp = compareAudioStreams(a, b);
+            else if (a.type === 'subtitle') cmp = compareSubtitleStreams(a, b);
+            if (cmp !== 0) return cmp;
 
             //Next would be attachments and data but the order of these aren't important
             return a.index - b.index;
