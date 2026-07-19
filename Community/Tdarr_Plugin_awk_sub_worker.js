@@ -12,7 +12,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all) and skip_commentary (omit commentary tracks). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled/enabled_delete modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '2.1.6',
+    Version: '2.1.7',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -599,7 +599,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // lang is the only metadata-derived filename component read raw (title is percent-encoded via encodeTitle, disp/ext are fixed enums), so restrict
         // it to the language-code charset: a crafted container tag must not inject path separators/.. (traversal outside libDir) or a " that breaks out of
         // the quoted "${full}" in the extract preset. parseSidecar round-trips unchanged - valid codes (en/eng/pt-br) are already within [a-z0-9-].
-        const lang = (resolveLang(s) || 'und').replace(/[^a-z0-9-]/g, '') || 'und';
+        const langRaw = (resolveLang(s) || 'und').replace(/[^a-z0-9-]/g, '') || 'und';
+        // A tag that sanitises to a disposition-token word (a crafted tags.language of "forced"/"sdh"/etc.) would be consumed as a trailing disposition by
+        // parseSidecar's right-to-left disp strip, nulling or corrupting the reimport - collapse any such collision to 'und' so the fixed language slot can
+        // never be shaped like a disposition token.
+        const lang = DISP_TOKENS.has(langRaw) ? 'und' : langRaw;
         const disp = dispTokensOf(s);
         const { ext } = TEXT_SUB[String(s.codec_name).toLowerCase()];
         const rawTitle = s.tags?.title || '';

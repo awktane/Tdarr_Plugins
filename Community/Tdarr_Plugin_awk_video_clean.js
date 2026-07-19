@@ -12,7 +12,7 @@ const details = () => ({
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n
                      MAJOR UPGRADE - inputs were renamed/reworked, and Tdarr stores settings by input name, so on upgrade these RESET to defaults - re-check your video_clean settings: encoder->method_encoder, speed->method_speed, force_bit_depth->method_bitdepth, max_height->height_cap (value 'original'->'source'), method_hdr->hdr_mode, guard_min_bitrate->guard_shrink_bitrate (now shrink-only); the old preserve_dv is now the guard_dv toggle (default on); guard_reprocess is gone (use action=shrink); codec gained a 'source' value (keep the source codec).\n\n`,
-    Version: '2.999.3',
+    Version: '2.999.4',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -894,7 +894,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const ENCODABLE = ['hevc', 'h264', 'av1'];                       // codecs this plugin has an encoder for (codec=source keeps the source only when it is one of these)
         const EFF = { av1: 3, hevc: 2, h264: 1 };                        // efficiency rank for shrink's never-downgrade rule; a legacy codec (absent here) ranks below every target
         let targetCodecName = codec === 'source' ? srcCodecName : codec; // let: guard_dv forces 'hevc' for a DV file, and shrink's never-downgrade may fall back to the source codec
-        let wantTenbit = targetCodecName === 'h264' ? false : (bitDepthOpt === '10' || (bitDepthOpt === 'source' && srcIs10));   // let: guard_dv forces 10-bit for DV below
 
         // ---- HDR / Dolby Vision detection (both probes) ----
         // ffmpeg auto-propagates static colour metadata (primaries/transfer/matrix) through a re-encode (verified libx265/libsvtav1/videotoolbox, incl. the scale filter), so static HDR10/HLG
@@ -934,10 +933,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const effHdrMode = dvOverridesHdr ? 'preserve' : hdrMode;
         if (dvOverridesHdr)
             response.infoLog += `☒${streamTag(primary.index)}[guard_dv=true][hdr_mode=${hdrMode}] ${dvLabel} - guard_dv keeps the Dolby Vision instead of ${hdrMode === 'tonemap_sdr' ? 'tonemapping to SDR' : 'stripping the dynamic layer'}; set guard_dv=false to ${hdrMode === 'tonemap_sdr' ? 'tonemap' : 'strip'} it\n`;
-        if (preserveDv && !wantTenbit) {   // DV is inherently 10-bit; an 8-bit output would break it
-            response.infoLog += `☒${streamTag(primary.index)}[method_bitdepth=${bitDepthOpt}][guard_dv=true] Dolby Vision requires 10-bit - keeping 10-bit output (ignoring the 8-bit request)\n`;
-            wantTenbit = true;
-        }
         const dvIptC2 = preserveDv && (primary.color_space || mi?.matrix_coefficients || '').toLowerCase().trim() === 'ipt-c2';   // libx265 can't re-encode the IPT-C2 matrix - skip below rather than emit an erroring command
 
         // Resolution / downscale (only ever downscales) + the quality tier for the OUTPUT height. Inert under hdr_cleanup_only.
@@ -1015,6 +1010,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 targetCodecName = preserveDv ? 'hevc' : srcCodecName;                 // same-codec size pass (guard_dv still forces hevc for DV)
                 codecTrigger = ENCODABLE.includes(targetCodecName);                    // a legacy same-codec pass can't encode - caught by the !canEncodeTarget skip below
             }
+        }
+        // Final output bit depth - computed only AFTER targetCodecName is fully resolved (the guard_dv override above and shrink's never-downgrade fallback can each
+        // still change it), so the 'h264 has no 10-bit encoder here' rule keys on the ACTUAL output codec, not the provisional one. Every other target follows
+        // method_bitdepth (10 / source-depth); guard_dv then forces 10-bit for a DV file since an 8-bit output would break the Dolby Vision.
+        let wantTenbit = targetCodecName === 'h264' ? false : (bitDepthOpt === '10' || (bitDepthOpt === 'source' && srcIs10));
+        if (preserveDv && !wantTenbit) {
+            response.infoLog += `☒${streamTag(primary.index)}[method_bitdepth=${bitDepthOpt}][guard_dv=true] Dolby Vision requires 10-bit - keeping 10-bit output (ignoring the 8-bit request)\n`;
+            wantTenbit = true;
         }
         // guard_shrink_bitrate gates SHRINK's efficiency re-encode only (a CQ re-encode of an already-lean file can grow it). normalize is compatibility-driven - it must convert regardless of size - and
         // height_cap / tonemap / the lossless strip are always exempt (requested transforms that can't grow a file).

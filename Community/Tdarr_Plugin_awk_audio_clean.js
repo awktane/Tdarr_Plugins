@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '3.999.11',
+    Version: '3.999.12',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1575,11 +1575,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // track, so comparing against 'aac_vbr' directly would never match and would needlessly re-encode existing AAC tracks.
         const stereoCodecFamily = aacFamily(stereoCodec);
         const channelMatch = (stream) => {
+            // The surround no-work shortcuts below must only fire for a genuine surround-tier track: a 'stereo'-tier track (language_stereo,
+            // language_unlisted=stereo, or downmix_secondary=stereo) always needs the in-place stereo downmix, so a stereo-tier surround source already
+            // in surroundCodec must NOT be treated as done here - it has to stay in workStreams to reach that downmix regardless of downmix_to_* / codec.
             //8 channel
-            if(stream.channels > 6 && (downmixToSix === 'false') && (downmixToTwo === 'false') && (forceCodec === 'all' && ((stream?.codec_name ?? '').trim().toLowerCase() === surroundCodec)))
+            if(stream.channels > 6 && stream.isTdarrTier === 'surround' && (downmixToSix === 'false') && (downmixToTwo === 'false') && (forceCodec === 'all' && ((stream?.codec_name ?? '').trim().toLowerCase() === surroundCodec)))
                 return false;
             //3-6 channel
-            else if(stream.channels > 2 && stream.channels <= 6 && (downmixToTwo === 'false') && (['all','6below'].includes(forceCodec) && ((stream?.codec_name ?? '').trim().toLowerCase() === surroundCodec)))
+            else if(stream.channels > 2 && stream.channels <= 6 && stream.isTdarrTier === 'surround' && (downmixToTwo === 'false') && (['all','6below'].includes(forceCodec) && ((stream?.codec_name ?? '').trim().toLowerCase() === surroundCodec)))
                 return false;
             if((stream.channels <= 2) && ['all','6below','2below'].includes(forceCodec) && ((stream?.codec_name ?? '').trim().toLowerCase() === stereoCodecFamily))
                 return false;
@@ -1803,7 +1806,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // LOUDNORM_TOLERANCE_LU of the preset target. measured_thresh has NO uppercase alias (unlike measured_I/measured_LRA/measured_TP, which
         // accept either case) - keep it exactly lowercase. Pass-1's JSON field names (input_i/input_lra/input_tp/target_offset) are NOT the same
         // strings as pass-2's filter option names (measured_I/measured_LRA/measured_TP/offset) - same numbers, different names on each side.
+        // Cap the loudnorm analysis passes per file: each is a synchronous full-duration ffmpeg spawn, so a pathological/crafted file declaring a huge number
+        // of audio tracks could otherwise tie up a worker for hours (the per-spawn 10-min timeout never fires - each pass finishes well under it). A real file
+        // has a handful of audio tracks, so this bound is invisible in practice; past it the remaining tracks are left at source loudness with a single warning
+        // rather than measured, and a later queue pass can normalize them.
+        const LOUDNORM_MAX_TRACKS = 24;
+        let loudnormMeasureCount = 0;
+        let loudnormCapWarned = false;
         const buildLoudnormFilter = (streamIndex, srcAudioIdx, preFilter, preset) => {
+            if (loudnormMeasureCount >= LOUDNORM_MAX_TRACKS) {
+                if (!loudnormCapWarned) {
+                    response.infoLog += `☒[method_loudnorm=${loudnorm}] More than ${LOUDNORM_MAX_TRACKS} audio tracks to normalize - measuring the first ${LOUDNORM_MAX_TRACKS}, leaving the rest at source loudness (a later pass can normalize them)\n`;
+                    loudnormCapWarned = true;
+                }
+                return { filter: preFilter, changed: false };
+            }
+            loudnormMeasureCount++;
             const analysis = measureLoudness(srcAudioIdx, preFilter, preset);
             if (analysis.error)
                 failFile(`${streamTag(streamIndex)}[method_loudnorm=${loudnorm}] loudnorm analysis pass failed (${analysis.error}) - if this file has known corruption, try clean_and_remux's recover_bad_timestamps/recover_bad_data first; if the codec itself is unsupported, that won't help`);
