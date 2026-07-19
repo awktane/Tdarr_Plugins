@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.999.12',
+    Version: '3.999.13',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -296,6 +296,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         dub:              { streams:['audio'],                    keywords: ['dub','dubbed'],                                          tag: 'Dub'         },
         original:         { streams:['audio'],                    keywords: ['original'],                                              tag: 'Original'    },
         clean_effects:    { streams:['audio'],                    keywords: ['music and effects','m&e'],                               tag: null          },
+        karaoke:          { streams:['audio'],                    keywords: ['karaoke'],                                               tag: 'Karaoke'     },
         default:          { streams:['audio','subtitle','video'], keywords: ['default'],                                               tag: null          },
         attached_pic:     { streams:['video'],                    keywords: [],                                                        tag: null          },
         still_image:      { streams:['video'],                    keywords: [],                                                        tag: null          },

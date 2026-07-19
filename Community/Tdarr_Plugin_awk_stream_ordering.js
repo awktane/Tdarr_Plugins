@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can promote the default, SDH or descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart) - both ride the reorder remux, so no extra pass.\n`,
-    Version: '3.999.1',
+    Version: '3.999.2',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -212,6 +212,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         dub:              { streams:['audio'],                    keywords: ['dub','dubbed'],                                          tag: 'Dub'         },
         original:         { streams:['audio'],                    keywords: ['original'],                                              tag: 'Original'    },
         clean_effects:    { streams:['audio'],                    keywords: ['music and effects','m&e'],                               tag: null          },
+        karaoke:          { streams:['audio'],                    keywords: ['karaoke'],                                               tag: 'Karaoke'     },
         default:          { streams:['audio','subtitle','video'], keywords: ['default'],                                               tag: null          },
         attached_pic:     { streams:['video'],                    keywords: [],                                                        tag: null          },
         still_image:      { streams:['video'],                    keywords: [],                                                        tag: null          },
@@ -366,7 +367,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //   source-lossy (everything else): { score, transparent } - `transparent` is the 2-CHANNEL baseline; scoreThresholds scales it by (ch/2)^0.65 and
     //       derives minimum as MIN_RATIO of transparent. Some formats here aren't ffmpeg-encodable (e.g. ac4).
     // objectAudio: true marks a codec whose stream carries object-audio metadata (Atmos/DTS:X/MPEG-H) that ffmpeg cannot
-    // re-encode - read only by audio_clean's guard_object_audio, never by the score/threshold math below.
+    // re-encode - read only by audio_clean's guard_object_audio, never by the score/threshold math below. AC-4 is deliberately NOT flagged: it spans plain stereo to Atmos and
+    // no ffprobe field distinguishes the immersive (IMS) variant the way eac3->eac3atmos does, and it isn't ffmpeg-encodable anyway (so the guard could only ever block a drop).
     const codecInfo = {
         // Lossless
         pcm:         { score: 100, lossless: true },

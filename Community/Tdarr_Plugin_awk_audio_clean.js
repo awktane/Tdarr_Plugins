@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '3.999.13',
+    Version: '3.999.14',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -416,6 +416,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         dub:              { streams:['audio'],                    keywords: ['dub','dubbed'],                                          tag: 'Dub'         },
         original:         { streams:['audio'],                    keywords: ['original'],                                              tag: 'Original'    },
         clean_effects:    { streams:['audio'],                    keywords: ['music and effects','m&e'],                               tag: null          },
+        karaoke:          { streams:['audio'],                    keywords: ['karaoke'],                                               tag: 'Karaoke'     },
         default:          { streams:['audio','subtitle','video'], keywords: ['default'],                                               tag: null          },
         attached_pic:     { streams:['video'],                    keywords: [],                                                        tag: null          },
         still_image:      { streams:['video'],                    keywords: [],                                                        tag: null          },
@@ -576,7 +577,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //   source-lossy (everything else): { score, transparent } - `transparent` is the 2-CHANNEL baseline; scoreThresholds scales it by (ch/2)^0.65 and
     //       derives minimum as MIN_RATIO of transparent. Some formats here aren't ffmpeg-encodable (e.g. ac4).
     // objectAudio: true marks a codec whose stream carries object-audio metadata (Atmos/DTS:X/MPEG-H) that ffmpeg cannot
-    // re-encode - read only by audio_clean's guard_object_audio, never by the score/threshold math below.
+    // re-encode - read only by audio_clean's guard_object_audio, never by the score/threshold math below. AC-4 is deliberately NOT flagged: it spans plain stereo to Atmos and
+    // no ffprobe field distinguishes the immersive (IMS) variant the way eac3->eac3atmos does, and it isn't ffmpeg-encodable anyway (so the guard could only ever block a drop).
     const codecInfo = {
         // Lossless
         pcm:         { score: 100, lossless: true },
@@ -1278,7 +1280,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // A secondary track is any commentary, visually-impaired/descriptive, or music-and-effects (clean_effects) track — the shared classifiers cover the
         // disposition flags and the title keywords. A distinct M&E (dialogue-free) mix must never be deduped away as a duplicate of the main mix. Lyrics/songs
         // are subtitle-only, so they never apply to an audio stream. Secondary is a ROLE: such a track follows downmix_secondary whatever its language.
-        const isSecondaryTrack = (stream) => isCommentary(stream) || isDescriptive(stream) || hasDisposition(stream, 'clean_effects');
+        const isSecondaryTrack = (stream) => isCommentary(stream) || isDescriptive(stream) || hasDisposition(stream, 'clean_effects') || hasDisposition(stream, 'karaoke');
 
         // Dormancy: does any genuine (non-secondary) track sit in a language the user actually asked for (language_surround or language_stereo)? Only then do
         // the language settings act on unlisted languages. If nothing wanted is present they go dormant - every genuine track is kept at surround and
@@ -1692,6 +1694,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const CANON_LAYOUTS = {
             '3.1':            ['FL', 'FR', 'FC', 'LFE'],
             '4.0':            ['FL', 'FR', 'FC', 'BC'],
+            'quad':           ['FL', 'FR', 'BL', 'BR'],
+            'quad(side)':     ['FL', 'FR', 'SL', 'SR'],
             '5.0':            ['FL', 'FR', 'FC', 'BL', 'BR'],
             '5.0(side)':      ['FL', 'FR', 'FC', 'SL', 'SR'],
             '5.1':            ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR'],
