@@ -1349,7 +1349,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 // A Dolby Vision HEVC stream carries a dvhe/dvh1 (etc.) fourcc / a DOVI configuration record, NOT hvc1 - and this is a -c copy path, so its own tag is
                 // already correct. Forcing hvc1 onto it drops the DV configuration box and demotes the file to plain HEVC (verified: the output ffprobes as "Invalid
-                // data found"), undoing what video_clean's preserve_dv protects. Detect DV both-probe (fourcc / mediaInfo HDR_Format / ffprobe side_data) and leave its
+                // data found"), undoing what video_clean's guard_dv protects. Detect DV both-probe (fourcc / mediaInfo HDR_Format / ffprobe side_data) and leave its
                 // tag untouched. (video_clean re-encodes, so it makes the finer dvh1-vs-hvc1 choice; here the safe action on a mere remux is to not retag DV at all.)
                 const isDolbyVision = /^(dvhe|dvh1|dvav|dva1|dav1)$/.test((ffstream.codec_tag_string || '').toLowerCase().trim())
                     || String(ffmedia?.HDR_Format || ffmedia?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
