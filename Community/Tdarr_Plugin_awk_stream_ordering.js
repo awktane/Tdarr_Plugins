@@ -5,12 +5,12 @@ const details = () => ({
     Name: 'Re-order streams video, audio, subtitle, then anything else',
     Type: 'Any',
     Operation: 'Transcode',
-    Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - first_audio can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - first_subtitle can promote the default, SDH or descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart) - both ride the reorder remux, so no extra pass.\n`,
-    Version: '3.2.6',
+    Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can promote the default, SDH or descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart) - both ride the reorder remux, so no extra pass.\n`,
+    Version: '3.999.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
-            name: 'first_audio',
+            name: 'audio_first',
             type: 'string',
             defaultValue: 'language',
             inputUI: {
@@ -24,7 +24,7 @@ const details = () => ({
                 \\ndescriptive: promote the descriptive (audio-description) track above language. Falls back to language ordering when no descriptive track is present. Note: the first sorted track becomes the sole default, so this makes the description the default audio.`,
         },
         {
-            name: 'first_subtitle',
+            name: 'subtitle_first',
             type: 'string',
             defaultValue: 'normal',
             inputUI: {
@@ -681,16 +681,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
         failFile('No ffProbe stream data available for this file - the plugin cannot process it');
 
-    // Value checks. The two free-text inputs (order_language/order_codec) have no fixed option set; the six dropdowns (first_audio, first_subtitle,
+    // Value checks. The two free-text inputs (order_language/order_codec) have no fixed option set; the six dropdowns (audio_first, subtitle_first,
     // order_channel, order_quality, remove_junk_tags, method_mp4_faststart) each have one, validated below.
-    if(!['language', 'original', 'default', 'descriptive'].includes(inputs.first_audio))
-        failFile(`[first_audio=${inputs.first_audio}] invalid value, check your settings`);
+    if(!['language', 'original', 'default', 'descriptive'].includes(inputs.audio_first))
+        failFile(`[audio_first=${inputs.audio_first}] invalid value, check your settings`);
     if(!['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled'].includes(inputs.order_channel))
         failFile(`[order_channel=${inputs.order_channel}] invalid value, check your settings`);
     if(!['descending', 'descending <=1024k', 'ascending', 'disabled'].includes(inputs.order_quality))
         failFile(`[order_quality=${inputs.order_quality}] invalid value, check your settings`);
-    if(!['normal', 'default', 'sdh', 'descriptive'].includes(inputs.first_subtitle))
-        failFile(`[first_subtitle=${inputs.first_subtitle}] invalid value, check your settings`);
+    if(!['normal', 'default', 'sdh', 'descriptive'].includes(inputs.subtitle_first))
+        failFile(`[subtitle_first=${inputs.subtitle_first}] invalid value, check your settings`);
     if(!['disabled', 'encoder', 'descriptive'].includes(String(inputs.remove_junk_tags || 'disabled').toLowerCase()))
         failFile(`[remove_junk_tags=${inputs.remove_junk_tags}] invalid value, check your settings`);
     if(!['enabled', 'disabled'].includes(String(inputs.method_mp4_faststart || 'enabled').toLowerCase()))
@@ -704,8 +704,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // VIDEO -> AUDIO -> SUBTITLE -> ATTACHMENT -> DATA -> OTHER?
         const streamOrder = { video: 0, audio: 1, subtitle: 2 , attachment: 3, data: 4};
-        const audioFirst = inputs.first_audio;       // 'language' (baseline) | 'original' | 'default' | 'descriptive'
-        const subtitleFirst = inputs.first_subtitle; // 'normal' (baseline) | 'default' | 'sdh' | 'descriptive'
+        const audioFirst = inputs.audio_first;       // 'language' (baseline) | 'original' | 'default' | 'descriptive'
+        const subtitleFirst = inputs.subtitle_first; // 'normal' (baseline) | 'default' | 'sdh' | 'descriptive'
         const preferredLanguages = (inputs.order_language || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
         const preferredLangKeys = preferredLanguages.map(langKey);   // normalised keys: en/eng/english/en-US and 639-2/B vs /T all rank together
         const codecFirstList = (inputs.order_codec || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
@@ -734,7 +734,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return idx === -1 ? 999 : idx;
         };
 
-        // Audio ordering below first_audio, shared by the sort AND the winning-default pre-pass: language -> role -> order_codec -> the union cap partition
+        // Audio ordering below audio_first, shared by the sort AND the winning-default pre-pass: language -> role -> order_codec -> the union cap partition
         // (over EITHER cap -> tail) -> channel (direction) -> quality (direction). Returns 0 when every key ties. The cap ONLY partitions; within each partition
         // channel/quality keep their requested direction, so a 'descending <=N' list stays fully descending - the cap just shifts which serveable track leads.
         const audioKeyCompare = (a, b) => {
@@ -817,7 +817,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // Does this audio stream's canonical codec match order_codec? Family-prefix: "dts" catches dtsma/dtshr/dtsexpress, "eac3" catches eac3atmos.
                 codecmatch: canon !== '' && codecFirstList.some(c => canon.startsWith(c)),
                 default: ffstream?.disposition?.default === 1,
-                original: hasDisposition(ffstream, 'original'),   // for first_audio='original': promote the original-language track above language
+                original: hasDisposition(ffstream, 'original'),   // for audio_first='original': promote the original-language track above language
 
                 // Role classification via the shared classifiers (single source of truth — keeps the sort and the summary line in agreement).
                 commentary: isCommentary(ffstream),
@@ -830,10 +830,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             });
         }
 
-        // first_audio='default': only ONE audio track can remain default (the normalisation below marks the first sorted audio the sole default). So promote
+        // audio_first='default': only ONE audio track can remain default (the normalisation below marks the first sorted audio the sole default). So promote
         // the SINGLE default track that WINS the normal ordering, not every default flag - then the emitted order already matches the post-normalisation state and
         // is a fixpoint. Promoting every default would lead with a lower-priority default on pass 1, then re-sort it once its default is stripped (a wasteful extra
-        // reorder remux before it settles). undefined when no track is flagged default, so first_audio='default' then falls through to normal ordering. Identity-compared below.
+        // reorder remux before it settles). undefined when no track is flagged default, so audio_first='default' then falls through to normal ordering. Identity-compared below.
         const winningDefault = audioFirst === 'default'
             ? streams.filter(s => s.type === 'audio' && s.default).sort((a, b) => audioKeyCompare(a, b) || a.index - b.index)[0]
             : undefined;
@@ -853,7 +853,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     return a.coverArt ? 1 : -1;
             //Audio
             } else if(a.type === 'audio') {
-                //first_audio promotes ONE track above every audio key (including language). Only one value is active, so at most one clause fires; each is a no-op
+                //audio_first promotes ONE track above every audio key (including language). Only one value is active, so at most one clause fires; each is a no-op
                 //when no track qualifies, falling through to the normal ordering. original: keeps a foreign film's original audio first (and default), not a dub.
                 //default: keeps the source's flagged-default audio first - promoting only the WINNING default (winningDefault) so the result is idempotent.
                 //descriptive: lifts the audio-description track first (and, via normalisation, makes it the default).
@@ -882,7 +882,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (aRank !== bRank)
                     return aRank - bRank;
 
-                //first_subtitle promotes the default/SDH/descriptive subtitle to the top of THEIR language (below forced + language, above the normal role order).
+                //subtitle_first promotes the default/SDH/descriptive subtitle to the top of THEIR language (below forced + language, above the normal role order).
                 if (subtitleFirst === 'default' && a.default !== b.default)
                     return a.default ? -1 : 1;
                 else if (subtitleFirst === 'sdh' && a.sdh !== b.sdh)
@@ -890,7 +890,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 else if (subtitleFirst === 'descriptive' && a.descriptive !== b.descriptive)
                     return a.descriptive ? -1 : 1;
 
-                //Normal, lyrics/songs, SDH, descriptive, commentary - first_subtitle overrides the default/SDH/descriptive position within the language
+                //Normal, lyrics/songs, SDH, descriptive, commentary - subtitle_first overrides the default/SDH/descriptive position within the language
                 const aRole = a.commentary ? 4 : (a.descriptive ? 3 : (a.sdh ? 2 : (a.lyrics ? 1 : 0)));
                 const bRole = b.commentary ? 4 : (b.descriptive ? 3 : (b.sdh ? 2 : (b.lyrics ? 1 : 0)));
                 if (aRole !== bRole)
