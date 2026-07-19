@@ -10,7 +10,7 @@ const details = () => ({
                      -Optionally removes any subtitle tracks that are not in the specified language(s) via language_sub (audio language filtering is audio_clean's job)\n\n
                      -Standardises the stored language tag per container (tag_language / method_tag_language) and fills missing or und tags from language_fill - the only awk plugin that WRITES language tags\n\n
                      -Optional pre-mux early warning (guard_audio_language) that aborts a multi-language file whose original audio track isn't marked, before any downstream encoding work\n\n
-                     -Optionally removes SDH/CC accessibility subtitles via remove_sub_sdh (audio-description audio is audio_clean's method_secondary)\n\n
+                     -Optionally removes SDH/CC accessibility subtitles via remove_sub_sdh (audio-description audio is audio_clean's downmix_secondary)\n\n
                      -Option to modify metadata to remove metadata comments and titles with too many periods\n\n
                      -Automatically deduplicates titles reducing "Stereo / Stereo" down to "Stereo" or "English - English" down to "English"\n\n
                      -Optionally rebuilds audio and/or subtitle titles from their disposition roles and imports title keywords into the real ffmpeg disposition flags\n\n
@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.999.13',
+    Version: '3.999.14',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -169,7 +169,7 @@ const details = () => ({
             },
             tooltip: `Remove SDH / Closed Caption subtitles (for the deaf/hard-of-hearing). Detected by the real ffmpeg disposition flag or by keywords in the title/handler/description.
                 \\nSafety: a track is only removed when a "plain" subtitle of the same language survives - one carrying no commentary/descriptive/SDH/lyrics role, in a format the output container keeps and not stripped by remove_imagesubs. So extras are removed, never the last usable track.
-                \\nAudio-description (visual_impaired) audio is not handled here - audio_clean's method_secondary owns it, along with commentary and M&E.`,
+                \\nAudio-description (visual_impaired) audio is not handled here - audio_clean's downmix_secondary owns it, along with commentary and M&E.`,
         },
         {
             name: 'method_tag_language',
@@ -1029,7 +1029,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // subtitle. remove_sub_sdh removes an SDH/CC subtitle only when its language still has a plain subtitle that SURVIVES the language, format, and
     // remove_imagesubs filters, so we strip extras, never the last usable track. resolveWorkLang shares canonicalLangMeta's fillApplies rule so the language this guard filters on
     // and the tag that gets written can't drift. Computed BEFORE the language_fill_mode pre-check so that check can exclude the SDH tracks this guard will drop. Audio has no
-    // equivalent here: audio_clean's method_secondary owns audio-description removal and carries its own plain-same-language fall-back rule.
+    // equivalent here: audio_clean's downmix_secondary owns audio-description removal and carries its own plain-same-language fall-back rule.
     const plainSubLangs = new Set();
     const isPlainTrack = (s) => !isCommentary(s) && !isDescriptive(s) && !isSdh(s) && !isLyrics(s);
     const hasPlainSameLang = (set, wl) => set.has(langKey(wl));
@@ -1281,7 +1281,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
 
                 // This plugin never removes an audio stream - audio_clean owns every audio keep/drop decision (language via language_surround/language_stereo/
-                // language_unlisted, role via method_secondary), so audio only ever gets metadata work here.
+                // language_unlisted, role via downmix_secondary), so audio only ever gets metadata work here.
 
                 //Remove surrounding whitespace, single/double quotes (no reason for them). Busy-title clearing happens after tag_disposition (below).
                 let newStreamTitle = cleanStreamTitle(streamTitle);
