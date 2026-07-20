@@ -12,7 +12,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all) and skip_commentary (omit commentary tracks). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled/enabled_delete modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '2.999.4',
+    Version: '2.999.5',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -766,13 +766,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const deleteConfirmed = removeSidecarAfterImport || dedupeMode === 'enabled_delete';
         // Which toggle triggered the delete, for the log tag: remove_sidecar_after_import is the direct "delete after import"; otherwise it is method_deduplicate=enabled_delete.
         const delReason = removeSidecarAfterImport ? 'remove_sidecar_after_import=true' : 'method_deduplicate=enabled_delete';
-        // Confirm each marker-listed sidecar against the CURRENT file's streams before unlinking it: only delete when an embedded subtitle stream actually matches its
-        // language + title (the identity our own import writes). A forged awk_sub_worker marker - a file that arrived already tagged but was never muxed by us - can
-        // otherwise make enabled_delete / remove_sidecar_after_import unlink on-disk sidecars that were never embedded. A legitimate second pass (the mux just happened)
-        // matches exactly; a forged marker naming a sidecar the file doesn't contain does not. A false negative merely keeps the sidecar (a later pass, or the user, can
-        // remove it) rather than deleting it - it never re-adds or loses subtitle content - so this fails safe. (Metadata identity, not a content hash, by design.)
+        // Confirm each marker-listed sidecar against the CURRENT file's streams before unlinking it: only delete when an embedded subtitle stream matches its language +
+        // title (the identity our own import writes). On an mp4/mov target the container DROPS per-stream subtitle titles on the -c copy mux, so a re-probe can't see the
+        // title - there we confirm on LANGUAGE alone (else a titled sidecar we DID embed never matches its now-title-less stream, so its cleanup silently never runs). A
+        // forged awk_sub_worker marker - a file that arrived already tagged but was never muxed by us - can otherwise make enabled_delete / remove_sidecar_after_import
+        // unlink on-disk sidecars never embedded; the marker VALUE (basenames we listed this/last pass) still scopes deletion, so the forged-marker guard holds on mp4 too.
+        // A false negative merely keeps the sidecar (a later pass, or the user, removes it) - it never re-adds or loses subtitle content - so this fails safe.
         const embeddedSubs = streams.filter((s) => (s.codec_type || '').toLowerCase() === 'subtitle');
-        const markerConfirmsEmbedded = (f) => embeddedSubs.some((s) => langKey(resolveLang(s) || 'und') === langKey(f.lang || 'und') && (s.tags?.title || '') === (f.title || ''));
+        const markerConfirmsEmbedded = (f) => embeddedSubs.some((s) =>
+            langKey(resolveLang(s) || 'und') === langKey(f.lang || 'und') && (isMp4 || (s.tags?.title || '') === (f.title || '')));
         let deleted = 0;
         if (deleteConfirmed) {
             for (const f of found.filter((x) => importedSet.has(x.name))) {
