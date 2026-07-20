@@ -9,7 +9,7 @@ const details = () => ({
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n
                      MAJOR UPGRADE - inputs were renamed/reworked, and Tdarr stores settings by input name, so on upgrade these RESET to defaults - re-check your video_clean settings: encoder->method_encoder, speed->method_speed, force_bit_depth->method_bitdepth, max_height->height_cap (value 'original'->'source'), method_hdr->hdr_mode, guard_min_bitrate->guard_shrink_bitrate (now shrink-only); the old preserve_dv is now the guard_dv toggle (default on); guard_reprocess is gone (use action=shrink); codec gained a 'source' value (keep the source codec).\n\n`,
-    Version: '2.999.9',
+    Version: '2.999.10',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -434,6 +434,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Embedded-font filename extensions + a font-mimetype test, shared by summariseStream's [attach:...] token and clean_and_remux's attachmentKind font classification.
     const FONT_EXTS = ['ttf', 'otf', 'ttc', 'otc', 'pfb', 'pfa', 'woff', 'woff2', 'eot'];
     const isFontMime = (mime) => /font|truetype|opentype|sfnt/.test(mime);
+    // -=-=-= HDR_TRANSFERS  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The HDR transfer curves: ffmpeg's two HDR color_trc enums (smpte2084 = PQ, arib-std-b67 = HLG) plus the MediaInfo spellings (pq, hlg).
+    // The single source for every HDR-curve test: summariseStream's vHdr token below, and video_clean's isHdr / dvNoBaseLayer / tonemap-setparams gate.
+    const HDR_TRANSFERS = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'];
     // -=-=-= summariseStream  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Per type: video codec + resolution/10bit/hdr (+/cover for cover-art/still images); data & attachment codec only. Audio & subtitle append /default, then their role markers.
     // Audio role markers: /commentary|/description then /dub|/original. Subtitle: /forced then /commentary|/description|/sdh|/lyrics.
@@ -453,7 +457,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const vHeight = Number(s.height || vmi?.Height || 0);
             const vTenbit = is10Bit(s, vmi);
             const vXfer = (s.color_transfer || vmi?.transfer_characteristics || '').toLowerCase().trim();
-            const vHdr = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'].includes(vXfer) || !!String(vmi?.HDR_Format || '').trim();
+            const vHdr = HDR_TRANSFERS.includes(vXfer) || !!String(vmi?.HDR_Format || '').trim();
             // HDR sub-type marker, shown in place of 'hdr'. Dolby Vision is detected self-contained here (video_clean carries summariseStream but not
             // isDolbyVisionVideo): a dvhe/dvh1/dvav/dva1/dav1 fourcc, a mediaInfo HDR_Format naming Dolby Vision, or a DOVI record - also surfacing
             // Profile-5 DV whose non-standard transfer sets no hdr flag. HDR10+ is stream-visible only via mediaInfo (ffprobe carries 2094-40 per-frame, which
@@ -950,9 +954,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const dvSignal = !!dovi || dvCodecTag || hdrFmt.includes('dolby vision');   // Dolby Vision specifically (excludes HDR10+)
         const isHdr10Plus = isDynamicHdr && !dvSignal;                              // dynamic HDR that is not DV = HDR10+ (no RPU path; a lossless strip needs HEVC via hevc_metadata)
         const srcXfer = (primary.color_transfer || mi?.transfer_characteristics || '').toLowerCase().trim();
-        // The complete set of HDR transfer curves: ffmpeg's two HDR color_trc enums (smpte2084 = PQ, arib-std-b67 = HLG) plus the MediaInfo spellings (pq, hlg). Single source for the HDR-curve
-        // tests below (isHdr, dvNoBaseLayer, the tonemap setparams gate). summariseStream's shared 'vHdr' token carries a byte-identical copy - keep the two in lockstep.
-        const HDR_TRANSFERS = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'];
+        // isHdr / dvNoBaseLayer / the tonemap-setparams gate below read the shared HDR_TRANSFERS curve set (defined in the stream/preset-helpers section).
         const isHdr = HDR_TRANSFERS.includes(srcXfer) || !!String(mi?.HDR_Format || '').trim() || isDynamicHdr;
         // A single-layer DV whose base carries NO standard HDR transfer (e.g. profile 5's IPT-PQ base): no smpte2084/HLG to fall back to, so neither a lossless strip nor a normal re-encode
         // keeps a valid picture. The transfer - not the DOVI compat id - is the reliable signal (a compat-0 stream that DOES carry a PQ transfer re-encodes fine; profile 7/8/10 carry smpte2084/HLG).
