@@ -9,7 +9,7 @@ const details = () => ({
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n
                      MAJOR UPGRADE - inputs were renamed/reworked, and Tdarr stores settings by input name, so on upgrade these RESET to defaults - re-check your video_clean settings: encoder->method_encoder, speed->method_speed, force_bit_depth->method_bitdepth, max_height->height_cap (value 'original'->'source'), method_hdr->hdr_mode, guard_min_bitrate->guard_shrink_bitrate (now shrink-only); the old preserve_dv is now the guard_dv toggle (default on); guard_reprocess is gone (use action=shrink); codec gained a 'source' value (keep the source codec).\n\n`,
-    Version: '2.999.10',
+    Version: '2.999.11',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1006,6 +1006,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return response;
         };
 
+        // Lossless dynamic-HDR strip eligibility, shared by hdr_cleanup_only and the no-real-transcode strip path: a no-base DV and HDR10+-in-non-HEVC both have no
+        // lossless path (skip); otherwise do the strip. The two callers point users at slightly different next steps, so their two skip messages are passed in.
+        const tryLosslessStrip = (noBaseMsg, hdr10PlusMsg) => {
+            if (dvNoBaseLayer) { response.infoLog += noBaseMsg; response.processFile = false; return response; }
+            if (isHdr10Plus && srcCodecName !== 'hevc') { response.infoLog += hdr10PlusMsg; response.processFile = false; return response; }
+            return emitLosslessStrip();
+        };
+
         // ================= decide, gated by action =================
         if (action === 'hdr_cleanup_only') {
             // Only hdr_mode is live; codec / height_cap / bit-depth / encoder inert. Lossless-or-skip.
@@ -1019,17 +1027,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.processFile = false;
                 return response;
             }
-            if (dvNoBaseLayer) {
-                response.infoLog += `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} has no HDR10 base layer - can't strip losslessly; switch to action=normalize or shrink with hdr_mode=tonemap_sdr to flatten it to SDR\n`;
-                response.processFile = false;
-                return response;
-            }
-            if (isHdr10Plus && srcCodecName !== 'hevc') {
-                response.infoLog += `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] HDR10+ in ${srcCodecName || 'this codec'} has no lossless strip path (needs HEVC) - left untouched; use action=normalize/shrink to re-encode it away\n`;
-                response.processFile = false;
-                return response;
-            }
-            return emitLosslessStrip();
+            return tryLosslessStrip(
+                `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} has no HDR10 base layer - can't strip losslessly; switch to action=normalize or shrink with hdr_mode=tonemap_sdr to flatten it to SDR\n`,
+                `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] HDR10+ in ${srcCodecName || 'this codec'} has no lossless strip path (needs HEVC) - left untouched; use action=normalize/shrink to re-encode it away\n`);
         }
 
         // ---- action = normalize | shrink (real-transcode capable) ----
@@ -1146,17 +1146,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // ---- no real transcode: a lossless strip, a bitrate skip, or a benign no-op ----
         if (effHdrMode === 'strip_dynamic' && isDynamicHdr) {   // strip_dynamic is the sole reason - do it losslessly (or skip when it can't be lossless)
-            if (dvNoBaseLayer) {
-                response.infoLog += `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} has no HDR10 base layer - can't strip losslessly; set hdr_mode=tonemap_sdr to flatten it to SDR\n`;
-                response.processFile = false;
-                return response;
-            }
-            if (isHdr10Plus && srcCodecName !== 'hevc') {
-                response.infoLog += `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] HDR10+ in ${srcCodecName || 'this codec'} has no lossless strip path (needs HEVC) - left untouched\n`;
-                response.processFile = false;
-                return response;
-            }
-            return emitLosslessStrip();
+            return tryLosslessStrip(
+                `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} has no HDR10 base layer - can't strip losslessly; set hdr_mode=tonemap_sdr to flatten it to SDR\n`,
+                `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] HDR10+ in ${srcCodecName || 'this codec'} has no lossless strip path (needs HEVC) - left untouched\n`);
         }
         if (belowFloorKbps > 0) {
             response.infoLog += `☑${streamTag(primary.index)}[guard_shrink_bitrate=${guardShrinkKbps}] Source video bitrate ${belowFloorKbps}k is below the ${guardShrinkKbps}k floor - already efficient, left untouched\n`;

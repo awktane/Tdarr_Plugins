@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '3.999.19',
+    Version: '3.999.20',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1273,21 +1273,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //      the bitmap codecs (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle, hdmv_text_subtitle) natively. The legacy PC/fansub text formats below
                 //      (microdvd, mpl2, jacosub, sami, realtext, subviewer, vplayer, pjs) have NO Matroska CodecID either, so a bare -c copy would fail the whole
                 //      remux — ffmpeg decodes them as text, so convert to srt too. xsub has no CodecID and is not decodable text, so it is dropped above (alwaysDropSubs).
-                if((dstContainer === 'mkv') && ['mov_text', ...legacyTextSubs].includes(ffstreamCodec)) {
-                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Unsupported codec - converting ${ffstreamCodec} subtitle to srt\n`;
-                    extraArguments += metadataCommand+` -c:s:${subtitleStreamIndex} srt`;
-                    subCodecOverride.set(ffstream.index, 'srt');
-                    convert = true;
-                    continue;
-                }
-
-                // mp4: only mov_text is natively supported. All decodable text subtitle codecs must be converted to it — the common ones (subrip/srt/ass/ssa/
+                // mp4 (below): only mov_text is natively supported. All decodable text subtitle codecs must be converted to it — the common ones (subrip/srt/ass/ssa/
                 //      webvtt/text) plus the legacy PC/fansub formats (microdvd, mpl2, jacosub, sami, realtext, subviewer, vplayer, pjs) that ffmpeg decodes as
                 //      text; without this they would hit the bare -c copy and fail the whole remux. text is raw UTF-8 that ffmpeg normalises to subrip on mux.
-                if((dstContainer === 'mp4') && ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'text', ...legacyTextSubs].includes(ffstreamCodec)) {
-                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Unsupported codec - converting ${ffstreamCodec} subtitle to mov_text\n`;
-                    extraArguments += metadataCommand+` -c:s:${subtitleStreamIndex} mov_text`;
-                    subCodecOverride.set(ffstream.index, 'mov_text');
+                let subConvertTarget = null;
+                if (dstContainer === 'mkv' && ['mov_text', ...legacyTextSubs].includes(ffstreamCodec)) subConvertTarget = 'srt';
+                else if (dstContainer === 'mp4' && ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'text', ...legacyTextSubs].includes(ffstreamCodec)) subConvertTarget = 'mov_text';
+                if (subConvertTarget) {
+                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Unsupported codec - converting ${ffstreamCodec} subtitle to ${subConvertTarget}\n`;
+                    extraArguments += metadataCommand+` -c:s:${subtitleStreamIndex} ${subConvertTarget}`;
+                    subCodecOverride.set(ffstream.index, subConvertTarget);
                     convert = true;
                     continue;
                 }

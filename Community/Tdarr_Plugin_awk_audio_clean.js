@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '3.999.20',
+    Version: '3.999.21',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1614,7 +1614,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
-        //Remove any tracks that we won't use based on channel count, etc.
+        // Exclude tracks that need no codec work: alreadyTargetCodec flags a track already in its tier's forced codec; the filter below drops it.
         // aac_vbr is treated as the aac family for codec-identity checks — ffprobe always reports codec_name 'aac' regardless of which encoder produced the
         // track, so comparing against 'aac_vbr' directly would never match and would needlessly re-encode existing AAC tracks.
         const stereoCodecFamily = aacFamily(stereoCodec);
@@ -1902,6 +1902,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // genuinely needs correction still re-encodes once regardless of container, then measures within tolerance next run.
         const loudnormTagPersists = ['mkv', 'webm', 'mka'].includes(String(file.container).toLowerCase());
         const loudnormStampArg = (idx) => (loudnormTagPersists ? ` -metadata:s:a:${idx} "awk_loudnorm=${loudnormTagValue()}"` : '');
+        const langMetaArg = (idx, lang) => (lang ? ` -metadata:s:a:${idx} "language=${escMeta(lang)}"` : '');
         // ===== END LOUDNORM =====
 
         // Channel/filter snippet for a new or replaced stereo track. When loudnorm is enabled, every call site here has already either passed its
@@ -1943,7 +1944,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             workDone += `☐${streamTag(srcStream.index)}[downmix_to_six=${downmixToSix}] Adding ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s from ${srcCodecStr} ${srcStream.channels}ch @ ${srcRateStr}${logSuffix}\n`;
             extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${audioEncoder(surroundCodec)}${dstBitArg}${sixFilter} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
             const wl = langForWrite(srcStream);
-            if (wl) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(wl)}"`;
+            extraArguments += langMetaArg(newStreamOutputIdx, wl);
             newStreamOutputIdx++;
             appendedAudio.push({ srcStream, codec: surroundCodec, channels: 6, bps: dstBitStr });
             created6chLangs.add(langKeyVal);
@@ -1955,7 +1956,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             workDone += `☐${streamTag(srcStream.index)}[downmix_to_stereo=${downmixToStereo}] Adding ${e.logCodec} stereo @ ${e.rate}${e.label ? ` (${e.label})` : ''} from ${srcCodecStr} ${srcStream.channels}ch @ ${srcRateStr}${logSuffix}\n`;
             extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${e.frag}${stereoArg(newStreamOutputIdx, srcStream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
             const wl = langForWrite(srcStream);
-            if (wl) extraArguments += ` -metadata:s:a:${newStreamOutputIdx} "language=${escMeta(wl)}"`;
+            extraArguments += langMetaArg(newStreamOutputIdx, wl);
             newStreamOutputIdx++;
             appendedAudio.push({ srcStream, ...e.record });
             created2chLangs.add(langKeyVal);
@@ -2007,7 +2008,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     : (langStereoKeys.includes(ffstream.isTdarrCleanLang) ? 'language_stereo' : `language_unlisted=${langUnlisted}`);
                 workDone += `☐${streamTag(ffstream.index)}[${tierTag}] Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${e.logCodec} stereo @ ${e.rate} (${e.label ? `${e.label}, ` : ''}${ffstream.isTdarrSecondaryTrack ? 'secondary' : 'stereo tier'})\n`;
                 extraArguments += ` -c:a:${outputAudioIdx} ${e.frag}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
-                if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(streamLang)}"`;
+                extraArguments += langMetaArg(outputAudioIdx, streamLang);
                 modifiedAudioIdx.add(outputAudioIdx);
                 outputAudioOverride.set(outputAudioIdx, e.record);
                 convert = true;
@@ -2028,7 +2029,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const sixFilter = sixArg(outputAudioIdx, ffstream);
                     workDone += `☐${streamTag(ffstream.index)}[downmix_to_six=${downmixToSix}] Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${audioEncoder(surroundCodec)}${dstBitArg}${sixFilter} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
-                    if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(streamLang)}"`;
+                    extraArguments += langMetaArg(outputAudioIdx, streamLang);
                     modifiedAudioIdx.add(outputAudioIdx);
                     outputAudioOverride.set(outputAudioIdx, { codec: surroundCodec, channels: 6, bps: dstBitStr });
                     created6chLangs.add(ffstreamLangKey);
@@ -2053,7 +2054,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const e = stereoEnc(outputAudioIdx);
                     workDone += `☐${streamTag(ffstream.index)}[downmix_to_stereo=${downmixToStereo}] Transcoding ${ffstreamCodec} ${ffstream.channels}ch @ ${srcRateStr} → ${e.logCodec} stereo @ ${e.rate}${e.label ? ` (${e.label})` : ''}\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${e.frag}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
-                    if (streamLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(streamLang)}"`;
+                    extraArguments += langMetaArg(outputAudioIdx, streamLang);
                     modifiedAudioIdx.add(outputAudioIdx);
                     outputAudioOverride.set(outputAudioIdx, e.record);
                     created2chLangs.add(ffstreamLangKey);
@@ -2260,7 +2261,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             const e = stereoEnc(outputAudioIdx);
                             workDone += `☐${streamTag(stream.index)}[method_loudnorm=${loudnorm}] Normalizing ${rawCodec} ${channels}ch → ${e.logCodec} stereo @ ${e.rate} (${e.label ? `${e.label}; ` : ''}remixed - libopus can't encode a ${lay || `${channels}ch`} layout)\n`;
                             extraArguments += ` -c:a:${outputAudioIdx} ${e.frag}${stereoArg(outputAudioIdx, stream)}${loudnormStampArg(outputAudioIdx)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
-                            if (sLang) extraArguments += ` -metadata:s:a:${outputAudioIdx} "language=${escMeta(sLang)}"`;
+                            extraArguments += langMetaArg(outputAudioIdx, sLang);
                             outputAudioOverride.set(outputAudioIdx, e.record);
                             modifiedAudioIdx.add(outputAudioIdx);
                             convert = true;

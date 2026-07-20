@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can promote the default, SDH or descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time it's needed).\n`,
-    Version: '3.999.7',
+    Version: '3.999.8',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -755,6 +755,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // VIDEO -> AUDIO -> SUBTITLE -> ATTACHMENT -> DATA -> OTHER?
         const streamOrder = { video: 0, audio: 1, subtitle: 2 , attachment: 3, data: 4};
+        const UNKNOWN_TYPE_ORDER = 99;   // a codec_type not in streamOrder (video/audio/subtitle/attachment/data) sorts last
         const audioFirst = inputs.audio_first;       // 'language' (baseline) | 'original' | 'default' | 'descriptive'
         const subtitleFirst = inputs.subtitle_first; // 'normal' (baseline) | 'default' | 'sdh' | 'descriptive'
         const preferredLanguages = (inputs.order_language || '').toLowerCase().split(',').map(v => v.trim()).filter(Boolean);
@@ -932,8 +933,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         //Sort the streams: stream-type precedence, then the per-type comparator, then source-index order as the final tie-break.
         streams.sort((a, b) => {
-            const aOrder = streamOrder[a.type] ?? 99;
-            const bOrder = streamOrder[b.type] ?? 99;
+            const aOrder = streamOrder[a.type] ?? UNKNOWN_TYPE_ORDER;
+            const bOrder = streamOrder[b.type] ?? UNKNOWN_TYPE_ORDER;
 
             if (aOrder !== bOrder)
                 return aOrder - bOrder;

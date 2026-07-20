@@ -12,7 +12,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all) and skip_commentary (omit commentary tracks). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled/enabled_delete modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '2.999.7',
+    Version: '2.999.8',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -574,21 +574,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The import marker's VALUE carries the sidecar basenames muxed in the most-recent pass, encoded to [A-Za-z0-9%]
     // (nothing escMeta touches, no comma) and comma-joined - a GLOBAL tag value survives every container (incl. mp4,
     // which drops per-stream title/default), so pass 2 deletes exactly what pass 1 embedded without re-reading metadata.
-    const encMarker = (s) => Array.from(Buffer.from(String(s), 'utf8')).map((b) => (/[A-Za-z0-9]/.test(String.fromCharCode(b)) ? String.fromCharCode(b) : `%${b.toString(16).toUpperCase().padStart(2, '0')}`)).join('');
-    const decMarker = (s) => { const b = []; for (let i = 0; i < s.length; i += 1) { if (s[i] === '%') { b.push(parseInt(s.slice(i + 1, i + 3), 16)); i += 2; } else b.push(s.charCodeAt(i)); } return Buffer.from(b).toString('utf8'); };
-    const encodeMarkerList = (names) => names.map(encMarker).join(',');
-    const decodeMarkerList = (v) => String(v || '').split(',').filter(Boolean).map(decMarker);
+    const encodeMarker = (s) => Array.from(Buffer.from(String(s), 'utf8')).map((b) => (/[A-Za-z0-9]/.test(String.fromCharCode(b)) ? String.fromCharCode(b) : `%${b.toString(16).toUpperCase().padStart(2, '0')}`)).join('');
+    const decodeMarker = (s) => { const b = []; for (let i = 0; i < s.length; i += 1) { if (s[i] === '%') { b.push(parseInt(s.slice(i + 1, i + 3), 16)); i += 2; } else b.push(s.charCodeAt(i)); } return Buffer.from(b).toString('utf8'); };
+    const encodeMarkerList = (names) => names.map(encodeMarker).join(',');
+    const decodeMarkerList = (v) => String(v || '').split(',').filter(Boolean).map(decodeMarker);
     // Keep the sidecar basename under the filesystem's 255-byte cap; if the encoded title pushes it over, trim the
     // RAW title (whole chars, so UTF-8 stays valid) until it fits and flag the lossy truncation.
     let titleTruncated = false;
+    const NAME_BYTE_CAP = 255;   // filesystem basename byte limit (ext4/APFS/NTFS) the encoded sidecar name must fit under
     const encodeTitleCapped = (rawTitle, fixedLen) => {
         let raw = String(rawTitle);
         // Bound the work: the name budget is 255 bytes and encodeTitle emits >= 1 byte per raw char, so any raw title longer
         // than 255 chars can never fit - trimming it up front makes the fit loop O(cap) instead of O(N^2) on a crafted multi-KB
         // title (untrusted container metadata), losing only chars the loop would trim anyway (output identical, still flagged).
-        if (raw.length > 255) { raw = raw.slice(0, 255); titleTruncated = true; }
+        if (raw.length > NAME_BYTE_CAP) { raw = raw.slice(0, NAME_BYTE_CAP); titleTruncated = true; }
         let enc = encodeTitle(raw);
-        while (raw.length > 0 && Buffer.byteLength(`${enc}${'.'.repeat(fixedLen ? 1 : 0)}`, 'utf8') + fixedLen > 255) { raw = raw.slice(0, -1); enc = encodeTitle(raw); titleTruncated = true; }
+        while (raw.length > 0 && Buffer.byteLength(`${enc}${'.'.repeat(fixedLen ? 1 : 0)}`, 'utf8') + fixedLen > NAME_BYTE_CAP) { raw = raw.slice(0, -1); enc = encodeTitle(raw); titleTruncated = true; }
         return enc;
     };
 
@@ -796,7 +797,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Import is NON-DESTRUCTIVE: every recognized sidecar not already handled by our own prior pass (marker) is muxed in. We do NOT suppress a
         // sidecar just because an embedded sub shares its lang|title|disposition - metadata can't prove same content, and dropping a distinct track is
         // data loss, whereas a redundant duplicate is not. Genuine duplication is collapsed by CONTENT instead (method_deduplicate, below).
-        const existingSubCount = streams.filter((s) => (s.codec_type || '').toLowerCase() === 'subtitle').length;
+        const existingSubCount = embeddedSubs.length;   // same subtitle-stream filter already computed above (streams is unchanged since)
         // The import muxes each sidecar as -i "${libDir}/${name}"; a " or control char in that real on-disk path would close the quote and inject ffmpeg args, and unlike a
         // name we generate it must match the file byte-for-byte, so it can't be sanitised - skip it instead (a Plex-native/user file we can't safely reference), never break out.
         const candidates = found.filter((f) => !importedSet.has(f.name)).filter((f) => {
