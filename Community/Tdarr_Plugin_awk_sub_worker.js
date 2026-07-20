@@ -10,8 +10,9 @@ const details = () => ({
                 \\nmode=import muxes matching sidecars back into the file (restoring language, title, and disposition) and, by default, deletes the sidecar once it is safely embedded. Import never drops a subtitle - anything not already embedded is muxed in (a copy already present just becomes a duplicate, never a loss); method_deduplicate collapses byte-identical copies.
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them. Import ALSO recognizes fresh Plex-native sidecars with no s<index> (e.g. <video>.en.forced.srt), anchoring on the language token.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
+                \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all) and skip_commentary (omit commentary tracks). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled/enabled_delete modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '2.1.0',
+    Version: '3.0.0',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -129,6 +130,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         dub:              { streams:['audio'],                    keywords: ['dub','dubbed'],                                          tag: 'Dub'         },
         original:         { streams:['audio'],                    keywords: ['original'],                                              tag: 'Original'    },
         clean_effects:    { streams:['audio'],                    keywords: ['music and effects','m&e'],                               tag: null          },
+        karaoke:          { streams:['audio'],                    keywords: ['karaoke'],                                               tag: 'Karaoke'     },
         default:          { streams:['audio','subtitle','video'], keywords: ['default'],                                               tag: null          },
         attached_pic:     { streams:['video'],                    keywords: [],                                                        tag: null          },
         still_image:      { streams:['video'],                    keywords: [],                                                        tag: null          },
@@ -184,7 +186,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last;
     // summariseStream flags them /cover.
     const IMAGE_CODECS = ['mjpeg', 'mjpegb', 'png', 'apng', 'gif', 'bmp', 'webp', 'tiff'];
-    // A stream is cover art / a still image when its codec is an image codec OR it carries a cover-art disposition (attached_pic/still_image/timed_thumbnails).
     const isCoverArt = (s) => IMAGE_CODECS.includes((s.codec_name || '').trim().toLowerCase())
         || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails');
     // ===== END SHARED: image / cover-art codecs =====
@@ -194,7 +195,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Prefix → canonical codec key (e.g. wmav1 → wma).
     const codecAliases = [
         ['pcm_',   'pcm'],
+        ['dsd',    'dsd'],       // DSD / SACD (1-bit): fold dsd_lsbf/dsd_msbf(_planar) to one lossless key
+        ['mp4als', 'als'],       // MPEG-4 ALS: fold the mp4-wrapped spelling to the 'als' codecInfo key (a bare 'als' resolves directly)
         ['adpcm',  'adpcm'],
+        ['wmavoice', 'wmavoice'],   // WMA Voice: low-bitrate SPEECH codec, not music-grade WMA - keep distinct so the wmav prefix below doesn't score it as full WMA
         ['wmav',   'wma'],
         ['atrac',  'atrac'],
         ['mpegh',  'mpegh3d'],   // ffmpeg reports MPEG-H 3D Audio as mpegh_3d_audio; map it to the codecInfo key so it scores + gets object-audio protection
@@ -203,7 +207,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= resolveCodecName  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the
     // _x variant when DTS:X is detected) and eac3 into eac3atmos. Used for scoring by audioQuality (audio_clean, stream_ordering)
-    // and losslessSource (audio_clean), and by summariseStream (all five) purely for accurate display labeling - a plugin
+    // and isLosslessSource (audio_clean), and by summariseStream (all five) purely for accurate display labeling - a plugin
     // that doesn't score audio still benefits from showing "eac3atmos"/"dtsx" instead of a bare "eac3"/"dts" in its logs.
     // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't
     // tell the subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to
@@ -328,8 +332,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const ff = Number(ffstream.channels || 0);
         if (ff > 0) return ff;
         const ffmedia = mediaInfoFor(ffstream);
-        const mi = Number(ffmedia?.Channels || 0);
-        if (mi > 0) return mi;
+        const miChannels = Number(ffmedia?.Channels || 0);
+        if (miChannels > 0) return miChannels;
         return channelsFromLayout(ffstream.channel_layout || ffmedia?.ChannelLayout || ffmedia?.ChannelPositions);
     };
 
@@ -337,15 +341,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Enrich a stream with both-probe bitrate + channels before summariseStream/audioQuality/scoring, so ffprobe-unreadable values (e.g. DTS-HD MA
     // bitrate in MP4) fall back to mediaInfo. Every summary and scoring call site uses this so logged tokens and the scoring path enrich identically.
     const enrichStream = (s) => ({ ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate, channels: resolveChannels(s) || s.channels });
-    // -=-=-= summariseStream  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Per type: video codec + resolution/10bit/hdr (+/cover for cover-art/still images); data & attachment codec only. Audio & subtitle append /default, then their role markers.
-    // Audio role markers: /commentary|/description then /dub|/original. Subtitle: /forced then /commentary|/description|/sdh|/lyrics.
-    // /default and /forced read the REAL disposition flag only — a title keyword must not flip a selection flag (as forced already did).
     // -=-=-= is10Bit  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // True when a video stream is 10-bit (or deeper): raw sample depth or mediaInfo BitDepth >= 10, a 10-bit pixel format (p10le/p10be), or a 10-bit
     // profile (Main 10 / High 10). Single source for summariseStream's 10bit token and video_clean's re-encode depth decision so the two can't drift.
     const is10Bit = (s, mi = mediaInfoFor(s)) => Number(s.bits_per_raw_sample || mi?.BitDepth || 0) >= 10
         || /p10(le|be)?$|10le|10be/.test((s.pix_fmt || '').toLowerCase()) || /10/.test((s.profile || '').toLowerCase());
+    // -=-=-= FONT_EXTS + isFontMime  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Embedded-font filename extensions + a font-mimetype test, shared by summariseStream's [attach:...] token and clean_and_remux's attachmentKind font classification.
+    const FONT_EXTS = ['ttf', 'otf', 'ttc', 'otc', 'pfb', 'pfa', 'woff', 'woff2', 'eot'];
+    const isFontMime = (mime) => /font|truetype|opentype|sfnt/.test(mime);
+    // -=-=-= HDR_TRANSFERS  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The HDR transfer curves: ffmpeg's two HDR color_trc enums (smpte2084 = PQ, arib-std-b67 = HLG) plus the MediaInfo spellings (pq, hlg).
+    // The single source for every HDR-curve test: summariseStream's vHdr token below, and video_clean's isHdr / dvNoBaseLayer / tonemap-setparams gate.
+    const HDR_TRANSFERS = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'];
+    // -=-=-= summariseStream  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Per type: video codec + resolution/10bit/hdr (+/cover for cover-art/still images); data & attachment codec only. Audio & subtitle append /default, then their role markers.
+    // Audio role markers: /commentary|/description then /dub|/original. Subtitle: /forced then /commentary|/description|/sdh|/lyrics.
+    // /default and /forced read the REAL disposition flag only — a title keyword must not flip a selection flag (as forced already did).
     // The role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary lines up.
     // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Audio uses codecDisplayName so a DTS subtype
     // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all five.
@@ -361,8 +373,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const vHeight = Number(s.height || vmi?.Height || 0);
             const vTenbit = is10Bit(s, vmi);
             const vXfer = (s.color_transfer || vmi?.transfer_characteristics || '').toLowerCase().trim();
-            const vHdr = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'].includes(vXfer) || !!String(vmi?.HDR_Format || '').trim();
-            return `[video:${[codec, vHeight > 0 ? `${vHeight}p` : '', vTenbit ? '10bit' : '', vHdr ? 'hdr' : ''].filter(Boolean).join(' ')}${isCoverArt(s) ? '/cover' : ''}]`;
+            const vHdr = HDR_TRANSFERS.includes(vXfer) || !!String(vmi?.HDR_Format || '').trim();
+            // HDR sub-type marker, shown in place of 'hdr'. Dolby Vision is detected self-contained here (video_clean carries summariseStream but not
+            // isDolbyVisionVideo): a dvhe/dvh1/dvav/dva1/dav1 fourcc, a mediaInfo HDR_Format naming Dolby Vision, or a DOVI record - also surfacing
+            // Profile-5 DV whose non-standard transfer sets no hdr flag. HDR10+ is stream-visible only via mediaInfo (ffprobe carries 2094-40 per-frame, which
+            // Tdarr doesn't probe), so it degrades to plain 'hdr' when mediaInfo is absent.
+            const vHdrFmt = String(vmi?.HDR_Format || vmi?.HDR_Format_Compatibility || '').toLowerCase();
+            const vSide = Array.isArray(s.side_data_list) ? s.side_data_list : [];
+            const vDv = /^(dvhe|dvh1|dvav|dva1|dav1)$/.test((s.codec_tag_string || '').toLowerCase().trim()) || vHdrFmt.includes('dolby vision')
+                || vSide.some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
+            const vHdrTok = vDv ? 'dv' : (/2094-40|hdr10\+|hdr10 plus/.test(vHdrFmt) ? 'hdr10+' : (vHdr ? 'hdr' : ''));
+            const vParts = [codec, vHeight > 0 ? `${vHeight}p` : '', vTenbit ? '10bit' : '', vHdrTok].filter(Boolean).join(' ');
+            return `[video:${vParts}${isCoverArt(s) ? '/cover' : ''}]`;
         }
         if (type === 'audio') {
             const ch = s.channels ? `${s.channels}ch` : '';
@@ -378,22 +400,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return `[sub:${[lang, codec].filter(Boolean).join(' ')}${def}${forced}${role}]`;
         }
         if (type === 'attachment') {
-            // codec_name is frequently absent or 'none' on attachment streams (fonts especially), which would degrade an obviously-identifiable embedded font to
-            // [attach:unknown]. Fall back to the filename extension, then a font/image category from the mimetype - the same signals used to classify attachments.
+            // codec_name is often absent/'none' on attachments (fonts especially). Fall back to the filename extension, then the mimetype: fonts read 'font',
+            // everything else uses the mimetype SUBTYPE (image/png -> png, text/html -> html) so a removed attachment is legible by what it actually is.
             let label = codec;
             if (label === 'unknown' || label === 'none') {
                 const mime  = (s.tags?.mimetype || '').trim().toLowerCase();
                 const fname = (s.tags?.filename || '').trim().toLowerCase();
                 const ext   = fname.includes('.') ? fname.slice(fname.lastIndexOf('.') + 1) : '';
-                if (['ttf', 'otf', 'ttc', 'otc', 'pfb', 'pfa', 'woff', 'woff2', 'eot'].includes(ext)) label = ext;
-                else if (/font|truetype|opentype|sfnt/.test(mime)) label = 'font';
-                else if (mime.startsWith('image/')) label = 'image';
+                const sub   = mime.includes('/') ? mime.slice(mime.indexOf('/') + 1).replace(/^x-/, '') : '';
+                if (FONT_EXTS.includes(ext)) label = ext;
+                else if (isFontMime(mime)) label = 'font';
                 else if (ext) label = ext;
+                else if (sub) label = sub;
             }
             return `[attach:${label}]`;
         }
-        if (type === 'data')
-            return `[data:${codec}]`;
+        if (type === 'data') {
+            // Prefer a meaningful codec_name; when it's absent/generic, surface the mimetype SUBTYPE (text/html -> html) so a removed data stream is legible.
+            const dmime = (s.tags?.mimetype || '').trim().toLowerCase();
+            const dsub = dmime.includes('/') ? dmime.slice(dmime.indexOf('/') + 1).replace(/^x-/, '') : '';
+            return `[data:${(codec === 'unknown' || codec === 'none') && dsub ? dsub : codec}]`;
+        }
         return `[${type || 'unknown'}:${codec}]`;
     };
 
@@ -427,7 +454,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (idx) return idx;
             idx = {};
             const dn = new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' });
-            for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {
+            for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {   // 97-122 = ASCII a-z: every 2-letter combo
                 const code = String.fromCharCode(a, b);
                 const name = dn.of(code);
                 if (name) idx[name.toLowerCase()] = code;
@@ -446,6 +473,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         try { return String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase(); } catch (e) { return s; }
     };
     // ===== END SHARED: language matching =====
+
+    // ===== SHARED [clean_and_remux, audio_clean, sub_worker, stream_ordering]: dolby vision detection =====
+    // -=-=-= isDolbyVisionVideo  [clean_and_remux, audio_clean, sub_worker, stream_ordering] =-=-=-
+    // True when a video stream carries Dolby Vision, both-probe: a dvhe/dvh1/dvav/dva1/dav1 fourcc, a mediaInfo HDR_Format naming Dolby Vision, or an ffprobe DOVI configuration
+    // record / dolby-vision side_data. The four -c copy plugins use it to add `-strict unofficial` to an mp4/mov remux so ffmpeg's mov muxer keeps the dvcC/dvvC configuration
+    // boxes - a plain copy drops them, demoting DV to plain HEVC (verified on a real sample). Pass the stream's paired mediaInfo (mediaInfoFor(stream)); a single-probe false
+    // negative would silently lose the boxes. video_clean re-encodes DV via its own path, so it does not carry this helper.
+    const isDolbyVisionVideo = (ffstream, ffmedia) => /^(dvhe|dvh1|dvav|dva1|dav1)$/.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
+        || String(ffmedia?.HDR_Format || ffmedia?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
+        || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : []).some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
+    // ===== END SHARED: dolby vision detection =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker]: dolby vision strict mp4 arg =====
+    // -=-=-= dvStrictMp4Arg  [audio_clean, stream_ordering, sub_worker] =-=-=-
+    // The ' -strict unofficial' an mp4/mov -c copy needs so ffmpeg's mov muxer keeps a Dolby Vision stream's dvcC/dvvC boxes; a plain copy drops them,
+    // demoting DV to plain HEVC/AV1 (verified on real HEVC + AV1 DV samples). Finds the DV video stream DIRECTLY - isDolbyVisionVideo, cover art excluded -
+    // so a leading cover-art stream can't mask it (not just the first video stream); HEVC-DV and AV1-DV both qualify. Pass the RAW file.ffProbeData.streams:
+    // codec_tag_string / side_data_list (the DV signals) live only there. clean_and_remux does the equivalent per-stream in its own loop.
+    const dvStrictMp4Arg = (container, streams) => {
+        if (!isMp4Family(container)) return '';
+        const list = Array.isArray(streams) ? streams : [];
+        const hasDv = list.some((s) => (s.codec_type || '').toLowerCase() === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s)));
+        return hasDv ? ' -strict unofficial' : '';
+    };
+    // ===== END SHARED: dolby vision strict mp4 arg =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
     // -=-=-= escMeta  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -523,21 +574,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The import marker's VALUE carries the sidecar basenames muxed in the most-recent pass, encoded to [A-Za-z0-9%]
     // (nothing escMeta touches, no comma) and comma-joined - a GLOBAL tag value survives every container (incl. mp4,
     // which drops per-stream title/default), so pass 2 deletes exactly what pass 1 embedded without re-reading metadata.
-    const encMarker = (s) => Array.from(Buffer.from(String(s), 'utf8')).map((b) => (/[A-Za-z0-9]/.test(String.fromCharCode(b)) ? String.fromCharCode(b) : `%${b.toString(16).toUpperCase().padStart(2, '0')}`)).join('');
-    const decMarker = (s) => { const b = []; for (let i = 0; i < s.length; i += 1) { if (s[i] === '%') { b.push(parseInt(s.slice(i + 1, i + 3), 16)); i += 2; } else b.push(s.charCodeAt(i)); } return Buffer.from(b).toString('utf8'); };
-    const encodeMarkerList = (names) => names.map(encMarker).join(',');
-    const decodeMarkerList = (v) => String(v || '').split(',').filter(Boolean).map(decMarker);
+    const encodeMarker = (s) => Array.from(Buffer.from(String(s), 'utf8')).map((b) => (/[A-Za-z0-9]/.test(String.fromCharCode(b)) ? String.fromCharCode(b) : `%${b.toString(16).toUpperCase().padStart(2, '0')}`)).join('');
+    const decodeMarker = (s) => { const b = []; for (let i = 0; i < s.length; i += 1) { if (s[i] === '%') { b.push(parseInt(s.slice(i + 1, i + 3), 16)); i += 2; } else b.push(s.charCodeAt(i)); } return Buffer.from(b).toString('utf8'); };
+    const encodeMarkerList = (names) => names.map(encodeMarker).join(',');
+    const decodeMarkerList = (v) => String(v || '').split(',').filter(Boolean).map(decodeMarker);
     // Keep the sidecar basename under the filesystem's 255-byte cap; if the encoded title pushes it over, trim the
     // RAW title (whole chars, so UTF-8 stays valid) until it fits and flag the lossy truncation.
     let titleTruncated = false;
+    const NAME_BYTE_CAP = 255;   // filesystem basename byte limit (ext4/APFS/NTFS) the encoded sidecar name must fit under
     const encodeTitleCapped = (rawTitle, fixedLen) => {
         let raw = String(rawTitle);
         // Bound the work: the name budget is 255 bytes and encodeTitle emits >= 1 byte per raw char, so any raw title longer
         // than 255 chars can never fit - trimming it up front makes the fit loop O(cap) instead of O(N^2) on a crafted multi-KB
         // title (untrusted container metadata), losing only chars the loop would trim anyway (output identical, still flagged).
-        if (raw.length > 255) { raw = raw.slice(0, 255); titleTruncated = true; }
+        if (raw.length > NAME_BYTE_CAP) { raw = raw.slice(0, NAME_BYTE_CAP); titleTruncated = true; }
         let enc = encodeTitle(raw);
-        while (raw.length > 0 && Buffer.byteLength(`${enc}${'.'.repeat(fixedLen ? 1 : 0)}`, 'utf8') + fixedLen > 255) { raw = raw.slice(0, -1); enc = encodeTitle(raw); titleTruncated = true; }
+        while (raw.length > 0 && Buffer.byteLength(`${enc}${'.'.repeat(fixedLen ? 1 : 0)}`, 'utf8') + fixedLen > NAME_BYTE_CAP) { raw = raw.slice(0, -1); enc = encodeTitle(raw); titleTruncated = true; }
         return enc;
     };
 
@@ -549,11 +601,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // quote and inject ffmpeg args (lang/disp/ext are separately safe). We create these files, so sanitising is safe; parseSidecar reads the sanitised name back unchanged.
     const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '');
 
-    // Recognize a filename token as a real language (2/3-letter ISO code or English name) so a Plex-native sidecar can be anchored on it without
-    // mis-reading an arbitrary token as a language. Normalizes via the shared langKey, then confirms it names a real language (Intl.DisplayNames
-    // with fallback:'none' returns undefined for non-languages). The DisplayNames instance is built once, on first use.
-    const langDisplay = (() => { let dn = null; return () => (dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' })); })();
-    const isKnownLang = (token) => { const k = langKey(token); if (!k) return false; try { return !!langDisplay().of(k); } catch (e) { return false; } };
+    // ===== SHARED [clean_and_remux, sub_worker]: language display name =====
+    // -=-=-= langDisplayName  [clean_and_remux, sub_worker] =-=-=-
+    // Memoised ICU DisplayNames (built once, reused): the recognised English name for an ALREADY-normalised language code, or '' for a non-language/unrecognised code. A
+    // fresh ICU instance per call is wasteful. Each caller normalises the token first - clean_and_remux via shortLang (tag recognition), sub_worker via langKey (sidecar).
+    const langDisplayName = (() => {
+        let dn = null;
+        return (code) => { try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(code) || ''; } catch (e) { return ''; } };
+    })();
+    // ===== END SHARED: language display name =====
+    // Recognise a filename token as a real language (2/3-letter ISO code or English name) so a Plex-native sidecar can be anchored on it without mis-reading an arbitrary token
+    // as a language. Normalises via the shared langKey, then confirms it names a real language through langDisplayName (which returns '' for a non-language/unrecognised code).
+    const isKnownLang = (token) => { const k = langKey(token); if (!k) return false; return !!langDisplayName(k); };
 
     // ===== SHARED [clean_and_remux, sub_worker]: iso639-1 to iso639-2 map =====
     // -=-=-= ISO639_1_TO_2  [clean_and_remux, sub_worker] =-=-=-
@@ -586,7 +645,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // lang is the only metadata-derived filename component read raw (title is percent-encoded via encodeTitle, disp/ext are fixed enums), so restrict
         // it to the language-code charset: a crafted container tag must not inject path separators/.. (traversal outside libDir) or a " that breaks out of
         // the quoted "${full}" in the extract preset. parseSidecar round-trips unchanged - valid codes (en/eng/pt-br) are already within [a-z0-9-].
-        const lang = (resolveLang(s) || 'und').replace(/[^a-z0-9-]/g, '') || 'und';
+        const langRaw = (resolveLang(s) || 'und').replace(/[^a-z0-9-]/g, '') || 'und';
+        // A tag that sanitises to a disposition-token word (a crafted tags.language of "forced"/"sdh"/etc.) would be consumed as a trailing disposition by
+        // parseSidecar's right-to-left disp strip, nulling or corrupting the reimport - collapse any such collision to 'und' so the fixed language slot can
+        // never be shaped like a disposition token.
+        const lang = DISP_TOKENS.has(langRaw) ? 'und' : langRaw;
         const disp = dispTokensOf(s);
         const { ext } = TEXT_SUB[String(s.codec_name).toLowerCase()];
         const rawTitle = s.tags?.title || '';
@@ -629,7 +692,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { codec_type: 'subtitle', codec_name: codec, index: -1, tags: { language: f.lang, title: f.title }, disposition };
     };
 
-    // ---- guards + input validation (before the try, per the suite's failFile convention) ----
+    // ============= guards + input validation (before the try, per the suite's failFile convention) =============
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams)) failFile('No ffProbe stream data available, cannot process this file');
     const mode = String(inputs.mode);
     if (mode !== 'extract' && mode !== 'import') failFile(`[mode=${mode}] invalid value, check your settings`);
@@ -644,6 +707,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const dedupeMode = String(inputs.method_deduplicate);
     const dstContainer = String(file.container || '').toLowerCase().trim();
     const isMp4 = isMp4Family(dstContainer);   // shared checker; cached once for this container
+    // Preserve Dolby Vision's dvcC/dvvC boxes on either -c copy remux below (see dvStrictMp4Arg) - a plain copy of a DV HEVC/AV1 stream drops them,
+    // demoting DV to plain HEVC/AV1.
+    const dvStrictArg = dvStrictMp4Arg(dstContainer, streams);
+    // Finalize a built output-side arg string into response.preset: append the DV strict flag, then (mp4 only) -movflags use_metadata_tags so a -c copy keeps
+    // sibling plugins' global awk_* tags (awk_video/awk_recovered), then the universal output options. Shared by the extract and import branches so their tails can't drift.
+    const finishPreset = (out) => {
+        let full = out + dvStrictArg;
+        if (isMp4) full += ' -movflags use_metadata_tags';
+        full += globalOutputOpt;
+        response.preset = `,${full}`;
+        response.processFile = true;
+    };
 
     try {
         response.infoLog += `☐Input streams: ${streams.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
@@ -672,10 +747,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let out = `${sidecarOut} -map 0`;
             for (const idx of removeIdx) out += ` -map -0:${idx}`;
             out += ' -c copy';
-            if (isMp4) out += ' -movflags use_metadata_tags';   // mp4 -c copy drops sibling plugins' global tags (awk_video/awk_recovered) without this - mirror the import branch
-            out += globalOutputOpt;
-            response.preset = `,${out}`;
-            response.processFile = true;
+            finishPreset(out);
             const survivors = streams.filter((s) => !removeIdx.includes(s.index));
             response.infoLog += `☑Expected results: ${survivors.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
             return response;
@@ -701,9 +773,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const deleteConfirmed = removeSidecarAfterImport || dedupeMode === 'enabled_delete';
         // Which toggle triggered the delete, for the log tag: remove_sidecar_after_import is the direct "delete after import"; otherwise it is method_deduplicate=enabled_delete.
         const delReason = removeSidecarAfterImport ? 'remove_sidecar_after_import=true' : 'method_deduplicate=enabled_delete';
+        // Confirm each marker-listed sidecar against the CURRENT file's streams before unlinking it: only delete when an embedded subtitle stream matches its language +
+        // title (the identity our own import writes). On an mp4/mov target the container DROPS per-stream subtitle titles on the -c copy mux, so a re-probe can't see the
+        // title - there we confirm on LANGUAGE alone (else a titled sidecar we DID embed never matches its now-title-less stream, so its cleanup silently never runs). A
+        // forged awk_sub_worker marker - a file that arrived already tagged but was never muxed by us - can otherwise make enabled_delete / remove_sidecar_after_import
+        // unlink on-disk sidecars never embedded; the marker VALUE (basenames we listed this/last pass) still scopes deletion, so the forged-marker guard holds on mp4 too.
+        // A false negative merely keeps the sidecar (a later pass, or the user, removes it) - it never re-adds or loses subtitle content - so this fails safe.
+        const embeddedSubs = streams.filter((s) => (s.codec_type || '').toLowerCase() === 'subtitle');
+        const markerConfirmsEmbedded = (f) => embeddedSubs.some((s) =>
+            langKey(resolveLang(s) || 'und') === langKey(f.lang || 'und') && (isMp4 || (s.tags?.title || '') === (f.title || '')));
         let deleted = 0;
         if (deleteConfirmed) {
             for (const f of found.filter((x) => importedSet.has(x.name))) {
+                if (!markerConfirmsEmbedded(f)) {
+                    response.infoLog += `☒[${delReason}] Marker lists ${f.name} but no embedded subtitle matches its language/title - not deleting (unverified)\n`;
+                    continue;
+                }
                 try { fs.unlinkSync(path.join(libDir, f.name)); deleted += 1; response.infoLog += `☑[${delReason}] Deleted sidecar (embedded): ${f.name}\n`; }
                 catch (e) { response.infoLog += `☒[${delReason}] Could not delete sidecar ${f.name}: ${e && e.message ? e.message : e}\n`; }
             }
@@ -712,7 +797,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Import is NON-DESTRUCTIVE: every recognized sidecar not already handled by our own prior pass (marker) is muxed in. We do NOT suppress a
         // sidecar just because an embedded sub shares its lang|title|disposition - metadata can't prove same content, and dropping a distinct track is
         // data loss, whereas a redundant duplicate is not. Genuine duplication is collapsed by CONTENT instead (method_deduplicate, below).
-        const existingSubCount = streams.filter((s) => (s.codec_type || '').toLowerCase() === 'subtitle').length;
+        const existingSubCount = embeddedSubs.length;   // same subtitle-stream filter already computed above (streams is unchanged since)
         // The import muxes each sidecar as -i "${libDir}/${name}"; a " or control char in that real on-disk path would close the quote and inject ffmpeg args, and unlike a
         // name we generate it must match the file byte-for-byte, so it can't be sanitised - skip it instead (a Plex-native/user file we can't safely reference), never break out.
         const candidates = found.filter((f) => !importedSet.has(f.name)).filter((f) => {
@@ -761,10 +846,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const priorStillPresent = deleteConfirmed ? [] : found.filter((f) => importedSet.has(f.name)).map((f) => f.name);
             const markList = [...new Set([...consumed, ...priorStillPresent])];
             let out = `${inputSide} -map 0${extraMaps} -c copy${meta} -metadata "awk_sub_worker=${encodeMarkerList(markList)}"`;
-            if (isMp4) out += ' -movflags use_metadata_tags';
-            out += globalOutputOpt;
-            response.preset = `,${out}`;
-            response.processFile = true;
+            finishPreset(out);
             response.reQueueAfter = deleteConfirmed;   // re-run only to delete the now-embedded sidecars
             const expected = streams.concat(merged.map(sidecarToStream));
             response.infoLog += `☑Expected results: ${expected.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
@@ -776,7 +858,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     } catch (err) {
         failUnexpected(err);
     }
-    return response;
 };
 
 module.exports.details = details;
