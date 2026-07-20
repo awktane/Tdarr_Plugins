@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '3.999.18',
+    Version: '3.999.19',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1639,11 +1639,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         workStreams.sort((a, b) => {
             // language priority: the languages the user most wants (language_surround), in the order they listed them. isTdarrCleanLang is the normalised key
             // and langSurroundKeys the normalised user list, so en/eng/english all rank together. A stereo-tier or unlisted language ranks last.
+            // The unlisted sentinel is the list LENGTH (past every real 0..length-1 index), so it can't collide with a real index on a huge free-text list -
+            // matching stream_ordering's getLangRank.
             const aLang = langSurroundKeys.indexOf(a.isTdarrCleanLang);
             const bLang = langSurroundKeys.indexOf(b.isTdarrCleanLang);
 
-            const aRank = aLang === -1 ? 999 : aLang;
-            const bRank = bLang === -1 ? 999 : bLang;
+            const aRank = aLang === -1 ? langSurroundKeys.length : aLang;
+            const bRank = bLang === -1 ? langSurroundKeys.length : bLang;
             if (aRank !== bRank) return aRank - bRank;
 
             // a full-quality genuine track outranks anything demoted to stereo or any secondary (commentary/descriptive/M&E) track
