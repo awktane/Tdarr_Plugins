@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '4.0.1',
+    Version: '4.0.2',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1148,12 +1148,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Factored per-stream metadata emitter (a per-iteration closure over this stream's ffstream/i/metadataCommand): the handler_name canonicalisation (mkv wipes it - it
             // can confuse mkv title display; mp4 sets the per-type handler) is common to the subtitle/audio/video branches. Branch-specific bits (title tagging, hvc1,
             // busy-title, comment removal) stay inline; wipeReason carries video's extra "problems for titles in mkv" note so the log stays byte-identical.
+            // Read the handler case-insensitively (getTagCI): matroska UPPER-CASES it to HANDLER_NAME, which mediaInfo surfaces as the Title - miss it and
+            // the busy handler survives to re-trigger remove_busytitle every pass (an infinite loop). ffmpeg matches -metadata keys case-insensitively, so
+            // the lowercase "handler_name=" wipe still clears the uppercase tag.
             const emitHandlerMeta = (typeLetter, idx, typeWord, handlerName, wipeReason = '') => {
-                if (dstContainer === 'mkv' && ffstream.tags?.handler_name) {
-                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Wiping handler_name tag${wipeReason} (${typeWord}) "${logSafe(ffstream.tags?.handler_name)}"\n`;
+                const curHandler = getTagCI(ffstream.tags, 'handler_name');
+                if (dstContainer === 'mkv' && curHandler) {
+                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Wiping handler_name tag${wipeReason} (${typeWord}) "${logSafe(curHandler)}"\n`;
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "handler_name="`;
-                } else if (dstContainer === 'mp4' && ffstream.tags?.handler_name !== handlerName) {
-                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Setting handler_name tag (${typeWord}) to ${handlerName} "${logSafe(ffstream.tags?.handler_name)}"\n`;
+                } else if (dstContainer === 'mp4' && curHandler !== handlerName) {
+                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Setting handler_name tag (${typeWord}) to ${handlerName} "${logSafe(curHandler)}"\n`;
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "handler_name=${handlerName}"`;
                 }
             };
