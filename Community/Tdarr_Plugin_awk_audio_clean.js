@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '4.0.0',
+    Version: '4.1.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -815,7 +815,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : '');
             const prov = hasDisposition(s, 'dub') ? '/dub' : (hasDisposition(s, 'original') ? '/original' : '');
-            return `[audio:${[lang, ch, codecDisplayName(s), rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
+            // Dolby Surround EX marker (a rear channel matrix-folded into a 5.1 AC-3), read inline from mediaInfo Format_Settings_Mode - the flag's only home
+            // (this shared helper can't call audio_clean's local isMatrixSurroundSource). Marks the EX copy so its token differs from a plain 5.1 twin.
+            const surEx = /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '') ? 'dd-ex' : '';
+            return `[audio:${[lang, ch, surEx, codecDisplayName(s), rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
         }
         if (type === 'subtitle') {
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : (isSdh(s) ? '/sdh' : (isLyrics(s) ? '/lyrics' : '')));
@@ -1227,6 +1230,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // independent third guard) and used as a dedup tie-breaker so an object-audio track is preferred over an otherwise-equal plain one.
     const isObjectAudioSource = (stream) => codecInfo[resolveCodecName(stream)]?.objectAudio === true;
 
+    // Resolve whether a source stream is Dolby Surround EX - a rear-surround (6.1) channel matrix-encoded into a normal 5.1 AC-3/E-AC-3, so it carries strictly
+    // MORE than a plain 5.1 twin while still decoding as ordinary 5.1 on a non-EX decoder. Read only from mediaInfo's Format_Settings_Mode (ffprobe doesn't expose
+    // the flag). Stored per-stream as isTdarrMatrixSurround and used ONLY as a dedup tie-breaker (mirrors the object-audio one): on an otherwise-exact quality tie
+    // the EX copy is kept over a plain 5.1 twin, so the richer track survives regardless of source order. Not object audio (ffmpeg re-encodes the AC-3 fine), so no guard.
+    const isMatrixSurroundSource = (stream) => /surround ex/i.test(mediaInfoFor(stream)?.Format_Settings_Mode || '');
+
     // Parse + validate inputs. Order here mirrors the Inputs array in details() so the two never drift. Only type:'string' dropdowns are validated here -
     // the two free-text inputs (language_surround, language_stereo) have no fixed option set, and there are no type:'boolean' inputs. Every checked value
     // fails the file on an out-of-set value.
@@ -1361,7 +1370,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // comparable quantity for a perceptual encode and would otherwise pin the output at the codec ceiling for no audible gain.
                 isTdarrLossless: isLosslessSource(stream),
                 // True when the source carries Atmos/DTS:X/MPEG-H object audio ffmpeg can't re-encode - read by guard_object_audio and the dedup tie-break.
-                isTdarrObjectAudio: isObjectAudioSource(stream)
+                isTdarrObjectAudio: isObjectAudioSource(stream),
+                // True when the source is a Dolby Surround EX (matrix-6.1) AC-3 - read only by the dedup tie-break, to keep the EX copy over a plain 5.1 twin.
+                isTdarrMatrixSurround: isMatrixSurroundSource(stream)
             };
         });
 
@@ -1453,11 +1464,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const trustedRate = (s) => hasKnownRate(s) || s.isTdarrLossless;
             // On a quality tie, keep the higher channel count before falling back to index, so multi-stereo dedup collapsing a language's surround variants keeps
             // the 7.1 over a same-quality 5.1 (channel mode already tiers by exact count, so this only bites the broad modes). When channels also tie, prefer an
-            // object-audio (Atmos/DTS:X) track over an otherwise-equal plain one so dedup keeps the copy with the object layer (the codecInfo score bump usually
-            // separates them before this fires; the tie-break only matters when their scores land exactly equal).
+            // object-audio (Atmos/DTS:X) track over an otherwise-equal plain one so dedup keeps the copy with the object layer. Then a Dolby Surround EX
+            // (matrix-6.1) track is kept over a plain 5.1 twin for the same reason: the EX copy carries an extra matrixed rear channel a non-EX decoder folds
+            // harmlessly, so keeping it is never worse. Both bumps usually get separated by the score/bitrate first; the tie-breaks only matter when
+            // everything above them lands exactly equal.
             const byQuality = [...audioStreams].sort((a, b) =>
                 (trustedRate(b) ? 1 : 0) - (trustedRate(a) ? 1 : 0) || b.isTdarrQuality - a.isTdarrQuality || b.channels - a.channels
-                || (b.isTdarrObjectAudio ? 1 : 0) - (a.isTdarrObjectAudio ? 1 : 0) || a.index - b.index);
+                || (b.isTdarrObjectAudio ? 1 : 0) - (a.isTdarrObjectAudio ? 1 : 0)
+                || (b.isTdarrMatrixSurround ? 1 : 0) - (a.isTdarrMatrixSurround ? 1 : 0) || a.index - b.index);
             for (const s of byQuality) {
                 // Commentary/descriptive (secondary) tracks are never deduplicated: two different commentaries (e.g. cast & crew vs directors, often BOTH
                 // just titled "Commentary") are distinct content the grouping can't tell apart, so keep every one; only MAIN tracks are deduplicated.
