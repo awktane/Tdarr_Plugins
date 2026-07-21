@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '4.0.0',
+    Version: '4.0.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1220,12 +1220,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
 
                 if (!delStream) {
-                    // Fill a blank language and/or standardise the tag (tag_language) before deciding whether to remove it.
-                    {
-                        const lm = canonicalLangMeta('s', subtitleStreamIndex, ffstream, 'subtitle', true);
-                        workLang = lm.workLang;
-                        if (lm.meta) { workDone += lm.log; metadataCommand += lm.meta; }
-                    }
+                    // Decide removal BEFORE standardising the tag, so a subtitle dropped by language_sub / remove_sub_sdh never logs a language
+                    // correction it won't keep. workLang here equals canonicalLangMeta's own workLang (same fillApplies rule), so the keep/drop
+                    // decision is unchanged - the tag write is just skipped for a stream about to be mapped out.
+                    workLang = resolveWorkLang(ffstream);
 
                     //If the subtitle is a language that should be removed then remove it regardless of other settings.
                     if(subLanguage.length > 0 && !langListMatch(workLang, subLangKeys)) {
@@ -1234,6 +1232,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     } else if (removeSubSdh === 'enabled' && isSdh(ffstream) && hasPlainSameLang(plainSubLangs, workLang)) {
                         workDone += `☐${streamTag(ffstream.index)}[remove_sub_sdh=${removeSubSdh}] Remove accessibility subtitle SDH/CC (${logSafe(roleTextLower(ffstream))})\n`;
                         delStream = true;
+                    }
+
+                    // Kept subtitle: fill a blank language and/or standardise the tag (tag_language) now that we know it survives.
+                    if (!delStream) {
+                        const lm = canonicalLangMeta('s', subtitleStreamIndex, ffstream, 'subtitle', true);
+                        if (lm.meta) { workDone += lm.log; metadataCommand += lm.meta; }
                     }
                 }
 
