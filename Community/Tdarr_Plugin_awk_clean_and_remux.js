@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '4.1.0',
+    Version: '4.1.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -157,6 +157,7 @@ const details = () => ({
                 \\nunsupported (default): keep them where the container carries them (mkv), drop them only where it can't (mp4 can't store these).
                 \\nall: remove all image-based subtitles from any container (use when you only want text subtitles).
                 \\nexport: save each image subtitle to a hidden sidecar next to the video (PGS -> ".<name>.<lang>.sup", VobSub/DVB -> ".<name>.<lang>.mks") and then remove it. The leading dot keeps Plex/Jellyfin from indexing it; run an external OCR tool on the sidecars to produce .srt, then reimport with awk_sub_worker. One-way - these are never reimported by this plugin.
+                \\nEmby caveat: Emby does NOT skip dot-prefixed files, so an exported .mks may surface as a stray library item (it ignores .sup outright). On Emby, add a .embyignore file (4.9+) listing ".*" in the library root, or OCR and delete the sidecars before the next scan.
                 \\nText subtitles are never affected. xsub is always removed (no Matroska CodecID) and is not exported.`,
         },
         {
@@ -883,7 +884,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // beyond subFormatDropped, used by subDroppedAnyReason for the language_fill tally + accessibility plain-track guard.
     const imageSubDropped = (codec) => isImageSub(codec) && (removeImageSubs === 'all' || removeImageSubs === 'export');
     // Hidden dot-prefixed sidecar name for an exported image subtitle: ".<video>.s<index>.<lang>[.forced].<ext>". The leading dot makes Plex/Jellyfin ignore it (Jellyfin
-    // skips **/.* ; Plex ignores .sup/.mks by extension). Both metadata-derived name parts are made safe for the quoted "${path}" in the export preset: lang is restricted
+    // skips **/.* ; Plex ignores .sup/.mks by extension). Emby is the exception - it scans dot-prefixed files, so an exported .mks needs a .embyignore entry there
+    // (called out in the remove_imagesubs tooltip). Both metadata-derived name parts are made safe for the quoted "${path}" in the export preset: lang is restricted
     // to the language-code charset, and imageBase (the source basename) has any " / control char stripped so a crafted video filename can't close the quote and inject args.
     const path = require('path');
     const libFile = otherArguments?.originalLibraryFile?.file || file.file;

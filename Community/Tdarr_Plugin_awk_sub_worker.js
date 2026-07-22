@@ -4,15 +4,16 @@ const details = () => ({
     Name: 'Subtitle sidecar worker - extract embedded text subs to sidecars and reimport them',
     Type: 'Video',
     Operation: 'Transcode',
-    Description: `Round-trips text subtitles between the container and Plex-style sidecar files so they can be reviewed/edited on disk.
+    Description: `Round-trips text subtitles between the container and media-server-style sidecar files so they can be reviewed/edited on disk (by hand or an external script).
 
                 \\nmode=extract writes each embedded TEXT subtitle to a sidecar next to the video (native format: srt/ass/vtt) and, by default, removes those tracks from the file.
                 \\nmode=import muxes matching sidecars back into the file (restoring language, title, and disposition) and, by default, deletes the sidecar once it is safely embedded. Import never drops a subtitle - anything not already embedded is muxed in (a copy already present just becomes a duplicate, never a loss); method_deduplicate collapses byte-identical copies.
-                \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|cc|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex auto-detects them. Import ALSO recognizes fresh Plex-native sidecars with no s<index> (e.g. <video>.en.forced.srt), anchoring on the language token.
+                \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex/Jellyfin/Emby auto-detect them.
+                \\nImport ALSO recognizes sidecars named the way those servers do, with no s<index> (e.g. <video>.en.forced.srt), anchored on the language token: the flag spellings foreign (= forced), cc and hi (= sdh) and default (ignored) are all understood, as is Emby's parenthesized description (<video>.English(Commentary).srt), which becomes the track title. hi is only read as hearing-impaired when a real language precedes it, so <video>.hi.srt stays Hindi.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all) and skip_commentary (omit commentary tracks). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled/enabled_delete modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.1.0',
+    Version: '3.2.0',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -544,12 +545,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         { token: 'commentary',  ff: 'comment',          flags: ['comment'] },
         { token: 'descriptive', ff: 'descriptions',     flags: ['descriptions'] },
     ];
-    // Legacy/Plex filename tokens that normalise onto a canonical token above (parse-only; extract never writes them):
-    // 'cc' is the closed-captions spelling of SDH, so an existing <name>.cc.srt still imports (restored as portable hearing_impaired).
-    const DISP_ALIAS = { cc: 'sdh' };
+    // Media-server filename tokens that normalise onto a canonical token above (parse-only; extract never writes them), so a sidecar named by
+    // Plex/Jellyfin/Emby - or by hand from their docs - still imports with its role intact instead of being read as the language and skipped:
+    // 'cc' and 'hi' are the closed-captions/hearing-impaired spellings of SDH, 'foreign' is Jellyfin's and Emby's spelling of forced.
+    const DISP_ALIAS = { cc: 'sdh', hi: 'sdh', foreign: 'forced' };
     // Parse-only tokens recognised so they aren't mis-read as the language, but carrying NO disposition: 'default' is muxer-managed, not a role we track or restore.
     const DISP_IGNORE = new Set(['default']);
     const DISP_TOKENS = new Set([...DISPOSITIONS.map((d) => d.token), ...Object.keys(DISP_ALIAS), ...DISP_IGNORE]);
+    // Alias tokens that are ALSO a real ISO 639-1 code, so the right-to-left disposition strip must not swallow the language slot: 'hi' is both the
+    // hearing-impaired flag and Hindi. Such a token counts as a disposition only when a real language sits immediately before it (Jellyfin's own rule),
+    // so <name>.en.hi.srt is English+SDH while <name>.hi.srt stays a Hindi track. See the guard in parseSidecar's disposition loop.
+    const DISP_AMBIGUOUS_LANG = new Set(['hi']);
     const dispFfOf = (token) => (DISPOSITIONS.find((d) => d.token === token) || {}).ff;
     // extract: one canonical token per role the stream's real flags carry (sdh covers hearing_impaired OR captions), deduped.
     const dispTokensOf = (s) => DISPOSITIONS.filter((d) => d.flags.some((f) => s.disposition?.[f] === 1)).map((d) => d.token);
@@ -613,7 +619,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return (code) => { try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(code) || ''; } catch (e) { return ''; } };
     })();
     // ===== END SHARED: language display name =====
-    // Recognise a filename token as a real language (2/3-letter ISO code or English name) so a Plex-native sidecar can be anchored on it without mis-reading an arbitrary token
+    // Recognise a filename token as a real language (2/3-letter ISO code or English name) so a server-native sidecar can be anchored on it without mis-reading an arbitrary token
     // as a language. Normalises via the shared langKey, then confirms it names a real language through langDisplayName (which returns '' for a non-language/unrecognised code).
     const isKnownLang = (token) => { const k = langKey(token); if (!k) return false; return !!langDisplayName(k); };
 
@@ -639,11 +645,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: iso639-1 to iso639-2 map =====
     // Normalise a sidecar language token to a lowercase 3-letter ISO 639-2/T code for an mp4-family import target (mdhd silently drops 2-letter/spelled codes). langKey folds
     // spelled names and 639-2/B onto the 2-letter key, which ISO639_1_TO_2 maps to /T; an already-3-letter code (eng, fil, und) or an unmappable token is left as-is. Mirrors
-    // clean_and_remux's toCanonicalTag three(false); mkv keeps the raw token (it accepts any recognised form).
+    // clean_and_remux's toCanonicalTag three(false); mkv keeps the raw token where it is already a code (see normSidecarLang).
     const to6392T = (lang) => { const key = langKey(lang); if (!key || key.length !== 2) return lang; return ISO639_1_TO_2[key] || lang; };
+    // Plex/Jellyfin/Emby all accept a spelled-out language NAME in a sidecar name (Movie.English.srt), which isKnownLang recognises - but the name itself is not a valid
+    // container language tag, so writing it through would stamp "language=English" into the mkv. Fold any non-code token to its 3-letter code; a token already shaped like
+    // a code is passed through untouched so a region tag (pt-BR) survives, which is the whole point of keeping the raw token on the mkv path.
+    const LANG_CODE_SHAPE = /^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?$/;
+    const normSidecarLang = (lang) => (LANG_CODE_SHAPE.test(String(lang)) ? lang : to6392T(lang));
 
     // sidecarBasename <-> parseSidecar are exact inverses. Name = <videoBase>.s<index>[.<encTitle>].<lang>[.<disp...>].<ext>. parseSidecar ALSO
-    // accepts a Plex-native name with no s<index> (e.g. <videoBase>.en.forced.srt), anchored on a recognized <lang> token.
+    // accepts a server-native name with no s<index> (e.g. <videoBase>.en.forced.srt), anchored on a recognized <lang> token.
     const sidecarBasename = (s) => {
         // lang is the only metadata-derived filename component read raw (title is percent-encoded via encodeTitle, disp/ext are fixed enums), so restrict
         // it to the language-code charset: a crafted container tag must not inject path separators/.. (traversal outside libDir) or a " that breaks out of
@@ -667,23 +678,34 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const mid = name.slice(videoBase.length + 1, name.length - extMatch[0].length);
         const toks = mid.split('.');
         if (!toks.length) return null;
-        // Our own sidecars lead with an s<index> order marker; a fresh Plex-native sidecar (Movie.en.forced.srt) has none. Consume the marker if
+        // Our own sidecars lead with an s<index> order marker; a fresh server-native sidecar (Movie.en.forced.srt) has none. Consume the marker if
         // present (index only keeps our names unique); otherwise index is null and the language token below MUST be a recognized language, so an
         // unrelated .srt (Movie.backup.srt) is not mis-read as lang="backup" and imported as junk.
         const ours = /^s\d+$/.test(toks[0]);
         const index = ours ? parseInt(toks.shift().slice(1), 10) : null;
+        // Trailing dispositions, right-to-left. A DISP_AMBIGUOUS_LANG token only counts as a disposition when the token it would expose is itself a real
+        // language, so Movie.en.hi.srt reads as English+SDH while Movie.hi.srt - and our own Movie.s3.Title.hi.srt - keeps Hindi as its language.
         const rawDisp = [];
-        while (toks.length && DISP_TOKENS.has(toks[toks.length - 1])) rawDisp.unshift(toks.pop());  // trailing dispositions, right-to-left
-        const dispTokens = [...new Set(rawDisp.filter((t) => !DISP_IGNORE.has(t)).map((t) => DISP_ALIAS[t] || t))];   // drop ignored (default), normalise legacy (cc->sdh), dedupe
+        while (toks.length && DISP_TOKENS.has(toks[toks.length - 1])) {
+            if (DISP_AMBIGUOUS_LANG.has(toks[toks.length - 1]) && !isKnownLang(toks[toks.length - 2] || '')) break;
+            rawDisp.unshift(toks.pop());
+        }
+        const dispTokens = [...new Set(rawDisp.filter((t) => !DISP_IGNORE.has(t)).map((t) => DISP_ALIAS[t] || t))];   // drop ignored (default), normalise aliases (cc/hi->sdh, foreign->forced), dedupe
         if (!toks.length) return null;
-        const lang = toks.pop();                                          // language is the next-from-right token
+        let lang = toks.pop();                                            // language is the next-from-right token
         if (!lang) return null;
-        if (!ours && !isKnownLang(lang)) return null;                     // Plex-native has no s<index> anchor, so its language token must be real
-        // A real Plex sidecar names the FULL video basename then lang[.disp] - it never carries a title token. So for a non-ours name any residual token is actually the tail
+        // Emby distinguishes same-language extras by appending a parenthesised description to the language token (Home Alone.English(Commentary).srt) rather
+        // than by a flag. Split it so the language is still recognised and the description becomes the track title - only when the bare prefix really is a
+        // language, so an ordinary bracketed token is still rejected below. Our own names can't reach here: sidecarBasename restricts lang to [a-z0-9-].
+        let parenTitle = '';
+        const parenMatch = !isKnownLang(lang) && lang.match(/^([^()]+)\(([^()]+)\)$/);
+        if (parenMatch && isKnownLang(parenMatch[1])) { [, lang, parenTitle] = parenMatch; }
+        if (!ours && !isKnownLang(lang)) return null;                     // server-native has no s<index> anchor, so its language token must be real
+        // A real server-native sidecar names the FULL video basename then lang[.disp] - it never carries a title token. So for a non-ours name any residual token is actually the tail
         // of a LONGER sibling video's basename (Avatar.Extended.en.srt vs Avatar.mkv): reject it, or the shorter video would mux the sibling's subtitle. Our s<index> names keep their title.
         if (!ours && toks.length) return null;
         if (toks.length > 1) return null;                                // 0 or 1 residual token = the encoded title (our own s<index> sidecars only)
-        const title = toks.length ? decodeTitle(toks[0]) : '';
+        const title = toks.length ? decodeTitle(toks[0]) : parenTitle;
         return { name, index, lang, title, ext: extMatch[1].toLowerCase(), dispTokens, disp: [...new Set(dispTokens.map(dispFfOf).filter(Boolean))] };
     };
 
@@ -767,7 +789,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const found = entries.map(parseSidecar).filter(Boolean)
             .filter((f) => !(langFilter && !langFilter.has(langKey(f.lang))))
             // Match extract's isCommentary (flag OR title keyword): a sidecar whose commentary role sits only in its decoded title (no disposition token) must
-            // also be skipped, else skip_commentary would exclude it on extract but re-mux it on import (a Plex-native/manual sidecar or a title-only source).
+            // also be skipped, else skip_commentary would exclude it on extract but re-mux it on import (a server-native/manual sidecar or a title-only source).
             .filter((f) => !(skipCommentary && (f.dispTokens.includes('commentary') || matchesKeyword(String(f.title || '').toLowerCase(), dispositionTypes.comment.keywords))));
         if (!found.length) { response.infoLog += '☑No subtitle sidecars found to import\n'; return response; }
 
@@ -802,7 +824,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // data loss, whereas a redundant duplicate is not. Genuine duplication is collapsed by CONTENT instead (method_deduplicate, below).
         const existingSubCount = embeddedSubs.length;   // same subtitle-stream filter already computed above (streams is unchanged since)
         // The import muxes each sidecar as -i "${libDir}/${name}"; a " or control char in that real on-disk path would close the quote and inject ffmpeg args, and unlike a
-        // name we generate it must match the file byte-for-byte, so it can't be sanitised - skip it instead (a Plex-native/user file we can't safely reference), never break out.
+        // name we generate it must match the file byte-for-byte, so it can't be sanitised - skip it instead (a server-native/user file we can't safely reference), never break out.
         const candidates = found.filter((f) => !importedSet.has(f.name)).filter((f) => {
             if (!/["\x00-\x1f\x7f]/.test(path.join(libDir, f.name))) return true;
             response.infoLog += `☒Skipping sidecar with an unsafe filename (contains a quote or control character), cannot import safely: ${f.name}\n`;
@@ -835,7 +857,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const outIdx = existingSubCount + k;
                 inputSide += ` -sub_charenc UTF-8 -i "${path.join(libDir, f.name)}"`;
                 extraMaps += ` -map ${k + 1}:0`;
-                meta += ` -metadata:s:s:${outIdx} "language=${escMeta(isMp4 ? to6392T(f.lang) : f.lang)}"`;
+                meta += ` -metadata:s:s:${outIdx} "language=${escMeta(isMp4 ? to6392T(f.lang) : normSidecarLang(f.lang))}"`;
                 if (f.title) meta += ` -metadata:s:s:${outIdx} "title=${escMeta(f.title)}"`;
                 if (f.disp.length) meta += ` -disposition:s:${outIdx} ${f.disp.join('+')}`;
                 if (isMp4) meta += ` -c:s:${outIdx} mov_text`;
