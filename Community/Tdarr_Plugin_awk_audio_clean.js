@@ -480,6 +480,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= codecAliases  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Prefix → canonical codec key (e.g. wmav1 → wma).
     const codecAliases = [
+        ['pcm_alaw',  'g711'],   // G.711 A-law: LOSSY 8-bit companded telephony (64 kbps/ch), NOT lossless - carve out before the generic pcm_ fold
+        ['pcm_mulaw', 'g711'],   // G.711 mu-law: same
         ['pcm_',   'pcm'],
         ['dsd',    'dsd'],       // DSD / SACD (1-bit): fold dsd_lsbf/dsd_msbf(_planar) to one lossless key
         ['mp4als', 'als'],       // MPEG-4 ALS: fold the mp4-wrapped spelling to the 'als' codecInfo key (a bare 'als' resolves directly)
@@ -535,10 +537,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // whole trailing token (\bxll x\b) NOT a raw substring, so a hypothetical "XLL X96"/"XLL XBR" can't false-positive
                 // (those core-extension tokens attach to plain DTS core, which has no XLL, but the boundary check makes the guarantee literal).
                 const additionalFeatures = (mi?.Format_AdditionalFeatures || '').toLowerCase();
-                if (/\bxll x\b/.test(additionalFeatures))
+                // MediaInfo signal, plus an ffprobe fallback: jellyfin reports DTS:X in `profile` (e.g. "DTS-HD MA + DTS:X"), the only
+                // object-audio signal when Tdarr supplies no mediaInfo track. /dts:?x/ matches "dts:x"/"dtsx"; no plain-DTS profile carries it.
+                if (/\bxll x\b/.test(additionalFeatures) || /dts:?x/.test(profile))
                     codec = DTS_X_VARIANT[codec];
             }
-        } else if (codec === 'eac3' && (longName.includes('atmos') || commercial.includes('atmos')))
+        } else if (codec === 'eac3' && (longName.includes('atmos') || commercial.includes('atmos') || profile.includes('atmos')))
             codec = 'eac3atmos';
 
         return codec;
@@ -583,6 +587,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const codecInfo = {
         // Lossless
         pcm:         { score: 100, lossless: true },
+        g711:        { score: 40,  transparent: 64000 },   // G.711 A-law/mu-law: lossy 8-bit telephony, a heavy score BELOW every real music codec so it never wins a dedup group or guard_lossless
         s302m:       { score: 100, lossless: true },   // SMPTE 302M PCM (broadcast MPEG-TS) — effectively uncompressed, so guard_lossless must protect it
         flac:        { score: 100, lossless: true },
         alac:        { score: 100, lossless: true },
