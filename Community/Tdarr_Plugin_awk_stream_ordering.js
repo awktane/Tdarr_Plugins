@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can promote the default, SDH or descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time it's needed).\n`,
-    Version: '4.1.1',
+    Version: '4.2.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -113,15 +113,14 @@ const details = () => ({
         {
             name: 'method_mp4_faststart',
             type: 'string',
-            defaultValue: 'enabled',
+            defaultValue: 'force',
             inputUI: {
                 type: 'dropdown',
-                options: ['enabled', 'disabled'],
+                options: ['force', 'strip'],
             },
-            tooltip: `mp4/mov only: write the moov atom (the index) at the FRONT of the file so players start and seek instantly on progressive download / remote direct-play. mkv is unaffected.
-                \\nRuns as this plugin's normal reorder remux when there is reordering to do, and otherwise forces a single lossless -c copy remux to relocate the index when the file isn't already front-loaded (detected without decoding). Already-fronted files are left untouched, so it settles after one pass and never loops.
-                \\nenabled (default): front-load the mp4 moov atom. Cost is one extra read/write of the file the first time it's needed.
-                \\ndisabled: leave the moov atom wherever the source muxer put it.`,
+            tooltip: `mp4/mov only: where the moov atom (the index) sits in the file. At the FRONT, players start and seek instantly on progressive download / remote direct-play; at the end they must fetch the tail first. mkv is unaffected.
+                \\nforce (default): front-load the moov atom. Rides this plugin's normal reorder remux when there is reordering to do, and otherwise forces ONE extra lossless -c copy remux the first time the file isn't already front-loaded (detected without decoding). Already-fronted files are left untouched, so it settles after one pass and never loops.
+                \\nstrip: actively REMOVE faststart - it does not leave the file alone. Any remux this plugin performs (reordering, disposition normalisation, remove_junk_tags) writes the moov atom at the END, the mov muxer's default, so an mp4 that arrived front-loaded comes out back-loaded and cannot be restored by a later pass. Only pick this if you never stream this library remotely.`,
         },
     ],
 });
@@ -735,17 +734,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
         failFile('No ffProbe stream data available for this file - the plugin cannot process it');
 
+    // method_mp4_faststart normalizer: lower-cases, and silently folds the accepted aliases 'enabled'->'force' / 'disabled'->'strip' onto the current option
+    // pair (same behaviour, plainer names). The aliases are accepted but NOT offered - they stay out of the dropdown's options list. The fold is required, not
+    // cosmetic: the dropdown validator below FAILS the file on an unknown value, so a value already persisted in a Tdarr library config must keep validating.
+    const normFaststart = (v) => { const s = String(v || 'force').toLowerCase().trim(); return ({ enabled: 'force', disabled: 'strip' })[s] || s; };
     // Value checks. The two free-text inputs (order_language/order_codec) have no fixed option set; the six dropdowns (audio_first, subtitle_first,
     // order_channel, order_quality, remove_junk_tags, method_mp4_faststart) each have one, validated below.
-    // [inputName, valueToTest, validOptions] - remove_junk_tags/method_mp4_faststart pre-normalize (String(...).toLowerCase()) before the membership check; the
-    // other four test the raw input. The failFile message always shows the RAW inputs[name]. Checked top-to-bottom, failing on the first invalid value.
+    // [inputName, valueToTest, validOptions] - remove_junk_tags normalizes case and method_mp4_faststart normalizes case + aliases before the membership
+    // check; the four others test the raw input. The failFile message always shows the RAW inputs[name]. Checked top-down, failing on the first bad value.
     const dropdownChecks = [
         ['audio_first',          inputs.audio_first,                                             ['language', 'original', 'default', 'descriptive']],
         ['order_channel',        inputs.order_channel,                                           ['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled']],
         ['order_quality',        inputs.order_quality,                                           ['descending', 'descending <=1024k', 'ascending', 'disabled']],
         ['subtitle_first',       inputs.subtitle_first,                                          ['normal', 'default', 'sdh', 'descriptive']],
         ['remove_junk_tags',     String(inputs.remove_junk_tags || 'disabled').toLowerCase(),   ['disabled', 'encoder', 'descriptive']],
-        ['method_mp4_faststart', String(inputs.method_mp4_faststart || 'enabled').toLowerCase(), ['enabled', 'disabled']],
+        ['method_mp4_faststart', normFaststart(inputs.method_mp4_faststart),                     ['force', 'strip']],
     ];
     for (const [name, value, opts] of dropdownChecks)
         if (!opts.includes(value)) failFile(`[${name}=${inputs[name]}] invalid value, check your settings`);
@@ -776,7 +779,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
         const channelOrder = parseOrderMode(inputs.order_channel);
         const qualityOrder = parseOrderMode(inputs.order_quality);
-        const methodFaststart = String(inputs.method_mp4_faststart || 'enabled').toLowerCase();
+        const methodFaststart = normFaststart(inputs.method_mp4_faststart);
         // Union-of-caps demotion: a track over EITHER the channel cap OR the quality cap is demoted below every under-all-caps track, so the fully-serveable
         // track leads - e.g. a 5.1 that's under the <=6 channel cap but over the <=1024k quality cap is still demoted, not kept above a stereo. A finite cap
         // exists only in a 'descending <=N' mode (plain descending/ascending/disabled don't cap -> Infinity). Channel caps by channel count; quality by capBitrate.
@@ -867,8 +870,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // genuinely small and stays 0 = under-cap. Only the '<=Nk' cap reads this; plain descending/ascending ignore it.
                 capBitrate: (streamType === 'audio' && !(enrichedStream.bit_rate > 0) && codecInfo[canon]?.lossless === true) ? Infinity : (enrichedStream.bit_rate || 0),
                 forced: ffstream?.disposition?.forced === 1,
-                // Only score audio: scoring video/subtitle/data would spam bogus "unknown codec"/"invalid bitrate" notices, and quality is only used to sort audio.
-                audioQuality: streamType === 'audio' ? audioQuality(enrichedStream) : 0,
+                // Only score audio, and only when order_quality actually reads the score: scoring video/subtitle/data would spam bogus "unknown codec" /
+                // "invalid bitrate" notices, and with order_quality=disabled the score is dead - scoring anyway warns about values with no bearing on the sort.
+                audioQuality: (streamType === 'audio' && qualityOrder.enabled) ? audioQuality(enrichedStream) : 0,
                 // Does this audio stream's canonical codec match order_codec? Family-prefix: "dts" catches dtsma/dtshr/dtsexpress, "eac3" catches eac3atmos.
                 codecMatch: canon !== '' && codecFirstList.some(c => canon.startsWith(c)),
                 default: ffstream?.disposition?.default === 1,
@@ -998,7 +1002,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // (spawn-free; __awkMoovFront overrides for the harness) and force a one-time remux when faststart is on, the output is an mp4-family container, and the file
         // isn't already fronted. moovBeforeMdat is fail-safe (unreadable/odd -> treated as fronted), so this settles after one pass and never loops.
         const isMp4 = isMp4Family(file.container);   // shared checker; cached once for this container
-        const faststartOn = methodFaststart === 'enabled';
+        const faststartOn = methodFaststart === 'force';
         const needsFront = faststartOn && isMp4 && !moovBeforeMdat(file.file, otherArguments);
 
         if (!changed && dispositionArgs === '' && !needsFront && junkArgs === '') {

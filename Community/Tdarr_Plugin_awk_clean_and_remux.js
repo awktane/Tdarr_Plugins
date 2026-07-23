@@ -18,8 +18,8 @@ const details = () => ({
                      -Converts unsupported subtitles to a supported format\n\n
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
-                     -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched.\n\n`,
-    Version: '4.1.1',
+                     -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
+    Version: '4.1.2',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -843,9 +843,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const filled = fillApplies(sl, allowFill);
         let workLang = filled ? fillLanguage : (sl || 'und'), desired = '';
         if (filled) {
-            // A fill is a WRITE of a new tag, so its emitted form must round-trip in the destination container. mp4's mdhd stores only a lowercase 3-letter code, so fold through
-            // toCanonicalTag even when tag_language=disabled - a raw 'en'/'english'/'pt-BR' is dropped on the mp4 mux, leaving the stream blank and re-filling forever; mkv round-trips the raw form.
-            desired = tagLanguage !== 'disabled' ? toCanonicalTag(fillLanguage) : (dstContainer === 'mp4' ? toCanonicalTag(fillLanguage) : fillLanguage);
+            // A fill is a WRITE of a NEW tag, never a preserved user tag, so it is ALWAYS canonicalised - tag_language=disabled means "don't rewrite EXISTING
+            // tags", not "write an unrecognised string into a blank one" (language_fill accepts a spelled-out "English", which Matroska's Language element
+            // cannot store as a code). mkv keeps a valid region/script subtag so a pt-BR fill survives (as the repair branch does); mp4's mdhd stores only a
+            // lowercase 3-letter code.
+            desired = (tagLanguage !== 'disabled' || dstContainer === 'mp4')
+                ? toCanonicalTag(fillLanguage)
+                : (canonicalRegionTag(fillLanguage) || toCanonicalTag(fillLanguage));
         } else if (!blank && tagLanguage !== 'disabled' && (tagLanguage === 'strict' || !storesCleanly(rawTag))) {
             // strict enforces the method form (folds region under container/639-2); invalid only repairs syntax, so a recognised region/script tag keeps its region
             // (canonicalised: en_us -> en-US, pt-br -> pt-BR) on mkv. mp4 can't store a region, so it still folds to 639-2/T via toCanonicalTag.
@@ -1183,13 +1187,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 return title;
             };
-            // Write a changed title, or reconcile ONLY when the ffprobe tag is missing but mediaInfo has one: the write adds the ffprobe tag so both probes agree next
-            // pass. The reverse (ffprobe has a title mediaInfo never reports) must NOT fire, or a container that never surfaces Title to mediaInfo would remux every pass.
+            // mediaInfo surfaces the container's HANDLER (mp4 udta handler / matroska HANDLER_NAME) AS the track Title, so a track whose mediaInfo Title merely
+            // echoes its own handler has no real title at all - boilerplate like SoundHandler/SubtitleHandler must never be promoted into a real title tag by
+            // the reconcile branch below. Read the handler case-insensitively (getTagCI): matroska stores it uppercase.
+            const mediaTitleIsHandler = () => {
+                const handler = (getTagCI(ffstream.tags, 'handler_name') || '').trim().toLowerCase();
+                const mediaTitle = (ffmedia?.Title ?? '').trim().toLowerCase();
+                return mediaTitle !== '' && mediaTitle === handler;
+            };
+            // Write a changed title, or reconcile ONLY when the ffprobe tag is missing but mediaInfo has a REAL one (mediaTitleIsHandler filters the handler
+            // echo): the write adds the ffprobe tag so both probes agree next pass. The reverse (ffprobe has a title mediaInfo never reports) must NOT fire, or
+            // a container that never surfaces Title to mediaInfo would remux every pass.
             const reconcileTitle = (typeLetter, idx, typeWord, streamTitle, newStreamTitle, titleCauses) => {
                 if (newStreamTitle !== streamTitle) {
                     workDone += `☐${streamTag(ffstream.index)}${titleCauses.length ? `[${titleCauses.join('][')}]` : ''} Change title (${typeWord}) "${logSafe(streamTitle)}" -> "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "title=${escMeta(newStreamTitle)}"`;
-                } else if (ffmedia && !(ffstream.tags?.title) && (ffmedia.Title ?? '') !== '') {
+                } else if (ffmedia && !(ffstream.tags?.title) && (ffmedia.Title ?? '') !== '' && !mediaTitleIsHandler()) {
                     workDone += `☐${streamTag(ffstream.index)} Change title (${typeWord}) - found "${logSafe(ffstream.tags?.title ?? '')}" and "${logSafe(ffmedia?.Title ?? '')}" change to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "title=${escMeta(newStreamTitle)}"`;
                 }
@@ -1418,7 +1431,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     deferredFontIndices.push(ffstream.index);
                     continue;
                 }
-                // 'other' - unidentifiable attachment, leave it untouched (see attachmentKind).
+                // 'other' - unidentifiable attachment. mkv carries anything, so the "never remove what we can't identify" policy holds there (see
+                // attachmentKind). It has to yield for mp4: the mp4/mov muxer has NO attachment stream support at all, so leaving one in -map 0 doesn't just
+                // lose it - the whole remux fails.
+                if (dstContainer === 'mp4') {
+                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Remove attachment mp4 can't carry (${ffstreamType}-${ffstreamCodec})\n`;
+                    extraArguments += ` -map -0:${ffstream.index}`;
+                    removedIndices.add(ffstream.index);
+                    convert = true;
+                    continue;
+                }
             } else if ((ffstreamType === 'data') || ['data','bin_data','tmcd'].includes(ffstreamCodec)) {
                 workDone += `☐${streamTag(ffstream.index)} Remove data stream (${ffstreamType}-${ffstreamCodec})\n`;
                 extraArguments += ` -map -0:${ffstream.index}`;

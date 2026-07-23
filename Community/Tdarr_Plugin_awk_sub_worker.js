@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all) and skip_commentary (omit commentary tracks). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled/enabled_delete modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.2.0',
+    Version: '3.2.1',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -786,6 +786,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         let entries;
         try { entries = fs.readdirSync(libDir); } catch (e) { failFile(`Cannot read the library directory to find sidecars: ${e && e.message ? e.message : e}`); }
+        // readdir order is filesystem-dependent (ext4 hash order vs APFS), and it propagates into the dedup groups, the extra -i inputs, the outIdx
+        // assignment and so the appended subtitle order - the same file would embed its sidecars in a different order per node. Sort by name to fix that.
+        entries.sort((a, b) => (a < b ? -1 : (a > b ? 1 : 0)));
         const found = entries.map(parseSidecar).filter(Boolean)
             .filter((f) => !(langFilter && !langFilter.has(langKey(f.lang))))
             // Match extract's isCommentary (flag OR title keyword): a sidecar whose commentary role sits only in its decoded title (no disposition token) must
@@ -808,13 +811,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const markerConfirmsEmbedded = (f) => embeddedSubs.some((s) =>
             langKey(resolveLang(s) || 'und') === langKey(f.lang || 'und') && (isMp4 || (s.tags?.title || '') === (f.title || '')));
         let deleted = 0;
+        const deletedNames = new Set();   // sidecars actually unlinked this pass - the marker below must keep listing every one that SURVIVED
         if (deleteConfirmed) {
             for (const f of found.filter((x) => importedSet.has(x.name))) {
                 if (!markerConfirmsEmbedded(f)) {
                     response.infoLog += `☒[${delReason}] Marker lists ${f.name} but no embedded subtitle matches its language/title - not deleting (unverified)\n`;
                     continue;
                 }
-                try { fs.unlinkSync(path.join(libDir, f.name)); deleted += 1; response.infoLog += `☑[${delReason}] Deleted sidecar (embedded): ${f.name}\n`; }
+                try { fs.unlinkSync(path.join(libDir, f.name)); deleted += 1; deletedNames.add(f.name); response.infoLog += `☑[${delReason}] Deleted sidecar (embedded): ${f.name}\n`; }
                 catch (e) { response.infoLog += `☒[${delReason}] Could not delete sidecar ${f.name}: ${e && e.message ? e.message : e}\n`; }
             }
         }
@@ -865,10 +869,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.infoLog += `☐Import ${f.name} -> subtitle ${outIdx} (${f.lang}${f.dispTokens.length ? ` ${f.dispTokens.join('+')}` : ''})\n`;
             });
             const consumed = merged.flatMap((f) => f.members.map((m) => m.name));
-            // Carry prior-pass marks forward in KEEP mode so a kept-but-already-embedded sidecar stays in the skip set across
-            // incremental passes (otherwise the next pass re-imports it as a duplicate track). In delete mode those files were
-            // just unlinked above, so nothing prior survives - the marker is exactly this pass's consumed (what the confirm pass deletes).
-            const priorStillPresent = deleteConfirmed ? [] : found.filter((f) => importedSet.has(f.name)).map((f) => f.name);
+            // Carry prior-pass marks forward for every already-embedded sidecar STILL ON DISK, so it stays in the skip set across incremental passes
+            // (otherwise the next pass re-imports it as a duplicate track). ONE rule for both modes: delete mode is not "everything was unlinked" - the loop
+            // above skips (and ☒-logs) any sidecar markerConfirmsEmbedded rejects, and an unlink can fail, so only names actually unlinked leave the marker.
+            const priorStillPresent = found.filter((f) => importedSet.has(f.name) && !deletedNames.has(f.name)).map((f) => f.name);
             const markList = [...new Set([...consumed, ...priorStillPresent])];
             let out = `${inputSide} -map 0${extraMaps} -c copy${meta} -metadata "awk_sub_worker=${encodeMarkerList(markList)}"`;
             finishPreset(out);

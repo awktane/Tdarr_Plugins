@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '4.1.0',
+    Version: '4.1.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1066,6 +1066,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Fold the aac_vbr pseudo-codec onto the real aac family for scoring/limit/target lookups (aac_vbr is only an encoder choice, not a distinct codec). One local source for
     // the six non-shared fold sites below; the two inside the shared audio-scoring section keep the idiom inline (byte-identical across carriers, so they can't drift).
     const aacFamily = (codec) => codec === 'aac_vbr' ? 'aac' : codec;
+    // Codec family of a STREAM for identity checks ("is this track already the target codec?"): the shared codecAliases prefix fold and nothing else, so
+    // aac_latm (AAC in MPEG-TS/LATM, routine in DVR/.ts captures) matches an 'aac' target instead of taking a pointless lossy aac->aac re-encode. Deliberately
+    // NOT resolveCodecName: its refinement resolves eac3 to eac3atmos and dts to dtsma/dtshr, names no codec_* target ever uses, causing re-encodes of its own.
+    const codecFamilyOf = (stream) => {
+        const codec = (stream?.codec_name ?? '').trim().toLowerCase();
+        for (const [prefix, replacement] of codecAliases) if (codec.startsWith(prefix)) return replacement;
+        return codec;
+    };
     // Transcode target bitrate (bps) for a codec + channel count, from the shared CODEC_TARGET_BPS table (aac_vbr shares aac's targets; ac3/eac3 cap at 6ch).
     // For these encodable codecs the ladder IS the scoring transparent point (scoreThresholds reads the same table), and it serves as the FLOOR for a
     // transcode - the actual target is max(thisTable, source). AC3/EAC3 CBR fixed-preset: mono 192k, stereo 224k, 3ch 320k, 4ch 384k, 5ch 448k, 6ch 640k
@@ -1630,7 +1638,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Exclude tracks that need no codec work: alreadyTargetCodec flags a track already in its tier's forced codec; the filter below drops it.
         // aac_vbr is treated as the aac family for codec-identity checks — ffprobe always reports codec_name 'aac' regardless of which encoder produced the
-        // track, so comparing against 'aac_vbr' directly would never match and would needlessly re-encode existing AAC tracks.
+        // track, so comparing against 'aac_vbr' directly would never match and would needlessly re-encode existing AAC tracks. The stream side of the
+        // same comparison folds through codecFamilyOf (alias-only) so a container-spelling variant such as aac_latm also reads as its real family.
         const stereoCodecFamily = aacFamily(stereoCodec);
         // alreadyTargetCodec: true when a track has landed in a codec_force-affected tier AND is already in that tier's target codec, so there is nothing
         // left to do and it can be excluded from workStreams (the .filter below keeps only the streams this returns false for). The surround shortcuts must
@@ -1639,12 +1648,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // workStreams to reach that downmix regardless of downmix_to_* / codec.
         const alreadyTargetCodec = (stream) => {
             //8 channel
-            if(stream.channels > 6 && stream.isTdarrTier === 'surround' && (downmixToSix === 'false') && (downmixToStereo === 'false') && (forceCodec === 'all' && ((stream?.codec_name ?? '').trim().toLowerCase() === surroundCodec)))
+            if(stream.channels > 6 && stream.isTdarrTier === 'surround' && (downmixToSix === 'false') && (downmixToStereo === 'false') && (forceCodec === 'all' && (codecFamilyOf(stream) === surroundCodec)))
                 return true;
             //3-6 channel
-            else if(stream.channels > 2 && stream.channels <= 6 && stream.isTdarrTier === 'surround' && (downmixToStereo === 'false') && (['all','6below'].includes(forceCodec) && ((stream?.codec_name ?? '').trim().toLowerCase() === surroundCodec)))
+            else if(stream.channels > 2 && stream.channels <= 6 && stream.isTdarrTier === 'surround' && (downmixToStereo === 'false') && (['all','6below'].includes(forceCodec) && (codecFamilyOf(stream) === surroundCodec)))
                 return true;
-            if((stream.channels <= 2) && ['all','6below','2below'].includes(forceCodec) && ((stream?.codec_name ?? '').trim().toLowerCase() === stereoCodecFamily))
+            if((stream.channels <= 2) && ['all','6below','2below'].includes(forceCodec) && (codecFamilyOf(stream) === stereoCodecFamily))
                 return true;
             return false;
         };
@@ -1683,6 +1692,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         });
 
         if (workStreams.length === 0 && streamsToRemove.size === 0 && loudnorm === 'disabled') {
+            // Flush both buffers like every other exit - skipDone is routinely non-empty here (a guard that blocked the only candidate is exactly the
+            // "why did nothing happen" diagnostic), and throwing it away leaves the user with a bare "no changes" line and no reason.
+            response.infoLog += workDone;
+            response.infoLog += skipDone;
             response.infoLog += '☑No audio tracks require changes\n';
             return response;
         }
@@ -2091,10 +2104,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (forceChannels > 0) {
                 const isStereo = forceChannels <= 2;
                 const targetCodec = isStereo ? stereoCodec : surroundCodec;
-                // aac_vbr is only valid for stereo; for family-identity checks compare against 'aac'.
+                // aac_vbr is only valid for stereo; for family-identity checks compare against 'aac'. The stream side folds through codecFamilyOf
+                // (alias-only) so aac_latm reads as aac, not re-encoded aac->aac; the logs below keep the RAW codec name so the track is still identifiable.
                 const targetCodecFamily = aacFamily(targetCodec);
 
-                if (ffstreamCodec !== targetCodecFamily) {
+                if (codecFamilyOf(ffstream) !== targetCodecFamily) {
                     const shouldForce =
                         forceCodec === 'all' ||
                         (forceCodec === '6below' && !isStereo && forceChannels <= 6) ||
@@ -2140,6 +2154,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             const e = stereoEnc(outputAudioIdx);
                             workDone += `☐${streamTag(ffstream.index)}[method_layout_err=${methodLayoutErr}] Remixing ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} (${layoutName}, opus-incompatible) → ${e.logCodec} stereo @ ${e.rate}${e.label ? ` (${e.label})` : ''}\n`;
                             extraArguments += ` -c:a:${outputAudioIdx} ${e.frag}${stereoArg(outputAudioIdx, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                            extraArguments += langMetaArg(outputAudioIdx, streamLang);   // re-assert the language, as every other in-place transcode does
                             modifiedAudioIdx.add(outputAudioIdx);
                             outputAudioOverride.set(outputAudioIdx, e.record);
                             created2chLangs.add(ffstreamLangKey);   // register the remix-created stereo so a later same-language downmix / remix defers to it
@@ -2392,8 +2407,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;
             response.processFile = true;
         } else {
-            if (workDone) response.infoLog += workDone;
-            if (skipDone) response.infoLog += skipDone;
+            response.infoLog += workDone;
+            response.infoLog += skipDone;
             response.infoLog += `☑Audio already has the correct formats available\n`;
             response.processFile = false;
         }
