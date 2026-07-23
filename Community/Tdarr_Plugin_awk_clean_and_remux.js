@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.1.2',
+    Version: '4.1.3',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -675,10 +675,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
         failFile('No ffProbe stream data available for this file - the plugin cannot process it');
 
-    // Input validation. Order mirrors the Inputs array in details(); only type:'string' inputs are checked - free-text inputs (language_sub, language_fill)
-    // have no fixed option set, and type:'boolean' inputs (remove_comments/remove_busytitle) are coerced to a real
-    // true/false by loadDefaultValues (any out-of-set value becomes false), so a guard on them would be dead code. container is validated first (input #1) and
-    // before the dstContainer parse below so an empty value fails cleanly rather than throwing a raw TypeError. Remaining checks run after all inputs parse.
+    // Input validation. Order mirrors the Inputs array in details(); every type:'string' input is checked. The two free-text inputs (language_fill,
+    // language_sub) have no fixed option set, so they are checked against the LANGUAGE RECOGNISER instead (knownLangToken below) - a typo in either
+    // silently changes which streams survive, so neither is left unchecked. type:'boolean' inputs (remove_comments/remove_busytitle) are coerced to a real
+    // true/false by loadDefaultValues (any out-of-set value becomes false), so a guard on them would be dead code. container is validated first (input #1)
+    // and before the dstContainer parse below so an empty value fails cleanly rather than a raw TypeError. Remaining checks run after all inputs parse.
     if (!inputs.container || inputs.container === '')
         failFile(`[container=${inputs.container || ''}] not configured, check your settings`);
 
@@ -716,10 +717,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const methodTagLanguage = String(inputs.method_tag_language || 'container').toLowerCase();
     const guardAudioLanguage = String(inputs.guard_audio_language || 'disabled').toLowerCase();
 
-    // ===== SHARED [clean_and_remux, sub_worker]: language display name =====
-    // -=-=-= langDisplayName  [clean_and_remux, sub_worker] =-=-=-
-    // Memoised ICU DisplayNames (built once, reused): the recognised English name for an ALREADY-normalised language code, or '' for a non-language/unrecognised code. A
-    // fresh ICU instance per call is wasteful. Each caller normalises the token first - clean_and_remux via shortLang (tag recognition), sub_worker via langKey (sidecar).
+    // ===== SHARED [audio_clean, clean_and_remux, sub_worker]: language display name =====
+    // -=-=-= langDisplayName  [audio_clean, clean_and_remux, sub_worker] =-=-=-
+    // Memoised ICU DisplayNames (built once, reused): the recognised English name for an ALREADY-normalised language code, or '' for a non-language/unknown
+    // code. A fresh ICU instance per call is wasteful. Each caller normalises the token first - clean_and_remux via shortLang (tag recognition), audio_clean
+    // and sub_worker via langKey (free-text language-list validation / sidecar name recognition).
     const langDisplayName = (() => {
         let dn = null;
         return (code) => { try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(code) || ''; } catch (e) { return ''; } };
@@ -729,16 +731,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // spelled-out name or region tag folds to its base first). Used by the language_fill validation below and once per tagged stream via storesCleanly.
     const langName = (tag) => langDisplayName(shortLang(String(tag).toLowerCase()));
 
-    // Value checks continue in Inputs order (container already checked above): language_fill is format-checked and cross-checked against language_sub,
-    // then the remaining dropdowns are checked against their option set (free-text and boolean inputs need no check - see above).
-    // language_fill accepts any recognised language in any form - langKey folds en/eng/English/en-US/pt-BR to a base code - or a valid special/private code
-    // (und/mul/zxx/mis/qaa-qtz, mirroring isNonLang); an unrecognised token (typo/garbage) fails the file so a bad fill can't be written and then demote a stream downstream.
-    if(fillLanguage) {
-        const fk = langKey(fillLanguage);
-        const knownFill = fk === 'und' || fk === 'mul' || fk === 'zxx' || fk === 'mis' || /^q[a-t][a-z]$/.test(fk) || !!langName(fk);
-        if(!knownFill)
-            failFile(`[language_fill=${String(inputs.language_fill ?? '').slice(0, 200)}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);   // cap the echoed free-text value: it's unbounded and Tdarr persists the whole error message
-    }
+    // A recognised language token, given its already-folded langKey: any real language in any form (langKey folds en/eng/English/en-US/pt-BR to a base
+    // code) or a valid special/private code (und/mul/zxx/mis/qaa-qtz, mirroring isNonLang). Both free-text language inputs are checked through this, so
+    // an unrecognised token (typo/garbage) fails the file rather than silently changing which streams survive.
+    const knownLangToken = (key) => key === 'und' || key === 'mul' || key === 'zxx' || key === 'mis' || /^q[a-t][a-z]$/.test(key) || !!langName(key);
+    // The failFile message echoes the offending token capped at 200 chars: free text is unbounded and Tdarr persists the whole error message.
+    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').slice(0, 200)}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
+    // Value checks continue in Inputs order (container already checked above), with ONE deliberate exception: language_sub's tokens are checked before the
+    // language_fill/language_sub cross-check, which can only give a sensible message once both lists are known-good. Then the remaining dropdowns are checked
+    // against their option set (boolean inputs need no check - see above).
+    // A bad language_fill would be written into a stream and demote it downstream; a bad language_sub is worse - the keep test only asks whether the list is
+    // non-empty, so ONE unrecognised token makes every subtitle fail the match and get mapped out on a remux that reports success.
+    if(fillLanguage && !knownLangToken(langKey(fillLanguage)))
+        failLangToken('language_fill', inputs.language_fill);
+    for(let i = 0; i < subLangKeys.length; i++)
+        if(!knownLangToken(subLangKeys[i])) failLangToken('language_sub', subLanguage[i]);
     // If fillLanguage is set it should be a subtitle that's kept. (There is no audio equivalent: audio_clean owns audio language, and it reads the tag
     // this plugin has already written rather than language_fill itself, so there is nothing here to cross-check against.)
     if(fillLanguage && subLanguage.length > 0 && !subLangKeys.includes(langKey(fillLanguage)))
@@ -887,10 +894,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // 'all'/'export' drop every image sub; 'unsupported' relies on subFormatDropped (container-forced) alone. imageSubDropped is the remove_imagesubs-specific drop
     // beyond subFormatDropped, used by subDroppedAnyReason for the language_fill tally + accessibility plain-track guard.
     const imageSubDropped = (codec) => isImageSub(codec) && (removeImageSubs === 'all' || removeImageSubs === 'export');
+
+    // ===== SHARED [clean_and_remux, sub_worker]: preset path safety =====
+    // -=-=-= pathIsPresetSafe  [clean_and_remux, sub_worker] =-=-=-
+    // True when a real on-disk path can be embedded in a preset's quoted "${path}" token. Tdarr never shells out, but its worker tokenises each preset
+    // half with a quote-aware parser before spawning ffmpeg, so a " anywhere in the path closes the wrapper mid-token and everything after it becomes
+    // fresh argv entries (a raw control character breaks the token just as badly). The name parts WE generate are sanitised at their source, but the
+    // library DIRECTORY is a real path that has to stay literal - it can only be checked, never rewritten - so a caller that fails this test refuses
+    // that one sidecar with a ☒ line rather than emit the token.
+    const pathIsPresetSafe = (p) => !/["\x00-\x1f\x7f]/.test(String(p));
+    // ===== END SHARED: preset path safety =====
+
     // Hidden dot-prefixed sidecar name for an exported image subtitle: ".<video>.s<index>.<lang>[.forced].<ext>". The leading dot makes Plex/Jellyfin ignore it (Jellyfin
     // skips **/.* ; Plex ignores .sup/.mks by extension). Emby is the exception - it scans dot-prefixed files, so an exported .mks needs a .embyignore entry there
-    // (called out in the remove_imagesubs tooltip). Both metadata-derived name parts are made safe for the quoted "${path}" in the export preset: lang is restricted
-    // to the language-code charset, and imageBase (the source basename) has any " / control char stripped so a crafted video filename can't close the quote and inject args.
+    // (called out in the remove_imagesubs tooltip). Both metadata-derived name parts are made safe for the quoted "${path}" in the export preset: lang is
+    // restricted to the language-code charset, and imageBase (the source basename) has any " / control char stripped so a crafted video filename can't close
+    // the quote and inject args. The library DIRECTORY they are joined to is NOT sanitised - it has to stay literal - so the full path is CHECKED with
+    // pathIsPresetSafe at the emit site below, and the export is refused when that check fails.
     const path = require('path');
     const libFile = otherArguments?.originalLibraryFile?.file || file.file;
     const libDir = path.dirname(libFile);
@@ -1022,7 +1042,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // control characters; infoLog is newline-delimited and every line must start with ☐/☑/☒, so a raw char would split it into a continuation with no
     // status symbol. Collapse control characters to a space for display only - quotes/backslashes are preserved so the logged value reads faithfully
     // (unlike escMeta, which rewrites them for ffmpeg-argument safety). Display-only, never feeds ffmpeg.
-    const logSafe = (value) => String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ');
+    // Also length-capped (ellipsised), for the same reason the free-text inputs are: nothing bounds a container title, several call sites echo two or three of
+    // them on one line, and the whole infoLog is persisted by Tdarr - a file carrying multi-KB titles on many streams would otherwise build a multi-MB log.
+    const logSafe = (value, max = 200) => {
+        const s = String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ');
+        return s.length > max ? `${s.slice(0, max)}…` : s;
+    };
 
     // tag_disposition: the tagged dispositions a stream matches by title (or flag) that aren't already a real flag - i.e. the keywords to promote into
     // +flags. Same predicate for audio and subtitle, so keep it here. A promotion must be able to PERSIST in the destination container, or the flag never
@@ -1223,14 +1248,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // from any container, 'export' saves each to a hidden dot-prefixed sidecar (PGS->.sup, VobSub/DVB->.mks, both ignored by Plex/Jellyfin) before dropping.
                 // Non-image subs the container can't carry (ttml/eia_608/xsub/dvb_teletext, or mp4 arib/hdmv_text) are dropped by subFormatDropped as before. A kept image
                 // sub (unsupported + carriable) and every non-image sub then fall through to the language/accessibility filters below.
-                if (isImageSub(ffstreamCodec) && imageSubDropped(ffstreamCodec)) {
-                    // remove_imagesubs = all/export drops the image sub explicitly; export first saves a hidden dot-prefixed sidecar for external OCR.
-                    if (removeImageSubs === 'export') {
-                        const sc = IMAGE_SUB[ffstreamCodec];   // { ext, fmt } - .mks needs an explicit -f matroska; .sup auto-detects from the extension
-                        const sidecarName = imageSidecarName(ffstream, sc.ext);
-                        sidecarOut += ` -map 0:${ffstream.index} -c:s copy -f ${sc.fmt} "${path.join(libDir, sidecarName)}"`;
+                // remove_imagesubs = all/export drops the image sub explicitly; export first saves a hidden dot-prefixed sidecar for external OCR. The
+                // export has to SUCCEED for the drop to be safe (the sidecar is the only surviving copy), so when the joined path can't be embedded in the
+                // quoted preset token (pathIsPresetSafe - a " or control char in the library directory, which has to stay literal) the export is refused
+                // with a ☒ and the drop is refused with it. The stream then falls through to the container test below, which still drops it on mp4 (which
+                // cannot carry an image sub at all) and keeps it on mkv. That ☒ goes straight to the infoLog rather than into workDone: it warns about the
+                // ENVIRONMENT, not a queued change, and workDone is flushed only on a real remux - so a file whose only pending change WAS the refused
+                // export would otherwise report "nothing requiring removal or conversion" and swallow the warning entirely.
+                const imageSubDrop = isImageSub(ffstreamCodec) && imageSubDropped(ffstreamCodec);
+                let exportRefused = false;
+                if (imageSubDrop && removeImageSubs === 'export') {
+                    const sc = IMAGE_SUB[ffstreamCodec];   // { ext, fmt } - .mks needs an explicit -f matroska; .sup auto-detects from the extension
+                    const sidecarName = imageSidecarName(ffstream, sc.ext);
+                    const sidecarPath = path.join(libDir, sidecarName);
+                    if (pathIsPresetSafe(sidecarPath)) {
+                        sidecarOut += ` -map 0:${ffstream.index} -c:s copy -f ${sc.fmt} "${sidecarPath}"`;
                         workDone += `☐${streamTag(ffstream.index)}[remove_imagesubs=export] Export image subtitle -> ${sidecarName} for external OCR (before drop)\n`;
+                    } else {
+                        exportRefused = true;
+                        response.infoLog += `☒${streamTag(ffstream.index)}[remove_imagesubs=export] Library directory contains a quote or control character - cannot write ${sidecarName} safely, keeping the subtitle\n`;
                     }
+                }
+                if (imageSubDrop && !exportRefused) {
                     workDone += `☐${streamTag(ffstream.index)}[remove_imagesubs=${removeImageSubs}] Remove image-based subtitle (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
                 } else if (subFormatDropped(ffstreamCodec)) {
@@ -1249,7 +1288,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                     //If the subtitle is a language that should be removed then remove it regardless of other settings.
                     if(subLanguage.length > 0 && !langListMatch(workLang, subLangKeys)) {
-                        workDone += `☐${streamTag(ffstream.index)}[language_sub=${logSafe(inputs.language_sub).slice(0, 200)}] Remove subtitle language (${streamLang})\n`;   // cap: this echoes the whole language_sub list once PER dropped subtitle, so an unbounded value multiplies
+                        workDone += `☐${streamTag(ffstream.index)}[language_sub=${logSafe(inputs.language_sub)}] Remove subtitle language (${streamLang})\n`;   // logSafe's own 200-char cap matters here: this echoes the whole list once PER dropped subtitle
                         delStream = true;
                     } else if (removeSubSdh === 'enabled' && isSdh(ffstream) && hasPlainSameLang(plainSubLangs, workLang)) {
                         workDone += `☐${streamTag(ffstream.index)}[remove_sub_sdh=${removeSubSdh}] Remove accessibility subtitle SDH/CC (${logSafe(roleTextLower(ffstream))})\n`;

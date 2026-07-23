@@ -11,9 +11,9 @@ const details = () => ({
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>].<lang>[.<forced|sdh|commentary|descriptive>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and language+flags sit last so Plex/Jellyfin/Emby auto-detect them.
                 \\nImport ALSO recognizes sidecars named the way those servers do, with no s<index> (e.g. <video>.en.forced.srt), anchored on the language token: the flag spellings foreign (= forced), cc and hi (= sdh) and default (ignored) are all understood, as is Emby's parenthesized description (<video>.English(Commentary).srt), which becomes the track title. hi is only read as hearing-impaired when a real language precedes it, so <video>.hi.srt stays Hindi.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
-                \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all) and skip_commentary (omit commentary tracks). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled/enabled_delete modes).
+                \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all) and skip_commentary (omit commentary tracks). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.2.1',
+    Version: '3.3.0',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -60,12 +60,12 @@ const details = () => ({
             name: 'method_deduplicate',
             type: 'string',
             defaultValue: 'enabled',
-            inputUI: { type: 'dropdown', options: ['disabled', 'enabled', 'enabled_delete'] },
+            inputUI: { type: 'dropdown', options: ['disabled', 'enabled'] },
             tooltip: `On import, how to handle sidecar files that are BYTE-IDENTICAL to each other (the same subtitle saved under more than one name/flag). Content is compared, so genuinely different tracks - two commentaries, a real forced vs a full track - are always kept separately; only exact duplicates collapse.
                 \\nImport never drops a subtitle: a sidecar whose text isn't already embedded is always muxed in (if its content already exists in the file you simply get a duplicate track, never a loss).
-                \\ndisabled       - mux every sidecar as its own track, even byte-identical copies (you may get duplicate subtitles).
-                \\nenabled        - mux one track per byte-identical group, combining their flags (a byte-identical plain + SDH pair imports once, tagged SDH). All sidecar files are left on disk.
-                \\nenabled_delete - same as enabled, and once the muxed track is confirmed embedded, delete every sidecar file that was imported/deduplicated this pass (regardless of remove_sidecar_after_import). Non-destructive: the content survives in the embedded track.`,
+                \\ndisabled - mux every sidecar as its own track, even byte-identical copies (you may get duplicate subtitles).
+                \\nenabled  - mux one track per byte-identical group, combining their flags (a byte-identical plain + SDH pair imports once, tagged SDH). Every member of the group is listed in the marker, so remove_sidecar_after_import cleans up the whole group.
+                \\nWhether the sidecar files are deleted afterwards is remove_sidecar_after_import's decision alone, in either mode.`,
         },
     ],
 });
@@ -602,18 +602,31 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return enc;
     };
 
+    // ===== SHARED [clean_and_remux, sub_worker]: preset path safety =====
+    // -=-=-= pathIsPresetSafe  [clean_and_remux, sub_worker] =-=-=-
+    // True when a real on-disk path can be embedded in a preset's quoted "${path}" token. Tdarr never shells out, but its worker tokenises each preset
+    // half with a quote-aware parser before spawning ffmpeg, so a " anywhere in the path closes the wrapper mid-token and everything after it becomes
+    // fresh argv entries (a raw control character breaks the token just as badly). The name parts WE generate are sanitised at their source, but the
+    // library DIRECTORY is a real path that has to stay literal - it can only be checked, never rewritten - so a caller that fails this test refuses
+    // that one sidecar with a ☒ line rather than emit the token.
+    const pathIsPresetSafe = (p) => !/["\x00-\x1f\x7f]/.test(String(p));
+    // ===== END SHARED: preset path safety =====
+
     // The real library path (for naming sidecars) and its directory - originalLibraryFile is the true on-disk file;
     // fall back to file.file so the plugin still works when a caller (or the test harness) omits originalLibraryFile.
     const libFilePath = otherArguments?.originalLibraryFile?.file || file.file || '';
     const libDir = path.dirname(libFilePath);
-    // Strip any " / control char from the source basename: it is interpolated into the quoted "${full}" sidecar path in the extract preset, where a " would close the
-    // quote and inject ffmpeg args (lang/disp/ext are separately safe). We create these files, so sanitising is safe; parseSidecar reads the sanitised name back unchanged.
+    // Strip any " / control char from the source basename: it is interpolated into the quoted "${full}" sidecar path in the extract preset, where a " would
+    // close the quote and inject ffmpeg args (lang/disp/ext are separately safe). We create these files, so sanitising is safe; parseSidecar reads the
+    // sanitised name back unchanged. The library DIRECTORY it is joined to is NOT sanitised - it has to stay literal - so both write paths CHECK the full
+    // joined path with pathIsPresetSafe and skip that sidecar when it fails.
     const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '');
 
-    // ===== SHARED [clean_and_remux, sub_worker]: language display name =====
-    // -=-=-= langDisplayName  [clean_and_remux, sub_worker] =-=-=-
-    // Memoised ICU DisplayNames (built once, reused): the recognised English name for an ALREADY-normalised language code, or '' for a non-language/unrecognised code. A
-    // fresh ICU instance per call is wasteful. Each caller normalises the token first - clean_and_remux via shortLang (tag recognition), sub_worker via langKey (sidecar).
+    // ===== SHARED [audio_clean, clean_and_remux, sub_worker]: language display name =====
+    // -=-=-= langDisplayName  [audio_clean, clean_and_remux, sub_worker] =-=-=-
+    // Memoised ICU DisplayNames (built once, reused): the recognised English name for an ALREADY-normalised language code, or '' for a non-language/unknown
+    // code. A fresh ICU instance per call is wasteful. Each caller normalises the token first - clean_and_remux via shortLang (tag recognition), audio_clean
+    // and sub_worker via langKey (free-text language-list validation / sidecar name recognition).
     const langDisplayName = (() => {
         let dn = null;
         return (code) => { try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(code) || ''; } catch (e) { return ''; } };
@@ -721,7 +734,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams)) failFile('No ffProbe stream data available, cannot process this file');
     const mode = String(inputs.mode);
     if (mode !== 'extract' && mode !== 'import') failFile(`[mode=${mode}] invalid value, check your settings`);
-    if (!['disabled', 'enabled', 'enabled_delete'].includes(String(inputs.method_deduplicate))) failFile(`[method_deduplicate=${inputs.method_deduplicate}] invalid value, check your settings`);
+    // method_deduplicate normalizer: lower-cases, and silently folds the accepted legacy value 'enabled_delete' -> 'enabled'. Deletion is
+    // remove_sidecar_after_import's decision alone, and the marker already lists every member of a dedup group, so the legacy value never added a
+    // capability of its own; it is accepted but NOT offered - it stays out of the dropdown's options list. The fold is required, not cosmetic: the
+    // check below FAILS the file on an unknown value, so a value already persisted in a Tdarr library config must keep validating. The failFile
+    // message shows the RAW inputs value.
+    const normDedupe = (v) => { const s = String(v || 'enabled').toLowerCase().trim(); return s === 'enabled_delete' ? 'enabled' : s; };
+    const dedupeMode = normDedupe(inputs.method_deduplicate);
+    if (!['disabled', 'enabled'].includes(dedupeMode)) failFile(`[method_deduplicate=${inputs.method_deduplicate}] invalid value, check your settings`);
     if (file.fileMedium && file.fileMedium !== 'video') { response.infoLog += '☑Not a video file - skipping\n'; return response; }
 
     const streams = file.ffProbeData.streams;
@@ -729,7 +749,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const skipCommentary = String(inputs.skip_commentary) === 'true';
     const removeAfterExtract = String(inputs.remove_after_extract) === 'true';
     const removeSidecarAfterImport = String(inputs.remove_sidecar_after_import) === 'true';
-    const dedupeMode = String(inputs.method_deduplicate);
     const dstContainer = String(file.container || '').toLowerCase().trim();
     const isMp4 = isMp4Family(dstContainer);   // shared checker; cached once for this container
     // Preserve Dolby Vision's dvcC/dvvC boxes on either -c copy remux below (see dvStrictMp4Arg) - a plain copy of a DV HEVC/AV1 stream drops them,
@@ -754,11 +773,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 && !(skipCommentary && isCommentary(s)) && !(langFilter && !langFilter.has(langKey(resolveLang(s) || 'und'))));
             if (!eligible.length) { response.infoLog += '☑No text subtitles to extract\n'; return response; }
 
-            let sidecarOut = ''; const removeIdx = []; let wrote = 0; let skipped = 0;
+            let sidecarOut = ''; const removeIdx = []; let wrote = 0; let skipped = 0; let unsafe = 0;
             for (const s of eligible) {
                 const { enc } = TEXT_SUB[String(s.codec_name).toLowerCase()];
                 const name = sidecarBasename(s);
                 const full = path.join(libDir, name);
+                // The path goes into the quoted "${full}" token of the extract preset, so it has to survive Tdarr's quote-aware tokenizer
+                // (pathIsPresetSafe). Only the library directory can fail that - the name we build is already sanitised - and a directory has to stay
+                // literal, so the extract is skipped instead. The stream is NOT pushed to removeIdx either: a refused extract must never strip the
+                // embedded track, which would then be the only remaining copy.
+                if (!pathIsPresetSafe(full)) {
+                    unsafe += 1;
+                    response.infoLog += `☒${streamTag(s.index)} Library directory contains a quote or control character - cannot write ${name} safely, keeping the embedded subtitle\n`;
+                    continue;
+                }
                 // An existing sidecar is preserved (never overwrite a user's on-disk edits) - but only if it has content. A 0-byte sidecar is the fingerprint of a
                 // prior extract ffmpeg aborted mid-write; trusting it and then stripping the embedded source would lose the subtitle, so re-extract it instead.
                 const existsNonEmpty = fs.existsSync(full) && (() => { try { return fs.statSync(full).size > 0; } catch { return false; } })();
@@ -767,7 +795,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (removeAfterExtract) removeIdx.push(s.index);
             }
             if (titleTruncated) response.infoLog += '☒A subtitle title was too long for the filename and was truncated\n';
-            if (!wrote && !removeIdx.length) { response.infoLog += '☑All eligible subtitles already extracted\n'; return response; }
+            if (!wrote && !removeIdx.length) { response.infoLog += unsafe ? '☒No subtitle could be extracted safely\n' : '☑All eligible subtitles already extracted\n'; return response; }
 
             let out = `${sidecarOut} -map 0`;
             for (const idx of removeIdx) out += ` -map -0:${idx}`;
@@ -796,16 +824,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .filter((f) => !(skipCommentary && (f.dispTokens.includes('commentary') || matchesKeyword(String(f.title || '').toLowerCase(), dispositionTypes.comment.keywords))));
         if (!found.length) { response.infoLog += '☑No subtitle sidecars found to import\n'; return response; }
 
-        // Sidecars are removed only after their content is confirmed embedded: remove_sidecar_after_import deletes everything we muxed, and
-        // method_deduplicate=enabled_delete additionally forces removal of every file consumed this pass (dedup group members included), regardless.
-        const deleteConfirmed = removeSidecarAfterImport || dedupeMode === 'enabled_delete';
-        // Which toggle triggered the delete, for the log tag: remove_sidecar_after_import is the direct "delete after import"; otherwise it is method_deduplicate=enabled_delete.
-        const delReason = removeSidecarAfterImport ? 'remove_sidecar_after_import=true' : 'method_deduplicate=enabled_delete';
+        // Sidecars are removed only after their content is confirmed embedded, and remove_sidecar_after_import is the ONLY control over that: it deletes every
+        // file we muxed this pass, dedup group members included (the marker lists all of them), so no dedup setting has a say in deletion.
+        const deleteConfirmed = removeSidecarAfterImport;
+        const delReason = 'remove_sidecar_after_import=true';   // the single toggle behind every delete line below
         // Confirm each marker-listed sidecar against the CURRENT file's streams before unlinking it: only delete when an embedded subtitle stream matches its language +
         // title (the identity our own import writes). On an mp4/mov target the container DROPS per-stream subtitle titles on the -c copy mux, so a re-probe can't see the
         // title - there we confirm on LANGUAGE alone (else a titled sidecar we DID embed never matches its now-title-less stream, so its cleanup silently never runs). A
-        // forged awk_sub_worker marker - a file that arrived already tagged but was never muxed by us - can otherwise make enabled_delete / remove_sidecar_after_import
-        // unlink on-disk sidecars never embedded; the marker VALUE (basenames we listed this/last pass) still scopes deletion, so the forged-marker guard holds on mp4 too.
+        // forged awk_sub_worker marker - a file that arrived already tagged but was never muxed by us - can otherwise make remove_sidecar_after_import
+        // unlink on-disk sidecars never embedded; the marker VALUE (basenames we listed this/last pass) still scopes deletion, so the forged-marker
+        // guard holds on mp4 too.
         // A false negative merely keeps the sidecar (a later pass, or the user, removes it) - it never re-adds or loses subtitle content - so this fails safe.
         const embeddedSubs = streams.filter((s) => (s.codec_type || '').toLowerCase() === 'subtitle');
         const markerConfirmsEmbedded = (f) => embeddedSubs.some((s) =>
@@ -827,10 +855,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // sidecar just because an embedded sub shares its lang|title|disposition - metadata can't prove same content, and dropping a distinct track is
         // data loss, whereas a redundant duplicate is not. Genuine duplication is collapsed by CONTENT instead (method_deduplicate, below).
         const existingSubCount = embeddedSubs.length;   // same subtitle-stream filter already computed above (streams is unchanged since)
-        // The import muxes each sidecar as -i "${libDir}/${name}"; a " or control char in that real on-disk path would close the quote and inject ffmpeg args, and unlike a
-        // name we generate it must match the file byte-for-byte, so it can't be sanitised - skip it instead (a server-native/user file we can't safely reference), never break out.
+        // The import muxes each sidecar as -i "${libDir}/${name}"; a " or control char in that real on-disk path would close the quote and inject
+        // ffmpeg args (see pathIsPresetSafe), and unlike a name we generate it must match the file byte-for-byte, so it can't be sanitised - skip it
+        // instead (a server-native/user file we can't safely reference), never break out.
         const candidates = found.filter((f) => !importedSet.has(f.name)).filter((f) => {
-            if (!/["\x00-\x1f\x7f]/.test(path.join(libDir, f.name))) return true;
+            if (pathIsPresetSafe(path.join(libDir, f.name))) return true;
             response.infoLog += `☒Skipping sidecar with an unsafe filename (contains a quote or control character), cannot import safely: ${f.name}\n`;
             return false;
         });

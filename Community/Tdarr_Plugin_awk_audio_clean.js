@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '4.1.1',
+    Version: '4.2.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -900,6 +900,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ===== END SHARED: language matching =====
 
+    // ===== SHARED [audio_clean, clean_and_remux, sub_worker]: language display name =====
+    // -=-=-= langDisplayName  [audio_clean, clean_and_remux, sub_worker] =-=-=-
+    // Memoised ICU DisplayNames (built once, reused): the recognised English name for an ALREADY-normalised language code, or '' for a non-language/unknown
+    // code. A fresh ICU instance per call is wasteful. Each caller normalises the token first - clean_and_remux via shortLang (tag recognition), audio_clean
+    // and sub_worker via langKey (free-text language-list validation / sidecar name recognition).
+    const langDisplayName = (() => {
+        let dn = null;
+        return (code) => { try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(code) || ''; } catch (e) { return ''; } };
+    })();
+    // ===== END SHARED: language display name =====
+
     // ===== SHARED [clean_and_remux, audio_clean, sub_worker, stream_ordering]: dolby vision detection =====
     // -=-=-= isDolbyVisionVideo  [clean_and_remux, audio_clean, sub_worker, stream_ordering] =-=-=-
     // True when a video stream carries Dolby Vision, both-probe: a dvhe/dvh1/dvav/dva1/dav1 fourcc, a mediaInfo HDR_Format naming Dolby Vision, or an ffprobe DOVI configuration
@@ -1244,9 +1255,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // the EX copy is kept over a plain 5.1 twin, so the richer track survives regardless of source order. Not object audio (ffmpeg re-encodes the AC-3 fine), so no guard.
     const isMatrixSurroundSource = (stream) => /surround ex/i.test(mediaInfoFor(stream)?.Format_Settings_Mode || '');
 
-    // Parse + validate inputs. Order here mirrors the Inputs array in details() so the two never drift. Only type:'string' dropdowns are validated here -
-    // the two free-text inputs (language_surround, language_stereo) have no fixed option set, and there are no type:'boolean' inputs. Every checked value
-    // fails the file on an out-of-set value.
+    // Parse + validate inputs. Order here mirrors the Inputs array in details() so the two never drift, and every type:'string' input is checked (there are no
+    // type:'boolean' inputs). The dropdowns are checked against their option set; the two free-text inputs (language_stereo, language_surround) have no option
+    // set, so their tokens go through the LANGUAGE RECOGNISER instead (knownLangToken below). Every check fails the file on a bad value.
     const langSurround = String(inputs.language_surround).toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
     const langSurroundKeys = langSurround.map(langKey);     // normalised comparison keys (folds en/eng/english/en-US and 639-2/B vs /T)
     const langStereo = String(inputs.language_stereo).toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
@@ -1272,6 +1283,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const guardObjectAudio = String(inputs.guard_object_audio).trim();
     const guardOriginal = String(inputs.guard_original).trim();
 
+    // A recognised language token, given its already-folded langKey: any real language in any form (langKey folds en/eng/English/en-US/pt-BR to a base code) or
+    // a valid special/private code (und/mul/zxx/mis/qaa-qtz). Both free-text lists are checked through this because dormancy is NOT a typo net - it only fires
+    // when NOTHING matches EITHER list, so a typo in one list while the other still matches leaves that language "unlisted", where language_unlisted=stereo
+    // downmixes it and language_unlisted=delete removes it. A rejected token fails the file. Mirrors clean_and_remux's identical check on its own lists.
+    const knownLangToken = (key) => key === 'und' || key === 'mul' || key === 'zxx' || key === 'mis' || /^q[a-t][a-z]$/.test(key) || !!langDisplayName(key);
+    // The failFile message echoes the offending token capped at 200 chars: free text is unbounded and Tdarr persists the whole error message.
+    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').slice(0, 200)}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
+    for(let i = 0; i < langStereoKeys.length; i++)
+        if(!knownLangToken(langStereoKeys[i])) failLangToken('language_stereo', langStereo[i]);
+    for(let i = 0; i < langSurroundKeys.length; i++)
+        if(!knownLangToken(langSurroundKeys[i])) failLangToken('language_surround', langSurround[i]);
     if(!['surround','stereo','delete'].includes(langUnlisted))
         failFile(`[language_unlisted=${langUnlisted}] invalid value, check your settings`);
     if(!['false','replace','true'].includes(downmixToSix))
