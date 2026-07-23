@@ -9,7 +9,7 @@ const details = () => ({
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n
                      MAJOR UPGRADE - inputs were renamed/reworked, and Tdarr stores settings by input name, so on upgrade these RESET to defaults - re-check your video_clean settings: encoder->method_encoder, speed->method_speed, force_bit_depth->method_bitdepth, max_height->height_cap (value 'original'->'source'), method_hdr->hdr_mode, guard_min_bitrate->guard_shrink_bitrate (now shrink-only); the old preserve_dv is now the guard_dv toggle (default on); guard_reprocess is gone (use action=shrink); codec gained a 'source' value (keep the source codec).\n\n`,
-    Version: '3.1.1',
+    Version: '3.2.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -210,7 +210,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         hearing_impaired: { streams:['subtitle'],                 keywords: ['sdh','hearing impaired','hard of hearing','hoh','deaf'], tag: 'SDH'         },
         captions:         { streams:['subtitle'],                 keywords: ['caption','captions','cc'],                               tag: 'SDH'         },
         lyrics:           { streams:['subtitle'],                 keywords: ['songs','lyrics'],                                        tag: 'Lyrics'      },
-        forced:           { streams:['subtitle'],                 keywords: ['forced'],                                                tag: 'Forced'      },
+        forced:           { streams:['subtitle'],                 keywords: ['forced','foreign'],                                      tag: 'Forced'      },
         dub:              { streams:['audio'],                    keywords: ['dub','dubbed'],                                          tag: 'Dub'         },
         original:         { streams:['audio'],                    keywords: ['original'],                                              tag: 'Original'    },
         clean_effects:    { streams:['audio'],                    keywords: ['music and effects','music & effects','m&e','m and e'],   tag: null          },
@@ -483,7 +483,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         if (type === 'subtitle') {
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : (isSdh(s) ? '/sdh' : (isLyrics(s) ? '/lyrics' : '')));
-            const forced = s.disposition?.forced === 1 ? '/forced' : '';
+            const forced = hasDisposition(s, 'forced') ? '/forced' : '';   // flag OR title keyword, same test the classifiers use - so the summary token and the sort key can never disagree
             return `[sub:${[lang, codec].filter(Boolean).join(' ')}${def}${forced}${role}]`;
         }
         if (type === 'attachment') {
@@ -793,6 +793,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Decode is kept on software frames (nvenc via the shared nvdecPreset helper) so a single CPU scale filter and
     // -pix_fmt path work uniformly across families; VAAPI is the exception - it needs its frames uploaded, so it
     // carries an explicit device + format,hwupload filter. Returns { inputSide, videoOut }.
+    // QuickTime VIDEO containers — the single gate for every fourCC emit in this plugin, used by both the encode path and the copy path. Deliberately
+    // mp4/m4v/mov WITHOUT m4a: isMp4Family includes m4a and is right for the -movflags use_metadata_tags decision, but not for tagging a video stream.
+    const isQtVideoContainer = (container) => ['mp4', 'm4v', 'mov'].includes(container);
+
     const buildVideoArgs = ({ family, encoderName, codec, qNorm, speed, want10Bit, willDownscale, outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase }) => {
         const { getNvdecHwaccelPreset, getNvenc10BitFormatArg } = require('../methods/nvdecPreset');
         const q = nativeQuality(codec, family, qNorm);
@@ -852,7 +856,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
-        if (codec === 'hevc' && ['mp4', 'm4v', 'mov'].includes(dstContainer)) parts.push(preserveDvNoBase ? '-tag:v:0 dvh1' : '-tag:v:0 hvc1');   // hvc1 = Apple/QuickTime HEVC-in-mp4 (primary only); a no-base DV (e.g. profile 5) needs dvh1 or the DV box is dropped
+        if (codec === 'hevc' && isQtVideoContainer(dstContainer)) parts.push(preserveDvNoBase ? '-tag:v:0 dvh1' : '-tag:v:0 hvc1');   // hvc1 = Apple/QuickTime HEVC-in-mp4 (primary only); a no-base DV (e.g. profile 5) needs dvh1 or the DV box is dropped. Encode path tags hevc ONLY — see mp4Tag for why it and the copy path differ
         const vfArg = vf.length ? ` -filter:v:0 "${vf.join(',')}"` : '';   // :v:0 - filtering a copied secondary video stream would error
         return { inputSide, videoOut: `${parts.filter(Boolean).join(' ')}${vfArg}` };
     };
@@ -995,14 +999,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // ---- shared emit helpers ----
         const coverArtDrops = videoStreams.filter((s) => isCoverArt(s)).map((s) => ` -map -0:${s.index}`).join('');   // drop embedded cover-art/still-image "video" streams from any output
-        const mp4Tag = (cn) => (isMp4Family(dstContainer) ? ({ hevc: ' -tag:v:0 hvc1', av1: ' -tag:v:0 av01', h264: ' -tag:v:0 avc1' }[cn] || '') : '');   // Apple/QuickTime fourCC for a copied/encoded stream
+        // Apple/QuickTime fourCC for a COPIED stream. Gated on isQtVideoContainer, not isMp4Family: the shared block states video_clean's fourCC gate is
+        // deliberately mp4/m4v/mov WITHOUT m4a, and reusing isMp4Family here silently broke that guarantee. The CODEC COVERAGE difference against the encode
+        // path below is intentional and must stay: this path copies an arbitrary source codec (so it maps all three), while the encode path only ever emits a
+        // fourCC for hevc and picks dvh1-vs-hvc1 from whether the DV RPU survives — a choice a copy cannot make. Do not merge the two.
+        const mp4Tag = (cn) => (isQtVideoContainer(dstContainer) ? ({ hevc: ' -tag:v:0 hvc1', av1: ' -tag:v:0 av01', h264: ' -tag:v:0 avc1' }[cn] || '') : '');
         const keptStreams = () => file.ffProbeData.streams.filter((s) => !(isCoverArt(s) && (s.codec_type || '').trim().toLowerCase() === 'video'));   // input streams minus dropped cover-art video
         // Lossless dynamic-HDR strip: -c:v copy + a bitstream filter, no re-encode. dovi_rpu strips DV (HEVC + AV1); hevc_metadata removes HDR10+ (HEVC only). The stream stays the source
         // codec/res/depth with its HDR10 base retained, so it needs no awk_video fence (once stripped it is no longer dynamic-HDR, so a re-run is a natural no-op). On mp4 the fourCC is reset (dvh1 -> hvc1).
         const emitLosslessStrip = () => {
             const bsf = dvSignal ? 'dovi_rpu=strip=1' : 'hevc_metadata=remove_hdr10plus=1';
             response.infoLog += `☐${streamTag(primary.index)}[hdr_mode=strip_dynamic] Stripping ${dvSignal ? dvLabel : 'HDR10+'} losslessly (-c:v copy, base HDR10 retained)\n`;
-            const out = `-map 0 -c copy -bsf:v:0 ${bsf}${coverArtDrops}${mp4Tag(srcCodecName)} -c:a copy -c:s copy${globalOutputOpt}`;
+            let out = `-map 0 -c copy -bsf:v:0 ${bsf}${coverArtDrops}${mp4Tag(srcCodecName)} -c:a copy -c:s copy${globalOutputOpt}`;
+            if (isMp4Family(dstContainer)) out += ' -movflags use_metadata_tags';   // same as the transcode path: keep sibling plugins' GLOBAL awk_* markers through an mp4/mov copy
             response.preset = `,${out}`;   // no input-side args
             response.processFile = true;
             response.infoLog += `☑Expected results: ${keptStreams().map((s) => summariseStream(enrichStream(s))).join('')}\n`;
