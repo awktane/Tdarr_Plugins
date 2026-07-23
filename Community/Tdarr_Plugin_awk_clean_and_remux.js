@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.3.0',
+    Version: '4.3.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -913,6 +913,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const pathIsPresetSafe = (p) => !/["\x00-\x1f\x7f]/.test(String(p));
     // ===== END SHARED: preset path safety =====
 
+    // ===== SHARED [clean_and_remux, sub_worker]: font attachment test =====
+    // -=-=-= isFontAttachment  [clean_and_remux, sub_worker] =-=-=-
+    // True when an attachment stream is an embedded font. Identified three ways because older builds report codec_name 'none'/'unknown' for a font:
+    // the ttf/otf codec name, a font mimetype, or a font filename extension. Read by clean_and_remux's attachmentKind (orphaned-font removal) and
+    // sub_worker's styled-subtitle .mks bundle (the fonts that must travel with an extracted ASS/SSA so its styling survives the round-trip).
+    const isFontAttachment = (s) => {
+        const mime  = (s.tags?.mimetype || '').trim().toLowerCase();
+        const fname = (s.tags?.filename || '').trim().toLowerCase();
+        const ext   = fname.includes('.') ? fname.slice(fname.lastIndexOf('.') + 1) : '';
+        return ['ttf', 'otf'].includes((s.codec_name || '').trim().toLowerCase()) || isFontMime(mime) || FONT_EXTS.includes(ext);
+    };
+    // ===== END SHARED: font attachment test =====
+
     // Hidden dot-prefixed sidecar name for an exported image subtitle: ".<video>.s<index>.<lang>[.forced].<ext>". The leading dot makes Plex/Jellyfin ignore it (Jellyfin
     // skips **/.* ; Plex ignores .sup/.mks by extension). Emby is the exception - it scans dot-prefixed files, so an exported .mks needs a .embyignore entry there
     // (called out in the remove_imagesubs tooltip). Both metadata-derived name parts are made safe for the quoted "${path}" in the export preset: lang is
@@ -1036,10 +1049,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (IMAGE_CODECS.includes(codec) || mime.startsWith('image/')
             || ['jpg', 'jpeg', 'jpe', 'jfif', 'png', 'apng', 'gif', 'bmp', 'webp', 'tif', 'tiff', 'jp2', 'avif', 'heic'].includes(ext))
             return 'image';
-        const fontMime = isFontMime(mime);
-        if (['ttf', 'otf'].includes(codec) || fontMime
-            || FONT_EXTS.includes(ext))
-            return 'font';
+        if (isFontAttachment(s)) return 'font';
         return 'other';
     };
 
@@ -1503,8 +1513,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // fonts if any such subtitle survives in the output; otherwise they are orphaned and removed. mp4 output never keeps fonts: ASS/SSA are converted to
         // mov_text (which needs no fonts) and mp4 cannot carry font attachments anyway, so dstContainer gates this to mkv. The source codec is read from
         // ffProbeData (it is still 'ass'/'ssa' there even when converted), which is why the mkv gate — not just the survivor check — is required.
-        // NOTE: if awk_sub_worker extracted a styled subtitle to a sidecar (remove_after_extract) and this plugin runs before the reimport, the ASS/SSA is gone from
-        // the container so its fonts read as orphaned and are removed here - reimport styled subs before an intervening clean_and_remux pass to keep their fonts.
+        // A styled subtitle extracted by awk_sub_worker takes its fonts with it (they ride along in its .mks bundle and come back on reimport), so an ASS/SSA
+        // missing from the container genuinely means these fonts are orphaned - removing them is correct wherever this plugin sits in the stack.
         if (deferredFontIndices.length > 0) {
             const fontsNeeded = dstContainer === 'mkv' && file.ffProbeData.streams.some(s =>
                 (s.codec_type || '').toLowerCase() === 'subtitle'
