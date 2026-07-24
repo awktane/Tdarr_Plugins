@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.3.2',
+    Version: '4.3.3',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -198,10 +198,6 @@ const details = () => ({
             tooltip: `An EARLY WARNING for multi-language files whose original language isn't marked. audio_clean is what actually keeps or drops audio by language, but it can only trust a track marked 'original' - it has no way to tell which of several untagged languages is the real original. This checks for that risk here, BEFORE the remux, so a file that needs your attention costs you nothing to find out about.
                 \\nWhen enabled: if the file has MORE THAN ONE audio language among its genuine (non-commentary/descriptive) tracks and NO audio track is marked original (the ffmpeg 'original' disposition flag, or an "original" keyword in the title/handler), the file is aborted to the error queue. Mark the original track and requeue - audio_clean's guard_original can then protect it.
                 \\nLanguages are compared folded, so en/eng/English/en-US count as one; an untagged track counts as its own "und" language. A file with a single audio language, or one that already marks its original, passes untouched.
-                \\n=====
-                \\nActions
-                \\n=====
-                \\nIf enabled  - abort a multi-language file that marks no original, so you can tag it before audio_clean acts on it.
                 \\nIf disabled - (Default) no check; audio_clean handles whatever it finds.`,
         },
         {
@@ -721,8 +717,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const tagDisposition = String(inputs.tag_disposition || 'disabled').toLowerCase();
     const tagTitle = String(inputs.tag_title || 'disabled').toLowerCase();
     const applies = (opt, type) => opt === 'both' || opt === type;
-    const metaCommentRemove = String(inputs.remove_comments) === 'true';
-    const metaBusyTitleRemove = String(inputs.remove_busytitle) === 'true';
+    const removeComments = String(inputs.remove_comments) === 'true';
+    const removeBusytitle = String(inputs.remove_busytitle) === 'true';
     const removeImageSubs = String(inputs.remove_imagesubs || 'unsupported').toLowerCase();
 
     const fillLanguage = (inputs.language_fill ? inputs.language_fill.toLowerCase().trim() : '');
@@ -753,8 +749,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // code) or a valid special/private code (und/mul/zxx/mis/qaa-qtz, mirroring isNonLang). Both free-text language inputs are checked through this, so
     // an unrecognised token (typo/garbage) fails the file rather than silently changing which streams survive.
     const knownLangToken = (key) => key === 'und' || key === 'mul' || key === 'zxx' || key === 'mis' || /^q[a-t][a-z]$/.test(key) || !!langName(key);
+    // ===== SHARED [audio_clean, clean_and_remux]: language token failure =====
+    // -=-=-= failLangToken  [audio_clean, clean_and_remux] =-=-=-
     // The failFile message echoes the offending token capped at 200 chars: free text is unbounded and Tdarr persists the whole error message.
     const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').slice(0, 200)}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
+    // ===== END SHARED: language token failure =====
     // Value checks continue in Inputs order (container already checked above), with ONE deliberate exception: language_sub's tokens are checked before the
     // language_fill/language_sub cross-check, which can only give a sensible message once both lists are known-good. Then the remaining dropdowns are checked
     // against their option set (boolean inputs need no check - see above).
@@ -1057,7 +1056,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Classify an attachment stream so we only ever remove things we can positively identify:
     //   'image' - cover art / poster (mjpeg/png/gif/bmp, image/* mimetype, or an image filename). Always removed.
     //   'font'  - an embedded font (ttf/otf codec, a font mimetype, or a font filename extension). Removed ONLY when nothing in the output uses it (no
-    //             surviving ASS/SSA subtitle). Key fix: older ffmpeg builds report codec_name 'none'/'unknown' for fonts, so we also ID by filename/mimetype,
+    //             surviving ASS/SSA subtitle). Older ffmpeg builds report codec_name 'none'/'unknown' for fonts, so we also ID by filename/mimetype,
     //             and never delete a font while a styled subtitle still needs it.
     //   'other' - anything unidentifiable (a bare 'none'/'unknown', no font/image signal). Left untouched - could be anything, never safe to remove.
     const attachmentKind = (s) => {
@@ -1176,7 +1175,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             failFile(`[language_fill_mode=${fillMode}] ${untaggedSubs} subtitle streams have no language tag and would all be assigned "${fillLanguage}" by language_fill - may be different languages; tag them manually and requeue, or set language_fill_mode=force-any`);
     }
 
-    // Set up required variables.
     let extraArguments = '';
     let sidecarOut = '';   // remove_imagesubs=export: accumulates the per-image-sub sidecar outputs, prepended to the main output in the preset below.
     let fflags = '';
@@ -1193,6 +1191,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // subCodecOverride: input stream position -> converted subtitle codec ('srt' / 'mov_text').
     const removedIndices = new Set();
     const subCodecOverride = new Map();
+    // Drop one input stream. The three writes are NOT independent: removedIndices is the sole input to the "Expected results" summary filter and to the
+    // orphaned-font survivor test, so a drop site that maps a stream out without recording it makes the summary advertise a stream the command deletes.
+    // Per-branch extras (a stream-index decrement, videoDropped, the continue) stay at the call site.
+    const dropStream = (index) => {
+        extraArguments += ` -map -0:${index}`;
+        removedIndices.add(index);
+        convert = true;
+    };
 
     // Font attachments whose removal is deferred until after the main loop, when we know which subtitle streams survive. Decided here (not inline) because an
     // attachment can appear before its subtitles in the file, so we cannot know whether a styled subtitle survives at the moment we reach the attachment.
@@ -1243,7 +1249,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Busy-title removal (audio/subtitle): once tag_disposition (above) has captured any role keywords into the real flags, clear an over-dotted title so
             // tag_title (below) re-names it by the usual rules - it drops in and is treated as a blank title (an empty base becomes the channel label). Returns the title.
             const clearBusyTitle = (title, titleCauses) => {
-                if (metaBusyTitleRemove && tooManyPeriods(title)) {
+                if (removeBusytitle && tooManyPeriods(title)) {
                     titleCauses.push('remove_busytitle=true');
                     return '';
                 }
@@ -1271,7 +1277,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
             // remove_comments (audio/subtitle/video): drop a stream comment tag (players rarely show it). Guard + output mirror the handler_name emitter above.
             const emitCommentRemoval = (typeLetter, idx, typeWord) => {
-                if (metaCommentRemove === true && (ffstream.tags?.comment || ffmedia?.Comment)) {
+                if (removeComments === true && (ffstream.tags?.comment || ffmedia?.Comment)) {
                     workDone += `☐${streamTag(ffstream.index)}[remove_comments=true] Remove comment (${typeWord}) "${logSafe(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "comment="`;
                 }
@@ -1283,7 +1289,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 // Image subs (PGS/VobSub/DVB) are governed by remove_imagesubs: 'unsupported' drops them only where the container can't carry them (mp4), 'all' drops them
                 // from any container, 'export' saves each to a hidden dot-prefixed sidecar (PGS->.sup, VobSub/DVB->.mks, both ignored by Plex/Jellyfin) before dropping.
-                // Non-image subs the container can't carry (ttml/eia_608/xsub/dvb_teletext, or mp4 arib/hdmv_text) are dropped by subFormatDropped as before. A kept image
+                // Non-image subs the container can't carry (ttml/eia_608/xsub/dvb_teletext, or mp4 arib/hdmv_text) are dropped by subFormatDropped. A kept image
                 // sub (unsupported + carriable) and every non-image sub then fall through to the language/accessibility filters below.
                 // remove_imagesubs = all/export drops the image sub explicitly; export first saves a hidden dot-prefixed sidecar for external OCR. The
                 // export has to SUCCEED for the drop to be safe (the sidecar is the only surviving copy), so when the joined path can't be embedded in the
@@ -1341,9 +1347,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 if(delStream === true) {
                     //Deleting the stream so including metadataCommand will cause problems
-                    extraArguments += ` -map -0:${ffstream.index}`;
-                    removedIndices.add(ffstream.index);
-                    convert = true;
+                    dropStream(ffstream.index);
                     subtitleStreamIndex--;
                     continue;
                 }
@@ -1389,11 +1393,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
 
-                if (metadataCommand !== '') {
-                    extraArguments += metadataCommand;
-                    convert = true;
-                    continue;
-                }
             } else if(ffstreamType === 'audio') {
                 //Start with zero based index for audio streams. This is only used when changing metadata.
                 audioStreamIndex++;
@@ -1432,11 +1431,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 emitCommentRemoval('a', audioStreamIndex, 'audio');
 
-                if (metadataCommand !== '') {
-                    extraArguments += metadataCommand;
-                    convert = true;
-                    continue;
-                }
             } else if(ffstreamType === 'video') {
                 //Start with zero based index for video streams. This is only used when changing metadata.
                 videoStreamIndex++;
@@ -1444,9 +1438,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const isImageCodec = IMAGE_CODECS.includes(ffstreamCodec);
                 if (isCoverArt(ffstream)) {
                     workDone += `☐${streamTag(ffstream.index)} Remove ${isImageCodec ? 'image' : 'cover-art/thumbnail'} (${ffstreamType}-${ffstreamCodec})\n`;
-                    extraArguments += ` -map -0:${ffstream.index}`;
-                    removedIndices.add(ffstream.index);
-                    convert = true;
+                    dropStream(ffstream.index);
                     videoDropped++;
                     videoStreamIndex--;
                     continue;
@@ -1481,25 +1473,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 emitCommentRemoval('v', videoStreamIndex, 'video');
 
-                if(metaBusyTitleRemove === true && (tooManyPeriods(ffstream.tags?.title ?? '') || tooManyPeriods(ffmedia?.Title ?? ''))) {
+                if(removeBusytitle === true && (tooManyPeriods(ffstream.tags?.title ?? '') || tooManyPeriods(ffmedia?.Title ?? ''))) {
                     workDone += `☐${streamTag(ffstream.index)}[remove_busytitle=true] Remove title (video) "${logSafe((ffstream.tags?.title ?? '').trim())}" and "${logSafe((ffmedia?.Title ?? '').trim())}"\n`;
                     metadataCommand += ` -metadata:s:v:${videoStreamIndex} "title="`;
                 }
 
                 emitHandlerMeta('v', videoStreamIndex, 'video', 'VideoHandler', ' as it can cause problems for titles in mkv');
 
-                if (metadataCommand !== '') {
-                    extraArguments += metadataCommand;
-                    convert = true;
-                    continue;
-                }                
             } else if(ffstreamType === 'attachment') {
                 const kind = attachmentKind(ffstream);
                 if (kind === 'image') {
                     workDone += `☐${streamTag(ffstream.index)} Remove cover-art attachment (${ffstreamType}-${ffstreamCodec})\n`;
-                    extraArguments += ` -map -0:${ffstream.index}`;
-                    removedIndices.add(ffstream.index);
-                    convert = true;
+                    dropStream(ffstream.index);
                     continue;
                 }
                 if (kind === 'font') {
@@ -1512,17 +1497,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // lose it - the whole remux fails.
                 if (dstContainer === 'mp4') {
                     workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Remove attachment mp4 can't carry (${ffstreamType}-${ffstreamCodec})\n`;
-                    extraArguments += ` -map -0:${ffstream.index}`;
-                    removedIndices.add(ffstream.index);
-                    convert = true;
+                    dropStream(ffstream.index);
                     continue;
                 }
             } else if ((ffstreamType === 'data') || ['data','bin_data','tmcd'].includes(ffstreamCodec)) {
                 workDone += `☐${streamTag(ffstream.index)} Remove data stream (${ffstreamType}-${ffstreamCodec})\n`;
-                extraArguments += ` -map -0:${ffstream.index}`;
-                removedIndices.add(ffstream.index);
-                convert = true;
+                dropStream(ffstream.index);
                 continue;
+            }
+
+            // Flush this stream's queued metadata edits. metadataCommand is per-iteration (declared above), and only the subtitle/audio/video branches
+            // append to it, so reaching here from any other branch flushes nothing. Every branch that must NOT flush - a stream being deleted, a subtitle
+            // conversion that emits its own -c:s alongside the metadata, a removal - has already `continue`d past this point.
+            if (metadataCommand !== '') {
+                extraArguments += metadataCommand;
+                convert = true;
             }
 
             //Any other stream type (e.g. an unrecognised attachment classified as 'other') is left untouched - remove it with a separate plugin if needed.
@@ -1545,9 +1534,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const fontStream = file.ffProbeData.streams.find(s => s.index === idx);
                     const fname = (fontStream?.tags?.filename || '').trim();
                     workDone += `☐${streamTag(idx)} Remove orphaned font attachment (no ASS/SSA subtitle uses it)${fname ? ` "${logSafe(fname)}"` : ''}\n`;
-                    extraArguments += ` -map -0:${idx}`;
-                    removedIndices.add(idx);
-                    convert = true;
+                    dropStream(idx);
                 }
             }
         }
@@ -1555,20 +1542,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if(videoDropped > 0 && videoStreamIndex === -1)
             failFile('Removing the specified streams would leave the file with no video streams - check your removal settings');
 
-        //Now the file level metadata can be cleaned up if needed.
-        if((metaCommentRemove === true) && file.ffProbeData.format?.tags?.comment) {
+        if((removeComments === true) && file.ffProbeData.format?.tags?.comment) {
             workDone += `☐[remove_comments=true] Remove comment from file "${logSafe(file.ffProbeData.format?.tags?.comment)}"\n`;
             extraArguments += ` -metadata "comment="`;
             convert = true;
         }
 
-        if((metaBusyTitleRemove === true) && tooManyPeriods(file.ffProbeData.format?.tags?.title ?? '')) {
+        if((removeBusytitle === true) && tooManyPeriods(file.ffProbeData.format?.tags?.title ?? '')) {
             workDone += `☐[remove_busytitle=true] Remove title from file "${logSafe((file.ffProbeData.format?.tags?.title ?? '').trim())}"\n`;
             extraArguments += ` -metadata "title="`;
             convert = true;
         }
 
-        //Check if remuxing is required due to container change
         if (srcContainer !== dstContainer) {
             workDone += `☐[container=${dstContainer}] Remux file from ${srcContainer}\n`;
             convert = true;
@@ -1630,7 +1615,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             extraArguments += ` -metadata "awk_recovered=${recoverIntent}"`;
         }
 
-        //Convert file if convert variable is set to true.
         if (convert === true) {
             // mp4/mov drops GLOBAL custom tags on a -c copy remux unless use_metadata_tags is set - this plugin's own awk_recovered AND any awk_video/awk_sub_worker
             // written by a sibling plugin. Add it for EVERY mp4 remux (not just recovery ones), matching the other four plugins, so those markers survive. This plugin

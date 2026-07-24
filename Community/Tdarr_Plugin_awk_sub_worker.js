@@ -14,7 +14,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all) and skip_commentary (omit commentary tracks). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.6.1',
+    Version: '3.6.2',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -63,7 +63,6 @@ const details = () => ({
             defaultValue: 'enabled',
             inputUI: { type: 'dropdown', options: ['disabled', 'enabled'] },
             tooltip: `On import, how to handle sidecar files that are BYTE-IDENTICAL to each other (the same subtitle saved under more than one name/flag). Content is compared, so genuinely different tracks - two commentaries, a real forced vs a full track - are always kept separately; only exact duplicates collapse.
-                \\nImport never drops a subtitle: a sidecar whose text isn't already embedded is always muxed in (if its content already exists in the file you simply get a duplicate track, never a loss).
                 \\ndisabled - mux every sidecar as its own track, even byte-identical copies (you may get duplicate subtitles).
                 \\nenabled  - mux one track per byte-identical group, combining their flags (a byte-identical plain + SDH pair imports once, tagged SDH). Every member of the group is listed in the marker, so remove_sidecar_after_import cleans up the whole group.
                 \\nWhether the sidecar files are deleted afterwards is remove_sidecar_after_import's decision alone, in either mode.`,
@@ -593,33 +592,37 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // extract: one canonical token per role the stream's real flags carry (sdh covers hearing_impaired OR captions), deduped.
     const dispTokensOf = (s) => DISPOSITIONS.filter((d) => d.flags.some((f) => s.disposition?.[f] === 1)).map((d) => d.token);
 
-    // Reversibly encode a title into one filesystem-safe, dot-free filename token (Windows u Linux u Mac): keep a
-    // conservative readable set as-is, percent-encode every other char's UTF-8 bytes (covers . / \ : * ? " < > | %
-    // and non-ASCII). decodeTitle is the exact inverse.
-    const TITLE_SAFE = /[A-Za-z0-9 _()',!&+=@#-]/;
-    const encodeTitle = (t) => {
+    // One reversible percent-codec behind both filename-ish tokens this plugin writes. A char in the caller's `safe` set passes through; every other char's
+    // UTF-8 bytes become uppercase %XX. pctDecode is the exact inverse, and validates the two hex digits so malformed input (a hand-edited or foreign marker)
+    // round-trips unchanged rather than decoding to a NUL byte - a mangled name then simply matches no sidecar, which is the safe outcome.
+    const pctEncode = (str, safe) => {
         let out = '';
-        for (const ch of String(t)) {
-            if (TITLE_SAFE.test(ch)) { out += ch; continue; }
+        for (const ch of String(str)) {
+            if (safe.test(ch)) { out += ch; continue; }
             for (const b of Buffer.from(ch, 'utf8')) out += `%${b.toString(16).toUpperCase().padStart(2, '0')}`;
         }
         return out;
     };
-    const decodeTitle = (t) => {
+    const pctDecode = (str) => {
+        const s = String(str);
         const bytes = [];
-        for (let i = 0; i < t.length; i += 1) {
-            if (t[i] === '%' && i + 2 < t.length && /^[0-9A-Fa-f]{2}$/.test(t.slice(i + 1, i + 3))) { bytes.push(parseInt(t.slice(i + 1, i + 3), 16)); i += 2; }
-            else for (const b of Buffer.from(t[i], 'utf8')) bytes.push(b);
+        for (let i = 0; i < s.length; i += 1) {
+            if (s[i] === '%' && i + 2 < s.length && /^[0-9A-Fa-f]{2}$/.test(s.slice(i + 1, i + 3))) { bytes.push(parseInt(s.slice(i + 1, i + 3), 16)); i += 2; }
+            else for (const b of Buffer.from(s[i], 'utf8')) bytes.push(b);
         }
         return Buffer.from(bytes).toString('utf8');
     };
-    // The import marker's VALUE carries the sidecar basenames muxed in the most-recent pass, encoded to [A-Za-z0-9%]
-    // (nothing escMeta touches, no comma) and comma-joined - a GLOBAL tag value survives every container (incl. mp4,
-    // which drops per-stream title/default), so pass 2 deletes exactly what pass 1 embedded without re-reading metadata.
-    const encodeMarker = (s) => Array.from(Buffer.from(String(s), 'utf8')).map((b) => (/[A-Za-z0-9]/.test(String.fromCharCode(b)) ? String.fromCharCode(b) : `%${b.toString(16).toUpperCase().padStart(2, '0')}`)).join('');
-    const decodeMarker = (s) => { const b = []; for (let i = 0; i < s.length; i += 1) { if (s[i] === '%') { b.push(parseInt(s.slice(i + 1, i + 3), 16)); i += 2; } else b.push(s.charCodeAt(i)); } return Buffer.from(b).toString('utf8'); };
+    // The two safe sets. TITLE_SAFE keeps a title readable in one filesystem-safe, dot-free filename token (safe on Windows, Linux and Mac alike) - the rest
+    // (. / \ : * ? " < > | % and non-ASCII) is encoded, the dot because it is the sidecar name's field separator.
+    // MARKER_SAFE is stricter: the import marker's VALUE carries the sidecar basenames muxed in the most-recent pass, so it must survive escMeta and carry no
+    // comma (the list separator). A GLOBAL tag value survives every container (incl. mp4, which drops per-stream title/default), so pass 2 deletes exactly what
+    // pass 1 embedded without re-reading metadata.
+    const TITLE_SAFE = /[A-Za-z0-9 _()',!&+=@#-]/;
+    const MARKER_SAFE = /[A-Za-z0-9]/;
+    const encodeTitle = (t) => pctEncode(t, TITLE_SAFE);
+    const encodeMarker = (s) => pctEncode(s, MARKER_SAFE);
     const encodeMarkerList = (names) => names.map(encodeMarker).join(',');
-    const decodeMarkerList = (v) => String(v || '').split(',').filter(Boolean).map(decodeMarker);
+    const decodeMarkerList = (v) => String(v || '').split(',').filter(Boolean).map(pctDecode);
     // Keep the sidecar basename under the filesystem's 255-byte cap; if the encoded title pushes it over, trim the
     // RAW title (whole chars, so UTF-8 stays valid) until it fits and flag the lossy truncation.
     let titleTruncated = false;
@@ -785,7 +788,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // of a LONGER sibling video's basename (Avatar.Extended.en.srt vs Avatar.mkv): reject it, or the shorter video would mux the sibling's subtitle. Our s<index> names keep their title.
         if (!ours && toks.length) return null;
         if (toks.length > 1) return null;                                // 0 or 1 residual token = the encoded title (our own s<index> sidecars only)
-        const title = toks.length ? decodeTitle(toks[0]) : parenTitle;
+        const title = toks.length ? pctDecode(toks[0]) : parenTitle;
         return { name, bundle, index, lang, title, ext, dispTokens, disp: [...new Set(dispTokens.map(dispFfOf).filter(Boolean))] };
     };
 
@@ -821,9 +824,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Preserve Dolby Vision's dvcC/dvvC boxes on either -c copy remux below (see dvStrictMp4Arg) - a plain copy of a DV HEVC/AV1 stream drops them,
     // demoting DV to plain HEVC/AV1.
     const dvStrictArg = dvStrictMp4Arg(dstContainer, streams);
-    // Finalize a built output-side arg string into response.preset: append the DV strict flag, then (mp4 only) -movflags use_metadata_tags so a -c copy keeps
-    // sibling plugins' global awk_* tags (awk_video/awk_recovered), then the universal output options. Shared by the extract and import branches so their tails can't drift.
-    const finishPreset = (out) => {
+    // Commit a built output-side arg string as the run: append the DV strict flag, then (mp4 only) -movflags use_metadata_tags so a -c copy keeps sibling
+    // plugins' global awk_* tags (awk_video/awk_recovered), then the universal output options - and set response.processFile, Tdarr's go/no-go switch, so
+    // calling this IS the commit point for the whole run. Shared by the extract and import branches so their tails can't drift.
+    // The stream-summary token line. The input summary and both "Expected results" summaries are meant to be the SAME view of the stream set before and
+    // after, and the two expected-results lines sit in mutually exclusive branches - so three hand-typed copies could drift in a way only one run type shows.
+    const summariseAll = (list) => list.map((s) => summariseStream(enrichStream(s))).join('');
+    const commitPreset = (out) => {
         let full = out + dvStrictArg;
         if (isMp4) full += ' -movflags use_metadata_tags';
         full += globalOutputOpt;
@@ -832,7 +839,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     try {
-        response.infoLog += `☐Input streams: ${streams.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
+        response.infoLog += `☐Input streams: ${summariseAll(streams)}\n`;
 
         if (mode === 'extract') {
             // ============= EXTRACT: embedded text subs -> sidecars (+ optional removal) =============
@@ -888,9 +895,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let out = `${sidecarOut} -map 0`;
             for (const idx of removeIdx) out += ` -map -0:${idx}`;
             out += ' -c copy';
-            finishPreset(out);
+            commitPreset(out);
             const survivors = streams.filter((s) => !removeIdx.includes(s.index));
-            response.infoLog += `☑Expected results: ${survivors.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
+            response.infoLog += `☑Expected results: ${summariseAll(survivors)}\n`;
             return response;
         }
 
@@ -953,7 +960,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Import is NON-DESTRUCTIVE: every recognized sidecar not already handled by our own prior pass (marker) is muxed in. We do NOT suppress a
         // sidecar just because an embedded sub shares its lang|title|disposition - metadata can't prove same content, and dropping a distinct track is
         // data loss, whereas a redundant duplicate is not. Genuine duplication is collapsed by CONTENT instead (method_deduplicate, below).
-        const existingSubCount = embeddedSubs.length;   // same subtitle-stream filter already computed above (streams is unchanged since)
         // The import muxes each sidecar as -i "${libDir}/${name}"; a " or control char in that real on-disk path would close the quote and inject
         // ffmpeg args (see pathIsPresetSafe), and unlike a name we generate it must match the file byte-for-byte, so it can't be sanitised - skip it
         // instead (a server-native/user file we can't safely reference), never break out.
@@ -986,7 +992,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // members) so a re-run never re-imports them and the confirm pass can delete the whole deduplicated set; reQueue only when a delete is due.
             let inputSide = ''; let extraMaps = ''; let meta = ''; let fontsRestored = false;
             merged.forEach((f, k) => {
-                const outIdx = existingSubCount + k;
+                const outIdx = embeddedSubs.length + k;
                 // A bundle is a container, not raw text, so it takes no -sub_charenc and its subtitle is selected by type (:s:0) rather than by index.
                 // Its fonts come back only when the file has none of its own - every bundle carries the full font set, so one restore is always complete
                 // and a second bundle (or a re-import into a file that kept its fonts) can never duplicate them.
@@ -1017,10 +1023,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const priorStillPresent = found.filter((f) => importedSet.has(f.name) && !deletedNames.has(f.name)).map((f) => f.name);
             const markList = [...new Set([...consumed, ...priorStillPresent])];
             let out = `${inputSide} -map 0${extraMaps} -c copy${meta} -metadata "awk_sub_worker=${encodeMarkerList(markList)}"`;
-            finishPreset(out);
+            commitPreset(out);
             response.reQueueAfter = deleteConfirmed;   // re-run only to delete the now-embedded sidecars
             const expected = streams.concat(merged.map(sidecarToStream));
-            response.infoLog += `☑Expected results: ${expected.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
+            response.infoLog += `☑Expected results: ${summariseAll(expected)}\n`;
             return response;
         }
 

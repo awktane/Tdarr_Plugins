@@ -8,8 +8,8 @@ const details = () => ({
     Description: `Cleans and re-encodes the video stream. Audio and subtitles are copied unchanged (embedded cover-art video is dropped). Pick a top-level ACTION first (see its tooltip for full details) - the plugin does nothing until you choose a goal: hdr_cleanup_only (default, harmless HDR-only pass), normalize (compatibility conversion), shrink (space savings).\n\n
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n
-                     MAJOR UPGRADE - inputs were renamed/reworked, and Tdarr stores settings by input name, so on upgrade these RESET to defaults - re-check your video_clean settings: encoder->method_encoder, speed->method_speed, force_bit_depth->method_bitdepth, max_height->height_cap (value 'original'->'source'), method_hdr->hdr_mode, guard_min_bitrate->guard_shrink_bitrate (now shrink-only); the old preserve_dv is now the guard_dv toggle (default on); guard_reprocess is gone (use action=shrink); codec gained a 'source' value (keep the source codec).\n\n`,
-    Version: '3.3.1',
+                     UPGRADING FROM 2.x - inputs were renamed/reworked in 3.0.0, and Tdarr stores settings by input name, so that upgrade RESET them to defaults - re-check your video_clean settings: encoder->method_encoder, speed->method_speed, force_bit_depth->method_bitdepth, max_height->height_cap (value 'original'->'source'), method_hdr->hdr_mode, guard_min_bitrate->guard_shrink_bitrate (now shrink-only); the old preserve_dv is now the guard_dv toggle (default on); guard_reprocess is gone (use action=shrink); codec gained a 'source' value (keep the source codec).\n\n`,
+    Version: '3.3.2',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -148,7 +148,7 @@ const details = () => ({
             defaultValue: '1000',
             inputUI: { type: 'text' },
             tooltip: `Applies to action=shrink ONLY: skip the size re-encode when the source video bitrate is already below this (kbps). 0 disables the guard; the default 1000 leaves genuinely lean sources alone (rarely triggers - most content sits well above 1000 kbps at any resolution).
-                \\nShrink uses constant quality, which can't predict the output size, so re-encoding an already-lean source can GROW it - this floor prevents that. Example: 2500 skips shrinking anything already under 2500 kbps.
+                \\nShrink uses constant quality, which can't predict the output size, so re-encoding an already-lean source can GROW it - this floor prevents that.
                 \\nDoes NOT apply to normalize (a compatibility conversion must run regardless of size). Also exempt even under shrink (these can't grow a file): a height_cap downscale, tonemap_sdr, and the lossless strip_dynamic copy.`,
         },
     ],
@@ -168,6 +168,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         FFmpegMode: true,
         infoLog: '',
     };
+    // Benign skip: nothing for this plugin to do. processFile:false is Tdarr's "no work" signal, NOT a failure - the file is left untouched and the flow
+    // continues (a genuine failure has to throw, via failFile). Every call site keeps its own `return`, so this still reads as a terminal.
+    const skip = (msg) => { response.infoLog += msg; response.processFile = false; return response; };
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: file-failure helpers =====
     // -=-=-= AwkFailFile / failFile / failUnexpected  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -656,11 +659,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // tonemap_* filters REJECT a non-HDR input ("unsupported transfer function"), so a plain test pattern false-negatives
     // - the probe stamps a synthetic HDR transfer (smpte2084/bt2020) onto one frame and runs the real island. One frame,
     // cheap; the encoder-side re-upload (vaapi) is not probed here (that device is already proven by the encoder probe).
+    // The GPU tonemap curve, shared by the probe below and both emit sites in buildVideoArgs. The probe's verdict is only meaningful because it runs THE SAME
+    // island the transcode will use, so these must never drift: tune the curve here and every consumer moves together. (The CPU tonemapx long form is separate
+    // - a different filter with a different option spelling.) Callers append the pixel format, which differs per site.
+    const GPU_TONEMAP_OPTS = 'tonemap=bt2390:t=bt709:m=bt709:p=bt709:r=tv:format=';
     const confirmTonemap = (ffmpegPath, backend) => {
         let ok = false;
         try {
             const island = 'format=p010le,setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc,hwupload,'
-                + `tonemap_${backend}=tonemap=bt2390:t=bt709:m=bt709:p=bt709:r=tv:format=nv12,hwdownload,format=nv12`;
+                + `tonemap_${backend}=${GPU_TONEMAP_OPTS}nv12,hwdownload,format=nv12`;
             const args = ['-hide_banner', '-init_hw_device', `${backend}=tm`, '-filter_hw_device', 'tm',
                 '-f', 'lavfi', '-i', testColorSource('gray'), '-vf', island, '-frames:v', '1', '-f', 'null', '-'];
             const r = childProcess.spawnSync(ffmpegPath || 'ffmpeg', args, { encoding: 'utf8', timeout: CONFIRM_PROBE_TIMEOUT_MS });
@@ -840,7 +847,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const outFmt = want10Bit ? 'p010le' : 'nv12';
         const useGpuTm = tonemap && tonemapBackend !== 'cpu';
         const cpuTonemap = 'tonemapx=tonemap=bt2390:transfer=bt709:matrix=bt709:primaries=bt709:range=tv';
-        const gpuIsland = `format=p010le,hwupload,tonemap_${tonemapBackend}=tonemap=bt2390:t=bt709:m=bt709:p=bt709:r=tv:format=${outFmt},hwdownload,format=${outFmt}`;
+        const gpuIsland = `format=p010le,hwupload,tonemap_${tonemapBackend}=${GPU_TONEMAP_OPTS}${outFmt},hwdownload,format=${outFmt}`;
         const tmDevice = `-init_hw_device ${tonemapBackend}=tm -filter_hw_device tm`;   // single-device families: replaces any hwaccel decode (island does the GPU work)
         const scale = (fmt) => {   // optional downscale, then the tonemap island (GPU) or tonemapx (CPU), then an optional trailing format filter
             if (willDownscale) vf.push(`scale=-2:${outHeight}`);
@@ -861,7 +868,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (useGpuTm) {   // two devices: opencl tonemaps, frames download to software, then re-upload to vaapi for the encoder (proven on Intel)
                 inputSide = '-init_hw_device opencl=ocl -init_hw_device vaapi=va:/dev/dri/renderD128';
                 if (willDownscale) vf.push(`scale=-2:${outHeight}`);
-                vf.push(`${tonemapSetparams}format=p010le,hwupload=derive_device=opencl,tonemap_opencl=tonemap=bt2390:t=bt709:m=bt709:p=bt709:r=tv:format=${outFmt},hwdownload,format=${outFmt},hwupload=derive_device=vaapi`);
+                vf.push(`${tonemapSetparams}format=p010le,hwupload=derive_device=opencl,tonemap_opencl=${GPU_TONEMAP_OPTS}${outFmt},hwdownload,format=${outFmt},hwupload=derive_device=vaapi`);
             } else {
                 inputSide = '-vaapi_device /dev/dri/renderD128';
                 scale(`format=${want10Bit ? 'p010' : 'nv12'}`);
@@ -940,9 +947,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
 
     if (file.fileMedium !== 'video') {
-        response.infoLog += '☑File is not a video\n';
-        response.processFile = false;
-        return response;
+        return skip('☑File is not a video\n');
     }
 
     try {
@@ -950,9 +955,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const videoStreams = file.ffProbeData.streams.filter((s) => (s.codec_type || '').trim().toLowerCase() === 'video');
         const primary = videoStreams.find((s) => !isCoverArt(s));
         if (!primary) {
-            response.infoLog += '☑No encodable video stream found (cover-art / still images only)\n';
-            response.processFile = false;
-            return response;
+            return skip('☑No encodable video stream found (cover-art / still images only)\n');
         }
 
         // Source properties (both probes).
@@ -969,7 +972,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const ENCODABLE = ['hevc', 'h264', 'av1'];                       // codecs this plugin has an encoder for (codec=source keeps the source only when it is one of these)
         // Efficiency rank for shrink's never-downgrade rule: vp9~hevc and vp8~h264, so an efficient WebM/VP source isn't "upgraded" to a less-efficient codec; a
         // genuinely-legacy codec (mpeg2/vc1/xvid, absent here) ranks below every target via the `|| 0` fallback, so old-codec -> h264 stays a valid shrink upgrade.
-        const EFF = { av1: 3, hevc: 2, vp9: 2, h264: 1, vp8: 1 };
+        const CODEC_EFFICIENCY = { av1: 3, hevc: 2, vp9: 2, h264: 1, vp8: 1 };
         let targetCodecName = codec === 'source' ? srcCodecName : codec; // let: guard_dv forces 'hevc' for a DV file, and shrink's never-downgrade may fall back to the source codec
 
         // ---- HDR / Dolby Vision detection (both probes) ----
@@ -1054,8 +1057,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Lossless dynamic-HDR strip eligibility, shared by hdr_cleanup_only and the no-real-transcode strip path: a no-base DV and HDR10+-in-non-HEVC both have no
         // lossless path (skip); otherwise do the strip. The two callers point users at slightly different next steps, so their two skip messages are passed in.
         const tryLosslessStrip = (noBaseMsg, hdr10PlusMsg) => {
-            if (dvNoBaseLayer) { response.infoLog += noBaseMsg; response.processFile = false; return response; }
-            if (isHdr10Plus && srcCodecName !== 'hevc') { response.infoLog += hdr10PlusMsg; response.processFile = false; return response; }
+            if (dvNoBaseLayer) { return skip(noBaseMsg); }
+            if (isHdr10Plus && srcCodecName !== 'hevc') { return skip(hdr10PlusMsg); }
             return emitLosslessStrip();
         };
 
@@ -1063,14 +1066,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (action === 'hdr_cleanup_only') {
             // Only hdr_mode is live; codec / height_cap / bit-depth / encoder inert. Lossless-or-skip.
             if (hdrMode === 'preserve') {
-                response.infoLog += `☑${streamTag(primary.index)}[action=hdr_cleanup_only] ${isDynamicHdr ? `${dvSignal ? dvLabel : 'HDR10+'} left untouched (preserve)` : 'Nothing to clean up (preserve)'}\n`;
-                response.processFile = false;
-                return response;
+                return skip(`☑${streamTag(primary.index)}[action=hdr_cleanup_only] ${isDynamicHdr ? `${dvSignal ? dvLabel : 'HDR10+'} left untouched (preserve)` : 'Nothing to clean up (preserve)'}\n`);
             }
             if (!isDynamicHdr) {   // hdrMode === 'strip_dynamic'
-                response.infoLog += `☑${streamTag(primary.index)}[hdr_mode=strip_dynamic] No dynamic HDR (Dolby Vision / HDR10+) to strip - left untouched\n`;
-                response.processFile = false;
-                return response;
+                return skip(`☑${streamTag(primary.index)}[hdr_mode=strip_dynamic] No dynamic HDR (Dolby Vision / HDR10+) to strip - left untouched\n`);
             }
             return tryLosslessStrip(
                 `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} has no HDR10 base layer - can't strip losslessly; switch to action=normalize or shrink with hdr_mode=tonemap_sdr to flatten it to SDR\n`,
@@ -1085,8 +1084,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (action === 'normalize') {
             codecTrigger = ENCODABLE.includes(targetCodecName) && srcCodecName !== targetCodecName;   // fire on a mismatch either direction; codec=source never mismatches
         } else {   // shrink: upgrade to a more efficient codec, else a same-codec size pass; never downgrade efficiency
-            const srcEff = EFF[srcCodecName] || 0;
-            if (codec !== 'source' && (EFF[codec] || 0) > srcEff && !preserveDv) {
+            const srcEff = CODEC_EFFICIENCY[srcCodecName] || 0;
+            if (codec !== 'source' && (CODEC_EFFICIENCY[codec] || 0) > srcEff && !preserveDv) {
                 codecTrigger = true;   // upgrade (targetCodecName already = codec)
             } else {
                 // Never-downgrade governs codec CHOICE at a FIXED resolution; it has to yield when another transform already forces a real encode and the
@@ -1097,7 +1096,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const yieldToTransform = !preserveDv && forcedTransform && codec !== 'source' && ENCODABLE.includes(codec) && !ENCODABLE.includes(srcCodecName);
                 if (yieldToTransform)
                     response.infoLog += `☒${streamTag(primary.index)}[action=shrink][codec=${codec}] ${codec} is no more efficient than the source ${srcCodecName}, but the forced ${heightTrigger ? 'downscale' : 'tonemap'} saves more than the codec costs - encoding as ${codec}\n`;
-                else if (codec !== 'source' && (EFF[codec] || 0) < srcEff && !preserveDv)
+                else if (codec !== 'source' && (CODEC_EFFICIENCY[codec] || 0) < srcEff && !preserveDv)
                     response.infoLog += `☒${streamTag(primary.index)}[action=shrink][codec=${codec}] ${codec} is less efficient than the source ${srcCodecName} - never downgrading; re-encoding as ${srcCodecName} to shrink instead\n`;
                 targetCodecName = preserveDv ? 'hevc' : (yieldToTransform ? codec : srcCodecName);   // same-codec size pass (guard_dv still forces hevc for DV)
                 codecTrigger = ENCODABLE.includes(targetCodecName);                    // a legacy same-codec pass can't encode - caught by the !canEncodeTarget skip below
@@ -1165,31 +1164,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Skips that a pending real transcode would otherwise turn destructive.
         if (realTranscode && !canEncodeTarget) {   // codec=source resolved to a legacy codec with no encoder, but height_cap/tonemap force a transcode
-            response.infoLog += `☒${streamTag(primary.index)}[codec=source] Source codec ${srcCodecName || 'unknown'} has no encoder - can't keep it through the ${heightTrigger ? 'downscale' : 'tonemap'}; set codec=hevc/h264/av1 to convert it\n`;
-            response.processFile = false;
-            return response;
+            return skip(`☒${streamTag(primary.index)}[codec=source] Source codec ${srcCodecName || 'unknown'} has no encoder - can't keep it through the ${heightTrigger ? 'downscale' : 'tonemap'}; set codec=hevc/h264/av1 to convert it\n`);
         }
         if (realTranscode && dvIptC2) {
-            response.infoLog += `☒${streamTag(primary.index)}[guard_dv=true] ${dvLabel} uses the IPT-C2 colour matrix that libx265 cannot re-encode - left untouched; set guard_dv=false and hdr_mode=tonemap_sdr to flatten it to SDR\n`;
-            response.processFile = false;
-            return response;
+            return skip(`☒${streamTag(primary.index)}[guard_dv=true] ${dvLabel} uses the IPT-C2 colour matrix that libx265 cannot re-encode - left untouched; set guard_dv=false and hdr_mode=tonemap_sdr to flatten it to SDR\n`);
         }
         if (realTranscode && effHdrMode === 'strip_dynamic' && dvNoBaseLayer) {
-            response.infoLog += `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} has no HDR10 base layer - a re-encode would leave a mis-coloured picture with no HDR fallback, left untouched; set hdr_mode=tonemap_sdr to flatten it to SDR\n`;
-            response.processFile = false;
-            return response;
+            return skip(`☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} has no HDR10 base layer - a re-encode would leave a mis-coloured picture with no HDR fallback, left untouched; set hdr_mode=tonemap_sdr to flatten it to SDR\n`);
         }
         if (realTranscode && isDynamicHdr && !preserveDv && effHdrMode === 'preserve') {   // a transcode would drop the unprotected dynamic layer - protect it by skipping
-            response.infoLog += `☒${streamTag(primary.index)}[hdr_mode=preserve] ${dvSignal ? dvLabel : 'HDR10+'} can't survive a re-encode - left untouched to protect it; ${dvSignal ? 'enable guard_dv to carry the Dolby Vision through, or ' : ''}set hdr_mode=strip_dynamic (keep the HDR10 base) or hdr_mode=tonemap_sdr (flatten to SDR)\n`;
-            response.processFile = false;
-            return response;
+            return skip(`☒${streamTag(primary.index)}[hdr_mode=preserve] ${dvSignal ? dvLabel : 'HDR10+'} can't survive a re-encode - left untouched to protect it; ${dvSignal ? 'enable guard_dv to carry the Dolby Vision through, or ' : ''}set hdr_mode=strip_dynamic (keep the HDR10 base) or hdr_mode=tonemap_sdr (flatten to SDR)\n`);
         }
 
         if (realTranscode) {
             if (alreadyFenced) {
-                response.infoLog += `☑${streamTag(primary.index)}[action=${action}] Already processed by awk_video at this exact setting (${videoSig}) - left untouched\n`;
-                response.processFile = false;
-                return response;
+                return skip(`☑${streamTag(primary.index)}[action=${action}] Already processed by awk_video at this exact setting (${videoSig}) - left untouched\n`);
             }
             const reasonTags = [
                 srcCodecName !== targetCodecName && targetCodecName,   // codec change
@@ -1208,18 +1197,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] HDR10+ in ${srcCodecName || 'this codec'} has no lossless strip path (needs HEVC) - left untouched\n`);
         }
         if (belowFloorKbps > 0) {
-            response.infoLog += `☑${streamTag(primary.index)}[guard_shrink_bitrate=${guardShrinkKbps}] Source video bitrate ${belowFloorKbps}k is below the ${guardShrinkKbps}k floor - already efficient, left untouched\n`;
-            response.processFile = false;
-            return response;
+            return skip(`☑${streamTag(primary.index)}[guard_shrink_bitrate=${guardShrinkKbps}] Source video bitrate ${belowFloorKbps}k is below the ${guardShrinkKbps}k floor - already efficient, left untouched\n`);
         }
         if (action === 'shrink') {
-            response.infoLog += `☑${streamTag(primary.index)}[action=shrink] Nothing to shrink - ${canEncodeTarget ? `already ${srcCodecName}${srcHeight ? ` ${srcHeight}p` : ''} at the target and no more-efficient codec selected` : `source codec ${srcCodecName || 'unknown'} has no encoder (set codec=hevc/h264/av1 to convert it)`}\n`;
-            response.processFile = false;
-            return response;
+            return skip(`☑${streamTag(primary.index)}[action=shrink] Nothing to shrink - ${canEncodeTarget ? `already ${srcCodecName}${srcHeight ? ` ${srcHeight}p` : ''} at the target and no more-efficient codec selected` : `source codec ${srcCodecName || 'unknown'} has no encoder (set codec=hevc/h264/av1 to convert it)`}\n`);
         }
-        response.infoLog += `☑${streamTag(primary.index)}[action=normalize] Video is already ${targetCodecName}${srcHeight ? ` ${srcHeight}p` : ''}${srcIs10 ? ' 10-bit' : ''} and within limits\n`;
-        response.processFile = false;
-        return response;
+        return skip(`☑${streamTag(primary.index)}[action=normalize] Video is already ${targetCodecName}${srcHeight ? ` ${srcHeight}p` : ''}${srcIs10 ? ' 10-bit' : ''} and within limits\n`);
     } catch (err) {
         return failUnexpected(err);
     }
