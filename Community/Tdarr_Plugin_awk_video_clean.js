@@ -9,7 +9,7 @@ const details = () => ({
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n
                      UPGRADING FROM 2.x - inputs were renamed/reworked in 3.0.0, and Tdarr stores settings by input name, so that upgrade RESET them to defaults - re-check your video_clean settings: encoder->method_encoder, speed->method_speed, force_bit_depth->method_bitdepth, max_height->height_cap (value 'original'->'source'), method_hdr->hdr_mode, guard_min_bitrate->guard_shrink_bitrate (now shrink-only); the old preserve_dv is now the guard_dv toggle (default on); guard_reprocess is gone (use action=shrink); codec gained a 'source' value (keep the source codec).\n\n`,
-    Version: '3.3.2',
+    Version: '3.4.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -109,15 +109,16 @@ const details = () => ({
         {
             name: 'method_encoder',
             type: 'string',
-            defaultValue: 'auto',
+            defaultValue: 'node',
             inputUI: {
                 type: 'dropdown',
-                options: ['auto', 'nvenc', 'qsv', 'vaapi', 'videotoolbox', 'amf', 'cpu'],
+                options: ['node', 'node_strict', 'auto', 'cpu'],
             },
-            tooltip: `Which encoder to use on each node.
-                \\nauto (recommended): each node picks the best available encoder for its hardware - GPU workers use the node's GPU (NVENC/QSV/VAAPI/VideoToolbox/AMF) if present, CPU workers and GPU-less nodes use the software encoder.
-                \\nA specific value forces that encoder on every node; a node that can't run it (wrong GPU, wrong OS) falls back to the software encoder and logs it. Only pin this on a uniform fleet.
-                \\ncpu forces the software encoder (libx265/libx264/libsvtav1) everywhere.`,
+            tooltip: `Which encoder each node uses. To pin a specific encoder to a node (nvenc/qsv/vaapi/videotoolbox/amf), set it at the NODE level - Tdarr's "GPU worker hardware type" on that node - not here; that respects a mixed fleet instead of forcing one encoder everywhere.
+                \\nnode (recommended, default): follow the node's own "GPU worker hardware type". If it's set to a specific encoder, use it, else fall back to the software encoder; if it's "any", pick the best available GPU encoder, else software. CPU workers always use software. So each node uses the encoder you assigned it - e.g. push jobs onto an idle iGPU (qsv) and keep a discrete GPU free.
+                \\nnode_strict: same as node, but ERROR the file instead of falling back to the software encoder - for when you never want a GPU job to silently land on the CPU. (Dolby Vision still uses the software encoder to preserve its metadata; CPU workers still use software; a node hardware type we can't drive, e.g. rkmpp, errors.)
+                \\nauto: ignore the node's hardware type and just pick the best available encoder for the node's hardware, else software.
+                \\ncpu: force the software encoder (libx265/libx264/libsvtav1) everywhere.`,
         },
         {
             name: 'method_speed',
@@ -604,7 +605,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const NVIDIA_SMI_TIMEOUT_MS = 8000;
     const CONFIRM_PROBE_TIMEOUT_MS = 25000;
 
-    // Priority order of hardware families to try per OS (best/most-common first). CPU is always the final fallback.
+    // Priority order of hardware families to try per OS (best/most-common first). CPU is always the final fallback. Mac is videotoolbox-only by
+    // design: on macOS ALL hardware encoding (Apple Silicon media engine, Intel Quick Sync, an AMD dGPU/eGPU) is routed through VideoToolbox - there
+    // is no working nvenc/qsv/vaapi/amf path on macOS and the darwin ffmpeg build ships none of them. (rkmpp, a valid node hardware type, is Rockchip
+    // ARM only and unsupported here - a rkmpp node lands on CPU under 'node', or errors under 'node_strict'.)
     const HW_FAMILIES = {
         darwin: ['videotoolbox'],
         win32: ['nvenc', 'qsv', 'amf'],
@@ -730,15 +734,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return cpuChoice();
         }
 
-        // Candidate families: an explicit pick is tried first (then CPU); 'auto' tries the platform's HW list only on a
-        // GPU worker (CPU workers stay on software so slow encodes don't land on the GPU), then CPU.
+        // Candidate families to try in order, ending at 'cpu' (the always-available software fallback) unless node_strict forbids it. method_encoder picks the list:
+        //   node (default) / node_strict -> honor THIS node's Tdarr "GPU worker hardware type" (otherArguments.nodeHardwareType, which Tdarr also term-checks the
+        //     emitted command against). '-' / "any" = no node preference -> best-available (like auto); a specific type we support on this platform -> that family
+        //     alone; a specific type we can't drive (rkmpp, or a cross-platform mis-set) -> no usable GPU. 'node' falls every unusable case back to CPU; 'node_strict'
+        //     instead ERRORS the file (at the fallthrough below), for users who never want a GPU job silently landing on the CPU.
+        //   auto -> ignore the node type, try the platform priority list, then CPU (the pre-3.4.0 behaviour).
+        //   an explicit family / cpu -> force it (regardless of worker type), then CPU.
+        // Only auto/node/node_strict are worker-type-aware; a CPU worker (and Dolby Vision, handled above) takes CPU and never strict-errors.
+        const strict = encoderOpt === 'node_strict';
+        const isNodeMode = encoderOpt === 'node' || strict;
+        const hwList = [...(HW_FAMILIES[platform] || [])];
+        const nodeHw = isNodeMode ? String((otherArguments && otherArguments.nodeHardwareType) || '').toLowerCase().trim() : '';
+        const nodeIsSpecific = !!nodeHw && nodeHw !== '-';
         let families;
-        if (encoderOpt !== 'auto') {
-            families = [encoderOpt, 'cpu'];
-        } else if (isGpuWorker) {
-            families = [...(HW_FAMILIES[platform] || []), 'cpu'];
+        if (encoderOpt === 'auto' || isNodeMode) {
+            if (!isGpuWorker) families = ['cpu'];                                          // CPU worker: software regardless of mode
+            else if (!nodeIsSpecific) families = strict ? [...hwList] : [...hwList, 'cpu'];   // auto, or node/node_strict on an "any" node -> best available
+            else if (hwList.includes(nodeHw)) families = strict ? [nodeHw] : [nodeHw, 'cpu'];  // node pinned to a family we can drive on this platform
+            else families = strict ? [] : ['cpu'];                                        // node pinned to something we can't drive (rkmpp / cross-platform mis-set)
         } else {
-            families = ['cpu'];
+            families = [encoderOpt, 'cpu'];                                               // explicit family pin or cpu -> forced regardless of worker type
         }
 
         for (const family of families) {
@@ -771,9 +787,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return { family, encoderName, notes };
         }
 
-        if (encoderOpt === 'auto' && !isGpuWorker) notes.push(`☐[method_encoder=${encoderOpt}] Encoder: ${ENCODER_NAME[codec].cpu} (CPU worker)\n`);
-        else if (encoderOpt === 'auto') notes.push(`☐[method_encoder=${encoderOpt}] Encoder: ${ENCODER_NAME[codec].cpu} (no usable GPU encoder on this node)\n`);
-        else if (encoderOpt === 'cpu') notes.push(`☐[method_encoder=${encoderOpt}] Encoder: ${ENCODER_NAME[codec].cpu} (${platform}${isGpuWorker ? ' gpu-worker' : ''})\n`);
+        // Fell through without a usable hardware encoder. node_strict on a GPU worker forbids the CPU fallback -> fail the file; every other case lands on CPU.
+        if (strict && isGpuWorker) {
+            const why = !nodeIsSpecific ? 'no usable GPU encoder on this node'
+                : hwList.includes(nodeHw) ? `node hardware '${nodeHw}' could not encode ${codec} on this node`
+                    : `node hardware '${nodeHw}' is not supported by this plugin`;
+            return { strictFail: `[method_encoder=${encoderOpt}] ${why}; node_strict forbids the CPU fallback`, notes };
+        }
+        const cpuName = ENCODER_NAME[codec].cpu;
+        if (encoderOpt === 'auto' && !isGpuWorker) notes.push(`☐[method_encoder=${encoderOpt}] Encoder: ${cpuName} (CPU worker)\n`);
+        else if (encoderOpt === 'auto') notes.push(`☐[method_encoder=${encoderOpt}] Encoder: ${cpuName} (no usable GPU encoder on this node)\n`);
+        else if (encoderOpt === 'cpu') notes.push(`☐[method_encoder=${encoderOpt}] Encoder: ${cpuName} (${platform}${isGpuWorker ? ' gpu-worker' : ''})\n`);
+        else if (isNodeMode && !isGpuWorker) notes.push(`☐[method_encoder=${encoderOpt}] Encoder: ${cpuName} (CPU worker)\n`);
+        else if (isNodeMode) notes.push(`☐[method_encoder=${encoderOpt}] Encoder: ${cpuName} (${nodeIsSpecific ? `node hardware '${nodeHw}' ${hwList.includes(nodeHw) ? 'unavailable' : 'unsupported'}` : 'no usable GPU encoder'} on this node)\n`);
         return cpuChoice();
     };
 
@@ -907,7 +933,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const heightCapOpt = String(inputs.height_cap || 'source').toLowerCase().trim();
     const speed = String(inputs.method_speed || 'slow').toLowerCase().trim();
     const bitDepthOpt = String(inputs.method_bitdepth || 'source').toLowerCase().trim();
-    const encoderOpt = String(inputs.method_encoder || 'auto').toLowerCase().trim();
+    const encoderOpt = String(inputs.method_encoder || 'node').toLowerCase().trim();
     const hdrMode = String(inputs.hdr_mode || 'preserve').toLowerCase().trim();
     const guardDv = String(inputs.guard_dv) !== 'false';   // boolean (loadDefaultValues coerces it), default true
 
@@ -931,7 +957,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!['source', '2160', '1440', '1080', '720', '480'].includes(heightCapOpt)) failFile(`[height_cap=${heightCapOpt}] invalid value, check your settings`);
     if (!['slow', 'medium', 'fast'].includes(speed)) failFile(`[method_speed=${speed}] invalid value, check your settings`);
     if (!['source', '8', '10'].includes(bitDepthOpt)) failFile(`[method_bitdepth=${bitDepthOpt}] invalid value, check your settings`);
-    if (!['auto', 'nvenc', 'qsv', 'vaapi', 'videotoolbox', 'amf', 'cpu'].includes(encoderOpt)) failFile(`[method_encoder=${encoderOpt}] invalid value, check your settings`);
+    if (!['node', 'node_strict', 'auto', 'nvenc', 'qsv', 'vaapi', 'videotoolbox', 'amf', 'cpu'].includes(encoderOpt)) failFile(`[method_encoder=${encoderOpt}] invalid value, check your settings`);
     if (!['preserve', 'strip_dynamic', 'tonemap_sdr'].includes(hdrMode)) failFile(`[hdr_mode=${hdrMode}] invalid value, check your settings`);
     // The one cross-input config error: tonemap_sdr is a pixel-domain re-encode, so it can never satisfy hdr_cleanup_only's lossless-or-skip promise.
     if (hdrMode === 'tonemap_sdr' && action === 'hdr_cleanup_only')
@@ -1136,10 +1162,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Build the transcode preset (encoder resolved per node) + the predicted output summary.
         const emitTranscode = (encodeTag) => {
             if (preserveDv) response.infoLog += `☐${streamTag(primary.index)}[guard_dv=true] ${dvLabel} - keeping the DV RPU through the re-encode (libx265)\n`;
-            if (preserveDv && encoderOpt !== 'auto' && encoderOpt !== 'cpu')
+            if (preserveDv && !['auto', 'cpu', 'node', 'node_strict'].includes(encoderOpt))
                 response.infoLog += `☒${streamTag(primary.index)}[method_encoder=${encoderOpt}][guard_dv=true] Forced encoder overridden to ${ENCODER_NAME[targetCodecName].cpu} - ${encoderOpt} would drop the Dolby Vision RPU\n`;
             const sel = selectEncoder({ codec: targetCodecName, encoderOpt, otherArguments, forceCpu: preserveDv });
             sel.notes.forEach((n) => { response.infoLog += n; });
+            if (sel.strictFail) failFile(sel.strictFail);   // node_strict: the node's GPU encoder can't run and CPU fallback is forbidden
             const tonemapBackend = tonemap ? resolveTonemapBackend({ family: sel.family, otherArguments }) : null;
             if (tonemap) response.infoLog += tonemapBackend === 'cpu'
                 ? `☒${streamTag(primary.index)}[hdr_mode=tonemap_sdr] Tonemapping HDR -> SDR on CPU (tonemapx) - no GPU tonemap available on this node; result may differ slightly from GPU-tonemapped nodes\n`
