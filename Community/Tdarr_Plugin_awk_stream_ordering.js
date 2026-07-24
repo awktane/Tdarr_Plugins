@@ -129,17 +129,18 @@ const details = () => ({
 const plugin = (file, librarySettings, inputs, otherArguments) => {
     const lib = require('../methods/lib')();
     const fs = require('fs');
-    // True if the mp4 already has moov before mdat (front-loaded), so method_mp4_faststart needn't remux it. Reads only top-level box headers (a few 16-byte reads,
-    // seeking by box size) - no ffmpeg spawn, no full-file read. otherArguments.__awkMoovFront overrides for the harness (which has no real file on disk). Fail-safe: any
-    // read/parse anomaly returns true (treat as fronted -> skip) so we never loop on a file we can't inspect.
+    // True if the mp4 already has moov before mdat (front-loaded), so method_mp4_faststart needn't remux it. Reads only top-level box headers (a few
+    // 16-byte reads, seeking by box size) - no ffmpeg spawn, no full-file read. otherArguments.__awkMoovFront overrides for the harness (which has
+    // no real file on disk). Fail-safe: any read/parse anomaly returns true (treat as fronted -> skip) so we never loop on a file we can't inspect.
     const moovBeforeMdat = (filePath, otherArgs) => {
         const inj = otherArgs?.__awkMoovFront;
         if (inj !== undefined) return inj === true;
         let fd;
         try {
             fd = fs.openSync(filePath, 'r');
-            // A top-level box header is 4-byte size + 4-byte FourCC; when size === 1 the real size follows as a 64-bit largesize at offset 8. So every read
-            // must cover the largesize too, and BOX_READ_BYTES must stay >= BOX_HEADER_BYTES + 8 or the readBigUInt64BE(8) below runs off the buffer on a >4GB mdat.
+            // A top-level box header is 4-byte size + 4-byte FourCC; when size === 1 the real size follows as a
+            // 64-bit largesize at offset 8. So every read must cover the largesize too, and BOX_READ_BYTES must
+            // stay >= BOX_HEADER_BYTES + 8 or the readBigUInt64BE(8) below runs off the buffer on a >4GB mdat.
             const BOX_HEADER_BYTES = 8;
             const BOX_READ_BYTES = 16;
             const head = Buffer.alloc(BOX_READ_BYTES);
@@ -193,10 +194,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: file-failure helpers =====
 
     // =====================================================================
-    // SHARED CODE — duplicated verbatim because Tdarr loads each plugin as one self-contained file.
-    // Split into labeled sections; each is byte-identical across the plugins named in its header, and a
-    // plugin carries only the sections it uses. The section LABEL is the anchor (order is free). Verify any
-    // edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
+    // SHARED CODE — duplicated verbatim because Tdarr loads each plugin as one self-contained file. Split into labeled sections; each is
+    // byte-identical across the plugins named in its header, and a plugin carries only the sections it uses. The section LABEL is the anchor
+    // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: role/disposition classifiers =====
@@ -294,18 +294,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['aac_latm', 'aac'],     // AAC in MPEG-TS/LATM (broadcast/DVR .ts captures) reports codec_name aac_latm; fold to aac so it scores + displays as AAC, not an unknown codec
     ];
     // -=-=-= resolveCodecName  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the
-    // _x variant when DTS:X is detected) and eac3 into eac3atmos. Used for scoring by audioQuality (audio_clean, stream_ordering)
-    // and isLosslessSource (audio_clean), and by summariseStream (all five) purely for accurate display labeling - a plugin
-    // that doesn't score audio still benefits from showing "eac3atmos"/"dtsx" instead of a bare "eac3"/"dts" in its logs.
-    // codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't
-    // tell the subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to
-    // mediaInfo's Format_Commercial_IfAny ("DTS-HD Master Audio"), which decodes the substream header. Atmos comes from
-    // longName or the commercial name only - an editable title tag does not imply a real Atmos substream.
-    // DTS:X detection is best-effort: MediaInfo exposes it via Format_AdditionalFeatures containing "XLL X" (vs plain
-    // "XLL" for MA without X), but MediaInfo's own maintainers note this is incomplete for an undocumented format -
-    // expect a real DTS:X track to sometimes still classify as the plain (non-X) subtype, never the reverse (this only
-    // fires on an actual reported value, never on absence of one, so it can't produce a false positive).
+    // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the _x variant when DTS:X is detected)
+    // and eac3 into eac3atmos. Used for scoring by audioQuality (audio_clean, stream_ordering) and isLosslessSource (audio_clean), and by summariseStream
+    // (all five) purely for accurate display labeling - a plugin that doesn't score audio still benefits from showing "eac3atmos"/"dtsx" instead of a bare
+    // "eac3"/"dts" in its logs. codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't tell the
+    // subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to mediaInfo's Format_Commercial_IfAny ("DTS-HD
+    // Master Audio"), which decodes the substream header. Atmos comes from longName or the commercial name only - an editable title tag does not imply a real
+    // Atmos substream. DTS:X detection is best-effort: MediaInfo exposes it via Format_AdditionalFeatures containing "XLL X" (vs plain "XLL" for MA without
+    // X), but MediaInfo's own maintainers note this is incomplete for an undocumented format - expect a real DTS:X track to sometimes still classify as the
+    // plain (non-X) subtype, never the reverse (this only fires on an actual reported value, never on absence of one, so it can't produce a false positive).
     const resolveCodecName = (stream) => {
         let codec = (stream?.codec_name || '').toLowerCase().trim();
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
@@ -363,8 +360,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: codec name resolution =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4-family container =====
     // -=-=-= isMp4Family  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
-    // The mp4/mov container family whose -c copy needs `-movflags use_metadata_tags` to keep sibling plugins' GLOBAL awk_* markers through the remux (dropping one re-triggers
-    // work upstream). One source so the four writers can't drift on the set (video_clean's video-only hvc1 gate is deliberately mp4/m4v/mov WITHOUT m4a and stays separate).
+    // The mp4/mov container family whose -c copy needs `-movflags use_metadata_tags` to keep sibling plugins' GLOBAL
+    // awk_* markers through the remux (dropping one re-triggers work upstream). One source so the four writers can't
+    // drift on the set (video_clean's video-only hvc1 gate is deliberately mp4/m4v/mov WITHOUT m4a and stays separate).
     const isMp4Family = (container) => ['mp4', 'm4v', 'mov', 'm4a'].includes(String(container || '').toLowerCase());
     // ===== END SHARED: mp4-family container =====
 
@@ -376,9 +374,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //       `transparent` here, and `minimum` is kept ONLY as the transcode floor read by resolveBitrate (audio_clean).
     //   source-lossy (everything else): { score, transparent } - `transparent` is the 2-CHANNEL baseline; scoreThresholds scales it by (ch/2)^0.65 and
     //       derives minimum as MIN_RATIO of transparent. Some formats here aren't ffmpeg-encodable (e.g. ac4).
-    // objectAudio: true marks a codec whose stream carries object-audio metadata (Atmos/DTS:X/MPEG-H) that ffmpeg cannot
-    // re-encode - read only by audio_clean's guard_object_audio, never by the score/threshold math below. AC-4 is deliberately NOT flagged: it spans plain stereo to Atmos and
-    // no ffprobe field distinguishes the immersive (IMS) variant the way eac3->eac3atmos does, and it isn't ffmpeg-encodable anyway (so the guard could only ever block a drop).
+    // objectAudio: true marks a codec whose stream carries object-audio metadata (Atmos/DTS:X/MPEG-H) that ffmpeg cannot re-encode - read only by audio_clean's
+    // guard_object_audio, never by the score/threshold math below. AC-4 is deliberately NOT flagged: it spans plain stereo to Atmos and no ffprobe field
+    // distinguishes the immersive (IMS) variant the way eac3->eac3atmos does, and it isn't ffmpeg-encodable anyway (so the guard could only ever block a drop).
     const codecInfo = {
         // Lossless
         pcm:         { score: 100, lossless: true },
@@ -570,7 +568,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const is10Bit = (s, mi = mediaInfoFor(s)) => Number(s.bits_per_raw_sample || mi?.BitDepth || 0) >= 10
         || /p10(le|be)?$|10le|10be/.test((s.pix_fmt || '').toLowerCase()) || /10/.test((s.profile || '').toLowerCase());
     // -=-=-= FONT_EXTS + isFontMime  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Embedded-font filename extensions + a font-mimetype test, shared by summariseStream's [attach:...] token and clean_and_remux's attachmentKind font classification.
+    // Embedded-font filename extensions + a font-mimetype test, shared by summariseStream's
+    // [attach:...] token and clean_and_remux's attachmentKind font classification.
     const FONT_EXTS = ['ttf', 'otf', 'ttc', 'otc', 'pfb', 'pfa', 'woff', 'woff2', 'eot'];
     const isFontMime = (mime) => /font|truetype|opentype|sfnt/.test(mime);
     // -=-=-= HDR_TRANSFERS  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -583,14 +582,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // both read it, so the display token and the protective re-encode skip cannot disagree. DV is recognised separately (isDolbyVisionVideo / dvSignal).
     const DYNAMIC_HDR_RE = /2094|hdr10\+|hdr10 plus/;
     // -=-=-= summariseStream  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Per type: video codec + resolution/10bit/hdr (+/cover for cover-art/still images); data & attachment codec only. Audio & subtitle append /default, then their role markers.
-    // Audio role markers: /commentary|/description then /dub|/original. Subtitle: /forced then /commentary|/description|/sdh|/lyrics.
-    // /default and /forced read the REAL disposition flag only — a title keyword must not flip a selection flag (as forced already did).
-    // The role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary lines up.
-    // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Audio uses codecDisplayName so a DTS subtype
-    // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all five.
-    // The optional second argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - see the audio branch for what an encode keeps and
-    // what it drops. Because of it, NEVER pass this helper straight to .map(): Array.map would supply the element index as that argument.
+    // Per type: video codec + resolution/10bit/hdr (+/cover for cover-art/still images); data & attachment codec only. Audio & subtitle append /default,
+    // then their role markers. Audio role markers: /commentary|/description then /dub|/original. Subtitle: /forced then
+    // /commentary|/description|/sdh|/lyrics. /default and /forced read the REAL disposition flag only — a title keyword must not flip a selection flag
+    // (as forced already did). The role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary
+    // lines up. subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Audio uses codecDisplayName so a DTS
+    // subtype or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all
+    // five. The optional second argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - see the audio branch for what an encode
+    // keeps and what it drops. Because of it, NEVER pass this helper straight to .map(): Array.map would supply the element index as that argument.
     const summariseStream = (s, out) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
@@ -762,10 +761,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // cosmetic: the dropdown validator below FAILS the file on an unknown value, so a value already persisted in a Tdarr library config must keep validating.
     const normFaststart = (v) => { const s = String(v || 'force').toLowerCase().trim(); return ({ enabled: 'force', disabled: 'strip' })[s] || s; };
     // Value checks. The two free-text inputs (order_language/order_codec) have no fixed option set; the six dropdowns (audio_first, subtitle_first,
-    // order_channel, order_quality, remove_junk_tags, method_mp4_faststart) each have one, validated below.
-    // [inputName, valueToTest, validOptions] - remove_junk_tags normalizes case and method_mp4_faststart normalizes case + aliases before the membership
-    // check; the four others test the raw input. The failFile message always shows the RAW inputs[name]. Checked top-down, failing on the first bad value.
-    // Normalized ONCE here and reused at the use sites below, so the value that gets validated is provably the value that gets executed.
+    // order_channel, order_quality, remove_junk_tags, method_mp4_faststart) each have one, validated below. [inputName, valueToTest, validOptions]
+    // - remove_junk_tags normalizes case and method_mp4_faststart normalizes case + aliases before the membership check; the four others test the
+    // raw input. The failFile message always shows the RAW inputs[name]. Checked top-down, failing on the first bad value. Normalized ONCE here and
+    // reused at the use sites below, so the value that gets validated is provably the value that gets executed.
     const junkTags = String(inputs.remove_junk_tags || 'disabled').toLowerCase();
     const methodFaststart = normFaststart(inputs.method_mp4_faststart);
     const dropdownChecks = [
@@ -805,9 +804,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
         const channelOrder = parseOrderMode(inputs.order_channel);
         const qualityOrder = parseOrderMode(inputs.order_quality);
-        // Union-of-caps demotion: a track over EITHER the channel cap OR the quality cap is demoted below every under-all-caps track, so the fully-serveable
-        // track leads - e.g. a 5.1 that's under the <=6 channel cap but over the <=1024k quality cap is still demoted, not kept above a stereo. A finite cap
-        // exists only in a 'descending <=N' mode (plain descending/ascending/disabled don't cap -> Infinity). Channel caps by channel count; quality by capBitrate.
+        // Union-of-caps demotion: a track over EITHER the channel cap OR the quality cap is demoted below every
+        // under-all-caps track, so the fully-serveable track leads - e.g. a 5.1 that's under the <=6 channel cap but over the
+        // <=1024k quality cap is still demoted, not kept above a stereo. A finite cap exists only in a 'descending <=N' mode
+        // (plain descending/ascending/disabled don't cap -> Infinity). Channel caps by channel count; quality by capBitrate.
         const chanCap = (channelOrder.enabled && channelOrder.dir === 'descending') ? channelOrder.cap : Infinity;
         const qualCap = (qualityOrder.enabled && qualityOrder.dir === 'descending') ? qualityOrder.cap : Infinity;
         const overCap = (s) => s.channels > chanCap || s.capBitrate > qualCap;
@@ -817,9 +817,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return idx === -1 ? preferredLangKeys.length : idx;   // "not listed" sentinel must exceed every real index; a bare 999 collides on a >999-entry order_language list (unbounded free text)
         };
 
-        // Audio ordering below audio_first, shared by the sort AND the winning-default pre-pass: language -> role -> order_codec -> the union cap partition
-        // (over EITHER cap -> tail) -> channel (direction) -> quality (direction). Returns 0 when every key ties. The cap ONLY partitions; within each partition
-        // channel/quality keep their requested direction, so a 'descending <=N' list stays fully descending - the cap just shifts which serveable track leads.
+        // Audio ordering below audio_first, shared by the sort AND the winning-default pre-pass: language -> role ->
+        // order_codec -> the union cap partition (over EITHER cap -> tail) -> channel (direction) -> quality (direction).
+        // Returns 0 when every key ties. The cap ONLY partitions; within each partition channel/quality keep their requested
+        // direction, so a 'descending <=N' list stays fully descending - the cap just shifts which serveable track leads.
         const compareAudioKeys = (a, b) => {
             const aRank = a.langRank;
             const bRank = b.langRank;
@@ -844,18 +845,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return 0;
         };
 
-        // remove_junk_tags: strip encoder/muxer-provenance (+ optional descriptive) tags on the reorder remux. Two tiers: 'encoder' = pure provenance (global encoded_by;
-        // per-stream encoder/encoded_by); 'descriptive' (superset) also drops iTunes/movie-TV container tags. Always kept: title/comment, awk_* markers (idempotency),
-        // creation_time, the mkv BPS/statistics family (mediaInfo derives per-track bitrate from it), the functional per-stream tags, and the GLOBAL 'encoder' tag
-        // (muxer-managed: every mux re-stamps it, so stripping would loop). Per-stream 'encoder' - including the fresh Lavc tag a video/audio re-encode stamps upstream -
-        // is NOT re-added on a -c copy, so running last clears it in the SAME remux (a first-in-stack plugin could only catch it a pass later). Case-insensitive, present-only.
+        // remove_junk_tags: strip encoder/muxer-provenance (+ optional descriptive) tags on the reorder remux. Two tiers: 'encoder' = pure
+        // provenance (global encoded_by; per-stream encoder/encoded_by); 'descriptive' (superset) also drops iTunes/movie-TV container tags.
+        // Always kept: title/comment, awk_* markers (idempotency), creation_time, the mkv BPS/statistics family (mediaInfo derives per-track
+        // bitrate from it), the functional per-stream tags, and the GLOBAL 'encoder' tag (muxer-managed: every mux re-stamps it, so stripping
+        // would loop). Per-stream 'encoder' - including the fresh Lavc tag a video/audio re-encode stamps upstream - is NOT re-added on a -c copy,
+        // so running last clears it in the SAME remux (a first-in-stack plugin could only catch it a pass later). Case-insensitive, present-only.
         const JUNK_ENCODER_GLOBAL = new Set(['encoded_by']);
         const JUNK_DESCRIPTIVE = new Set(['compilation', 'gapless_playback', 'hd_video', 'purchase_date', 'sort_name', 'sort_album', 'sort_album_artist', 'sort_artist',
             'sort_composer', 'sort_show', 'genre', 'date', 'description', 'synopsis', 'show', 'episode_id', 'network', 'episode_sort', 'season_number', 'media_type', 'artist',
             'album', 'album_artist', 'composer', 'grouping', 'lyrics', 'copyright', 'keywords']);
         const JUNK_PERSTREAM = new Set(['encoded_by', 'encoder']);   // only encoder-tier keys are safe per-stream (descriptive per-stream tags are functional, kept)
         const junkGlobalStrip = (lowerKey) => junkTags !== 'disabled' && (JUNK_ENCODER_GLOBAL.has(lowerKey) || (junkTags === 'descriptive' && JUNK_DESCRIPTIVE.has(lowerKey)));
-        // Per-stream encoder/encoded_by clears for the stream at OUTPUT index outIdx (post-reorder position, which -metadata:s:<index> targets). escMeta guards the probe-derived key.
+        // Per-stream encoder/encoded_by clears for the stream at OUTPUT index outIdx (post-reorder
+        // position, which -metadata:s:<index> targets). escMeta guards the probe-derived key.
         const streamJunkClears = (ffstream, outIdx) => {
             if (junkTags === 'disabled') return '';
             let meta = '';
@@ -884,11 +887,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // mirrors audio_clean's isTdarrCleanLang precompute and the parseOrderMode-once discipline. Read as a.langRank/b.langRank in the comparators.
                 langRank: getLangRank(streamLang),
                 channels: enrichedStream.channels || 0,
-                // Bitrate the order_quality cap compares against, in bps (shared resolveStreamBitrate fallback, via enrichStream). order_quality sorts by the
-                // audioQuality score but CAPS by raw bitrate ('descending <=1024k'), so the cap threshold needs an actual bitrate, not the score - derive any
-                // new bitrate-cap key from THIS field, not from a raw bit_rate. A LOSSLESS track whose bitrate neither probe reports (0) is still a heavy, hard-to-serve
-                // track, so it must count as OVER any bitrate cap (Infinity), never under it. A non-lossless bitrate-0 track (e.g. a freshly-transcoded aac) is
-                // genuinely small and stays 0 = under-cap. Only the '<=Nk' cap reads this; plain descending/ascending ignore it.
+                // Bitrate the order_quality cap compares against, in bps (shared resolveStreamBitrate fallback, via enrichStream). order_quality sorts by
+                // the audioQuality score but CAPS by raw bitrate ('descending <=1024k'), so the cap threshold needs an actual bitrate, not the score -
+                // derive any new bitrate-cap key from THIS field, not from a raw bit_rate. A LOSSLESS track whose bitrate neither probe reports (0) is still
+                // a heavy, hard-to-serve track, so it must count as OVER any bitrate cap (Infinity), never under it. A non-lossless bitrate-0 track (e.g. a
+                // freshly-transcoded aac) is genuinely small and stays 0 = under-cap. Only the '<=Nk' cap reads this; plain descending/ascending ignore it.
                 capBitrate: (streamType === 'audio' && !(enrichedStream.bit_rate > 0) && codecInfo[canon]?.lossless === true) ? Infinity : (enrichedStream.bit_rate || 0),
                 forced: hasDisposition(ffstream, 'forced'),   // flag OR title keyword, like original/commentary below - a "Forced"/"Foreign Parts Only" title is a real forced signal on sources that never set the flag
                 // Only score audio, and only when order_quality actually reads the score: scoring video/subtitle/data would spam bogus "unknown codec" /
@@ -905,27 +908,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 sdh: isSdh(ffstream),
                 lyrics: isLyrics(ffstream),
 
-                // Cover art/poster/thumbnail sort last: ffmpeg cover-art dispositions (any codec) or a still-image codec - mirrors clean_and_remux image removal.
+                // Cover art/poster/thumbnail sort last: ffmpeg cover-art dispositions (any
+                // codec) or a still-image codec - mirrors clean_and_remux image removal.
                 coverArt: isCoverArt(ffstream),
             });
         }
 
-        // audio_first='default': only ONE audio track can remain default (the normalisation below marks the first sorted audio the sole default). So promote
-        // the SINGLE default track that WINS the normal ordering, not every default flag - then the emitted order already matches the post-normalisation state and
-        // is a fixpoint. Promoting every default would lead with a lower-priority default on pass 1, then re-sort it once its default is stripped (a wasteful extra
-        // reorder remux before it settles). undefined when no track is flagged default, so audio_first='default' then falls through to normal ordering. Identity-compared below.
+        // audio_first='default': only ONE audio track can remain default (the normalisation below marks the first sorted audio the sole
+        // default). So promote the SINGLE default track that WINS the normal ordering, not every default flag - then the emitted order
+        // already matches the post-normalisation state and is a fixpoint. Promoting every default would lead with a lower-priority
+        // default on pass 1, then re-sort it once its default is stripped (a wasteful extra reorder remux before it settles). undefined
+        // when no track is flagged default, so audio_first='default' then falls through to normal ordering. Identity-compared below.
         const winningDefault = audioFirst === 'default'
             ? streams.filter(s => s.type === 'audio' && s.default).sort((a, b) => compareAudioKeys(a, b) || a.index - b.index)[0]
             : undefined;
 
-        // Per-type comparators (pure: read only a/b and the closed-over read-only audioFirst/subtitleFirst/winningDefault/compareAudioKeys). Each returns 0 on a
-        // full tie, so the sort dispatcher below falls through to source-index order.
-        // Video: cover art / posters / thumbnails sort last.
+        // Per-type comparators (pure: read only a/b and the closed-over read-only audioFirst/subtitleFirst/winningDefault/compareAudioKeys). Each
+        // returns 0 on a full tie, so the sort dispatcher below falls through to source-index order. Video: cover art / posters / thumbnails sort last.
         const compareVideoStreams = (a, b) => (a.coverArt !== b.coverArt) ? (a.coverArt ? 1 : -1) : 0;
-        // Audio: audio_first promotes ONE track above every audio key (including language). Only one value is active, so at most one clause fires; each is a no-op
-        // when no track qualifies, falling through to the normal ordering. original: keeps a foreign film's original audio first (and default), not a dub. default:
-        // keeps the source's flagged-default audio first - promoting only the WINNING default (winningDefault) so the result is idempotent. descriptive: lifts the
-        // audio-description track first (and, via normalisation, makes it the default). Then language, role, order_codec, union cap, channel + quality via compareAudioKeys.
+        // Audio: audio_first promotes ONE track above every audio key (including language). Only one value is active, so at most one
+        // clause fires; each is a no-op when no track qualifies, falling through to the normal ordering. original: keeps a foreign
+        // film's original audio first (and default), not a dub. default: keeps the source's flagged-default audio first - promoting only
+        // the WINNING default (winningDefault) so the result is idempotent. descriptive: lifts the audio-description track first (and,
+        // via normalisation, makes it the default). Then language, role, order_codec, union cap, channel + quality via compareAudioKeys.
         const compareAudioStreams = (a, b) => {
             if (audioFirst === 'original' && a.original !== b.original)
                 return a.original ? -1 : 1;
@@ -937,8 +942,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return a.descriptive ? -1 : 1;
             return compareAudioKeys(a, b);
         };
-        // Subtitle: forced first, then language priority (forced already handled), then subtitle_first promotes the default/SDH/descriptive subtitle to the top of
-        // THEIR language (below forced + language, above the normal role order), then the normal role order (normal, lyrics/songs, SDH, descriptive, commentary).
+        // Subtitle: forced first, then language priority (forced already handled), then subtitle_first promotes
+        // the default/SDH/descriptive subtitle to the top of THEIR language (below forced + language, above the
+        // normal role order), then the normal role order (normal, lyrics/songs, SDH, descriptive, commentary).
         const compareSubtitleStreams = (a, b) => {
             if (a.forced !== b.forced)
                 return a.forced ? -1 : 1;
@@ -992,8 +998,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // non-contiguous indices (e.g. 0,1,3 after an upstream drop) isn't remuxed pointlessly. -map still uses the absolute index above.
             if (streams[i].origPos !== i) changed = true;
 
-            // remove_junk_tags (per-stream): clear encoder/encoded_by on this stream, keyed on its OUTPUT index i (a within-type reorder moves a track's per-type
-            // position, so -metadata:s must use the post-sort index, not the source one). Present-only, so a clean stream adds nothing and never forces a mux alone.
+            // remove_junk_tags (per-stream): clear encoder/encoded_by on this stream, keyed on its OUTPUT index i (a
+            // within-type reorder moves a track's per-type position, so -metadata:s must use the post-sort index,
+            // not the source one). Present-only, so a clean stream adds nothing and never forces a mux alone.
             const streamJunk = streamJunkClears(streams[i].stream, i);
             if (streamJunk) { junkArgs += streamJunk; junkLog += `☐${streamTag(streams[i].index)}[remove_junk_tags=${junkTags}] Remove encoder tag(s) from ${streams[i].type} stream\n`; }
 
@@ -1011,7 +1018,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
-        // remove_junk_tags (global): clear encoder-provenance / descriptive container tags present (case-insensitive; title/comment/creation_time/awk_* kept). escMeta guards the key.
+        // remove_junk_tags (global): clear encoder-provenance / descriptive container tags present
+        // (case-insensitive; title/comment/creation_time/awk_* kept). escMeta guards the key.
         if (junkTags !== 'disabled')
             for (const k of Object.keys(file.ffProbeData.format?.tags || {})) {
                 const lk = k.toLowerCase();
@@ -1019,9 +1027,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (junkGlobalStrip(lk)) { junkArgs += ` -metadata "${escMeta(k)}="`; junkLog += `☐[remove_junk_tags=${junkTags}] Remove ${k} tag from file\n`; }
             }
 
-        // method_mp4_faststart: front-load the mp4 moov atom. A plain ride-along isn't enough (we skip when order is already correct), so detect the moov position
-        // (spawn-free; __awkMoovFront overrides for the harness) and force a one-time remux when faststart is on, the output is an mp4-family container, and the file
-        // isn't already fronted. moovBeforeMdat is fail-safe (unreadable/odd -> treated as fronted), so this settles after one pass and never loops.
+        // method_mp4_faststart: front-load the mp4 moov atom. A plain ride-along isn't enough (we skip when order is already
+        // correct), so detect the moov position (spawn-free; __awkMoovFront overrides for the harness) and force a one-time
+        // remux when faststart is on, the output is an mp4-family container, and the file isn't already fronted.
+        // moovBeforeMdat is fail-safe (unreadable/odd -> treated as fronted), so this settles after one pass and never loops.
         const isMp4 = isMp4Family(file.container);   // shared checker; cached once for this container
         const faststartOn = methodFaststart === 'force';
         const needsFront = faststartOn && isMp4 && !moovBeforeMdat(file.file, otherArguments);
@@ -1035,8 +1044,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.reQueueAfter = true;
         if (needsFront && !changed && dispositionArgs === '')
             response.infoLog += `☐[method_mp4_faststart=${methodFaststart}] Remux to front-load the mp4 moov atom\n`;
-        // mp4/mov muxers drop a custom GLOBAL metadata tag (e.g. clean_and_remux's awk_recovered, set upstream) on a -c copy remux unless told to keep it, which would
-        // re-trigger recovery on the next pass. Preserve it on the mov family, and append +faststart when method_mp4_faststart is on so the moov atom leads the file.
+        // mp4/mov muxers drop a custom GLOBAL metadata tag (e.g. clean_and_remux's awk_recovered, set upstream) on
+        // a -c copy remux unless told to keep it, which would re-trigger recovery on the next pass. Preserve it on
+        // the mov family, and append +faststart when method_mp4_faststart is on so the moov atom leads the file.
         const mp4KeepTags = isMp4 ? ` -movflags use_metadata_tags${faststartOn ? '+faststart' : ''}` : '';
         // Preserve Dolby Vision's dvcC/dvvC boxes on this mp4/mov -c copy remux (see dvStrictMp4Arg) - a plain copy of a DV HEVC/AV1 stream drops them.
         // Pass the RAW ffprobe streams (the local `streams` array above is rebuilt for ordering and lacks codec_tag_string / side_data_list, the DV signals).
