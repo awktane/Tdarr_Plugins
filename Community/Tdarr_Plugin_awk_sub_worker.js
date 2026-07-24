@@ -14,7 +14,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all) and skip_commentary (omit commentary tracks). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.6.2',
+    Version: '3.6.3',
     Tags: 'pre-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -48,7 +48,8 @@ const details = () => ({
             defaultValue: true,
             inputUI: { type: 'dropdown', options: ['true', 'false'] },
             tooltip: `On extract, remove each text subtitle from the video after it is written to a sidecar. Off = write sidecars but keep the embedded tracks.
-                \\nStyled ASS/SSA rely on embedded fonts, so they are exported as a .mks bundle holding the subtitle and those fonts together, and the fonts are removed from the video along with it - the styling survives the round-trip whatever else runs in between.`,
+                \\nStyled ASS/SSA rely on embedded fonts, so they are exported as a .mks bundle holding the subtitle and those fonts together, and the fonts are removed from the video along with it - the styling survives the round-trip whatever else runs in between.
+                \\nRemote-node caveat: the sidecar lands next to the source file, which reaches the server only if this node shares the library filesystem. On an unmapped/remote node Tdarr copies back the transcoded video but NOT the sidecar, so the subtitle is lost - run extract only on filesystem-sharing nodes, or set this off there to keep the embedded tracks.`,
         },
         {
             name: 'remove_sidecar_after_import',

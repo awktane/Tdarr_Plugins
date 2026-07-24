@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.3.3',
+    Version: '4.3.4',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -157,6 +157,7 @@ const details = () => ({
                 \\nunsupported (default): keep them where the container carries them (mkv), drop them only where it can't (mp4 can't store these).
                 \\nall: remove all image-based subtitles from any container (use when you only want text subtitles).
                 \\nexport: save each image subtitle to a hidden sidecar next to the video (PGS -> ".<name>.<lang>.sup", VobSub/DVB -> ".<name>.<lang>.mks") and then remove it. The leading dot keeps Plex/Jellyfin from indexing it; run an external OCR tool on the sidecars to produce .srt, then reimport with awk_sub_worker. One-way - these are never reimported by this plugin.
+                \\nRemote-node caveat: the sidecar lands next to the source file, which reaches the server only if this node shares the library filesystem. On an unmapped/remote node Tdarr copies back the transcoded video but NOT the sidecar, so the image subtitle is lost (and image subs can't be OCR-recovered once gone) - run export only on filesystem-sharing nodes.
                 \\nEmby caveat: Emby does NOT skip dot-prefixed files, so an exported .mks may surface as a stray library item (it ignores .sup outright). On Emby, add a .embyignore file (4.9+) listing ".*" in the library root, or OCR and delete the sidecars before the next scan.
                 \\nText subtitles are never affected. xsub is always removed (no Matroska CodecID) and is not exported.`,
         },
