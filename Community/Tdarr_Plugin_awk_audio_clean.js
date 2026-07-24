@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '4.4.0',
+    Version: '4.5.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -794,7 +794,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary lines up.
     // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Audio uses codecDisplayName so a DTS subtype
     // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all five.
-    const summariseStream = (s) => {
+    // The optional second argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - see the audio branch for what an encode keeps and
+    // what it drops. Because of it, NEVER pass this helper straight to .map(): Array.map would supply the element index as that argument.
+    const summariseStream = (s, out) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
         if (codec === 'subrip') codec = 'srt';
@@ -817,15 +819,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return `[video:${vParts}${isCoverArt(s) ? '/cover' : ''}]`;
         }
         if (type === 'audio') {
-            const ch = s.channels ? `${s.channels}ch` : '';
-            const bitrate = Number(s.bit_rate || 0);
-            const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
+            // What survives a RE-ENCODE is decided here, once, so a plugin's before/after summary lines are built by the same rules. Language and the
+            // disposition markers carry through an encode and still read off the source stream; the source-only mediaInfo markers do NOT - a fresh encode
+            // has neither the source's Dolby Surround EX matrix nor its commercial subtype, so claiming either on the output would state something false.
+            const chNum = out ? out.channels : s.channels;
+            const ch = chNum ? `${chNum}ch` : '';
+            // An explicit pre-formatted rate string wins, because a VBR encode's rate is an ESTIMATE ('~192k') that cannot be known until the encode runs;
+            // otherwise format the bit rate - from the override when this is an output token, from the stream itself when it is not.
+            const bps = Number((out ? out.bps : s.bit_rate) || 0);
+            const rate = (out && out.rate) || (bps > 0 ? `${Math.round(bps / 1000)}k` : '');
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : '');
             const prov = hasDisposition(s, 'dub') ? '/dub' : (hasDisposition(s, 'original') ? '/original' : '');
             // Dolby Surround EX marker (a rear channel matrix-folded into a 5.1 AC-3), read inline from mediaInfo Format_Settings_Mode - the flag's only home
             // (this shared helper can't call audio_clean's local isMatrixSurroundSource). Marks the EX copy so its token differs from a plain 5.1 twin.
-            const surEx = /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '') ? 'dd-ex' : '';
-            return `[audio:${[lang, ch, surEx, codecDisplayName(s), rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
+            const surEx = !out && /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '') ? 'dd-ex' : '';
+            // A re-encode is named by the codec it is being encoded TO - resolved through a bare object so no source profile/long-name/mediaInfo can leak in.
+            const name = out ? codecDisplayName({ codec_name: out.codec }) : codecDisplayName(s);
+            return `[audio:${[lang, ch, surEx, name, rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
         }
         if (type === 'subtitle') {
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : (isSdh(s) ? '/sdh' : (isLyrics(s) ? '/lyrics' : '')));
@@ -1282,7 +1292,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const surroundCodec = String(inputs.codec_surround).trim();
     const stereoCodec = String(inputs.codec_stereo).trim();
     const forceCodec = String(inputs.codec_force).trim();
-    const removeDuplicatesBy = String(inputs.method_deduplicate).trim();
+    const methodDeduplicate = String(inputs.method_deduplicate).trim();
     const regionDedup = String(inputs.method_dedup_region).trim();
     const stereoDownmix = String(inputs.method_stereo_downmix).trim();
     const methodLayoutErr = String(inputs.method_layout_err).trim();
@@ -1317,8 +1327,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`[codec_stereo=${stereoCodec}] invalid value, check your settings`);
     if(!['false','6below','2below','all'].includes(forceCodec))
         failFile(`[codec_force=${forceCodec}] invalid value, check your settings`);
-    if(!['disabled','multi-stereo','multi-stereo-error','channel','channel-error'].includes(removeDuplicatesBy))
-        failFile(`[method_deduplicate=${removeDuplicatesBy}] invalid value, check your settings`);
+    if(!['disabled','multi-stereo','multi-stereo-error','channel','channel-error'].includes(methodDeduplicate))
+        failFile(`[method_deduplicate=${methodDeduplicate}] invalid value, check your settings`);
     if(!['fold','distinct'].includes(regionDedup))
         failFile(`[method_dedup_region=${regionDedup}] invalid value, check your settings`);
     if(!['default','dialogue'].includes(stereoDownmix))
@@ -1487,10 +1497,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Note: dedup runs across ALL audio streams regardless of the language settings (those govern each track's tier, not what's a
         // genuine duplicate - a duplicate in a non-preferred language is still a duplicate). guard_lossless/guard_quality/guard_object_audio (dedupeGuardBlocks) keep a duplicate whose removal
         // would lose detail the survivor can't hold (a last lossless copy, or a higher-channel track under quality) instead of removing it, and never -errors on it.
-        const removeDuplicatesErrorMode = removeDuplicatesBy === 'multi-stereo-error' || removeDuplicatesBy === 'channel-error';
-        const removeDuplicatesGroupBy = removeDuplicatesErrorMode ? removeDuplicatesBy.replace(/-error$/, '') : removeDuplicatesBy;
+        const methodDeduplicateErrorMode = methodDeduplicate === 'multi-stereo-error' || methodDeduplicate === 'channel-error';
+        const methodDeduplicateGroupBy = methodDeduplicateErrorMode ? methodDeduplicate.replace(/-error$/, '') : methodDeduplicate;
         const streamsToRemove = new Set();
-        if (removeDuplicatesGroupBy === 'channel' || removeDuplicatesGroupBy === 'multi-stereo') {
+        if (methodDeduplicateGroupBy === 'channel' || methodDeduplicateGroupBy === 'multi-stereo') {
             const seen = new Map();
             // A measured bitrate beats a bitrate-less duplicate of the same tier: audioQuality can only ESTIMATE a track with no reported bitrate (optimistically,
             // from the codec's per-channel target), so it must not win the "which duplicate to keep" decision over a track whose bitrate we actually measured. Both
@@ -1520,7 +1530,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // secondary exemption above). clean_and_remux's language_fill_mode vets untagged audio when it runs first, but audio_clean is independently runnable, so guard here too.
                 if (s.isTdarrCleanLang === 'und') continue;
                 let tier;
-                if (removeDuplicatesGroupBy === 'channel') {
+                if (methodDeduplicateGroupBy === 'channel') {
                     tier = s.channels;
                 } else if (downmixToSix !== 'false' && s.channels > 4 && s.channels <= 6) {
                     tier = 'six';
@@ -1534,17 +1544,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (seen.has(key)) {
                     const kept = seen.get(key);
                     if (dedupeGuardBlocks(s, kept)) continue;
-                    if (removeDuplicatesErrorMode) {
+                    if (methodDeduplicateErrorMode) {
                         const rmRate = hasKnownRate(s) ? ` @ ${Math.round(Number(s.bit_rate) / 1000)} kb/s` : '';
                         const keptRate = hasKnownRate(kept) ? ` @ ${Math.round(Number(kept.bit_rate) / 1000)} kb/s` : '';
-                        failFile(`${streamTag(s.index)}[method_deduplicate=${removeDuplicatesBy}] Duplicate audio track (${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrRegionKey}${rmRate}) alongside stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate}) - aborting; tag/remove tracks manually and requeue, or switch method_deduplicate to a non-error mode`);
+                        failFile(`${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Duplicate audio track (${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrRegionKey}${rmRate}) alongside stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate}) - aborting; tag/remove tracks manually and requeue, or switch method_deduplicate to a non-error mode`);
                     }
                     streamsToRemove.add(s.index);
                     // Show the removed track's bitrate and the kept track's for contrast — duplicates are
                     // decided by quality score (largely bitrate-driven), so this makes the choice transparent.
                     const rmRate = hasKnownRate(s) ? ` @ ${Math.round(Number(s.bit_rate) / 1000)} kb/s` : '';
                     const keptRate = hasKnownRate(kept) ? ` @ ${Math.round(Number(kept.bit_rate) / 1000)} kb/s` : '';
-                    workDone += `☐${streamTag(s.index)}[method_deduplicate=${removeDuplicatesBy}] Removing duplicate (lower quality ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrRegionKey}${rmRate}) - keeping stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate})\n`;
+                    workDone += `☐${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Removing duplicate (lower quality ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrRegionKey}${rmRate}) - keeping stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate})\n`;
                 } else
                     seen.set(key, s);
             }
@@ -1655,7 +1665,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // inputAudioIdxMap: 0-based audio-type index within the INPUT file (for -map 0:a:N).
         // outputAudioIdxMap: 0-based audio-type index within the OUTPUT (for -c:a:N and -metadata:s:a:N).
-        // These differ when removeDuplicatesBy removes streams, since -map 0:a:N always references input.
+        // These differ when methodDeduplicate removes streams, since -map 0:a:N always references input.
         const inputAudioIdxMap = new Map();
         const outputAudioIdxMap = new Map();
         let inputAudioCounter = 0;
@@ -2374,35 +2384,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Build the predicted output stream summary for the closing log line. Audio streams keep their original codec unless an in-place override was
         // recorded; removed duplicates are dropped; newly created downmix tracks are appended (matching ffmpeg's -map 0 then -map 0:a:N ordering). All
         // streams are enriched with resolveStreamBitrate before summariseStream, matching the input summary line - so untouched tracks (e.g. a copied stereo
-        // track) show their bitrate correctly. aac_vbr overrides carry approxRate instead of a fixed bps; summariseStream receives the approxRate string
-        // pre-formatted as the bit_rate field so the bracket token shows e.g. ~192k.
+        // track) show their bitrate correctly. A re-encoded track is summarised through summariseStream's output descriptor, which prints an aac_vbr
+        // override's approximate rate (~192k) and drops the source-only markers a fresh encode cannot carry.
         const buildOutputSummary = () => {
             const tokens = [];
-            // Build an audio token for a VBR override/append, where the rate is an approximate string (e.g. '~192k') rather than a number summariseStream can
-            // format. Only the rate diverges from summariseStream: the disposition suffix (default, then commentary/description, then dub/original) mirrors it
-            // exactly - read off the original source stream (an override preserves its disposition; an appended downmix inherits it from source) - so the output
-            // token carries the same markers as the input summary.
-            const vbrAudioToken = (srcStream, channels, codec, approxRate) => {
-                const lang = resolveLang(srcStream);
-                const langStr = (lang && lang !== 'und') ? lang : '';
-                const def = srcStream.disposition?.default === 1 ? '/default' : '';
-                const role = isCommentary(srcStream) ? '/commentary' : (isDescriptive(srcStream) ? '/description' : '');
-                const prov = hasDisposition(srcStream, 'dub') ? '/dub' : (hasDisposition(srcStream, 'original') ? '/original' : '');
-                return `[audio:${[langStr, `${channels}ch`, codec, approxRate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
-            };
             for (const s of file.ffProbeData.streams) {
                 const enriched = enrichStream(s);
                 if ((s?.codec_type || '').trim().toLowerCase() === 'audio') {
                     if (streamsToRemove.has(s.index)) continue;
                     const ov = outputAudioOverride.get(outputAudioIdxMap.get(s.index));
                     if (ov) {
-                        // approxRate carries the VBR display string (e.g. '~192k'); bps===0 flags this. summariseStream reads bit_rate numerically, so VBR
-                        // overrides build the token via vbrAudioToken to show the tilde-prefixed approximate rate instead.
-                        if (ov.approxRate) {
-                            tokens.push(vbrAudioToken(s, ov.channels, ov.codec, ov.approxRate));
-                        } else {
-                            tokens.push(summariseStream({ ...enriched, codec_name: ov.codec, channels: ov.channels, bit_rate: ov.bps }));
-                        }
+                        // One path for every override: summariseStream builds the output token from the encode's own codec/channels/rate, so a VBR
+                        // override's approximate rate ('~192k', carried in approxRate) prints through the same builder as a fixed-bitrate one.
+                        tokens.push(summariseStream(enriched, { codec: ov.codec, channels: ov.channels, bps: ov.bps, rate: ov.approxRate }));
                     } else {
                         tokens.push(summariseStream(enriched));
                     }
@@ -2410,11 +2404,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     tokens.push(summariseStream(enriched));
             }
             for (const a of appendedAudio) {
-                if (a.approxRate) {
-                    tokens.push(vbrAudioToken(a.srcStream, a.channels, a.codec, a.approxRate));
-                } else {
-                    tokens.push(summariseStream({ ...a.srcStream, codec_name: a.codec, channels: a.channels, bit_rate: a.bps }));
-                }
+                tokens.push(summariseStream(a.srcStream, { codec: a.codec, channels: a.channels, bps: a.bps, rate: a.approxRate }));
             }
             return tokens.join('');
         };

@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can promote the default, SDH or descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time it's needed).\n`,
-    Version: '4.4.0',
+    Version: '4.4.1',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -585,7 +585,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary lines up.
     // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Audio uses codecDisplayName so a DTS subtype
     // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all five.
-    const summariseStream = (s) => {
+    // The optional second argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - see the audio branch for what an encode keeps and
+    // what it drops. Because of it, NEVER pass this helper straight to .map(): Array.map would supply the element index as that argument.
+    const summariseStream = (s, out) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
         if (codec === 'subrip') codec = 'srt';
@@ -608,15 +610,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return `[video:${vParts}${isCoverArt(s) ? '/cover' : ''}]`;
         }
         if (type === 'audio') {
-            const ch = s.channels ? `${s.channels}ch` : '';
-            const bitrate = Number(s.bit_rate || 0);
-            const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
+            // What survives a RE-ENCODE is decided here, once, so a plugin's before/after summary lines are built by the same rules. Language and the
+            // disposition markers carry through an encode and still read off the source stream; the source-only mediaInfo markers do NOT - a fresh encode
+            // has neither the source's Dolby Surround EX matrix nor its commercial subtype, so claiming either on the output would state something false.
+            const chNum = out ? out.channels : s.channels;
+            const ch = chNum ? `${chNum}ch` : '';
+            // An explicit pre-formatted rate string wins, because a VBR encode's rate is an ESTIMATE ('~192k') that cannot be known until the encode runs;
+            // otherwise format the bit rate - from the override when this is an output token, from the stream itself when it is not.
+            const bps = Number((out ? out.bps : s.bit_rate) || 0);
+            const rate = (out && out.rate) || (bps > 0 ? `${Math.round(bps / 1000)}k` : '');
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : '');
             const prov = hasDisposition(s, 'dub') ? '/dub' : (hasDisposition(s, 'original') ? '/original' : '');
             // Dolby Surround EX marker (a rear channel matrix-folded into a 5.1 AC-3), read inline from mediaInfo Format_Settings_Mode - the flag's only home
             // (this shared helper can't call audio_clean's local isMatrixSurroundSource). Marks the EX copy so its token differs from a plain 5.1 twin.
-            const surEx = /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '') ? 'dd-ex' : '';
-            return `[audio:${[lang, ch, surEx, codecDisplayName(s), rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
+            const surEx = !out && /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '') ? 'dd-ex' : '';
+            // A re-encode is named by the codec it is being encoded TO - resolved through a bare object so no source profile/long-name/mediaInfo can leak in.
+            const name = out ? codecDisplayName({ codec_name: out.codec }) : codecDisplayName(s);
+            return `[audio:${[lang, ch, surEx, name, rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
         }
         if (type === 'subtitle') {
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : (isSdh(s) ? '/sdh' : (isLyrics(s) ? '/lyrics' : '')));

@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.3.1',
+    Version: '4.3.2',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -531,7 +531,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The role markers mirror the sorting logic (flag OR title keyword, via the shared classifiers) so every plugin's summary lines up.
     // subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Audio uses codecDisplayName so a DTS subtype
     // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. Shared verbatim across all five.
-    const summariseStream = (s) => {
+    // The optional second argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - see the audio branch for what an encode keeps and
+    // what it drops. Because of it, NEVER pass this helper straight to .map(): Array.map would supply the element index as that argument.
+    const summariseStream = (s, out) => {
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
         if (codec === 'subrip') codec = 'srt';
@@ -554,15 +556,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return `[video:${vParts}${isCoverArt(s) ? '/cover' : ''}]`;
         }
         if (type === 'audio') {
-            const ch = s.channels ? `${s.channels}ch` : '';
-            const bitrate = Number(s.bit_rate || 0);
-            const rate = bitrate > 0 ? `${Math.round(bitrate / 1000)}k` : '';
+            // What survives a RE-ENCODE is decided here, once, so a plugin's before/after summary lines are built by the same rules. Language and the
+            // disposition markers carry through an encode and still read off the source stream; the source-only mediaInfo markers do NOT - a fresh encode
+            // has neither the source's Dolby Surround EX matrix nor its commercial subtype, so claiming either on the output would state something false.
+            const chNum = out ? out.channels : s.channels;
+            const ch = chNum ? `${chNum}ch` : '';
+            // An explicit pre-formatted rate string wins, because a VBR encode's rate is an ESTIMATE ('~192k') that cannot be known until the encode runs;
+            // otherwise format the bit rate - from the override when this is an output token, from the stream itself when it is not.
+            const bps = Number((out ? out.bps : s.bit_rate) || 0);
+            const rate = (out && out.rate) || (bps > 0 ? `${Math.round(bps / 1000)}k` : '');
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : '');
             const prov = hasDisposition(s, 'dub') ? '/dub' : (hasDisposition(s, 'original') ? '/original' : '');
             // Dolby Surround EX marker (a rear channel matrix-folded into a 5.1 AC-3), read inline from mediaInfo Format_Settings_Mode - the flag's only home
             // (this shared helper can't call audio_clean's local isMatrixSurroundSource). Marks the EX copy so its token differs from a plain 5.1 twin.
-            const surEx = /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '') ? 'dd-ex' : '';
-            return `[audio:${[lang, ch, surEx, codecDisplayName(s), rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
+            const surEx = !out && /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '') ? 'dd-ex' : '';
+            // A re-encode is named by the codec it is being encoded TO - resolved through a bare object so no source profile/long-name/mediaInfo can leak in.
+            const name = out ? codecDisplayName({ codec_name: out.codec }) : codecDisplayName(s);
+            return `[audio:${[lang, ch, surEx, name, rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
         }
         if (type === 'subtitle') {
             const role = isCommentary(s) ? '/commentary' : (isDescriptive(s) ? '/description' : (isSdh(s) ? '/sdh' : (isLyrics(s) ? '/lyrics' : '')));
@@ -926,20 +936,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ===== END SHARED: font attachment test =====
 
+    const path = require('path');
+
+    // ===== SHARED [clean_and_remux, sub_worker]: sidecar path derivation =====
+    // -=-=-= libFilePath / libDir / videoBase / sidecarLangToken  [clean_and_remux, sub_worker] =-=-=-
+    // Where a sidecar is written, plus the two metadata-derived name parts that get interpolated into the quoted "${path}" token of a preset. These two plugins
+    // are the only ones that write files next to the library video, and both must sanitise identically, so the derivation lives here rather than being spelled
+    // out twice - it is security-relevant, and a copy outside the shared markers is one awk-shared-block-check structurally cannot compare.
+    // originalLibraryFile is the true on-disk file; file.file is the fallback so the plugin still works when a caller (or the test harness) omits it.
+    // videoBase and sidecarLangToken are sanitised at their source: a crafted filename or container language tag must not inject a path separator or
+    // ".." (escaping libDir) or a " that closes the quote and appends ffmpeg args. The library DIRECTORY is deliberately NOT sanitised - a real path
+    // has to stay literal - so callers CHECK the joined path with pathIsPresetSafe instead and refuse that one sidecar when it fails.
+    const libFilePath = otherArguments?.originalLibraryFile?.file || file.file || '';
+    const libDir = path.dirname(libFilePath);
+    const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '');
+    const sidecarLangToken = (s) => (resolveLang(s) || 'und').replace(/[^a-z0-9-]/g, '') || 'und';
+    // ===== END SHARED: sidecar path derivation =====
+
     // Hidden dot-prefixed sidecar name for an exported image subtitle: ".<video>.s<index>.<lang>[.forced].<ext>". The leading dot makes Plex/Jellyfin ignore it (Jellyfin
     // skips **/.* ; Plex ignores .sup/.mks by extension). Emby is the exception - it scans dot-prefixed files, so an exported .mks needs a .embyignore entry there
-    // (called out in the remove_imagesubs tooltip). Both metadata-derived name parts are made safe for the quoted "${path}" in the export preset: lang is
-    // restricted to the language-code charset, and imageBase (the source basename) has any " / control char stripped so a crafted video filename can't close
-    // the quote and inject args. The library DIRECTORY they are joined to is NOT sanitised - it has to stay literal - so the full path is CHECKED with
-    // pathIsPresetSafe at the emit site below, and the export is refused when that check fails.
-    const path = require('path');
-    const libFile = otherArguments?.originalLibraryFile?.file || file.file;
-    const libDir = path.dirname(libFile);
-    const imageBase = path.basename(libFile).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '');
+    // (called out in the remove_imagesubs tooltip). Name safety is handled by the shared derivation above; the emit site below still CHECKS the joined path.
     const imageSidecarName = (ffstream, ext) => {
-        const lang = (resolveLang(ffstream) || 'und').replace(/[^a-z0-9-]/g, '') || 'und';
         const forced = ffstream.disposition?.forced === 1 ? '.forced' : '';
-        return `.${imageBase}.s${ffstream.index}.${lang}${forced}.${ext}`;
+        return `.${videoBase}.s${ffstream.index}.${sidecarLangToken(ffstream)}${forced}.${ext}`;
     };
     // A subtitle removed regardless of language - by container/format (subFormatDropped) or by remove_imagesubs (imageSubDropped). Neither is ever assigned
     // language_fill, and neither counts as a survivor for the language_fill_mode untagged tally or the remove_sub_sdh plain-track guard.
@@ -1627,7 +1646,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 .map(s => ({ s: enrichStream(s), idx: s.index }))
                 .filter(({ idx }) => !removedIndices.has(idx))
                 .map(({ s, idx }) => (subCodecOverride.has(idx) ? { ...s, codec_name: subCodecOverride.get(idx) } : s))
-                .map(summariseStream).join('');
+                .map((s) => summariseStream(s)).join('');
             response.infoLog += `☑Expected results: ${outSummary}\n`;
             response.processFile = true;
         } else {
