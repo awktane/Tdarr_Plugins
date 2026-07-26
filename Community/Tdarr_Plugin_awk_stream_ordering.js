@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can promote the default, SDH or descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time it's needed).\n`,
-    Version: '4.5.0',
+    Version: '4.6.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -763,17 +763,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
         failFile('No ffProbe stream data available for this file - the plugin cannot process it');
 
-    // method_mp4_faststart normalizer: lower-cases, and silently folds the accepted aliases 'enabled'->'force' / 'disabled'->'strip' onto the current option
-    // pair (same behaviour, plainer names). The aliases are accepted but NOT offered - they stay out of the dropdown's options list. The fold is required, not
-    // cosmetic: the dropdown validator below FAILS the file on an unknown value, so a value already persisted in a Tdarr library config must keep validating.
-    const normFaststart = (v) => { const s = String(v || 'force').toLowerCase().trim(); return ({ enabled: 'force', disabled: 'strip' })[s] || s; };
     // Value checks. The two free-text inputs (order_language/order_codec) have no fixed option set; the six dropdowns (audio_first, subtitle_first,
     // order_channel, order_quality, remove_junk_tags, method_mp4_faststart) each have one, validated below. [inputName, valueToTest, validOptions]
-    // - remove_junk_tags normalizes case and method_mp4_faststart normalizes case + aliases before the membership check; the four others test the
-    // raw input. The failFile message always shows the RAW inputs[name]. Checked top-down, failing on the first bad value. Normalized ONCE here and
-    // reused at the use sites below, so the value that gets validated is provably the value that gets executed.
+    // - remove_junk_tags and method_mp4_faststart normalize case before the membership check; the four others test the raw input. The failFile message
+    // always shows the RAW inputs[name]. Checked top-down, failing on the first bad value. Normalized ONCE here and reused at the use sites below, so the
+    // value that gets validated is provably the value that gets executed.
     const junkTags = String(inputs.remove_junk_tags || 'disabled').toLowerCase();
-    const methodFaststart = normFaststart(inputs.method_mp4_faststart);
+    const methodFaststart = String(inputs.method_mp4_faststart || 'force').toLowerCase().trim();
     const dropdownChecks = [
         ['audio_first',          inputs.audio_first,                                             ['language', 'original', 'default', 'descriptive']],
         ['order_channel',        inputs.order_channel,                                           ['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled']],

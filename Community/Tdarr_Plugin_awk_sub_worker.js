@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.18.0',
+    Version: '3.19.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -933,7 +933,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!ours && !isKnownLang(lang)) return null;                     // server-native has no s<index> anchor, so its language token must be real
         // Flags we park AHEAD of the language because media servers would choke on them there (EXTRA_DISPOSITIONS). Only our own s<index> names carry
         // them, and they sit between the encoded title and the language, so they are consumed here - before the residual-token count below decides what
-        // is left is a title. A name written by an older version simply has none, and parses exactly as it did.
+        // is left is a title. A name that carries none of them simply skips this step.
         const extraTokens = [];
         const preRoles = [];
         while (ours && toks.length && (EXTRA_TOKENS.has(toks[toks.length - 1]) || DISP_TOKENS.has(toks[toks.length - 1]))) {
@@ -1270,13 +1270,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!isPostProcessing && (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))) failFile('No ffProbe stream data available, cannot process this file');
     const mode = String(inputs.mode);
     if (mode !== 'extract' && mode !== 'import') failFile(`[mode=${mode}] invalid value, check your settings`);
-    // method_deduplicate normalizer: lower-cases, and silently folds the accepted legacy value 'enabled_delete' -> 'enabled'. Deletion is
-    // import_remove_sidecar's decision alone, and the marker already lists every member of a dedup group, so the legacy value never added a
-    // capability of its own; it is accepted but NOT offered - it stays out of the dropdown's options list. The fold is required, not cosmetic: the
-    // check below FAILS the file on an unknown value, so a value already persisted in a Tdarr library config must keep validating. The failFile
-    // message shows the RAW inputs value.
-    const normDedupe = (v) => { const s = String(v || 'enabled').toLowerCase().trim(); return s === 'enabled_delete' ? 'enabled' : s; };
-    const dedupeMode = normDedupe(inputs.method_deduplicate);
+    // Deleting the sidecar FILES is import_remove_sidecar's decision alone in every mode - this setting only ever decides what counts as a duplicate. An
+    // unrecognised value FAILS the file rather than falling through to a default, since the three modes do materially different amounts of work and a typo
+    // must not quietly pick one. The failFile message shows the RAW inputs value.
+    const dedupeMode = String(inputs.method_deduplicate || 'enabled').toLowerCase().trim();
     if (!['disabled', 'enabled', 'enabled_embedded'].includes(dedupeMode)) failFile(`[method_deduplicate=${inputs.method_deduplicate}] invalid value, check your settings`);
     const dedupeSidecars = dedupeMode !== 'disabled';        // both enabled values collapse byte-identical sidecars and skip one already embedded
     const dedupeStreams = dedupeMode === 'enabled_embedded'; // only this one also removes a duplicate the file already carries
