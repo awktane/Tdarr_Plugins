@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.23.0',
+    Version: '3.23.1',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1686,6 +1686,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // afterwards. Nothing can do this job from here, so it says so and leaves the sidecars alone rather than claiming a deletion it did not perform.
         if (!toMux.length && !retuneMeta && alreadyInFile.length && removeSidecarAfterImport && placeViaApi()) {
             const stranded = alreadyInFile.flatMap((f) => f.members.map((m) => m.rel));
+            // Forcing twice for the same sidecar is worse than not forcing at all: Tdarr ERRORS a file whose consecutive passes emit identical arguments
+            // (its own infinite-transcode-loop guard), so a repeat does not merely waste a remux, it quarantines the video. The marker is the record of
+            // what an earlier pass already queued, and it is checked DIRECTLY here rather than through alreadyEmbedded, which cannot confirm a sidecar whose
+            // decoded title differs from the track's - a hand-added copy under a name of the user's own choosing is exactly that, and would otherwise
+            // re-force on every pass. Nothing is lost by stopping: that earlier pass's marker still names them, so post-processing deletes them when it runs.
+            if (!stranded.some((rel) => !importedSet.has(rel))) {
+                response.infoLog += `☑[import_remove_sidecar=${removeSidecarMode}] Already queued for removal by an earlier pass - nothing more to do until the post-processing stage runs\n`;
+                response.infoLog += '☑Nothing to import - every sidecar was already in the file\n';
+                return response;
+            }
             // The only route left, so it is taken rather than offered. Post-processing runs SERVER-side, where the library is reachable, but it only runs
             // after a transcode is ACCEPTED - so a lossless copy of the whole file is emitted purely to reach that stage. Making this a setting would only
             // work for someone who already knew the trap existed, and by then they have been caught by it: asking for the sidecars to be deleted IS asking
