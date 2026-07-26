@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.24.1',
+    Version: '3.25.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1541,18 +1541,34 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const listDest = serverSidePath(path.join(libDir, listName));
                 if (!listDest) failFile(`[method_unmapped=text_file] No path translator maps ${libDir} back to the server, so ${listName} cannot be fetched`);
                 const listLocal = path.join(libDir, listName);
+                // No list is NOTHING TO IMPORT, not a failure. It is the ordinary state of most files: extract only writes one when it actually placed
+                // sidecars, so a video with no text subtitles never has one - and a completed round trip deletes the list once its last entry is embedded.
+                // Failing here would quarantine every such file, turning both "nothing to do" and "finished successfully" into errors. This is the same
+                // outcome a mapped node reaches by scanning the folder and finding no sidecars; only the way it looks is different.
                 const listWhy = downloadLibraryFile(listDest, listLocal);
-                if (listWhy) failFile(`[method_unmapped=text_file] Could not read ${listName} from the library (${listWhy}) - run extract once to create it, or add it yourself with one filename per line`);
-                let listText = '';
-                try { listText = fs.readFileSync(listLocal, 'utf8'); } catch (e) { failFile(`[method_unmapped=text_file] Fetched ${listName} but could not read it back: ${e && e.message ? e.message : e}`); }
-                const parsed = readSubtitleList(listText);
-                for (const [entry, why] of parsed.bad) response.infoLog += `☒[method_unmapped=text_file] Ignoring "${entry}" in ${listName} - ${why}\n`;
-                if (!parsed.ok.length) failFile(`[method_unmapped=text_file] ${listName} lists no usable filenames${parsed.bad.length ? ' - every line was rejected, see above' : ' - add one filename per line'}`);
-                listedRels = fetchListedSidecars(parsed.ok, listName, importedSet);
-                // Names an earlier pass already embedded and removed are not a shortfall, so they count out of the total rather than reading as failures.
-                const spent = parsed.ok.filter((rel) => importedSet.has(rel) && !listedRels.includes(rel)).length;
-                const wanted = parsed.ok.length - spent;
-                response.infoLog += `☑[method_unmapped=text_file] Read ${parsed.ok.length} filename${parsed.ok.length === 1 ? '' : 's'} from ${listName}, fetched ${listedRels.length} of the ${wanted} still to import${spent ? ` (${spent} already embedded and removed)` : ''}\n`;
+                if (listWhy) {
+                    response.infoLog += `☑[method_unmapped=text_file] No ${listName} in the library, so there is nothing listed to import - extract creates one when it writes sidecars, or add it yourself with one filename per line\n`;
+                    listedRels = [];   // nothing to import - but the file's own duplicate subtitle streams are still worth collapsing, so fall through
+                }
+                if (listedRels === null) {
+                    let listText = '';
+                    try { listText = fs.readFileSync(listLocal, 'utf8'); } catch (e) { failFile(`[method_unmapped=text_file] Fetched ${listName} but could not read it back: ${e && e.message ? e.message : e}`); }
+                    const parsed = readSubtitleList(listText);
+                    for (const [entry, why] of parsed.bad) response.infoLog += `☒[method_unmapped=text_file] Ignoring "${entry}" in ${listName} - ${why}\n`;
+                    // An empty list is the same "nothing to import" as no list at all - a user who emptied it, or left only comments, has said so. A list whose
+                    // every line was REJECTED is different: those were written with intent and not one can be used, which is a mistake worth stopping on.
+                    if (!parsed.ok.length && parsed.bad.length) failFile(`[method_unmapped=text_file] ${listName} lists no usable filenames - every line was rejected, see above`);
+                    if (!parsed.ok.length) {
+                        response.infoLog += `☑[method_unmapped=text_file] ${listName} lists no filenames, so there is nothing to import - add one filename per line\n`;
+                        listedRels = [];
+                    } else {
+                        listedRels = fetchListedSidecars(parsed.ok, listName, importedSet);
+                        // Names an earlier pass already embedded and removed are not a shortfall, so they count out of the total rather than reading as failures.
+                        const spent = parsed.ok.filter((rel) => importedSet.has(rel) && !listedRels.includes(rel)).length;
+                        const wanted = parsed.ok.length - spent;
+                        response.infoLog += `☑[method_unmapped=text_file] Read ${parsed.ok.length} filename${parsed.ok.length === 1 ? '' : 's'} from ${listName}, fetched ${listedRels.length} of the ${wanted} still to import${spent ? ` (${spent} already embedded and removed)` : ''}\n`;
+                    }
+                }
             }
         }
 
@@ -1590,8 +1606,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const relExt = (path.posix.basename(rel.replace(/\\/g, '/')).match(/\.([A-Za-z0-9]+)$/) || ['', ''])[1].toLowerCase();
             if (TEXT_EXTS.includes(relExt) || relExt === BUNDLE_EXT) response.infoLog += `☒Not a recognised sidecar name, skipping: ${rel}\n`;
         }
-        if (!found.length) { response.infoLog += '☑No subtitle sidecars found to import\n'; return response; }
-
         // This pass only ever ADDS subtitles to the file - it never deletes a sidecar. import_remove_sidecar acts in the post-processing branch
         // above, once the transcode has been accepted; unlinking here would destroy the sidecars of a run the user then rejects.
         const embeddedSubs = streams.filter((s) => (s.codec_type || '').toLowerCase() === 'subtitle');
@@ -1602,6 +1616,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const dupes = dedupeStreams ? dedupeEmbeddedSubs(embeddedSubs) : { dropIdx: [], retag: null, log: '' };
         response.infoLog += dupes.log;
         const keptSubs = embeddedSubs.filter((s) => !dupes.dropIdx.includes(s.index));
+
+        // Nothing to import does not mean nothing to do: the file's OWN duplicate subtitle streams are a property of the file, not of the sidecars, so
+        // they are still removed. Reaching the mux below requires a sidecar, and this is the one route to it that has none - a library with no sidecars at
+        // all, or a round trip that has already finished and cleaned up after itself, would otherwise never have its duplicates collapsed.
+        if (!found.length) {
+            if (!dupes.dropIdx.length) { response.infoLog += '☑No subtitle sidecars found to import\n'; return response; }
+            let dropOnly = ' -map 0';
+            for (const idx of dupes.dropIdx) dropOnly += ` -map -0:${idx}`;
+            dropOnly += ' -c copy';
+            const survivingSubs = embeddedSubs.filter((x) => !dupes.dropIdx.includes(x.index));
+            for (const r of dupes.retag || []) {
+                const n2i = survivingSubs.findIndex((x) => x.index === r.index);
+                if (n2i < 0) continue;
+                dropOnly += ` -metadata:s:s:${n2i} "language=${escMeta(isMp4 ? to6392T(r.lang) : normSidecarLang(r.lang))}"`;
+                dropOnly += ` -metadata:s:s:${n2i} "title=${escMeta(r.title || '')}"`;
+                dropOnly += ` -disposition:s:${n2i} ${r.disp.length ? r.disp.join('+') : '0'}`;
+            }
+            commitPreset(dropOnly);
+            response.infoLog += `☑Expected results: ${summariseAll(streams.filter((x) => !dupes.dropIdx.includes(x.index)))}\n`;
+            return response;
+        }
 
         // Import is NON-DESTRUCTIVE: every recognized sidecar not already handled by our own prior pass (marker) is muxed in. We do NOT suppress a
         // sidecar just because an embedded sub shares its lang|title|disposition - metadata can't prove same content, and dropping a distinct track is
