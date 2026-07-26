@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.20.1',
+    Version: '3.21.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1676,6 +1676,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // asked for happens now rather than in the post-processing pass that normally does it - and it is safe precisely because these files never entered
         // the marker: a sidecar this pass muxed is filtered out upstream by alreadyEmbedded, so anything reaching here had its content in the file BEFORE
         // this flow started, and is therefore in the accepted library copy no matter what the rest of the flow does or how it ends.
+        // It requires REACHING the library, which placeViaApi() is exactly the negation of. Without that, workLibDir() is the node-local mirror: under
+        // method_unmapped=text_file the sidecars there are the copies just downloaded to compare against, so unlinking them removes this run's own
+        // scratch files and reports a deletion that never touched the library. Nor can the usual route stand in - the file API offers upload and download
+        // but no delete, and with nothing to mux there is no transcode, no acceptance, and therefore no server-side post-processing pass to clean up
+        // afterwards. Nothing can do this job from here, so it says so and leaves the sidecars alone rather than claiming a deletion it did not perform.
+        if (!toMux.length && !retuneMeta && alreadyInFile.length && removeSidecarAfterImport && placeViaApi()) {
+            response.infoLog += '☒[import_remove_sidecar=true] Every sidecar is already in the file, but this node cannot reach the library to delete them - and with nothing to mux there is no transcode for the post-processing pass to clean up after\n';
+            response.infoLog += `☒[method_unmapped=${unmappedMode}] Run this import on a node that shares the library filesystem, or use method_unmapped=mount, to have them removed\n`;
+            response.infoLog += '☑Nothing to import - every sidecar was already in the file\n';
+            return response;
+        }
         if (!toMux.length && !retuneMeta && alreadyInFile.length && removeSidecarAfterImport) {
             let gone = 0; const removedRels = new Set();
             for (const rel of alreadyInFile.flatMap((f) => f.members.map((m) => m.rel))) {
