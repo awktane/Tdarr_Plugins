@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.15.0',
+    Version: '3.16.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -55,11 +55,12 @@ const details = () => ({
             name: 'method_deduplicate',
             type: 'string',
             defaultValue: 'enabled',
-            inputUI: { type: 'dropdown', options: ['disabled', 'enabled'] },
-            tooltip: `On import, how to handle sidecar files that are BYTE-IDENTICAL to each other (the same subtitle saved under more than one name/flag). Content is compared, so genuinely different tracks - two commentaries, a real forced vs a full track - are always kept separately; only exact duplicates collapse.
-                \\ndisabled - mux every sidecar as its own track, even byte-identical copies (you may get duplicate subtitles).
-                \\nenabled  - mux one track per byte-identical group, combining their flags (a byte-identical plain + SDH pair imports once, tagged SDH). Every member of the group is listed in the marker, so remove_sidecar_after_import cleans up the whole group.
-                \\nWhether the sidecar files are deleted afterwards is remove_sidecar_after_import's decision alone, in either mode.`,
+            inputUI: { type: 'dropdown', options: ['disabled', 'enabled', 'enabled_embedded'] },
+            tooltip: `What counts as a copy of a subtitle you already have. The TEXT always decides, so genuinely different tracks - two commentaries, a real forced track vs a full one - are never collapsed; only byte-for-byte duplicates are.
+                \\ndisabled - mux every sidecar as its own track, even byte-identical copies (you may end up with duplicate subtitles).
+                \\nenabled - on import, mux one track per byte-identical group of sidecars, combining their flags (a plain + SDH pair imports once, tagged SDH), and skip a sidecar whose text is ALREADY one of the embedded tracks rather than adding a second copy of it. Every member of a group is listed in the marker, so remove_sidecar_after_import cleans up the whole group. Nothing is removed from the video.
+                \\nenabled_embedded - all of the above, and in BOTH modes also removes a subtitle the video itself carries twice. The lowest-numbered copy survives and inherits the others' flags, title and language, so no tagging is lost. This is the only setting that deletes a subtitle you did not ask to extract, and it costs one extra read of the file to compare the tracks.
+                \\nWhether the sidecar FILES are deleted afterwards is remove_sidecar_after_import's decision alone, in every mode.`,
         },
         {
             name: 'method_metadata',
@@ -1187,6 +1188,36 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return embeddedHashCache;
     };
 
+    // method_deduplicate=enabled_embedded: the same duplicate test turned on the file's OWN tracks. Two subtitle streams holding identical text are one
+    // subtitle stored twice, however their tags read, and this is the only place in the plugin that removes a subtitle the user did not ask to extract -
+    // which is exactly why it is its own opt-in value rather than part of `enabled`. The survivor is chosen by the rule the sidecar groups already use, so
+    // there is nothing new to learn: lowest source index wins, and it inherits the union of the group's flags plus the first title and first real language
+    // any member carries. Nothing is lost by dropping the others - identical text, and every tag folded onto the keeper. Returns the source indices to drop
+    // and, only when the union actually differs from what the keeper already has, the metadata to restamp it with.
+    const dedupeEmbeddedSubs = (subs) => {
+        const hashes = embeddedTextHashes(subs);
+        const out = { dropIdx: [], retag: null, log: '' };
+        if (!hashes || hashes.size < 2) return out;
+        const byHash = new Map();
+        for (const s of subs) { const h = hashes.get(s.index); if (!h) continue; if (!byHash.has(h)) byHash.set(h, []); byHash.get(h).push(s); }
+        for (const g of byHash.values()) {
+            if (g.length < 2) continue;
+            const ordered = g.slice().sort((a, b) => a.index - b.index);
+            const keep = ordered[0]; const drop = ordered.slice(1);
+            out.dropIdx.push(...drop.map((s) => s.index));
+            out.log += `☐${streamTag(keep.index)}[method_deduplicate=enabled_embedded] Removing ${drop.length} duplicate subtitle stream${drop.length === 1 ? '' : 's'} (${drop.map((s) => `s${s.index}`).join(', ')}) - byte-identical to this one\n`;
+            const disp = new Set(ordered.flatMap((s) => Object.keys(s.disposition || {}).filter((k) => s.disposition[k] === 1)));
+            const title = ordered.map((s) => s.tags?.title || '').find(Boolean) || '';
+            const lang = ordered.map((s) => resolveLang(s) || '').find((l) => l && l !== 'und') || (resolveLang(keep) || 'und');
+            const keepDisp = new Set(Object.keys(keep.disposition || {}).filter((k) => keep.disposition[k] === 1));
+            const sameDisp = keepDisp.size === disp.size && [...disp].every((k) => keepDisp.has(k));
+            if (sameDisp && (keep.tags?.title || '') === title && langKey(resolveLang(keep) || 'und') === langKey(lang)) continue;
+            out.retag = (out.retag || []).concat([{ index: keep.index, lang, title, disp: [...disp] }]);
+            out.log += `☐${streamTag(keep.index)}[method_deduplicate=enabled_embedded] Folding the removed streams' tags onto it (${[lang, title, ...disp].filter(Boolean).join(' ')})\n`;
+        }
+        return out;
+    };
+
     // Is a marker-listed sidecar REALLY in the file? The marker records what the last import muxed and NOTHING ever clears it, so an extract pass strips the
     // subtitles and leaves a tag behind still naming them. Both readers of the marker therefore confirm it against the streams as they stand rather than
     // trusting it: deletion, so a stale or forged marker cannot unlink a sidecar that was never embedded, and import suppression, so a stale one cannot
@@ -1246,7 +1277,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // message shows the RAW inputs value.
     const normDedupe = (v) => { const s = String(v || 'enabled').toLowerCase().trim(); return s === 'enabled_delete' ? 'enabled' : s; };
     const dedupeMode = normDedupe(inputs.method_deduplicate);
-    if (!['disabled', 'enabled'].includes(dedupeMode)) failFile(`[method_deduplicate=${inputs.method_deduplicate}] invalid value, check your settings`);
+    if (!['disabled', 'enabled', 'enabled_embedded'].includes(dedupeMode)) failFile(`[method_deduplicate=${inputs.method_deduplicate}] invalid value, check your settings`);
+    const dedupeSidecars = dedupeMode !== 'disabled';        // both enabled values collapse byte-identical sidecars and skip one already embedded
+    const dedupeStreams = dedupeMode === 'enabled_embedded'; // only this one also removes a duplicate the file already carries
     if (!['error', 'mount', 'text_file'].includes(unmappedMode)) failFile(`[method_unmapped=${inputs.method_unmapped}] invalid value, check your settings`);
     const metadataMode = String(inputs.method_metadata || 'embedded').toLowerCase();
     if (!['embedded', 'sidecar'].includes(metadataMode)) failFile(`[method_metadata=${inputs.method_metadata}] invalid value, check your settings`);
@@ -1300,9 +1333,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         if (mode === 'extract') {
             // ============= EXTRACT: embedded text subs -> sidecars (+ optional removal) =============
+            // Duplicate tracks the file already carries go before anything else: a dropped stream must not also be written to a sidecar, or the copy we just
+            // decided was redundant comes straight back on the next import under a name of its own.
+            const dupes = dedupeStreams ? dedupeEmbeddedSubs(streams.filter((s) => (s.codec_type || '').toLowerCase() === 'subtitle')) : { dropIdx: [], retag: null, log: '' };
+            response.infoLog += dupes.log;
             const eligible = streams.filter((s) => (s.codec_type || '').toLowerCase() === 'subtitle' && isTextSub(s.codec_name)
+                && !dupes.dropIdx.includes(s.index)
                 && !(langFilter && !langFilter.has(langKey(resolveLang(s) || 'und'))));
-            if (!eligible.length) { response.infoLog += '☑No text subtitles to extract\n'; return response; }
+            if (!eligible.length && !dupes.dropIdx.length) { response.infoLog += '☑No text subtitles to extract\n'; return response; }
 
             // method_unmapped=mount on a node where the mount is not actually there. Extract does not need it - the file API still lands every sidecar in the
             // library - so failing here would be gratuitous when the work can be done. But it must not pass in silence: the user asked for a mount, the mount
@@ -1323,7 +1361,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
             // sidecarOut carries the extra ffmpeg outputs that write the sidecars on a MAPPED node. On an unmapped node it stays empty and the same
             // extractions are collected in placeJobs instead, to be run and uploaded by placeSidecars once the loop has seen every stream.
-            let sidecarOut = ''; const removeIdx = []; let wrote = 0; let skipped = 0; let unsafe = 0; let bundled = 0;
+            let sidecarOut = ''; const removeIdx = [...dupes.dropIdx]; let wrote = 0; let skipped = 0; let unsafe = 0; let bundled = 0;
             const placeJobs = [];
             for (const s of eligible) {
                 const { enc } = TEXT_SUB[String(s.codec_name).toLowerCase()];
@@ -1421,6 +1459,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let out = `${sidecarOut} -map 0`;
             for (const idx of removeIdx) out += ` -map -0:${idx}`;
             out += ' -c copy';
+            // A folded tag set is addressed by the keeper's position among the SURVIVING subtitle streams, which is what -map 0 minus the drops leaves.
+            const keptSubs = streams.filter((s) => !removeIdx.includes(s.index) && (s.codec_type || '').toLowerCase() === 'subtitle');
+            for (const r of dupes.retag || []) {
+                const n = keptSubs.findIndex((s) => s.index === r.index);
+                if (n < 0) continue;
+                out += ` -metadata:s:s:${n} "language=${escMeta(isMp4 ? to6392T(r.lang) : normSidecarLang(r.lang))}"`;
+                out += ` -metadata:s:s:${n} "title=${escMeta(r.title || '')}"`;
+                out += ` -disposition:s:${n} ${r.disp.length ? r.disp.join('+') : '0'}`;
+            }
             commitPreset(out);
             const survivors = streams.filter((s) => !removeIdx.includes(s.index));
             response.infoLog += `☑Expected results: ${summariseAll(survivors)}\n`;
@@ -1498,6 +1545,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // above, once the transcode has been accepted; unlinking here would destroy the sidecars of a run the user then rejects.
         const embeddedSubs = streams.filter((s) => (s.codec_type || '').toLowerCase() === 'subtitle');
         const hasFontAttachment = streams.some((s) => (s.codec_type || '').toLowerCase() === 'attachment' && isFontAttachment(s));
+        // Duplicates the file already carries, removed here as well as on extract - they are a property of the file, not of a workflow. Every output index
+        // below counts SURVIVING subtitle streams, since -map 0 minus these drops is what the muxer actually sees; using the unfiltered list would silently
+        // retag or land tracks one slot off for every stream removed.
+        const dupes = dedupeStreams ? dedupeEmbeddedSubs(embeddedSubs) : { dropIdx: [], retag: null, log: '' };
+        response.infoLog += dupes.log;
+        const keptSubs = embeddedSubs.filter((s) => !dupes.dropIdx.includes(s.index));
 
         // Import is NON-DESTRUCTIVE: every recognized sidecar not already handled by our own prior pass (marker) is muxed in. We do NOT suppress a
         // sidecar just because an embedded sub shares its lang|title|disposition - metadata can't prove same content, and dropping a distinct track is
@@ -1527,7 +1580,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // listed, but guard anyway: an unreadable file gets a unique key so it is imported on its own, never silently dropped or merged.
         const contentKey = (f) => { try { return crypto.createHash('sha1').update(fs.readFileSync(path.join(workLibDir(), f.rel))).digest('hex'); } catch (e) { return `unreadable:${f.rel}`; } };
         const groups = []; const groupHash = new Map();
-        if (dedupeMode === 'disabled') { for (const f of candidates) groups.push([f]); }
+        if (!dedupeSidecars) { for (const f of candidates) groups.push([f]); }
         else { const byHash = new Map(); for (const f of candidates) { const h = contentKey(f); let g = byHash.get(h); if (!g) { g = []; byHash.set(h, g); groups.push(g); groupHash.set(g, h); } g.push(f); } }
 
         // One import per group: union the members' disposition tokens (byte-identical plain + SDH -> SDH), and take the first non-"und" language and
@@ -1551,7 +1604,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // share a language and title while holding different text. So the content decides (embeddedTextHashes - one ffmpeg pass, reached only from here, and
         // only when dedup is on and something could actually be a duplicate). The sidecar still counts as consumed: its content is demonstrably in the file,
         // and preserving the information is the test - not which container it ends up living in.
-        const embeddedHashes = (dedupeMode === 'enabled' && merged.some((f) => !f.bundle)) ? embeddedTextHashes(embeddedSubs) : new Map();
+        const allHashes = (dedupeSidecars && merged.some((f) => !f.bundle)) ? embeddedTextHashes(embeddedSubs) : new Map();
+        const embeddedHashes = allHashes && new Map([...allHashes].filter(([idx]) => !dupes.dropIdx.includes(idx)));
         // A bundle is an archive, not comparable text, so it is never matched this way. A null map means the probe could not run: nothing is proven, so
         // every sidecar imports exactly as before - a redundant track can be removed later, a dropped one cannot be recovered.
         const embeddedAt = (f) => {
@@ -1574,7 +1628,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             f.embeddedAt = at;
             alreadyInFile.push(f);
             response.infoLog += `☑${streamTag(at)}[method_deduplicate=${dedupeMode}] ${f.rel} is already in the file byte-for-byte - not importing a second copy\n`;
-            const cur = embeddedSubs.find((s) => s.index === at);
+            const cur = keptSubs.find((s) => s.index === at);
             const curTitle = isMp4 ? (f.title || '') : (cur?.tags?.title || '');
             const curDisp = new Set(Object.keys(cur?.disposition || {}).filter((k) => cur.disposition[k] === 1));
             const sameDisp = curDisp.size === f.disp.length && f.disp.every((k) => curDisp.has(k));
@@ -1584,7 +1638,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.infoLog += `☒${streamTag(at)}[method_metadata=${metadataMode}] The sidecar name and the embedded track disagree on metadata - keeping the track's own (name: ${named})\n`;
                 continue;
             }
-            const outIdx = embeddedSubs.findIndex((s) => s.index === at);   // position among the file's subtitle streams, which -map 0 preserves
+            const outIdx = keptSubs.findIndex((s) => s.index === at);   // position among the subtitle streams that survive, which is what -map 0 minus the drops leaves
             retuneMeta += ` -metadata:s:s:${outIdx} "language=${escMeta(isMp4 ? to6392T(f.lang) : normSidecarLang(f.lang))}"`;
             retuneMeta += ` -metadata:s:s:${outIdx} "title=${escMeta(f.title || '')}"`;
             retuneMeta += ` -disposition:s:${outIdx} ${f.disp.length ? f.disp.join('+') : '0'}`;
@@ -1607,12 +1661,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // A retune is a mux of its own: no new inputs and no new maps, just the metadata of a stream that is already there. It rides the same output as any
         // real import when both are due, so a pass that adds one track and retags another does it in a single remux.
-        if (toMux.length || retuneMeta) {
+        if (toMux.length || retuneMeta || dupes.dropIdx.length) {
             // Mux one track per group. Extra -i inputs go on the OUTPUT side (main stays input 0). The marker lists EVERY consumed file (all group
             // members) so a re-run never re-imports them and the confirm pass can delete the whole deduplicated set; reQueue only when a delete is due.
             let inputSide = ''; let extraMaps = ''; let meta = retuneMeta; let fontsRestored = false;
             toMux.forEach((f, k) => {
-                const outIdx = embeddedSubs.length + k;
+                const outIdx = keptSubs.length + k;
                 // A bundle is a container, not raw text, so it takes no -sub_charenc and its subtitle is selected by type (:s:0) rather than by index.
                 // Its fonts come back only when the file has none of its own - every bundle carries the full font set, so one restore is always complete
                 // and a second bundle (or a re-import into a file that kept its fonts) can never duplicate them.
@@ -1651,9 +1705,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // longer carries - is harmless either way, since the entry only counts while the confirmation agrees with it.
             const priorStillPresent = found.filter(alreadyEmbedded).map((f) => f.rel);
             const markList = [...new Set([...consumed, ...priorStillPresent])];
+            for (const idx of dupes.dropIdx) extraMaps = ` -map -0:${idx}${extraMaps}`;   // drops first, so the -map 0 they subtract from is still the whole file
+            for (const r of dupes.retag || []) {
+                const n = keptSubs.findIndex((s) => s.index === r.index);
+                if (n < 0) continue;
+                meta += ` -metadata:s:s:${n} "language=${escMeta(isMp4 ? to6392T(r.lang) : normSidecarLang(r.lang))}"`;
+                meta += ` -metadata:s:s:${n} "title=${escMeta(r.title || '')}"`;
+                meta += ` -disposition:s:${n} ${r.disp.length ? r.disp.join('+') : '0'}`;
+            }
             let out = `${inputSide} -map 0${extraMaps} -c copy${meta} -metadata "awk_sub_worker=${encodeMarkerList(markList)}"`;
             commitPreset(out);
-            const expected = streams.concat(toMux.map(sidecarToStream));
+            const expected = streams.filter((s) => !dupes.dropIdx.includes(s.index)).concat(toMux.map(sidecarToStream));
             response.infoLog += `☑Expected results: ${summariseAll(expected)}\n`;
             return response;
         }
