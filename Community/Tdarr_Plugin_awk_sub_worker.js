@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all) and skip_commentary (omit commentary tracks). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.7.1',
+    Version: '3.7.2',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -932,6 +932,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // Parse each scanned path as a sidecar, carrying its relative path along as the identity everything downstream keys on.
     const parseSidecarRel = (rel) => { const p = parseSidecar(path.posix.basename(rel.replace(/\\/g, '/'))); return p ? { ...p, rel } : null; };
+    // Import order = the ORIGINAL stream order. Our own names carry the source stream index in their s<index> anchor, and that is the whole point of it:
+    // a round trip should hand the tracks back in the order it found them, not in the order their names happen to sort (a plain lexical sort puts s11
+    // ahead of s2). A server-native sidecar has no anchor, so it has no original position to restore and goes after the ones that do. The relative path
+    // breaks ties, keeping the result identical on every node whatever order a filesystem lists entries in - which is what the scan's own sort is for.
+    const byOriginalPosition = (a, b) => (a.index === null ? Infinity : a.index) - (b.index === null ? Infinity : b.index)
+        || (a.rel < b.rel ? -1 : (a.rel > b.rel ? 1 : 0));
 
     // The streams and global tags of the file as it stands NOW. Pre-processing is always handed ffProbeData; the post-processing stage may not be, so fall
     // back to running ffprobe here - otherArguments supplies ffmpegPath and ffprobe sits beside it under the matching name. null means neither route
@@ -1184,6 +1190,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const scan = scanSidecarDirs();
         if (scan.err) failFile(`Cannot read the library directory to find sidecars: ${scan.err.message || scan.err}`);
         const found = scan.rels.map(parseSidecarRel).filter(Boolean)
+            .sort(byOriginalPosition)
             .filter((f) => !(langFilter && !langFilter.has(langKey(f.lang))))
             // Match extract's isCommentary (flag OR title keyword): a sidecar whose commentary role sits only in
             // its decoded title (no disposition token) must also be skipped, else skip_commentary would exclude
