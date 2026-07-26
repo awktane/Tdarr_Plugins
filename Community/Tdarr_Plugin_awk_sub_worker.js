@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.26.0',
+    Version: '3.26.1',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1609,7 +1609,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // every one of them would be noise. This runs before the empty check, because a run that imports nothing is exactly when the user needs the reason.
         for (const rel of scan.rels) {
             if (parseSidecarRel(rel)) continue;
-            const relExt = (path.posix.basename(rel.replace(/\\/g, '/')).match(/\.([A-Za-z0-9]+)$/) || ['', ''])[1].toLowerCase();
+            const relBase = path.posix.basename(rel.replace(/\\/g, '/'));
+            // A DOT-PREFIXED file is deliberately hidden - from media servers, and from us. clean_and_remux's remove_imagesubs=export writes exactly that
+            // (".<video>.<lang>.mks" for VobSub/DVB, one-way by design, waiting on an external OCR pass), and .mks is also our own bundle extension, so
+            // reporting it would warn about a file the user meant to create, on every run, forever. Our own bundles are dot-prefixed too but they parse,
+            // so they never reach this line.
+            if (relBase.startsWith('.')) continue;
+            const relExt = (relBase.match(/\.([A-Za-z0-9]+)$/) || ['', ''])[1].toLowerCase();
             if (TEXT_EXTS.includes(relExt) || relExt === BUNDLE_EXT) response.infoLog += `☒Not a recognised sidecar name, skipping: ${rel}\n`;
         }
         // This pass only ever ADDS subtitles to the file - it never deletes a sidecar. import_remove_sidecar acts in the post-processing branch
