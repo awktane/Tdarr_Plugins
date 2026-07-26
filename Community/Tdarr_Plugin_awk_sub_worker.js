@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.24.0',
+    Version: '3.24.1',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1041,13 +1041,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Pull every listed sidecar into this node's own copy of the library folder, at the same relative path. Everything downstream - the dedup hash, the -i
     // inputs, the marker - then works on ordinary local files and needs to know nothing about how they arrived. The copy lives in the throwaway mirror,
     // which is the right place for it: it is consumed by this one mux and goes with the job.
-    const fetchListedSidecars = (rels, listName) => {
+    // A name that is missing because we already imported it and cleaned it up is the list going stale in the ordinary way, not a problem: the list is seeded
+    // once and never rewritten, so it still names files whose whole purpose has been served. The marker is what tells the two apart - it records what an
+    // earlier pass embedded - and without that distinction a completed round trip reports itself as one warning per subtitle it successfully handled.
+    const fetchListedSidecars = (rels, listName, embeddedAlready) => {
         const got = [];
         for (const rel of rels) {
             const dest = serverSidePath(path.join(libDir, rel));
             if (!dest) { response.infoLog += `☒[method_unmapped=text_file] Cannot work out the server path for ${rel}\n`; continue; }
             const why = downloadLibraryFile(dest, path.join(libDir, rel));
             if (!why) { got.push(rel); continue; }
+            if (embeddedAlready && embeddedAlready.has(rel)) { response.infoLog += `☑[method_unmapped=text_file] ${listName} still lists ${rel}, which an earlier pass already embedded and removed\n`; continue; }
             response.infoLog += `☒[method_unmapped=text_file] ${listName} lists ${rel} but it could not be fetched - ${why}\n`;
         }
         return got;
@@ -1544,8 +1548,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const parsed = readSubtitleList(listText);
                 for (const [entry, why] of parsed.bad) response.infoLog += `☒[method_unmapped=text_file] Ignoring "${entry}" in ${listName} - ${why}\n`;
                 if (!parsed.ok.length) failFile(`[method_unmapped=text_file] ${listName} lists no usable filenames${parsed.bad.length ? ' - every line was rejected, see above' : ' - add one filename per line'}`);
-                listedRels = fetchListedSidecars(parsed.ok, listName);
-                response.infoLog += `☑[method_unmapped=text_file] Read ${parsed.ok.length} filename${parsed.ok.length === 1 ? '' : 's'} from ${listName}, fetched ${listedRels.length} of them from the server\n`;
+                listedRels = fetchListedSidecars(parsed.ok, listName, importedSet);
+                // Names an earlier pass already embedded and removed are not a shortfall, so they count out of the total rather than reading as failures.
+                const spent = parsed.ok.filter((rel) => importedSet.has(rel) && !listedRels.includes(rel)).length;
+                const wanted = parsed.ok.length - spent;
+                response.infoLog += `☑[method_unmapped=text_file] Read ${parsed.ok.length} filename${parsed.ok.length === 1 ? '' : 's'} from ${listName}, fetched ${listedRels.length} of the ${wanted} still to import${spent ? ` (${spent} already embedded and removed)` : ''}\n`;
             }
         }
 
