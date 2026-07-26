@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.19.0',
+    Version: '3.20.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1228,6 +1228,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const markerConfirmsEmbedded = (f, subs, anyFont, mp4Target) => (!f.bundle || anyFont) && subs.some((s) =>
         langKey(resolveLang(s) || 'und') === langKey(f.lang || 'und') && (mp4Target || (s.tags?.title || '') === (f.title || '')));
 
+    // The subtitle list is a file the USER may have typed into, so it is only ever removed once it demonstrably has nothing left to say: every name in it is
+    // gone from disk, AND at least one of those names was a sidecar we actually embedded. Both halves matter. The first makes a hand-added or mistyped line
+    // protective - it names a file that is still there, so the list stays and the user can fix it. The second proves the list did its job rather than being a
+    // list of names that never existed. Deliberately NOT conditioned on method_unmapped: a list written by a text_file run and then imported through mount is
+    // exactly as spent, and leaving it behind only misleads a later pass. Nothing is lost either way, since a text_file extract seeds a fresh one when it
+    // next needs it.
+    const deleteSpentSubtitleList = (delReason, marked) => {
+        const listName = `${videoBase}${SUBTITLE_LIST_SUFFIX}`;
+        const listPath = path.join(workLibDir(), listName);
+        let text;
+        try { text = fs.readFileSync(listPath, 'utf8'); } catch (e) { return ''; }   // no list at all is the normal case, and says nothing
+        const entries = readSubtitleList(text).ok;
+        if (!entries.length || !entries.some((n) => marked.has(n))) return '';
+        if (entries.some((n) => fs.existsSync(path.join(workLibDir(), n)))) return '';
+        try { fs.unlinkSync(listPath); return `☑[${delReason}] Deleted ${listName} - every sidecar it listed is now in the file\n`; }
+        catch (e) { return `☒[${delReason}] Could not delete ${listName}: ${e && e.message ? e.message : e}\n`; }
+    };
+
     // import_remove_sidecar's actual deletion. Called ONLY from the post-processing pass, once Tdarr has accepted the transcode and moved it into
     // the library, so the embedded copy is the one that survives. Each marker-listed sidecar is confirmed against the accepted file's streams before it is
     // unlinked (markerConfirmsEmbedded, above); the marker VALUE still scopes deletion to names we listed, so that guard holds on mp4 too. A false negative
@@ -1247,8 +1265,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             try { fs.unlinkSync(path.join(workLibDir(), f.rel)); deleted += 1; log += `☑[${delReason}] Deleted sidecar (embedded): ${f.rel}\n`; }
             catch (e) { log += `☒[${delReason}] Could not delete sidecar ${f.rel}: ${e && e.message ? e.message : e}\n`; }
         }
+        log += deleteSpentSubtitleList(delReason, marked);
         return { deleted, log };
     };
+
 
     const parseLangFilter = (v) => { const l = String(v || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean); return l.length ? new Set(l.map(langKey)) : null; };   // keys, so en/eng/English match
     // Synthetic stream so a not-yet-muxed sidecar renders through summariseStream in the expected-results line.
@@ -1647,11 +1667,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // the marker: a sidecar this pass muxed is filtered out upstream by alreadyEmbedded, so anything reaching here had its content in the file BEFORE
         // this flow started, and is therefore in the accepted library copy no matter what the rest of the flow does or how it ends.
         if (!toMux.length && !retuneMeta && alreadyInFile.length && removeSidecarAfterImport) {
-            let gone = 0;
+            let gone = 0; const removedRels = new Set();
             for (const rel of alreadyInFile.flatMap((f) => f.members.map((m) => m.rel))) {
-                try { fs.unlinkSync(path.join(workLibDir(), rel)); gone += 1; response.infoLog += `☑[import_remove_sidecar=true] Deleted sidecar (its content is already in the file): ${rel}\n`; }
+                try { fs.unlinkSync(path.join(workLibDir(), rel)); gone += 1; removedRels.add(rel); response.infoLog += `☑[import_remove_sidecar=true] Deleted sidecar (its content is already in the file): ${rel}\n`; }
                 catch (e) { response.infoLog += `☒[import_remove_sidecar=true] Could not delete sidecar ${rel}: ${e && e.message ? e.message : e}\n`; }
             }
+            response.infoLog += deleteSpentSubtitleList('import_remove_sidecar=true', removedRels);   // same cleanup whichever route removed them
             response.infoLog += `☑Nothing to import - every sidecar was already in the file${gone ? `, ${gone} removed from disk` : ''}\n`;
             return response;
         }
