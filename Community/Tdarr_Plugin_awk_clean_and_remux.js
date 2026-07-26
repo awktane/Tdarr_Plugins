@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.4.0',
+    Version: '4.4.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1774,7 +1774,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // before the plugin that wrote it re-reads it (e.g. sub_worker's sidecar-delete would then find no marker).
             if (dstContainer === 'mp4')
                 extraArguments += ' -movflags use_metadata_tags';
-            response.preset += `${fflags}${inputArgs},${sidecarOut} -map 0 -c copy${extraArguments}${globalOutputOpt}`;
+            response.preset += `${fflags}${inputArgs}<io>${sidecarOut} -map 0 -c copy${extraArguments}${globalOutputOpt}`;
             response.infoLog += workDone;
             // Predicted output: re-renders the input streams with the two mutations this summary tracks - removedIndices
             // filtering and subCodecOverride (converted subtitle codec). It does NOT reflect queued language fills / tag_language

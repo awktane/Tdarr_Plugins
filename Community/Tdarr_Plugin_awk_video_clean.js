@@ -9,7 +9,7 @@ const details = () => ({
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n
                      UPGRADING FROM 2.x - inputs were renamed/reworked in 3.0.0, and Tdarr stores settings by input name, so that upgrade RESET them to defaults - re-check your video_clean settings: encoder->method_encoder, speed->method_speed, force_bit_depth->method_bitdepth, max_height->height_cap (value 'original'->'source'), method_hdr->hdr_mode, guard_min_bitrate->guard_shrink_bitrate (now shrink-only); the old preserve_dv is now the guard_dv toggle (default on); guard_reprocess is gone (use action=shrink); codec gained a 'source' value (keep the source codec).\n\n`,
-    Version: '3.4.1',
+    Version: '3.4.2',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1077,7 +1077,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += `☐${streamTag(primary.index)}[hdr_mode=strip_dynamic] Stripping ${dvSignal ? dvLabel : 'HDR10+'} losslessly (-c:v copy, base HDR10 retained)\n`;
             let out = `-map 0 -c copy -bsf:v:0 ${bsf}${coverArtDrops}${mp4Tag(srcCodecName)} -c:a copy -c:s copy${globalOutputOpt}`;
             if (isMp4Family(dstContainer)) out += ' -movflags use_metadata_tags';   // same as the transcode path: keep sibling plugins' GLOBAL awk_* markers through an mp4/mov copy
-            response.preset = `,${out}`;   // no input-side args
+            response.preset = `<io>${out}`;   // no input-side args
             response.processFile = true;
             response.infoLog += `☑Expected results: ${keptStreams().map((s) => summariseStream(enrichStream(s))).join('')}\n`;
             return response;
@@ -1179,7 +1179,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy${coverArtDrops} -metadata "awk_video=${videoSig}"`;
             if (isMp4Family(dstContainer)) out += ' -movflags use_metadata_tags';   // keep the global tag through an mp4/mov copy
             out += globalOutputOpt;
-            response.preset = `${enc.inputSide},${out}`;
+            response.preset = `${enc.inputSide}<io>${out}`;
             response.processFile = true;
             response.infoLog += `☐${streamTag(primary.index)}${encodeTag} Transcoding video @ ${sel.encoderName} q${Math.round(qNorm)}\n`;
             // Predict the re-encoded stream through the shared summariseStream (single source of truth for the [video:...]

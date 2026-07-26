@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '4.5.2',
+    Version: '4.5.3',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -2435,7 +2435,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const mp4KeepTags = isMp4Family(file.container) ? ' -movflags use_metadata_tags' : '';
             // Preserve Dolby Vision's dvcC/dvvC boxes on this mp4/mov -c copy remux (see dvStrictMp4Arg) - a plain copy of a DV HEVC/AV1 stream drops them.
             const dvStrictArg = dvStrictMp4Arg(file.container, file.ffProbeData.streams);
-            response.preset += `,-map 0 -c copy${extraArguments}${dvStrictArg}${globalOutputOpt}${mp4KeepTags}`;
+            response.preset += `<io>-map 0 -c copy${extraArguments}${dvStrictArg}${globalOutputOpt}${mp4KeepTags}`;
             // workDone (what changed) and skipDone (why something DIDN'T change - guard blocks,
             // ceiling/missing-data skips, the diagnostic negative-space) are both always logged.
             response.infoLog += workDone;
