@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.20.0',
+    Version: '3.20.1',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1325,7 +1325,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const probed = probeCurrentFile();
         if (!probed) { response.infoLog += '☒[import_remove_sidecar=true] Cannot read the accepted file to confirm what is embedded - every sidecar is left in place\n'; return response; }
         const { deleted, log } = deleteImportedSidecars(probed.streams, probed.tags, isMp4);
-        response.infoLog += log || '☑[import_remove_sidecar=true] No imported sidecar is waiting to be removed\n';
+        response.infoLog += log ? `☑[import_remove_sidecar=true] Working in ${workLibDir()}\n${log}` : '☑[import_remove_sidecar=true] No imported sidecar is waiting to be removed\n';
         return response;
     }
     // Preserve Dolby Vision's dvcC/dvvC boxes on either -c copy remux below (see dvStrictMp4Arg) - a plain copy of a DV HEVC/AV1 stream drops them,
@@ -1511,6 +1511,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             if (unmappedMode === 'mount' && !mountedLib().dir) failFile(`[method_unmapped=mount] Could not reach the library from this node - ${mountedLib().why}`);
             if (unmappedMode === 'mount') response.infoLog += `☑[method_unmapped=mount] Reading the library at ${mountedLib().dir} (via ${mountedLib().via})\n`;
+            // Nothing below this point can tell you WHERE a sidecar came from unless the mode that found it says so, and every route deserves that line -
+            // an import that reads the wrong directory looks exactly like one that read the right one and found nothing.
             if (unmappedMode === 'text_file') {
                 // No directory access at all here, so the list IS the discovery: each name is fetched from the server by path. The file itself is read the
                 // same way, which is why it has to sit at a name we can compute rather than one we would have to go looking for.
@@ -1526,9 +1528,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 for (const [entry, why] of parsed.bad) response.infoLog += `☒[method_unmapped=text_file] Ignoring "${entry}" in ${listName} - ${why}\n`;
                 if (!parsed.ok.length) failFile(`[method_unmapped=text_file] ${listName} lists no usable filenames${parsed.bad.length ? ' - every line was rejected, see above' : ' - add one filename per line'}`);
                 listedRels = fetchListedSidecars(parsed.ok, listName);
+                response.infoLog += `☑[method_unmapped=text_file] Read ${parsed.ok.length} filename${parsed.ok.length === 1 ? '' : 's'} from ${listName}, fetched ${listedRels.length} of them from the server\n`;
             }
         }
 
+        // The mapped route had nothing to say for itself, which is the one case where naming the directory matters MOST: it is the only route that can end up
+        // reading a node-local mirror while looking exactly like a healthy run. Sidecars found there import, compare and delete perfectly well - against the
+        // wrong copy of the library. So every route now prints its source, and the two unmapped ones above have already printed theirs.
+        // ...and it says so when it does not KNOW. Node type comes from otherArguments.configVars, which only the classic worker supplies - a caller that
+        // passes less (the flow shim passes no configVars at all) leaves an unmapped node indistinguishable from a mapped one, and the mapped assumption
+        // then points every read and every delete at the mirror. Naming both the directory and the missing configuration turns that into one visible line.
+        if (!isUnmappedNode) response.infoLog += `☑Reading sidecars from ${workLibDir()}${otherArguments?.configVars ? '' : ' (node type unknown - Tdarr passed no node configuration for this run)'}\n`;
         const scan = listedRels ? { rels: listedRels } : scanSidecarDirs();
         if (scan.err) failFile(`Cannot read the library directory to find sidecars: ${scan.err.message || scan.err}`);
         // Every drop from here down says so. A sidecar that is on disk and never mentioned again is indistinguishable from one the plugin never saw, and
@@ -1673,7 +1683,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 catch (e) { response.infoLog += `☒[import_remove_sidecar=true] Could not delete sidecar ${rel}: ${e && e.message ? e.message : e}\n`; }
             }
             response.infoLog += deleteSpentSubtitleList('import_remove_sidecar=true', removedRels);   // same cleanup whichever route removed them
-            response.infoLog += `☑Nothing to import - every sidecar was already in the file${gone ? `, ${gone} removed from disk` : ''}\n`;
+            response.infoLog += `☑Nothing to import - every sidecar was already in the file${gone ? `, ${gone} removed from ${workLibDir()}` : ''}\n`;
             return response;
         }
 
