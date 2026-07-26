@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.25.0',
+    Version: '3.26.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1211,7 +1211,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const keep = ordered[0]; const drop = ordered.slice(1);
             out.dropIdx.push(...drop.map((s) => s.index));
             out.log += `☐${streamTag(keep.index)}[method_deduplicate=enabled_embedded] Removing ${drop.length} duplicate subtitle stream${drop.length === 1 ? '' : 's'} (${drop.map((s) => `s${s.index}`).join(', ')}) - byte-identical to this one\n`;
+            // `default` is the one flag NOT unioned. It is not a property of the subtitle, it is a statement about which track a player should pick, and
+            // this plugin does not track it anywhere else for exactly that reason - muxers auto-manage it (mp4 forces it onto the first subtitle) and
+            // stream_ordering decides it last. Folding it would let a duplicate hand the survivor a default flag it never had, silently changing what plays.
+            // So the keeper simply keeps its own, and the disposition write below - which replaces the whole set - neither invents nor strips it.
             const disp = new Set(ordered.flatMap((s) => Object.keys(s.disposition || {}).filter((k) => s.disposition[k] === 1)));
+            disp.delete('default');
+            if (keep.disposition?.default === 1) disp.add('default');
             const title = ordered.map((s) => s.tags?.title || '').find(Boolean) || '';
             const lang = ordered.map((s) => resolveLang(s) || '').find((l) => l && l !== 'und') || (resolveLang(keep) || 'und');
             const keepDisp = new Set(Object.keys(keep.disposition || {}).filter((k) => keep.disposition[k] === 1));
