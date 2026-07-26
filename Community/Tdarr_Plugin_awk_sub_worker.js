@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all) and skip_commentary (omit commentary tracks). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.8.0',
+    Version: '3.9.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -612,6 +612,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         { token: 'original', ff: 'original', flags: ['original'] },
     ];
     const EXTRA_TOKENS = new Set(EXTRA_DISPOSITIONS.map((d) => d.token));
+    // The only tokens a media server both documents and acts on, and Plex takes just ONE of them - ".forced.sdh" is not a supported combination, it is one
+    // or the other. So the trailing run carries a single flag and every other role joins 'original' ahead of the language, where servers do not look and
+    // nothing is lost because our own parser reads both regions. forced wins the slot over sdh: it drives AUTOMATIC selection (a forced track that loses
+    // its flag stops appearing by itself), whereas an unlabelled SDH track is still listed and selectable, just not marked.
+    const SERVER_FLAG_TOKENS = ['forced', 'sdh'];
     const dispFfOf = (token) => (DISPOSITIONS.concat(EXTRA_DISPOSITIONS).find((d) => d.token === token) || {}).ff;
     // extract: one canonical token per role the stream's real flags carry (sdh covers hearing_impaired OR captions), deduped.
     const dispTokensOf = (s) => DISPOSITIONS.filter((d) => d.flags.some((f) => s.disposition?.[f] === 1)).map((d) => d.token);
@@ -850,8 +855,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // parseSidecar's right-to-left disp strip, nulling or corrupting the reimport - collapse any such collision to 'und' so the fixed language slot can
         // never be shaped like a disposition token.
         const lang = (DISP_TOKENS.has(langRaw) || EXTRA_TOKENS.has(langRaw)) ? 'und' : langRaw;
-        const disp = dispTokensOf(s);
-        const extra = extraTokensOf(s);   // written BEFORE the language, where media servers do not look - see EXTRA_DISPOSITIONS
+        const roles = dispTokensOf(s);
+        const trailing = SERVER_FLAG_TOKENS.find((t) => roles.includes(t));   // at most one, and only a token every server documents
+        const disp = trailing ? [trailing] : [];
+        // Everything else - a second server flag Plex could not have taken anyway, plus our own roles - rides ahead of the language beside 'original'.
+        const extra = extraTokensOf(s).concat(roles.filter((t) => t !== trailing));
         const ext = bundle ? BUNDLE_EXT : TEXT_SUB[String(s.codec_name).toLowerCase()].ext;
         const dot = bundle ? '.' : '';
         const mark = bundle ? `.${BUNDLE_TOKEN}` : '';
@@ -906,16 +914,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // them, and they sit between the encoded title and the language, so they are consumed here - before the residual-token count below decides what
         // is left is a title. A name written by an older version simply has none, and parses exactly as it did.
         const extraTokens = [];
-        while (ours && toks.length && EXTRA_TOKENS.has(toks[toks.length - 1])) extraTokens.unshift(toks.pop());
+        const preRoles = [];
+        while (ours && toks.length && (EXTRA_TOKENS.has(toks[toks.length - 1]) || DISP_TOKENS.has(toks[toks.length - 1]))) {
+            const t = toks.pop();
+            if (EXTRA_TOKENS.has(t)) extraTokens.unshift(t); else if (!DISP_IGNORE.has(t)) preRoles.unshift(DISP_ALIAS[t] || t);
+        }
         // A real server-native sidecar names the FULL video basename then lang[.disp] - it never carries a title token. So for a
         // non-ours name any residual token is actually the tail of a LONGER sibling video's basename (Avatar.Extended.en.srt vs
         // Avatar.mkv): reject it, or the shorter video would mux the sibling's subtitle. Our s<index> names keep their title.
         if (!ours && toks.length) return null;
         if (toks.length > 1) return null;                                // 0 or 1 residual token = the encoded title (our own s<index> sidecars only)
         const title = toks.length ? pctDecode(toks[0]) : parenTitle;
+        const allRoles = [...new Set(dispTokens.concat(preRoles))];
         return {
-            name, bundle, index, lang, title, ext, dispTokens, extraTokens,
-            disp: [...new Set(dispTokens.concat(extraTokens).map(dispFfOf).filter(Boolean))],
+            name, bundle, index, lang, title, ext, dispTokens: allRoles, extraTokens,
+            disp: [...new Set(allRoles.concat(extraTokens).map(dispFfOf).filter(Boolean))],
         };
     };
 
