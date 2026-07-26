@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.3.5',
+    Version: '4.4.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -943,7 +943,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ===== END SHARED: font attachment test =====
 
-    const path = require('path');
+    const path = require('path'); const fs = require('fs');   // fs is read only on an unmapped node, by the sidecar placement section below
 
     // ===== SHARED [clean_and_remux, sub_worker]: sidecar path derivation =====
     // -=-=-= libFilePath / libDir / videoBase / sidecarLangToken  [clean_and_remux, sub_worker] =-=-=-
@@ -959,6 +959,95 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '');
     const sidecarLangToken = (s) => (resolveLang(s) || 'und').replace(/[^a-z0-9-]/g, '') || 'und';
     // ===== END SHARED: sidecar path derivation =====
+
+    // ===== SHARED [clean_and_remux, sub_worker]: sidecar placement =====
+    // -=-=-= nodeConfig / isUnmappedNode / serverSidePath  [clean_and_remux, sub_worker] =-=-=-
+    // These two plugins are the only ones that write a file NEXT TO the library video, and where that file lands depends on the node. A MAPPED node sees
+    // the real library, so a sidecar emitted as an extra output of Tdarr's own ffmpeg run is written straight into it - and because the sidecar and the
+    // strip that follows are outputs of the SAME command, they succeed or fail together. An UNMAPPED node never sees the library at all: Tdarr mirrors the
+    // library tree under its unmappedNodeCache, downloads the file into that mirror, and uploads only the transcode RESULT back - so a sidecar written
+    // beside it is discarded with the job while the strip succeeds, the one shape that loses subtitle content. nodeType is the authority for that
+    // difference; a filesystem probe false-passes, because the mirror genuinely is a writable directory holding a real copy of the video.
+    const nodeConfig = otherArguments?.configVars?.config || {};
+    const isUnmappedNode = String(nodeConfig.nodeType || '').toLowerCase() === 'unmapped';
+    // A node path -> the server's own path for it, through the translators Tdarr auto-populates on an unmapped node (e.g. /media -> /cache/tiny/media).
+    // The longest node prefix wins, so a nested mapping beats the parent it sits under. '' means no translator claims the path, which makes the server-side
+    // destination unknowable rather than guessable - a caller must refuse the export instead of inventing one.
+    const serverSidePath = (p) => {
+        const hit = (Array.isArray(nodeConfig.pathTranslators) ? nodeConfig.pathTranslators : [])
+            .filter((t) => t && t.node && String(p).startsWith(String(t.node)))
+            .sort((a, b) => String(b.node).length - String(a.node).length)[0];
+        return hit ? String(hit.server) + String(p).slice(String(hit.node).length) : '';
+    };
+
+    // -=-=-= sidecarExistsRemote / placeSidecars  [clean_and_remux, sub_worker] =-=-=-
+    // The unmapped route, in one place: ask the server whether a sidecar is already there, then extract and upload the ones that are not. Tdarr runs the
+    // preset only AFTER the plugin returns, so there is no post-ffmpeg hook to upload from - extraction has to happen HERE, and be confirmed placed before
+    // the caller may strip the embedded stream. Both routes are gated server-side on "Allow unmapped Nodes and source/cache file access through API", and
+    // the server cannot have handed this job to an unmapped node with that off, so the transport needs no capability probe (it is also why a MAPPED node
+    // must keep writing directly - that option is off by default, so routing its sidecar through the API would fail on a normal install). curl through
+    // spawnSync because a classic plugin is synchronous: Tdarr does await the result, but making the whole plugin async would ripple through every caller
+    // for one branch that runs on unmapped nodes alone. Values go through --form-string so a comma or semicolon in a title can never be read as curl -F
+    // syntax, and the file part names a temp path built from an index, never from the sidecar name.
+    const nullDevice = process.platform === 'win32' ? 'NUL' : '/dev/null';
+    const apiAuthArgs = () => {
+        const key = String(nodeConfig.apiKey || '');
+        return key ? ['-H', `x-api-key: ${key}`, '-H', `tdarrKey: ${key}`, '-H', `Authorization: Bearer ${key}`] : [];
+    };
+    // Is a non-empty sidecar already at this server path? Download is the only read the API offers, so the test IS a fetch - discarded to the null device
+    // and measured with curl's own counters, never buffered back through spawnSync (a large body silently exceeds maxBuffer and reports a failure that
+    // never happened). Absent is the common case and answers with a cheap 404, and a hit skips the extraction entirely.
+    const sidecarExistsRemote = (dest) => {
+        const { spawnSync } = require('child_process');
+        const url = String(nodeConfig.serverURL || '').replace(/\/+$/, '');
+        if (!url) return false;
+        const r = spawnSync('curl', ['-sS', '-m', '1800', '-o', nullDevice, '-w', '%{http_code} %{size_download}', ...apiAuthArgs(),
+            '-X', 'POST', '-H', 'Content-Type: application/json', '-d', JSON.stringify({ filePath: dest }), `${url}/api/v2/file/download`],
+            { encoding: 'utf8', timeout: 1800000 });
+        const [code, got] = String(r.stdout || '').trim().split(/\s+/);
+        return code === '200' && Number(got) > 0;
+    };
+    // Extract every pending sidecar in ONE ffmpeg pass (even a tiny subtitle stream demuxes the whole container, so a second pass would re-read the lot),
+    // then upload each to its server path. The upload's 200 IS the verification: the server compares what it wrote against the fileSize field and reports
+    // success only when they match, a stronger check than this side could make. Returns the names genuinely in the library - a caller may strip only
+    // those, and anything in `failed` keeps its embedded stream, exactly as a refused export does. The multipart field ORDER is load-bearing: the server
+    // parses the stream as it arrives, so filePath and fileSize have to precede the file part or the upload is rejected as pathless.
+    const placeSidecars = (jobs) => {
+        const os = require('os');
+        const { spawnSync } = require('child_process');
+        const placed = new Set(); const failed = new Map();
+        const tmpExt = (name) => path.extname(name).replace(/[^.a-z0-9]/gi, '');   // from our own table-driven extension, so the temp name stays ours alone
+        const staged = jobs.map((j, i) => ({ ...j, tmp: path.join(os.tmpdir(), `awk_sidecar_${process.pid}_${i}${tmpExt(j.name)}`) }));
+        const failAll = (why) => { for (const j of staged) failed.set(j.name, why); return { placed, failed }; };
+        const clearStaged = () => { for (const j of staged) { try { fs.unlinkSync(j.tmp); } catch (e) { /* never written, or already gone */ } } };
+        const url = String(nodeConfig.serverURL || '').replace(/\/+$/, '');
+        if (!url) return failAll('the node config carries no server URL to upload through');
+        const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', String(file._id || file.file || '')];
+        for (const j of staged) args.push(...j.args, j.tmp);
+        // The ceiling is bounded by the container's size and the node's storage rather than by the sidecar, so it is generous - but a hung ffmpeg is
+        // killed rather than holding the worker forever.
+        const ff = spawnSync(String(otherArguments?.ffmpegPath || 'ffmpeg'), args, { encoding: 'utf8', timeout: 1800000, maxBuffer: 4 * 1024 * 1024 });
+        if (ff.error || ff.status !== 0) {
+            const why = ff.error ? `extraction failed (${ff.error.code || ff.error.message})`
+                : `extraction failed (ffmpeg exit ${ff.status}: ${String(ff.stderr || '').trim().slice(0, 200)})`;
+            clearStaged();
+            return failAll(why);
+        }
+        for (const j of staged) {
+            let size = 0;
+            try { size = fs.statSync(j.tmp).size; } catch (e) { size = 0; }
+            if (!size) { failed.set(j.name, 'extraction produced no data'); continue; }
+            const up = spawnSync('curl', ['-sS', '-m', '1800', '-o', nullDevice, '-w', '%{http_code}', ...apiAuthArgs(),
+                '--form-string', `filePath=${j.dest}`, '--form-string', `fileSize=${size}`, '--form-string', `nodeID=${String(nodeConfig.nodeID || '')}`,
+                '-F', `file=@${j.tmp}`, `${url}/api/v2/file/upload`], { encoding: 'utf8', timeout: 1800000 });
+            const code = String(up.stdout || '').trim();
+            if (!up.error && code === '200') placed.add(j.name);
+            else failed.set(j.name, `upload rejected (${up.error ? (up.error.code || up.error.message) : `HTTP ${code || 'no response'}`})`);
+        }
+        clearStaged();
+        return { placed, failed };
+    };
+    // ===== END SHARED: sidecar placement =====
 
     // Hidden dot-prefixed sidecar name for an exported image subtitle: ".<video>.s<index>.<lang>[.forced].<ext>". The leading
     // dot makes Plex/Jellyfin ignore it (Jellyfin skips **/.* ; Plex ignores .sup/.mks by extension). Emby is the exception -
@@ -1190,6 +1279,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     let extraArguments = '';
     let sidecarOut = '';   // remove_imagesubs=export: accumulates the per-image-sub sidecar outputs, prepended to the main output in the preset below.
+                           // Stays empty on an unmapped node, where the exports are placed by placedSidecars below instead of riding on the remux.
     let fflags = '';
     let inputArgs = '';   // recovery args that must precede -i (e.g. -err_detect); placed on the input side of the preset
     let workDone = '';
@@ -1198,6 +1288,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     let subtitleStreamIndex = -1;
     let audioStreamIndex = -1;
     let videoStreamIndex = -1;
+
+    // remove_imagesubs=export on an UNMAPPED node: the sidecars cannot ride along as extra outputs of the remux (they would land in the node-local mirror
+    // and be discarded with the job), so they are extracted and uploaded HERE, before the stream loop decides anything - the loop then drops an image sub
+    // only when its export is in placedSidecars, refusing the drop otherwise exactly as an unsafe path does. The pre-scan repeats the loop's own export
+    // test (imageSubDropped on an image codec), which reads nothing but the codec, so the two cannot select different streams.
+    let exportRefusedCount = 0;   // image-sub exports that could not be written this run - any at all fails the file, see the check after the stream loop
+    const placedSidecars = new Set(); const failedSidecars = new Map();
+    if (isUnmappedNode && removeImageSubs === 'export') {
+        const exportJobs = [];
+        for (const s of (file.ffProbeData.streams || [])) {
+            const codec = (s?.codec_name || '').toLowerCase();
+            if ((s?.codec_type || '').toLowerCase() !== 'subtitle' || !imageSubDropped(codec)) continue;
+            const sc = IMAGE_SUB[codec];
+            const name = imageSidecarName(s, sc.ext);
+            const dest = serverSidePath(path.join(libDir, name));
+            if (!dest) { failedSidecars.set(name, 'no path translator maps this library directory back to the server'); continue; }
+            // Already on the server (a re-run, or a prior export the drop never followed): count it placed rather than re-extracting and re-uploading it.
+            if (sidecarExistsRemote(dest)) { placedSidecars.add(name); continue; }
+            exportJobs.push({ name, dest, args: ['-map', `0:${s.index}`, '-c:s', 'copy', '-f', sc.fmt] });
+        }
+        if (exportJobs.length) {
+            const { placed, failed } = placeSidecars(exportJobs);
+            for (const n of placed) placedSidecars.add(n);
+            for (const [n, why] of failed) failedSidecars.set(n, why);
+        }
+    }
 
     // Predicted-output tracking for the closing summary line (does not affect the ffmpeg preset). removedIndices: input stream positions
     // dropped via -map -0:ffstream.index. subCodecOverride: input stream position -> converted subtitle codec ('srt' / 'mov_text').
@@ -1318,11 +1434,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const sc = IMAGE_SUB[ffstreamCodec];   // { ext, fmt } - .mks needs an explicit -f matroska; .sup auto-detects from the extension
                     const sidecarName = imageSidecarName(ffstream, sc.ext);
                     const sidecarPath = path.join(libDir, sidecarName);
-                    if (pathIsPresetSafe(sidecarPath)) {
+                    // Unmapped: the export already ran, above this loop - the drop is allowed only for a sidecar the server confirmed it holds, and the
+                    // line is ☑ rather than ☐ because it reports work already done. A refusal reads like the unsafe-path one below and keeps the subtitle.
+                    if (isUnmappedNode) {
+                        if (placedSidecars.has(sidecarName)) {
+                            workDone += `☑${streamTag(ffstream.index)}[remove_imagesubs=export] Exported image subtitle -> ${sidecarName} for external OCR (before drop)\n`;
+                        } else {
+                            exportRefused = true; exportRefusedCount += 1;
+                            response.infoLog += `☒${streamTag(ffstream.index)}[remove_imagesubs=export] Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}, keeping the subtitle\n`;
+                        }
+                    } else if (pathIsPresetSafe(sidecarPath)) {
                         sidecarOut += ` -map 0:${ffstream.index} -c:s copy -f ${sc.fmt} "${sidecarPath}"`;
                         workDone += `☐${streamTag(ffstream.index)}[remove_imagesubs=export] Export image subtitle -> ${sidecarName} for external OCR (before drop)\n`;
                     } else {
-                        exportRefused = true;
+                        exportRefused = true; exportRefusedCount += 1;
                         response.infoLog += `☒${streamTag(ffstream.index)}[remove_imagesubs=export] Library directory contains a quote or control character - cannot write ${sidecarName} safely, keeping the subtitle\n`;
                     }
                 }
@@ -1632,6 +1757,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (runRecover)
                 workDone += `☐Stamp awk_recovered=${recoverIntent} - recovery re-runs only if a recover_bad_* mode changes\n`;
             extraArguments += ` -metadata "awk_recovered=${recoverIntent}"`;
+        }
+
+        // remove_imagesubs=export asked for a sidecar that could not be written, so the export did not happen and neither did the drop it protects. Fail
+        // rather than remux around it: every cause is environmental (a quote in the library directory, no path translator, a rejected upload) and so
+        // recurs on every future run, which would leave the export setting quietly doing nothing while each run reported success. Failing costs nothing -
+        // the file is untouched and the image subtitle is still embedded - and the error clears itself once the environment is fixed and the file requeued.
+        if (exportRefusedCount) {
+            failFile(`[remove_imagesubs=export] ${exportRefusedCount} image subtitle${exportRefusedCount === 1 ? '' : 's'} could not be exported, see the reasons above - nothing was removed from the file`);
         }
 
         if (convert === true) {
