@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.17.0',
+    Version: '3.18.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -63,11 +63,11 @@ const details = () => ({
                 \\nWhether the sidecar FILES are deleted afterwards is import_remove_sidecar's decision alone, in every mode.`,
         },
         {
-            name: 'method_metadata',
+            name: 'method_import_metadata',
             type: 'string',
             defaultValue: 'embedded',
             inputUI: { type: 'dropdown', options: ['embedded', 'sidecar'] },
-            tooltip: `On import, which side owns the language/title/flags when a sidecar's TEXT is already one of the embedded tracks - i.e. who wins a disagreement about a subtitle that is already in the file. Only reachable with method_deduplicate=enabled, since that is what compares the text; a sidecar being muxed as a NEW track always takes its metadata from its filename, because nothing else describes it.
+            tooltip: `Which side owns the language/title/flags when a sidecar's TEXT is already one of the embedded tracks - i.e. who wins a disagreement about a subtitle that is already in the file. Reachable only when method_deduplicate is comparing text (enabled or enabled_embedded); a sidecar muxed as a NEW track always takes its metadata from its filename, because nothing else describes it.
                 \\nembedded - leave the track exactly as it is and report the difference. Safe with an OLD sidecar name: a name written before a flag existed carries no token for it, and applying it would strip that flag off a track that has it.
                 \\nsidecar  - the filename wins, so renaming a sidecar retunes the track already in the file (language, title and flags, including clearing flags you removed from the name). Use it when you renamed the sidecar deliberately; it costs one remux of the file.`,
         },
@@ -1281,27 +1281,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const dedupeSidecars = dedupeMode !== 'disabled';        // both enabled values collapse byte-identical sidecars and skip one already embedded
     const dedupeStreams = dedupeMode === 'enabled_embedded'; // only this one also removes a duplicate the file already carries
     if (!['error', 'mount', 'text_file'].includes(unmappedMode)) failFile(`[method_unmapped=${inputs.method_unmapped}] invalid value, check your settings`);
-    const metadataMode = String(inputs.method_metadata || 'embedded').toLowerCase();
-    if (!['embedded', 'sidecar'].includes(metadataMode)) failFile(`[method_metadata=${inputs.method_metadata}] invalid value, check your settings`);
+    const metadataMode = String(inputs.method_import_metadata || 'embedded').toLowerCase();
+    if (!['embedded', 'sidecar'].includes(metadataMode)) failFile(`[method_import_metadata=${inputs.method_import_metadata}] invalid value, check your settings`);
     if (file.fileMedium && file.fileMedium !== 'video') { response.infoLog += '☑Not a video file - skipping\n'; return response; }
 
     const streams = (file.ffProbeData && file.ffProbeData.streams) || [];   // [] only in post-processing, which reads the file through probeCurrentFile instead
     const langFilter = parseLangFilter(inputs.only_languages);
-    // Both of these were renamed to lead with the MODE they belong to (remove_after_extract -> extract_remove_stream, remove_sidecar_after_import ->
-    // import_remove_sidecar). Tdarr's loadDefaultValues only ADDS defaults for inputs a plugin declares - it never strips a key it no longer knows - so a
-    // config saved under the old name still arrives here intact. That matters because both default to TRUE and both DELETE something: falling straight
-    // through to the default would start removing subtitle tracks, or deleting sidecars, for anyone who had deliberately turned one off. So while the new
-    // setting is still sitting at its default - meaning the user has not re-saved the form, which is what drops the stale key - the old value wins and says
-    // so. Opening the plugin's settings and saving once clears it for good.
-    const renamedBool = (nowName, wasName, dflt) => {
-        const now = String(inputs[nowName]) === 'true';
-        if (inputs[wasName] === undefined || now !== dflt) return now;
-        const legacy = String(inputs[wasName]) === 'true';
-        if (legacy !== dflt) response.infoLog += `☒[${nowName}=${legacy}] Honouring your old ${wasName} setting - it was renamed, so open this plugin's settings and save them once\n`;
-        return legacy;
-    };
-    const removeAfterExtract = renamedBool('extract_remove_stream', 'remove_after_extract', true);
-    const removeSidecarAfterImport = renamedBool('import_remove_sidecar', 'remove_sidecar_after_import', true);
+    const removeAfterExtract = String(inputs.extract_remove_stream) === 'true';
+    const removeSidecarAfterImport = String(inputs.import_remove_sidecar) === 'true';
     const dstContainer = String(file.container || '').toLowerCase().trim();
     const isMp4 = isMp4Family(dstContainer);   // shared checker; cached once for this container
 
@@ -1629,7 +1616,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return null;
         };
         // A track that is already in the file needs no mux, so the only open question is its METADATA - and unlike a new track, it has metadata of its own to
-        // disagree with. method_metadata decides who wins. 'embedded' keeps the track's tags and reports the difference: a sidecar name is frozen at the
+        // disagree with. method_import_metadata decides who wins. 'embedded' keeps the track's tags and reports the difference: a sidecar name is frozen at the
         // moment it was written, so an old one carries no token for a flag that did not exist yet, and applying it would STRIP that flag off a track that has
         // it. 'sidecar' makes the filename authoritative, which is what makes renaming a sidecar a way to retune the track already in the file - dispositions
         // included, written as an explicit 0 when the name carries none so a flag removed by renaming actually goes away. Comparison ignores per-stream titles
@@ -1648,14 +1635,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (curTitle === (f.title || '') && langKey(resolveLang(cur) || 'und') === langKey(f.lang || 'und') && sameDisp) continue;
             const named = [f.lang, f.title, ...f.disp].filter(Boolean).join(' ');
             if (metadataMode !== 'sidecar') {
-                response.infoLog += `☒${streamTag(at)}[method_metadata=${metadataMode}] The sidecar name and the embedded track disagree on metadata - keeping the track's own (name: ${named})\n`;
+                response.infoLog += `☒${streamTag(at)}[method_import_metadata=${metadataMode}] The sidecar name and the embedded track disagree on metadata - keeping the track's own (name: ${named})\n`;
                 continue;
             }
             const outIdx = keptSubs.findIndex((s) => s.index === at);   // position among the subtitle streams that survive, which is what -map 0 minus the drops leaves
             retuneMeta += ` -metadata:s:s:${outIdx} "language=${escMeta(isMp4 ? to6392T(f.lang) : normSidecarLang(f.lang))}"`;
             retuneMeta += ` -metadata:s:s:${outIdx} "title=${escMeta(f.title || '')}"`;
             retuneMeta += ` -disposition:s:${outIdx} ${f.disp.length ? f.disp.join('+') : '0'}`;
-            response.infoLog += `☐${streamTag(at)}[method_metadata=sidecar] Retagging the track already in the file from ${f.rel} (${named || 'no language, title or flags'})\n`;
+            response.infoLog += `☐${streamTag(at)}[method_import_metadata=sidecar] Retagging the track already in the file from ${f.rel} (${named || 'no language, title or flags'})\n`;
         }
 
         // Sidecars that were only ever redundant, with nothing at all to mux alongside them. There is no transcode to wait on here, so the deletion the user
