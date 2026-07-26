@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.23.2',
+    Version: '3.24.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1259,10 +1259,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (scan.err) return { deleted: 0, log: `☒[${delReason}] Cannot read the library directory to remove imported sidecars: ${scan.err.message || scan.err}\n` };
         const embedded = streamList.filter((s) => (s.codec_type || '').toLowerCase() === 'subtitle');
         const anyFont = streamList.some((s) => (s.codec_type || '').toLowerCase() === 'attachment' && isFontAttachment(s));
-        const confirmed = (f) => markerConfirmsEmbedded(f, embedded, anyFont, mp4Target);
+        // Language + title is a proxy for "this is in the file"; the TEXT is the fact itself. So a sidecar the metadata cannot vouch for gets the same
+        // content test the import side uses, and only a sidecar neither test can confirm survives. This is what lets a copy the user named themselves be
+        // cleaned up: its title matches no track by construction, yet its content is provably one of them. Strictly safer than the metadata check too - it
+        // cannot pass for a sidecar that merely resembles a track. The hashes cost one pass over the file, so they are computed only once a metadata check
+        // has already failed, and never for a bundle: an .mks is an archive, and its fonts are what the metadata path checks for.
+        let hashes;
+        const contentConfirms = (f) => {
+            if (f.bundle) return false;
+            if (hashes === undefined) hashes = embeddedTextHashes(embedded);
+            if (!hashes || !hashes.size) return false;
+            let h = '';
+            try { h = crypto.createHash('sha1').update(fs.readFileSync(path.join(workLibDir(), f.rel))).digest('hex'); } catch (e) { return false; }
+            return [...hashes.values()].includes(h);
+        };
+        const confirmed = (f) => markerConfirmsEmbedded(f, embedded, anyFont, mp4Target) || contentConfirms(f);
         let deleted = 0; let log = '';
         for (const f of scan.rels.map(parseSidecarRel).filter(Boolean).filter((x) => marked.has(x.rel))) {
-            if (!confirmed(f)) { log += `☒[${delReason}] Marker lists ${f.rel} but no embedded subtitle matches its language/title - not deleting (unverified)\n`; continue; }
+            if (!confirmed(f)) { log += `☒[${delReason}] Marker lists ${f.rel} but no embedded subtitle matches its language/title, and its text is not in the file either - not deleting (unverified)\n`; continue; }
             try { fs.unlinkSync(path.join(workLibDir(), f.rel)); deleted += 1; log += `☑[${delReason}] Deleted sidecar (embedded): ${f.rel}\n`; }
             catch (e) { log += `☒[${delReason}] Could not delete sidecar ${f.rel}: ${e && e.message ? e.message : e}\n`; }
         }
