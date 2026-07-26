@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.23.1',
+    Version: '3.23.2',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1599,8 +1599,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // guess. Matched on language + title, except on mp4/mov where the muxer drops per-stream titles and only the language survives to compare.
         const stillEmbedded = (m) => m.index !== null && embeddedSubs.some((s) => s.index === m.index
             && langKey(resolveLang(s) || 'und') === langKey(m.lang || 'und') && (isMp4 || (s.tags?.title || '') === (m.title || '')));
+        // Only the unsafe-name check filters INDIVIDUAL sidecars here. The marker skip deliberately waits until they have been grouped by content, because
+        // it is a per-file test on a metadata match and would otherwise split a byte-identical group: with two copies of one subtitle under different names,
+        // whichever the marker happens to confirm drops out, leaving the OTHER to speak for the group - and which one that is flips every pass, so a retune
+        // ping-pongs between their two titles forever. Grouping first gives the group one identity no matter which member is confirmed, and the retune then
+        // finds the track already matching and does nothing. See the group-level skip below.
         const candidates = found.filter((f) => {
-            if (alreadyEmbedded(f)) { response.infoLog += `☑Skipping ${f.rel} - already embedded by an earlier pass\n`; return false; }
             if (pathIsPresetSafe(path.join(workLibDir(), f.rel))) return true;
             response.infoLog += `☒Skipping sidecar with an unsafe filename (contains a quote or control character), cannot import safely: ${f.rel}\n`;
             return false;
@@ -1616,7 +1620,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // One import per group: union the members' disposition tokens (byte-identical plain + SDH -> SDH), and take the first non-"und" language and
         // first non-empty title. The physical file muxed is the member with the most-specific dispositions (deterministic tie-break by name); its
         // metadata is overridden by the merged values, so which identical copy we pick doesn't matter.
-        const merged = groups.map((g) => {
+        let merged = groups.map((g) => {
             const dispTokens = [...new Set(g.flatMap((m) => m.dispTokens))];
             const extraTokens = [...new Set(g.flatMap((m) => m.extraTokens || []))];   // unioned with the roles, so a merged group keeps every member's flags
             const lang = (g.find((m) => m.lang && m.lang !== 'und') || g[0]).lang;
@@ -1627,6 +1631,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 disp: [...new Set(dispTokens.concat(extraTokens).map(dispFfOf).filter(Boolean))],
             };
         });
+
+        // The marker skip, now that a group has ONE identity. A group is done only when EVERY member is confirmed embedded: a partly-confirmed group still
+        // has something to say (its merged title or flags may not be on the track yet), and processing it is harmless because its content is then found
+        // already embedded below. Skipping per FILE instead is what let two names for one subtitle take turns retagging the track on alternate passes.
+        const settled = merged.filter((f) => f.members.every(alreadyEmbedded));
+        for (const f of settled) {
+            const names = f.members.length > 1 ? `${f.members.length} copies of it (${f.members.map((m) => m.rel).join(', ')})` : f.rel;
+            response.infoLog += `☑Skipping ${names} - already embedded by an earlier pass\n`;
+        }
+        merged = merged.filter((f) => !f.members.every(alreadyEmbedded));
 
         // Dedup does not stop at sidecar-vs-sidecar. A sidecar whose TEXT is already one of the embedded tracks is just as much a duplicate, and muxing it
         // leaves the file carrying the same subtitle twice - the state extract_remove_stream=false sets up, since the track stayed behind and the sidecar was
