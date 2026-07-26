@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.22.1',
+    Version: '3.23.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -46,11 +46,11 @@ const details = () => ({
             name: 'import_remove_sidecar',
             type: 'string',
             defaultValue: 'enabled',
-            inputUI: { type: 'dropdown', options: ['disabled', 'enabled', 'enabled_remux'] },
+            inputUI: { type: 'dropdown', options: ['disabled', 'enabled'] },
             tooltip: `On import, delete each sidecar whose basename is listed in the file's global awk_sub_worker marker (stamped by the mux pass) once an embedded subtitle matching its language and title confirms the content really is in the file.
                 \\ndisabled - leave every sidecar on disk.
                 \\nenabled (default) - delete them once they are safely embedded. The deletion runs in POST-PROCESSING, after you accept the transcode: deleting earlier would destroy the sidecars of a run you then reject, leaving those subtitles nowhere. So ADD THIS PLUGIN TO THE POST-PROCESSING PLUGIN STACK as well as the pre-processing one. Without that, nothing is ever lost, but the sidecars simply stay on disk. That stage runs on the SERVER, which is also how it cleans up for an unmapped node - one has no way of its own to delete a library file, since Tdarr's API offers upload and download but no delete.
-                \\nenabled_remux - the same, plus one case 'enabled' cannot reach: when every sidecar is ALREADY in the file there is nothing to mux, so there is no transcode, no acceptance, and no post-processing pass to clean up after. This forces a lossless -c copy pass purely to get there. It is a full read and write of the video to delete a few kB of text, so it is opt-in - and it can only ever happen ONCE per file, because that pass marks the sidecars and the next pass skips them. Pointless on a node that can reach the library, which deletes them directly.`,
+                \\nOne case needs more than that: on an unmapped node with no mount, when every sidecar is ALREADY in the file, there is nothing to mux - so no transcode, no acceptance, and no post-processing pass in which to delete anything. There, enabled forces a lossless -c copy of the video purely to reach that stage. It is a full read and write to remove a few kB of text, but it is the only route, it happens at most ONCE per file (the pass marks those sidecars and the next one skips them), and asking for them to be deleted is taken as asking for whatever that costs. Set disabled if you would rather keep them.`,
         },
         {
             name: 'method_deduplicate',
@@ -1300,7 +1300,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const dedupeStreams = dedupeMode === 'enabled_embedded'; // only this one also removes a duplicate the file already carries
     if (!['error', 'mount', 'text_file'].includes(unmappedMode)) failFile(`[method_unmapped=${inputs.method_unmapped}] invalid value, check your settings`);
     const removeSidecarMode = String(inputs.import_remove_sidecar || 'enabled').toLowerCase().trim();
-    if (!['disabled', 'enabled', 'enabled_remux'].includes(removeSidecarMode)) failFile(`[import_remove_sidecar=${inputs.import_remove_sidecar}] invalid value, check your settings`);
+    if (!['disabled', 'enabled'].includes(removeSidecarMode)) failFile(`[import_remove_sidecar=${inputs.import_remove_sidecar}] invalid value, check your settings`);
     const metadataMode = String(inputs.method_import_metadata || 'embedded').toLowerCase();
     if (!['embedded', 'sidecar'].includes(metadataMode)) failFile(`[method_import_metadata=${inputs.method_import_metadata}] invalid value, check your settings`);
     if (file.fileMedium && file.fileMedium !== 'video') { response.infoLog += '☑Not a video file - skipping\n'; return response; }
@@ -1309,7 +1309,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const langFilter = parseLangFilter(inputs.only_languages);
     const removeAfterExtract = String(inputs.extract_remove_stream) === 'true';
     const removeSidecarAfterImport = removeSidecarMode !== 'disabled';
-    const forceRemuxToClean = removeSidecarMode === 'enabled_remux';
     const dstContainer = String(file.container || '').toLowerCase().trim();
     const isMp4 = isMp4Family(dstContainer);   // shared checker; cached once for this container
 
@@ -1687,18 +1686,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // afterwards. Nothing can do this job from here, so it says so and leaves the sidecars alone rather than claiming a deletion it did not perform.
         if (!toMux.length && !retuneMeta && alreadyInFile.length && removeSidecarAfterImport && placeViaApi()) {
             const stranded = alreadyInFile.flatMap((f) => f.members.map((m) => m.rel));
-            if (!forceRemuxToClean) {
-                response.infoLog += `☒[import_remove_sidecar=${removeSidecarMode}] Every sidecar is already in the file, but this node cannot reach the library to delete them - and with nothing to mux there is no transcode for the post-processing pass to clean up after\n`;
-                response.infoLog += `☒[method_unmapped=${unmappedMode}] Run this import on a node that shares the library filesystem, use method_unmapped=mount, or set import_remove_sidecar=enabled_remux to have them removed\n`;
-                response.infoLog += '☑Nothing to import - every sidecar was already in the file\n';
-                return response;
-            }
-            // The only route left. Post-processing runs SERVER-side, where the library is reachable, but it only runs after a transcode is accepted - so a
-            // lossless copy of the whole file is emitted purely to reach that stage. Expensive and deliberately opt-in. It cannot repeat: the marker stamped
-            // here lists these sidecars, so the next pass filters them out through alreadyEmbedded before this branch is reached, whether or not the deletion
-            // that follows actually succeeded. One extra pass per file, at most, ever.
-            response.infoLog += `☐[import_remove_sidecar=enabled_remux] Every sidecar is already in the file and this node cannot delete them - remuxing losslessly so the post-processing pass can, on the server\n`;
-            for (const rel of stranded) response.infoLog += `☐[import_remove_sidecar=enabled_remux] Queued for removal once accepted: ${rel}\n`;
+            // The only route left, so it is taken rather than offered. Post-processing runs SERVER-side, where the library is reachable, but it only runs
+            // after a transcode is ACCEPTED - so a lossless copy of the whole file is emitted purely to reach that stage. Making this a setting would only
+            // work for someone who already knew the trap existed, and by then they have been caught by it: asking for the sidecars to be deleted IS asking
+            // for whatever it takes. It cannot repeat - the marker stamped here lists them, so the next pass filters them out through alreadyEmbedded before
+            // this branch is reached, whether or not the deletion that follows actually succeeded. One extra pass per file, at most, ever.
+            response.infoLog += `☒[import_remove_sidecar=${removeSidecarMode}] Every sidecar is already in the file and this node cannot reach the library to delete them - remuxing losslessly, since only an accepted transcode gives the server a pass in which to do it\n`;
+            for (const rel of stranded) response.infoLog += `☐[import_remove_sidecar=${removeSidecarMode}] Queued for removal once accepted: ${rel}\n`;
             commitPreset(` -map 0 -c copy -metadata "awk_sub_worker=${encodeMarkerList(stranded)}"`);
             response.infoLog += `☑Expected results: ${summariseAll(streams)}\n`;
             return response;
