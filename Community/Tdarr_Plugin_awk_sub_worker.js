@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.22.0',
+    Version: '3.22.1',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1688,7 +1688,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!toMux.length && !retuneMeta && alreadyInFile.length && removeSidecarAfterImport && placeViaApi()) {
             const stranded = alreadyInFile.flatMap((f) => f.members.map((m) => m.rel));
             if (!forceRemuxToClean) {
-                response.infoLog += '☒[import_remove_sidecar=enabled] Every sidecar is already in the file, but this node cannot reach the library to delete them - and with nothing to mux there is no transcode for the post-processing pass to clean up after\n';
+                response.infoLog += `☒[import_remove_sidecar=${removeSidecarMode}] Every sidecar is already in the file, but this node cannot reach the library to delete them - and with nothing to mux there is no transcode for the post-processing pass to clean up after\n`;
                 response.infoLog += `☒[method_unmapped=${unmappedMode}] Run this import on a node that shares the library filesystem, use method_unmapped=mount, or set import_remove_sidecar=enabled_remux to have them removed\n`;
                 response.infoLog += '☑Nothing to import - every sidecar was already in the file\n';
                 return response;
