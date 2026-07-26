@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all) and skip_commentary (omit commentary tracks). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.7.2',
+    Version: '3.8.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -68,6 +68,17 @@ const details = () => ({
                 \\ndisabled - mux every sidecar as its own track, even byte-identical copies (you may get duplicate subtitles).
                 \\nenabled  - mux one track per byte-identical group, combining their flags (a byte-identical plain + SDH pair imports once, tagged SDH). Every member of the group is listed in the marker, so remove_sidecar_after_import cleans up the whole group.
                 \\nWhether the sidecar files are deleted afterwards is remove_sidecar_after_import's decision alone, in either mode.`,
+        },
+        {
+            name: 'method_unmapped',
+            type: 'string',
+            defaultValue: 'error',
+            inputUI: { type: 'dropdown', options: ['error', 'mount', 'text_file'] },
+            tooltip: `What to do on an UNMAPPED node, which is only ever given a local copy of the video and never sees the library folder. Ignored entirely on a normal (mapped) node.
+                \\nExtract already works everywhere - the sidecar is uploaded to the library through Tdarr's file API. It is IMPORT that has the problem: finding sidecars means listing a directory, and the API offers no way to list one.
+                \\nerror     - fail the file and say so. Nothing is silently skipped; run import on a node that can see the library.
+                \\nmount     - reach the library directly. The node's own path is tried first (a container bind-mounting the library at the server's own path, e.g. /media, needs nothing more), then any "key=value" Node Tag set for this node in the server's web UI, which names where THIS node sees that folder - for example "media=M:\\\\" when the server calls it /media. A tag is needed on Windows and macOS, where the server's path cannot exist locally. Extract writes directly too in this mode, skipping the upload API.
+                \\ntext_file - read "<video>.subtitles.txt" next to the video: one filename per line, lines starting with # ignored. Extract seeds it with what it wrote; after that it is yours to maintain, which is how a subtitle you OCR'd from an exported image sub gets imported. Each name must still follow the sidecar naming convention, since that is where language, title and flags come from.`,
         },
     ],
 });
@@ -908,6 +919,153 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
     };
 
+    // ============= UNMAPPED-NODE LIBRARY ACCESS (method_unmapped) =============
+    // An unmapped node is handed a local MIRROR of the library under unmappedNodeCache, never the library itself, and Tdarr withholds the user's own path
+    // translators from it - configVars.config.pathTranslators carries only the mirror mappings Tdarr generates, and librarySettings.folder is the mirror
+    // too. So the node can work out that the server calls this folder /media/Show and reach nothing at that path. Two ways out, both measured on a real
+    // Windows node rather than assumed:
+    //   mount     - the server's path may simply work (a container bind-mounting the library at /media), and otherwise a Node Tag names where THIS node
+    //               sees it ("media=M:\"). Tags are the only PER-NODE setting a classic plugin can read: they reach flow plugins directly but not this
+    //               one, so they are fetched from /api/v2/get-nodes using the serverURL, apiKey and nodeID the node config already carries.
+    //   text_file - no directory access at all; the user lists the filenames and each is fetched by name through the download API.
+    const unmappedMode = String(inputs.method_unmapped || 'error').toLowerCase();
+    const SUBTITLE_LIST_SUFFIX = '.subtitles.txt';
+
+    // This node's Node Tags, as [key, value] pairs. One request, memoised, and only ever made when something actually needs it. Tdarr maintains entries in
+    // the SAME field - a node restart rewrites it to e.g. "unmapped,media=M:\" - so the field is shared, not ours: split on commas and keep only the
+    // "key=value" tokens, leaving Tdarr's own bare tags alone rather than assuming the field contains nothing but our setting.
+    const nodeTagPairs = (() => {
+        let cached = null;
+        return () => {
+            if (cached) return cached;
+            cached = [];
+            const url = String(nodeConfig.serverURL || '').replace(/\/+$/, '');
+            if (!url) return cached;
+            const { spawnSync } = require('child_process');
+            const r = spawnSync('curl', ['-sS', '-m', '30', ...apiAuthArgs(), `${url}/api/v2/get-nodes`], { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 });
+            if (r.error || r.status !== 0) return cached;
+            try {
+                const reg = JSON.parse(String(r.stdout || '')) || {};
+                const me = reg[String(nodeConfig.nodeID || '')] || Object.values(reg).find((n) => n && n.nodeName === nodeConfig.nodeName);
+                const raw = me && me.nodeTags;
+                const tags = Array.isArray(raw) ? raw : String(raw || '').split(',');
+                cached = tags.map((t) => String(t).trim()).filter(Boolean)
+                    .map((t) => { const i = t.indexOf('='); return i === -1 ? null : [t.slice(0, i).trim(), t.slice(i + 1).trim()]; }).filter(Boolean);
+            } catch (e) { /* a non-JSON reply just means no tags are available */ }
+            return cached;
+        };
+    })();
+
+    // The library directory as THIS node can actually open it, or '' with the reason it could not. Candidates are tried in order and each is PROBED - a
+    // path is only accepted once a real readdir succeeds, never because its shape looked right. ENOENT and EACCES are reported apart because they send you
+    // to different places: a wrong value versus a path that exists but this node has no credentials for (typically Tdarr running as a service).
+    const resolveMountedLibDir = () => {
+        const serverDir = serverSidePath(libDir);
+        if (!serverDir) return { dir: '', why: `no path translator maps ${libDir} back to the server, so this node cannot name the library at all` };
+        const candidates = [['the server\'s own path', serverDir]];
+        for (const [k, v] of nodeTagPairs()) {
+            const root = `/${String(k).replace(/^\/+/, '')}`;
+            const norm = serverDir.replace(/\\/g, '/');
+            if (!norm.startsWith(root)) continue;
+            candidates.push([`Node Tag "${k}=${v}"`, path.normalize(String(v).replace(/[\\/]+$/, '') + norm.slice(root.length))]);
+        }
+        const tried = [];
+        for (const [label, dir] of candidates) {
+            try { fs.readdirSync(dir); return { dir, via: label }; } catch (e) {
+                const code = (e && e.code) || '';
+                tried.push(`${label} (${dir}) - ${code === 'ENOENT' ? 'not there' : (code === 'EACCES' || code === 'EPERM' ? 'exists but unreadable from this node, check credentials' : code || e.message)}`);
+            }
+        }
+        return { dir: '', why: `nothing reachable. Tried: ${tried.join('; ')}${nodeTagPairs().length ? '' : '. No "key=value" Node Tag is set for this node'}` };
+    };
+    const mountedLib = (() => { let c = null; return () => { if (!c) c = (isUnmappedNode && unmappedMode === 'mount') ? resolveMountedLibDir() : { dir: '' }; return c; }; })();
+
+    // Every path below goes through these two rather than libDir/isUnmappedNode directly: with a resolved mount the node behaves exactly like a mapped one,
+    // reading and writing the real library, and the API routes are only for a node that genuinely cannot reach it.
+    const workLibDir = () => mountedLib().dir || libDir;
+    const placeViaApi = () => isUnmappedNode && !mountedLib().dir;
+
+    // Fetch one library file to a local path, through the only read an unmapped node has. It addresses a single KNOWN path, which is exactly why the list
+    // has to live at a name we can compute rather than one we would have to go looking for. Written straight to disk by curl, never buffered back through
+    // spawnSync, so a large sidecar cannot silently exceed maxBuffer and report a failure that never happened.
+    const downloadLibraryFile = (dest, local) => {
+        const url = String(nodeConfig.serverURL || '').replace(/\/+$/, '');
+        if (!url) return 'the node config carries no server URL';
+        const { spawnSync } = require('child_process');
+        try { fs.mkdirSync(path.dirname(local), { recursive: true }); } catch (e) { /* already there */ }
+        const r = spawnSync('curl', ['-sS', '-m', '600', '-o', local, '-w', '%{http_code}', ...apiAuthArgs(),
+            '-X', 'POST', '-H', 'Content-Type: application/json', '-d', JSON.stringify({ filePath: dest }), `${url}/api/v2/file/download`],
+            { encoding: 'utf8', timeout: 600000 });
+        const code = String(r.stdout || '').trim();
+        let size = 0; try { size = fs.statSync(local).size; } catch (e) { size = 0; }
+        if (!r.error && code === '200' && size > 0) return '';
+        try { fs.unlinkSync(local); } catch (e) { /* nothing landed */ }
+        return r.error ? `download failed (${r.error.code || r.error.message})` : `HTTP ${code || 'no response'}`;
+    };
+
+    // Pull every listed sidecar into this node's own copy of the library folder, at the same relative path. Everything downstream - the dedup hash, the -i
+    // inputs, the marker - then works on ordinary local files and needs to know nothing about how they arrived. The copy lives in the throwaway mirror,
+    // which is the right place for it: it is consumed by this one mux and goes with the job.
+    const fetchListedSidecars = (rels, listName) => {
+        const got = [];
+        for (const rel of rels) {
+            const dest = serverSidePath(path.join(libDir, rel));
+            if (!dest) { response.infoLog += `☒[method_unmapped=text_file] Cannot work out the server path for ${rel}\n`; continue; }
+            const why = downloadLibraryFile(dest, path.join(libDir, rel));
+            if (!why) { got.push(rel); continue; }
+            response.infoLog += `☒[method_unmapped=text_file] ${listName} lists ${rel} but it could not be fetched - ${why}\n`;
+        }
+        return got;
+    };
+
+    // Extract seeds the list once and then never touches it again - it is the user's file from that moment, and rewriting it every pass would quietly
+    // discard the OCR'd subtitles they added, which is the one failure that would make the feature untrustworthy. The header explains itself, so opening
+    // the file is enough to understand it.
+    const seedSubtitleList = (rels) => {
+        const listName = `${videoBase}${SUBTITLE_LIST_SUFFIX}`;
+        const dest = serverSidePath(path.join(libDir, listName));
+        if (!dest) return `no path translator maps ${libDir} back to the server`;
+        if (sidecarExistsRemote(dest)) return 'exists';
+        const body = [
+            `# Subtitles to import for ${path.basename(libFilePath)} - one filename per line.`,
+            '# Lines starting with # are ignored. This file was created once, automatically; it is yours to edit now.',
+            '# Add any subtitle you have made yourself here - for example one you OCR\'d from an exported image subtitle -',
+            '# naming it the same way as the lines below, since the language, title and flags are read from the filename.',
+            ...rels,
+            '',
+        ].join('\n');
+        const tmp = path.join(require('os').tmpdir(), `awk_sublist_${process.pid}.txt`);
+        try { fs.writeFileSync(tmp, body); } catch (e) { return `could not stage the list (${e && e.message ? e.message : e})`; }
+        const url = String(nodeConfig.serverURL || '').replace(/\/+$/, '');
+        const { spawnSync } = require('child_process');
+        const size = fs.statSync(tmp).size;
+        const up = spawnSync('curl', ['-sS', '-m', '300', '-o', nullDevice, '-w', '%{http_code}', ...apiAuthArgs(),
+            '--form-string', `filePath=${dest}`, '--form-string', `fileSize=${size}`, '--form-string', `nodeID=${String(nodeConfig.nodeID || '')}`,
+            '-F', `file=@${tmp}`, `${url}/api/v2/file/upload`], { encoding: 'utf8', timeout: 300000 });
+        try { fs.unlinkSync(tmp); } catch (e) { /* best effort */ }
+        const code = String(up.stdout || '').trim();
+        return (!up.error && code === '200') ? '' : `upload rejected (${up.error ? (up.error.code || up.error.message) : `HTTP ${code || 'no response'}`})`;
+    };
+
+    // One line per filename, # for comments. Deliberately the simplest format that can be hand-edited without getting quoting wrong, because maintaining it
+    // IS the point - it is how a subtitle OCR'd from an exported image sub announces itself. Every entry is confined to the library folder: '..', an
+    // absolute path and a UNC path are all rejected outright, and the joined result is then resolved and re-checked to stay under the directory, so
+    // anything that slips the syntactic tests fails on the outcome instead.
+    const readSubtitleList = (text) => {
+        const ok = []; const bad = [];
+        for (const line of String(text || '').split(/\r?\n/)) {
+            const entry = line.trim();
+            if (!entry || entry.startsWith('#')) continue;
+            const norm = entry.replace(/\\/g, '/');
+            if (/^([a-zA-Z]:|\/|\\)/.test(entry) || norm.startsWith('//')) { bad.push([entry, 'absolute paths are not allowed, name a file inside the video\'s own folder']); continue; }
+            if (norm.split('/').includes('..')) { bad.push([entry, '".." is not allowed, a listed file must sit inside the video\'s own folder']); continue; }
+            const full = path.resolve(workLibDir(), norm);
+            if (full !== path.resolve(workLibDir()) && !full.startsWith(path.resolve(workLibDir()) + path.sep)) { bad.push([entry, 'resolves outside the video\'s folder']); continue; }
+            ok.push(norm);
+        }
+        return { ok, bad };
+    };
+
     // Where a sidecar can legitimately live. Plex is the only one of the three servers that reads a SUBFOLDER: it accepts `subs` or `subtitles` beside the
     // video (the season directory for a show), with the files inside named exactly as they would be beside the video. Jellyfin reads only the video's own
     // directory - subfolder support is an open feature request there, not behaviour - and Emby documents no subfolder either. So IMPORT reads all of them,
@@ -920,12 +1078,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // A relative path is also what the marker stores, so a sidecar in a subfolder is distinguishable from a same-named one beside the video.
     const scanSidecarDirs = () => {
         let top;
-        try { top = fs.readdirSync(libDir, { withFileTypes: true }); } catch (e) { return { err: e }; }
+        try { top = fs.readdirSync(workLibDir(), { withFileTypes: true }); } catch (e) { return { err: e }; }
         const rels = top.filter((d) => !d.isDirectory()).map((d) => d.name).sort();
         const subs = top.filter((d) => d.isDirectory() && SIDECAR_SUBDIRS.includes(d.name.toLowerCase())).map((d) => d.name).sort();
         for (const s of subs) {
             let inner = [];
-            try { inner = fs.readdirSync(path.join(libDir, s)); } catch (e) { continue; }   // unreadable subfolder: the sidecars beside the video still import
+            try { inner = fs.readdirSync(path.join(workLibDir(), s)); } catch (e) { continue; }   // unreadable subfolder: the sidecars beside the video still import
             for (const n of inner.sort()) rels.push(`${s}/${n}`);
         }
         return { rels };
@@ -979,7 +1137,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let deleted = 0; let log = '';
         for (const f of scan.rels.map(parseSidecarRel).filter(Boolean).filter((x) => marked.has(x.rel))) {
             if (!confirmed(f)) { log += `☒[${delReason}] Marker lists ${f.rel} but no embedded subtitle matches its language/title - not deleting (unverified)\n`; continue; }
-            try { fs.unlinkSync(path.join(libDir, f.rel)); deleted += 1; log += `☑[${delReason}] Deleted sidecar (embedded): ${f.rel}\n`; }
+            try { fs.unlinkSync(path.join(workLibDir(), f.rel)); deleted += 1; log += `☑[${delReason}] Deleted sidecar (embedded): ${f.rel}\n`; }
             catch (e) { log += `☒[${delReason}] Could not delete sidecar ${f.rel}: ${e && e.message ? e.message : e}\n`; }
         }
         return { deleted, log };
@@ -1013,6 +1171,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const normDedupe = (v) => { const s = String(v || 'enabled').toLowerCase().trim(); return s === 'enabled_delete' ? 'enabled' : s; };
     const dedupeMode = normDedupe(inputs.method_deduplicate);
     if (!['disabled', 'enabled'].includes(dedupeMode)) failFile(`[method_deduplicate=${inputs.method_deduplicate}] invalid value, check your settings`);
+    if (!['error', 'mount', 'text_file'].includes(unmappedMode)) failFile(`[method_unmapped=${inputs.method_unmapped}] invalid value, check your settings`);
     if (file.fileMedium && file.fileMedium !== 'video') { response.infoLog += '☑Not a video file - skipping\n'; return response; }
 
     const streams = (file.ffProbeData && file.ffProbeData.streams) || [];   // [] only in post-processing, which reads the file through probeCurrentFile instead
@@ -1082,7 +1241,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const { enc } = TEXT_SUB[String(s.codec_name).toLowerCase()];
                 const bundle = fontIndices.length > 0 && isStyledSub(s.codec_name);
                 const name = sidecarBasename(s, bundle);
-                const full = path.join(libDir, name);
+                const full = path.join(workLibDir(), name);
                 // The path goes into the quoted "${full}" token of the extract preset, so it has to survive Tdarr's quote-aware tokenizer
                 // (pathIsPresetSafe). Only the library directory can fail that - the name we build is already sanitised - and a directory has to stay
                 // literal, so the extract is skipped instead. The stream is NOT pushed to removeIdx either: a refused extract must never strip the
@@ -1094,8 +1253,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 // An unmapped node cannot reach the library to test or write the sidecar locally, so both happen through the server. With no translator
                 // claiming the path there is no server-side destination at all, and the extract is refused exactly as an unsafe path is.
-                const remoteDest = isUnmappedNode ? serverSidePath(full) : '';
-                if (isUnmappedNode && !remoteDest) {
+                const remoteDest = placeViaApi() ? serverSidePath(full) : '';
+                if (placeViaApi() && !remoteDest) {
                     unsafe += 1;
                     response.infoLog += `☒${streamTag(s.index)} No path translator maps this library directory back to the server - cannot write ${name}, keeping the embedded subtitle\n`;
                     continue;
@@ -1103,12 +1262,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // An existing sidecar is preserved (never overwrite a user's on-disk edits) - but only if it has
                 // content. A 0-byte sidecar is the fingerprint of a prior extract ffmpeg aborted mid-write; trusting
                 // it and then stripping the embedded source would lose the subtitle, so re-extract it instead.
-                const existsNonEmpty = isUnmappedNode ? sidecarExistsRemote(remoteDest)
+                const existsNonEmpty = placeViaApi() ? sidecarExistsRemote(remoteDest)
                     : (fs.existsSync(full) && (() => { try { return fs.statSync(full).size > 0; } catch { return false; } })());
                 if (existsNonEmpty) { skipped += 1; response.infoLog += `☑${streamTag(s.index)} Sidecar already exists, not overwriting: ${name}\n`; }
                 // Unmapped: the extraction is deferred to placeSidecars after the loop, so this stream's removeIdx entry and its bundled tally wait for
                 // the server's answer - nothing may be stripped until the sidecar is confirmed in the library.
-                else if (isUnmappedNode) {
+                else if (placeViaApi()) {
                     const ffArgs = bundle ? ['-map', `0:${s.index}`, ...fontIndices.flatMap((i) => ['-map', `0:${i}`]), '-c', 'copy', '-f', 'matroska']
                         : ['-map', `0:${s.index}`, '-c:s', enc];
                     placeJobs.push({ name, dest: remoteDest, args: ffArgs, index: s.index, bundle });
@@ -1139,6 +1298,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (removeAfterExtract) removeIdx.push(j.index);
                     const bundleNote = j.bundle ? ` (styled subtitle bundled with ${fontIndices.length} font${fontIndices.length === 1 ? '' : 's'})` : '';
                     response.infoLog += `☑${streamTag(j.index)} Extracted -> ${j.name}${bundleNote}\n`;
+                }
+                // Seed the import list with what just landed, so a node that can only reach the library by name has somewhere to look. Written once and
+                // never again: from here it belongs to the user, who adds their own OCR'd subtitles to it.
+                if (unmappedMode === 'text_file') {
+                    const placedNames = placeJobs.filter((j) => placed.has(j.name)).map((j) => j.name);
+                    const why = placedNames.length ? seedSubtitleList(placedNames) : 'nothing was placed to list';
+                    if (!why) response.infoLog += `☑[method_unmapped=text_file] Created ${videoBase}${SUBTITLE_LIST_SUFFIX} listing ${placedNames.length} sidecar${placedNames.length === 1 ? '' : 's'} - edit it to add your own\n`;
+                    else if (why !== 'exists' && why !== 'nothing was placed to list') response.infoLog += `☒[method_unmapped=text_file] Could not create ${videoBase}${SUBTITLE_LIST_SUFFIX} - ${why}\n`;
                 }
             }
             // The fonts leave with the styled subtitles that need them, but only once a bundle actually holds them (bundled) and no styled subtitle is
@@ -1182,12 +1349,35 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Tdarr downloads into, so the scan would read back only the video it was given. The file API cannot stand in: it addresses one known path at a
         // time (upload/download) and offers no directory listing, while a sidecar's name encodes language, flags and title, so there is nothing
         // enumerable to ask for.
-        // This FAILS the file rather than skipping. The user asked for import and import cannot happen here, so processFile:false would be a lie - Tdarr
-        // reads it as "no work needed" and files the video under success, leaving a silently un-imported library nobody has reason to look at. An error
-        // queue entry is the only outcome that surfaces the mismatch between the configured mode and what this node can do.
-        if (isUnmappedNode) failFile('[mode=import] This node is unmapped and cannot see the library to find sidecars - import needs a node that shares the library filesystem');
+        // method_unmapped decides which of the three ways out applies. Whatever happens, a mode that cannot do the job FAILS the file rather than skipping:
+        // the user asked for import, and processFile:false is Tdarr's "no work needed" signal, so returning it would file the video under success and leave
+        // a silently un-imported library nobody has reason to look at.
+        let listedRels = null;   // non-null once method_unmapped=text_file has supplied the names, since there is no directory to scan
+        if (isUnmappedNode) {
+            if (unmappedMode === 'error') {
+                failFile('[method_unmapped=error] This node is unmapped and cannot see the library to find sidecars - set method_unmapped to mount or text_file, or run import on a node that shares the library filesystem');
+            }
+            if (unmappedMode === 'mount' && !mountedLib().dir) failFile(`[method_unmapped=mount] Could not reach the library from this node - ${mountedLib().why}`);
+            if (unmappedMode === 'mount') response.infoLog += `☑[method_unmapped=mount] Reading the library at ${mountedLib().dir} (via ${mountedLib().via})\n`;
+            if (unmappedMode === 'text_file') {
+                // No directory access at all here, so the list IS the discovery: each name is fetched from the server by path. The file itself is read the
+                // same way, which is why it has to sit at a name we can compute rather than one we would have to go looking for.
+                const listName = `${videoBase}${SUBTITLE_LIST_SUFFIX}`;
+                const listDest = serverSidePath(path.join(libDir, listName));
+                if (!listDest) failFile(`[method_unmapped=text_file] No path translator maps ${libDir} back to the server, so ${listName} cannot be fetched`);
+                const listLocal = path.join(libDir, listName);
+                const listWhy = downloadLibraryFile(listDest, listLocal);
+                if (listWhy) failFile(`[method_unmapped=text_file] Could not read ${listName} from the library (${listWhy}) - run extract once to create it, or add it yourself with one filename per line`);
+                let listText = '';
+                try { listText = fs.readFileSync(listLocal, 'utf8'); } catch (e) { failFile(`[method_unmapped=text_file] Fetched ${listName} but could not read it back: ${e && e.message ? e.message : e}`); }
+                const parsed = readSubtitleList(listText);
+                for (const [entry, why] of parsed.bad) response.infoLog += `☒[method_unmapped=text_file] Ignoring "${entry}" in ${listName} - ${why}\n`;
+                if (!parsed.ok.length) failFile(`[method_unmapped=text_file] ${listName} lists no usable filenames${parsed.bad.length ? ' - every line was rejected, see above' : ' - add one filename per line'}`);
+                listedRels = fetchListedSidecars(parsed.ok, listName);
+            }
+        }
 
-        const scan = scanSidecarDirs();
+        const scan = listedRels ? { rels: listedRels } : scanSidecarDirs();
         if (scan.err) failFile(`Cannot read the library directory to find sidecars: ${scan.err.message || scan.err}`);
         const found = scan.rels.map(parseSidecarRel).filter(Boolean)
             .sort(byOriginalPosition)
@@ -1218,14 +1408,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // ffmpeg args (see pathIsPresetSafe), and unlike a name we generate it must match the file byte-for-byte, so it can't be sanitised - skip it
         // instead (a server-native/user file we can't safely reference), never break out.
         const candidates = found.filter((f) => !importedSet.has(f.rel)).filter((f) => {
-            if (pathIsPresetSafe(path.join(libDir, f.rel))) return true;
+            if (pathIsPresetSafe(path.join(workLibDir(), f.rel))) return true;
             response.infoLog += `☒Skipping sidecar with an unsafe filename (contains a quote or control character), cannot import safely: ${f.rel}\n`;
             return false;
         });
 
         // Group candidates by byte-identical file content (disabled => every file is its own group). readFileSync can't fail for a file readdir just
         // listed, but guard anyway: an unreadable file gets a unique key so it is imported on its own, never silently dropped or merged.
-        const contentKey = (f) => { try { return crypto.createHash('sha1').update(fs.readFileSync(path.join(libDir, f.rel))).digest('hex'); } catch (e) { return `unreadable:${f.rel}`; } };
+        const contentKey = (f) => { try { return crypto.createHash('sha1').update(fs.readFileSync(path.join(workLibDir(), f.rel))).digest('hex'); } catch (e) { return `unreadable:${f.rel}`; } };
         const groups = [];
         if (dedupeMode === 'disabled') { for (const f of candidates) groups.push([f]); }
         else { const byHash = new Map(); for (const f of candidates) { const h = contentKey(f); let g = byHash.get(h); if (!g) { g = []; byHash.set(h, g); groups.push(g); } g.push(f); } }
@@ -1256,11 +1446,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // and a second bundle (or a re-import into a file that kept its fonts) can never duplicate them.
                 const restoreFonts = f.bundle && !hasFontAttachment && !fontsRestored;
                 if (f.bundle) {
-                    inputSide += ` -i "${path.join(libDir, f.rel)}"`;
+                    inputSide += ` -i "${path.join(workLibDir(), f.rel)}"`;
                     extraMaps += ` -map ${k + 1}:s:0`;
                     if (restoreFonts) { extraMaps += ` -map ${k + 1}:t?`; fontsRestored = true; }
                 } else {
-                    inputSide += ` -sub_charenc UTF-8 -i "${path.join(libDir, f.rel)}"`;
+                    inputSide += ` -sub_charenc UTF-8 -i "${path.join(workLibDir(), f.rel)}"`;
                     extraMaps += ` -map ${k + 1}:0`;
                 }
                 meta += ` -metadata:s:s:${outIdx} "language=${escMeta(isMp4 ? to6392T(f.lang) : normSidecarLang(f.lang))}"`;
