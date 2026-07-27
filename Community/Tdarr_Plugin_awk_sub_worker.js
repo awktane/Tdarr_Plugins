@@ -5,25 +5,41 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `Round-trips text subtitles between the container and media-server-style sidecar files so they can be reviewed/edited on disk (by hand or an external script).
 
-                \\nmode=extract writes each embedded TEXT subtitle to a sidecar next to the video (native format: srt/ass/vtt) and, by default, removes those tracks from the file.
+                \\naction=extract writes each embedded TEXT subtitle to a sidecar next to the video (native format: srt/ass/vtt) and, by default, removes those tracks from the file.
                 \\nA STYLED subtitle (ASS/SSA) in a file that has embedded fonts is exported as a bundle named .<video>.s<streamIndex>[.<title>].<lang>[.<flags>].styled.mks - one Matroska holding the subtitle plus those fonts, which leave the video with it (they exist nowhere else, and Matroska is the only container that can carry both). The leading dot hides it from Plex/Jellyfin. Import restores the subtitle and its fonts together. An mp4 target cannot hold font attachments at all, so a bundle is left on disk until the file is mkv again.
-                \\nmode=import muxes matching sidecars back into the file (restoring language, title, and disposition) and, by default, deletes the sidecar once it is safely embedded. Import never drops a subtitle - anything not already embedded is muxed in (a copy already present just becomes a duplicate, never a loss); method_deduplicate collapses byte-identical copies.
+                \\naction=import muxes matching sidecars back into the file (restoring language, title, and disposition) and, by default, deletes the sidecar once it is safely embedded. Import never drops a subtitle - anything not already embedded is muxed in (a copy already present just becomes a duplicate, never a loss); deduplicate collapses byte-identical copies.
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>][.<other flags>].<lang>[.<forced|sdh>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and the language plus at most ONE server-documented flag sit last so Plex/Jellyfin/Emby auto-detect them (Plex accepts only one, and forced wins the slot because it drives automatic selection). Every other flag - commentary, descriptive, original, visual_impaired - rides AHEAD of the language, where media servers ignore it and this plugin still reads it, so nothing is lost and nothing confuses them.
                 \\nImport ALSO recognizes sidecars named the way those servers do, with no s<index> (e.g. <video>.en.forced.srt), anchored on the language token: the flag spellings foreign (= forced), cc and hi (= sdh) and default (ignored) are all understood, as is Emby's parenthesized description (<video>.English(Commentary).srt), which becomes the track title. hi is only read as hearing-impaired when a real language precedes it, so <video>.hi.srt stays Hindi.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
-                \\nScope both modes with only_languages (comma-separated, e.g. eng,jpn; blank = all). method_deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
+                \\nScope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.26.1',
+    Version: '3.27.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
-            name: 'mode',
+            name: 'action',
             type: 'string',
-            defaultValue: 'extract',
-            inputUI: { type: 'dropdown', options: ['extract', 'import'] },
+            defaultValue: 'import',
+            inputUI: {
+                type: 'dropdown',
+                options: ['import', 'extract'] },
             tooltip: `Which direction to run.
                 \\nextract: pull embedded text subtitles out to sidecar files (and remove them from the video unless extract_remove_stream is off).
                 \\nimport: mux sidecar files back into the video (and delete the sidecar once embedded unless import_remove_sidecar is off).`,
+        },
+        {
+            name: 'deduplicate',
+            type: 'string',
+            defaultValue: 'enabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['enabled', 'enabled_embedded', 'disabled']
+            },
+            tooltip: `What counts as a copy of a subtitle you already have. The TEXT always decides, so genuinely different tracks - two commentaries, a real forced track vs a full one - are never collapsed; only byte-for-byte duplicates are.
+                \\nenabled - on import, mux one track per byte-identical group of sidecars, combining their flags (a plain + SDH pair imports once, tagged SDH), and skip a sidecar whose text is ALREADY one of the embedded tracks rather than adding a second copy of it. Every member of a group is listed in the marker, so import_remove_sidecar cleans up the whole group. Nothing is removed from the video.
+                \\nenabled_embedded - all of the above, and in BOTH actions also removes a subtitle the video itself carries twice. The lowest-numbered copy survives and inherits the others' flags, title and language, so no tagging is lost. This is the only setting that deletes a subtitle you did not ask to extract, and it costs one extra read of the file to compare the tracks.
+                \\ndisabled - mux every sidecar as its own track, even byte-identical copies (you may end up with duplicate subtitles).
+                \\nWhether the sidecar FILES are deleted afterwards is import_remove_sidecar's decision alone, whatever this is set to.`,
         },
         {
             name: 'only_languages',
@@ -37,38 +53,36 @@ const details = () => ({
             name: 'extract_remove_stream',
             type: 'boolean',
             defaultValue: true,
-            inputUI: { type: 'dropdown', options: ['true', 'false'] },
+            inputUI: {
+                type: 'dropdown',
+                options: ['true', 'false']
+            },
             tooltip: `On extract, remove each text subtitle from the video after it is written to a sidecar. Off = write sidecars but keep the embedded tracks.
                 \\nStyled ASS/SSA rely on embedded fonts, so they are exported as a .mks bundle holding the subtitle and those fonts together, and the fonts are removed from the video along with it - the styling survives the round-trip whatever else runs in between.
                 \\nThe sidecar lands next to the video in the library on any node. A node that shares the library filesystem writes it there directly; an unmapped node, which only ever sees a local copy of the file, extracts the sidecar itself and uploads it through Tdarr's file API. Either way the embedded track is removed ONLY once the sidecar is confirmed in place, so a failed write costs you nothing but the extraction.`,
         },
         {
             name: 'import_remove_sidecar',
-            type: 'string',
-            defaultValue: 'enabled',
-            inputUI: { type: 'dropdown', options: ['disabled', 'enabled'] },
+            type: 'boolean',
+            defaultValue: true,
+            inputUI: {
+                type: 'dropdown',
+                options: ['true', 'false']
+            },
             tooltip: `On import, delete each sidecar whose basename is listed in the file's global awk_sub_worker marker (stamped by the mux pass) once an embedded subtitle matching its language and title confirms the content really is in the file.
-                \\ndisabled - leave every sidecar on disk.
-                \\nenabled (default) - delete them once they are safely embedded. The deletion runs in POST-PROCESSING, after you accept the transcode: deleting earlier would destroy the sidecars of a run you then reject, leaving those subtitles nowhere. So ADD THIS PLUGIN TO THE POST-PROCESSING PLUGIN STACK as well as the pre-processing one. Without that, nothing is ever lost, but the sidecars simply stay on disk. That stage runs on the SERVER, which is also how it cleans up for an unmapped node - one has no way of its own to delete a library file, since Tdarr's API offers upload and download but no delete.
-                \\nOne case needs more than that: on an unmapped node with no mount, when every sidecar is ALREADY in the file, there is nothing to mux - so no transcode, no acceptance, and no post-processing pass in which to delete anything. There, enabled forces a lossless -c copy of the video purely to reach that stage. It is a full read and write to remove a few kB of text, but it is the only route, it happens at most ONCE per file (the pass marks those sidecars and the next one skips them), and asking for them to be deleted is taken as asking for whatever that costs. Set disabled if you would rather keep them.`,
-        },
-        {
-            name: 'method_deduplicate',
-            type: 'string',
-            defaultValue: 'enabled',
-            inputUI: { type: 'dropdown', options: ['disabled', 'enabled', 'enabled_embedded'] },
-            tooltip: `What counts as a copy of a subtitle you already have. The TEXT always decides, so genuinely different tracks - two commentaries, a real forced track vs a full one - are never collapsed; only byte-for-byte duplicates are.
-                \\ndisabled - mux every sidecar as its own track, even byte-identical copies (you may end up with duplicate subtitles).
-                \\nenabled - on import, mux one track per byte-identical group of sidecars, combining their flags (a plain + SDH pair imports once, tagged SDH), and skip a sidecar whose text is ALREADY one of the embedded tracks rather than adding a second copy of it. Every member of a group is listed in the marker, so import_remove_sidecar cleans up the whole group. Nothing is removed from the video.
-                \\nenabled_embedded - all of the above, and in BOTH modes also removes a subtitle the video itself carries twice. The lowest-numbered copy survives and inherits the others' flags, title and language, so no tagging is lost. This is the only setting that deletes a subtitle you did not ask to extract, and it costs one extra read of the file to compare the tracks.
-                \\nWhether the sidecar FILES are deleted afterwards is import_remove_sidecar's decision alone, in every mode.`,
+                \\ntrue (default) - delete them once they are safely embedded. The deletion runs in POST-PROCESSING, after you accept the transcode: deleting earlier would destroy the sidecars of a run you then reject, leaving those subtitles nowhere. So ADD THIS PLUGIN TO THE POST-PROCESSING PLUGIN STACK as well as the pre-processing one. Without that, nothing is ever lost, but the sidecars simply stay on disk. That stage runs on the SERVER, which is also how it cleans up for an unmapped node - one has no way of its own to delete a library file, since Tdarr's API offers upload and download but no delete.
+                \\nfalse - leave every sidecar on disk.
+                \\nOne case needs more than that: on an unmapped node with no mount, when every sidecar is ALREADY in the file, there is nothing to mux - so no transcode, no acceptance, and no post-processing pass in which to delete anything. There, true forces a lossless -c copy of the video purely to reach that stage. It is a full read and write to remove a few kB of text, but it is the only route, it happens at most ONCE per file (the pass marks those sidecars and the next one skips them), and asking for them to be deleted is taken as asking for whatever that costs. Set false if you would rather keep them.`,
         },
         {
             name: 'method_import_metadata',
             type: 'string',
             defaultValue: 'embedded',
-            inputUI: { type: 'dropdown', options: ['embedded', 'sidecar'] },
-            tooltip: `Which side owns the language/title/flags when a sidecar's TEXT is already one of the embedded tracks - i.e. who wins a disagreement about a subtitle that is already in the file. Reachable only when method_deduplicate is comparing text (enabled or enabled_embedded); a sidecar muxed as a NEW track always takes its metadata from its filename, because nothing else describes it.
+            inputUI: {
+                type: 'dropdown',
+                options: ['embedded', 'sidecar']
+            },
+            tooltip: `Which side owns the language/title/flags when a sidecar's TEXT is already one of the embedded tracks - i.e. who wins a disagreement about a subtitle that is already in the file. Reachable only when deduplicate is comparing text (enabled or enabled_embedded); a sidecar muxed as a NEW track always takes its metadata from its filename, because nothing else describes it.
                 \\nembedded - leave the track exactly as it is and report the difference. Safe with an OLD sidecar name: a name written before a flag existed carries no token for it, and applying it would strip that flag off a track that has it.
                 \\nsidecar  - the filename wins, so renaming a sidecar retunes the track already in the file (language, title and flags, including clearing flags you removed from the name). Use it when you renamed the sidecar deliberately; it costs one remux of the file.`,
         },
@@ -76,7 +90,10 @@ const details = () => ({
             name: 'method_unmapped',
             type: 'string',
             defaultValue: 'error',
-            inputUI: { type: 'dropdown', options: ['error', 'mount', 'text_file'] },
+            inputUI: {
+                type: 'dropdown',
+                options: ['error', 'mount', 'text_file']
+            },
             tooltip: `What to do on an UNMAPPED node, which is only ever given a local copy of the video and never sees the library folder. Ignored entirely on a normal (mapped) node.
                 \\nExtract already works everywhere - the sidecar is uploaded to the library through Tdarr's file API. It is IMPORT that has the problem: finding sidecars means listing a directory, and the API offers no way to list one.
                 \\nerror     - fail the file and say so. Nothing is silently skipped; run import on a node that can see the library.
@@ -1158,7 +1175,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // can share a language and title while holding completely different text. One ffmpeg run extracts them all in a SINGLE pass, re-encoded through the same
     // codec->format map the sidecars were written with, so the bytes are directly comparable - measured identical across a -c copy remux on jellyfin-ffmpeg
     // for both srt and ass. The cost is one sequential read of the file (0.3s on an 885MB mkv from cache, and the import mux reads AND writes it anyway),
-    // which is why callers only reach it with method_deduplicate enabled and a candidate that could actually be a duplicate. An empty map means "asked, found
+    // which is why callers only reach it with deduplicate enabled and a candidate that could actually be a duplicate. An empty map means "asked, found
     // nothing"; null means the probe could not run at all, and every caller must read that as "cannot prove anything" and import - a redundant track is
     // recoverable, a dropped one is not.
     let embeddedHashCache;
@@ -1193,7 +1210,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return embeddedHashCache;
     };
 
-    // method_deduplicate=enabled_embedded: the same duplicate test turned on the file's OWN tracks. Two subtitle streams holding identical text are one
+    // deduplicate=enabled_embedded: the same duplicate test turned on the file's OWN tracks. Two subtitle streams holding identical text are one
     // subtitle stored twice, however their tags read, and this is the only place in the plugin that removes a subtitle the user did not ask to extract -
     // which is exactly why it is its own opt-in value rather than part of `enabled`. The survivor is chosen by the rule the sidecar groups already use, so
     // there is nothing new to learn: lowest source index wins, and it inherits the union of the group's flags plus the first title and first real language
@@ -1210,7 +1227,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const ordered = g.slice().sort((a, b) => a.index - b.index);
             const keep = ordered[0]; const drop = ordered.slice(1);
             out.dropIdx.push(...drop.map((s) => s.index));
-            out.log += `☐${streamTag(keep.index)}[method_deduplicate=enabled_embedded] Removing ${drop.length} duplicate subtitle stream${drop.length === 1 ? '' : 's'} (${drop.map((s) => `s${s.index}`).join(', ')}) - byte-identical to this one\n`;
+            out.log += `☐${streamTag(keep.index)}[deduplicate=enabled_embedded] Removing ${drop.length} duplicate subtitle stream${drop.length === 1 ? '' : 's'} (${drop.map((s) => `s${s.index}`).join(', ')}) - byte-identical to this one\n`;
             // `default` is the one flag NOT unioned. It is not a property of the subtitle, it is a statement about which track a player should pick, and
             // this plugin does not track it anywhere else for exactly that reason - muxers auto-manage it (mp4 forces it onto the first subtitle) and
             // stream_ordering decides it last. Folding it would let a duplicate hand the survivor a default flag it never had, silently changing what plays.
@@ -1224,7 +1241,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const sameDisp = keepDisp.size === disp.size && [...disp].every((k) => keepDisp.has(k));
             if (sameDisp && (keep.tags?.title || '') === title && langKey(resolveLang(keep) || 'und') === langKey(lang)) continue;
             out.retag = (out.retag || []).concat([{ index: keep.index, lang, title, disp: [...disp] }]);
-            out.log += `☐${streamTag(keep.index)}[method_deduplicate=enabled_embedded] Folding the removed streams' tags onto it (${[lang, title, ...disp].filter(Boolean).join(' ')})\n`;
+            out.log += `☐${streamTag(keep.index)}[deduplicate=enabled_embedded] Folding the removed streams' tags onto it (${[lang, title, ...disp].filter(Boolean).join(' ')})\n`;
         }
         return out;
     };
@@ -1262,7 +1279,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // unlinked (markerConfirmsEmbedded, above); the marker VALUE still scopes deletion to names we listed, so that guard holds on mp4 too. A false negative
     // merely keeps the sidecar (a later pass, or the user, removes it) and never loses subtitle content, so this fails safe.
     const deleteImportedSidecars = (streamList, globalTags, mp4Target) => {
-        const delReason = `import_remove_sidecar=${removeSidecarMode}`;
+        const delReason = 'import_remove_sidecar=true';   // this pass only runs when removal is on
         const marked = new Set(decodeMarkerList(getTagCI(globalTags || {}, 'awk_sub_worker')));
         if (!marked.size) return { deleted: 0, log: '' };
         const scan = scanSidecarDirs();
@@ -1313,18 +1330,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // belongs to pre-processing alone.
     const isPostProcessing = !!otherArguments?.homePath && !otherArguments?.configVars && !otherArguments?.job;
     if (!isPostProcessing && (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))) failFile('No ffProbe stream data available, cannot process this file');
-    const mode = String(inputs.mode);
-    if (mode !== 'extract' && mode !== 'import') failFile(`[mode=${mode}] invalid value, check your settings`);
+    const action = String(inputs.action);
+    if (action !== 'extract' && action !== 'import') failFile(`[action=${action}] invalid value, check your settings`);
     // Deleting the sidecar FILES is import_remove_sidecar's decision alone in every mode - this setting only ever decides what counts as a duplicate. An
     // unrecognised value FAILS the file rather than falling through to a default, since the three modes do materially different amounts of work and a typo
     // must not quietly pick one. The failFile message shows the RAW inputs value.
-    const dedupeMode = String(inputs.method_deduplicate || 'enabled').toLowerCase().trim();
-    if (!['disabled', 'enabled', 'enabled_embedded'].includes(dedupeMode)) failFile(`[method_deduplicate=${inputs.method_deduplicate}] invalid value, check your settings`);
+    const dedupeMode = String(inputs.deduplicate || 'enabled').toLowerCase().trim();
+    if (!['disabled', 'enabled', 'enabled_embedded'].includes(dedupeMode)) failFile(`[deduplicate=${inputs.deduplicate}] invalid value, check your settings`);
     const dedupeSidecars = dedupeMode !== 'disabled';        // both enabled values collapse byte-identical sidecars and skip one already embedded
     const dedupeStreams = dedupeMode === 'enabled_embedded'; // only this one also removes a duplicate the file already carries
     if (!['error', 'mount', 'text_file'].includes(unmappedMode)) failFile(`[method_unmapped=${inputs.method_unmapped}] invalid value, check your settings`);
-    const removeSidecarMode = String(inputs.import_remove_sidecar || 'enabled').toLowerCase().trim();
-    if (!['disabled', 'enabled'].includes(removeSidecarMode)) failFile(`[import_remove_sidecar=${inputs.import_remove_sidecar}] invalid value, check your settings`);
     const metadataMode = String(inputs.method_import_metadata || 'embedded').toLowerCase();
     if (!['embedded', 'sidecar'].includes(metadataMode)) failFile(`[method_import_metadata=${inputs.method_import_metadata}] invalid value, check your settings`);
     if (file.fileMedium && file.fileMedium !== 'video') { response.infoLog += '☑Not a video file - skipping\n'; return response; }
@@ -1332,7 +1347,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const streams = (file.ffProbeData && file.ffProbeData.streams) || [];   // [] only in post-processing, which reads the file through probeCurrentFile instead
     const langFilter = parseLangFilter(inputs.only_languages);
     const removeAfterExtract = String(inputs.extract_remove_stream) === 'true';
-    const removeSidecarAfterImport = removeSidecarMode !== 'disabled';
+    const removeSidecarAfterImport = String(inputs.import_remove_sidecar) === 'true';
     const dstContainer = String(file.container || '').toLowerCase().trim();
     const isMp4 = isMp4Family(dstContainer);   // shared checker; cached once for this container
 
@@ -1347,12 +1362,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Only the import workflow ends in a deletion. In extract mode this pass must do nothing at all: extract WRITES the sidecars, and with
         // extract_remove_stream off the embedded subtitles stay too - so a stale marker from an earlier import would confirm against those still-embedded
         // streams and delete the sidecar that was just written.
-        if (mode !== 'import') { response.infoLog += `☑[mode=${mode}] Nothing for post-processing to do outside import\n`; return response; }
-        if (!removeSidecarAfterImport) { response.infoLog += '☑[import_remove_sidecar=disabled] Imported sidecars left on disk\n'; return response; }
+        if (action !== 'import') { response.infoLog += `☑[action=${action}] Nothing for post-processing to do outside import\n`; return response; }
+        if (!removeSidecarAfterImport) { response.infoLog += '☑[import_remove_sidecar=false] Imported sidecars left on disk\n'; return response; }
         const probed = probeCurrentFile();
-        if (!probed) { response.infoLog += `☒[import_remove_sidecar=${removeSidecarMode}] Cannot read the accepted file to confirm what is embedded - every sidecar is left in place\n`; return response; }
+        if (!probed) { response.infoLog += '☒[import_remove_sidecar=true] Cannot read the accepted file to confirm what is embedded - every sidecar is left in place\n'; return response; }
         const { deleted, log } = deleteImportedSidecars(probed.streams, probed.tags, isMp4);
-        response.infoLog += log ? `☑[import_remove_sidecar=${removeSidecarMode}] Working in ${workLibDir()}\n${log}` : `☑[import_remove_sidecar=${removeSidecarMode}] No imported sidecar is waiting to be removed\n`;
+        response.infoLog += log ? `☑[import_remove_sidecar=true] Working in ${workLibDir()}\n${log}` : `☑[import_remove_sidecar=true] No imported sidecar is waiting to be removed\n`;
         return response;
     }
     // Preserve Dolby Vision's dvcC/dvvC boxes on either -c copy remux below (see dvStrictMp4Arg) - a plain copy of a DV HEVC/AV1 stream drops them,
@@ -1375,7 +1390,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     try {
         response.infoLog += `☐Input streams: ${summariseAll(streams)}\n`;
 
-        if (mode === 'extract') {
+        if (action === 'extract') {
             // ============= EXTRACT: embedded text subs -> sidecars (+ optional removal) =============
             // Duplicate tracks the file already carries go before anything else: a dropped stream must not also be written to a sidecar, or the copy we just
             // decided was redundant comes straight back on the next import under a name of its own.
@@ -1652,7 +1667,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Import is NON-DESTRUCTIVE: every recognized sidecar not already handled by our own prior pass (marker) is muxed in. We do NOT suppress a
         // sidecar just because an embedded sub shares its lang|title|disposition - metadata can't prove same content, and dropping a distinct track is
-        // data loss, whereas a redundant duplicate is not. Genuine duplication is collapsed by CONTENT instead (method_deduplicate, below).
+        // data loss, whereas a redundant duplicate is not. Genuine duplication is collapsed by CONTENT instead (deduplicate, below).
         // The marker suppresses a re-import only while the file STILL CARRIES that subtitle (markerConfirmsEmbedded). Suppressing on the marker alone would
         // strand every sidecar of a second round trip: nothing clears the tag, so the extract that stripped the subtitles left it naming them all, and the
         // next import would skip the lot. Either way the decision is logged - "nothing happened" and "nothing needed to happen" look identical from outside.
@@ -1739,7 +1754,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (at === null) { toMux.push(f); continue; }
             f.embeddedAt = at;
             alreadyInFile.push(f);
-            response.infoLog += `☑${streamTag(at)}[method_deduplicate=${dedupeMode}] ${f.rel} is already in the file byte-for-byte - not importing a second copy\n`;
+            response.infoLog += `☑${streamTag(at)}[deduplicate=${dedupeMode}] ${f.rel} is already in the file byte-for-byte - not importing a second copy\n`;
             const cur = keptSubs.find((s) => s.index === at);
             const curTitle = isMp4 ? (f.title || '') : (cur?.tags?.title || '');
             const curDisp = new Set(Object.keys(cur?.disposition || {}).filter((k) => cur.disposition[k] === 1));
@@ -1774,7 +1789,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // decoded title differs from the track's - a hand-added copy under a name of the user's own choosing is exactly that, and would otherwise
             // re-force on every pass. Nothing is lost by stopping: that earlier pass's marker still names them, so post-processing deletes them when it runs.
             if (!stranded.some((rel) => !importedSet.has(rel))) {
-                response.infoLog += `☑[import_remove_sidecar=${removeSidecarMode}] Already queued for removal by an earlier pass - nothing more to do until the post-processing stage runs\n`;
+                response.infoLog += '☑[import_remove_sidecar=true] Already queued for removal by an earlier pass - nothing more to do until the post-processing stage runs\n';
                 response.infoLog += '☑Nothing to import - every sidecar was already in the file\n';
                 return response;
             }
@@ -1783,8 +1798,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // work for someone who already knew the trap existed, and by then they have been caught by it: asking for the sidecars to be deleted IS asking
             // for whatever it takes. It cannot repeat - the marker stamped here lists them, so the next pass filters them out through alreadyEmbedded before
             // this branch is reached, whether or not the deletion that follows actually succeeded. One extra pass per file, at most, ever.
-            response.infoLog += `☒[import_remove_sidecar=${removeSidecarMode}] Every sidecar is already in the file and this node cannot reach the library to delete them - remuxing losslessly, since only an accepted transcode gives the server a pass in which to do it\n`;
-            for (const rel of stranded) response.infoLog += `☐[import_remove_sidecar=${removeSidecarMode}] Queued for removal once accepted: ${rel}\n`;
+            response.infoLog += '☒[import_remove_sidecar=true] Every sidecar is already in the file and this node cannot reach the library to delete them - remuxing losslessly, since only an accepted transcode gives the server a pass in which to do it\n';
+            for (const rel of stranded) response.infoLog += `☐[import_remove_sidecar=true] Queued for removal once accepted: ${rel}\n`;
             commitPreset(` -map 0 -c copy -metadata "awk_sub_worker=${encodeMarkerList(stranded)}"`);
             response.infoLog += `☑Expected results: ${summariseAll(streams)}\n`;
             return response;
@@ -1792,10 +1807,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!toMux.length && !retuneMeta && alreadyInFile.length && removeSidecarAfterImport) {
             let gone = 0; const removedRels = new Set();
             for (const rel of alreadyInFile.flatMap((f) => f.members.map((m) => m.rel))) {
-                try { fs.unlinkSync(path.join(workLibDir(), rel)); gone += 1; removedRels.add(rel); response.infoLog += `☑[import_remove_sidecar=${removeSidecarMode}] Deleted sidecar (its content is already in the file): ${rel}\n`; }
-                catch (e) { response.infoLog += `☒[import_remove_sidecar=${removeSidecarMode}] Could not delete sidecar ${rel}: ${e && e.message ? e.message : e}\n`; }
+                try { fs.unlinkSync(path.join(workLibDir(), rel)); gone += 1; removedRels.add(rel); response.infoLog += `☑[import_remove_sidecar=true] Deleted sidecar (its content is already in the file): ${rel}\n`; }
+                catch (e) { response.infoLog += `☒[import_remove_sidecar=true] Could not delete sidecar ${rel}: ${e && e.message ? e.message : e}\n`; }
             }
-            response.infoLog += deleteSpentSubtitleList(`import_remove_sidecar=${removeSidecarMode}`, removedRels);   // same cleanup whichever route removed them
+            response.infoLog += deleteSpentSubtitleList('import_remove_sidecar=true', removedRels);   // same cleanup whichever route removed them
             response.infoLog += `☑Nothing to import - every sidecar was already in the file${gone ? `, ${gone} removed from ${workLibDir()}` : ''}\n`;
             return response;
         }
@@ -1834,7 +1849,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const flagText = flagsBack.length ? ` ${flagsBack.join('+')}` : '';
                 const origin = f.members.find(stillEmbedded);
                 if (origin) response.infoLog += `☒${streamTag(origin.index)} Importing ${f.rel} as a SECOND copy - the stream it was extracted from is still in the file${embeddedHashes && embeddedHashes.size ? ' and its text differs' : ''}, so both will be present\n`;
-                if (f.members.length > 1) response.infoLog += `☑[method_deduplicate=${dedupeMode}] Deduplicated ${f.members.length} byte-identical sidecars -> ${f.rel} (${f.lang}${flagText})\n`;
+                if (f.members.length > 1) response.infoLog += `☑[deduplicate=${dedupeMode}] Deduplicated ${f.members.length} byte-identical sidecars -> ${f.rel} (${f.lang}${flagText})\n`;
                 response.infoLog += `☐Import ${f.rel} -> subtitle ${outIdx} (${f.lang}${flagText})${restoreFonts ? ' and its bundled font attachments' : ''}\n`;
             });
             // Consumed = every sidecar this pass accounted for, INCLUDING the ones already in the file. They are not muxed, but their content is provably
