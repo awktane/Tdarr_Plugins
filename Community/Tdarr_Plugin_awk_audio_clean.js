@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '4.7.0',
+    Version: '4.7.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -928,11 +928,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ===== END SHARED: language matching =====
 
-    // ===== SHARED [audio_clean, clean_and_remux, sub_worker]: language display name =====
-    // -=-=-= langDisplayName  [audio_clean, clean_and_remux, sub_worker] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language display name =====
+    // -=-=-= langDisplayName  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // Memoised ICU DisplayNames (built once, reused): the recognised English name for an ALREADY-normalised language code, or '' for a non-language/unknown
     // code. A fresh ICU instance per call is wasteful. Each caller normalises the token first - clean_and_remux via shortLang (tag recognition), audio_clean
-    // and sub_worker via langKey (free-text language-list validation / sidecar name recognition).
+    // audio_clean, stream_ordering and sub_worker via langKey (free-text language-list validation / sidecar name recognition).
     const langDisplayName = (() => {
         let dn = null;
         return (code) => { try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(code) || ''; } catch (e) { return ''; } };
@@ -1330,8 +1330,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // when NOTHING matches EITHER list, so a typo in one list while the other still matches leaves that language "unlisted", where language_unlisted=stereo
     // downmixes it and language_unlisted=delete removes it. A rejected token fails the file. Mirrors clean_and_remux's identical check on its own lists.
     const knownLangToken = (key) => key === 'und' || key === 'mul' || key === 'zxx' || key === 'mis' || /^q[a-t][a-z]$/.test(key) || !!langDisplayName(key);
-    // ===== SHARED [audio_clean, clean_and_remux]: language token failure =====
-    // -=-=-= failLangToken  [audio_clean, clean_and_remux] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language token failure =====
+    // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // The failFile message echoes the offending token capped at 200 chars: free text is unbounded and Tdarr persists the whole error message.
     const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').slice(0, 200)}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
     // ===== END SHARED: language token failure =====

@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.29.0',
+    Version: '3.30.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -538,6 +538,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ===== END SHARED: language matching =====
 
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language token failure =====
+    // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // The failFile message echoes the offending token capped at 200 chars: free text is unbounded and Tdarr persists the whole error message.
+    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').slice(0, 200)}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
+    // ===== END SHARED: language token failure =====
+
     // ===== SHARED [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean]: dolby vision detection =====
     // -=-=-= isDolbyVisionVideo  [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean] =-=-=-
     // True when a video stream carries Dolby Vision, both-probe: a dvhe/dvh1/dvav/dva1/dav1 fourcc, a mediaInfo HDR_Format naming Dolby Vision, or an ffprobe
@@ -832,11 +838,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ===== END SHARED: sidecar placement =====
 
-    // ===== SHARED [audio_clean, clean_and_remux, sub_worker]: language display name =====
-    // -=-=-= langDisplayName  [audio_clean, clean_and_remux, sub_worker] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language display name =====
+    // -=-=-= langDisplayName  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // Memoised ICU DisplayNames (built once, reused): the recognised English name for an ALREADY-normalised language code, or '' for a non-language/unknown
     // code. A fresh ICU instance per call is wasteful. Each caller normalises the token first - clean_and_remux via shortLang (tag recognition), audio_clean
-    // and sub_worker via langKey (free-text language-list validation / sidecar name recognition).
+    // audio_clean, stream_ordering and sub_worker via langKey (free-text language-list validation / sidecar name recognition).
     const langDisplayName = (() => {
         let dn = null;
         return (code) => { try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(code) || ''; } catch (e) { return ''; } };
@@ -1352,6 +1358,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const metadataMode = String(inputs.method_import_metadata || 'embedded').toLowerCase();
     if (!['embedded', 'sidecar'].includes(metadataMode)) failFile(`[method_import_metadata=${inputs.method_import_metadata}] invalid value, check your settings`);
     if (file.fileMedium && file.fileMedium !== 'video') { response.infoLog += '☑Not a video file - skipping\n'; return response; }
+    // A language token that is not a language FAILS the file. only_languages scopes which subtitles are touched at all, so a typo ('eng,fer') silently matches
+    // nothing and every subtitle in that language is quietly left out of the extract - the user gets a clean run that did none of the work they asked for, with
+    // no way to tell it apart from a file that genuinely had no such subtitle. Stopping is the far cheaper failure. The und/mul/zxx/mis/qaa-qtz allowance is
+    // load-bearing, NOT laxness: the filter is compared against langKey(resolveLang(s) || 'und'), so scoping on 'und' is how untagged subtitles are selected.
+    const knownLangToken = (key) => key === 'und' || key === 'mul' || key === 'zxx' || key === 'mis' || /^q[a-t][a-z]$/.test(key) || !!langDisplayName(key);
+    const onlyLangRaw = String(inputs.only_languages || '').split(',').map((x) => x.trim()).filter(Boolean);
+    for (const tok of onlyLangRaw) if (!knownLangToken(langKey(tok))) failLangToken('only_languages', tok);
 
     const streams = (file.ffProbeData && file.ffProbeData.streams) || [];   // [] only in post-processing, which reads the file through probeCurrentFile instead
     const langFilter = parseLangFilter(inputs.only_languages);

@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can promote the default, SDH or descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time it's needed).\n`,
-    Version: '4.7.0',
+    Version: '4.8.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -738,6 +738,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ===== END SHARED: language matching =====
 
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language display name =====
+    // -=-=-= langDisplayName  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // Memoised ICU DisplayNames (built once, reused): the recognised English name for an ALREADY-normalised language code, or '' for a non-language/unknown
+    // code. A fresh ICU instance per call is wasteful. Each caller normalises the token first - clean_and_remux via shortLang (tag recognition), audio_clean
+    // audio_clean, stream_ordering and sub_worker via langKey (free-text language-list validation / sidecar name recognition).
+    const langDisplayName = (() => {
+        let dn = null;
+        return (code) => { try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(code) || ''; } catch (e) { return ''; } };
+    })();
+    // ===== END SHARED: language display name =====
+
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language token failure =====
+    // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // The failFile message echoes the offending token capped at 200 chars: free text is unbounded and Tdarr persists the whole error message.
+    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').slice(0, 200)}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
+    // ===== END SHARED: language token failure =====
+
     // ===== SHARED [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean]: dolby vision detection =====
     // -=-=-= isDolbyVisionVideo  [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean] =-=-=-
     // True when a video stream carries Dolby Vision, both-probe: a dvhe/dvh1/dvav/dva1/dav1 fourcc, a mediaInfo HDR_Format naming Dolby Vision, or an ffprobe
@@ -785,6 +802,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     ];
     for (const [name, value, opts] of dropdownChecks)
         if (!opts.includes(value)) failFile(`[${name}=${inputs[name]}] invalid value, check your settings`);
+    // order_language has no option set, but it still holds LANGUAGES, so a token that is not one FAILS the file. A typo does not announce itself here: an
+    // unmatched entry simply scores as "not listed" and the tracks the user meant to promote stay wherever they were, which reads exactly like the ordering
+    // rules not working. order_codec is genuinely open (codec names come and go, and an unknown one is inert rather than misleading), so it stays unchecked.
+    // The und/mul/zxx/mis/qaa-qtz allowance matches every other language input - 'und' is a real ordering target, since untagged tracks sort somewhere too.
+    const knownLangToken = (key) => key === 'und' || key === 'mul' || key === 'zxx' || key === 'mis' || /^q[a-t][a-z]$/.test(key) || !!langDisplayName(key);
+    for (const tok of String(inputs.order_language || '').split(',').map(v => v.trim()).filter(Boolean))
+        if (!knownLangToken(langKey(tok))) failLangToken('order_language', tok);
 
     // One guard around all the reordering work below: a deliberate failFile abort (AwkFailFile) rethrows unchanged, and any UNEXPECTED error fails the
     // file too — annotated and carrying the full infoLog — instead of silently skipping. (Earlier input validation runs before this and fails via failFile.)

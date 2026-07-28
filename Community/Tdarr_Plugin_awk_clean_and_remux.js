@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.6.0',
+    Version: '4.6.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -743,11 +743,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const methodTagLanguage = String(inputs.method_tag_language || 'container').toLowerCase();
     const guardAudioLanguage = String(inputs.guard_audio_language || 'disabled').toLowerCase();
 
-    // ===== SHARED [audio_clean, clean_and_remux, sub_worker]: language display name =====
-    // -=-=-= langDisplayName  [audio_clean, clean_and_remux, sub_worker] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language display name =====
+    // -=-=-= langDisplayName  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // Memoised ICU DisplayNames (built once, reused): the recognised English name for an ALREADY-normalised language code, or '' for a non-language/unknown
     // code. A fresh ICU instance per call is wasteful. Each caller normalises the token first - clean_and_remux via shortLang (tag recognition), audio_clean
-    // and sub_worker via langKey (free-text language-list validation / sidecar name recognition).
+    // audio_clean, stream_ordering and sub_worker via langKey (free-text language-list validation / sidecar name recognition).
     const langDisplayName = (() => {
         let dn = null;
         return (code) => { try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(code) || ''; } catch (e) { return ''; } };
@@ -761,8 +761,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // code) or a valid special/private code (und/mul/zxx/mis/qaa-qtz, mirroring isNonLang). Both free-text language inputs are checked through this, so
     // an unrecognised token (typo/garbage) fails the file rather than silently changing which streams survive.
     const knownLangToken = (key) => key === 'und' || key === 'mul' || key === 'zxx' || key === 'mis' || /^q[a-t][a-z]$/.test(key) || !!langName(key);
-    // ===== SHARED [audio_clean, clean_and_remux]: language token failure =====
-    // -=-=-= failLangToken  [audio_clean, clean_and_remux] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language token failure =====
+    // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // The failFile message echoes the offending token capped at 200 chars: free text is unbounded and Tdarr persists the whole error message.
     const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').slice(0, 200)}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
     // ===== END SHARED: language token failure =====
