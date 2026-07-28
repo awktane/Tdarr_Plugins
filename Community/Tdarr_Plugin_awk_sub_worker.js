@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.28.0',
+    Version: '3.29.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -920,9 +920,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const bundle = ext === BUNDLE_EXT;
         if (!bundle && !TEXT_EXTS.includes(ext)) return null;
         // A bundle is written only by us, always dot-prefixed and always with the s<index> anchor (required below), so an unrelated .mks dropped
-        // beside the video is left alone rather than muxed in blind. The dot is stripped before the videoBase match so the rest parses identically.
+        // beside the video is left alone rather than muxed in blind.
         if (bundle && !name.startsWith('.')) return null;
-        const bare = bundle ? name.slice(1) : name;
+        // The leading dot is stripped for EVERY sidecar, not just bundles, so the rest parses identically either way. A hidden text sidecar is a real
+        // arrival, not junk: clean_and_remux exports image subtitles dot-prefixed for external OCR, and the OCR comes back as ".<video>.s<n>.<lang>.srt"
+        // with that dot intact - refusing it here stranded the user's OCR work in the library forever. Hiding a sidecar from media servers says nothing
+        // about whether we should read it, and an unrelated hidden file is still rejected below by the videoBase and language-token requirements.
+        const bare = name.startsWith('.') ? name.slice(1) : name;
         if (!bare.startsWith(`${videoBase}.`)) return null;
         const mid = bare.slice(videoBase.length + 1, bare.length - extMatch[0].length);
         const toks = mid.split('.');
@@ -1630,12 +1634,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         for (const rel of scan.rels) {
             if (parseSidecarRel(rel)) continue;
             const relBase = path.posix.basename(rel.replace(/\\/g, '/'));
-            // A DOT-PREFIXED file is deliberately hidden - from media servers, and from us. clean_and_remux's remove_imagesubs=export writes exactly that
-            // (".<video>.<lang>.mks" for VobSub/DVB, one-way by design, waiting on an external OCR pass), and .mks is also our own bundle extension, so
-            // reporting it would warn about a file the user meant to create, on every run, forever. Our own bundles are dot-prefixed too but they parse,
-            // so they never reach this line.
-            if (relBase.startsWith('.')) continue;
             const relExt = (relBase.match(/\.([A-Za-z0-9]+)$/) || ['', ''])[1].toLowerCase();
+            // A DOT-PREFIXED file is hidden from media servers, and an unparseable one is usually a file the user meant to leave alone: clean_and_remux's
+            // remove_imagesubs=export writes ".<video>.<lang>.mks" for VobSub/DVB and waits on an external OCR pass, so warning about it every run, forever,
+            // would be noise. Our own bundles are dot-prefixed too, but they parse and never reach this line.
+            // A hidden TEXT sidecar named after THIS video is the exception: that is the OCR coming back, it is importable now, so a name that still fails to
+            // parse is a genuine mistake (a bad language token, a lost s<index>) and saying nothing would strand the work the user just did.
+            if (relBase.startsWith('.') && !(TEXT_EXTS.includes(relExt) && relBase.slice(1).startsWith(`${videoBase}.`))) continue;
             if (TEXT_EXTS.includes(relExt) || relExt === BUNDLE_EXT) response.infoLog += `☒Not a recognised sidecar name, skipping: ${rel}\n`;
         }
         // This pass only ever ADDS subtitles to the file - it never deletes a sidecar. import_remove_sidecar acts in the post-processing branch
