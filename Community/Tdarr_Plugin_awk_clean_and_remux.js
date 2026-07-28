@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.5.1',
+    Version: '4.5.2',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1265,7 +1265,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Counts only untagged streams that WILL REACH THE OUTPUT: an untagged subtitle dropped by the language filter, by container/format (subDroppedAnyReason),
     // or by the remove_sub_sdh guard above never reaches a later plugin. This plugin never drops audio, so every untagged audio stream reaches the output and
     // counts. Resolves language via resolveLang (ffprobe tag, then mediaInfo fallback), so a language only mediaInfo supplies is not treated as blank here.
-    if (fillMode === 'single-or-error' && fillLanguage && langKey(fillLanguage) !== 'und') {
+    // The collision this guards against needs a REAL language: every non-language code (und/mul/zxx/mis/qaa-qtz) leaves the tracks indistinguishable to a
+    // later dedup exactly as "und" does, so none of them can create the ambiguity worth erroring over - gate on isNonLang, not on "und" alone.
+    if (fillMode === 'single-or-error' && fillLanguage && !isNonLang(langKey(fillLanguage))) {
         const streams = file.ffProbeData.streams || [];
         const isUntagged = (s) => { const lang = resolveLang(s); return !lang || lang === 'und'; };
         // Inside this block language_fill assigns fillLanguage to every untagged track, so "does it survive the subtitle filter" is one check: kept when the
