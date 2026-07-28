@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.5.2',
+    Version: '4.5.3',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -949,7 +949,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ===== END SHARED: font attachment test =====
 
-    const path = require('path'); const fs = require('fs');   // fs is read only on an unmapped node, by the sidecar placement section below
+    const path = require('path'); const fs = require('fs');   // fs is read-only: the sidecar placement section below, and the image-sub export's exists-check
 
     // ===== SHARED [clean_and_remux, sub_worker]: sidecar path derivation =====
     // -=-=-= libFilePath / libDir / videoBase / sidecarLangToken  [clean_and_remux, sub_worker] =-=-=-
@@ -1453,8 +1453,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             response.infoLog += `☒${streamTag(ffstream.index)}[remove_imagesubs=export] Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}, keeping the subtitle\n`;
                         }
                     } else if (pathIsPresetSafe(sidecarPath)) {
-                        sidecarOut += ` -map 0:${ffstream.index} -c:s copy -f ${sc.fmt} "${sidecarPath}"`;
-                        workDone += `☐${streamTag(ffstream.index)}[remove_imagesubs=export] Export image subtitle -> ${sidecarName} for external OCR (before drop)\n`;
+                        // ffmpeg refuses to overwrite an existing output file and aborts the ENTIRE run, so a sidecar left by an earlier pass would take the
+                        // whole remux down with it rather than just skipping its own export. An existing sidecar has already served its purpose and may since
+                        // have been OCR'd, so the export is simply not repeated and the drop still goes ahead - forcing it (-y) could only destroy that work.
+                        let sidecarExists = false;
+                        try { sidecarExists = fs.statSync(sidecarPath).size > 0; } catch (e) { sidecarExists = false; }
+                        if (sidecarExists) {
+                            workDone += `☑${streamTag(ffstream.index)}[remove_imagesubs=export] Sidecar already exists, not overwriting: ${sidecarName}\n`;
+                        } else {
+                            sidecarOut += ` -map 0:${ffstream.index} -c:s copy -f ${sc.fmt} "${sidecarPath}"`;
+                            workDone += `☐${streamTag(ffstream.index)}[remove_imagesubs=export] Export image subtitle -> ${sidecarName} for external OCR (before drop)\n`;
+                        }
                     } else {
                         exportRefused = true; exportRefusedCount += 1;
                         response.infoLog += `☒${streamTag(ffstream.index)}[remove_imagesubs=export] Library directory contains a quote or control character - cannot write ${sidecarName} safely, keeping the subtitle\n`;
