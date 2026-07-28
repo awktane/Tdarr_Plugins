@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.5.0',
+    Version: '4.5.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1197,8 +1197,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // and hearing_impaired persists in both containers, so we promote hearing_impaired in captions' place rather than dropping the SDH role; a role with no
     // storable flag in this container (lyrics anywhere; original into mp4) is skipped - its title keyword still drives the classifiers, summary and sort
     // order, so nothing is lost but a redundant, non-persisting flag write. Dedupe by target so a track matching both SDH synonyms promotes once. The set
-    // therefore lists only flags with no storable target in the container: lyrics (neither) and original (mp4 only); captions needs no entry (remapped above).
-    const unstorableDisp = { mkv: new Set(['lyrics']), mp4: new Set(['original', 'lyrics']) };
+    // therefore lists only flags with no storable target in the container: lyrics and karaoke (neither container) and original (mp4 only); captions needs no
+    // entry (remapped above). karaoke is the same class as lyrics - `-disposition +karaoke` reads back 0 from both muxers, verified against jellyfin-ffmpeg.
+    const unstorableDisp = { mkv: new Set(['lyrics', 'karaoke']), mp4: new Set(['original', 'lyrics', 'karaoke']) };
     const dispositionsToPromote = (s, type) => {
         const out = []; const seen = new Set();
         for (const key of dispKeysFor(type)) {
