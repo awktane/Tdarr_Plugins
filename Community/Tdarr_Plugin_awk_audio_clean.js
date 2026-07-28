@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '4.6.0',
+    Version: '4.6.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -57,7 +57,7 @@ const details = () => ({
                 \\n=====
                 \\nIf surround - (Default) an unlisted language is kept at full quality, exactly as if it were in language_surround. Nothing is lost; use this until you trust your lists.
                 \\nIf stereo   - an unlisted language is kept but downmixed to stereo, exactly as if it were in language_stereo.
-                \\nIf delete   - an unlisted language is removed from the file. A track is only removed when a plain (non-commentary/descriptive/M&E) track of the SAME language survives, and never if it would leave the file with no audio at all. guard_original vetoes the delete for an 'original'-flagged track.`,
+                \\nIf delete   - an unlisted language is removed from the file. There is no same-language safety net: a plain (non-commentary/descriptive/M&E) track of that language is NOT required to survive - that rule belongs to downmix_secondary=delete. The only protections are dormancy (nothing is deleted while no track matches either list) and the never-empty floor (the last audio track is never removed); guard_original additionally vetoes the delete for an 'original'-flagged track.`,
         },
         {
             name: 'downmix_secondary',
