@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.27.0',
+    Version: '3.27.1',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1781,7 +1781,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // scratch files and reports a deletion that never touched the library. Nor can the usual route stand in - the file API offers upload and download
         // but no delete, and with nothing to mux there is no transcode, no acceptance, and therefore no server-side post-processing pass to clean up
         // afterwards. Nothing can do this job from here, so it says so and leaves the sidecars alone rather than claiming a deletion it did not perform.
-        if (!toMux.length && !retuneMeta && alreadyInFile.length && removeSidecarAfterImport && placeViaApi()) {
+        // Both sidecar-cleanup shortcuts below require that the mux branch has nothing to do, so their condition must be the exact negation of its trigger
+        // (toMux || retuneMeta || dupes.dropIdx) - a queued embedded-dedup drop is work on the FILE, independent of whether any sidecar still needs importing,
+        // and returning here would discard it silently, leaving the duplicate in place with nothing logged.
+        if (!toMux.length && !retuneMeta && !dupes.dropIdx.length && alreadyInFile.length && removeSidecarAfterImport && placeViaApi()) {
             const stranded = alreadyInFile.flatMap((f) => f.members.map((m) => m.rel));
             // Forcing twice for the same sidecar is worse than not forcing at all: Tdarr ERRORS a file whose consecutive passes emit identical arguments
             // (its own infinite-transcode-loop guard), so a repeat does not merely waste a remux, it quarantines the video. The marker is the record of
@@ -1804,7 +1807,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += `☑Expected results: ${summariseAll(streams)}\n`;
             return response;
         }
-        if (!toMux.length && !retuneMeta && alreadyInFile.length && removeSidecarAfterImport) {
+        if (!toMux.length && !retuneMeta && !dupes.dropIdx.length && alreadyInFile.length && removeSidecarAfterImport) {
             let gone = 0; const removedRels = new Set();
             for (const rel of alreadyInFile.flatMap((f) => f.members.map((m) => m.rel))) {
                 try { fs.unlinkSync(path.join(workLibDir(), rel)); gone += 1; removedRels.add(rel); response.infoLog += `☑[import_remove_sidecar=true] Deleted sidecar (its content is already in the file): ${rel}\n`; }
