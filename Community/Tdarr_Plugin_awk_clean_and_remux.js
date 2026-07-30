@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.6.1',
+    Version: '4.7.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -757,14 +757,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // so a spelled-out name or region tag folds to its base first). Used by the language_fill validation below and once per tagged stream via storesCleanly.
     const langName = (tag) => langDisplayName(shortLang(String(tag).toLowerCase()));
 
+    // Sanitize a file-supplied string (title/comment/handler/filename) for embedding in a single infoLog line. These fields can contain
+    // newlines/tabs/other control characters; infoLog is newline-delimited and every line must start with ☐/☑/☒, so a raw char would split it into a
+    // continuation with no status symbol. Collapse control characters to a space for display only - quotes/backslashes are preserved so the logged
+    // value reads faithfully (unlike escMeta, which rewrites them for ffmpeg-argument safety). Display-only, never feeds ffmpeg. Also length-capped
+    // (ellipsised), for the same reason the free-text inputs are: nothing bounds a container title, several call sites echo two or three of them on
+    // one line, and the whole infoLog is persisted by Tdarr - a file carrying multi-KB titles on many streams would otherwise build a multi-MB log.
+    const logSafe = (value, max = 200) => {
+        const s = String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ');
+        return s.length > max ? `${s.slice(0, max)}…` : s;
+    };
+
     // A recognised language token, given its already-folded langKey: any real language in any form (langKey folds en/eng/English/en-US/pt-BR to a base
     // code) or a valid special/private code (und/mul/zxx/mis/qaa-qtz, mirroring isNonLang). Both free-text language inputs are checked through this, so
     // an unrecognised token (typo/garbage) fails the file rather than silently changing which streams survive.
     const knownLangToken = (key) => key === 'und' || key === 'mul' || key === 'zxx' || key === 'mis' || /^q[a-t][a-z]$/.test(key) || !!langName(key);
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language token failure =====
     // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
-    // The failFile message echoes the offending token capped at 200 chars: free text is unbounded and Tdarr persists the whole error message.
-    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').slice(0, 200)}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
+    // The failFile message echoes the offending token capped at 200 chars, with control characters collapsed to a space: free text is unbounded and Tdarr
+    // persists the whole error message, and a raw newline in the echo would split the line into a continuation carrying no ☐/☑/☒ status symbol.
+    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
     // ===== END SHARED: language token failure =====
     // Value checks continue in Inputs order (container already checked above), with ONE deliberate exception: language_sub's tokens are
     // checked before the language_fill/language_sub cross-check, which can only give a sensible message once both lists are known-good.
@@ -778,7 +790,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // If fillLanguage is set it should be a subtitle that's kept. (There is no audio equivalent: audio_clean owns audio language, and it reads the tag
     // this plugin has already written rather than language_fill itself, so there is nothing here to cross-check against.)
     if(fillLanguage && subLanguage.length > 0 && !subLangKeys.includes(langKey(fillLanguage)))
-        failFile(`[language_fill=${fillLanguage}] not in language_sub - untagged subtitle streams would be removed; add it to language_sub or clear language_fill`);
+        failFile(`[language_fill=${logSafe(fillLanguage)}] not in language_sub - untagged subtitle streams would be removed; add it to language_sub or clear language_fill`);
     if(!['single-or-error', 'force-any'].includes(fillMode))
         failFile(`[language_fill_mode=${fillMode}] invalid value, check your settings`);
     if(!['disabled', 'enabled'].includes(removeSubSdh))
@@ -900,7 +912,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const compareTo = blank ? '' : rawTag;
         if (!desired || desired === compareTo) return { workLang, meta: '', log: '' };
         const log = blank
-            ? `☐${streamTag(ffstream.index)}[language_fill=${fillLanguage}] Language blank on ${typeWord} stream - setting to "${desired}"\n`
+            ? `☐${streamTag(ffstream.index)}[language_fill=${logSafe(fillLanguage)}] Language blank on ${typeWord} stream - setting to "${desired}"\n`
             : `☐${streamTag(ffstream.index)}[tag_language=${tagLanguage}] Standardise ${typeWord} language - "${rawTag}" to "${desired}"\n`;
         return { workLang, meta: ` -metadata:s:${typeLetter}:${idx} "language=${escMeta(desired)}"`, log };
     };
@@ -1184,17 +1196,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // >3-period 'busy'/scene-release title test (>4 dot-segments). Callers apply it AFTER role tagging, per the cleanStreamTitle note.
     const tooManyPeriods = (s) => (s || '').trim().split('.').length > 4;
 
-    // Sanitize a file-supplied string (title/comment/handler/filename) for embedding in a single infoLog line. These fields can contain
-    // newlines/tabs/other control characters; infoLog is newline-delimited and every line must start with ☐/☑/☒, so a raw char would split it into a
-    // continuation with no status symbol. Collapse control characters to a space for display only - quotes/backslashes are preserved so the logged
-    // value reads faithfully (unlike escMeta, which rewrites them for ffmpeg-argument safety). Display-only, never feeds ffmpeg. Also length-capped
-    // (ellipsised), for the same reason the free-text inputs are: nothing bounds a container title, several call sites echo two or three of them on
-    // one line, and the whole infoLog is persisted by Tdarr - a file carrying multi-KB titles on many streams would otherwise build a multi-MB log.
-    const logSafe = (value, max = 200) => {
-        const s = String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ');
-        return s.length > max ? `${s.slice(0, max)}…` : s;
-    };
-
     // tag_disposition: the tagged dispositions a stream matches by title (or flag) that aren't already a real flag - i.e. the keywords to promote into +flags.
     // Same predicate for audio and subtitle, so keep it here. A promotion must be able to PERSIST in the destination container, or the flag never "takes" and
     // the plugin re-promotes it on every pass (an infinite remux loop). Empirically (jellyfin-ffmpeg): Matroska has no captions/lyrics flag, and MP4/MOV has
@@ -1212,6 +1213,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const target = key === 'captions' ? 'hearing_impaired' : key;   // canonicalise the SDH synonym to the container-portable flag
             if (s.disposition?.[target] === 1 || (unstorableDisp[dstContainer] || new Set()).has(target) || seen.has(target)) continue;
             seen.add(target); out.push(target);
+        }
+        // The same persistence rule for a mutually exclusive PAIR rather than a single unstorable flag. Matroska carries the dub/original distinction in ONE
+        // tri-state element (FlagOriginal), so setting both bits writes NEITHER - and because a promotion is additive it also clears whichever of the two the
+        // source already carried. Verified against jellyfin-ffmpeg: `+dub` reads back dub, `+original` reads back original, `+dub+original` reads back
+        // neither, and a track already reading dub=1 remuxed with `+original` reads back neither (a plain -c copy keeps it). So when the EFFECTIVE
+        // disposition - what we would promote plus what the stream already carries - would hold both, promote neither: the write cannot persist, it would
+        // destroy a real flag downstream guards key on (guard_original, guard_audio_language), and the next pass would re-emit the identical preset until
+        // Tdarr errors the file as a transcode loop. The title keywords still drive the classifiers, summary and sort order, exactly as for the skips above.
+        // mp4 stores dub on its own and already lists original as unstorable, so the pair can never be emitted there.
+        if (dstContainer === 'mkv') {
+            const effective = new Set(out.concat(['dub', 'original'].filter((k) => s.disposition?.[k] === 1)));
+            if (effective.has('dub') && effective.has('original')) return out.filter((k) => k !== 'dub' && k !== 'original');
         }
         return out;
     };
@@ -1244,112 +1257,124 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             plainSubLangs.add(langKey(wl));
         }
     }
-
-    // Summarise the input streams exactly as they arrived, before any removal/remux/quarantine, using the shared bracket helper.
-    // This plugin runs first, so it captures the file as received; reading it alongside the stream-ordering plugin's output line
-    // shows where a file came from and where it ended up. Emitted before the guard_audio_language / language_fill_mode
-    // pre-checks so a quarantine there carries the same input picture the no-video quarantine does. Starts with ☐.
-    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
-
-    // guard_audio_language: an early warning, evaluated BEFORE the remux so a file that needs attention costs nothing to find out about. audio_clean decides
-    // what audio to keep, but it can only trust a track MARKED 'original' - it has no way to tell which of several untagged languages is the real one. So when
-    // this file carries more than one genuine audio language and marks no original, abort and let the user tag it. Languages fold through langKey (en/eng/
-    // English/en-US are one language); an untagged track counts as its own "und". Commentary/descriptive tracks are excluded - a foreign-language commentary is
-    // normal and says nothing about which track is the original.
-    if (guardAudioLanguage === 'enabled') {
-        const audioStreams = (file.ffProbeData.streams || []).filter((s) => (s?.codec_type || '').toLowerCase() === 'audio');
-        const genuineLangs = new Set(audioStreams.filter((s) => !isCommentary(s) && !isDescriptive(s)).map((s) => langKey(resolveWorkLang(s))));
-        if (genuineLangs.size > 1 && !audioStreams.some((s) => hasDisposition(s, 'original')))
-            failFile(`[guard_audio_language=${guardAudioLanguage}] ${genuineLangs.size} audio languages (${[...genuineLangs].join(', ')}) and none marked original - one of them could be the original language; mark the original track and requeue, or set guard_audio_language=disabled`);
-    }
-
-    // language_fill_mode pre-check - only relevant WHEN language_fill will assign a real language. That is the one case where multiple untagged streams of a
-    // type are a hazard: language_fill tags them all IDENTICALLY, and a later plugin can then treat them as duplicates and remove one (silent content loss).
-    // Left untagged (no language_fill, or language_fill=und) they stay "und", which audio_clean's dedup skips - so there is no collision to guard against and
-    // this does nothing. The separate "several audio languages, none marked original" concern is guard_audio_language's (opt-in), not re-litigated here.
-    // Counts only untagged streams that WILL REACH THE OUTPUT: an untagged subtitle dropped by the language filter, by container/format (subDroppedAnyReason),
-    // or by the remove_sub_sdh guard above never reaches a later plugin. This plugin never drops audio, so every untagged audio stream reaches the output and
-    // counts. Resolves language via resolveLang (ffprobe tag, then mediaInfo fallback), so a language only mediaInfo supplies is not treated as blank here.
-    // The collision this guards against needs a REAL language: every non-language code (und/mul/zxx/mis/qaa-qtz) leaves the tracks indistinguishable to a
-    // later dedup exactly as "und" does, so none of them can create the ambiguity worth erroring over - gate on isNonLang, not on "und" alone.
-    if (fillMode === 'single-or-error' && fillLanguage && !isNonLang(langKey(fillLanguage))) {
-        const streams = file.ffProbeData.streams || [];
-        const isUntagged = (s) => { const lang = resolveLang(s); return !lang || lang === 'und'; };
-        // Inside this block language_fill assigns fillLanguage to every untagged track, so "does it survive the subtitle filter" is one check: kept when the
-        // language list is empty (keep-all) or contains fillLanguage. Mirrors the main loop's own keep/drop decision.
-        const keptByLangFilter = (keys) => keys.length === 0 || langListMatch(fillLanguage, keys);
-        // An untagged SDH subtitle the remove_sub_sdh guard would drop is excluded too -
-        // mirrors the loop's own removal predicate (untagged tracks resolve to fillLanguage).
-        const removedBySdh = (s) => removeSubSdh === 'enabled' && isSdh(s) && hasPlainSameLang(plainSubLangs, fillLanguage);
-        const untaggedAudio = streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s)).length;
-        if (untaggedAudio > 1)
-            failFile(`[language_fill_mode=${fillMode}] ${untaggedAudio} audio streams have no language tag and would all be assigned "${fillLanguage}" by language_fill - may be different languages; tag them manually and requeue, or set language_fill_mode=force-any`);
-        const untaggedSubs = keptByLangFilter(subLangKeys)
-            ? streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'subtitle'
-                && !subDroppedAnyReason((s.codec_name || '').toLowerCase()) && isUntagged(s) && !removedBySdh(s)).length : 0;
-        if (untaggedSubs > 1)
-            failFile(`[language_fill_mode=${fillMode}] ${untaggedSubs} subtitle streams have no language tag and would all be assigned "${fillLanguage}" by language_fill - may be different languages; tag them manually and requeue, or set language_fill_mode=force-any`);
-    }
-
-    let extraArguments = '';
-    let sidecarOut = '';   // remove_imagesubs=export: accumulates the per-image-sub sidecar outputs, prepended to the main output in the preset below.
-                           // Stays empty on an unmapped node, where the exports are placed by placedSidecars below instead of riding on the remux.
-    let fflags = '';
-    let inputArgs = '';   // recovery args that must precede -i (e.g. -err_detect); placed on the input side of the preset
-    let workDone = '';
-    let convert = false;
-    let videoDropped = 0;
-    let subtitleStreamIndex = -1;
-    let audioStreamIndex = -1;
-    let videoStreamIndex = -1;
-
-    // remove_imagesubs=export on an UNMAPPED node: the sidecars cannot ride along as extra outputs of the remux (they would land in the node-local mirror
-    // and be discarded with the job), so they are extracted and uploaded HERE, before the stream loop decides anything - the loop then drops an image sub
-    // only when its export is in placedSidecars, refusing the drop otherwise exactly as an unsafe path does. The pre-scan repeats the loop's own export
-    // test (imageSubDropped on an image codec), which reads nothing but the codec, so the two cannot select different streams.
-    let exportRefusedCount = 0;   // image-sub exports that could not be written this run - any at all fails the file, see the check after the stream loop
-    const placedSidecars = new Set(); const failedSidecars = new Map();
-    if (isUnmappedNode && removeImageSubs === 'export') {
-        const exportJobs = [];
-        for (const s of (file.ffProbeData.streams || [])) {
-            const codec = (s?.codec_name || '').toLowerCase();
-            if ((s?.codec_type || '').toLowerCase() !== 'subtitle' || !imageSubDropped(codec)) continue;
-            const sc = IMAGE_SUB[codec];
-            const name = imageSidecarName(s, sc.ext);
-            const dest = serverSidePath(path.join(libDir, name));
-            if (!dest) { failedSidecars.set(name, 'no path translator maps this library directory back to the server'); continue; }
-            // Already on the server (a re-run, or a prior export the drop never followed): count it placed rather than re-extracting and re-uploading it.
-            if (sidecarExistsRemote(dest)) { placedSidecars.add(name); continue; }
-            exportJobs.push({ name, dest, args: ['-map', `0:${s.index}`, '-c:s', 'copy', '-f', sc.fmt] });
-        }
-        if (exportJobs.length) {
-            const { placed, failed } = placeSidecars(exportJobs);
-            for (const n of placed) placedSidecars.add(n);
-            for (const [n, why] of failed) failedSidecars.set(n, why);
-        }
-    }
-
-    // Predicted-output tracking for the closing summary line (does not affect the ffmpeg preset). removedIndices: input stream positions
-    // dropped via -map -0:ffstream.index. subCodecOverride: input stream position -> converted subtitle codec ('srt' / 'mov_text').
-    const removedIndices = new Set();
-    const subCodecOverride = new Map();
-    // Drop one input stream. The three writes are NOT independent: removedIndices is the sole input to the "Expected results" summary filter and to the
-    // orphaned-font survivor test, so a drop site that maps a stream out without recording it makes the summary advertise a stream the command deletes.
-    // Per-branch extras (a stream-index decrement, videoDropped, the continue) stay at the call site.
-    const dropStream = (index) => {
-        extraArguments += ` -map -0:${index}`;
-        removedIndices.add(index);
-        convert = true;
+    // The two filters that discard a subtitle on its own merits rather than because of its codec or the container - language_sub and remove_sub_sdh - as a
+    // predicate the remove_imagesubs=export sites can consult BEFORE writing anything. Mirrors the stream loop's own tests exactly, so the answer here and
+    // the drop it takes there can never disagree. Only the export needs it: exporting is one-way, so a sidecar written for a track those filters were about
+    // to discard is a permanent file (and, on an unmapped node, an upload) giving the user an OCR job for a language they excluded.
+    const subFilterDrops = (s) => {
+        const wl = resolveWorkLang(s);
+        if (subLanguage.length > 0 && !langListMatch(wl, subLangKeys)) return true;
+        return removeSubSdh === 'enabled' && isSdh(s) && hasPlainSameLang(plainSubLangs, wl);
     };
 
-    // Font attachments whose removal is deferred until after the main loop, when we know which subtitle streams survive. Decided here (not inline) because an
-    // attachment can appear before its subtitles in the file, so we cannot know whether a styled subtitle survives at the moment we reach the attachment.
-    const deferredFontIndices = [];
-
-    // One guard around all the real work (the per-stream loop plus the font/metadata/preset build below): a deliberate failFile abort (AwkFailFile)
-    // rethrows unchanged, and any UNEXPECTED error fails the file too — annotated and carrying the full infoLog — instead of silently skipping. (Earlier
-    // input validation runs before this and fails via failFile directly.)
+    // One guard around all the per-file work (the input summary, the guard_audio_language / language_fill_mode pre-checks, the unmapped-node image-sub
+    // export, the per-stream loop and the font/metadata/preset build): a deliberate failFile abort (AwkFailFile) rethrows unchanged, and any UNEXPECTED
+    // error fails the file too — annotated and carrying the full infoLog — instead of silently skipping. The summary walk is inside it because it reads
+    // both probes for every stream, so it is real work that can throw. (Earlier input validation runs before this and fails via failFile directly.)
     try {
+        // Summarise the input streams exactly as they arrived, before any removal/remux/quarantine, using the shared bracket helper.
+        // This plugin runs first, so it captures the file as received; reading it alongside the stream-ordering plugin's output line
+        // shows where a file came from and where it ended up. Emitted before the guard_audio_language / language_fill_mode
+        // pre-checks so a quarantine there carries the same input picture the no-video quarantine does. Starts with ☐.
+        response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
+
+            // guard_audio_language: an early warning, evaluated BEFORE the remux so a file that needs attention costs nothing to find out about. audio_clean
+            // decides what audio to keep, but it can only trust a track MARKED 'original' - it has no way to tell which of several untagged languages is the
+            // real one. So when this file carries more than one genuine audio language and marks no original, abort and let the user tag it. Languages fold
+            // through langKey (en/eng/ English/en-US are one language); an untagged track counts as its own "und". Commentary/descriptive tracks are excluded -
+            // a foreign-language commentary is normal and says nothing about which track is the original.
+        if (guardAudioLanguage === 'enabled') {
+            const audioStreams = (file.ffProbeData.streams || []).filter((s) => (s?.codec_type || '').toLowerCase() === 'audio');
+            const genuineLangs = new Set(audioStreams.filter((s) => !isCommentary(s) && !isDescriptive(s)).map((s) => langKey(resolveWorkLang(s))));
+            if (genuineLangs.size > 1 && !audioStreams.some((s) => hasDisposition(s, 'original')))
+                failFile(`[guard_audio_language=${guardAudioLanguage}] ${genuineLangs.size} audio languages (${[...genuineLangs].join(', ')}) and none marked original - one of them could be the original language; mark the original track and requeue, or set guard_audio_language=disabled`);
+        }
+
+            // language_fill_mode pre-check - only relevant WHEN language_fill will assign a real language. That is the one case where multiple untagged streams
+            // of a type are a hazard: language_fill tags them all IDENTICALLY, and a later plugin can then treat them as duplicates and remove one (silent
+            // content loss). Left untagged (no language_fill, or language_fill=und) they stay "und", which audio_clean's dedup skips - so there is no collision
+            // to guard against and this does nothing. The separate "several audio languages, none marked original" concern is guard_audio_language's (opt-in),
+            // not re-litigated here. Counts only untagged streams that WILL REACH THE OUTPUT: an untagged subtitle dropped by the language filter, by
+            // container/format (subDroppedAnyReason), or by the remove_sub_sdh guard above never reaches a later plugin. This plugin never drops audio, so
+            // every untagged audio stream reaches the output and counts. Resolves language via resolveLang (ffprobe tag, then mediaInfo fallback), so a
+            // language only mediaInfo supplies is not treated as blank here. The collision this guards against needs a REAL language: every non-language code
+            // (und/mul/zxx/mis/qaa-qtz) leaves the tracks indistinguishable to a later dedup exactly as "und" does, so none of them can create the ambiguity
+            // worth erroring over - gate on isNonLang, not on "und" alone.
+        if (fillMode === 'single-or-error' && fillLanguage && !isNonLang(langKey(fillLanguage))) {
+            const streams = file.ffProbeData.streams || [];
+            const isUntagged = (s) => { const lang = resolveLang(s); return !lang || lang === 'und'; };
+                // Inside this block language_fill assigns fillLanguage to every untagged track, so "does it survive the subtitle filter" is one check: kept
+                // when the language list is empty (keep-all) or contains fillLanguage. Mirrors the main loop's own keep/drop decision.
+            const keptByLangFilter = (keys) => keys.length === 0 || langListMatch(fillLanguage, keys);
+            // An untagged SDH subtitle the remove_sub_sdh guard would drop is excluded too -
+            // mirrors the loop's own removal predicate (untagged tracks resolve to fillLanguage).
+            const removedBySdh = (s) => removeSubSdh === 'enabled' && isSdh(s) && hasPlainSameLang(plainSubLangs, fillLanguage);
+            const untaggedAudio = streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s)).length;
+            if (untaggedAudio > 1)
+                failFile(`[language_fill_mode=${fillMode}] ${untaggedAudio} audio streams have no language tag and would all be assigned "${logSafe(fillLanguage)}" by language_fill - may be different languages; tag them manually and requeue, or set language_fill_mode=force-any`);
+            const untaggedSubs = keptByLangFilter(subLangKeys)
+                ? streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'subtitle'
+                    && !subDroppedAnyReason((s.codec_name || '').toLowerCase()) && isUntagged(s) && !removedBySdh(s)).length : 0;
+            if (untaggedSubs > 1)
+                failFile(`[language_fill_mode=${fillMode}] ${untaggedSubs} subtitle streams have no language tag and would all be assigned "${logSafe(fillLanguage)}" by language_fill - may be different languages; tag them manually and requeue, or set language_fill_mode=force-any`);
+        }
+
+        let extraArguments = '';
+        let sidecarOut = '';   // remove_imagesubs=export: accumulates the per-image-sub sidecar outputs, prepended to the main output in the preset below.
+                               // Stays empty on an unmapped node, where the exports are placed by placedSidecars below instead of riding on the remux.
+        let fflags = '';
+        let inputArgs = '';   // recovery args that must precede -i (e.g. -err_detect); placed on the input side of the preset
+        let workDone = '';
+        let convert = false;
+        let videoDropped = 0;
+        let subtitleStreamIndex = -1;
+        let audioStreamIndex = -1;
+        let videoStreamIndex = -1;
+
+        // remove_imagesubs=export on an UNMAPPED node: the sidecars cannot ride along as extra outputs of the remux (they would land in the node-local mirror
+        // and be discarded with the job), so they are extracted and uploaded HERE, before the stream loop decides anything - the loop then drops an image sub
+        // only when its export is in placedSidecars, refusing the drop otherwise exactly as an unsafe path does. The pre-scan repeats the loop's own export
+        // test (imageSubDropped on an image codec, and not a track subFilterDrops discards), so the two cannot select different streams.
+        let exportRefusedCount = 0;   // image-sub exports that could not be written this run - any at all fails the file, see the check after the stream loop
+        const placedSidecars = new Set(); const failedSidecars = new Map();
+        if (isUnmappedNode && removeImageSubs === 'export') {
+            const exportJobs = [];
+            for (const s of (file.ffProbeData.streams || [])) {
+                const codec = (s?.codec_name || '').toLowerCase();
+                if ((s?.codec_type || '').toLowerCase() !== 'subtitle' || !imageSubDropped(codec) || subFilterDrops(s)) continue;
+                const sc = IMAGE_SUB[codec];
+                const name = imageSidecarName(s, sc.ext);
+                const dest = serverSidePath(path.join(libDir, name));
+                if (!dest) { failedSidecars.set(name, 'no path translator maps this library directory back to the server'); continue; }
+                // Already on the server (a re-run, or a prior export the drop never followed): count it placed rather than re-extracting and re-uploading it.
+                if (sidecarExistsRemote(dest)) { placedSidecars.add(name); continue; }
+                exportJobs.push({ name, dest, args: ['-map', `0:${s.index}`, '-c:s', 'copy', '-f', sc.fmt] });
+            }
+            if (exportJobs.length) {
+                const { placed, failed } = placeSidecars(exportJobs);
+                for (const n of placed) placedSidecars.add(n);
+                for (const [n, why] of failed) failedSidecars.set(n, why);
+            }
+        }
+
+        // Predicted-output tracking for the closing summary line (does not affect the ffmpeg preset). removedIndices: input stream positions
+        // dropped via -map -0:ffstream.index. subCodecOverride: input stream position -> converted subtitle codec ('srt' / 'mov_text').
+        const removedIndices = new Set();
+        const subCodecOverride = new Map();
+        // Drop one input stream. The three writes are NOT independent: removedIndices is the sole input to the "Expected results" summary filter and to the
+        // orphaned-font survivor test, so a drop site that maps a stream out without recording it makes the summary advertise a stream the command deletes.
+        // Per-branch extras (a stream-index decrement, videoDropped, the continue) stay at the call site.
+        const dropStream = (index) => {
+            extraArguments += ` -map -0:${index}`;
+            removedIndices.add(index);
+            convert = true;
+        };
+
+            // Font attachments whose removal is deferred until after the main loop, when we know which subtitle streams survive. Decided here (not inline)
+            // because an attachment can appear before its subtitles in the file, so we cannot know whether a styled subtitle survives at the moment we reach
+            // the attachment.
+        const deferredFontIndices = [];
+
         for (let i = 0; i < file.ffProbeData.streams.length; i++) {
             const ffstream = file.ffProbeData?.streams[i];
             const ffmedia = mediaInfoFor(ffstream);
@@ -1443,8 +1468,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // into workDone: it warns about the ENVIRONMENT, not a queued change, and workDone is flushed only on a real remux - so a file whose only
                 // pending change WAS the refused export would otherwise report "nothing requiring removal or conversion" and swallow the warning entirely.
                 const imageSubDrop = isImageSub(ffstreamCodec) && imageSubDropped(ffstreamCodec);
+                // language_sub / remove_sub_sdh discard this track on its own merits, so it must not be exported first: the sidecar is permanent (nothing
+                // here ever deletes one, and on an unmapped node it is uploaded into the library over the file API), it hands the user an OCR job for a
+                // track they excluded, and a refused export of one would fail the WHOLE file. The drop still happens - the stream simply falls through to
+                // those filters below, which log the real reason. Only the export defers this way; 'all' keeps reporting the drop as its own.
+                const exportSuppressed = removeImageSubs === 'export' && subFilterDrops(ffstream);
                 let exportRefused = false;
-                if (imageSubDrop && removeImageSubs === 'export') {
+                if (imageSubDrop && removeImageSubs === 'export' && !exportSuppressed) {
                     const sc = IMAGE_SUB[ffstreamCodec];   // { ext, fmt } - .mks needs an explicit -f matroska; .sup auto-detects from the extension
                     const sidecarName = imageSidecarName(ffstream, sc.ext);
                     const sidecarPath = path.join(libDir, sidecarName);
@@ -1474,7 +1504,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         response.infoLog += `☒${streamTag(ffstream.index)}[remove_imagesubs=export] Library directory contains a quote or control character - cannot write ${sidecarName} safely, keeping the subtitle\n`;
                     }
                 }
-                if (imageSubDrop && !exportRefused) {
+                if (imageSubDrop && !exportRefused && !exportSuppressed) {
                     workDone += `☐${streamTag(ffstream.index)}[remove_imagesubs=${removeImageSubs}] Remove image-based subtitle (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
                 } else if (subFormatDropped(ffstreamCodec)) {

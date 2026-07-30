@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.30.1',
+    Version: '3.31.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -540,8 +540,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language token failure =====
     // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
-    // The failFile message echoes the offending token capped at 200 chars: free text is unbounded and Tdarr persists the whole error message.
-    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').slice(0, 200)}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
+    // The failFile message echoes the offending token capped at 200 chars, with control characters collapsed to a space: free text is unbounded and Tdarr
+    // persists the whole error message, and a raw newline in the echo would split the line into a continuation carrying no ☐/☑/☒ status symbol.
+    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
     // ===== END SHARED: language token failure =====
 
     // ===== SHARED [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean]: dolby vision detection =====
@@ -897,8 +898,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const langRaw = sidecarLangToken(s);
         // A tag that sanitises to a disposition-token word (a crafted tags.language of "forced"/"sdh"/etc.) would be consumed as a trailing disposition by
         // parseSidecar's right-to-left disp strip, nulling or corrupting the reimport - collapse any such collision to 'und' so the fixed language slot can
-        // never be shaped like a disposition token.
-        const lang = (DISP_TOKENS.has(langRaw) || EXTRA_TOKENS.has(langRaw)) ? 'und' : langRaw;
+        // never be shaped like a disposition token. A DISP_AMBIGUOUS_LANG token is exempt because it is also a real language code: the disp strip only reads
+        // it as a disposition when a real language sits immediately before it, so a Hindi track keeps 'hi' here rather than losing its language to 'und'.
+        // The `collides` escape below is what keeps that preceding slot free of anything the strip would mistake for a language.
+        const lang = ((DISP_TOKENS.has(langRaw) && !DISP_AMBIGUOUS_LANG.has(langRaw)) || EXTRA_TOKENS.has(langRaw)) ? 'und' : langRaw;
         const roles = dispTokensOf(s);
         const trailing = SERVER_FLAG_TOKENS.find((t) => roles.includes(t));   // at most one, and only a token every server documents
         const disp = trailing ? [trailing] : [];
@@ -911,9 +914,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const rawTitle = s.tags?.title || '';
         // The same collision one field to the left: TITLE_SAFE passes letters and '_' straight through, so a title that IS a token ("forced", "original")
         // would encode to that exact word and be eaten by parseSidecar's token strip - losing the title and inventing a flag. Encoding only ever expands, so
-        // ONLY a title that already is the token can reach that spelling; escape its first character in that one case, which pctDecode reverses exactly. The
+        // ONLY a title that already is the token can reach that spelling; escape its first character in that one case, which pctDecode reverses exactly. A
+        // DISP_AMBIGUOUS_LANG language slot collides the same way with a title that NAMES a language ("English" ahead of 'hi'): that is exactly the
+        // language-then-disposition shape the strip acts on, so it would read the title as the language and invent an SDH flag. Escape that title too. The
         // two extra bytes join the fixed budget so the 255-byte name cap still holds.
-        const collides = DISP_TOKENS.has(rawTitle) || EXTRA_TOKENS.has(rawTitle);
+        const collides = DISP_TOKENS.has(rawTitle) || EXTRA_TOKENS.has(rawTitle) || (DISP_AMBIGUOUS_LANG.has(lang) && isKnownLang(rawTitle));
         const fixed = `${dot}${videoBase}.s${s.index}${pre}.${lang}${disp.length ? `.${disp.join('.')}` : ''}${mark}.${ext}`;
         const encRaw = rawTitle ? encodeTitleCapped(rawTitle, Buffer.byteLength(fixed, 'utf8') + (collides ? 2 : 0)) : '';
         const encTitle = collides && encRaw ? `${pctEncode(encRaw.slice(0, 1), NEVER_SAFE)}${encRaw.slice(1)}` : encRaw;
@@ -1526,14 +1531,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (titleTruncated) response.infoLog += '☒A subtitle title was too long for the filename and was truncated\n';
             // sidecarOut rather than wrote, because on an unmapped node the sidecars are already written and only a removal still needs a remux: with
             // extract_remove_stream off there is then genuinely nothing left for ffmpeg to do, and emitting a whole-file copy would earn nothing.
-            // Three distinct endings, and only one of them is a success worth reporting as "no work needed". Extraction that was ASKED FOR and produced
-            // nothing - every eligible subtitle refused, whether by an unsafe library path or a placement that would not land - is a failure: returning
-            // processFile:false files the video under success and the subtitles are never extracted, with nothing to draw the eye. A run where some
-            // sidecars did land keeps going and carries its ☒ lines into a successful log; that is a partial result, not a failed one.
+            // Three distinct endings, and only one of them is a failure: extraction that was ASKED FOR and left NOTHING in the library - every eligible
+            // subtitle refused, whether by an unsafe library path or a placement that would not land. Returning processFile:false there files the video
+            // under success and the subtitles are never extracted, with nothing to draw the eye. A run where some sidecars did land keeps going and carries
+            // its ☒ lines into a successful log; that is a partial result, not a failed one - and a sidecar an earlier pass already placed (skipped) is
+            // landed just as much as one written this pass, since sitting in the library is the only property the rest of the round trip depends on.
             if (!sidecarOut && !removeIdx.length) {
-                if (wrote) { response.infoLog += '☑[extract_remove_stream=false] Sidecars placed in the library - nothing left to remux\n'; return response; }
-                if (unsafe) failFile('No subtitle could be extracted - every eligible subtitle was refused, see the reasons above');
-                response.infoLog += '☑All eligible subtitles already extracted\n';
+                if (unsafe && !wrote && !skipped) failFile('No subtitle could be extracted - every eligible subtitle was refused, see the reasons above');
+                response.infoLog += wrote ? '☑[extract_remove_stream=false] Sidecars placed in the library - nothing left to remux\n'
+                    : '☑All eligible subtitles already extracted\n';
                 return response;
             }
 
@@ -1630,7 +1636,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .sort(byOriginalPosition)
             .filter((f) => {
                 if (!langFilter || langFilter.has(langKey(f.lang))) return true;
-                response.infoLog += `☑[only_languages=${inputs.only_languages}] Skipping ${f.rel} - ${f.lang} is not in the list\n`;
+                // The tag echoes a free-text input, so it gets the same treatment failLangToken gives its token: control characters collapsed (a raw newline
+                // would split the line into a continuation with no ☐/☑/☒ symbol) and capped, since nothing bounds the list and this line is per-sidecar.
+                response.infoLog += `☑[only_languages=${String(inputs.only_languages ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)}] Skipping ${f.rel} - ${f.lang} is not in the list\n`;
                 return false;
             })
             // An mp4-family target carries no font attachments at all, so importing a styled-subtitle bundle there would embed the subtitle and strand

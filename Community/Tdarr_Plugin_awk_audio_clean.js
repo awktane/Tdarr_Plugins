@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '4.7.1',
+    Version: '4.8.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -175,7 +175,7 @@ const details = () => ({
             },
             tooltip: `If enabled then duplicate audio tracks (same language, same broad role) are reduced down to the highest quality option(s). Any stream newly created by downmix_to_six or downmix_to_stereo is always kept and is never collapsed against a different channel count it was created alongside (see below).
                 \\nCommentary and descriptive (visually-impaired) tracks are never treated as duplicates of each other - every such track is always kept, since two different commentaries (e.g. cast & crew vs directors) are distinct content even when both are titled "Commentary".
-                \\nThe "-error" variants use identical grouping/duplicate-detection logic to their non-error counterpart, but instead of deleting the lower quality duplicate(s) they abort the plugin run entirely (no streams are removed, no other changes in this run are applied) so the file can be inspected and tagged manually before being requeued.
+                \\nThe "-error" variants use identical grouping/duplicate-detection logic to their non-error counterpart, but instead of deleting the duplicate(s) they abort the plugin run entirely (no streams are removed, no other changes in this run are applied) so the file can be inspected and tagged manually before being requeued.
                 \\n=====
                 \\nActions
                 \\n=====
@@ -1238,8 +1238,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //   • aac_at    (Mac only)  -> -aac_at_mode vbr -q:a 1/0        Apple AudioToolbox, the platform's best VBR AAC when libfdk is absent
     //   • native aac (any)      -> -b:a 256k CBR                    last-resort floor via encoderArgsIdx (-vbr is libfdk-private, so native aac can't VBR here)
     // aac_at's top tier (q:a 0) runs a little heavier than libfdk -vbr 5 but is leaner + faster than native 256k; erring high
-    // keeps the fallback no worse than the source warranted. isStereoSrc should be true only for codec_force codec-swap paths
-    // where the source is already 2ch. Warns once per file when not using libfdk. Single source for the aac_vbr low-info boundary
+    // keeps the fallback no worse than the source warranted. isStereoSrc is true for the codec-swap paths whose source is already in
+    // the stereo tier (<=2ch, mono included). Warns once per file when not using libfdk. Single source for the aac_vbr low-info boundary
     // and its predicted delivered rate, shared by aacVbrArgsIdx (picks the VBR level) and guardBlocks (scores the delivered
     // quality) so the two can't drift: a stereo source at/below this bitrate emits libfdk -vbr 4 (~128k), above it -vbr 5 (~192k).
     const AAC_VBR_LOWINFO_BPS = 144000;
@@ -1332,8 +1332,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const knownLangToken = (key) => key === 'und' || key === 'mul' || key === 'zxx' || key === 'mis' || /^q[a-t][a-z]$/.test(key) || !!langDisplayName(key);
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language token failure =====
     // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
-    // The failFile message echoes the offending token capped at 200 chars: free text is unbounded and Tdarr persists the whole error message.
-    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').slice(0, 200)}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
+    // The failFile message echoes the offending token capped at 200 chars, with control characters collapsed to a space: free text is unbounded and Tdarr
+    // persists the whole error message, and a raw newline in the echo would split the line into a continuation carrying no ☐/☑/☒ status symbol.
+    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
     // ===== END SHARED: language token failure =====
     for(let i = 0; i < langStereoKeys.length; i++)
         if(!knownLangToken(langStereoKeys[i])) failLangToken('language_stereo', langStereo[i]);
@@ -1390,13 +1391,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return response;
     }
 
-    // Input summary — the streams exactly as they arrived, before any audio work.
-    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
-
-    // One guard around all the per-file work (dedup, index mapping, the transcode loop, and the output-summary / preset build): a deliberate failFile
-    // abort (AwkFailFile) rethrows unchanged, and any UNEXPECTED error fails the file too — annotated and carrying the full infoLog — not a silent skip.
+    // One guard around all the per-file work (the input summary, dedup, index mapping, the transcode loop, and the output-summary / preset build): a
+    // deliberate failFile abort (AwkFailFile) rethrows unchanged, and any UNEXPECTED error fails the file too — annotated and carrying the full infoLog —
+    // not a silent skip. The summary walk is inside it because it reads both probes for every stream, so it is real work that can throw.
     // (Earlier input validation and the not-a-video / no-audio pre-flight checks run before this and fail-or-skip on their own.)
     try {
+        // Input summary — the streams exactly as they arrived, before any audio work.
+        response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
 
         // A secondary track is any commentary, visually-impaired/descriptive, or music-and-effects (clean_effects) track — the shared classifiers cover the
         // disposition flags and the title keywords. A distinct M&E (dialogue-free) mix must never be deduped away as a duplicate of the main mix. Lyrics/songs
@@ -1554,6 +1555,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // a language lost. Language can't prove same content (mirrors the secondary exemption above). clean_and_remux's
                 // language_fill_mode vets untagged audio when it runs first, but audio_clean is independently runnable, so guard here too.
                 if (s.isTdarrCleanLang === 'und') continue;
+                // A track no probe can measure a channel count for is left out of the grouping entirely, the same rule codec_force and method_loudnorm
+                // already apply: an unmeasurable count is never guessed. It matters more here than there, because every comparison against it silently
+                // reads false - the tier test would file a surround track under 'stereo' and dedupeGuardBlocks' channel clause could not intervene, so a
+                // real 2.0 track (or the surround master itself) would be deleted as its duplicate. `continue` rather than a seen entry, so it can be
+                // neither removed nor the survivor that removes something else.
+                if (!(Number(s.channels) > 0)) {
+                    skipDone += `☒${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Skipping - no channel count in ffprobe, mediaInfo, or channel layout; can't tell which tracks it would duplicate\n`;
+                    continue;
+                }
                 let tier;
                 if (methodDeduplicateGroupBy === 'channel') {
                     tier = s.channels;
@@ -1579,7 +1589,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         failFile(`${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Duplicate audio track (${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrRegionKey}${rmRate}) alongside stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate}) - aborting; tag/remove tracks manually and requeue, or switch method_deduplicate to a non-error mode`);
                     }
                     streamsToRemove.add(s.index);
-                    workDone += `☐${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Removing duplicate (lower quality ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrRegionKey}${rmRate}) - keeping stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate})\n`;
+                    // Name the sort key that actually decided this, walking the same order byQuality does. Quality is only the SECOND key, so a removed
+                    // track can outscore its survivor (see dedupeGuardBlocks' note) - and a removal decided on channels or a tiebreak explains nothing at
+                    // all unless the survivor's channel count is rendered beside its bitrate.
+                    let why;
+                    if (!trustedRate(s) && trustedRate(kept)) why = 'no measured bitrate';
+                    else if (s.isTdarrQuality < kept.isTdarrQuality) why = 'lower quality';
+                    else if (s.channels < kept.channels) why = 'fewer channels';
+                    else if (!s.isTdarrObjectAudio && kept.isTdarrObjectAudio) why = 'no object audio';
+                    else if (!s.isTdarrMatrixSurround && kept.isTdarrMatrixSurround) why = 'no matrixed rear channel';
+                    else why = 'equal, keeping the earlier track';
+                    workDone += `☐${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Removing duplicate (${why}: ${s.codec_name || 'unknown'} ${s.channels}ch ${s.isTdarrRegionKey}${rmRate}) - keeping stream ${kept.index} (${kept.codec_name || 'unknown'} ${kept.channels}ch${keptRate})\n`;
                 } else
                     seen.set(key, s);
             }
@@ -2239,7 +2259,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                                 const { filter } = buildLoudnormFilter(ffstream.index, srcAudioIdx, '', LOUDNORM_PRESETS[methodLoudnorm]);
                                 if (filter) aacVbrFilter = ` -filter:a:${outputAudioIdx} "${filter}"`;
                             }
-                            workDone += `☐${streamTag(ffstream.index)}[codec_force=${forceCodec}] Transcoding ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → aac stereo @ ${approxRate} (${label})\n`;
+                            workDone += `☐${streamTag(ffstream.index)}[codec_force=${forceCodec}] Transcoding ${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → aac ${forceChannels}ch @ ${approxRate} (${label})\n`;
                             extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${aacVbrFilter}`;
                             modifiedAudioIdx.add(outputAudioIdx);
                             outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: forceChannels, bps: 0, approxRate });
@@ -2342,7 +2362,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 // Converging a non-opus source to opus (rawCodec isn't opus-encodable, so targetCodec fell through to codec_surround=opus): if libopus
                 // can't encode this track's layout, a bare -c:a opus would abort the whole ffmpeg job. Relabel losslessly when possible (chained before
-                // loudnorm); otherwise defer to method_layout_err. 'remix' downmixes to codec_stereo (+ loudnorm) in place; 'keep' - and 'drop', which
+                // loudnorm); otherwise defer to method_layout_err. 'remix' downmixes to codec_stereo (+ loudnorm) in place, unless a stereo already
+                // exists for this language (remixDefer, exactly as the codec_force path decides it - see the comment there); 'keep' - and 'drop', which
                 // can't remove a track once the audio index maps are built (the codec_force path drops such a track in the pre-pass) - leave it in its
                 // source codec, un-normalized. AC3/EAC3/AAC accept every layout, so this only fires when codec_surround is opus.
                 let loudnormRelabel = '';
@@ -2350,9 +2371,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const lay = (stream.channel_layout || '').toLowerCase().trim();
                     if (!opusAcceptsLayout(channels, lay)) {
                         const relabel = OPUS_RELABEL[lay];
+                        const remixDefer = !relabel && methodLayoutErr === 'remix'
+                            && (existing2chLangs.has(stream.isTdarrRegionKey) || created2chLangs.has(stream.isTdarrRegionKey));
                         if (relabel) {
                             loudnormRelabel = `channelmap=map=${relabel.map}:channel_layout=${relabel.layout}`;   // lossless relabel to an opus-safe layout, chained ahead of loudnorm
-                        } else if (methodLayoutErr === 'remix') {
+                        } else if (methodLayoutErr === 'remix' && !remixDefer) {
                             const newTitle = escMeta(buildTitle(stream, '2.0'));
                             const sLang = langForWrite(stream);
                             const enc = stereoEnc(outputAudioIdx);
@@ -2361,10 +2384,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             extraArguments += langMetaArg(outputAudioIdx, sLang);
                             outputAudioOverride.set(outputAudioIdx, enc.record);
                             modifiedAudioIdx.add(outputAudioIdx);
+                            created2chLangs.add(stream.isTdarrRegionKey);   // register the remix-created stereo so a later same-language downmix / remix defers to it
                             convert = true;
                             continue;
                         } else {
-                            skipDone += `☒${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - libopus can't encode a ${lay || `${channels}ch`} layout; left as ${rawCodec} (method_layout_err=${methodLayoutErr})\n`;
+                            const why = remixDefer ? 'a stereo already exists for this language' : `method_layout_err=${methodLayoutErr}`;
+                            skipDone += `☒${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - libopus can't encode a ${lay || `${channels}ch`} layout; left as ${rawCodec} (${why})\n`;
                             continue;
                         }
                     }
@@ -2387,7 +2412,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 if (targetCodec === 'aac_vbr') {
                     const { encoder, args, approxRate, label } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true, channels);
-                    workDone += `☐${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${rawCodec} ${channels}ch → aac stereo @ ${approxRate} (${label})\n`;
+                    workDone += `☐${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${rawCodec} ${channels}ch → aac ${channels}ch @ ${approxRate} (${label})\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args} -filter:a:${outputAudioIdx} "${filter}"${loudnormStampArg(outputAudioIdx)}`;
                     modifiedAudioIdx.add(outputAudioIdx);
                     outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels, bps: 0, approxRate });

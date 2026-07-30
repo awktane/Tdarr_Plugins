@@ -9,7 +9,7 @@ const details = () => ({
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n
                      UPGRADING FROM 2.x - inputs were renamed/reworked in 3.0.0, and Tdarr stores settings by input name, so that upgrade RESET them to defaults - re-check your video_clean settings: encoder->method_encoder, speed->method_speed, force_bit_depth->method_bitdepth, max_height->height_cap (value 'original'->'source'), method_hdr->hdr_mode, guard_min_bitrate->guard_shrink_bitrate (now shrink-only); the old preserve_dv is now the guard_dv toggle (default on); guard_reprocess is gone (use action=shrink); codec gained a 'source' value (keep the source codec).\n\n`,
-    Version: '3.6.0',
+    Version: '3.7.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -975,14 +975,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (hdrMode === 'tonemap_sdr' && action === 'hdr_cleanup_only')
         failFile('[hdr_mode=tonemap_sdr][action=hdr_cleanup_only] tonemapping is always a re-encode (never lossless) - switch to action=normalize or shrink to tonemap, check your settings');
 
-    // Input summary is always logged.
-    response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
-
-    if (file.fileMedium !== 'video') {
-        return skip('☑File is not a video\n');
-    }
-
+    // Everything from here is per-FILE work, so it runs inside the failUnexpected wrapper: the summary walk reads both probes for every stream, and an
+    // unforeseen throw in there must still reach the error queue carrying this plugin's own infoLog rather than as a bare Error with none of it.
     try {
+        // Input summary is always logged.
+        response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
+
+        if (file.fileMedium !== 'video') {
+            return skip('☑File is not a video\n');
+        }
+
         // Primary (non-cover-art) video stream - the one we actually encode.
         const videoStreams = file.ffProbeData.streams.filter((s) => (s.codec_type || '').trim().toLowerCase() === 'video');
         const primary = videoStreams.find((s) => !isCoverArt(s));
@@ -1038,7 +1040,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // A single-layer DV whose base carries NO standard HDR transfer (e.g. profile 5's IPT-PQ base): no smpte2084/HLG to fall back
         // to, so neither a lossless strip nor a normal re-encode keeps a valid picture. The transfer - not the DOVI compat id - is
         // the reliable signal (a compat-0 stream that DOES carry a PQ transfer re-encodes fine; profile 7/8/10 carry smpte2084/HLG).
-        const dvNoBaseLayer = isDynamicHdr && !HDR_TRANSFERS.includes(srcXfer);
+        const dvNoBaseLayer = dvSignal && !HDR_TRANSFERS.includes(srcXfer);
 
         // ---- Dolby Vision guard (action-aware) ---- guard_dv protects DV through a transcode: forces HEVC + libx265 (CPU, below) + 10-bit + RPU
         // passthrough, and overrides a strip_dynamic/tonemap_sdr request for a DV file. INERT under hdr_cleanup_only (a lossless-only action - a
@@ -1090,7 +1092,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (isMp4Family(dstContainer)) out += ' -movflags use_metadata_tags';   // same as the transcode path: keep sibling plugins' GLOBAL awk_* markers through an mp4/mov copy
             response.preset = `<io>${out}`;   // no input-side args
             response.processFile = true;
-            response.infoLog += `☑Expected results: ${keptStreams().map((s) => summariseStream(enrichStream(s))).join('')}\n`;
+            // The strip removes exactly the layer the 'dv'/'hdr10+' token names, so the prediction clears the same carriers the transcode prediction does -
+            // the dvhe/dvh1 fourcc, the DOVI record, and the mediaInfo join (via the index) - leaving the HDR10/HLG base's own transfer, inferred off
+            // HDR_Format when neither probe reported one. Everything else about the stream is untouched, since this path is a -c:v copy.
+            const strippedVideo = { ...primary, codec_tag_string: '', side_data_list: [], index: -1 };
+            if (!HDR_TRANSFERS.includes(srcXfer)) strippedVideo.color_transfer = /hlg|log-gamma|b67/.test(hdrFmt) ? 'arib-std-b67' : 'smpte2084';
+            response.infoLog += `☑Expected results: ${keptStreams().map((s) => (s === primary ? summariseStream(strippedVideo) : summariseStream(enrichStream(s)))).join('')}\n`;
             return response;
         };
 
@@ -1198,10 +1205,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // pix_fmt/profile cleared, and a tonemapped output is SDR (bt709, detached mediaInfo so no 'hdr' token).
             const outStream = { ...primary, codec_name: targetCodecName, height: outHeight || srcHeight, bits_per_raw_sample: want10Bit ? 10 : 8, pix_fmt: '', profile: '' };
             if (tonemap) { outStream.color_transfer = 'bt709'; outStream.index = -1; }
-            // Unless guard_dv carried it, the re-encode DISCARDS the Dolby Vision layer, so the prediction must not still read 'dv'. Clear every carrier
-            // summariseStream's DV test reads: the dvhe/dvh1/... fourcc, a DOVI side-data record, and the mediaInfo HDR_Format (detached by dropping the index
-            // mediaInfoFor joins on). A surviving HDR10 base still shows 'hdr' from the stream's own transfer characteristics.
-            if (dvSignal && !preserveDv) { outStream.codec_tag_string = ''; outStream.side_data_list = []; outStream.index = -1; }
+            // Unless guard_dv carried it, the re-encode DISCARDS the DYNAMIC HDR layer - the Dolby Vision RPU and the HDR10+ SEI alike, since no encoder this
+            // plugin drives carries either - so the prediction must not still read 'dv' or 'hdr10+'. Clear every carrier summariseStream's dynamic tests read:
+            // the dvhe/dvh1/... fourcc, a DOVI side-data record, and the mediaInfo HDR_Format (detached by dropping the index mediaInfoFor joins on). The
+            // surviving HDR10/HLG base still shows 'hdr', from the stream's own transfer characteristics - or, when neither probe reported one, from the curve
+            // inferred off HDR_Format and stamped here, for the same reason tonemapSetparams stamps it onto the filter island. A tonemap already landed bt709
+            // above and must keep it, so the stamp skips that case.
+            if (isDynamicHdr && !preserveDv) {
+                outStream.codec_tag_string = ''; outStream.side_data_list = []; outStream.index = -1;
+                if (!tonemap && !HDR_TRANSFERS.includes(srcXfer)) outStream.color_transfer = /hlg|log-gamma|b67/.test(hdrFmt) ? 'arib-std-b67' : 'smpte2084';
+            }
             const outVideoToken = summariseStream(outStream);
             response.infoLog += `☑Expected results: ${keptStreams().map((s) => (s === primary ? outVideoToken : summariseStream(enrichStream(s)))).join('')}\n`;
             return response;
