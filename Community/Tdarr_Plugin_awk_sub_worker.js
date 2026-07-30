@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.31.0',
+    Version: '3.32.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -413,10 +413,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // five. The optional second argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - see the audio branch for what an encode
     // keeps and what it drops. Because of it, NEVER pass this helper straight to .map(): Array.map would supply the element index as that argument.
     const summariseStream = (s, out) => {
+        // Every value below that comes from container metadata rather than from ffprobe's own bounded tables is clamped through this: control characters
+        // become spaces (a raw newline would split the summary into a continuation line carrying no ☐/☑/☒) and the token is cut to 64 chars. Nothing bounds
+        // a language tag, an attachment filename or a mimetype, and the whole infoLog is persisted by Tdarr - the same reasoning that caps the workDone
+        // lines. 64 clears every real value: the longest registered mimetype subtype is 59 chars, and language codes and font extensions are far shorter.
+        const tok = (v) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 64);
         const type = (s.codec_type || '').trim().toLowerCase();
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
         if (codec === 'subrip') codec = 'srt';
-        const langRaw = resolveLang(s) || 'und';
+        const langRaw = tok(resolveLang(s) || 'und');
         const lang = langRaw !== 'und' ? langRaw : '';
         const def = s.disposition?.default === 1 ? '/default' : '';
         if (type === 'video') {
@@ -477,13 +482,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 else if (ext) label = ext;
                 else if (sub) label = sub;
             }
-            return `[attach:${label}]`;
+            return `[attach:${tok(label)}]`;
         }
         if (type === 'data') {
             // Prefer a meaningful codec_name; when it's absent/generic, surface the mimetype SUBTYPE (text/html -> html) so a removed data stream is legible.
             const dmime = (s.tags?.mimetype || '').trim().toLowerCase();
             const dsub = dmime.includes('/') ? dmime.slice(dmime.indexOf('/') + 1).replace(/^x-/, '') : '';
-            return `[data:${(codec === 'unknown' || codec === 'none') && dsub ? dsub : codec}]`;
+            return `[data:${tok((codec === 'unknown' || codec === 'none') && dsub ? dsub : codec)}]`;
         }
         return `[${type || 'unknown'}:${codec}]`;
     };
@@ -512,11 +517,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= langNameIndex  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // Reverse map English language NAME -> 2-letter code (english->en), built once per run by probing every aa..zz pair (fallback:'none' returns
     // undefined for the invalid pairs, leaving the 190 real ISO 639-1 languages). Lazily built on first spelled-out name, then memoised for the run.
+    // Null-prototype so a container tag spelling an Object.prototype member ('constructor') misses the map instead of resolving to an inherited value.
     const langNameIndex = (() => {
         let idx = null;
         return () => {
             if (idx) return idx;
-            idx = {};
+            idx = Object.create(null);
             const dn = new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' });
             for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {   // 97-122 = ASCII a-z: every 2-letter combo
                 const code = String.fromCharCode(a, b);
@@ -807,11 +813,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const { spawnSync } = require('child_process');
         const placed = new Set(); const failed = new Map();
         const tmpExt = (name) => path.extname(name).replace(/[^.a-z0-9]/gi, '');   // from our own table-driven extension, so the temp name stays ours alone
-        const staged = jobs.map((j, i) => ({ ...j, tmp: path.join(os.tmpdir(), `awk_sidecar_${process.pid}_${i}${tmpExt(j.name)}`) }));
-        const failAll = (why) => { for (const j of staged) failed.set(j.name, why); return { placed, failed }; };
-        const clearStaged = () => { for (const j of staged) { try { fs.unlinkSync(j.tmp); } catch (e) { /* never written, or already gone */ } } };
+        const failAll = (why) => { for (const j of jobs) failed.set(j.name, why); return { placed, failed }; };
         const url = String(nodeConfig.serverURL || '').replace(/\/+$/, '');
         if (!url) return failAll('the node config carries no server URL to upload through');
+        // A PRIVATE staging directory, not predictable names in the shared temp dir. os.tmpdir() is world-writable on Unix, so a name derived from the pid
+        // and an index can be pre-created as a symlink by any other local user, and ffmpeg's -y then writes THROUGH it - overwriting whatever it points at,
+        // as the Tdarr user. mkdtemp's 0700 directory closes that window outright rather than racing it, which is what embeddedTextHashes already does.
+        // Inside it the names can stay trivially short, since nothing else can get in; they still come from our own extension table, never the sidecar name.
+        let stageDir = '';
+        try { stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'awk_sidecar_')); }
+        catch (e) { return failAll(`could not create a staging directory (${e && e.message ? e.message : e})`); }
+        const staged = jobs.map((j, i) => ({ ...j, tmp: path.join(stageDir, `${i}${tmpExt(j.name)}`) }));
+        // Best effort: a staging directory left behind is harmless, and failing the placement over it would lose the sidecars it just uploaded.
+        const clearStaged = () => { try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch (e) { /* see above */ } };
         const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', String(file._id || file.file || '')];
         for (const j of staged) args.push(...j.args, j.tmp);
         // The ceiling is bounded by the container's size and the node's storage rather than by the sidecar, so it is generous - but a hung ffmpeg is
@@ -1060,6 +1074,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Fetch one library file to a local path, through the only read an unmapped node has. It addresses a single KNOWN path, which is exactly why the list
     // has to live at a name we can compute rather than one we would have to go looking for. Written straight to disk by curl, never buffered back through
     // spawnSync, so a large sidecar cannot silently exceed maxBuffer and report a failure that never happened.
+    // curl's EXIT STATUS is part of the success test, not just the HTTP code: a transfer that dies after the response headers - the -m timeout, a dropped
+    // connection - still reports %{http_code} 200 and leaves a non-empty file, so testing the code alone would call a truncated download complete.
     const downloadLibraryFile = (dest, local) => {
         const url = String(nodeConfig.serverURL || '').replace(/\/+$/, '');
         if (!url) return 'the node config carries no server URL';
@@ -1070,9 +1086,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             { encoding: 'utf8', timeout: 600000 });
         const code = String(r.stdout || '').trim();
         let size = 0; try { size = fs.statSync(local).size; } catch (e) { size = 0; }
-        if (!r.error && code === '200' && size > 0) return '';
+        if (!r.error && r.status === 0 && code === '200' && size > 0) return '';
         try { fs.unlinkSync(local); } catch (e) { /* nothing landed */ }
-        return r.error ? `download failed (${r.error.code || r.error.message})` : `HTTP ${code || 'no response'}`;
+        if (r.error) return `download failed (${r.error.code || r.error.message})`;
+        return r.status === 0 ? `HTTP ${code || 'no response'}` : `the transfer did not complete (curl exit ${r.status === null ? 'signalled' : r.status})`;
     };
 
     // Pull every listed sidecar into this node's own copy of the library folder, at the same relative path. Everything downstream - the dedup hash, the -i
@@ -1081,9 +1098,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // A name that is missing because we already imported it and cleaned it up is the list going stale in the ordinary way, not a problem: the list is seeded
     // once and never rewritten, so it still names files whose whole purpose has been served. The marker is what tells the two apart - it records what an
     // earlier pass embedded - and without that distinction a completed round trip reports itself as one warning per subtitle it successfully handled.
+    // The NAME is checked before anything is fetched. readSubtitleList only proves an entry stays inside the video's folder; it says nothing about the entry
+    // being a subtitle, and the destination is path.join(libDir, rel) in the mirror that also holds the video being transcoded - so a line naming the video
+    // itself would have curl truncate it, or delete it outright on an HTTP error, before the first name test downstream ever ran. An entry has to parse as a
+    // sidecar to be usable at all (that is exactly what the import filters on), so testing it here costs nothing and is the only place the test is in time.
     const fetchListedSidecars = (rels, listName, embeddedAlready) => {
         const got = [];
         for (const rel of rels) {
+            if (!parseSidecarRel(rel)) {
+                response.infoLog += `☒[method_unmapped=text_file] ${listName} lists ${rel}, which is not a recognised sidecar name - skipping\n`;
+                continue;
+            }
             const dest = serverSidePath(path.join(libDir, rel));
             if (!dest) { response.infoLog += `☒[method_unmapped=text_file] Cannot work out the server path for ${rel}\n`; continue; }
             const why = downloadLibraryFile(dest, path.join(libDir, rel));
@@ -1110,7 +1135,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             ...rels,
             '',
         ].join('\n');
-        const tmp = path.join(require('os').tmpdir(), `awk_sublist_${process.pid}.txt`);
+        // Staged in a private mkdtemp directory for the same reason placeSidecars is: a pid-derived name in the world-writable temp dir can be pre-created
+        // as a symlink by another local user, and writeFileSync follows it. The inner name is fixed, so nothing user-supplied reaches curl's -F syntax.
+        let stageDir = '';
+        try { stageDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_sublist_')); }
+        catch (e) { return `could not stage the list (${e && e.message ? e.message : e})`; }
+        const tmp = path.join(stageDir, 'list.txt');
         try { fs.writeFileSync(tmp, body); } catch (e) { return `could not stage the list (${e && e.message ? e.message : e})`; }
         const url = String(nodeConfig.serverURL || '').replace(/\/+$/, '');
         const { spawnSync } = require('child_process');
@@ -1118,7 +1148,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const up = spawnSync('curl', ['-sS', '-m', '300', '-o', nullDevice, '-w', '%{http_code}', ...apiAuthArgs(),
             '--form-string', `filePath=${dest}`, '--form-string', `fileSize=${size}`, '--form-string', `nodeID=${String(nodeConfig.nodeID || '')}`,
             '-F', `file=@${tmp}`, `${url}/api/v2/file/upload`], { encoding: 'utf8', timeout: 300000 });
-        try { fs.unlinkSync(tmp); } catch (e) { /* best effort */ }
+        try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
         const code = String(up.stdout || '').trim();
         return (!up.error && code === '200') ? '' : `upload rejected (${up.error ? (up.error.code || up.error.message) : `HTTP ${code || 'no response'}`})`;
     };
@@ -1172,6 +1202,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // breaks ties, keeping the result identical on every node whatever order a filesystem lists entries in - which is what the scan's own sort is for.
     const byOriginalPosition = (a, b) => (a.index === null ? Infinity : a.index) - (b.index === null ? Infinity : b.index)
         || (a.rel < b.rel ? -1 : (a.rel > b.rel ? 1 : 0));
+
+    // The sha1 of a sidecar's bytes - the identity both the import grouping and the post-processing deletion decide on. '' means "could not be read", which
+    // every caller must treat as proving nothing: such a sidecar is grouped on its own and is never confirmed for deletion. The size is checked FIRST,
+    // because a name that merely parses as a sidecar says nothing about what is behind it - a runaway OCR dump or a mis-renamed file left as
+    // <video>.eng.srt would otherwise be pulled into the worker whole for a hash that is not even needed. Real text subtitles are kilobytes and a heavily
+    // typeset ASS a few MB, so 64 MiB is orders of magnitude of headroom and never refuses a genuine one. (Node itself already refuses past 2 GiB.)
+    const SIDECAR_HASH_MAX = 64 * 1024 * 1024;
+    const sidecarSha1 = (rel) => {
+        const p = path.join(workLibDir(), rel);
+        try {
+            if (fs.statSync(p).size > SIDECAR_HASH_MAX) return '';
+            return crypto.createHash('sha1').update(fs.readFileSync(p)).digest('hex');
+        } catch (e) { return ''; }
+    };
 
     // The streams and global tags of the file as it stands NOW. Pre-processing is always handed ffProbeData; the post-processing stage may not be, so fall
     // back to running ffprobe here - otherArguments supplies ffmpegPath and ffprobe sits beside it under the matching name. null means neither route
@@ -1266,13 +1310,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return out;
     };
 
-    // Is a marker-listed sidecar REALLY in the file? The marker records what the last import muxed and NOTHING ever clears it, so an extract pass strips the
-    // subtitles and leaves a tag behind still naming them. Both readers of the marker therefore confirm it against the streams as they stand rather than
-    // trusting it: deletion, so a stale or forged marker cannot unlink a sidecar that was never embedded, and import suppression, so a stale one cannot
-    // silently skip a re-import. An embedded subtitle matches on language + title, the identity our own import writes. On an mp4/mov target the container
-    // DROPS per-stream subtitle titles on the -c copy mux, so a re-probe cannot see the title - there we match on LANGUAGE alone, else a titled sidecar we
-    // DID embed never matches its now-title-less stream. A bundle additionally has to see a font attachment in the file: carrying fonts is its whole reason
-    // to exist, so confirming only its subtitle would let the archive go while the styling stayed broken.
+    // Does a marker-listed sidecar RESEMBLE something in the file? The marker records what the last import muxed and NOTHING ever clears it, so an extract
+    // pass strips the subtitles and leaves a tag behind still naming them, and the marker VALUE is ordinary container metadata any file can carry. Both
+    // readers therefore confirm it against the streams as they stand rather than trusting it. This is the METADATA half: an embedded subtitle matches on
+    // language + title, the identity our own import writes. On an mp4/mov target the container DROPS per-stream subtitle titles on the -c copy mux, so a
+    // re-probe cannot see the title - there we match on LANGUAGE alone, else a titled sidecar we DID embed never matches its now-title-less stream. A bundle
+    // additionally has to see a font attachment in the file: carrying fonts is its whole reason to exist, so confirming only its subtitle would let the
+    // archive go while the styling stayed broken. Metadata can only ever say "something like this is here", never "this one is here" - a sidecar the user
+    // edited keeps its name and matches just as well - so it decides alone only for a bundle (an archive is not comparable text) or when the text cannot be
+    // read at all. Otherwise both readers require the sidecar's own bytes to be one of the tracks.
     const markerConfirmsEmbedded = (f, subs, anyFont, mp4Target) => (!f.bundle || anyFont) && subs.some((s) =>
         langKey(resolveLang(s) || 'und') === langKey(f.lang || 'und') && (mp4Target || (s.tags?.title || '') === (f.title || '')));
 
@@ -1294,10 +1340,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         catch (e) { return `☒[${delReason}] Could not delete ${listName}: ${e && e.message ? e.message : e}\n`; }
     };
 
-    // import_remove_sidecar's actual deletion. Called ONLY from the post-processing pass, once Tdarr has accepted the transcode and moved it into
-    // the library, so the embedded copy is the one that survives. Each marker-listed sidecar is confirmed against the accepted file's streams before it is
-    // unlinked (markerConfirmsEmbedded, above); the marker VALUE still scopes deletion to names we listed, so that guard holds on mp4 too. A false negative
-    // merely keeps the sidecar (a later pass, or the user, removes it) and never loses subtitle content, so this fails safe.
+    // import_remove_sidecar's actual deletion. Called ONLY from the post-processing pass, once Tdarr has accepted the transcode and moved it into the
+    // library, so the embedded copy is the one that survives. This unlink is the one irreversible thing the plugin does, so each marker-listed sidecar has to
+    // be proved against the accepted file's own text before it goes; the marker VALUE still scopes deletion to names we listed, so no file outside this
+    // video's sidecars is ever a candidate. A false negative merely keeps the sidecar (a later pass, or the user, removes it) and never loses subtitle
+    // content, so this fails safe.
     const deleteImportedSidecars = (streamList, globalTags, mp4Target) => {
         const delReason = 'import_remove_sidecar=true';   // this pass only runs when removal is on
         const marked = new Set(decodeMarkerList(getTagCI(globalTags || {}, 'awk_sub_worker')));
@@ -1306,25 +1353,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (scan.err) return { deleted: 0, log: `☒[${delReason}] Cannot read the library directory to remove imported sidecars: ${scan.err.message || scan.err}\n` };
         const embedded = streamList.filter((s) => (s.codec_type || '').toLowerCase() === 'subtitle');
         const anyFont = streamList.some((s) => (s.codec_type || '').toLowerCase() === 'attachment' && isFontAttachment(s));
-        // Language + title is a proxy for "this is in the file"; the TEXT is the fact itself. So a sidecar the metadata cannot vouch for gets the same
-        // content test the import side uses, and only a sidecar neither test can confirm survives. This is what lets a copy the user named themselves be
-        // cleaned up: its title matches no track by construction, yet its content is provably one of them. Strictly safer than the metadata check too - it
-        // cannot pass for a sidecar that merely resembles a track. The hashes cost one pass over the file, so they are computed only once a metadata check
-        // has already failed, and never for a bundle: an .mks is an archive, and its fonts are what the metadata path checks for.
+        // Language + title is a proxy for "this is in the file"; the TEXT is the fact itself, and only the fact may authorise an unlink. So the content test
+        // is the PRIMARY one for every ordinary sidecar, and the metadata match survives only as the fallback the content cannot cover: a bundle (an .mks is
+        // an archive, and its fonts are what the metadata path checks for) and a probe that could not run at all. This is also what lets a copy the user named
+        // themselves be cleaned up: its title matches no track by construction, yet its content is provably one of them. The hashes cost one pass over the
+        // accepted library file, now paid by every successful round trip rather than only by the ones metadata could not vouch for - the price of never
+        // unlinking a sidecar on a resemblance. `confirmed` returns the REASON it may go, so the deletion line reports what was actually proved.
         let hashes;
         const contentConfirms = (f) => {
             if (f.bundle) return false;
             if (hashes === undefined) hashes = embeddedTextHashes(embedded);
             if (!hashes || !hashes.size) return false;
-            let h = '';
-            try { h = crypto.createHash('sha1').update(fs.readFileSync(path.join(workLibDir(), f.rel))).digest('hex'); } catch (e) { return false; }
-            return [...hashes.values()].includes(h);
+            const h = sidecarSha1(f.rel);
+            return !!h && [...hashes.values()].includes(h);
         };
-        const confirmed = (f) => markerConfirmsEmbedded(f, embedded, anyFont, mp4Target) || contentConfirms(f);
+        const confirmed = (f) => {
+            if (!f.bundle && contentConfirms(f)) return 'its text is in the file';
+            const metaOnly = f.bundle || !hashes || !hashes.size;   // an archive, or a probe that could not run - the two cases the text cannot settle
+            return (metaOnly && markerConfirmsEmbedded(f, embedded, anyFont, mp4Target)) ? 'the file carries a matching subtitle' : '';
+        };
         let deleted = 0; let log = '';
         for (const f of scan.rels.map(parseSidecarRel).filter(Boolean).filter((x) => marked.has(x.rel))) {
-            if (!confirmed(f)) { log += `☒[${delReason}] Marker lists ${f.rel} but no embedded subtitle matches its language/title, and its text is not in the file either - not deleting (unverified)\n`; continue; }
-            try { fs.unlinkSync(path.join(workLibDir(), f.rel)); deleted += 1; log += `☑[${delReason}] Deleted sidecar (embedded): ${f.rel}\n`; }
+            const why = confirmed(f);
+            if (!why) { log += `☒[${delReason}] Marker lists ${f.rel} but nothing in the file is confirmed to be it - not deleting (unverified)\n`; continue; }
+            try { fs.unlinkSync(path.join(workLibDir(), f.rel)); deleted += 1; log += `☑[${delReason}] Deleted sidecar (${why}): ${f.rel}\n`; }
             catch (e) { log += `☒[${delReason}] Could not delete sidecar ${f.rel}: ${e && e.message ? e.message : e}\n`; }
         }
         log += deleteSpentSubtitleList(delReason, marked);
@@ -1699,9 +1751,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Import is NON-DESTRUCTIVE: every recognized sidecar not already handled by our own prior pass (marker) is muxed in. We do NOT suppress a
         // sidecar just because an embedded sub shares its lang|title|disposition - metadata can't prove same content, and dropping a distinct track is
         // data loss, whereas a redundant duplicate is not. Genuine duplication is collapsed by CONTENT instead (deduplicate, below).
-        // The marker suppresses a re-import only while the file STILL CARRIES that subtitle (markerConfirmsEmbedded). Suppressing on the marker alone would
-        // strand every sidecar of a second round trip: nothing clears the tag, so the extract that stripped the subtitles left it naming them all, and the
-        // next import would skip the lot. Either way the decision is logged - "nothing happened" and "nothing needed to happen" look identical from outside.
+        // The marker suppresses a re-import only while the file STILL CARRIES that subtitle - the metadata match here, plus the group's own text further
+        // down. Suppressing on the marker alone would strand every sidecar of a second round trip: nothing clears the tag, so the extract that stripped the
+        // subtitles left it naming them all, and the next import would skip the lot. Either way the decision is logged - "nothing happened" and "nothing
+        // needed to happen" look identical from outside.
         // The import muxes each sidecar as -i "${libDir}/${name}"; a " or control char in that real on-disk path would close the quote and inject
         // ffmpeg args (see pathIsPresetSafe), and unlike a name we generate it must match the file byte-for-byte, so it can't be sanitised - skip it
         // instead (a server-native/user file we can't safely reference), never break out.
@@ -1724,9 +1777,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return false;
         });
 
-        // Group candidates by byte-identical file content (disabled => every file is its own group). readFileSync can't fail for a file readdir just
-        // listed, but guard anyway: an unreadable file gets a unique key so it is imported on its own, never silently dropped or merged.
-        const contentKey = (f) => { try { return crypto.createHash('sha1').update(fs.readFileSync(path.join(workLibDir(), f.rel))).digest('hex'); } catch (e) { return `unreadable:${f.rel}`; } };
+        // Group candidates by byte-identical file content (disabled => every file is its own group). A file whose bytes cannot be read - gone since the
+        // readdir, or too large to be a subtitle at all - gets a unique key, so it is imported on its own, never silently dropped or merged.
+        const contentKey = (f) => sidecarSha1(f.rel) || `unreadable:${f.rel}`;
         const groups = []; const groupHash = new Map();
         if (!dedupeSidecars) { for (const f of candidates) groups.push([f]); }
         else { const byHash = new Map(); for (const f of candidates) { const h = contentKey(f); let g = byHash.get(h); if (!g) { g = []; byHash.set(h, g); groups.push(g); groupHash.set(g, h); } g.push(f); } }
@@ -1746,24 +1799,40 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
         });
 
-        // The marker skip, now that a group has ONE identity. A group is done only when EVERY member is confirmed embedded: a partly-confirmed group still
-        // has something to say (its merged title or flags may not be on the track yet), and processing it is harmless because its content is then found
-        // already embedded below. Skipping per FILE instead is what let two names for one subtitle take turns retagging the track on alternate passes.
-        const settled = merged.filter((f) => f.members.every(alreadyEmbedded));
+        // The sha1 of every text track that will STILL be in the file after this pass, so the marker skip below can be decided on the same fact the dedup
+        // further down decides on. embeddedTextHashes memoises its one ffmpeg pass, so the two share it however many times either asks.
+        const survivingTextHashes = () => {
+            const all = embeddedTextHashes(embeddedSubs);
+            return all && new Map([...all].filter(([idx]) => !dupes.dropIdx.includes(idx)));
+        };
+        // The marker names what an earlier import muxed; it cannot say whether the file still holds that TEXT, and a sidecar the user edited keeps its name.
+        // So a group is only settled once its own bytes are one of the surviving tracks - otherwise an edit made between two passes would be skipped as
+        // "already embedded" and silently never reach the file. A bundle is an archive rather than comparable text, and a probe that could not run proves
+        // nothing either way, so both fall back to the marker's metadata match. Group-level by construction: every member of a group is byte-identical.
+        const contentSettles = (f) => {
+            if (f.bundle) return true;
+            const eh = survivingTextHashes();
+            if (!eh || !eh.size) return true;
+            return [...eh.values()].includes(groupHash.get(f.members) || contentKey(f));
+        };
+        // The marker skip, now that a group has ONE identity. A group is done only when EVERY member is confirmed embedded AND the group's text is really
+        // there: a partly-confirmed group still has something to say (its merged title or flags may not be on the track yet), and processing it is harmless
+        // because its content is then found already embedded below. Skipping per FILE instead is what let two names for one subtitle take turns retagging the
+        // track on alternate passes - which is why the content test is applied HERE, to a group that already has its identity, and never to a bare file.
+        const settled = new Set(merged.filter((f) => f.members.every(alreadyEmbedded) && contentSettles(f)));
         for (const f of settled) {
             const names = f.members.length > 1 ? `${f.members.length} copies of it (${f.members.map((m) => m.rel).join(', ')})` : f.rel;
             response.infoLog += `☑Skipping ${names} - already embedded by an earlier pass\n`;
         }
-        merged = merged.filter((f) => !f.members.every(alreadyEmbedded));
+        merged = merged.filter((f) => !settled.has(f));
 
         // Dedup does not stop at sidecar-vs-sidecar. A sidecar whose TEXT is already one of the embedded tracks is just as much a duplicate, and muxing it
         // leaves the file carrying the same subtitle twice - the state extract_remove_stream=false sets up, since the track stayed behind and the sidecar was
         // written from it. No metadata test can see this: retitling a sidecar changes every visible field while the text is untouched, and two tracks can
-        // share a language and title while holding different text. So the content decides (embeddedTextHashes - one ffmpeg pass, reached only from here, and
-        // only when dedup is on and something could actually be a duplicate). The sidecar still counts as consumed: its content is demonstrably in the file,
-        // and preserving the information is the test - not which container it ends up living in.
-        const allHashes = (dedupeSidecars && merged.some((f) => !f.bundle)) ? embeddedTextHashes(embeddedSubs) : new Map();
-        const embeddedHashes = allHashes && new Map([...allHashes].filter(([idx]) => !dupes.dropIdx.includes(idx)));
+        // share a language and title while holding different text. So the content decides (the same surviving-track hashes the marker skip above reads, and
+        // the same single ffmpeg pass). The sidecar still counts as consumed: its content is demonstrably in the file, and preserving the information is the
+        // test - not which container it ends up living in.
+        const embeddedHashes = (dedupeSidecars && merged.some((f) => !f.bundle)) ? survivingTextHashes() : new Map();
         // A bundle is an archive, not comparable text, so it is never matched this way. A null map means the probe could not run: nothing is proven, so
         // every sidecar imports exactly as before - a redundant track can be removed later, a dropped one cannot be recovered.
         const embeddedAt = (f) => {
