@@ -1,7 +1,7 @@
 const details = () => ({
     id: 'Tdarr_Plugin_awk_sub_worker',
     Name: 'Subtitle sidecar worker - extract embedded text subs to sidecars and reimport them',
-    Type: 'Video',
+    Type: 'Subtitle',
     Operation: 'Transcode',
     Description: `Round-trips text subtitles between the container and media-server-style sidecar files so they can be reviewed/edited on disk (by hand or an external script).
 
@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.30.0',
+    Version: '3.30.1',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
