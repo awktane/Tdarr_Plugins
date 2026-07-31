@@ -7,13 +7,13 @@ const details = () => ({
 
                 \\naction=extract writes each embedded TEXT subtitle to a sidecar next to the video (native format: srt/ass/vtt) and, by default, removes those tracks from the file.
                 \\nA STYLED subtitle (ASS/SSA) in a file that has embedded fonts is exported as a bundle named .<video>.s<streamIndex>[.<title>].<lang>[.<flags>].styled.mks - one Matroska holding the subtitle plus those fonts, which leave the video with it (they exist nowhere else, and Matroska is the only container that can carry both). The leading dot hides it from Plex/Jellyfin. Import restores the subtitle and its fonts together. An mp4 target cannot hold font attachments at all, so a bundle is left on disk until the file is mkv again.
-                \\naction=import muxes matching sidecars back into the file (restoring language, title, and disposition) and, by default, deletes the sidecar once it is safely embedded. Import never drops a subtitle - anything not already embedded is muxed in (a copy already present just becomes a duplicate, never a loss); deduplicate collapses byte-identical copies.
+                \\naction=import muxes matching sidecars back into the file (restoring language, title, and disposition) and, by default, deletes the sidecar once it is safely embedded. Import never drops a subtitle - anything not already embedded is muxed in (a copy already present just becomes a duplicate, never a loss).
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>][.<other flags>].<lang>[.<forced|sdh>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and the language plus at most ONE server-documented flag sit last so Plex/Jellyfin/Emby auto-detect them (Plex accepts only one, and forced wins the slot because it drives automatic selection). Every other flag - commentary, descriptive, original, visual_impaired - rides AHEAD of the language, where media servers ignore it and this plugin still reads it, so nothing is lost and nothing confuses them.
                 \\nImport ALSO recognizes sidecars named the way those servers do, with no s<index> (e.g. <video>.en.forced.srt), anchored on the language token: the flag spellings foreign (= forced), cc and hi (= sdh) and default (ignored) are all understood, as is Emby's parenthesized description (<video>.English(Commentary).srt), which becomes the track title. hi is only read as hearing-impaired when a real language precedes it, so <video>.hi.srt stays Hindi.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.33.1',
+    Version: '3.33.2',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -24,8 +24,19 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['import', 'extract'] },
             tooltip: `Which direction to run.
+                \\n=====
+                \\nActions
+                \\n=====
                 \\nextract: pull embedded text subtitles out to sidecar files (and remove them from the video unless extract_remove_stream is off).
                 \\nimport: mux sidecar files back into the video (and delete the sidecar once embedded unless import_remove_sidecar is off).`,
+        },
+        {
+            name: 'only_languages',
+            type: 'string',
+            defaultValue: '',
+            inputUI: { type: 'text' },
+            tooltip: `Optional comma-separated languages to act on (e.g. eng,jpn). Blank = all languages. One form is enough - en, eng, or English all match the same language (including region variants like en-US), so you don't need to list every variant.
+                \\nExample:\\neng,fra`,
         },
         {
             name: 'deduplicate',
@@ -36,18 +47,13 @@ const details = () => ({
                 options: ['enabled', 'enabled_embedded', 'disabled']
             },
             tooltip: `What counts as a copy of a subtitle you already have. The TEXT always decides, so genuinely different tracks - two commentaries, a real forced track vs a full one - are never collapsed; only byte-for-byte duplicates are.
+                \\n=====
+                \\nActions
+                \\n=====
                 \\nenabled - on import, mux one track per byte-identical group of sidecars, combining their flags (a plain + SDH pair imports once, tagged SDH), and skip a sidecar whose text is ALREADY one of the embedded tracks rather than adding a second copy of it. Every member of a group is listed in the marker, so import_remove_sidecar cleans up the whole group. Nothing is removed from the video.
                 \\nenabled_embedded - all of the above, and in BOTH actions also removes a subtitle the video itself carries twice. The lowest-numbered copy survives and inherits the others' flags, title and language, so no tagging is lost. This is the only setting that deletes a subtitle you did not ask to extract, and it costs one extra read of the file to compare the tracks.
                 \\ndisabled - mux every sidecar as its own track, even byte-identical copies (you may end up with duplicate subtitles).
                 \\nWhether the sidecar FILES are deleted afterwards is import_remove_sidecar's decision alone, whatever this is set to.`,
-        },
-        {
-            name: 'only_languages',
-            type: 'string',
-            defaultValue: '',
-            inputUI: { type: 'text' },
-            tooltip: `Optional comma-separated languages to act on (e.g. eng,jpn). Blank = all languages. One form is enough - en, eng, or English all match the same language (including region variants like en-US), so you don't need to list every variant.
-                \\nExample:\\neng,fra`,
         },
         {
             name: 'extract_remove_stream',
@@ -70,6 +76,9 @@ const details = () => ({
                 options: ['true', 'false']
             },
             tooltip: `On import, delete each sidecar whose basename is listed in the file's global awk_sub_worker marker (stamped by the mux pass) once an embedded subtitle matching its language and title confirms the content really is in the file.
+                \\n=====
+                \\nActions
+                \\n=====
                 \\ntrue (default) - delete them once they are safely embedded. The deletion runs in POST-PROCESSING, after you accept the transcode: deleting earlier would destroy the sidecars of a run you then reject, leaving those subtitles nowhere. So ADD THIS PLUGIN TO THE POST-PROCESSING PLUGIN STACK as well as the pre-processing one. Without that, nothing is ever lost, but the sidecars simply stay on disk. That stage runs on the SERVER, which is also how it cleans up for an unmapped node - one has no way of its own to delete a library file, since Tdarr's API offers upload and download but no delete.
                 \\nfalse - leave every sidecar on disk.
                 \\nOne case needs more than that: on an unmapped node with no mount, when every sidecar is ALREADY in the file, there is nothing to mux - so no transcode, no acceptance, and no post-processing pass in which to delete anything. There, true forces a lossless -c copy of the video purely to reach that stage. It is a full read and write to remove a few kB of text, but it is the only route, it happens at most ONCE per file (the pass marks those sidecars and the next one skips them), and asking for them to be deleted is taken as asking for whatever that costs. Set false if you would rather keep them.`,
@@ -83,6 +92,9 @@ const details = () => ({
                 options: ['embedded', 'sidecar']
             },
             tooltip: `Which side owns the language/title/flags when a sidecar's TEXT is already one of the embedded tracks - i.e. who wins a disagreement about a subtitle that is already in the file. Reachable only when deduplicate is comparing text (enabled or enabled_embedded); a sidecar muxed as a NEW track always takes its metadata from its filename, because nothing else describes it.
+                \\n=====
+                \\nActions
+                \\n=====
                 \\nembedded - leave the track exactly as it is and report the difference. Safe with an OLD sidecar name: a name written before a flag existed carries no token for it, and applying it would strip that flag off a track that has it.
                 \\nsidecar  - the filename wins, so renaming a sidecar retunes the track already in the file (language, title and flags, including clearing flags you removed from the name). Use it when you renamed the sidecar deliberately; it costs one remux of the file.`,
         },
@@ -96,6 +108,9 @@ const details = () => ({
             },
             tooltip: `What to do on an UNMAPPED node, which is only ever given a local copy of the video and never sees the library folder. Ignored entirely on a normal (mapped) node.
                 \\nExtract already works everywhere - the sidecar is uploaded to the library through Tdarr's file API. It is IMPORT that has the problem: finding sidecars means listing a directory, and the API offers no way to list one.
+                \\n=====
+                \\nActions
+                \\n=====
                 \\nerror     - fail the file and say so. Nothing is silently skipped; run import on a node that can see the library.
                 \\nmount     - reach the library directly. The node's own path is tried first (a container bind-mounting the library at the server's own path, e.g. /media, needs nothing more), then any "key=value" Node Tag set for this node in the server's web UI, which names where THIS node sees that folder - for example "media=M:\\\\" when the server calls it /media. A tag is needed on Windows and macOS, where the server's path cannot exist locally. Extract writes directly too in this mode, skipping the upload API.
                 \\ntext_file - read "<video>.subtitles.txt" next to the video: one filename per line, lines starting with # ignored. Extract seeds it with what it wrote; after that it is yours to maintain, which is how a subtitle you OCR'd from an exported image sub gets imported. Each name must still follow the sidecar naming convention, since that is where language, title and flags come from.`,
@@ -478,8 +493,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (type === 'subtitle') {
             // A subtitle can also carry 'visual_impaired' and 'original' - mkvtoolnix writes either, and sub_worker's sidecar round trip restores them - but
             // dispositionTypes scopes both to audio, where they mean an audio-description track and the original-language one. 'original' is therefore read as
-            // a RAW flag here: exactly like /default and /forced, a title keyword must not be able to invent one. visual_impaired needs no special case any
-            // more - isDescriptive reads that subtitle-scoped raw flag itself, on the same terms, so the summary and the classifiers cannot disagree about it.
+            // a RAW flag here: exactly like /default and /forced, a title keyword must not be able to invent one. visual_impaired needs no special case
+            // here - isDescriptive reads that subtitle-scoped raw flag itself, on the same terms, so the summary and the classifiers cannot disagree about it.
             const descriptive = isDescriptive(s);
             const role = `${isCommentary(s) ? '/commentary' : ''}${descriptive ? '/description' : ''}${isSdh(s) ? '/sdh' : ''}${isLyrics(s) ? '/lyrics' : ''}`;
             const forced = hasDisposition(s, 'forced') ? '/forced' : '';   // flag OR title keyword, same test the classifiers use - so the summary token and the sort key can never disagree
@@ -809,6 +824,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // for one branch that runs on unmapped nodes alone. Values go through --form-string so a comma or semicolon in a title can never be read as curl -F
     // syntax, and the file part names a temp path built from an index, never from the sidecar name.
     const nullDevice = process.platform === 'win32' ? 'NUL' : '/dev/null';
+    // One ceiling for every spawn in this section. Bounded by the container's size and the node's storage rather than by the sidecar, so it is generous -
+    // but a hung ffmpeg or curl is killed rather than holding the worker forever. curl takes seconds and spawnSync milliseconds; deriving one from the
+    // other keeps the two spellings from drifting.
+    const SIDECAR_SPAWN_TIMEOUT_MS = 1800000;
+    const SIDECAR_SPAWN_TIMEOUT_S = String(SIDECAR_SPAWN_TIMEOUT_MS / 1000);
+    // The server's base URL with any trailing slashes removed, so every caller can append '/api/v2/...' without doubling the separator. '' means the node
+    // config carries no server URL at all, which each caller has to treat as "no route" rather than building a request against an empty host.
+    const serverApiUrl = () => String(nodeConfig.serverURL || '').replace(/\/+$/, '');
     const apiAuthArgs = () => {
         const key = String(nodeConfig.apiKey || '');
         return key ? ['-H', `x-api-key: ${key}`, '-H', `tdarrKey: ${key}`, '-H', `Authorization: Bearer ${key}`] : [];
@@ -818,11 +841,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // never happened). Absent is the common case and answers with a cheap 404, and a hit skips the extraction entirely.
     const sidecarExistsRemote = (dest) => {
         const { spawnSync } = require('child_process');
-        const url = String(nodeConfig.serverURL || '').replace(/\/+$/, '');
+        const url = serverApiUrl();
         if (!url) return false;
-        const r = spawnSync('curl', ['-sS', '-m', '1800', '-o', nullDevice, '-w', '%{http_code} %{size_download}', ...apiAuthArgs(),
+        const r = spawnSync('curl', ['-sS', '-m', SIDECAR_SPAWN_TIMEOUT_S, '-o', nullDevice, '-w', '%{http_code} %{size_download}', ...apiAuthArgs(),
             '-X', 'POST', '-H', 'Content-Type: application/json', '-d', JSON.stringify({ filePath: dest }), `${url}/api/v2/file/download`],
-            { encoding: 'utf8', timeout: 1800000 });
+            { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS });
         const [code, got] = String(r.stdout || '').trim().split(/\s+/);
         return code === '200' && Number(got) > 0;
     };
@@ -837,7 +860,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const placed = new Set(); const failed = new Map();
         const tmpExt = (name) => path.extname(name).replace(/[^.a-z0-9]/gi, '');   // from our own table-driven extension, so the temp name stays ours alone
         const failAll = (why) => { for (const j of jobs) failed.set(j.name, why); return { placed, failed }; };
-        const url = String(nodeConfig.serverURL || '').replace(/\/+$/, '');
+        const url = serverApiUrl();
         if (!url) return failAll('the node config carries no server URL to upload through');
         // A PRIVATE staging directory, not predictable names in the shared temp dir. os.tmpdir() is world-writable on Unix, so a name derived from the pid
         // and an index can be pre-created as a symlink by any other local user, and ffmpeg's -y then writes THROUGH it - overwriting whatever it points at,
@@ -851,9 +874,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const clearStaged = () => { try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch (e) { /* see above */ } };
         const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', String(file._id || file.file || '')];
         for (const j of staged) args.push(...j.args, j.tmp);
-        // The ceiling is bounded by the container's size and the node's storage rather than by the sidecar, so it is generous - but a hung ffmpeg is
-        // killed rather than holding the worker forever.
-        const ff = spawnSync(String(otherArguments?.ffmpegPath || 'ffmpeg'), args, { encoding: 'utf8', timeout: 1800000, maxBuffer: 4 * 1024 * 1024 });
+        const ff = spawnSync(String(otherArguments?.ffmpegPath || 'ffmpeg'), args, { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 });
         if (ff.error || ff.status !== 0) {
             const why = ff.error ? `extraction failed (${ff.error.code || ff.error.message})`
                 : `extraction failed (ffmpeg exit ${ff.status}: ${String(ff.stderr || '').trim().slice(0, 200)})`;
@@ -864,9 +885,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let size = 0;
             try { size = fs.statSync(j.tmp).size; } catch (e) { size = 0; }
             if (!size) { failed.set(j.name, 'extraction produced no data'); continue; }
-            const up = spawnSync('curl', ['-sS', '-m', '1800', '-o', nullDevice, '-w', '%{http_code}', ...apiAuthArgs(),
+            const up = spawnSync('curl', ['-sS', '-m', SIDECAR_SPAWN_TIMEOUT_S, '-o', nullDevice, '-w', '%{http_code}', ...apiAuthArgs(),
                 '--form-string', `filePath=${j.dest}`, '--form-string', `fileSize=${size}`, '--form-string', `nodeID=${String(nodeConfig.nodeID || '')}`,
-                '-F', `file=@${j.tmp}`, `${url}/api/v2/file/upload`], { encoding: 'utf8', timeout: 1800000 });
+                '-F', `file=@${j.tmp}`, `${url}/api/v2/file/upload`], { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS });
             const code = String(up.stdout || '').trim();
             if (!up.error && code === '200') placed.add(j.name);
             else failed.set(j.name, `upload rejected (${up.error ? (up.error.code || up.error.message) : `HTTP ${code || 'no response'}`})`);
@@ -879,7 +900,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language display name =====
     // -=-=-= langDisplayName  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // Memoised ICU DisplayNames (built once, reused): the recognised English name for an ALREADY-normalised language code, or '' for a non-language/unknown
-    // code. A fresh ICU instance per call is wasteful. Each caller normalises the token first - clean_and_remux via shortLang (tag recognition), audio_clean
+    // code. A fresh ICU instance per call is wasteful. Each caller normalises the token first - clean_and_remux via shortLang (tag recognition),
     // audio_clean, stream_ordering and sub_worker via langKey (free-text language-list validation / sidecar name recognition).
     const langDisplayName = (() => {
         let dn = null;
@@ -1039,6 +1060,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //   text_file - no directory access at all; the user lists the filenames and each is fetched by name through the download API.
     const unmappedMode = String(inputs.method_unmapped || 'error').toLowerCase();
     const SUBTITLE_LIST_SUFFIX = '.subtitles.txt';
+    // Spawn ceilings for the helpers below, named once. curl counts SECONDS and spawnSync MILLISECONDS, so each pair is derived from a single number rather
+    // than written twice - the two spellings of one duration are exactly what drifts. Sized by what the call actually moves: the node registry is a small
+    // JSON document, a library file transfer is not, and the two ffmpeg/ffprobe reads scale with the container. Each is a ceiling on a hang, not a target.
+    const NODE_TAG_FETCH_S = 30;
+    const LIBRARY_DOWNLOAD_S = 600;
+    const SIDECAR_UPLOAD_S = 300;
+    const PROBE_TIMEOUT_MS = 300000;
+    const SUB_EXTRACT_TIMEOUT_MS = 600000;
 
     // This node's Node Tags, as [key, value] pairs. One request, memoised, and only ever made when something actually needs it. Tdarr maintains entries in
     // the SAME field - a node restart rewrites it to e.g. "unmapped,media=M:\" - so the field is shared, not ours: split on commas and keep only the
@@ -1048,10 +1077,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return () => {
             if (cached) return cached;
             cached = [];
-            const url = String(nodeConfig.serverURL || '').replace(/\/+$/, '');
+            const url = serverApiUrl();
             if (!url) return cached;
             const { spawnSync } = require('child_process');
-            const r = spawnSync('curl', ['-sS', '-m', '30', ...apiAuthArgs(), `${url}/api/v2/get-nodes`], { encoding: 'utf8', timeout: 30000, maxBuffer: 8 * 1024 * 1024 });
+            const r = spawnSync('curl', ['-sS', '-m', String(NODE_TAG_FETCH_S), ...apiAuthArgs(), `${url}/api/v2/get-nodes`], { encoding: 'utf8', timeout: NODE_TAG_FETCH_S * 1000, maxBuffer: 8 * 1024 * 1024 });
             if (r.error || r.status !== 0) return cached;
             try {
                 const reg = JSON.parse(String(r.stdout || '')) || {};
@@ -1100,13 +1129,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // curl's EXIT STATUS is part of the success test, not just the HTTP code: a transfer that dies after the response headers - the -m timeout, a dropped
     // connection - still reports %{http_code} 200 and leaves a non-empty file, so testing the code alone would call a truncated download complete.
     const downloadLibraryFile = (dest, local) => {
-        const url = String(nodeConfig.serverURL || '').replace(/\/+$/, '');
+        const url = serverApiUrl();
         if (!url) return 'the node config carries no server URL';
         const { spawnSync } = require('child_process');
         try { fs.mkdirSync(path.dirname(local), { recursive: true }); } catch (e) { /* already there */ }
-        const r = spawnSync('curl', ['-sS', '-m', '600', '-o', local, '-w', '%{http_code}', ...apiAuthArgs(),
+        const r = spawnSync('curl', ['-sS', '-m', String(LIBRARY_DOWNLOAD_S), '-o', local, '-w', '%{http_code}', ...apiAuthArgs(),
             '-X', 'POST', '-H', 'Content-Type: application/json', '-d', JSON.stringify({ filePath: dest }), `${url}/api/v2/file/download`],
-            { encoding: 'utf8', timeout: 600000 });
+            { encoding: 'utf8', timeout: LIBRARY_DOWNLOAD_S * 1000 });
         const code = String(r.stdout || '').trim();
         let size = 0; try { size = fs.statSync(local).size; } catch (e) { size = 0; }
         if (!r.error && r.status === 0 && code === '200' && size > 0) return '';
@@ -1165,12 +1194,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         catch (e) { return `could not stage the list (${e && e.message ? e.message : e})`; }
         const tmp = path.join(stageDir, 'list.txt');
         try { fs.writeFileSync(tmp, body); } catch (e) { return `could not stage the list (${e && e.message ? e.message : e})`; }
-        const url = String(nodeConfig.serverURL || '').replace(/\/+$/, '');
+        const url = serverApiUrl();
         const { spawnSync } = require('child_process');
         const size = fs.statSync(tmp).size;
-        const up = spawnSync('curl', ['-sS', '-m', '300', '-o', nullDevice, '-w', '%{http_code}', ...apiAuthArgs(),
+        const up = spawnSync('curl', ['-sS', '-m', String(SIDECAR_UPLOAD_S), '-o', nullDevice, '-w', '%{http_code}', ...apiAuthArgs(),
             '--form-string', `filePath=${dest}`, '--form-string', `fileSize=${size}`, '--form-string', `nodeID=${String(nodeConfig.nodeID || '')}`,
-            '-F', `file=@${tmp}`, `${url}/api/v2/file/upload`], { encoding: 'utf8', timeout: 300000 });
+            '-F', `file=@${tmp}`, `${url}/api/v2/file/upload`], { encoding: 'utf8', timeout: SIDECAR_UPLOAD_S * 1000 });
         try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
         const code = String(up.stdout || '').trim();
         return (!up.error && code === '200') ? '' : `upload rejected (${up.error ? (up.error.code || up.error.message) : `HTTP ${code || 'no response'}`})`;
@@ -1252,7 +1281,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const ffprobePath = ffmpegPath.replace(/ffmpeg(\.exe)?$/i, (m) => (m.toLowerCase().endsWith('.exe') ? 'ffprobe.exe' : 'ffprobe'));
         const { spawnSync } = require('child_process');
         const r = spawnSync(ffprobePath, ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', target],
-            { encoding: 'utf8', timeout: 300000, maxBuffer: 8 * 1024 * 1024 });
+            { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 });
         if (r.error || r.status !== 0) return null;
         try { const j = JSON.parse(r.stdout); return Array.isArray(j.streams) ? { streams: j.streams, tags: j.format?.tags || {} } : null; } catch (e) { return null; }
     };
@@ -1285,7 +1314,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             outs.set(s.index, out);
         }
         const { spawnSync } = require('child_process');
-        const r = spawnSync(String(otherArguments?.ffmpegPath || 'ffmpeg'), args, { encoding: 'utf8', timeout: 600000, maxBuffer: 8 * 1024 * 1024 });
+        const r = spawnSync(String(otherArguments?.ffmpegPath || 'ffmpeg'), args, { encoding: 'utf8', timeout: SUB_EXTRACT_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 });
         if (!r.error && r.status === 0) {
             const map = new Map();
             for (const [idx, out] of outs) {
@@ -1458,7 +1487,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const removeAfterExtract = String(inputs.extract_remove_stream) === 'true';
     const removeSidecarAfterImport = String(inputs.import_remove_sidecar) === 'true';
     const dstContainer = String(file.container || '').toLowerCase().trim();
-    const isMp4 = isMp4Family(dstContainer);   // shared checker; cached once for this container
+    const isMp4 = isMp4Family(dstContainer);
     // The one rule for writing a language into the output container: mp4 stores only lowercase 3-letter ISO 639-2/T, while mkv keeps the sidecar spelling.
     const langMetaValue = (l) => escMeta(isMp4 ? to6392T(l) : normSidecarLang(l));
     // Flush a folded tag set into output-side args. A folded tag set is addressed by the keeper's position among the SURVIVING subtitle streams, which is
@@ -1497,12 +1526,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Preserve Dolby Vision's dvcC/dvvC boxes on either -c copy remux below (see dvStrictMp4Arg) - a plain copy of a DV HEVC/AV1 stream drops them,
     // demoting DV to plain HEVC/AV1.
     const dvStrictArg = dvStrictMp4Arg(dstContainer, streams);
-    // Commit a built output-side arg string as the run: append the DV strict flag, then (mp4 only) -movflags use_metadata_tags so a -c copy keeps sibling
-    // plugins' global awk_* tags (awk_video/awk_recovered), then the universal output options - and set response.processFile, Tdarr's go/no-go switch, so
-    // calling this IS the commit point for the whole run. Shared by the extract and import branches so their tails can't drift.
     // The stream-summary token line. The input summary and both "Expected results" summaries are meant to be the SAME view of the stream set before and
     // after, and the two expected-results lines sit in mutually exclusive branches - so three hand-typed copies could drift in a way only one run type shows.
     const summariseAll = (list) => list.map((s) => summariseStream(enrichStream(s))).join('');
+    // Commit a built output-side arg string as the run: append the DV strict flag, then (mp4 only) -movflags use_metadata_tags so a -c copy keeps sibling
+    // plugins' global awk_* tags (awk_video/awk_recovered), then the universal output options - and set response.processFile, Tdarr's go/no-go switch, so
+    // calling this IS the commit point for the whole run. Shared by the extract and import branches so their tails can't drift.
     const commitPreset = (out) => {
         let full = out + dvStrictArg;
         if (isMp4) full += ' -movflags use_metadata_tags';
@@ -1544,7 +1573,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
             // sidecarOut carries the extra ffmpeg outputs that write the sidecars on a MAPPED node. On an unmapped node it stays empty and the same
             // extractions are collected in placeJobs instead, to be run and uploaded by placeSidecars once the loop has seen every stream.
-            let sidecarOut = ''; const removedIndices = new Set(dupes.dropIdx); let wrote = 0; let skipped = 0; let unsafe = 0; let bundled = 0;
+            let sidecarOut = ''; const removedIndices = new Set(dupes.dropIdx); let wrote = 0; let skipped = 0; let refused = 0; let bundled = 0;
             const placeJobs = [];
             for (const s of eligible) {
                 const { enc } = TEXT_SUB[String(s.codec_name).toLowerCase()];
@@ -1556,7 +1585,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // literal, so the extract is skipped instead. The stream is NOT recorded in removedIndices either: a refused extract must never strip the
                 // embedded track, which would then be the only remaining copy.
                 if (!pathIsPresetSafe(full)) {
-                    unsafe += 1;
+                    refused += 1;
                     response.infoLog += `☒${streamTag(s.index)} Library directory contains a quote or control character - cannot write ${name} safely, keeping the embedded subtitle\n`;
                     continue;
                 }
@@ -1564,7 +1593,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // claiming the path there is no server-side destination at all, and the extract is refused exactly as an unsafe path is.
                 const remoteDest = placeViaApi() ? serverSidePath(full) : '';
                 if (placeViaApi() && !remoteDest) {
-                    unsafe += 1;
+                    refused += 1;
                     response.infoLog += `☒${streamTag(s.index)} No path translator maps this library directory back to the server - cannot write ${name}, keeping the embedded subtitle\n`;
                     continue;
                 }
@@ -1598,7 +1627,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const { placed, failed } = placeSidecars(placeJobs);
                 for (const j of placeJobs) {
                     if (!placed.has(j.name)) {
-                        unsafe += 1;
+                        refused += 1;
                         response.infoLog += `☒${streamTag(j.index)} Could not place ${j.name} in the library - ${failed.get(j.name)}, keeping the embedded subtitle\n`;
                         continue;
                     }
@@ -1634,7 +1663,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // its ☒ lines into a successful log; that is a partial result, not a failed one - and a sidecar an earlier pass already placed (skipped) is
             // landed just as much as one written this pass, since sitting in the library is the only property the rest of the round trip depends on.
             if (!sidecarOut && !removedIndices.size) {
-                if (unsafe && !wrote && !skipped) failFile('No subtitle could be extracted - every eligible subtitle was refused, see the reasons above');
+                if (refused && !wrote && !skipped) failFile('No subtitle could be extracted - every eligible subtitle was refused, see the reasons above');
                 return skip(wrote ? '☑[extract_remove_stream=false] Sidecars placed in the library - nothing left to remux\n'
                     : '☑All eligible subtitles already extracted\n');
             }
