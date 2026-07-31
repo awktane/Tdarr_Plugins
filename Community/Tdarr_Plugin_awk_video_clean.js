@@ -9,7 +9,7 @@ const details = () => ({
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n
                      UPGRADING FROM 2.x - inputs were renamed/reworked in 3.0.0, and Tdarr stores settings by input name, so that upgrade RESET them to defaults - re-check your video_clean settings: encoder->method_encoder, speed->method_speed, force_bit_depth->method_bitdepth, max_height->height_cap (value 'original'->'source'), method_hdr->hdr_mode, guard_min_bitrate->guard_shrink_bitrate (now shrink-only); the old preserve_dv is now the guard_dv toggle (default on); guard_reprocess is gone (use action=shrink); codec gained a 'source' value (keep the source codec).\n\n`,
-    Version: '3.8.0',
+    Version: '3.9.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -208,8 +208,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // detection, and clean_and_remux's title/flag tagging. Shared verbatim across all five awk plugins.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                                            tag: 'Commentary'  },
-        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','dvs','audio description','visually impaired','visual impaired'], tag: 'Descriptive' },
-        descriptions:     { streams:['subtitle'],                 keywords: ['descriptive','dvs'],                                     tag: 'Descriptive' },
+        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','descriptions','dvs','audio description','visually impaired','visual impaired'], tag: 'Descriptive' },
+        descriptions:     { streams:['subtitle'],                 keywords: ['descriptive','descriptions','dvs'],                      tag: 'Descriptive' },
         hearing_impaired: { streams:['subtitle'],                 keywords: ['sdh','hearing impaired','hard of hearing','hoh','deaf'], tag: 'SDH'         },
         captions:         { streams:['subtitle'],                 keywords: ['caption','captions','cc'],                               tag: 'SDH'         },
         lyrics:           { streams:['subtitle'],                 keywords: ['songs','lyrics'],                                        tag: 'Lyrics'      },
@@ -292,6 +292,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['dsd',    'dsd'],       // DSD / SACD (1-bit): fold dsd_lsbf/dsd_msbf(_planar) to one lossless key
         ['mp4als', 'als'],       // MPEG-4 ALS: fold the mp4-wrapped spelling to the 'als' codecInfo key (a bare 'als' resolves directly)
         ['adpcm',  'adpcm'],
+        ['gsm',    'gsm'],      // GSM 06.10 full-rate and the Microsoft variant (gsm_ms) are one speech family - fold to one key
+        ['qdm',    'qdm'],      // QDesign Music 1 and 2 (qdmc/qdm2), old QuickTime - fold to one key
         ['wmavoice', 'wmavoice'],   // WMA Voice: low-bitrate SPEECH codec, not music-grade WMA - keep distinct so the wmav prefix below doesn't score it as full WMA
         ['wmav',   'wma'],
         ['atrac',  'atrac'],
@@ -300,7 +302,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     ];
     // -=-=-= resolveCodecName  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the _x variant when DTS:X is detected)
-    // and eac3 into eac3atmos. Used for scoring by audioQuality (audio_clean, stream_ordering) and isLosslessSource (audio_clean), and by summariseStream
+    // and eac3/truehd into eac3atmos/truehdatmos. Used by audioQuality (audio_clean, stream_ordering), isLosslessSource (audio_clean), and summariseStream
     // (all five) purely for accurate display labeling - a plugin that doesn't score audio still benefits from showing "eac3atmos"/"dtsx" instead of a bare
     // "eac3"/"dts" in its logs. codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't tell the
     // subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to mediaInfo's Format_Commercial_IfAny ("DTS-HD
@@ -346,8 +348,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (/\bxll x\b/.test(additionalFeatures) || /dts:?x/.test(profile))
                     codec = DTS_X_VARIANT[codec];
             }
-        } else if (codec === 'eac3' && (longName.includes('atmos') || commercial.includes('atmos') || profile.includes('atmos')))
-            codec = 'eac3atmos';
+        } else if ((codec === 'eac3' || codec === 'truehd') && (longName.includes('atmos') || commercial.includes('atmos') || profile.includes('atmos')))
+            codec = codec === 'eac3' ? 'eac3atmos' : 'truehdatmos';
 
         return codec;
     };
@@ -360,7 +362,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         dtsma:   'dts-hd-ma',   dtsmax:      'dts-hd-ma-x',
         dtshr:   'dts-hd-hr',   dtshrx:      'dts-hd-hr-x',
         dtsx:    'dts-x',       dtsexpress:  'dts-express',   dtsexpressx: 'dts-express-x',
-        eac3atmos: 'eac3-atmos', mpegh3d: 'mpeg-h',
+        eac3atmos: 'eac3-atmos', truehdatmos: 'truehd-atmos', mpegh3d: 'mpeg-h',
     };
     const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
     // ===== END SHARED: codec name resolution =====
@@ -1080,7 +1082,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             : '';
 
         // ---- shared emit helpers ----
-        const coverArtDrops = videoStreams.filter((s) => isCoverArt(s)).map((s) => ` -map -0:${s.index}`).join('');   // drop embedded cover-art/still-image "video" streams from any output
+        const coverArtStreams = videoStreams.filter((s) => isCoverArt(s));                                 // embedded cover-art / still-image "video" streams
+        const coverArtDrops = coverArtStreams.map((s) => ` -map -0:${s.index}`).join('');                  // dropped from every output this plugin emits
+        // clean_and_remux logs the identical removal, and the infoLog contract gives a queued change its own ☐ line - without this the only trace is the
+        // stream's absence from the ☑ summary, which a user has to spot by diffing two lines. Appended by whichever preset path runs rather than built
+        // here, because on a skipped file no preset is emitted and nothing is dropped, so an unconditional line would announce work that never happens.
+        // No [input=...] tag: no user setting causes this, the stream simply is not video. In the designed run order clean_and_remux has already dropped
+        // these, so this only ever fires when video_clean runs standalone or first - exactly when no other plugin's log explains the removal.
+        const coverArtLog = coverArtStreams
+            .map((s) => `☐${streamTag(s.index)} Remove cover-art/thumbnail (video-${(s.codec_name || 'unknown').trim().toLowerCase()})\n`)
+            .join('');
         // Apple/QuickTime fourCC for a COPIED stream. Gated on isQtVideoContainer, not isMp4Family: the shared block states video_clean's fourCC gate is
         // deliberately mp4/m4v/mov WITHOUT m4a, and reusing isMp4Family here silently broke that guarantee. The CODEC COVERAGE difference against the encode
         // path below is intentional and must stay: this path copies an arbitrary source codec (so it maps all three), while the encode path only ever emits a
@@ -1097,6 +1108,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (isMp4Family(dstContainer)) out += ' -movflags use_metadata_tags';   // same as the transcode path: keep sibling plugins' GLOBAL awk_* markers through an mp4/mov copy
             response.preset = `<io>${out}`;   // no input-side args
             response.processFile = true;
+            response.infoLog += coverArtLog;
             // The strip removes exactly the layer the 'dv'/'hdr10+' token names, so the prediction clears the same carriers the transcode prediction does -
             // the dvhe/dvh1 fourcc, the DOVI record, and the mediaInfo join (via the index) - leaving the HDR10/HLG base's own transfer, inferred off
             // HDR_Format when neither probe reported one. Everything else about the stream is untouched, since this path is a -c:v copy.
@@ -1204,6 +1216,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             out += globalOutputOpt;
             response.preset = `${enc.inputSide}<io>${out}`;
             response.processFile = true;
+            response.infoLog += coverArtLog;
             response.infoLog += `☐${streamTag(primary.index)}${encodeTag} Transcoding video @ ${sel.encoderName} q${Math.round(qNorm)}\n`;
             // Predict the re-encoded stream through the shared summariseStream (single source of truth for the [video:...]
             // token) so Expected-results matches the input-summary format; depth is exact via bits_per_raw_sample with

@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.8.0',
+    Version: '4.9.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -158,8 +158,9 @@ const details = () => ({
                 \\nall: remove all image-based subtitles from any container (use when you only want text subtitles).
                 \\nexport: save each image subtitle to a hidden sidecar next to the video (PGS -> ".<name>.<lang>.sup", VobSub/DVB -> ".<name>.<lang>.mks") and then remove it. The leading dot keeps Plex/Jellyfin from indexing it; run an external OCR tool on the sidecars to produce .srt, then reimport with awk_sub_worker. One-way - these are never reimported by this plugin.
                 \\nRemote-node caveat: the sidecar lands next to the source file, which reaches the server only if this node shares the library filesystem. On an unmapped/remote node Tdarr copies back the transcoded video but NOT the sidecar, so the image subtitle is lost (and image subs can't be OCR-recovered once gone) - run export only on filesystem-sharing nodes.
-                \\nEmby caveat: Emby does NOT skip dot-prefixed files, so an exported .mks may surface as a stray library item (it ignores .sup outright). On Emby, add a .embyignore file (4.9+) listing ".*" in the library root, or OCR and delete the sidecars before the next scan.
-                \\nText subtitles are never affected. xsub is always removed (no Matroska CodecID) and is not exported.`,
+                \\nEmby caveat: Emby does NOT skip dot-prefixed files, so an exported sidecar may surface as a stray library item (it ignores .sup outright). This matters most for the xsub .avi: that is a full VIDEO container holding no video, so Emby indexes it as a broken zero-duration title, where a stray .mks is merely an odd entry. On Emby, add a .embyignore file (4.9+) listing ".*" in the library root, or OCR and delete the sidecars before the next scan.
+                \\nxsub (DivX) is ALWAYS removed whatever this is set to - no container can carry it - but export still saves it first, to a ".<name>.<lang>.avi" (AVI is the only format that holds xsub).
+                \\nText subtitles are never affected. ttml is kept on mp4 (it stores as stpp) and removed only on mkv, which has no CodecID for it.`,
         },
         {
             name: 'remove_sub_sdh',
@@ -229,7 +230,7 @@ const details = () => ({
                  \\ndisabled: no timestamp recovery.
                  \\nlight (risk-free): -fflags +genpts and -avoid_negative_ts make_zero - regenerates missing PTS and shifts negative start times to zero. Touches no frame data.
                  \\naggressive: additionally -fflags +igndts - ignores the source DTS and fully rebuilds the timeline (fixes "Non-monotonous DTS"). Can produce odd results, so only use it if light didn't help.
-                 \\nThe mode actually applied is recorded in an awk_recovered tag. Recovery re-runs only when a recover_bad_* mode changes, then settles (it won't reprocess every pass). Container-forced timestamp fixes for ts/avi/mpg/mpeg still always apply.`,
+                 \\nThe mode actually applied is recorded in an awk_recovered tag. Recovery re-runs only when a recover_bad_* mode changes, then settles (it won't reprocess every pass). Container-forced timestamp fixes still always apply, for the whole MPEG-TS family (ts/m2ts/mts/m2t), the whole MPEG-PS family (mpg/mpeg/vob/evo), and avi.`,
         },
     ],
 });
@@ -284,8 +285,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // detection, and clean_and_remux's title/flag tagging. Shared verbatim across all five awk plugins.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                                            tag: 'Commentary'  },
-        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','dvs','audio description','visually impaired','visual impaired'], tag: 'Descriptive' },
-        descriptions:     { streams:['subtitle'],                 keywords: ['descriptive','dvs'],                                     tag: 'Descriptive' },
+        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','descriptions','dvs','audio description','visually impaired','visual impaired'], tag: 'Descriptive' },
+        descriptions:     { streams:['subtitle'],                 keywords: ['descriptive','descriptions','dvs'],                      tag: 'Descriptive' },
         hearing_impaired: { streams:['subtitle'],                 keywords: ['sdh','hearing impaired','hard of hearing','hoh','deaf'], tag: 'SDH'         },
         captions:         { streams:['subtitle'],                 keywords: ['caption','captions','cc'],                               tag: 'SDH'         },
         lyrics:           { streams:['subtitle'],                 keywords: ['songs','lyrics'],                                        tag: 'Lyrics'      },
@@ -368,6 +369,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['dsd',    'dsd'],       // DSD / SACD (1-bit): fold dsd_lsbf/dsd_msbf(_planar) to one lossless key
         ['mp4als', 'als'],       // MPEG-4 ALS: fold the mp4-wrapped spelling to the 'als' codecInfo key (a bare 'als' resolves directly)
         ['adpcm',  'adpcm'],
+        ['gsm',    'gsm'],      // GSM 06.10 full-rate and the Microsoft variant (gsm_ms) are one speech family - fold to one key
+        ['qdm',    'qdm'],      // QDesign Music 1 and 2 (qdmc/qdm2), old QuickTime - fold to one key
         ['wmavoice', 'wmavoice'],   // WMA Voice: low-bitrate SPEECH codec, not music-grade WMA - keep distinct so the wmav prefix below doesn't score it as full WMA
         ['wmav',   'wma'],
         ['atrac',  'atrac'],
@@ -376,7 +379,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     ];
     // -=-=-= resolveCodecName  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the _x variant when DTS:X is detected)
-    // and eac3 into eac3atmos. Used for scoring by audioQuality (audio_clean, stream_ordering) and isLosslessSource (audio_clean), and by summariseStream
+    // and eac3/truehd into eac3atmos/truehdatmos. Used by audioQuality (audio_clean, stream_ordering), isLosslessSource (audio_clean), and summariseStream
     // (all five) purely for accurate display labeling - a plugin that doesn't score audio still benefits from showing "eac3atmos"/"dtsx" instead of a bare
     // "eac3"/"dts" in its logs. codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't tell the
     // subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to mediaInfo's Format_Commercial_IfAny ("DTS-HD
@@ -422,8 +425,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (/\bxll x\b/.test(additionalFeatures) || /dts:?x/.test(profile))
                     codec = DTS_X_VARIANT[codec];
             }
-        } else if (codec === 'eac3' && (longName.includes('atmos') || commercial.includes('atmos') || profile.includes('atmos')))
-            codec = 'eac3atmos';
+        } else if ((codec === 'eac3' || codec === 'truehd') && (longName.includes('atmos') || commercial.includes('atmos') || profile.includes('atmos')))
+            codec = codec === 'eac3' ? 'eac3atmos' : 'truehdatmos';
 
         return codec;
     };
@@ -436,7 +439,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         dtsma:   'dts-hd-ma',   dtsmax:      'dts-hd-ma-x',
         dtshr:   'dts-hd-hr',   dtshrx:      'dts-hd-hr-x',
         dtsx:    'dts-x',       dtsexpress:  'dts-express',   dtsexpressx: 'dts-express-x',
-        eac3atmos: 'eac3-atmos', mpegh3d: 'mpeg-h',
+        eac3atmos: 'eac3-atmos', truehdatmos: 'truehd-atmos', mpegh3d: 'mpeg-h',
     };
     const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
     // ===== END SHARED: codec name resolution =====
@@ -928,24 +931,39 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Subtitle codecs dropped purely by container/format, regardless of language - never assigned language_fill (counted separately by the
     // language_fill_mode check below). alwaysDropSubs is unmuxable by BOTH containers: eia_608 (closed-caption data embedded in the video
-    // bitstream, not a real subtitle stream) and ttml (no working ffmpeg encoder/muxer path) either way; xsub and dvb_teletext have no Matroska
-    // CodecID, so mkv rejects them too. mp4OnlyDropSubs muxes fine in mkv but not mp4: the image-based PGS/VobSub/DVB formats, plus arib_caption
-    // and hdmv_text_subtitle (both decode-only for mp4; hdmv_text_subtitle copies into mkv fine).
-    const alwaysDropSubs  = ['eia_608', 'ttml', 'xsub', 'dvb_teletext'];
+    // bitstream, not a real subtitle stream), xsub (no Matroska CodecID and no mp4 tag - AVI is its only home) and dvb_teletext (matroska rejects
+    // codec 94215; it CAN decode to srt, but only with a per-broadcaster teletext PAGE that ffprobe does not expose - it lives in 2 bytes of stream
+    // extradata - and guessing yields the entire teletext service, ~1300x the size and not subtitles). mkvOnlyDropSubs is the opposite case, carried by
+    // mp4 but not mkv: ttml muxes into mp4 as stpp (verified, 1 packet, codec_tag=stpp) while matroska has no CodecID for it. mp4OnlyDropSubs muxes
+    // fine in mkv but not mp4: the image-based PGS/VobSub/DVB formats, plus arib_caption and hdmv_text_subtitle (both decode-only for mp4;
+    // hdmv_text_subtitle copies into mkv fine). Note arib_caption is effectively unreachable - the build has no libaribb24, so ARIB captions arrive
+    // as bin_data/data streams and never carry this codec name.
+    const alwaysDropSubs  = ['eia_608', 'xsub', 'dvb_teletext'];
+    const mkvOnlyDropSubs = ['ttml'];
     const mp4OnlyDropSubs = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'arib_caption', 'hdmv_text_subtitle'];
     // Legacy PC/fansub text codecs with no Matroska CodecID and no native mp4 support: a bare -c copy would fail the
     // remux, but ffmpeg decodes them as text, so BOTH container branches below convert them (mkv -> srt, mp4 -> mov_text).
     // Hoisted once so the two branches can't drift (a codec added to one list but not the other aborts a remux).
-    const legacyTextSubs = ['microdvd', 'mpl2', 'jacosub', 'sami', 'realtext', 'subviewer', 'subviewer1', 'vplayer', 'pjs'];
+    const legacyTextSubs = ['microdvd', 'mpl2', 'jacosub', 'sami', 'realtext', 'subviewer', 'subviewer1', 'vplayer', 'pjs', 'stl'];
     const subFormatDropped = (codec) => alwaysDropSubs.includes(codec)
+        || (dstContainer === 'mkv' && mkvOnlyDropSubs.includes(codec))
         || (dstContainer === 'mp4' && mp4OnlyDropSubs.includes(codec));
     // Image-based subtitles (PGS/VobSub/DVB) mkv muxes natively; remove_imagesubs governs them (mp4 drops them via mp4OnlyDropSubs
-    // regardless). xsub is image-based too but has no Matroska CodecID, so it lives in alwaysDropSubs (always removed) and is NOT
-    // exportable to .mks. IMAGE_SUB maps each exportable image codec to its native sidecar container: PGS -> raw .sup, VobSub/DVB -> a
-    // single-stream Matroska .mks (no vobsub muxer exists), both via -c:s copy. The .mks output needs an explicit -f matroska - ffmpeg
-    // only auto-detects the matroska muxer from a .mkv extension, not .mks (verified); the .sup muxer auto-detects from the extension.
-    const imageSubCodecs = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle'];
-    const IMAGE_SUB = { hdmv_pgs_subtitle: { ext: 'sup', fmt: 'sup' }, dvd_subtitle: { ext: 'mks', fmt: 'matroska' }, dvb_subtitle: { ext: 'mks', fmt: 'matroska' } };
+    // regardless). xsub is image-based too and stays in alwaysDropSubs because it muxes into NO container - but it is still EXPORTABLE:
+    // AVI is its native home and a -c:s copy into one preserves the codec and every packet (verified). Being in both lists is the point -
+    // the export is the user's choice, the drop is not. IMAGE_SUB maps each image codec to its sidecar container: PGS -> raw .sup,
+    // VobSub/DVB -> a single-stream Matroska .mks (no vobsub muxer exists), xsub -> .avi, all via -c:s copy. What decides the mapping is
+    // whether the RAW stream is SELF-DESCRIBING: PGS segments carry PTS and xsub packets carry inline [HH:MM:SS.mmm-...] ranges, so a raw
+    // or native container round-trips; VobSub/DVB timing lives outside the stream (in the .idx), so those need a real container. The .mks
+    // output needs an explicit -f matroska - ffmpeg only auto-detects matroska from a .mkv extension, not .mks (verified); .sup and .avi
+    // both auto-detect from the extension.
+    const imageSubCodecs = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub'];
+    const IMAGE_SUB = {
+        hdmv_pgs_subtitle: { ext: 'sup', fmt: 'sup'      },   // raw PGS segments; they carry their own PTS, so no container is needed
+        dvd_subtitle:      { ext: 'mks', fmt: 'matroska' },   // VobSub timing lives in a separate .idx, so the stream needs a real container
+        dvb_subtitle:      { ext: 'mks', fmt: 'matroska' },
+        xsub:              { ext: 'avi', fmt: 'avi'      },   // AVI is the only container that holds xsub; packets carry inline timestamp ranges
+    };
     const isImageSub = (codec) => imageSubCodecs.includes(codec);
     // 'all'/'export' drop every image sub; 'unsupported' relies on subFormatDropped (container-forced) alone. imageSubDropped is the
     // remove_imagesubs-specific drop beyond subFormatDropped, used by subDroppedAnyReason for the language_fill tally + accessibility plain-track guard.
@@ -1524,10 +1542,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     }
                 }
                 if (imageSubDrop && !exportRefused && !exportSuppressed) {
-                    workDone += `☐${streamTag(ffstream.index)}[remove_imagesubs=${removeImageSubs}] Remove image-based subtitle (${ffstreamType}-${ffstreamCodec})\n`;
+                    // A codec that is ALSO in alwaysDropSubs (xsub) is removed whatever remove_imagesubs says, so it carries no input tag even
+                    // when an export ran first - the export is caused by the setting, the removal is not, and the tag names the cause.
+                    const imgCause = alwaysDropSubs.includes(ffstreamCodec) ? '' : `[remove_imagesubs=${removeImageSubs}]`;
+                    workDone += `☐${streamTag(ffstream.index)}${imgCause} Remove image-based subtitle (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
                 } else if (subFormatDropped(ffstreamCodec)) {
-                    // Container/format can't carry it. alwaysDropSubs (eia_608/ttml/xsub/dvb_teletext) drop in ANY container - no setting governs them,
+                    // Container/format can't carry it. alwaysDropSubs (eia_608/xsub/dvb_teletext) drop in ANY container - no setting governs them,
                     // so no tag; the rest (image subs, arib/hdmv_text on mp4) drop only because of the chosen container, so they carry [container=<dst>].
                     const dropCause = alwaysDropSubs.includes(ffstreamCodec) ? '' : `[container=${dstContainer}]`;
                     workDone += `☐${streamTag(ffstream.index)}${dropCause} Remove unsupported (${ffstreamType}-${ffstreamCodec})\n`;
@@ -1792,7 +1813,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const containerChanging = srcContainer !== dstContainer;
         const runRecover = recoverRequested && (!intentMatches || containerChanging);
 
-        // The flags below apply only when runRecover is true, so a remux triggered by other work never re-applies them; the ts/avi/mpg/mpeg
+        // The flags below apply only when runRecover is true, so a remux triggered by other work never re-applies them; the container-forced
         // genpts/-avoid_negative_ts fix further down is container-forced instead (needed to remux those formats at all) and always applies.
 
         // recover_bad_timestamps: light = +genpts, aggressive = full +igndts+genpts rebuild (igndts can misbehave without genpts, so it always pulls it in).
@@ -1801,7 +1822,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         else if(runRecover && tsLight)
             fflags += '+genpts';
 
-        if (['ts', 'avi', 'mpg', 'mpeg'].includes(srcContainer)) {          // container-forced timestamp fix (always applied)
+        // Grouped by DEMUXER FAMILY, not by extension spelling - ffmpeg picks its demuxer by probing content, while file.container is nothing but the
+        // lowercased extension. mpegts = ts/m2ts/mts/m2t · MPEG-PS = mpg/mpeg/vob/evo · avi. Add a new spelling to the family it demuxes as, not to the end.
+        // Not hypothetical: identical MPEG-PS bytes named .vob hard-fail a bare -c copy remux ("Can't write packet with unknown timestamp", exit -22) while
+        // the same bytes named .mpg are repaired here - and vob/evo/m2ts are all in Tdarr's DEFAULT containerFilter, so the gap was reachable out of the box.
+        if (['ts', 'm2ts', 'mts', 'm2t', 'vob', 'evo', 'avi', 'mpg', 'mpeg'].includes(srcContainer)) {   // container-forced timestamp fix (always applied)
             if(!fflags.includes('genpts'))
                 fflags += '+genpts';
             extraArguments = ` -avoid_negative_ts make_zero${extraArguments}`;

@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '4.9.0',
+    Version: '4.10.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -406,8 +406,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // detection, and clean_and_remux's title/flag tagging. Shared verbatim across all five awk plugins.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                                            tag: 'Commentary'  },
-        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','dvs','audio description','visually impaired','visual impaired'], tag: 'Descriptive' },
-        descriptions:     { streams:['subtitle'],                 keywords: ['descriptive','dvs'],                                     tag: 'Descriptive' },
+        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','descriptions','dvs','audio description','visually impaired','visual impaired'], tag: 'Descriptive' },
+        descriptions:     { streams:['subtitle'],                 keywords: ['descriptive','descriptions','dvs'],                      tag: 'Descriptive' },
         hearing_impaired: { streams:['subtitle'],                 keywords: ['sdh','hearing impaired','hard of hearing','hoh','deaf'], tag: 'SDH'         },
         captions:         { streams:['subtitle'],                 keywords: ['caption','captions','cc'],                               tag: 'SDH'         },
         lyrics:           { streams:['subtitle'],                 keywords: ['songs','lyrics'],                                        tag: 'Lyrics'      },
@@ -490,6 +490,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['dsd',    'dsd'],       // DSD / SACD (1-bit): fold dsd_lsbf/dsd_msbf(_planar) to one lossless key
         ['mp4als', 'als'],       // MPEG-4 ALS: fold the mp4-wrapped spelling to the 'als' codecInfo key (a bare 'als' resolves directly)
         ['adpcm',  'adpcm'],
+        ['gsm',    'gsm'],      // GSM 06.10 full-rate and the Microsoft variant (gsm_ms) are one speech family - fold to one key
+        ['qdm',    'qdm'],      // QDesign Music 1 and 2 (qdmc/qdm2), old QuickTime - fold to one key
         ['wmavoice', 'wmavoice'],   // WMA Voice: low-bitrate SPEECH codec, not music-grade WMA - keep distinct so the wmav prefix below doesn't score it as full WMA
         ['wmav',   'wma'],
         ['atrac',  'atrac'],
@@ -498,7 +500,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     ];
     // -=-=-= resolveCodecName  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the _x variant when DTS:X is detected)
-    // and eac3 into eac3atmos. Used for scoring by audioQuality (audio_clean, stream_ordering) and isLosslessSource (audio_clean), and by summariseStream
+    // and eac3/truehd into eac3atmos/truehdatmos. Used by audioQuality (audio_clean, stream_ordering), isLosslessSource (audio_clean), and summariseStream
     // (all five) purely for accurate display labeling - a plugin that doesn't score audio still benefits from showing "eac3atmos"/"dtsx" instead of a bare
     // "eac3"/"dts" in its logs. codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't tell the
     // subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to mediaInfo's Format_Commercial_IfAny ("DTS-HD
@@ -544,8 +546,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (/\bxll x\b/.test(additionalFeatures) || /dts:?x/.test(profile))
                     codec = DTS_X_VARIANT[codec];
             }
-        } else if (codec === 'eac3' && (longName.includes('atmos') || commercial.includes('atmos') || profile.includes('atmos')))
-            codec = 'eac3atmos';
+        } else if ((codec === 'eac3' || codec === 'truehd') && (longName.includes('atmos') || commercial.includes('atmos') || profile.includes('atmos')))
+            codec = codec === 'eac3' ? 'eac3atmos' : 'truehdatmos';
 
         return codec;
     };
@@ -558,7 +560,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         dtsma:   'dts-hd-ma',   dtsmax:      'dts-hd-ma-x',
         dtshr:   'dts-hd-hr',   dtshrx:      'dts-hd-hr-x',
         dtsx:    'dts-x',       dtsexpress:  'dts-express',   dtsexpressx: 'dts-express-x',
-        eac3atmos: 'eac3-atmos', mpegh3d: 'mpeg-h',
+        eac3atmos: 'eac3-atmos', truehdatmos: 'truehd-atmos', mpegh3d: 'mpeg-h',
     };
     const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
     // ===== END SHARED: codec name resolution =====
@@ -606,6 +608,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Dolby family
         truehd:      { score: 99,  lossless: true },
+        truehdatmos: { score: 99,  lossless: true,       objectAudio: true },
         dtsma:       { score: 98,  lossless: true },
         dtsmax:      { score: 98,  lossless: true,       objectAudio: true },
         dtshr:       { score: 94,  transparent: 1470000 },
@@ -638,7 +641,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         mp3:         { score: 78,  transparent: 320000 },
         mp2:         { score: 73,  transparent: 256000 },
         adpcm:       { score: 60,  transparent: 256000 },
-        cook:        { score: 58,  transparent: 128000 }
+        cook:        { score: 58,  transparent: 128000 },
+
+        // Speech / telephony - every score below cook (58), the lowest music codec, so a low-bitrate voice track can never
+        // win a dedup group or satisfy a quality guard. transparent is each codec's own top rate. Joins g711 (40) and
+        // wmavoice (45), which are carved out above for the same reason.
+        qdm:         { score: 55,  transparent: 128000 },  // QDesign Music 1/2, old QuickTime - music-capable, so highest of this group
+        nellymoser:  { score: 50,  transparent:  88000 },  // Flash/FLV speech-music hybrid
+        speex:       { score: 42,  transparent:  44000 },  // VoIP / old web audio
+        amr_wb:      { score: 42,  transparent:  23850 },  // AMR wideband (G.722.2), top mode
+        sipr:        { score: 38,  transparent:  32000 },  // RealAudio SIPR / ACELP.NET
+        gsm:         { score: 35,  transparent:  13200 },  // GSM 06.10 full-rate (folds gsm_ms)
+        amr_nb:      { score: 32,  transparent:  12200 },  // AMR narrowband, top mode - every .3gp phone recording
+        truespeech:  { score: 30,  transparent:   9600 },  // DSP Group TrueSpeech, very old
     };
     // -=-=-= unknownCodecs  [audio_clean, stream_ordering] =-=-=-
     const unknownCodecs = new Set();
