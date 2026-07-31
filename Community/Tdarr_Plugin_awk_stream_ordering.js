@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can promote the default, SDH or descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time it's needed).\n`,
-    Version: '4.11.0',
+    Version: '4.11.1',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -191,6 +191,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.infoLog += `☒Unexpected error: ${err && err.message ? err.message : err}\n`;
         throw new AwkFailFile(`\n${response.infoLog}`);
     };
+    // -=-=-= skip  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The OTHER terminal, and the one the helpers above exist to be told apart from. A benign skip means there is nothing for this plugin to do:
+    // processFile:false is Tdarr's "no work needed" signal, NOT a failure - the file is left untouched and the flow moves on to the next plugin, whereas a
+    // genuine failure has to throw (failFile). Every call site keeps its own `return`, so a skip still reads as a terminal where it stands.
+    const skip = (msg) => { response.infoLog += msg; response.processFile = false; return response; };
     // ===== END SHARED: file-failure helpers =====
 
     // =====================================================================
@@ -198,6 +203,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // byte-identical across the plugins named in its header, and a plugin carries only the sections it uses. The section LABEL is the anchor
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
+
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
+    // -=-=-= codecTypeOf  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The stream's kind - video / audio / subtitle / attachment / data - normalised once, and the single most repeated test in the suite. jellyfin-ffprobe
+    // emits a fixed lowercase enum with no padding, so the trim and the lowercase are pure defensiveness; they live here so every test in the suite is
+    // defensive the SAME way. Hand-written spellings were not: within one plugin a padded value would have been seen by the trimmed sites and skipped by the
+    // untrimmed ones, so two guards documented as mirroring each other could classify the same stream differently. Optional-chained, so a nullish stream
+    // reads as "no type" rather than throwing.
+    const codecTypeOf = (s) => (s?.codec_type || '').trim().toLowerCase();
+    // ===== END SHARED: stream codec type =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: role/disposition classifiers =====
     // -=-=-= dispositionTypes  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -258,7 +273,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const hasDisposition = (s, key) => {
         const entry = dispositionTypes[key];
         if (!entry) return false;
-        if (!entry.streams.includes((s.codec_type || '').trim().toLowerCase())) return false;
+        if (!entry.streams.includes(codecTypeOf(s))) return false;
         return s.disposition?.[key] === 1 || matchesKeyword(roleTextLower(s), entry.keywords);
     };
     // -=-=-= role classifiers: isCommentary / isDescriptive / isSdh / isLyrics  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -268,7 +283,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // widening the table entry: that would also let its audio-oriented keywords ('audio description', 'visually impaired') invent the role from a subtitle's
     // title, which the subtitle summary explicitly refuses to allow. 'descriptions' remains the keyword-matched subtitle spelling of the same role.
     const isDescriptive = (s) => hasDisposition(s, 'visual_impaired') || hasDisposition(s, 'descriptions')
-        || ((s.codec_type || '').trim().toLowerCase() === 'subtitle' && s.disposition?.visual_impaired === 1);
+        || (codecTypeOf(s) === 'subtitle' && s.disposition?.visual_impaired === 1);
     const isSdh         = (s) => hasDisposition(s, 'hearing_impaired') || hasDisposition(s, 'captions');
     const isLyrics      = (s) => hasDisposition(s, 'lyrics');
     // ===== END SHARED: role/disposition classifiers =====
@@ -618,7 +633,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // a language tag, an attachment filename or a mimetype, and the whole infoLog is persisted by Tdarr - the same reasoning that caps the workDone
         // lines. 64 clears every real value: the longest registered mimetype subtype is 59 chars, and language codes and font extensions are far shorter.
         const tok = (v) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 64);
-        const type = (s.codec_type || '').trim().toLowerCase();
+        const type = codecTypeOf(s);
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
         if (codec === 'subrip') codec = 'srt';
         const langRaw = tok(resolveLang(s) || 'und');
@@ -778,6 +793,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: language token failure =====
 
     // ===== SHARED [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean]: dolby vision detection =====
+    // -=-=-= DV_FOURCC_RE  [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean] =-=-=-
+    // The DV fourccs: HEVC dvhe/dvh1, AVC dvav/dva1, AV1 dav1. Named so the set has ONE definition - video_clean tests the same constant for its encode-side
+    // dvSignal, which would otherwise carry a second copy of the literal that no structural check can compare against this one. Non-global, so `.test()` on
+    // one shared instance is stateless.
+    const DV_FOURCC_RE = /^(dvhe|dvh1|dvav|dva1|dav1)$/;
+
     // -=-=-= isDolbyVisionVideo  [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean] =-=-=-
     // True when a video stream carries Dolby Vision, both-probe: a dvhe/dvh1/dvav/dva1/dav1 fourcc, a mediaInfo HDR_Format naming Dolby Vision, or an ffprobe
     // DOVI configuration record / dolby-vision side_data. The four -c copy plugins add `-strict unofficial` to an mp4/mov remux with it, so ffmpeg's mov
@@ -785,7 +806,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // the summariseStream [video:...dv] display token; its guard_dv ENCODE routing uses the NARROWER dvSignal (needs a parsed DOVI record) instead, since
     // libx265 -dolbyvision hard-requires a real RPU (see the note there). Pass the stream's paired mediaInfo (mediaInfoFor(stream)); a single-probe false
     // negative would silently lose the boxes.
-    const isDolbyVisionVideo = (ffstream, ffmedia) => /^(dvhe|dvh1|dvav|dva1|dav1)$/.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
+    const isDolbyVisionVideo = (ffstream, ffmedia) => DV_FOURCC_RE.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
         || String(ffmedia?.HDR_Format || ffmedia?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : []).some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
@@ -798,7 +819,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const dvStrictMp4Arg = (container, streams) => {
         if (!isMp4Family(container)) return '';
         const list = Array.isArray(streams) ? streams : [];
-        const hasDv = list.some((s) => (s.codec_type || '').toLowerCase() === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s)));
+        const hasDv = list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s)));
         return hasDv ? ' -strict unofficial' : '';
     };
     // ===== END SHARED: dolby vision strict mp4 arg =====
@@ -828,7 +849,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // unmatched entry simply scores as "not listed" and the tracks the user meant to promote stay wherever they were, which reads exactly like the ordering
     // rules not working. order_codec is genuinely open (codec names come and go, and an unknown one is inert rather than misleading), so it stays unchecked.
     // The und/mul/zxx/mis/qaa-qtz allowance matches every other language input - 'und' is a real ordering target, since untagged tracks sort somewhere too.
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker]: language token recognition =====
+    // -=-=-= knownLangToken  [audio_clean, stream_ordering, sub_worker] =-=-=-
+    // Is an already-folded langKey a recognised language token: any real language in any form (langKey folds en/eng/English/en-US/pt-BR to one base code), or
+    // a valid special/private code - und (undetermined), mul (multiple), zxx (no linguistic content), mis (uncoded) and the qaa-qtz private-use range. Those
+    // specials are load-bearing rather than laxness: stream language tags carry them, so a list has to be able to name them. Why an unrecognised token STOPS
+    // the file is per-plugin and stays above this section, since it depends on what that plugin's input scopes; the message itself is failLangToken.
     const knownLangToken = (key) => key === 'und' || key === 'mul' || key === 'zxx' || key === 'mis' || /^q[a-t][a-z]$/.test(key) || !!langDisplayName(key);
+    // ===== END SHARED: language token recognition =====
     for (const tok of String(inputs.order_language || '').split(',').map(v => v.trim()).filter(Boolean))
         if (!knownLangToken(langKey(tok))) failLangToken('order_language', tok);
 
@@ -928,7 +956,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const enrichedStream = enrichStream(ffstream);
             const streamLang = resolveLang(ffstream) || 'und';
 
-            const streamType = (ffstream.codec_type || '').trim().toLowerCase();
+            const streamType = codecTypeOf(ffstream);
             // Resolve the canonical codec once (resolveCodecName does a probe-join + string work); order_codec membership can't change between list entries.
             const canon = streamType === 'audio' ? resolveCodecName(enrichedStream) : '';
 
@@ -1037,20 +1065,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return a.index - b.index;
         });
 
-        //Check if order changed and build the map; also normalise the audio default flag so exactly one audio track — the first in sorted order — is default,
-        //matching what our ordering rules chose. Additive +default/-default preserves forced/commentary/etc; subtitle/video untouched.
+        //Set orderChanged if the sort moved a stream, and build the map; also normalise the audio default flag so exactly one audio track — the first in sorted
+        //order — is default, matching what our ordering rules chose. Additive +default/-default preserves forced/commentary/etc; subtitle/video untouched.
         let ffmpegMap = '';
         let dispositionArgs = '';
         let junkArgs = '';
         let junkLog = '';
-        let changed = false;
+        let orderChanged = false;
         let audioIndex = -1;
 
         for (let i = 0; i < streams.length; i++) {
             ffmpegMap += ` -map 0:${streams[i].index}`;
             // Compare against each stream's ORIGINAL array position, not its absolute ffprobe index, so a file already in the desired order but with
             // non-contiguous indices (e.g. 0,1,3 after an upstream drop) isn't remuxed pointlessly. -map still uses the absolute index above.
-            if (streams[i].origPos !== i) changed = true;
+            if (streams[i].origPos !== i) orderChanged = true;
 
             // remove_junk_tags (per-stream): clear encoder/encoded_by on this stream, keyed on its OUTPUT index i (a
             // within-type reorder moves a track's per-type position, so -metadata:s must use the post-sort index,
@@ -1089,10 +1117,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const faststartOn = methodFaststart === 'force';
         const needsFront = faststartOn && isMp4 && !moovBeforeMdat(file.file, otherArguments);
 
-        if (!changed && dispositionArgs === '' && !needsFront && junkArgs === '') {
-            response.infoLog += '☑Streams already in desired order\n';
-            return response;
-        }
+        if (!orderChanged && dispositionArgs === '' && !needsFront && junkArgs === '') return skip('☑Streams already in desired order\n');
 
         response.processFile = true;
         response.reQueueAfter = true;

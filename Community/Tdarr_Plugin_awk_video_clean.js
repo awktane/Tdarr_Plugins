@@ -9,7 +9,7 @@ const details = () => ({
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n
                      UPGRADING FROM 2.x - inputs were renamed/reworked in 3.0.0, and Tdarr stores settings by input name, so that upgrade RESET them to defaults - re-check your video_clean settings: encoder->method_encoder, speed->method_speed, force_bit_depth->method_bitdepth, max_height->height_cap (value 'original'->'source'), method_hdr->hdr_mode, guard_min_bitrate->guard_shrink_bitrate (now shrink-only); the old preserve_dv is now the guard_dv toggle (default on); guard_reprocess is gone (use action=shrink); codec gained a 'source' value (keep the source codec).\n\n`,
-    Version: '3.9.0',
+    Version: '3.9.1',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -169,10 +169,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         FFmpegMode: true,
         infoLog: '',
     };
-    // Benign skip: nothing for this plugin to do. processFile:false is Tdarr's "no work" signal, NOT a failure - the file is left untouched and the flow
-    // continues (a genuine failure has to throw, via failFile). Every call site keeps its own `return`, so this still reads as a terminal.
-    const skip = (msg) => { response.infoLog += msg; response.processFile = false; return response; };
-
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: file-failure helpers =====
     // -=-=-= AwkFailFile / failFile / failUnexpected  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Fail the whole file (send it to Tdarr's error queue) carrying the full infoLog as context. A returned processFile:false is Tdarr's "no work needed /
@@ -191,6 +187,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.infoLog += `☒Unexpected error: ${err && err.message ? err.message : err}\n`;
         throw new AwkFailFile(`\n${response.infoLog}`);
     };
+    // -=-=-= skip  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The OTHER terminal, and the one the helpers above exist to be told apart from. A benign skip means there is nothing for this plugin to do:
+    // processFile:false is Tdarr's "no work needed" signal, NOT a failure - the file is left untouched and the flow moves on to the next plugin, whereas a
+    // genuine failure has to throw (failFile). Every call site keeps its own `return`, so a skip still reads as a terminal where it stands.
+    const skip = (msg) => { response.infoLog += msg; response.processFile = false; return response; };
     // ===== END SHARED: file-failure helpers =====
 
     // =====================================================================
@@ -198,6 +199,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // byte-identical across the plugins named in its header, and a plugin carries only the sections it uses. The section LABEL is the anchor
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
+
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
+    // -=-=-= codecTypeOf  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The stream's kind - video / audio / subtitle / attachment / data - normalised once, and the single most repeated test in the suite. jellyfin-ffprobe
+    // emits a fixed lowercase enum with no padding, so the trim and the lowercase are pure defensiveness; they live here so every test in the suite is
+    // defensive the SAME way. Hand-written spellings were not: within one plugin a padded value would have been seen by the trimmed sites and skipped by the
+    // untrimmed ones, so two guards documented as mirroring each other could classify the same stream differently. Optional-chained, so a nullish stream
+    // reads as "no type" rather than throwing.
+    const codecTypeOf = (s) => (s?.codec_type || '').trim().toLowerCase();
+    // ===== END SHARED: stream codec type =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: role/disposition classifiers =====
     // -=-=-= dispositionTypes  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -258,7 +269,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const hasDisposition = (s, key) => {
         const entry = dispositionTypes[key];
         if (!entry) return false;
-        if (!entry.streams.includes((s.codec_type || '').trim().toLowerCase())) return false;
+        if (!entry.streams.includes(codecTypeOf(s))) return false;
         return s.disposition?.[key] === 1 || matchesKeyword(roleTextLower(s), entry.keywords);
     };
     // -=-=-= role classifiers: isCommentary / isDescriptive / isSdh / isLyrics  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -268,7 +279,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // widening the table entry: that would also let its audio-oriented keywords ('audio description', 'visually impaired') invent the role from a subtitle's
     // title, which the subtitle summary explicitly refuses to allow. 'descriptions' remains the keyword-matched subtitle spelling of the same role.
     const isDescriptive = (s) => hasDisposition(s, 'visual_impaired') || hasDisposition(s, 'descriptions')
-        || ((s.codec_type || '').trim().toLowerCase() === 'subtitle' && s.disposition?.visual_impaired === 1);
+        || (codecTypeOf(s) === 'subtitle' && s.disposition?.visual_impaired === 1);
     const isSdh         = (s) => hasDisposition(s, 'hearing_impaired') || hasDisposition(s, 'captions');
     const isLyrics      = (s) => hasDisposition(s, 'lyrics');
     // ===== END SHARED: role/disposition classifiers =====
@@ -474,7 +485,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // a language tag, an attachment filename or a mimetype, and the whole infoLog is persisted by Tdarr - the same reasoning that caps the workDone
         // lines. 64 clears every real value: the longest registered mimetype subtype is 59 chars, and language codes and font extensions are far shorter.
         const tok = (v) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 64);
-        const type = (s.codec_type || '').trim().toLowerCase();
+        const type = codecTypeOf(s);
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
         if (codec === 'subrip') codec = 'srt';
         const langRaw = tok(resolveLang(s) || 'und');
@@ -595,6 +606,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: ffmpeg encoder probe =====
 
     // ===== SHARED [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean]: dolby vision detection =====
+    // -=-=-= DV_FOURCC_RE  [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean] =-=-=-
+    // The DV fourccs: HEVC dvhe/dvh1, AVC dvav/dva1, AV1 dav1. Named so the set has ONE definition - video_clean tests the same constant for its encode-side
+    // dvSignal, which would otherwise carry a second copy of the literal that no structural check can compare against this one. Non-global, so `.test()` on
+    // one shared instance is stateless.
+    const DV_FOURCC_RE = /^(dvhe|dvh1|dvav|dva1|dav1)$/;
+
     // -=-=-= isDolbyVisionVideo  [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean] =-=-=-
     // True when a video stream carries Dolby Vision, both-probe: a dvhe/dvh1/dvav/dva1/dav1 fourcc, a mediaInfo HDR_Format naming Dolby Vision, or an ffprobe
     // DOVI configuration record / dolby-vision side_data. The four -c copy plugins add `-strict unofficial` to an mp4/mov remux with it, so ffmpeg's mov
@@ -602,7 +619,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // the summariseStream [video:...dv] display token; its guard_dv ENCODE routing uses the NARROWER dvSignal (needs a parsed DOVI record) instead, since
     // libx265 -dolbyvision hard-requires a real RPU (see the note there). Pass the stream's paired mediaInfo (mediaInfoFor(stream)); a single-probe false
     // negative would silently lose the boxes.
-    const isDolbyVisionVideo = (ffstream, ffmedia) => /^(dvhe|dvh1|dvav|dva1|dav1)$/.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
+    const isDolbyVisionVideo = (ffstream, ffmedia) => DV_FOURCC_RE.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
         || String(ffmedia?.HDR_Format || ffmedia?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : []).some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
@@ -639,6 +656,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         h264: { nvenc: 'h264_nvenc', qsv: 'h264_qsv', vaapi: 'h264_vaapi', videotoolbox: 'h264_videotoolbox', amf: 'h264_amf', cpu: 'libx264' },
         av1: { nvenc: 'av1_nvenc', qsv: 'av1_qsv', vaapi: 'av1_vaapi', videotoolbox: null, amf: 'av1_amf', cpu: 'libsvtav1' },
     };
+    // The codecs this plugin has an encoder for, derived from the table above so a new target cannot be added to one and missed in the other
+    // (codec=source keeps the source codec only when it is one of these). Membership only, so key order is immaterial.
+    const ENCODABLE = Object.keys(ENCODER_NAME);
 
     // Query the ffmpeg build's encoder list + hardware presence for this node: encoders from `-encoders`, NVIDIA from nvidia-smi,
     // VAAPI/QSV from a /dev/dri check. Tdarr reloads each classic plugin fresh per file and selectEncoder calls this once, so it runs once per file.
@@ -993,7 +1013,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         // Primary (non-cover-art) video stream - the one we actually encode.
-        const videoStreams = file.ffProbeData.streams.filter((s) => (s.codec_type || '').trim().toLowerCase() === 'video');
+        const videoStreams = file.ffProbeData.streams.filter((s) => codecTypeOf(s) === 'video');
         const primary = videoStreams.find((s) => !isCoverArt(s));
         if (!primary) {
             return skip('☑No encodable video stream found (cover-art / still images only)\n');
@@ -1011,7 +1031,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Bit depth: source-detected (raw sample depth, or a 10-bit pixel format / profile), overridable. H.264 is always 8-bit. Shares the is10Bit helper with
         // summariseStream's 10bit token so the re-encode depth decision and the logged token can't drift.
         const srcIs10 = is10Bit(primary, mi);
-        const ENCODABLE = ['hevc', 'h264', 'av1'];                       // codecs this plugin has an encoder for (codec=source keeps the source only when it is one of these)
         // Efficiency rank for shrink's never-downgrade rule: vp9~hevc and vp8~h264, so an efficient WebM/VP source
         // isn't "upgraded" to a less-efficient codec; a genuinely-legacy codec (mpeg2/vc1/xvid, absent here) ranks
         // below every target via the `|| 0` fallback, so old-codec -> h264 stays a valid shrink upgrade.
@@ -1025,7 +1044,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // negative is destructive. isHdr (any HDR incl. static) gates tonemapping; dvSignal is DV specifically (excludes HDR10+).
         const hdrFmt = String(mi?.HDR_Format || mi?.HDR_Format_Compatibility || '').toLowerCase();
         const dvSideData = Array.isArray(primary.side_data_list) ? primary.side_data_list : [];
-        const dvCodecTag = /^(dvhe|dvh1|dvav|dva1|dav1)$/.test(String(primary.codec_tag_string || '').toLowerCase().trim());
+        const dvCodecTag = DV_FOURCC_RE.test(String(primary.codec_tag_string || '').toLowerCase().trim());
         const ffprobeDynamicHdr = dvSideData.some((sd) => /dovi|dolby vision|smpte ?2094|hdr dynamic metadata/.test(String(sd?.side_data_type || '').toLowerCase())) || dvCodecTag;
         const isDynamicHdr = hdrFmt.includes('dolby vision') || DYNAMIC_HDR_RE.test(hdrFmt) || ffprobeDynamicHdr;
         // DOVI configuration record (ffprobe side_data) -> profile-aware logging. dvLabel
@@ -1097,7 +1116,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // path below is intentional and must stay: this path copies an arbitrary source codec (so it maps all three), while the encode path only ever emits a
         // fourCC for hevc and picks dvh1-vs-hvc1 from whether the DV RPU survives — a choice a copy cannot make. Do not merge the two.
         const mp4Tag = (cn) => (isQtVideoContainer(dstContainer) ? ({ hevc: ' -tag:v:0 hvc1', av1: ' -tag:v:0 av01', h264: ' -tag:v:0 avc1' }[cn] || '') : '');
-        const keptStreams = () => file.ffProbeData.streams.filter((s) => !(isCoverArt(s) && (s.codec_type || '').trim().toLowerCase() === 'video'));   // input streams minus dropped cover-art video
+        const keptStreams = () => file.ffProbeData.streams.filter((s) => !(isCoverArt(s) && codecTypeOf(s) === 'video'));   // input streams minus dropped cover-art video
         // Lossless dynamic-HDR strip: -c:v copy + a bitstream filter, no re-encode. dovi_rpu strips DV (HEVC + AV1); hevc_metadata
         // removes HDR10+ (HEVC only). The stream stays the source codec/res/depth with its HDR10 base retained, so it needs no awk_video
         // fence (once stripped it is no longer dynamic-HDR, so a re-run is a natural no-op). On mp4 the fourCC is reset (dvh1 -> hvc1).

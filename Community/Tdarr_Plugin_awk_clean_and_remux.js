@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.9.0',
+    Version: '4.9.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -268,6 +268,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.infoLog += `☒Unexpected error: ${err && err.message ? err.message : err}\n`;
         throw new AwkFailFile(`\n${response.infoLog}`);
     };
+    // -=-=-= skip  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The OTHER terminal, and the one the helpers above exist to be told apart from. A benign skip means there is nothing for this plugin to do:
+    // processFile:false is Tdarr's "no work needed" signal, NOT a failure - the file is left untouched and the flow moves on to the next plugin, whereas a
+    // genuine failure has to throw (failFile). Every call site keeps its own `return`, so a skip still reads as a terminal where it stands.
+    const skip = (msg) => { response.infoLog += msg; response.processFile = false; return response; };
     // ===== END SHARED: file-failure helpers =====
 
     // =====================================================================
@@ -275,6 +280,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // byte-identical across the plugins named in its header, and a plugin carries only the sections it uses. The section LABEL is the anchor
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
+
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
+    // -=-=-= codecTypeOf  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The stream's kind - video / audio / subtitle / attachment / data - normalised once, and the single most repeated test in the suite. jellyfin-ffprobe
+    // emits a fixed lowercase enum with no padding, so the trim and the lowercase are pure defensiveness; they live here so every test in the suite is
+    // defensive the SAME way. Hand-written spellings were not: within one plugin a padded value would have been seen by the trimmed sites and skipped by the
+    // untrimmed ones, so two guards documented as mirroring each other could classify the same stream differently. Optional-chained, so a nullish stream
+    // reads as "no type" rather than throwing.
+    const codecTypeOf = (s) => (s?.codec_type || '').trim().toLowerCase();
+    // ===== END SHARED: stream codec type =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: role/disposition classifiers =====
     // -=-=-= dispositionTypes  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -335,7 +350,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const hasDisposition = (s, key) => {
         const entry = dispositionTypes[key];
         if (!entry) return false;
-        if (!entry.streams.includes((s.codec_type || '').trim().toLowerCase())) return false;
+        if (!entry.streams.includes(codecTypeOf(s))) return false;
         return s.disposition?.[key] === 1 || matchesKeyword(roleTextLower(s), entry.keywords);
     };
     // -=-=-= role classifiers: isCommentary / isDescriptive / isSdh / isLyrics  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -345,7 +360,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // widening the table entry: that would also let its audio-oriented keywords ('audio description', 'visually impaired') invent the role from a subtitle's
     // title, which the subtitle summary explicitly refuses to allow. 'descriptions' remains the keyword-matched subtitle spelling of the same role.
     const isDescriptive = (s) => hasDisposition(s, 'visual_impaired') || hasDisposition(s, 'descriptions')
-        || ((s.codec_type || '').trim().toLowerCase() === 'subtitle' && s.disposition?.visual_impaired === 1);
+        || (codecTypeOf(s) === 'subtitle' && s.disposition?.visual_impaired === 1);
     const isSdh         = (s) => hasDisposition(s, 'hearing_impaired') || hasDisposition(s, 'captions');
     const isLyrics      = (s) => hasDisposition(s, 'lyrics');
     // ===== END SHARED: role/disposition classifiers =====
@@ -544,7 +559,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // a language tag, an attachment filename or a mimetype, and the whole infoLog is persisted by Tdarr - the same reasoning that caps the workDone
         // lines. 64 clears every real value: the longest registered mimetype subtype is 59 chars, and language codes and font extensions are far shorter.
         const tok = (v) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 64);
-        const type = (s.codec_type || '').trim().toLowerCase();
+        const type = codecTypeOf(s);
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
         if (codec === 'subrip') codec = 'srt';
         const langRaw = tok(resolveLang(s) || 'und');
@@ -671,6 +686,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: language matching =====
 
     // ===== SHARED [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean]: dolby vision detection =====
+    // -=-=-= DV_FOURCC_RE  [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean] =-=-=-
+    // The DV fourccs: HEVC dvhe/dvh1, AVC dvav/dva1, AV1 dav1. Named so the set has ONE definition - video_clean tests the same constant for its encode-side
+    // dvSignal, which would otherwise carry a second copy of the literal that no structural check can compare against this one. Non-global, so `.test()` on
+    // one shared instance is stateless.
+    const DV_FOURCC_RE = /^(dvhe|dvh1|dvav|dva1|dav1)$/;
+
     // -=-=-= isDolbyVisionVideo  [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean] =-=-=-
     // True when a video stream carries Dolby Vision, both-probe: a dvhe/dvh1/dvav/dva1/dav1 fourcc, a mediaInfo HDR_Format naming Dolby Vision, or an ffprobe
     // DOVI configuration record / dolby-vision side_data. The four -c copy plugins add `-strict unofficial` to an mp4/mov remux with it, so ffmpeg's mov
@@ -678,7 +699,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // the summariseStream [video:...dv] display token; its guard_dv ENCODE routing uses the NARROWER dvSignal (needs a parsed DOVI record) instead, since
     // libx265 -dolbyvision hard-requires a real RPU (see the note there). Pass the stream's paired mediaInfo (mediaInfoFor(stream)); a single-probe false
     // negative would silently lose the boxes.
-    const isDolbyVisionVideo = (ffstream, ffmedia) => /^(dvhe|dvh1|dvav|dva1|dav1)$/.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
+    const isDolbyVisionVideo = (ffstream, ffmedia) => DV_FOURCC_RE.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
         || String(ffmedia?.HDR_Format || ffmedia?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : []).some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
@@ -957,14 +978,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // or native container round-trips; VobSub/DVB timing lives outside the stream (in the .idx), so those need a real container. The .mks
     // output needs an explicit -f matroska - ffmpeg only auto-detects matroska from a .mkv extension, not .mks (verified); .sup and .avi
     // both auto-detect from the extension.
-    const imageSubCodecs = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'xsub'];
     const IMAGE_SUB = {
         hdmv_pgs_subtitle: { ext: 'sup', fmt: 'sup'      },   // raw PGS segments; they carry their own PTS, so no container is needed
         dvd_subtitle:      { ext: 'mks', fmt: 'matroska' },   // VobSub timing lives in a separate .idx, so the stream needs a real container
         dvb_subtitle:      { ext: 'mks', fmt: 'matroska' },
         xsub:              { ext: 'avi', fmt: 'avi'      },   // AVI is the only container that holds xsub; packets carry inline timestamp ranges
     };
-    const isImageSub = (codec) => imageSubCodecs.includes(codec);
+    const isImageSub = (codec) => Object.prototype.hasOwnProperty.call(IMAGE_SUB, codec);
     // 'all'/'export' drop every image sub; 'unsupported' relies on subFormatDropped (container-forced) alone. imageSubDropped is the
     // remove_imagesubs-specific drop beyond subFormatDropped, used by subDroppedAnyReason for the language_fill tally + accessibility plain-track guard.
     const imageSubDropped = (codec) => isImageSub(codec) && (removeImageSubs === 'all' || removeImageSubs === 'export');
@@ -1171,7 +1191,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // dispKeysFor: the dispositions valid on a stream type. titleTagsFor: the deduped canonical tag strings a stream matches (real flag OR title keyword, via
     // hasDisposition), excluding untagged flags like default/cover-art. Both derive from the shared dispositionTypes table (single source of truth).
     const dispKeysFor = (type) => Object.keys(dispositionTypes).filter(k => dispositionTypes[k].streams.includes(type));
-    const titleTagsFor = (s) => [...new Set(dispKeysFor((s.codec_type || '').trim().toLowerCase())
+    const titleTagsFor = (s) => [...new Set(dispKeysFor(codecTypeOf(s))
         .filter(k => dispositionTypes[k].tag && hasDisposition(s, k)).map(k => dispositionTypes[k].tag))];
     // -=-=-= stripWords / stripDispositionWords  [audio_clean, clean_and_remux] =-=-=-
     // Single-word keywords stripped when recovering the channel/base portion of a title (multi-word
@@ -1269,11 +1289,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Check if file is a video. If it isn't then exit plugin. This benign skip (processFile:false) must precede
     // the per-file CONTENT checks below - the language_fill_mode / guard_audio_language pre-checks can failFile
     // (quarantine), and a non-video file the plugin only means to skip must never be routed to the error queue.
-    if (file.fileMedium !== 'video') {
-        response.infoLog += '☑File is not a video\n';
-        response.processFile = false;
-        return response;
-    }
+    if (file.fileMedium !== 'video') return skip('☑File is not a video\n');
 
     // remove_sub_sdh safety guard. (subDroppedAnyReason/subtitle drop lists defined earlier) A "plain" subtitle carries no
     // commentary/descriptive/SDH/lyrics role - a genuine dialogue subtitle. remove_sub_sdh removes an SDH/CC subtitle only when its language
@@ -1287,7 +1303,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const resolveWorkLang = (s) => { const sl = resolveLang(s); return fillApplies(sl, true) ? fillLanguage : (sl || 'und'); };
     if (removeSubSdh === 'enabled') {
         for (const s of (file.ffProbeData?.streams || [])) {
-            if ((s.codec_type || '').trim().toLowerCase() !== 'subtitle' || !isPlainTrack(s)) continue;
+            if (codecTypeOf(s) !== 'subtitle' || !isPlainTrack(s)) continue;
             if (subDroppedAnyReason((s.codec_name || '').toLowerCase())) continue;
             const wl = resolveWorkLang(s);
             if (subLangKeys.length > 0 && !langListMatch(wl, subLangKeys)) continue;
@@ -1321,7 +1337,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // through langKey (en/eng/ English/en-US are one language); an untagged track counts as its own "und". Commentary/descriptive tracks are excluded -
             // a foreign-language commentary is normal and says nothing about which track is the original.
         if (guardAudioLanguage === 'enabled') {
-            const audioStreams = (file.ffProbeData.streams || []).filter((s) => (s?.codec_type || '').toLowerCase() === 'audio');
+            const audioStreams = (file.ffProbeData.streams || []).filter((s) => codecTypeOf(s) === 'audio');
             const genuineLangs = new Set(audioStreams.filter((s) => !isCommentary(s) && !isDescriptive(s)).map((s) => langKey(resolveWorkLang(s))));
             if (genuineLangs.size > 1 && !audioStreams.some((s) => hasDisposition(s, 'original')))
                 failFile(`[guard_audio_language=${guardAudioLanguage}] ${genuineLangs.size} audio languages (${[...genuineLangs].join(', ')}) and none marked original - one of them could be the original language; mark the original track and requeue, or set guard_audio_language=disabled`);
@@ -1346,11 +1362,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // An untagged SDH subtitle the remove_sub_sdh guard would drop is excluded too -
             // mirrors the loop's own removal predicate (untagged tracks resolve to fillLanguage).
             const removedBySdh = (s) => removeSubSdh === 'enabled' && isSdh(s) && hasPlainSameLang(plainSubLangs, fillLanguage);
-            const untaggedAudio = streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'audio' && isUntagged(s)).length;
+            const untaggedAudio = streams.filter((s) => codecTypeOf(s) === 'audio' && isUntagged(s)).length;
             if (untaggedAudio > 1)
                 failFile(`[language_fill_mode=${fillMode}] ${untaggedAudio} audio streams have no language tag and would all be assigned "${logSafe(fillLanguage)}" by language_fill - may be different languages; tag them manually and requeue, or set language_fill_mode=force-any`);
             const untaggedSubs = keptByLangFilter(subLangKeys)
-                ? streams.filter((s) => (s?.codec_type || '').toLowerCase() === 'subtitle'
+                ? streams.filter((s) => codecTypeOf(s) === 'subtitle'
                     && !subDroppedAnyReason((s.codec_name || '').toLowerCase()) && isUntagged(s) && !removedBySdh(s)).length : 0;
             if (untaggedSubs > 1)
                 failFile(`[language_fill_mode=${fillMode}] ${untaggedSubs} subtitle streams have no language tag and would all be assigned "${logSafe(fillLanguage)}" by language_fill - may be different languages; tag them manually and requeue, or set language_fill_mode=force-any`);
@@ -1378,7 +1394,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const exportJobs = [];
             for (const s of (file.ffProbeData.streams || [])) {
                 const codec = (s?.codec_name || '').toLowerCase();
-                if ((s?.codec_type || '').toLowerCase() !== 'subtitle' || !imageSubDropped(codec) || subFilterDrops(s)) continue;
+                if (codecTypeOf(s) !== 'subtitle' || !imageSubDropped(codec) || subFilterDrops(s)) continue;
                 const sc = IMAGE_SUB[codec];
                 const name = imageSidecarName(s, sc.ext);
                 const dest = serverSidePath(path.join(libDir, name));
@@ -1416,7 +1432,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const ffstream = file.ffProbeData?.streams[i];
             const ffmedia = mediaInfoFor(ffstream);
             const ffstreamCodec = (ffstream.codec_name || '').toLowerCase();
-            const ffstreamType = (ffstream.codec_type || '').toLowerCase();
+            const ffstreamType = codecTypeOf(ffstream);
 
             //Original stream title - prefer stream title but use metadata if available. When we set tags.title both are set.
             const streamTitle = (ffstream.tags?.title || ffmedia?.Title || '');
@@ -1761,7 +1777,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // missing from the container genuinely means these fonts are orphaned - removing them is correct wherever this plugin sits in the stack.
         if (deferredFontIndices.length > 0) {
             const fontsNeeded = dstContainer === 'mkv' && file.ffProbeData.streams.some(s =>
-                (s.codec_type || '').toLowerCase() === 'subtitle'
+                codecTypeOf(s) === 'subtitle'
                 && !removedIndices.has(s.index)
                 && ['ass', 'ssa'].includes((s.codec_name || '').toLowerCase()));
 
