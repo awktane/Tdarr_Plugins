@@ -8,7 +8,7 @@ const details = () => ({
     Description: `Cleans and re-encodes the video stream. Audio and subtitles are copied unchanged (embedded cover-art video is dropped). Pick a top-level ACTION first (see its tooltip for full details) - the plugin does nothing until you choose a goal: hdr_cleanup_only (default, harmless HDR-only pass), normalize (compatibility conversion), shrink (space savings).\n\n
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '3.12.1',
+    Version: '3.13.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -44,6 +44,24 @@ const details = () => ({
                 \\nh264 (AVC): a COMPATIBILITY target only (larger files) for old / weak devices that can't do HEVC. Forced to 8-bit (10-bit H.264 breaks device support). HDR10 in H.264 plays poorly - you'll be warned.
                 \\nav1: most efficient, but slow on CPU; hardware AV1 needs a very new GPU (Intel Arc, RTX 40-series, RDNA3), else the libsvtav1 software encoder.
                 \\nDolby Vision needs HEVC: with guard_dv on, a DV source is forced to HEVC regardless of this setting (only libx265 carries the DV RPU).`,
+        },
+        {
+            name: 'deinterlace',
+            type: 'string',
+            defaultValue: 'disabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['disabled', 'enabled'],
+            },
+            tooltip: `Repair interlaced (combed) video. Old TV material stores each frame as two half-pictures captured a fraction of a second apart, which show as comb teeth on any modern display. Live under normalize / shrink; inert under hdr_cleanup_only (a pixel change is never lossless).
+                \\nYou are NOT asked which kind of source it is - that is detected from the actual pixels, because containers routinely mislabel it. There are two kinds and they need opposite repairs. Material SHOT on video (sport, news, soaps, camcorders) has no original full frame to recover, so the missing lines are interpolated and every half-picture becomes a frame of its own - 1080i60 comes out as 60fps, keeping all the motion the file actually holds. Material shot on FILM and padded out for broadcast (nearly every film DVD, much anime) still contains its original frames intact, so those are rebuilt exactly and come back at their own rate (24fps) with nothing invented.
+                \\nRepairing before any downscale is the whole point: shrinking combed video blends the two half-pictures into each other permanently, and no later pass can undo it.
+                \\nWorth knowing: shot-on-video material therefore comes out at double the frame rate, because that is what it contains - roughly a third more bitrate and half again the encode time. Film-originated video is unaffected, and so is anything already progressive, so on a normal mixed library this applies to a small slice of it.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\ndisabled (default): leave interlaced video alone.
+                \\nenabled: detect and repair, keeping everything the file contains.`,
         },
         {
             name: 'hdr_mode',
@@ -765,6 +783,60 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return ok;
     };
 
+    // ====== INTERLACE DETECTION ======
+    // Decided from the PIXELS, never from the container: real files lie routinely - the sample corpus has genuinely combed material tagged field_order=unknown,
+    // and a stream-copy cut can drop the flag outright - so a metadata-only test would miss exactly the files that need repairing. One decode pass through idet
+    // answers both questions at once.
+    //
+    // Which kind of combing it is matters, because the two repairs are opposite: material shot on VIDEO has no original full frame to recover, so bwdif
+    // interpolates the missing lines; material shot on FILM and telecined for broadcast still contains its original frames, so fieldmatch+decimate rebuilds
+    // them EXACTLY (measured SSIM 1.000000 against the true 24p, against 0.9606 for deinterlacing the same file). Using the interpolator on a film source
+    // throws away a perfect reconstruction; using the rebuilder on video-origin content drops every fifth field and judders.
+    //
+    // The discriminator is idet's REPEATED-FIELD counter, not its combed-frame ratio. 3:2 pulldown structurally repeats one field in five (20% in theory);
+    // genuine interlace repeats almost none - measured 27% on the telecine sample against 0-8% on four true-interlace ones. The combed RATIO cannot do it:
+    // the same samples read 97.8% (telecine) against 100% (interlace), a margin far too narrow to key on. It only answers combed-vs-progressive.
+    const IDET_PROBE_TIMEOUT_MS = 180000;
+    const IDET_PROBE_MAX_BYTES = 8 * 1024 * 1024;
+    const IDET_SAMPLE_FRAMES = 400;      // enough for a stable ratio; a few seconds of decode even at 4K
+    const IDET_COMBED_MIN = 0.20;        // below this the sample is progressive (measured: 0% progressive vs ~100% interlaced - a wide margin either side)
+    const IDET_REPEAT_MIN = 0.15;        // at or above this the combing is 3:2 pulldown (measured 27%), below it genuine interlace (measured 0-8%)
+    // Pull the LAST populated match out of idet's stderr. ffmpeg emits the filter's counters more than once (an all-zero block from a discarded init precedes
+    // the real one), so anchoring to the first - or to end-of-stderr - reads zeros and calls every file progressive.
+    const lastIdetCounts = (text, re) => {
+        const rx = new RegExp(re, 'g');
+        let best = null; let hit;
+        while ((hit = rx.exec(text)) !== null) if (hit.slice(1).some((n) => Number(n) > 0)) best = hit;
+        return best ? hit0Nums(best) : null;
+    };
+    const hit0Nums = (m) => m.slice(1).map(Number);
+    const detectInterlace = (ffmpegPath, inputPath, startSec) => {
+        try {
+            // Sampled from a way into the file, not the head: logos, black and title cards are commonly progressive even in an interlaced programme, so a
+            // head sample under-reports. -ss ahead of -i is safe here because this DECODES; it is only a stream COPY that -ss corrupts.
+            const args = ['-nostats', '-hide_banner', ...(startSec > 0 ? ['-ss', String(startSec)] : []), '-i', inputPath,
+                '-frames:v', String(IDET_SAMPLE_FRAMES), '-vf', 'idet', '-an', '-sn', '-f', 'null', '-'];
+            const r = childProcess.spawnSync(ffmpegPath || 'ffmpeg', args,
+                { encoding: 'utf8', timeout: IDET_PROBE_TIMEOUT_MS, maxBuffer: IDET_PROBE_MAX_BYTES });
+            const text = String((r && r.stderr) || '');
+            const multi = lastIdetCounts(text,
+                'Multi frame detection:\\s*TFF:\\s*(\\d+)\\s*BFF:\\s*(\\d+)\\s*Progressive:\\s*(\\d+)\\s*Undetermined:\\s*(\\d+)');
+            if (!multi) return { kind: 'unknown' };
+            const [tff, bff, prog, undet] = multi;
+            const total = tff + bff + prog + undet;
+            if (total === 0) return { kind: 'unknown' };
+            const combed = tff + bff;
+            if (combed / total < IDET_COMBED_MIN) return { kind: 'progressive', combed, total };
+            const rep = lastIdetCounts(text, 'Repeated Fields:\\s*Neither:\\s*(\\d+)\\s*Top:\\s*(\\d+)\\s*Bottom:\\s*(\\d+)');
+            const repeats = rep ? rep[1] + rep[2] : 0;
+            // Parity from idet's own TFF/BFF split. Only consulted when the container states no field order - bwdif's parity=auto reads the frame flags and
+            // guesses top-first when there are none, which on a flagless bottom-field-first source is simply wrong (measured 0.9345 SSIM against 0.9668).
+            const parity = tff > bff ? 'tff' : (bff > tff ? 'bff' : 'auto');
+            return { kind: repeats / total >= IDET_REPEAT_MIN ? 'telecine' : 'interlaced', combed, total, repeats, parity };
+        } catch (e) { return { kind: 'unknown' }; }
+    };
+    // ====== END INTERLACE DETECTION ======
+
     // Route the HDR->SDR tonemap to the GPU filter that rides the chosen encoder's device stack, keeping every node's output in the ONE
     // consistent tonemap_* family (cuda ~= opencl ~= videotoolbox, SSIM ~0.9997 - validated on real NVIDIA/Intel/Mac hardware). CPU 'tonemapx'
     // is the ~0.79-different outlier, used only as a fallback when no GPU tonemap initialises or the encoder is software. nvenc->cuda (native,
@@ -944,7 +1016,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ffmpeg - no explicit colour flags needed (verified empirically). Decode is kept on software frames (nvenc via the shared nvdecPreset
     // helper) so a single CPU scale filter and -pix_fmt path work uniformly across families; VAAPI is the exception - it needs its frames
     // uploaded, so it carries an explicit device + format,hwupload filter. Returns { inputSide, videoOut }.
-    const buildVideoArgs = ({ family, encoderName, codec, qNorm, speed, want10Bit, willDownscale, outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase }) => {
+    const buildVideoArgs = ({ family, encoderName, codec, qNorm, speed, want10Bit, willDownscale, outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter }) => {
         const { getNvdecHwaccelPreset, getNvenc10BitFormatArg } = require('../methods/nvdecPreset');
         const q = nativeQuality(codec, family, qNorm);
         const spd = nativeSpeed(codec, family, speed);
@@ -966,7 +1038,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (fmt) vf.push(fmt);
         };
 
-        // The downscale always leads the filter chain, in every family and with or without a tonemap, so it is emitted once here rather than per branch.
+        // Interlace repair leads the WHOLE chain, ahead of the downscale, and that order is the point of the feature: scaling combed video blends its two
+        // half-pictures into each other permanently (measured - idet then reads 'progressive' because the fields were averaged, not because anything was
+        // deinterlaced), so a repair after the scaler would have nothing left to repair. It stays on the CPU even when the encoder is hardware: the GPU
+        // deinterlacers are faster end-to-end but SILENTLY emit fully combed output on some real broadcast sources, and comb baked into a re-encode that is
+        // then labelled progressive is unrecoverable. Only the FILTER is CPU - method_encoder still picks the hardware encoder and it still does the encode.
+        if (deintFilter) vf.push(deintFilter);
+        // The downscale then leads the rest of the chain, in every family and with or without a tonemap, so it is emitted once here rather than per branch.
         if (willDownscale) vf.push(`scale=-2:${outHeight}`);
 
         if (family === 'nvenc') {
@@ -1027,6 +1105,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const bitDepthOpt = String(inputs.method_bitdepth || 'source').toLowerCase().trim();
     const encoderOpt = String(inputs.method_encoder || 'node').toLowerCase().trim();
     const hdrMode = String(inputs.hdr_mode || 'preserve').toLowerCase().trim();
+    const deinterlaceOpt = String(inputs.deinterlace || 'disabled').toLowerCase().trim();
     const guardDv = String(inputs.guard_dv) !== 'false';   // boolean (loadDefaultValues coerces it), default true
     const guardLossless = String(inputs.guard_lossless) !== 'false';   // boolean, default true
 
@@ -1052,6 +1131,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!['source', '8', '10'].includes(bitDepthOpt)) failFile(`[method_bitdepth=${bitDepthOpt}] invalid value, check your settings`);
     if (!['node', 'node_strict', 'auto', 'nvenc', 'qsv', 'vaapi', 'videotoolbox', 'amf', 'cpu'].includes(encoderOpt)) failFile(`[method_encoder=${encoderOpt}] invalid value, check your settings`);
     if (!['preserve', 'strip_dynamic', 'tonemap_sdr'].includes(hdrMode)) failFile(`[hdr_mode=${hdrMode}] invalid value, check your settings`);
+    if (!['disabled', 'enabled'].includes(deinterlaceOpt)) failFile(`[deinterlace=${deinterlaceOpt}] invalid value, check your settings`);
     // The one cross-input config error: tonemap_sdr is a pixel-domain re-encode, so it can never satisfy hdr_cleanup_only's lossless-or-skip promise.
     if (hdrMode === 'tonemap_sdr' && action === 'hdr_cleanup_only')
         failFile('[hdr_mode=tonemap_sdr][action=hdr_cleanup_only] tonemapping is always a re-encode (never lossless) - switch to action=normalize or shrink to tonemap, check your settings');
@@ -1180,6 +1260,39 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             ? `setparams=color_trc=${/hlg|log-gamma|b67/.test(hdrFmt) ? 'arib-std-b67' : 'smpte2084'}:color_primaries=bt2020:colorspace=bt2020nc,`
             : '';
 
+        // ---- interlace repair ---- Inert under hdr_cleanup_only for the same reason tonemap_sdr is: it changes pixels, so it can never be the lossless-only
+        // action's business. The detection decode is the one real cost of turning this on, so it runs ONLY when the setting is live - never on the default.
+        // Tests inject otherArguments.__awkCap.idet to pin a verdict without spawning ffmpeg, exactly as they do for the encoder and tonemap probes.
+        const deinterlaceLive = deinterlaceOpt !== 'disabled' && action !== 'hdr_cleanup_only';
+        const idet = (() => {
+            if (!deinterlaceLive) return { kind: 'disabled' };
+            // An injected capability object means a synthetic node, so NEVER spawn past it - a missing idet key reads as "no verdict", it does not fall through
+            // to a real decode. Mirrors resolveTonemapBackend, which likewise stops at the injection rather than probing.
+            const inj = otherArguments && otherArguments.__awkCap;
+            if (inj) return inj.idet || { kind: 'unknown' };
+            // Sample from a third of the way in, capped, so a long programme is not read from its (often progressive) opening titles and a short clip still
+            // starts at 0. Duration comes from the format header; an absent one simply samples from the start.
+            const durSec = Number(file.ffProbeData.format?.duration) || 0;
+            const startSec = durSec > 90 ? Math.min(Math.floor(durSec / 3), 600) : 0;
+            return detectInterlace((otherArguments && otherArguments.ffmpegPath) || 'ffmpeg', file.file, startSec);
+        })();
+        // A repaired file re-detects as progressive on any later pass, so this converges by itself and needs no reprocess fence of its own.
+        const deinterlaceNeeded = idet.kind === 'interlaced' || idet.kind === 'telecine';
+        // Film-originated video is REBUILT (its original frames are still in there), video-origin video is INTERPOLATED. deint=all because a genuinely
+        // interlaced file often carries no per-frame interlaced flag - that is why the decision came from the pixels - so deint=interlaced would skip it.
+        // Parity: prefer the container's own field order; fall back to idet's TFF/BFF split, because bwdif's parity=auto guesses top-first when the frames
+        // carry no flag, which is simply wrong on a flagless bottom-field-first source (measured 0.9345 SSIM against 0.9668).
+        const srcFieldOrder = String(primary.field_order || '').toLowerCase().trim();
+        const deintParity = ['tt', 'tb'].includes(srcFieldOrder) ? 'tff' : (['bb', 'bt'].includes(srcFieldOrder) ? 'bff' : (idet.parity || 'auto'));
+        // send_field, not send_frame: a shot-on-video source genuinely holds one distinct moment per FIELD, so emitting one frame per field (1080i60 -> 60p)
+        // keeps what the file contains, while the half-rate alternative would discard every second moment purely to save space. It costs ~31% bitrate and ~58%
+        // encode time (measured, libx265 CRF 23 on real 1080i broadcast). A telecined source is unaffected either way - its original frames come back at their
+        // own rate, so there is no second field to keep and the question does not arise.
+        const deintFilter = !deinterlaceNeeded ? ''
+            : (idet.kind === 'telecine'
+                ? 'fieldmatch,bwdif=deint=interlaced,decimate'   // rebuild the original frames; bwdif only touches what fieldmatch could not pair
+                : `bwdif=mode=send_field:parity=${deintParity}:deint=all`);
+
         // ---- shared emit helpers ----
         const coverArtStreams = videoStreams.filter((s) => isCoverArt(s));                                 // embedded cover-art / still-image "video" streams
         const coverArtDrops = coverArtStreams.map((s) => ` -map -0:${s.index}`).join('');                  // dropped from every output this plugin emits
@@ -1250,6 +1363,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // codec. depth is a PARAMETER (never a trigger). height_cap + tonemap are triggers/levers in both actions.
         const heightTrigger = willDownscale;
         const tonemapTrigger = tonemap;
+        const deintTrigger = deinterlaceNeeded;   // a filter, so it forces a real encode exactly as a downscale or a tonemap does
         let codecTrigger = false;
         if (action === 'normalize') {
             codecTrigger = ENCODABLE.includes(targetCodecName) && srcCodecName !== targetCodecName;   // fire on a mismatch either direction; codec=source never mismatches
@@ -1287,7 +1401,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const vkbps = Math.round((resolveStreamBitrate(primary) || 0) / 1000);
             if (vkbps > 0 && vkbps < guardShrinkKbps) { codecTrigger = false; belowFloorKbps = vkbps; }
         }
-        const realTranscode = codecTrigger || heightTrigger || tonemapTrigger;
+        const realTranscode = codecTrigger || heightTrigger || tonemapTrigger || deintTrigger;
         const canEncodeTarget = ENCODABLE.includes(targetCodecName);
 
         // Idempotency fence: a settings fingerprint stored as a container-global awk_video tag. Essential for shrink (a constant-quality
@@ -1315,7 +1429,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // No cross-compatible base (compat id 0 / no surviving HDR transfer, e.g. profile 5): the mp4
             // output needs the dvh1 tag - hvc1 drops the DV box entirely; a stream WITH a base keeps hvc1.
             const preserveDvNoBase = preserveDv && (dvNoBaseLayer || (!!dovi && dovi.compatId === 0));
-            const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, codec: targetCodecName, qNorm, speed, want10Bit, willDownscale, outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase });
+            const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, codec: targetCodecName, qNorm, speed, want10Bit, willDownscale, outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter });
             let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy${coverArtDrops} -metadata "awk_video=${videoSig}"`;
             if (isMp4Family(dstContainer)) out += ' -movflags use_metadata_tags';   // keep the global tag through an mp4/mov copy
             out += globalOutputOpt;
@@ -1343,6 +1457,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return response;
         };
 
+        // Say what the detection found and what is being done about it, whichever way it went - including when it found nothing. The setting costs a decode
+        // pass per file, so "I looked and there was no combing" is information the user paid for and should see. It also makes the no-effect cases legible:
+        // It also makes the frame-rate change legible on the files it happens to, and its absence legible on the film-originated ones where it never applies.
+        if (deinterlaceLive) {
+            const pct = (n) => (idet.total ? `${Math.round((n / idet.total) * 100)}%` : '?');
+            if (idet.kind === 'telecine') {
+                response.infoLog += `☐${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Film-originated video detected (${pct(idet.repeats)} repeated fields) - rebuilding its original frames exactly, at its own frame rate\n`;
+            } else if (idet.kind === 'interlaced') {
+                response.infoLog += `☐${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Interlaced video detected (${pct(idet.combed)} combed frames, ${deintParity} field order) - keeping every field as its own frame, so the output runs at double the frame rate\n`;
+            } else if (idet.kind === 'progressive') {
+                response.infoLog += `☑${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] No combing found (${pct(idet.combed)} combed frames) - nothing to repair\n`;
+            } else {
+                response.infoLog += `☒${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Could not read an interlace verdict from this file - left as-is\n`;
+            }
+        }
+
         // Skips that a pending real transcode would otherwise turn destructive.
         // guard_lossless leads the block: it is the one that says "don't touch this file at all", so it should answer for a lossless source whatever else also
         // applies. It keys on realTranscode, so the lossless -c:v copy paths (hdr_cleanup_only, a bare strip_dynamic) still run - they cost the master nothing.
@@ -1350,7 +1480,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return skip(`☒${streamTag(primary.index)}[guard_lossless=true] ${srcCodecName} is a lossless/mastering source - a re-encode would flatten it to lossy 4:2:0 ${want10Bit ? '10' : '8'}-bit; set guard_lossless=false to convert it anyway\n`);
         }
         if (realTranscode && !canEncodeTarget) {   // codec=source resolved to a legacy codec with no encoder, but height_cap/tonemap force a transcode
-            return skip(`☒${streamTag(primary.index)}[codec=source] Source codec ${srcCodecName || 'unknown'} has no encoder - can't keep it through the ${heightTrigger ? 'downscale' : 'tonemap'}; set codec=hevc/h264/av1 to convert it\n`);
+            return skip(`☒${streamTag(primary.index)}[codec=source] Source codec ${srcCodecName || 'unknown'} has no encoder - can't keep it through the ${heightTrigger ? 'downscale' : (tonemapTrigger ? 'tonemap' : 'interlace repair')}; set codec=hevc/h264/av1 to convert it\n`);
         }
         if (realTranscode && dvIptC2) {
             return skip(`☒${streamTag(primary.index)}[guard_dv=true] ${dvLabel} uses the IPT-C2 colour matrix that libx265 cannot re-encode - left untouched; set guard_dv=false and hdr_mode=tonemap_sdr to flatten it to SDR\n`);
@@ -1371,6 +1501,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 willDownscale && `${outHeight}p`,
                 want10Bit !== srcIs10 && (want10Bit ? '10-bit' : '8-bit'),   // depth piggybacks a transcode fired by something else
                 tonemap && 'tonemap_sdr',
+                deinterlaceNeeded && (idet.kind === 'telecine' ? 'film-restore' : 'deinterlace'),
             ].filter(Boolean);
             if (reasonTags.length === 0) reasonTags.push('shrink');   // a same-codec shrink with no other visible transform
             return emitTranscode(`[${reasonTags.join('][')}]`);
