@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.11.0',
+    Version: '4.12.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -197,6 +197,23 @@ const details = () => ({
                 \\n639-2/t: terminologic 3-letter codes everywhere - fra, deu, zho (matches mp4's mdhd; 3-letter is also the common mkv convention).
                 \\n639-2/b ("mkv classic"): bibliographic 3-letter codes everywhere - fre, ger, chi.
                 \\nbcp47: like container on mp4 (3-letter terminologic) but on mkv keeps the full BCP-47 tag - a region (ISO-3166) subtag like pt-BR/es-419 or a script (ISO-15924) subtag like zh-Hans; mp4 can't store a region so it still folds to 3-letter (por).`,
+        },
+        {
+            name: 'method_unmuxable',
+            type: 'string',
+            defaultValue: 'error',
+            inputUI: {
+                type: 'dropdown',
+                options: ['error', 'drop', 'mkv_fallback'],
+            },
+            tooltip: `What to do when a stream's codec CANNOT be stored in the target container. Without this the remux dies deep inside ffmpeg on an opaque "Could not find tag for codec ..." with nothing in the log saying which stream or why.
+                \\nmp4 refuses a long list that mkv accepts: TrueHD, MLP, WMA, most ADPCM, A-law / mu-law / 8-bit PCM, LATM AAC (what every DVB and broadcast capture carries), VP8, Theora, ProRes, DNxHD, FFV1, HuffYUV, MagicYUV, UtVideo, v210, DV, Cinepak, H.263, the WMV / MS-MPEG-4 family and the QuickTime-only codecs. A few fit in NEITHER container - AC-4, Blu-ray PCM, SMPTE 302M, IMA-QT and SWF ADPCM, Nellymoser - so for those no container choice is a way out.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nerror (default): stop and quarantine the file, naming the codec and the container. Nothing is changed, so the decision stays yours - the safest option, and the only one that never loses a track nor overrides your container choice.
+                \\ndrop: remove the offending streams and remux the rest. For a track you are happy to lose. Removing every video stream, or every audio stream, still fails the file rather than writing a stump.
+                \\nmkv_fallback: keep THIS file in mkv with every stream intact - your container setting still applies to every other file. A codec mkv cannot store either falls back to error, since there is nothing to fall back TO.`,
         },
         {
             name: 'guard_audio_language',
@@ -478,6 +495,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
     // ===== END SHARED: codec name resolution =====
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: mp4-family container =====
+    // -=-=-= isMp4Family  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The mp4/mov container family whose -c copy needs `-movflags use_metadata_tags` to keep sibling plugins' GLOBAL
+    // awk_* markers through the remux (dropping one re-triggers work upstream). One source so the four writers can't
+    // drift on the set (video_clean's video-only hvc1 gate is deliberately mp4/m4v/mov WITHOUT m4a and stays separate).
+    const isMp4Family = (container) => ['mp4', 'm4v', 'mov', 'm4a'].includes(String(container || '').toLowerCase());
+    // ===== END SHARED: mp4-family container =====
     // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: case-insensitive tag lookup =====
     // -=-=-= getTagCI  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
     // Look up a tag value case-insensitively - matroska UPPER-CASES tag keys on write, so a plugin reading its
@@ -768,7 +792,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`[container=${inputs.container || ''}] not configured, check your settings`);
 
     const srcContainer = file.container.toLowerCase().trim();
-    const dstContainer = inputs.container.toLowerCase().trim();
+    // let, not const: method_unmuxable=mkv_fallback rewrites this (and response.container) for THIS file when the target container cannot store one of its
+    // codecs. The rewrite happens before any consumer runs - see the muxability gate at the top of the per-file work below.
+    let dstContainer = inputs.container.toLowerCase().trim();
     // Membership guard (mirrors the sibling string-dropdown guards below): all container-specific logic branches on the literals mkv/mp4, so an out-of-set
     // value (only reachable via a hand-edited/imported config) would silently fall through to a generic remux into an unsupported container - a runtime ffmpeg
     // muxer error instead of a clean quarantine. Fail up front with the plugin's own infoLog, exactly like the sibling dropdown guards after the input parses.
@@ -790,6 +816,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const removeComments = String(inputs.remove_comments) === 'true';
     const removeBusytitle = String(inputs.remove_busytitle) === 'true';
     const removeImageSubs = String(inputs.remove_imagesubs || 'unsupported').toLowerCase();
+    const methodUnmuxable = String(inputs.method_unmuxable || 'error').toLowerCase().trim();
 
     const fillLanguage = (inputs.language_fill ? inputs.language_fill.toLowerCase().trim() : '');
     const subLanguage = String(inputs.language_sub || '').toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
@@ -869,6 +896,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`[guard_audio_language=${guardAudioLanguage}] invalid value, check your settings`);
     if(!['unsupported', 'all', 'export'].includes(removeImageSubs))
         failFile(`[remove_imagesubs=${removeImageSubs}] invalid value, check your settings`);
+    if(!['error', 'drop', 'mkv_fallback'].includes(methodUnmuxable))
+        failFile(`[method_unmuxable=${methodUnmuxable}] invalid value, check your settings`);
 
     // ====== LANGUAGE TAG CANONICALIZATION ======
     // Write-side helpers: this is the only plugin that WRITES container language tags via tag_language/language_fill; langKey/langListMatch
@@ -997,6 +1026,44 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const subFormatDropped = (codec) => alwaysDropSubs.includes(codec)
         || (dstContainer === 'mkv' && mkvOnlyDropSubs.includes(codec))
         || (dstContainer === 'mp4' && mp4OnlyDropSubs.includes(codec));
+
+    // ====== AUDIO / VIDEO CODEC x CONTAINER MUXABILITY ======
+    // The same class of knowledge as the three subtitle tables above, for the other two stream types - which codecs the destination MUXER will accept on a
+    // -c copy. Every row below was muxed for real into both containers and its exit code and first stderr line recorded; the whole 78-row matrix came out
+    // IDENTICAL on Mac, Linux and Windows jellyfin-ffmpeg 7.1.4, because a muxer's codec-tag table is compiled-in ffmpeg logic rather than a build option. So a
+    // static table is correct here and no runtime probe is needed.
+    //
+    // Keyed on the RAW ffprobe codec_name and NEVER on resolveCodecName. That helper folds aac_latm->aac, truehd->truehdatmos, wmav1/wmav2->wma and pcm_*->pcm,
+    // and since plain aac and pcm_s16le mux into mp4 perfectly well, a resolved key would silently miss the exact rows this table exists for - aac_latm most of
+    // all, since it is what every DVB/broadcast capture carries.
+    //
+    // The table is an allow-list of PROVEN failures, which is what makes it fail-safe: a codec that is not listed is not gated, so it reaches ffmpeg and fails
+    // there exactly as it does today. Being incomplete can only ever mean a missed diagnosis, never a wrongly-refused file.
+    const MP4_UNMUXABLE = [
+        // audio - "Could not find tag for codec X in stream #N, codec not currently supported in container"
+        'aac_latm', 'adpcm_ima_wav', 'adpcm_ms', 'adpcm_yamaha', 'mlp', 'pcm_alaw', 'pcm_mulaw', 'pcm_u8', 'wmav1', 'wmav2',
+        // video - same error
+        'cinepak', 'dnxhd', 'dvvideo', 'ffv1', 'ffvhuff', 'flv1', 'h263', 'huffyuv', 'magicyuv', 'msmpeg4v2', 'msmpeg4v3',
+        'prores', 'qtrle', 'svq1', 'theora', 'utvideo', 'v210', 'vp8', 'wmv1', 'wmv2',
+    ];
+    // Refused by BOTH muxers - matroska answers "No wav codec tag found for codec X". mkv_fallback cannot rescue these, because there is nothing to fall back
+    // TO; the gate degrades them to error/drop and says so. (s302m and pcm_bluray occur naturally only in MPEG-TS and on Blu-ray respectively, which is how a
+    // file can be carrying a codec neither of our two output containers accepts.)
+    const UNMUXABLE_ANYWHERE = ['ac4', 'adpcm_ima_qt', 'adpcm_swf', 'nellymoser', 'pcm_bluray', 's302m'];
+    // The one codec mp4 gates rather than refuses: it answers "truehd in MP4 support is experimental, add '-strict -2'" (rc 88), and an OUTPUT-side -strict
+    // experimental / -2 does satisfy it (-strict unofficial does not). That flag is deliberately NOT used to force a conversion - it writes a valid but
+    // non-standard file most players cannot decode, trading a loud diagnosable failure for a quiet unplayable one - so a truehd mkv bound for mp4 is gated
+    // exactly like the rows above. It survives only for a file that is ALREADY mp4-family TrueHD (codec_tag mlpa), where the format is a fact on disk rather
+    // than a conversion we are choosing: re-muxing mp4 -> mp4 emits the flag and preserves it instead of overriding the user's container.
+    const MP4_STRICT_GATED = ['truehd'];
+    // Which of the three the codec falls into for the CURRENT destination, or '' when it muxes fine. Read once per stream by the gate below.
+    const unmuxableClass = (codec) => {
+        if (UNMUXABLE_ANYWHERE.includes(codec)) return 'anywhere';
+        if (dstContainer !== 'mp4') return '';
+        if (MP4_STRICT_GATED.includes(codec)) return isMp4Family(srcContainer) ? '' : 'mp4';   // already-mp4 TrueHD is preserved with -strict, see above
+        return MP4_UNMUXABLE.includes(codec) ? 'mp4' : '';
+    };
+    // ====== END AUDIO / VIDEO CODEC x CONTAINER MUXABILITY ======
     // Image-based subtitles (PGS/VobSub/DVB) mkv muxes natively; remove_imagesubs governs them (mp4 drops them via mp4OnlyDropSubs
     // regardless). xsub is image-based too and stays in alwaysDropSubs because it muxes into NO container - but it is still EXPORTABLE:
     // AVI is its native home and a -c:s copy into one preserves the codec and every packet (verified). Being in both lists is the point -
@@ -1364,6 +1431,46 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // pre-checks so a quarantine there carries the same input picture the no-video quarantine does. Starts with ☐.
         response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
 
+            // method_unmuxable: the destination muxer cannot store one of this file's codecs, so a -c copy remux would die on an opaque ffmpeg error. Runs
+            // FIRST among the pre-checks - it is the most fundamental "can this even be written" question - and, load-bearing, before anything reads
+            // dstContainer, since mkv_fallback rewrites it. Audio and video only: the three subtitle tables above already handle subtitles, by conversion
+            // where one exists and by dropping where none does, and that behaviour is not this input's to override.
+        const unmuxableDrops = new Set();
+        let mp4StrictNeeded = false;
+        {
+            const offenders = (file.ffProbeData.streams || [])
+                .filter((s) => ['audio', 'video'].includes(codecTypeOf(s)))
+                .map((s) => ({ s, codec: (s.codec_name || '').toLowerCase().trim() }))
+                .map((o) => ({ ...o, cls: unmuxableClass(o.codec) }))
+                .filter((o) => o.cls);
+            // The mp4-family TrueHD that the gate deliberately does NOT treat as an offender still needs its flag, or the very remux we just allowed fails.
+            mp4StrictNeeded = dstContainer === 'mp4' && (file.ffProbeData.streams || [])
+                .some((s) => MP4_STRICT_GATED.includes((s.codec_name || '').toLowerCase().trim()));
+            if (offenders.length) {
+                const names = [...new Set(offenders.map((o) => o.codec))].join(', ');
+                // A codec NEITHER container accepts has nowhere to fall back to, so mkv_fallback degrades to error and says why - silently doing nothing, or
+                // silently dropping a track the user asked to keep, would both be worse than stopping.
+                const stuck = offenders.filter((o) => o.cls === 'anywhere');
+                if (methodUnmuxable === 'mkv_fallback' && stuck.length) {
+                    failFile(`[method_unmuxable=mkv_fallback] ${[...new Set(stuck.map((o) => o.codec))].join(', ')} cannot be stored in mkv either, so there is no container to fall back to - set method_unmuxable=drop to remove ${stuck.length > 1 ? 'those streams' : 'that stream'}, or remux this file outside Tdarr`);
+                }
+                if (methodUnmuxable === 'error') {
+                    failFile(`[method_unmuxable=error][container=${dstContainer}] ${names} cannot be stored in ${dstContainer} - set container=${dstContainer === 'mp4' ? 'mkv' : 'mp4'}, or method_unmuxable=drop to remove ${offenders.length > 1 ? 'those streams' : 'that stream'} / mkv_fallback to keep just this file in mkv`);
+                }
+                if (methodUnmuxable === 'drop') {
+                    for (const o of offenders) unmuxableDrops.add(o.s.index);
+                } else {   // mkv_fallback, and every offender is mkv-storable (the 'anywhere' case failed above)
+                    const abandoned = dstContainer;
+                    dstContainer = 'mkv';
+                    response.container = `.${dstContainer}`;
+                    // Say the target was abandoned even when the fallback is a no-op. Landing back on the source's own container can leave nothing to do at
+                    // all, and then the file is simply skipped - so without this line the user's container setting appears to have silently done nothing.
+                    response.infoLog += `☒${streamTag(offenders[0].s.index)}[method_unmuxable=mkv_fallback] ${names} cannot be stored in ${abandoned} - keeping this file in mkv instead${srcContainer === 'mkv' ? ' (it is already mkv, so no remux is needed for the container)' : ''}\n`;
+                    mp4StrictNeeded = false;   // the target is mkv now, and mkv needs no -strict for TrueHD
+                }
+            }
+        }
+
             // guard_audio_language: an early warning, evaluated BEFORE the remux so a file that needs attention costs nothing to find out about. audio_clean
             // decides what audio to keep, but it can only trust a track MARKED 'original' - it has no way to tell which of several untagged languages is the
             // real one. So when this file carries more than one genuine audio language and marks no original, abort and let the user tag it. Languages fold
@@ -1460,6 +1567,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             removedIndices.add(index);
             convert = true;
         };
+        // TrueHD already living in an mp4-family file, re-muxed back into one: the mov muxer writes it only under an output-side -strict experimental, so
+        // without this the very remux the muxability gate allowed would fail. Emitted here rather than at the gate because extraArguments is built inside this
+        // block. Not a `convert = true` trigger - it is inert unless some other work emits a command, and forcing a remux to add a flag would be a loop.
+        if (mp4StrictNeeded) extraArguments += ' -strict experimental';
 
             // Font attachments whose removal is deferred until after the main loop, when we know which subtitle streams survive. Decided here (not inline)
             // because an attachment can appear before its subtitles in the file, so we cannot know whether a styled subtitle survives at the moment we reach
@@ -1471,6 +1582,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const ffmedia = mediaInfoFor(ffstream);
             const ffstreamCodec = (ffstream.codec_name || '').toLowerCase();
             const ffstreamType = codecTypeOf(ffstream);
+
+            // method_unmuxable=drop: the destination cannot store this codec at all, so the stream goes before any per-type work reads it. Dropping BEFORE the
+            // type branches (rather than inside them) means the per-type output ordinal is never incremented for it, so survivors stay contiguous with no
+            // decrement to remember - including for audio, which every other path in this plugin leaves alone.
+            if (unmuxableDrops.has(ffstream.index)) {
+                workDone += `☐${streamTag(ffstream.index)}[method_unmuxable=drop] Remove ${ffstreamType}-${ffstreamCodec} - ${dstContainer} cannot store it\n`;
+                dropStream(ffstream.index);
+                if (ffstreamType === 'video') videoDropped++;
+                continue;
+            }
 
             //Original stream title - prefer stream title but use metadata if available. When we set tags.title both are set.
             const streamTitle = (ffstream.tags?.title || ffmedia?.Title || '');
@@ -1754,7 +1875,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // under -strict unofficial. Without it a -c copy remux keeps the in-band RPU + the dvhe tag but DROPS those boxes, weakening
                 // DV detection (verified on the real profile-5 sample). Add the flag so any remux this plugin performs preserves DV fully. It
                 // only SHAPES a remux another change already triggered - it does not set convert, since an untouched file keeps its boxes.
-                if (dstContainer === 'mp4' && ffstreamCodec === 'hevc' && isDolbyVision && !/ -strict unofficial\b/.test(extraArguments)) {
+                // Any -strict value already on the command satisfies this too: `experimental` (emitted for mp4-family TrueHD) is a strict superset of
+                // `unofficial` and preserves the DV configuration box just as well (verified - profile 8 retained), so a second one would be redundant.
+                if (dstContainer === 'mp4' && ffstreamCodec === 'hevc' && isDolbyVision && !/ -strict \S+/.test(extraArguments)) {
                     extraArguments += ' -strict unofficial';
                 }
 
@@ -1828,6 +1951,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         if(videoDropped > 0 && videoStreamIndex === -1)
             failFile('Removing the specified streams would leave the file with no video streams - check your removal settings');
+
+        // method_unmuxable=drop is the ONLY path here that removes an audio stream (audio_clean owns every other audio keep/drop), so it needs its own
+        // all-gone guard - the video one above does not cover audio. Gated on the file having had audio to begin with, so a genuinely silent file is untouched.
+        if(unmuxableDrops.size > 0
+            && file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'audio')
+            && !file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'audio' && !removedIndices.has(s.index)))
+            failFile(`[method_unmuxable=drop] Dropping every audio stream ${dstContainer} cannot store would leave the file with no audio at all - set method_unmuxable=error to stop instead, or mkv_fallback to keep this file in a container that can hold them`);
 
         if((removeComments === true) && file.ffProbeData.format?.tags?.comment) {
             workDone += `☐[remove_comments=true] Remove comment from file "${logSafe(file.ffProbeData.format?.tags?.comment)}"\n`;
