@@ -8,7 +8,7 @@ const details = () => ({
     Description: `Cleans and re-encodes the video stream. Audio and subtitles are copied unchanged (embedded cover-art video is dropped). Pick a top-level ACTION first (see its tooltip for full details) - the plugin does nothing until you choose a goal: hdr_cleanup_only (default, harmless HDR-only pass), normalize (compatibility conversion), shrink (space savings).\n\n
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '3.10.0',
+    Version: '3.11.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -53,12 +53,12 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['preserve', 'strip_dynamic', 'tonemap_sdr'],
             },
-            tooltip: `How to handle HDR. Static HDR10/HLG colour metadata is always carried through any encode automatically; this controls the dynamic layer (Dolby Vision / HDR10+) and whether to keep HDR at all.
+            tooltip: `How to handle HDR. Static HDR10/HLG colour metadata is always carried through any encode automatically; this controls the dynamic layer (Dolby Vision / HDR10+ / HDR Vivid) and whether to keep HDR at all.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\npreserve (recommended): keep HDR as-is. Static HDR10/HLG transcodes normally; Dolby Vision / HDR10+ is protected - with guard_dv on, DV is preserved through a transcode (libx265), and under hdr_cleanup_only nothing is touched.
-                \\nstrip_dynamic: drop just the dynamic layer, keep the base HDR10. When it's the ONLY thing to do (no codec/resolution change) this is LOSSLESS - a -c:v copy with a bitstream filter (dovi_rpu / hevc_metadata), no quality cost. Needs a base layer: single-layer DV with no HDR10 base (e.g. profile 5) has nothing to fall back to and is skipped (use tonemap_sdr). Folds into a real transcode if codec/height_cap also fire. Overridden per file by guard_dv (which preserves the DV instead).
+                \\npreserve (recommended): keep HDR as-is. Static HDR10/HLG transcodes normally; Dolby Vision / HDR10+ / HDR Vivid is protected - with guard_dv on, DV is preserved through a transcode (libx265), and under hdr_cleanup_only nothing is touched.
+                \\nstrip_dynamic: drop just the dynamic layer, keep the base HDR10. When it's the ONLY thing to do (no codec/resolution change) this is LOSSLESS - a -c:v copy with a bitstream filter (dovi_rpu / hevc_metadata), no quality cost. Needs a base layer: single-layer DV with no HDR10 base (e.g. profile 5) has nothing to fall back to and is skipped (use tonemap_sdr). HDR Vivid (CUVA) has NO lossless strip path at ALL - no bitstream filter in this ffmpeg can remove it - so a Vivid file is skipped here too; tonemap_sdr, or a re-encode via normalize/shrink, is the only way to be rid of it. Folds into a real transcode if codec/height_cap also fire. Overridden per file by guard_dv (which preserves the DV instead).
                 \\ntonemap_sdr: tonemap ALL HDR (static + dynamic) down to SDR (bt709) - always a real re-encode (a pixel operation, never lossless), so NOT valid under action=hdr_cleanup_only. For SDR-only playback: correct colour on non-HDR displays, no per-play server tonemapping. Runs GPU-accelerated on the node's encoder hardware (one consistent look across NVIDIA/Intel/AMD/Apple), CPU fallback otherwise. Lossy and one-way (HDR master discarded); the only safe flatten for a no-base DV. Follows method_bitdepth (source -> 10-bit SDR; set 8 for max compatibility).`,
         },
         {
@@ -154,7 +154,7 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\ntrue (default): when a DV source is re-encoded, carry the DV RPU through so the output stays Dolby Vision. Forces the libx265 software encoder (only it keeps the RPU; every hardware HEVC encoder drops it, so a GPU/auto node drops to CPU for these files); forces the HEVC codec (overriding your codec choice) and 10-bit; overrides hdr_mode=strip_dynamic/tonemap_sdr for DV files (the DV is preserved, with a warning). HDR10+ can't be carried (no ffmpeg-native path). A no-base DV that libx265 can't re-encode (e.g. an IPT-C2 profile 5) is skipped rather than corrupted.
+                \\ntrue (default): when a DV source is re-encoded, carry the DV RPU through so the output stays Dolby Vision. Forces the libx265 software encoder (only it keeps the RPU; every hardware HEVC encoder drops it, so a GPU/auto node drops to CPU for these files); forces the HEVC codec (overriding your codec choice) and 10-bit; overrides hdr_mode=strip_dynamic/tonemap_sdr for DV files (the DV is preserved, with a warning). Neither HDR10+ nor HDR Vivid can be carried (no ffmpeg-native path for either). A no-base DV that libx265 can't re-encode (e.g. an IPT-C2 profile 5) is skipped rather than corrupted.
                 \\nfalse: don't protect DV - a transcode that would destroy it still gets skipped under preserve, but strip_dynamic/tonemap_sdr are honoured (the DV layer is dropped/flattened as asked).`,
         },
         {
@@ -483,11 +483,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The HDR transfer curves: ffmpeg's two HDR color_trc enums (smpte2084 = PQ, arib-std-b67 = HLG) plus the MediaInfo spellings (pq, hlg).
     // The single source for every HDR-curve test: summariseStream's vHdr token below, and video_clean's isHdr / dvNoBaseLayer / tonemap-setparams gate.
     const HDR_TRANSFERS = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'];
-    // -=-=-= DYNAMIC_HDR_RE  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Recognises dynamic HDR (HDR10+) from a lowercased HDR_Format string. Matches the spellings real files use: 'hdr10+', 'hdr10 plus', and 'smpte st 2094'.
-    // Bare '2094' suffices - only HDR10+ carries a 2094 block (plain HDR10 is SMPTE ST 2086). summariseStream's HDR10+ token and video_clean's isDynamicHdr
-    // both read it, so the display token and the protective re-encode skip cannot disagree. DV is recognised separately (isDolbyVisionVideo / dvSignal).
-    const DYNAMIC_HDR_RE = /2094|hdr10\+|hdr10 plus/;
+    // -=-=-= HDR10P_RE / VIVID_HDR_RE / DYNAMIC_HDR_RE  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Recognises dynamic HDR from a lowercased HDR_Format string, split BY FORMAT because the two are not interchangeable downstream: HDR10+ has a lossless
+    // strip path (hevc_metadata=remove_hdr10plus, HEVC only) while HDR Vivid has none - no bitstream filter here can remove a CUVA block. The spellings are
+    // the ones real files use; a bare '2094' suffices for HDR10+ since only it carries a 2094 block (plain static HDR10 is SMPTE ST 2086), and production
+    // MediaInfo 23.07 spells Vivid 'HDR Vivid'. DYNAMIC_HDR_RE is COMPOSED from the two, so a spelling can never be added to one list and missed by the union.
+    // summariseStream's HDR token and video_clean's isDynamicHdr both read these, so the display token and the protective re-encode skip cannot disagree. DV is
+    // recognised separately (isDolbyVisionVideo / dvSignal). Note a probe limit these patterns cannot cover: production MediaInfo 23.07 reports no Video track
+    // at all for an H.266/VVC file, so a VVC stream can never be recognised as dynamic HDR by any path here.
+    const HDR10P_RE = /2094|hdr10\+|hdr10 plus/;
+    const VIVID_HDR_RE = /hdr vivid|cuva/;
+    const DYNAMIC_HDR_RE = new RegExp(`${HDR10P_RE.source}|${VIVID_HDR_RE.source}`);
     // -=-=-= summariseStream  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Per type: video codec + resolution/10bit/hdr (+/cover for cover-art/still images); data & attachment codec only. Audio & subtitle append /default,
     // then EVERY role marker that applies, so a track flagged two ways shows both. Audio: /commentary /description then /dub /original. Subtitle: /forced
@@ -517,11 +523,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const vXfer = (s.color_transfer || vmi?.transfer_characteristics || '').toLowerCase().trim();
             const vHdr = HDR_TRANSFERS.includes(vXfer) || !!String(vmi?.HDR_Format || '').trim();
             // HDR sub-type marker, shown in place of 'hdr'. Dolby Vision via the shared isDolbyVisionVideo (fourcc / mediaInfo HDR_Format / DOVI record) - also
-            // surfacing Profile-5 DV whose non-standard transfer sets no hdr flag. HDR10+ (DYNAMIC_HDR_RE) is stream-visible only via mediaInfo (ffprobe
-            // carries 2094-40 per-frame, which Tdarr doesn't probe), so it degrades to plain 'hdr' when mediaInfo is absent.
+            // surfacing Profile-5 DV whose non-standard transfer sets no hdr flag. HDR10+ and HDR Vivid are stream-visible only via mediaInfo (ffprobe carries
+            // their metadata per-FRAME, which Tdarr doesn't probe), so both degrade to plain 'hdr' when mediaInfo is absent. A stream can carry BOTH at once
+            // (real DVB multiplexes do), so the token names every format present rather than picking a winner - 'hdr10+/vivid'.
             const vHdrFmt = String(vmi?.HDR_Format || vmi?.HDR_Format_Compatibility || '').toLowerCase();
             const vDv = isDolbyVisionVideo(s, vmi);
-            const vHdrTok = vDv ? 'dv' : (DYNAMIC_HDR_RE.test(vHdrFmt) ? 'hdr10+' : (vHdr ? 'hdr' : ''));
+            const vDynTok = [HDR10P_RE.test(vHdrFmt) ? 'hdr10+' : '', VIVID_HDR_RE.test(vHdrFmt) ? 'vivid' : ''].filter(Boolean).join('/');
+            const vHdrTok = vDv ? 'dv' : (vDynTok || (vHdr ? 'hdr' : ''));
             const vParts = [codec, vHeight > 0 ? `${vHeight}p` : '', vTenbit ? '10bit' : '', vHdrTok].filter(Boolean).join(' ');
             return `[video:${vParts}${isCoverArt(s) ? '/cover' : ''}]`;
         }
@@ -1088,7 +1096,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // (libx265 -dolbyvision), which hard-requires a real RPU, so a record-less DV tag must NOT reach it. Do not collapse dvSignal into
         // isDolbyVisionVideo.
         const dvSignal = !!dovi || dvCodecTag || hdrFmt.includes('dolby vision');   // Dolby Vision specifically (excludes HDR10+)
-        const isHdr10Plus = isDynamicHdr && !dvSignal;                              // dynamic HDR that is not DV = HDR10+ (no RPU path; a lossless strip needs HEVC via hevc_metadata)
+        // The two non-DV dynamic formats, kept APART because their strip paths differ: HDR10+ has one (hevc_metadata=remove_hdr10plus, HEVC only) and HDR Vivid
+        // has none - no bitstream filter in this build removes a CUVA block, verified against a real pure-Vivid file (the HDR10+ half went, every CUVA frame
+        // stayed). A file can carry both, so these are independent flags rather than a single "which format is it".
+        const isHdr10Plus = !dvSignal && (HDR10P_RE.test(hdrFmt) || ffprobeDynamicHdr);
+        const isHdrVivid = VIVID_HDR_RE.test(hdrFmt);
+        // Names the dynamic layer(s) actually present, so a message never has to guess between DV, HDR10+ and Vivid. DV wins the label outright (its profile
+        // string is the useful detail); otherwise every non-DV format present is named. Falls back to the generic term if a probe flagged dynamic HDR without
+        // naming a format (a bare ffprobe side-data hit).
+        const dynLabel = dvSignal ? dvLabel
+            : ([isHdr10Plus ? 'HDR10+' : '', isHdrVivid ? 'HDR Vivid' : ''].filter(Boolean).join(' + ') || 'dynamic HDR');
         const srcXfer = (primary.color_transfer || mi?.transfer_characteristics || '').toLowerCase().trim();
         // isHdr / dvNoBaseLayer / the tonemap-setparams gate below read the shared HDR_TRANSFERS curve set (defined in the stream/preset-helpers section).
         const isHdr = HDR_TRANSFERS.includes(srcXfer) || !!String(mi?.HDR_Format || '').trim() || isDynamicHdr;
@@ -1151,7 +1168,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // fence (once stripped it is no longer dynamic-HDR, so a re-run is a natural no-op). On mp4 the fourCC is reset (dvh1 -> hvc1).
         const emitLosslessStrip = () => {
             const bsf = dvSignal ? 'dovi_rpu=strip=1' : 'hevc_metadata=remove_hdr10plus=1';
-            response.infoLog += `☐${streamTag(primary.index)}[hdr_mode=strip_dynamic] Stripping ${dvSignal ? dvLabel : 'HDR10+'} losslessly (-c:v copy, base HDR10 retained)\n`;
+            response.infoLog += `☐${streamTag(primary.index)}[hdr_mode=strip_dynamic] Stripping ${dynLabel} losslessly (-c:v copy, base HDR10 retained)\n`;
             let out = `-map 0 -c copy -bsf:v:0 ${bsf}${coverArtDrops}${qtVideoTag(srcCodecName)} -c:a copy -c:s copy${globalOutputOpt}`;
             if (isMp4Family(dstContainer)) out += ' -movflags use_metadata_tags';   // same as the transcode path: keep sibling plugins' GLOBAL awk_* markers through an mp4/mov copy
             response.preset = `<io>${out}`;   // no input-side args
@@ -1166,26 +1183,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return response;
         };
 
-        // Lossless dynamic-HDR strip eligibility, shared by hdr_cleanup_only and the no-real-transcode strip
-        // path: a no-base DV and HDR10+-in-non-HEVC both have no lossless path (skip); otherwise do the strip.
-        // The two callers point users at slightly different next steps, so their two skip messages are passed in.
-        const tryLosslessStrip = (noBaseMsg, hdr10PlusMsg) => {
+        // Lossless dynamic-HDR strip eligibility, shared by hdr_cleanup_only and the no-real-transcode strip path: a no-base DV, any HDR Vivid, and
+        // HDR10+-in-non-HEVC all have no lossless path (skip); otherwise do the strip. The callers point users at slightly different next steps, so each
+        // passes its own three skip messages. Vivid is tested BEFORE the HDR10+ leg on purpose: on a file carrying both, stripping only the HDR10+ half would
+        // leave the file still dynamic-HDR while the log reported a completed strip.
+        const tryLosslessStrip = (noBaseMsg, vividMsg, hdr10PlusMsg) => {
             if (dvNoBaseLayer) { return skip(noBaseMsg); }
+            if (isHdrVivid) { return skip(vividMsg); }
             if (isHdr10Plus && srcCodecName !== 'hevc') { return skip(hdr10PlusMsg); }
             return emitLosslessStrip();
         };
+        // The tail of a Vivid refusal: whatever ELSE the file carries also stays, since the whole strip is abandoned. Naming it stops the message implying a
+        // partial strip ran.
+        const vividAlso = dvSignal ? `, so the ${dvLabel} alongside it stays too` : (isHdr10Plus ? ', so the HDR10+ layer alongside it stays too' : '');
 
         // ================= decide, gated by action =================
         if (action === 'hdr_cleanup_only') {
             // Only hdr_mode is live; codec / height_cap / bit-depth / encoder inert. Lossless-or-skip.
             if (hdrMode === 'preserve') {
-                return skip(`☑${streamTag(primary.index)}[action=hdr_cleanup_only] ${isDynamicHdr ? `${dvSignal ? dvLabel : 'HDR10+'} left untouched (preserve)` : 'Nothing to clean up (preserve)'}\n`);
+                return skip(`☑${streamTag(primary.index)}[action=hdr_cleanup_only] ${isDynamicHdr ? `${dynLabel} left untouched (preserve)` : 'Nothing to clean up (preserve)'}\n`);
             }
             if (!isDynamicHdr) {   // hdrMode === 'strip_dynamic'
-                return skip(`☑${streamTag(primary.index)}[hdr_mode=strip_dynamic] No dynamic HDR (Dolby Vision / HDR10+) to strip - left untouched\n`);
+                return skip(`☑${streamTag(primary.index)}[hdr_mode=strip_dynamic] No dynamic HDR (Dolby Vision / HDR10+ / HDR Vivid) to strip - left untouched\n`);
             }
             return tryLosslessStrip(
                 `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} has no HDR10 base layer - can't strip losslessly; switch to action=normalize or shrink with hdr_mode=tonemap_sdr to flatten it to SDR\n`,
+                `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] HDR Vivid has no lossless strip path (no bitstream filter here can remove a CUVA block)${vividAlso} - left untouched; switch to action=normalize or shrink with hdr_mode=tonemap_sdr to flatten it to SDR\n`,
                 `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] HDR10+ in ${srcCodecName || 'this codec'} has no lossless strip path (needs HEVC) - left untouched; use action=normalize/shrink to re-encode it away\n`);
         }
 
@@ -1297,7 +1320,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return skip(`☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} has no HDR10 base layer - a re-encode would leave a mis-coloured picture with no HDR fallback, left untouched; set hdr_mode=tonemap_sdr to flatten it to SDR\n`);
         }
         if (realTranscode && isDynamicHdr && !preserveDv && effHdrMode === 'preserve') {   // a transcode would drop the unprotected dynamic layer - protect it by skipping
-            return skip(`☒${streamTag(primary.index)}[hdr_mode=preserve] ${dvSignal ? dvLabel : 'HDR10+'} can't survive a re-encode - left untouched to protect it; ${dvSignal ? 'enable guard_dv to carry the Dolby Vision through, or ' : ''}set hdr_mode=strip_dynamic (keep the HDR10 base) or hdr_mode=tonemap_sdr (flatten to SDR)\n`);
+            return skip(`☒${streamTag(primary.index)}[hdr_mode=preserve] ${dynLabel} can't survive a re-encode - left untouched to protect it; ${dvSignal ? 'enable guard_dv to carry the Dolby Vision through, or ' : ''}set hdr_mode=strip_dynamic (keep the HDR10 base) or hdr_mode=tonemap_sdr (flatten to SDR)\n`);
         }
 
         if (realTranscode) {
@@ -1318,6 +1341,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (effHdrMode === 'strip_dynamic' && isDynamicHdr) {   // strip_dynamic is the sole reason - do it losslessly (or skip when it can't be lossless)
             return tryLosslessStrip(
                 `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} has no HDR10 base layer - can't strip losslessly; set hdr_mode=tonemap_sdr to flatten it to SDR\n`,
+                `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] HDR Vivid has no lossless strip path (no bitstream filter here can remove a CUVA block)${vividAlso} - left untouched; set hdr_mode=tonemap_sdr to flatten it to SDR\n`,
                 `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] HDR10+ in ${srcCodecName || 'this codec'} has no lossless strip path (needs HEVC) - left untouched\n`);
         }
         if (belowFloorKbps > 0) {
