@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can promote the default, SDH or descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time it's needed).\n`,
-    Version: '4.11.2',
+    Version: '4.12.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -303,8 +303,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: image / cover-art codecs =====
     // -=-=-= IMAGE_CODECS / isCoverArt  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last;
-    // summariseStream flags them /cover.
-    const IMAGE_CODECS = ['mjpeg', 'mjpegb', 'png', 'apng', 'gif', 'bmp', 'webp', 'tiff'];
+    // summariseStream flags them /cover. Two codecs that LOOK like they belong are deliberately ABSENT, for one reason: they are also real
+    // moving-picture codecs. mjpeg/mjpegb is camcorder/AVI-era footage, and jpeg2000 is the DCP / IMF / broadcast-mezzanine codec - listing
+    // either drops genuine video as cover art, while neither is ever WRITTEN as cover art (mkv attaches image/jpeg or image/png; the mp4 covr
+    // atom encodes only JPEG or PNG). Real cover art in those codecs still matches via the disposition clause below - mp4 marks it attached_pic
+    // and mkv carries it as an ATTACHMENT, not a video stream - so a dispositionless mjpeg/jpeg2000 video stream reads as real video, the
+    // fail-safe direction. nb_frames cannot substitute for the disposition test: in mkv it is N/A for real MJPEG video AND for cover art.
+    const IMAGE_CODECS = ['png', 'apng', 'gif', 'bmp', 'webp', 'tiff', 'qoi'];
     const isCoverArt = (s) => IMAGE_CODECS.includes((s.codec_name || '').trim().toLowerCase())
         || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails');
     // ===== END SHARED: image / cover-art codecs =====
@@ -409,9 +414,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //       `transparent` here, and `minimum` is kept ONLY as the transcode floor read by resolveBitrate (audio_clean).
     //   source-lossy (everything else): { score, transparent } - `transparent` is the 2-CHANNEL baseline; scoreThresholds scales it by (ch/2)^0.65 and
     //       derives minimum as MIN_RATIO of transparent. Some formats here aren't ffmpeg-encodable (e.g. ac4).
-    // objectAudio: true marks a codec whose stream carries object-audio metadata (Atmos/DTS:X/MPEG-H) that ffmpeg cannot re-encode - read only by audio_clean's
-    // guard_object_audio, never by the score/threshold math below. AC-4 is deliberately NOT flagged: it spans plain stereo to Atmos and no ffprobe field
-    // distinguishes the immersive (IMS) variant the way eac3->eac3atmos does, and it isn't ffmpeg-encodable anyway (so the guard could only ever block a drop).
+    // objectAudio: true marks a codec carrying object-audio metadata (Atmos/DTS:X/MPEG-H/AC-4) that ffmpeg cannot re-encode - read only by audio_clean's
+    // guard_object_audio, never by the score/threshold math below. AC-4 is flagged WHOLESALE, because no probe separates its immersive variants (IMS, AJOC)
+    // from plain channel-based AC-4 the way eac3->eac3atmos does: ffprobe reports profile=unknown and MediaInfo the same Format for all three. So the choice
+    // is protect every AC-4 or none, and protecting all is the fail-safe half - AC-4 has no ffmpeg encoder, so a "protected" channel-based track merely stays
+    // AC-4, whereas an unprotected IMS track (2 channels, immersive, indistinguishable from plain stereo) is flattened to stereo AAC by codec_force=2below.
     const codecInfo = {
         // Lossless
         pcm:         { score: 100, lossless: true },
@@ -426,6 +433,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         wmalossless: { score: 100, lossless: true },
         als:         { score: 100, lossless: true },   // MPEG-4 ALS (ffprobe 'als'; the mp4-wrapped 'mp4als' folds here via codecAlias) — lossless, so guard_lossless must protect it
         dsd:         { score: 100, lossless: true },   // DSD / SACD 1-bit (ffprobe dsd_lsbf/dsd_msbf[_planar], folded via codecAlias) — lossless, so guard_lossless must protect it
+        // Decode-only lossless: no ffmpeg encoder, so each can only ever arrive as a SOURCE. All four carry ffmpeg's lossless flag (the trailing S of D.AI.S
+        // in `ffprobe -codecs`), and without a row here they'd fall to UNKNOWN_CODEC_SCORE (70, no lossless flag) - below aac and mp3, leaving them unguarded.
+        dst:         { score: 100, lossless: true },   // DST (Direct Stream Transfer) — the COMPRESSED form of DSD carried by every SACD ISO rip; dsd above is the raw form
+        ralf:        { score: 100, lossless: true },   // RealAudio Lossless (RealMedia containers)
+        shorten:     { score: 100, lossless: true },   // Shorten (.shn) — the pre-FLAC live-taping format
+        osq:         { score: 100, lossless: true },   // OSQ (Original Sound Quality)
         mlp:         { score: 99,  lossless: true },
 
         // Dolby family
@@ -442,7 +455,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         dtsexpressx: { score: 82,  transparent: 188000,  objectAudio: true },
 
         // Modern multichannel codecs
-        ac4:         { score: 90,  transparent: 188000 },
+        ac4:         { score: 90,  transparent: 188000,  objectAudio: true },
         eac3:        { score: 89,  minimum:     192000 },  // encodable -> scores off CODEC_TARGET_BPS; minimum = transcode floor only
         mpegh3d:     { score: 89,  transparent: 250000,  objectAudio: true },
 

@@ -5,9 +5,9 @@ const details = () => ({
     Name: 'Clean up the audio streams based on language, channels, and quality',
     Type: 'Audio',
     Operation: 'Transcode',
-    Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X), high-quality, and original-language tracks from destructive changes.\n\n
+    Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X/AC-4), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '4.11.0',
+    Version: '4.12.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -288,7 +288,7 @@ const details = () => ({
                 options: ['enabled','disabled'],
             },
             tooltip: `Protect a track from a destructive operation (downmix_to_six / downmix_to_stereo 'replace', codec_force, duplicate removal, and
-                method_loudnorm) whenever it carries OBJECT AUDIO (Dolby Atmos on E-AC-3, DTS:X, or MPEG-H) - independent of guard_lossless and
+                method_loudnorm) whenever it carries OBJECT AUDIO (Dolby Atmos on E-AC-3 or TrueHD, DTS:X, MPEG-H, or AC-4) - independent of guard_lossless and
                 guard_quality. ffmpeg has no encoder for these object-audio layers, so ANY re-encode permanently flattens the track to its plain
                 channel bed, silently discarding the height/object information - the same irreversible loss guard_lossless prevents for lossless
                 masters, but for LOSSY object-audio carriers that guard_lossless doesn't cover (Atmos on E-AC-3 and DTS:X on DTS core/HR are lossy).
@@ -298,6 +298,9 @@ const details = () => ({
                 \\nNote: object-audio detection is best-effort - Atmos on E-AC-3 is reliable, but DTS:X relies on a MediaInfo field its own maintainers
                 note is incomplete for an undocumented format, so a real DTS:X track may occasionally not be recognized (it never false-positives). A
                 recognized object-audio track is also PREFERRED over an otherwise-equal plain track when method_deduplicate picks which to keep.
+                \\nAC-4 is protected WHOLESALE, because no probe separates its immersive variants (IMS, AJOC) from plain channel-based AC-4 - and since
+                ffmpeg has no AC-4 encoder, protecting a channel-based one costs nothing (the track just stays AC-4), while leaving an immersive one
+                unprotected would flatten it to stereo.
                 \\n=====
                 \\nActions
                 \\n=====
@@ -489,8 +492,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: image / cover-art codecs =====
     // -=-=-= IMAGE_CODECS / isCoverArt  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last;
-    // summariseStream flags them /cover.
-    const IMAGE_CODECS = ['mjpeg', 'mjpegb', 'png', 'apng', 'gif', 'bmp', 'webp', 'tiff'];
+    // summariseStream flags them /cover. Two codecs that LOOK like they belong are deliberately ABSENT, for one reason: they are also real
+    // moving-picture codecs. mjpeg/mjpegb is camcorder/AVI-era footage, and jpeg2000 is the DCP / IMF / broadcast-mezzanine codec - listing
+    // either drops genuine video as cover art, while neither is ever WRITTEN as cover art (mkv attaches image/jpeg or image/png; the mp4 covr
+    // atom encodes only JPEG or PNG). Real cover art in those codecs still matches via the disposition clause below - mp4 marks it attached_pic
+    // and mkv carries it as an ATTACHMENT, not a video stream - so a dispositionless mjpeg/jpeg2000 video stream reads as real video, the
+    // fail-safe direction. nb_frames cannot substitute for the disposition test: in mkv it is N/A for real MJPEG video AND for cover art.
+    const IMAGE_CODECS = ['png', 'apng', 'gif', 'bmp', 'webp', 'tiff', 'qoi'];
     const isCoverArt = (s) => IMAGE_CODECS.includes((s.codec_name || '').trim().toLowerCase())
         || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails');
     // ===== END SHARED: image / cover-art codecs =====
@@ -602,9 +610,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //       `transparent` here, and `minimum` is kept ONLY as the transcode floor read by resolveBitrate (audio_clean).
     //   source-lossy (everything else): { score, transparent } - `transparent` is the 2-CHANNEL baseline; scoreThresholds scales it by (ch/2)^0.65 and
     //       derives minimum as MIN_RATIO of transparent. Some formats here aren't ffmpeg-encodable (e.g. ac4).
-    // objectAudio: true marks a codec whose stream carries object-audio metadata (Atmos/DTS:X/MPEG-H) that ffmpeg cannot re-encode - read only by audio_clean's
-    // guard_object_audio, never by the score/threshold math below. AC-4 is deliberately NOT flagged: it spans plain stereo to Atmos and no ffprobe field
-    // distinguishes the immersive (IMS) variant the way eac3->eac3atmos does, and it isn't ffmpeg-encodable anyway (so the guard could only ever block a drop).
+    // objectAudio: true marks a codec carrying object-audio metadata (Atmos/DTS:X/MPEG-H/AC-4) that ffmpeg cannot re-encode - read only by audio_clean's
+    // guard_object_audio, never by the score/threshold math below. AC-4 is flagged WHOLESALE, because no probe separates its immersive variants (IMS, AJOC)
+    // from plain channel-based AC-4 the way eac3->eac3atmos does: ffprobe reports profile=unknown and MediaInfo the same Format for all three. So the choice
+    // is protect every AC-4 or none, and protecting all is the fail-safe half - AC-4 has no ffmpeg encoder, so a "protected" channel-based track merely stays
+    // AC-4, whereas an unprotected IMS track (2 channels, immersive, indistinguishable from plain stereo) is flattened to stereo AAC by codec_force=2below.
     const codecInfo = {
         // Lossless
         pcm:         { score: 100, lossless: true },
@@ -619,6 +629,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         wmalossless: { score: 100, lossless: true },
         als:         { score: 100, lossless: true },   // MPEG-4 ALS (ffprobe 'als'; the mp4-wrapped 'mp4als' folds here via codecAlias) — lossless, so guard_lossless must protect it
         dsd:         { score: 100, lossless: true },   // DSD / SACD 1-bit (ffprobe dsd_lsbf/dsd_msbf[_planar], folded via codecAlias) — lossless, so guard_lossless must protect it
+        // Decode-only lossless: no ffmpeg encoder, so each can only ever arrive as a SOURCE. All four carry ffmpeg's lossless flag (the trailing S of D.AI.S
+        // in `ffprobe -codecs`), and without a row here they'd fall to UNKNOWN_CODEC_SCORE (70, no lossless flag) - below aac and mp3, leaving them unguarded.
+        dst:         { score: 100, lossless: true },   // DST (Direct Stream Transfer) — the COMPRESSED form of DSD carried by every SACD ISO rip; dsd above is the raw form
+        ralf:        { score: 100, lossless: true },   // RealAudio Lossless (RealMedia containers)
+        shorten:     { score: 100, lossless: true },   // Shorten (.shn) — the pre-FLAC live-taping format
+        osq:         { score: 100, lossless: true },   // OSQ (Original Sound Quality)
         mlp:         { score: 99,  lossless: true },
 
         // Dolby family
@@ -635,7 +651,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         dtsexpressx: { score: 82,  transparent: 188000,  objectAudio: true },
 
         // Modern multichannel codecs
-        ac4:         { score: 90,  transparent: 188000 },
+        ac4:         { score: 90,  transparent: 188000,  objectAudio: true },
         eac3:        { score: 89,  minimum:     192000 },  // encodable -> scores off CODEC_TARGET_BPS; minimum = transcode floor only
         mpegh3d:     { score: 89,  transparent: 250000,  objectAudio: true },
 
@@ -1338,7 +1354,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // source-bitrate floor on the codec_force / loudnorm encode paths (downmix paths pass no source bitrate, so are unaffected).
     const isLosslessSource = (stream) => codecInfo[resolveCodecName(stream)]?.lossless === true;
 
-    // Resolve whether a source stream carries object-audio metadata (Atmos / DTS:X / MPEG-H) that ffmpeg cannot reconstruct on re-encode - keyed off the
+    // Resolve whether a source stream carries object-audio metadata (Atmos / DTS:X / MPEG-H / AC-4) that ffmpeg cannot reconstruct on re-encode - keyed off the
     // codecInfo objectAudio flag via the same resolveCodecName resolution. Stored per-stream as isTdarrObjectAudio. Read by guard_object_audio (an
     // independent third guard) and used as a dedup tie-breaker so an object-audio track is preferred over an otherwise-equal plain one.
     const isObjectAudioSource = (stream) => codecInfo[resolveCodecName(stream)]?.objectAudio === true;
@@ -1499,7 +1515,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // Used by codec_force to suppress the source-bitrate floor in resolveBitrate for lossless sources. A lossless bitrate (e.g. 4 Mbps TrueHD)
                 // is not a comparable quantity for a perceptual encode and would otherwise pin the output at the codec ceiling for no audible gain.
                 isTdarrLossless: isLosslessSource(stream),
-                // True when the source carries Atmos/DTS:X/MPEG-H object audio ffmpeg can't re-encode - read by guard_object_audio and the dedup tie-break.
+                // True when the source has Atmos/DTS:X/MPEG-H/AC-4 object audio ffmpeg can't re-encode - read by guard_object_audio and the dedup tie-break.
                 isTdarrObjectAudio: isObjectAudioSource(stream),
                 // True when the source is a Dolby Surround EX (matrix-6.1) AC-3 - read only by the dedup tie-break, to keep the EX copy over a plain 5.1 twin.
                 isTdarrMatrixSurround: isMatrixSurroundSource(stream)
@@ -1528,7 +1544,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const guardBlocks = (stream, targetCodec, targetChannels, srcChannels) => {
             if (stream.isTdarrSecondaryTrack || stream.awkTier !== 'surround') return false;
             if (guardLossless === 'enabled' && stream.isTdarrLossless) return true;         // lossless detail can't survive any lossy re-encode
-            if (guardObjectAudio === 'enabled' && stream.isTdarrObjectAudio) return true;   // Atmos/DTS:X/MPEG-H object layer has no ffmpeg encoder
+            if (guardObjectAudio === 'enabled' && stream.isTdarrObjectAudio) return true;   // Atmos/DTS:X/MPEG-H/AC-4 object layer has no ffmpeg encoder
             if (guardQuality === 'disabled') return false;
             if (Number(targetChannels) < Number(srcChannels)) return true;       // the operation drops channels
             const family = aacFamily(targetCodec);      // aac_vbr scores as the aac family

@@ -8,7 +8,7 @@ const details = () => ({
     Description: `Cleans and re-encodes the video stream. Audio and subtitles are copied unchanged (embedded cover-art video is dropped). Pick a top-level ACTION first (see its tooltip for full details) - the plugin does nothing until you choose a goal: hdr_cleanup_only (default, harmless HDR-only pass), normalize (compatibility conversion), shrink (space savings).\n\n
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '3.9.2',
+    Version: '3.10.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -39,7 +39,7 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nsource: keep the source codec (re-encode in place when something else forces it - height_cap / hdr_mode - or, under shrink, a same-codec size pass). A legacy source codec with no encoder (VP9/MPEG-2/VC-1/...) can't be kept through a forced transcode - that file is skipped with a warning to pick hevc/h264/av1.
+                \\nsource: keep the source codec (re-encode in place when something else forces it - height_cap / hdr_mode - or, under shrink, a same-codec size pass). A source codec with no encoder in this build - legacy ones like VP9/MPEG-2/VC-1, and decode-only newcomers like VVC/H.266 - can't be kept through a forced transcode, so that file is skipped with a warning to pick hevc/h264/av1.
                 \\nhevc (H.265): the recommended target - roughly half the bitrate of H.264 at the same quality.
                 \\nh264 (AVC): a COMPATIBILITY target only (larger files) for old / weak devices that can't do HEVC. Forced to 8-bit (10-bit H.264 breaks device support). HDR10 in H.264 plays poorly - you'll be warned.
                 \\nav1: most efficient, but slow on CPU; hardware AV1 needs a very new GPU (Intel Arc, RTX 40-series, RDNA3), else the libsvtav1 software encoder.
@@ -301,8 +301,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: image / cover-art codecs =====
     // -=-=-= IMAGE_CODECS / isCoverArt  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last;
-    // summariseStream flags them /cover.
-    const IMAGE_CODECS = ['mjpeg', 'mjpegb', 'png', 'apng', 'gif', 'bmp', 'webp', 'tiff'];
+    // summariseStream flags them /cover. Two codecs that LOOK like they belong are deliberately ABSENT, for one reason: they are also real
+    // moving-picture codecs. mjpeg/mjpegb is camcorder/AVI-era footage, and jpeg2000 is the DCP / IMF / broadcast-mezzanine codec - listing
+    // either drops genuine video as cover art, while neither is ever WRITTEN as cover art (mkv attaches image/jpeg or image/png; the mp4 covr
+    // atom encodes only JPEG or PNG). Real cover art in those codecs still matches via the disposition clause below - mp4 marks it attached_pic
+    // and mkv carries it as an ATTACHMENT, not a video stream - so a dispositionless mjpeg/jpeg2000 video stream reads as real video, the
+    // fail-safe direction. nb_frames cannot substitute for the disposition test: in mkv it is N/A for real MJPEG video AND for cover art.
+    const IMAGE_CODECS = ['png', 'apng', 'gif', 'bmp', 'webp', 'tiff', 'qoi'];
     const isCoverArt = (s) => IMAGE_CODECS.includes((s.codec_name || '').trim().toLowerCase())
         || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails');
     // ===== END SHARED: image / cover-art codecs =====
@@ -1053,8 +1058,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const srcIs10 = is10Bit(primary, mi);
         // Efficiency rank for shrink's never-downgrade rule: vp9~hevc and vp8~h264, so an efficient WebM/VP source
         // isn't "upgraded" to a less-efficient codec; a genuinely-legacy codec (mpeg2/vc1/xvid, absent here) ranks
-        // below every target via the `|| 0` fallback, so old-codec -> h264 stays a valid shrink upgrade.
-        const CODEC_EFFICIENCY = { av1: 3, hevc: 2, vp9: 2, h264: 1, vp8: 1 };
+        // below every target via the `|| 0` fallback, so old-codec -> h264 stays a valid shrink upgrade. vvc (H.266)
+        // outranks av1 and is DECODE-only in this build: a rank here does NOT make a codec encodable (ENCODABLE derives
+        // from ENCODER_NAME, which has no vvc row), so the entry does exactly one job - stop shrink re-encoding a VVC
+        // source down to HEVC/AV1, the very downgrade this rule exists to prevent. codec=source on a VVC file still
+        // skips with the existing no-encoder warning.
+        const CODEC_EFFICIENCY = { vvc: 4, av1: 3, hevc: 2, vp9: 2, h264: 1, vp8: 1 };
         let targetCodecName = codec === 'source' ? srcCodecName : codec; // let: guard_dv forces 'hevc' for a DV file, and shrink's never-downgrade may fall back to the source codec
 
         // ---- HDR / Dolby Vision detection (both probes) ---- ffmpeg auto-propagates static colour metadata
