@@ -8,7 +8,7 @@ const details = () => ({
     Description: `Cleans and re-encodes the video stream. Audio and subtitles are copied unchanged (embedded cover-art video is dropped). Pick a top-level ACTION first (see its tooltip for full details) - the plugin does nothing until you choose a goal: hdr_cleanup_only (default, harmless HDR-only pass), normalize (compatibility conversion), shrink (space savings).\n\n
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '3.13.1',
+    Version: '3.14.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1395,8 +1395,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // same-codec re-encode would otherwise re-shrink every pass - a generational death spiral); harmless for normalize (which only fires on a
         // mismatch and is self-limiting). action is in the core so a normalize-tagged file isn't wrongly fenced under shrink. The plugin version
         // is appended for forensics but is NOT part of the match (like audio_clean's awk_loudnorm), so a version bump never invalidates the fence.
+        // EVERY input that can fire a transcode has to appear here, or turning that input on leaves the fingerprint unchanged and the file is skipped
+        // as "already processed at this exact setting" while the work it now asks for never runs. Each optional token keys on the resolved SETTING
+        // (effHdrMode, deinterlaceLive), never on whether this source happens to trigger it - a source property would change once the transform has
+        // been applied, so the fingerprint would stop matching the settings that produced it.
         const videoSigCore = escMeta([action, targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, want10Bit ? '10' : '8', `s${speed}`,
-            ...(effHdrMode === 'tonemap_sdr' ? ['sdr'] : []), ...(effHdrMode === 'strip_dynamic' ? ['strip'] : []), ...(preserveDv ? ['dv'] : [])].join('-'));
+            ...(effHdrMode === 'tonemap_sdr' ? ['sdr'] : []), ...(effHdrMode === 'strip_dynamic' ? ['strip'] : []), ...(preserveDv ? ['dv'] : []),
+            ...(deinterlaceLive ? ['deint'] : [])].join('-'));
         const videoSig = `${videoSigCore}-v${escMeta(details().Version)}`;
         const priorSig = getTagCI(file.ffProbeData.format?.tags || {}, 'awk_video').trim();
         const alreadyFenced = priorSig !== '' && priorSig.replace(/-v[^-]*$/, '') === videoSigCore;   // core only; the stored -v<version> suffix is forensic, not part of the fence

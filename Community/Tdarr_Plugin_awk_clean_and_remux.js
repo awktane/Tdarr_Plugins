@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.12.2',
+    Version: '4.13.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1388,21 +1388,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // remove_sub_sdh safety guard. A "plain" subtitle carries no commentary/descriptive/SDH/lyrics role - a genuine dialogue subtitle. remove_sub_sdh removes
     // an SDH/CC subtitle only when its language still has a plain subtitle that SURVIVES the language, format, and remove_imagesubs filters, so we strip
     // extras, never the last usable track. resolveWorkLang shares canonicalLangMeta's fillApplies rule so the language this guard filters on and the tag that
-    // gets written can't drift. Computed BEFORE the language_fill_mode pre-check so that check can exclude the SDH tracks this guard will drop. Audio has no
-    // equivalent here: audio_clean's downmix_secondary owns audio-description removal and carries its own plain-same-language fall-back rule.
+    // gets written can't drift. Audio has no equivalent here: audio_clean's downmix_secondary owns audio-description removal and carries its own
+    // plain-same-language fall-back rule. These are the definitions; plainSubLangs is FILLED after the muxability gate below, because the survives-the-format
+    // -filter test reads dstContainer and mkv_fallback can still rewrite it.
     const plainSubLangs = new Set();
     const isPlainTrack = (s) => !isCommentary(s) && !isDescriptive(s) && !isSdh(s) && !isLyrics(s);
     const hasPlainSameLang = (set, wl) => set.has(langKey(wl));
     const resolveWorkLang = (s) => { const sl = resolveLang(s); return fillApplies(sl, true) ? fillLanguage : (sl || 'und'); };
-    if (removeSubSdh === 'enabled') {
-        for (const s of (file.ffProbeData?.streams || [])) {
-            if (codecTypeOf(s) !== 'subtitle' || !isPlainTrack(s)) continue;
-            if (subDroppedAnyReason((s.codec_name || '').toLowerCase())) continue;
-            const wl = resolveWorkLang(s);
-            if (subLangKeys.length > 0 && !langListMatch(wl, subLangKeys)) continue;
-            plainSubLangs.add(langKey(wl));
-        }
-    }
     // The two filters that discard a subtitle on its own merits rather than because of its codec or the container - language_sub and remove_sub_sdh - as a
     // predicate the remove_imagesubs=export sites can consult BEFORE writing anything. Mirrors the stream loop's own tests exactly, so the answer here and
     // the drop it takes there can never disagree. Only the export needs it: exporting is one-way, so a sidecar written for a track those filters were about
@@ -1463,6 +1455,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
+        // Fill the remove_sub_sdh plain-track set (declared above). This runs HERE, after the muxability gate, because subDroppedAnyReason reads
+        // dstContainer through subFormatDropped and mkv_fallback rewrites dstContainer for this file - computed any earlier, a PGS/VobSub/DVB track would be
+        // counted as format-dropped under the abandoned mp4 target when the output is now mkv, where it survives. Still ahead of the language_fill_mode
+        // pre-check below, which subtracts the SDH tracks this guard will drop.
+        if (removeSubSdh === 'enabled') {
+            for (const s of (file.ffProbeData?.streams || [])) {
+                if (codecTypeOf(s) !== 'subtitle' || !isPlainTrack(s)) continue;
+                if (subDroppedAnyReason((s.codec_name || '').toLowerCase())) continue;
+                const wl = resolveWorkLang(s);
+                if (subLangKeys.length > 0 && !langListMatch(wl, subLangKeys)) continue;
+                plainSubLangs.add(langKey(wl));
+            }
+        }
+
             // guard_audio_language: an early warning, evaluated BEFORE the remux so a file that needs attention costs nothing to find out about. audio_clean
             // decides what audio to keep, but it can only trust a track MARKED 'original' - it has no way to tell which of several untagged languages is the
             // real one. So when this file carries more than one genuine audio language and marks no original, abort and let the user tag it. Languages fold
@@ -1480,8 +1486,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // content loss). Left untagged (no language_fill, or language_fill=und) they stay "und", which audio_clean's dedup skips - so there is no collision
             // to guard against and this does nothing. The separate "several audio languages, none marked original" concern is guard_audio_language's (opt-in),
             // not re-litigated here. Counts only untagged streams that WILL REACH THE OUTPUT: an untagged subtitle dropped by the language filter, by
-            // container/format (subDroppedAnyReason), or by the remove_sub_sdh guard above never reaches a later plugin. This plugin never drops audio, so
-            // every untagged audio stream reaches the output and counts. Resolves language via resolveLang (ffprobe tag, then mediaInfo fallback), so a
+            // container/format (subDroppedAnyReason), or by the remove_sub_sdh guard above never reaches a later plugin, and neither does an audio stream
+            // method_unmuxable=drop is about to remove - quarantining a file over tracks this very run deletes would be a stop the user cannot act on.
+            // Resolves language via resolveLang (ffprobe tag, then mediaInfo fallback), so a
             // language only mediaInfo supplies is not treated as blank here. The collision this guards against needs a REAL language: every non-language code
             // (und/mul/zxx/mis/qaa-qtz) leaves the tracks indistinguishable to a later dedup exactly as "und" does, so none of them can create the ambiguity
             // worth erroring over - gate on isNonLang, not on "und" alone.
@@ -1494,7 +1501,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // An untagged SDH subtitle the remove_sub_sdh guard would drop is excluded too -
             // mirrors the loop's own removal predicate (untagged tracks resolve to fillLanguage).
             const removedBySdh = (s) => removeSubSdh === 'enabled' && isSdh(s) && hasPlainSameLang(plainSubLangs, fillLanguage);
-            const untaggedAudio = streams.filter((s) => codecTypeOf(s) === 'audio' && isUntagged(s)).length;
+            const untaggedAudio = streams.filter((s) => codecTypeOf(s) === 'audio' && isUntagged(s) && !unmuxableDrops.has(s.index)).length;
             if (untaggedAudio > 1)
                 failFile(`[language_fill_mode=${fillMode}] ${untaggedAudio} audio streams have no language tag and would all be assigned "${logSafe(fillLanguage)}" by language_fill - may be different languages; tag them manually and requeue, or set language_fill_mode=force-any`);
             const untaggedSubs = keptByLangFilter(subLangKeys)
