@@ -8,7 +8,7 @@ const details = () => ({
     Description: `Cleans and re-encodes the video stream. Audio and subtitles are copied unchanged (embedded cover-art video is dropped). Pick a top-level ACTION first (see its tooltip for full details) - the plugin does nothing until you choose a goal: hdr_cleanup_only (default, harmless HDR-only pass), normalize (compatibility conversion), shrink (space savings).\n\n
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '3.11.0',
+    Version: '3.12.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -156,6 +156,22 @@ const details = () => ({
                 \\n=====
                 \\ntrue (default): when a DV source is re-encoded, carry the DV RPU through so the output stays Dolby Vision. Forces the libx265 software encoder (only it keeps the RPU; every hardware HEVC encoder drops it, so a GPU/auto node drops to CPU for these files); forces the HEVC codec (overriding your codec choice) and 10-bit; overrides hdr_mode=strip_dynamic/tonemap_sdr for DV files (the DV is preserved, with a warning). Neither HDR10+ nor HDR Vivid can be carried (no ffmpeg-native path for either). A no-base DV that libx265 can't re-encode (e.g. an IPT-C2 profile 5) is skipped rather than corrupted.
                 \\nfalse: don't protect DV - a transcode that would destroy it still gets skipped under preserve, but strip_dynamic/tonemap_sdr are honoured (the DV layer is dropped/flattened as asked).`,
+        },
+        {
+            name: 'guard_lossless',
+            type: 'boolean',
+            defaultValue: true,
+            inputUI: {
+                type: 'dropdown',
+                options: ['false', 'true'],
+            },
+            tooltip: `Protect a LOSSLESS or mastering-grade video source from being re-encoded: ProRes, DNxHD, FFV1, HuffYUV, FFVHuff, MagicYUV, UtVideo, CineForm, v210 and raw video.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\ntrue (default): skip the whole file when the source video is one of those codecs and anything would re-encode it - normalize, shrink, height_cap and tonemap_sdr alike. Every encode here is lossy AND lands 4:2:0 at 8 or 10 bit, so a 4:2:2 / 4:4:4 / 12-bit master loses chroma resolution and bit depth on top of the compression: detail an intermediate format exists to keep, which no later pass can bring back.
+                \\nfalse: treat a lossless source like any other and convert it. Choose this deliberately - it replaces an editing/archival master with a lossy delivery encode.
+                \\nNote for an mp4 TARGET this rarely comes up: most of these codecs cannot be stored in mp4 at all, so clean_and_remux (which runs first) stops the file before video_clean sees it.`,
         },
         {
             name: 'guard_shrink_bitrate',
@@ -686,6 +702,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The codecs this plugin has an encoder for, derived from the table above so a new target cannot be added to one and missed in the other
     // (codec=source keeps the source codec only when it is one of these). Membership only, so key order is immaterial.
     const ENCODABLE = Object.keys(ENCODER_NAME);
+    // Lossless / mastering-grade video codecs, read only by guard_lossless. Deliberately NOT a shared block: no other plugin re-encodes video, so nothing else
+    // has a use for it. Raw ffprobe codec_name spellings. The membership test is what makes the guard fail-safe - an unrecognised codec is not protected,
+    // never wrongly skipped. (Lossless MODES of lossy codecs - x264 -qp 0, for one - are out of scope: neither probe reports them.)
+    const LOSSLESS_VIDEO_CODECS = ['ffv1', 'huffyuv', 'ffvhuff', 'hymt', 'magicyuv', 'utvideo', 'v210', 'v210x', 'rawvideo', 'prores', 'dnxhd', 'cfhd'];
 
     // Query the ffmpeg build's encoder list + hardware presence for this node: encoders from `-encoders`, NVIDIA from nvidia-smi,
     // VAAPI/QSV from a /dev/dri check. Tdarr reloads each classic plugin fresh per file and selectEncoder calls this once, so it runs once per file.
@@ -1008,6 +1028,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const encoderOpt = String(inputs.method_encoder || 'node').toLowerCase().trim();
     const hdrMode = String(inputs.hdr_mode || 'preserve').toLowerCase().trim();
     const guardDv = String(inputs.guard_dv) !== 'false';   // boolean (loadDefaultValues coerces it), default true
+    const guardLossless = String(inputs.guard_lossless) !== 'false';   // boolean, default true
 
     const parseQuality = (v, name) => {
         const n = Number(String(v).trim());
@@ -1054,8 +1075,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Source properties (both probes).
         const mi = mediaInfoFor(primary);
-        const srcHeight = Number(primary.height || mi?.Height || 0);
+        const srcWidth = Number(primary.width || mi?.Width || 0);
+        const srcHeight = Number(primary.height || mi?.Height || 0);   // CODED height - what the decoder and the encoder see
         const srcCodecName = (primary.codec_name || '').toLowerCase().trim();
+        // DISPLAY orientation. A phone clip is routinely CODED 1920x1080 carrying a 90-degree rotation, so it DISPLAYS 1080x1920 - and height_cap has to judge
+        // what a viewer actually sees, or a portrait 4K reads as "already within 1080" and is never downscaled. The emitted command needs no help: ffmpeg
+        // autorotates before the filter chain, so scale=-2:N sets the DISPLAYED height (and a re-encode bakes the rotation into the pixels, dropping the
+        // matrix) - only the fire/skip decision and the tier were reading the wrong number. Both probes, since neither is complete: production ffprobe 7.1.4
+        // exposes a 'Display Matrix' side_data with a numeric `rotation` on mp4 AND mkv, while MediaInfo 23.07 reports a string `Rotation` for mp4 and
+        // nothing at all for mkv. The two also disagree on sign and wrap (ffprobe -90 is MediaInfo "270.000"), so only the PARITY is read: an odd quarter-turn
+        // swaps displayed width and height, 0/180 leaves them - a test no sign convention can flip.
+        const displayMatrix = (Array.isArray(primary.side_data_list) ? primary.side_data_list : [])
+            .find((sd) => /display matrix/i.test(String(sd?.side_data_type || '')));
+        const rotationDeg = Number(displayMatrix?.rotation ?? mi?.Rotation ?? 0);
+        const quarterTurned = Number.isFinite(rotationDeg) && Math.abs(Math.round(rotationDeg / 90)) % 2 === 1;
+        const dispHeight = quarterTurned && srcWidth > 0 ? srcWidth : srcHeight;   // the height height_cap and the quality tier both judge
         // Output container is always the source container - clean_and_remux owns container
         // policy; this plugin only re-encodes video (and tags hvc1 for HEVC-in-mp4 below).
         const dstContainer = String(file.container || '').toLowerCase().trim();
@@ -1130,10 +1164,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Resolution / downscale (only ever downscales) + the quality tier for the OUTPUT height. Inert under hdr_cleanup_only.
         const maxH = heightCapOpt === 'source' ? 0 : Number(heightCapOpt);
-        const willDownscale = action !== 'hdr_cleanup_only' && maxH > 0 && srcHeight > maxH;
-        const outHeight = willDownscale ? maxH : srcHeight;
+        const willDownscale = action !== 'hdr_cleanup_only' && maxH > 0 && dispHeight > maxH;
+        const outHeight = willDownscale ? maxH : dispHeight;
         const qualityForHeight = (h) => ({ sd: qualitySd, p720: quality720, p1080: quality1080, p4k: quality4k }[heightTier(h)]);
-        const qNorm = qualityForHeight(outHeight || srcHeight);
+        const qNorm = qualityForHeight(outHeight || dispHeight);
 
         // tonemap_sdr flattens ALL HDR -> SDR (a real re-encode). effHdrMode is never tonemap_sdr under hdr_cleanup_only (hard-errored) or for
         // a guard-protected DV file. The tonemap runs as a GPU island riding the node's encoder (cuda/opencl/videotoolbox - one consistent
@@ -1292,7 +1326,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Predict the re-encoded stream through the shared summariseStream (single source of truth for the [video:...]
             // token) so Expected-results matches the input-summary format; depth is exact via bits_per_raw_sample with
             // pix_fmt/profile cleared, and a tonemapped output is SDR (bt709, detached mediaInfo so no 'hdr' token).
-            const outStream = { ...primary, codec_name: targetCodecName, height: outHeight || srcHeight, bits_per_raw_sample: want10Bit ? 10 : 8, pix_fmt: '', profile: '' };
+            const outStream = { ...primary, codec_name: targetCodecName, height: outHeight || dispHeight, bits_per_raw_sample: want10Bit ? 10 : 8, pix_fmt: '', profile: '' };
             if (tonemap) { outStream.color_transfer = 'bt709'; outStream.index = -1; }
             // Unless guard_dv carried it, the re-encode DISCARDS the DYNAMIC HDR layer - the Dolby Vision RPU and the HDR10+ SEI alike, since no encoder this
             // plugin drives carries either - so the prediction must not still read 'dv' or 'hdr10+'. Clear every carrier summariseStream's dynamic tests read:
@@ -1310,6 +1344,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
 
         // Skips that a pending real transcode would otherwise turn destructive.
+        // guard_lossless leads the block: it is the one that says "don't touch this file at all", so it should answer for a lossless source whatever else also
+        // applies. It keys on realTranscode, so the lossless -c:v copy paths (hdr_cleanup_only, a bare strip_dynamic) still run - they cost the master nothing.
+        if (realTranscode && guardLossless && LOSSLESS_VIDEO_CODECS.includes(srcCodecName)) {
+            return skip(`☒${streamTag(primary.index)}[guard_lossless=true] ${srcCodecName} is a lossless/mastering source - a re-encode would flatten it to lossy 4:2:0 ${want10Bit ? '10' : '8'}-bit; set guard_lossless=false to convert it anyway\n`);
+        }
         if (realTranscode && !canEncodeTarget) {   // codec=source resolved to a legacy codec with no encoder, but height_cap/tonemap force a transcode
             return skip(`☒${streamTag(primary.index)}[codec=source] Source codec ${srcCodecName || 'unknown'} has no encoder - can't keep it through the ${heightTrigger ? 'downscale' : 'tonemap'}; set codec=hevc/h264/av1 to convert it\n`);
         }
@@ -1348,9 +1387,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return skip(`☑${streamTag(primary.index)}[guard_shrink_bitrate=${guardShrinkKbps}] Source video bitrate ${belowFloorKbps}k is below the ${guardShrinkKbps}k floor - already efficient, left untouched\n`);
         }
         if (action === 'shrink') {
-            return skip(`☑${streamTag(primary.index)}[action=shrink] Nothing to shrink - ${canEncodeTarget ? `already ${srcCodecName}${srcHeight ? ` ${srcHeight}p` : ''} at the target and no more-efficient codec selected` : `source codec ${srcCodecName || 'unknown'} has no encoder (set codec=hevc/h264/av1 to convert it)`}\n`);
+            return skip(`☑${streamTag(primary.index)}[action=shrink] Nothing to shrink - ${canEncodeTarget ? `already ${srcCodecName}${dispHeight ? ` ${dispHeight}p` : ''} at the target and no more-efficient codec selected` : `source codec ${srcCodecName || 'unknown'} has no encoder (set codec=hevc/h264/av1 to convert it)`}\n`);
         }
-        return skip(`☑${streamTag(primary.index)}[action=normalize] Video is already ${targetCodecName}${srcHeight ? ` ${srcHeight}p` : ''}${srcIs10 ? ' 10-bit' : ''} and within limits\n`);
+        return skip(`☑${streamTag(primary.index)}[action=normalize] Video is already ${targetCodecName}${dispHeight ? ` ${dispHeight}p` : ''}${srcIs10 ? ' 10-bit' : ''} and within limits\n`);
     } catch (err) {
         return failUnexpected(err);
     }
