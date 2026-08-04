@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X/AC-4), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '4.13.2',
+    Version: '4.14.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -136,7 +136,7 @@ const details = () => ({
                 options: ['aac','aac_vbr','ac3','eac3','opus'],
             },
             tooltip: `Specify codec for newly created stereo tracks. AAC and Opus are the most compatible choices for modern media servers and clients. EAC3 is useful for Dolby branding on compatible devices. AC3 is the most broadly compatible legacy choice.
-                \\naac_vbr uses libfdk_aac in VBR mode (-vbr 5, ~192-224 kb/s) for higher quality than native AAC CBR. Falls back to -vbr 4 (~128-144 kb/s) when codec_force is converting an existing stereo track whose bitrate is at or below 144 kb/s, matching the lower-information source.
+                \\naac_vbr uses libfdk_aac in VBR mode (-vbr 5, ~192-224 kb/s) for higher quality than native AAC CBR. Falls back to -vbr 4 (~128-144 kb/s) when codec_force or method_loudnorm is re-encoding an existing stereo track whose bitrate is at or below 144 kb/s, matching the lower-information source.
                 \\nlibfdk_aac ships in the Linux/Windows builds but not the Mac one; on a node whose ffmpeg lacks it, aac_vbr automatically uses Apple's aac_at (AudioToolbox) VBR on Mac, or native aac 256 kb/s on any other build without it, so the file still processes.
                 \\ncodec_force never re-encodes an existing AAC track just to reach aac_vbr — the AAC family check prevents a generational loss for no gain (method_loudnorm may still re-encode it when a loudness correction is genuinely needed).`,
         },
@@ -175,6 +175,7 @@ const details = () => ({
             },
             tooltip: `If enabled then duplicate audio tracks (same language, same broad role) are reduced down to the highest quality option(s). Any stream newly created by downmix_to_six or downmix_to_stereo is always kept and is never collapsed against a different channel count it was created alongside (see below).
                 \\nCommentary and descriptive (visually-impaired) tracks are never treated as duplicates of each other - every such track is always kept, since two different commentaries (e.g. cast & crew vs directors) are distinct content even when both are titled "Commentary".
+                \\nA track whose language folds to "und" is exempt too - every untagged track shares that one key, so two untagged tracks of genuinely different languages would look like duplicates and the only copy of one could be removed. Such a track is left out of the grouping entirely: it can neither be removed nor be the survivor that removes another.
                 \\nThe "-error" variants use identical grouping/duplicate-detection logic to their non-error counterpart, but instead of deleting the duplicate(s) they abort the plugin run entirely (no streams are removed, no other changes in this run are applied) so the file can be inspected and tagged manually before being requeued.
                 \\n=====
                 \\nActions
@@ -206,7 +207,7 @@ const details = () => ({
                 \\nActions (only for a layout with no lossless relabel)
                 \\n=====
                 \\nIf keep  - the track is left in its source codec (not written as opus). Safe default: nothing fails and no audio is lost; a loudnorm-only run just leaves that one track un-normalized.
-                \\nIf drop  - the track is removed entirely. The last remaining audio track is never dropped (falls back to keep). A stereo/5.1 a downmix would derive from that track is still created.
+                \\nIf drop  - the track is removed entirely, but only when it is codec_force sending that track to opus. On the method_loudnorm convergence route the removal would come too late (the surviving tracks are already numbered by then), so drop behaves as keep and the track is left un-normalized in its source codec. The last remaining audio track is never dropped (falls back to keep). A stereo/5.1 a downmix would derive from that track is still created.
                 \\nIf remix - the track is downmixed to a codec_stereo stereo (using method_stereo_downmix), with loudness applied when method_loudnorm is active. Defers to downmix_to_stereo / the stereo tier (language_stereo, language_unlisted=stereo, downmix_secondary=stereo) when they already convert the track, and falls back to keep rather than create a duplicate stereo.`,
         },
         {
@@ -297,7 +298,8 @@ const details = () => ({
                 tracks never are, and neither is a track already sent to stereo or delete. See language_surround.
                 \\nNote: object-audio detection is best-effort - Atmos on E-AC-3 is reliable, but DTS:X relies on a MediaInfo field its own maintainers
                 note is incomplete for an undocumented format, so a real DTS:X track may occasionally not be recognized (it never false-positives). A
-                recognized object-audio track is also PREFERRED over an otherwise-equal plain track when method_deduplicate picks which to keep.
+                recognized object-audio track is also PREFERRED over an otherwise-equal plain track when method_deduplicate picks which to keep - that
+                preference is part of dedup's own ranking, so it applies whether this guard is enabled or disabled.
                 \\nAC-4 is protected WHOLESALE, because no probe separates its immersive variants (IMS, AJOC) from plain channel-based AC-4 - and since
                 ffmpeg has no AC-4 encoder, protecting a channel-based one costs nothing (the track just stays AC-4), while leaving an immersive one
                 unprotected would flatten it to stereo.

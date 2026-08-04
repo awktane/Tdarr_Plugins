@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.13.0',
+    Version: '4.14.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -207,7 +207,7 @@ const details = () => ({
                 options: ['error', 'drop', 'mkv_fallback'],
             },
             tooltip: `What to do when a stream's codec CANNOT be stored in the target container. Without this the remux dies deep inside ffmpeg on an opaque "Could not find tag for codec ..." with nothing in the log saying which stream or why.
-                \\nmp4 refuses a long list that mkv accepts: TrueHD, MLP, WMA, most ADPCM, A-law / mu-law / 8-bit PCM, LATM AAC (what every DVB and broadcast capture carries), VP8, Theora, ProRes, DNxHD, FFV1, HuffYUV, MagicYUV, UtVideo, v210, DV, Cinepak, H.263, the WMV / MS-MPEG-4 family and the QuickTime-only codecs. A few fit in NEITHER container - AC-4, Blu-ray PCM, SMPTE 302M, IMA-QT and SWF ADPCM, Nellymoser - so for those no container choice is a way out.
+                \\nmp4 refuses a long list that mkv accepts: TrueHD, MLP, WMA, most ADPCM, A-law / mu-law / 8-bit PCM, LATM AAC (what every DVB and broadcast capture carries), VP8, Theora, ProRes, DNxHD, FFV1, HuffYUV, MagicYUV, UtVideo, v210, DV, Cinepak, H.263, the WMV / MS-MPEG-4 family and the QuickTime-only codecs. A few fit in NEITHER container - AC-4, Blu-ray PCM, SMPTE 302M, IMA-QT ADPCM, Nellymoser - so for those no container choice is a way out.
                 \\n=====
                 \\nActions
                 \\n=====
@@ -225,7 +225,7 @@ const details = () => ({
             },
             tooltip: `An EARLY WARNING for multi-language files whose original language isn't marked. audio_clean is what actually keeps or drops audio by language, but it can only trust a track marked 'original' - it has no way to tell which of several untagged languages is the real original. This checks for that risk here, BEFORE the remux, so a file that needs your attention costs you nothing to find out about.
                 \\nWhen enabled: if the file has MORE THAN ONE audio language among its genuine (non-commentary/descriptive) tracks and NO audio track is marked original (the ffmpeg 'original' disposition flag, or an "original" keyword in the title/handler), the file is aborted to the error queue. Mark the original track and requeue - audio_clean's guard_original can then protect it.
-                \\nLanguages are compared folded, so en/eng/English/en-US count as one; an untagged track counts as its own "und" language. A file with a single audio language, or one that already marks its original, passes untouched.
+                \\nLanguages are compared folded, so en/eng/English/en-US count as one; an untagged track counts as the language language_fill would give it, or "und" when language_fill is blank. A file with a single audio language, or one that already marks its original, passes untouched.
                 \\nIf disabled - (Default) no check; audio_clean handles whatever it finds.`,
         },
         {
