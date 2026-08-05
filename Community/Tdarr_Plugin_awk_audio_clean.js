@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X/AC-4), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '4.16.0',
+    Version: '4.17.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1020,19 +1020,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         || String(ffmedia?.HDR_Format || ffmedia?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : []).some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
-    // ===== SHARED [audio_clean, stream_ordering, sub_worker]: dolby vision strict mp4 arg =====
-    // -=-=-= dvStrictMp4Arg  [audio_clean, stream_ordering, sub_worker] =-=-=-
-    // The ' -strict unofficial' an mp4/mov -c copy needs so ffmpeg's mov muxer keeps a Dolby Vision stream's dvcC/dvvC boxes; a plain copy drops them,
-    // demoting DV to plain HEVC/AV1 (verified on real HEVC + AV1 DV samples). Finds the DV video stream DIRECTLY - isDolbyVisionVideo, cover art excluded -
-    // so a leading cover-art stream can't mask it (not just the first video stream); HEVC-DV and AV1-DV both qualify. Pass the RAW file.ffProbeData.streams:
-    // codec_tag_string / side_data_list (the DV signals) live only there. clean_and_remux does the equivalent per-stream in its own loop.
-    const dvStrictMp4Arg = (container, streams) => {
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
+    // -=-=-= mp4StrictArg  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The ' -strict <level>' an mp4/mov -c copy needs, or '' when it needs none. Two independent reasons share one flag, because `experimental` is a strict
+    // SUPERSET of `unofficial` and does both jobs:
+    //   experimental - a TrueHD stream copied INTO mp4, which the muxer otherwise refuses outright ("truehd in MP4 support is experimental, add '-strict -2'",
+    //                  rc 88); `unofficial` does NOT satisfy it. Matched on the raw codec_name, not resolveCodecName, whose refined truehdatmos would not equal
+    //                  'truehd'. mkv needs nothing, which is why the container test leads.
+    //   unofficial   - a Dolby Vision video stream, so the mov muxer keeps its dvcC/dvvC boxes; a plain copy drops them, demoting DV to plain HEVC/AV1
+    //                  (verified on real HEVC + AV1 DV samples). Found via isDolbyVisionVideo with cover art excluded, so a leading cover-art stream cannot
+    //                  mask it (not just the first video stream); HEVC-DV, AVC-DV and AV1-DV all qualify.
+    // Pass the RAW file.ffProbeData.streams as `streams`: codec_tag_string / side_data_list (the DV signals) live only there. `copied` is the subset of them
+    // this run emits as a -c copy and defaults to all of them - a caller that drops or re-encodes tracks passes its own survivor list, so a TrueHD track on
+    // its way out never pulls in a flag the output does not need. clean_and_remux does the equivalent inline (MP4_STRICT_GATED + its per-stream DV emit).
+    const mp4StrictArg = (container, streams, copied) => {
         if (!isMp4Family(container)) return '';
         const list = Array.isArray(streams) ? streams : [];
-        const hasDv = list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s)));
-        return hasDv ? ' -strict unofficial' : '';
+        const kept = Array.isArray(copied) ? copied : list;
+        if (kept.some((s) => codecTypeOf(s) === 'audio' && (s?.codec_name || '').toLowerCase().trim() === 'truehd')) return ' -strict experimental';
+        return list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s))) ? ' -strict unofficial' : '';
     };
-    // ===== END SHARED: dolby vision strict mp4 arg =====
+    // ===== END SHARED: mp4 strict compliance arg =====
 
     // ===== SHARED [audio_clean, clean_and_remux]: language list match =====
     // -=-=-= langListMatch  [audio_clean, clean_and_remux] =-=-=-
@@ -2532,9 +2540,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // to keep it, which would re-trigger recovery on the next pass. Preserve it. (Per-stream custom tags like awk_loudnorm are NOT rescued
             // by this flag - verified against the real mov muxer - which is why loudnorm caches on Matroska only; see loudnormTagPersists.)
             const mp4KeepTags = isMp4Family(file.container) ? ' -movflags use_metadata_tags' : '';
-            // Preserve Dolby Vision's dvcC/dvvC boxes on this mp4/mov -c copy remux (see dvStrictMp4Arg) - a plain copy of a DV HEVC/AV1 stream drops them.
-            const dvStrictArg = dvStrictMp4Arg(file.container, file.ffProbeData.streams);
-            response.preset += `<io>-map 0 -c copy${extraArguments}${dvStrictArg}${globalOutputOpt}${mp4KeepTags}`;
+            // The -strict level this mp4/mov -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses
+            // without it. The second list is what this run actually COPIES - a track removedIndices drops, or an in-place transcode replaces (recorded in
+            // outputAudioOverride, keyed by output audio index), is left out, so a TrueHD track on its way out never asks for a flag the output cannot need.
+            const copiedStreams = file.ffProbeData.streams
+                .filter((s) => !removedIndices.has(s.index) && !outputAudioOverride.has(outputAudioIdxMap.get(s.index)));
+            const strictArg = mp4StrictArg(file.container, file.ffProbeData.streams, copiedStreams);
+            response.preset += `<io>-map 0 -c copy${extraArguments}${strictArg}${globalOutputOpt}${mp4KeepTags}`;
             response.infoLog += workDone;
             response.infoLog += skipDone;
             response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;

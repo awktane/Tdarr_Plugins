@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.15.0',
+    Version: '4.16.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1327,8 +1327,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // form. Only channelLabel's 3ch (2.1 vs 3.0) and 4ch (3.1 vs 4.0) cases read hasLfe, so 6/8-ch labels are unaffected.
     const layoutHasLfe = (ffstream) => { const s = channelLayoutStr(ffstream); return /lfe/.test(s) || /^\d+\.[1-9]/.test(s.trim()); };
 
+    // Image filename extensions, for an attachment whose codec_name is absent or reads 'none'/'unknown'. COMPOSED from IMAGE_CODECS - every name there is
+    // also its own file extension - so a codec added to that shared list is recognised by extension too, plus the extensions IMAGE_CODECS deliberately omits:
+    // a filename extension is unambiguous where a codec name is not, so the JPEG family, JPEG 2000, AVIF and HEIC are safe here even though mjpeg/jpeg2000/
+    // av1/hevc must stay out of IMAGE_CODECS as real moving-picture codecs. 'tif' is the alternate spelling of the 'tiff' codec name.
+    const IMAGE_EXTS = [...IMAGE_CODECS, 'jpg', 'jpeg', 'jpe', 'jfif', 'tif', 'jp2', 'avif', 'heic'];
+
     // Classify an attachment stream so we only ever remove things we can positively identify:
-    //   'image' - cover art / poster (an IMAGE_CODECS codec name, an image/* mimetype, or an image filename extension). Always removed.
+    //   'image' - cover art / poster (an IMAGE_CODECS codec name, an image/* mimetype, or an IMAGE_EXTS filename extension). Always removed.
     //   'font'  - an embedded font (ttf/otf codec, a font mimetype, or a font filename extension). Removed ONLY when nothing in the output uses it (no
     //             surviving ASS/SSA subtitle). Older ffmpeg builds report codec_name 'none'/'unknown' for fonts, so we also ID by filename/mimetype,
     //             and never delete a font while a styled subtitle still needs it.
@@ -1338,9 +1344,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const mime  = (s.tags?.mimetype || '').trim().toLowerCase();
         const fname = (s.tags?.filename || '').trim().toLowerCase();
         const ext   = fname.includes('.') ? fname.slice(fname.lastIndexOf('.') + 1) : '';
-        if (IMAGE_CODECS.includes(codec) || mime.startsWith('image/')
-            || ['jpg', 'jpeg', 'jpe', 'jfif', 'png', 'apng', 'gif', 'bmp', 'webp', 'tif', 'tiff', 'jp2', 'avif', 'heic'].includes(ext))
-            return 'image';
+        if (IMAGE_CODECS.includes(codec) || mime.startsWith('image/') || IMAGE_EXTS.includes(ext)) return 'image';
         if (isFontAttachment(s)) return 'font';
         return 'other';
     };
@@ -1427,9 +1431,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 .map((s) => ({ s, codec: (s.codec_name || '').toLowerCase().trim() }))
                 .map((o) => ({ ...o, cls: unmuxableClass(o.codec) }))
                 .filter((o) => o.cls);
+            const offenderIndices = new Set(offenders.map((o) => o.s.index));
             // The mp4-family TrueHD that the gate deliberately does NOT treat as an offender still needs its flag, or the very remux we just allowed fails.
+            // Read against the OFFENDER list rather than the raw streams, so the flag can only ever describe a gated stream this run KEEPS: a gated stream
+            // that IS an offender is either mapped out by method_unmuxable=drop below, or the reason mkv_fallback rewrites the target and clears the flag -
+            // and a -strict left on a command whose gated stream is gone contradicts the refusal rationale at MP4_STRICT_GATED.
             mp4StrictNeeded = dstContainer === 'mp4' && (file.ffProbeData.streams || [])
-                .some((s) => MP4_STRICT_GATED.includes((s.codec_name || '').toLowerCase().trim()));
+                .some((s) => MP4_STRICT_GATED.includes((s.codec_name || '').toLowerCase().trim()) && !offenderIndices.has(s.index));
             if (offenders.length) {
                 const names = [...new Set(offenders.map((o) => o.codec))].join(', ');
                 // A codec NEITHER container accepts has nowhere to fall back to, so mkv_fallback degrades to error and says why - silently doing nothing, or
@@ -1655,10 +1663,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "title=${escMeta(newStreamTitle)}"`;
                 }
             };
-            // remove_comments (audio/subtitle/video): drop a stream comment tag (players rarely show it). Guard + output mirror the handler_name emitter above.
+            // remove_comments (audio/subtitle/video): drop a stream comment tag (players rarely show it). Guard + output mirror the handler_name emitter above,
+            // the case-insensitive read (getTagCI) included - matroska stores this key as COMMENT, so a lowercase read never matches on mkv and the comment
+            // survives every pass; the lowercase "comment=" wipe still clears it, as ffmpeg matches -metadata keys case-insensitively.
             const emitCommentRemoval = (typeLetter, idx, typeWord) => {
-                if (removeComments === true && (ffstream.tags?.comment || ffmedia?.Comment)) {
-                    workDone += `☐${streamTag(ffstream.index)}[remove_comments=true] Remove comment (${typeWord}) "${logSafe(ffstream.tags?.comment ?? (ffmedia?.Comment ?? ''))}"\n`;
+                const curComment = getTagCI(ffstream.tags, 'comment') || (ffmedia?.Comment ?? '');
+                if (removeComments === true && curComment) {
+                    workDone += `☐${streamTag(ffstream.index)}[remove_comments=true] Remove comment (${typeWord}) "${logSafe(curComment)}"\n`;
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "comment="`;
                 }
             };
@@ -1871,9 +1882,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // under -strict unofficial. Without it a -c copy remux keeps the in-band RPU + the dvhe tag but DROPS those boxes, weakening
                 // DV detection (verified on the real profile-5 sample). Add the flag so any remux this plugin performs preserves DV fully. It
                 // only SHAPES a remux another change already triggered - it does not set convert, since an untouched file keeps its boxes.
+                // The boxes are not codec-specific, so neither is this gate: DV rides HEVC (dvhe/dvh1), AVC (dvav/dva1) and AV1 (dav1) alike, and an AV1 DV
+                // stream loses its boxes to a plain mp4 copy exactly as an HEVC one does (verified on a real profile-10 AV1 sample).
                 // Any -strict value already on the command satisfies this too: `experimental` (emitted for mp4-family TrueHD) is a strict superset of
                 // `unofficial` and preserves the DV configuration box just as well (verified - profile 8 retained), so a second one would be redundant.
-                if (dstContainer === 'mp4' && ffstreamCodec === 'hevc' && isDolbyVision && !/ -strict \S+/.test(extraArguments)) {
+                if (dstContainer === 'mp4' && isDolbyVision && !/ -strict \S+/.test(extraArguments)) {
                     extraArguments += ' -strict unofficial';
                 }
 
@@ -1955,8 +1968,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             && !file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'audio' && !removedIndices.has(s.index)))
             failFile(`[method_unmuxable=drop] Dropping every audio stream ${dstContainer} cannot store would leave the file with no audio at all - set method_unmuxable=error to stop instead, or mkv_fallback to keep this file in a container that can hold them`);
 
-        if((removeComments === true) && file.ffProbeData.format?.tags?.comment) {
-            workDone += `☐[remove_comments=true] Remove comment from file "${logSafe(file.ffProbeData.format?.tags?.comment)}"\n`;
+        // Case-insensitive read (getTagCI) for the reason spelled out at emitCommentRemoval above: matroska stores this key as COMMENT.
+        const fileComment = getTagCI(file.ffProbeData.format?.tags, 'comment');
+        if((removeComments === true) && fileComment) {
+            workDone += `☐[remove_comments=true] Remove comment from file "${logSafe(fileComment)}"\n`;
             extraArguments += ` -metadata "comment="`;
             convert = true;
         }

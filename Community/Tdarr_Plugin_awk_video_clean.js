@@ -8,7 +8,7 @@ const details = () => ({
     Description: `Cleans and re-encodes the video stream. Audio and subtitles are copied unchanged (embedded cover-art video is dropped). Pick a top-level ACTION first (see its tooltip for full details) - the plugin does nothing until you choose a goal: hdr_cleanup_only (default, harmless HDR-only pass), normalize (compatibility conversion), shrink (space savings).\n\n
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '3.17.0',
+    Version: '3.18.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -681,6 +681,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         || String(ffmedia?.HDR_Format || ffmedia?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : []).some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
+    // -=-=-= mp4StrictArg  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The ' -strict <level>' an mp4/mov -c copy needs, or '' when it needs none. Two independent reasons share one flag, because `experimental` is a strict
+    // SUPERSET of `unofficial` and does both jobs:
+    //   experimental - a TrueHD stream copied INTO mp4, which the muxer otherwise refuses outright ("truehd in MP4 support is experimental, add '-strict -2'",
+    //                  rc 88); `unofficial` does NOT satisfy it. Matched on the raw codec_name, not resolveCodecName, whose refined truehdatmos would not equal
+    //                  'truehd'. mkv needs nothing, which is why the container test leads.
+    //   unofficial   - a Dolby Vision video stream, so the mov muxer keeps its dvcC/dvvC boxes; a plain copy drops them, demoting DV to plain HEVC/AV1
+    //                  (verified on real HEVC + AV1 DV samples). Found via isDolbyVisionVideo with cover art excluded, so a leading cover-art stream cannot
+    //                  mask it (not just the first video stream); HEVC-DV, AVC-DV and AV1-DV all qualify.
+    // Pass the RAW file.ffProbeData.streams as `streams`: codec_tag_string / side_data_list (the DV signals) live only there. `copied` is the subset of them
+    // this run emits as a -c copy and defaults to all of them - a caller that drops or re-encodes tracks passes its own survivor list, so a TrueHD track on
+    // its way out never pulls in a flag the output does not need. clean_and_remux does the equivalent inline (MP4_STRICT_GATED + its per-stream DV emit).
+    const mp4StrictArg = (container, streams, copied) => {
+        if (!isMp4Family(container)) return '';
+        const list = Array.isArray(streams) ? streams : [];
+        const kept = Array.isArray(copied) ? copied : list;
+        if (kept.some((s) => codecTypeOf(s) === 'audio' && (s?.codec_name || '').toLowerCase().trim() === 'truehd')) return ' -strict experimental';
+        return list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s))) ? ' -strict unofficial' : '';
+    };
+    // ===== END SHARED: mp4 strict compliance arg =====
 
     const os = require('os');
     const fs = require('fs');
@@ -824,8 +845,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (combed / total < IDET_COMBED_MIN) return { kind: 'progressive', combed, total };
             const rep = lastIdetCounts(text, 'Repeated Fields:\\s*Neither:\\s*(\\d+)\\s*Top:\\s*(\\d+)\\s*Bottom:\\s*(\\d+)');
             const repeats = rep ? rep[1] + rep[2] : 0;
-            // Parity from idet's own TFF/BFF split. Only consulted when the container states no field order - bwdif's parity=auto reads the frame flags and
-            // guesses top-first when there are none, which on a flagless bottom-field-first source is simply wrong (measured 0.9345 SSIM against 0.9668).
+            // Parity from idet's own TFF/BFF split. Consulted whenever the container states no UNAMBIGUOUS field order - that is, no order at all or one of
+            // the producer-dependent crossed values (see the deintParity note) - because bwdif's parity=auto reads the frame flags and guesses top-first when
+            // there are none, which on a flagless bottom-field-first source is simply wrong (measured 0.9345 SSIM against 0.9668).
             const parity = tff > bff ? 'tff' : (bff > tff ? 'bff' : 'auto');
             return { kind: repeats / total >= IDET_REPEAT_MIN ? 'telecine' : 'interlaced', combed, total, repeats, parity };
         } catch (e) { return { kind: 'unknown' }; }
@@ -1210,6 +1232,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const dynLabel = dvSignal ? dvLabel
             : ([isHdr10Plus ? 'HDR10+' : '', isHdrVivid ? 'HDR Vivid' : ''].filter(Boolean).join(' + ') || 'dynamic HDR');
         const srcXfer = (primary.color_transfer || mi?.transfer_characteristics || '').toLowerCase().trim();
+        // IPT-C2 is Dolby Vision profile 5's own colour matrix, and libx265 cannot re-encode it. Read from the source alone, independent of guard_dv, so the
+        // guard's skip below and the "enable guard_dv" advice on the dynamic-HDR skip key on one fact and can never send a file round the two of them.
+        const srcIsIptC2 = (primary.color_space || mi?.matrix_coefficients || '').toLowerCase().trim() === 'ipt-c2';
         // isHdr / dvNoBaseLayer / the tonemap-setparams gate below read the shared HDR_TRANSFERS curve set (defined in the stream/preset-helpers section).
         const isHdr = HDR_TRANSFERS.includes(srcXfer) || !!String(mi?.HDR_Format || '').trim() || isDynamicHdr;
         // A single-layer DV whose base carries NO standard HDR transfer (e.g. profile 5's IPT-PQ base): no smpte2084/HLG to fall back
@@ -1229,7 +1254,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const effHdrMode = dvOverridesHdr ? 'preserve' : hdrMode;
         if (dvOverridesHdr)
             response.infoLog += `☒${streamTag(primary.index)}[guard_dv=true][hdr_mode=${hdrMode}] ${dvLabel} - guard_dv keeps the Dolby Vision instead of ${hdrMode === 'tonemap_sdr' ? 'tonemapping to SDR' : 'stripping the dynamic layer'}; set guard_dv=false to ${hdrMode === 'tonemap_sdr' ? 'tonemap' : 'strip'} it\n`;
-        const dvIptC2 = preserveDv && (primary.color_space || mi?.matrix_coefficients || '').toLowerCase().trim() === 'ipt-c2';   // libx265 can't re-encode the IPT-C2 matrix - skip below rather than emit an erroring command
+        const dvIptC2 = preserveDv && srcIsIptC2;   // skip below rather than emit a command libx265 would reject
 
         // Resolution / downscale (only ever downscales) + the quality tier for the OUTPUT height. Inert under hdr_cleanup_only.
         const maxH = heightCapOpt === 'source' ? 0 : Number(heightCapOpt);
@@ -1268,9 +1293,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const deinterlaceNeeded = idet.kind === 'interlaced' || idet.kind === 'telecine';
         // Film-originated video is REBUILT (its original frames are still in there), video-origin video is INTERPOLATED. deint=all because a genuinely
         // interlaced file often carries no per-frame interlaced flag - that is why the decision came from the pixels - so deint=interlaced would skip it.
-        // Parity: prefer the container's own field order, else idet's TFF/BFF split; bwdif's parity=auto is not enough (see detectInterlace's parity note).
+        // Parity is bwdif's DISPLAY order, which only the container's uncrossed values state unambiguously ('tt' = top stored and top displayed, 'bb' = bottom
+        // and bottom). The crossed 'tb'/'bt' mean opposite things depending on who wrote the file, so no static mapping can be right for both - and in
+        // particular do not "correct" this to the display-order reading in libavutil's AVFieldOrder doc comment. Measured on this build: an ffmpeg encode of a
+        // genuinely top-displayed-first frame reads 'tb' (so the leading letter is right there and the doc reading wrong), while the same picture from a
+        // spec-compliant Matroska muxer reads 'bt' (leading letter wrong) - ffmpeg writes FieldOrder 9 for it and the spec defines 9 the other way up.
+        // Choosing the wrong parity costs SSIM 0.9377 against 0.9816, so the crossed values are ignored and idet decides from the pixels, which was exact
+        // both ways (100/0 and 0/100, with the frame flags cleared as well); bwdif's own parity=auto is the last resort (see detectInterlace's parity note).
         const srcFieldOrder = String(primary.field_order || '').toLowerCase().trim();
-        const deintParity = ['tt', 'tb'].includes(srcFieldOrder) ? 'tff' : (['bb', 'bt'].includes(srcFieldOrder) ? 'bff' : (idet.parity || 'auto'));
+        const deintParity = srcFieldOrder === 'tt' ? 'tff' : (srcFieldOrder === 'bb' ? 'bff' : (idet.parity || 'auto'));
         // send_field, not send_frame: a shot-on-video source genuinely holds one distinct moment per FIELD, so emitting one frame per field (1080i60 -> 60p)
         // keeps what the file contains, while the half-rate alternative would discard every second moment purely to save space. It costs ~31% bitrate and ~58%
         // encode time (measured, libx265 CRF 23 on real 1080i broadcast). A telecined source is unaffected either way - its original frames come back at their
@@ -1296,13 +1327,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // only ever emits a fourCC for hevc and picks dvh1-vs-hvc1 from whether the DV RPU survives - a choice a copy cannot make. Do not merge the two.
         const qtVideoTag = (cn) => (isQtVideoContainer(dstContainer) ? ({ hevc: ' -tag:v:0 hvc1', av1: ' -tag:v:0 av01', h264: ' -tag:v:0 avc1' }[cn] || '') : '');
         const keptStreams = () => file.ffProbeData.streams.filter((s) => !(isCoverArt(s) && codecTypeOf(s) === 'video'));   // input streams minus dropped cover-art video
+        // Both presets below copy the audio and subtitles into the SAME container they came from, so an mp4-family output still carrying TrueHD needs the mov
+        // muxer's -strict level or the mux is refused outright (see mp4StrictArg). Every stream this plugin does not re-encode is copied, so the default
+        // survivor set is right. On the transcode path it must sit AFTER buildVideoArgs' own -strict: the last one on the command wins, so appending keeps the
+        // escalation to experimental, while placing it earlier would let a plain unofficial override it and the TrueHD mux would fail.
+        const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams);
         // Lossless dynamic-HDR strip: -c:v copy + a bitstream filter, no re-encode. dovi_rpu strips DV (HEVC + AV1); hevc_metadata
         // removes HDR10+ (HEVC only). The stream stays the source codec/res/depth with its HDR10 base retained, so it needs no awk_video
         // fence (once stripped it is no longer dynamic-HDR, so a re-run is a natural no-op). On mp4 the fourCC is reset (dvh1 -> hvc1).
         const emitLosslessStrip = () => {
             const bsf = dvSignal ? 'dovi_rpu=strip=1' : 'hevc_metadata=remove_hdr10plus=1';
             response.infoLog += `☐${streamTag(primary.index)}[hdr_mode=strip_dynamic] Stripping ${dynLabel} losslessly (-c:v copy, base HDR10 retained)\n`;
-            let out = `-map 0 -c copy -bsf:v:0 ${bsf}${coverArtDrops}${qtVideoTag(srcCodecName)} -c:a copy -c:s copy${globalOutputOpt}`;
+            let out = `-map 0 -c copy -bsf:v:0 ${bsf}${coverArtDrops}${qtVideoTag(srcCodecName)} -c:a copy -c:s copy${strictArg}${globalOutputOpt}`;
             if (isMp4Family(dstContainer)) out += ' -movflags use_metadata_tags';   // same as the transcode path: keep sibling plugins' GLOBAL awk_* markers through an mp4/mov copy
             response.preset = `<io>${out}`;   // no input-side args
             response.processFile = true;
@@ -1422,7 +1458,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // output needs the dvh1 tag - hvc1 drops the DV box entirely; a stream WITH a base keeps hvc1.
             const preserveDvNoBase = preserveDv && (dvNoBaseLayer || (!!dovi && dovi.compatId === 0));
             const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, codec: targetCodecName, qNorm, speed, want10Bit, willDownscale, outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter });
-            let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy${coverArtDrops} -metadata "awk_video=${videoSig}"`;
+            let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy${coverArtDrops}${strictArg} -metadata "awk_video=${videoSig}"`;
             if (isMp4Family(dstContainer)) out += ' -movflags use_metadata_tags';   // keep the global tag through an mp4/mov copy
             out += globalOutputOpt;
             response.preset = `${enc.inputSide}<io>${out}`;
@@ -1482,9 +1518,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         if (realTranscode && isDynamicHdr && !preserveDv && effHdrMode === 'preserve') {   // a transcode would drop the unprotected dynamic layer - protect it by skipping
             // Only offer guard_dv when turning it on would actually change this file's outcome: it needs an HEVC source (libx265 is the only encoder that
-            // carries the RPU) and it must not already be on. Offering it to a DV-in-AV1 file, or to someone who has it enabled already, names a setting
-            // that cannot help and reads as the plugin not knowing its own state.
-            const guardDvWouldHelp = dvSignal && !guardDvLive && srcCodecName === 'hevc';
+            // carries the RPU), it must not already be on, and it must not use the IPT-C2 matrix libx265 cannot re-encode - that file skips again on the very
+            // next pass with the opposite advice. Naming a setting that cannot help reads as the plugin not knowing its own state.
+            const guardDvWouldHelp = dvSignal && !guardDvLive && srcCodecName === 'hevc' && !srcIsIptC2;
             return skip(`☒${streamTag(primary.index)}[hdr_mode=preserve] ${dynLabel} can't survive a re-encode - left untouched to protect it; ${guardDvWouldHelp ? 'enable guard_dv to carry the Dolby Vision through, or ' : ''}set hdr_mode=strip_dynamic (keep the HDR10 base) or hdr_mode=tonemap_sdr (flatten to SDR)\n`);
         }
 

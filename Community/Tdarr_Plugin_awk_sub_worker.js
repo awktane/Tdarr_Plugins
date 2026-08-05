@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.37.0',
+    Version: '3.38.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -611,19 +611,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         || String(ffmedia?.HDR_Format || ffmedia?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : []).some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
-    // ===== SHARED [audio_clean, stream_ordering, sub_worker]: dolby vision strict mp4 arg =====
-    // -=-=-= dvStrictMp4Arg  [audio_clean, stream_ordering, sub_worker] =-=-=-
-    // The ' -strict unofficial' an mp4/mov -c copy needs so ffmpeg's mov muxer keeps a Dolby Vision stream's dvcC/dvvC boxes; a plain copy drops them,
-    // demoting DV to plain HEVC/AV1 (verified on real HEVC + AV1 DV samples). Finds the DV video stream DIRECTLY - isDolbyVisionVideo, cover art excluded -
-    // so a leading cover-art stream can't mask it (not just the first video stream); HEVC-DV and AV1-DV both qualify. Pass the RAW file.ffProbeData.streams:
-    // codec_tag_string / side_data_list (the DV signals) live only there. clean_and_remux does the equivalent per-stream in its own loop.
-    const dvStrictMp4Arg = (container, streams) => {
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
+    // -=-=-= mp4StrictArg  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The ' -strict <level>' an mp4/mov -c copy needs, or '' when it needs none. Two independent reasons share one flag, because `experimental` is a strict
+    // SUPERSET of `unofficial` and does both jobs:
+    //   experimental - a TrueHD stream copied INTO mp4, which the muxer otherwise refuses outright ("truehd in MP4 support is experimental, add '-strict -2'",
+    //                  rc 88); `unofficial` does NOT satisfy it. Matched on the raw codec_name, not resolveCodecName, whose refined truehdatmos would not equal
+    //                  'truehd'. mkv needs nothing, which is why the container test leads.
+    //   unofficial   - a Dolby Vision video stream, so the mov muxer keeps its dvcC/dvvC boxes; a plain copy drops them, demoting DV to plain HEVC/AV1
+    //                  (verified on real HEVC + AV1 DV samples). Found via isDolbyVisionVideo with cover art excluded, so a leading cover-art stream cannot
+    //                  mask it (not just the first video stream); HEVC-DV, AVC-DV and AV1-DV all qualify.
+    // Pass the RAW file.ffProbeData.streams as `streams`: codec_tag_string / side_data_list (the DV signals) live only there. `copied` is the subset of them
+    // this run emits as a -c copy and defaults to all of them - a caller that drops or re-encodes tracks passes its own survivor list, so a TrueHD track on
+    // its way out never pulls in a flag the output does not need. clean_and_remux does the equivalent inline (MP4_STRICT_GATED + its per-stream DV emit).
+    const mp4StrictArg = (container, streams, copied) => {
         if (!isMp4Family(container)) return '';
         const list = Array.isArray(streams) ? streams : [];
-        const hasDv = list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s)));
-        return hasDv ? ' -strict unofficial' : '';
+        const kept = Array.isArray(copied) ? copied : list;
+        if (kept.some((s) => codecTypeOf(s) === 'audio' && (s?.codec_name || '').toLowerCase().trim() === 'truehd')) return ' -strict experimental';
+        return list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s))) ? ' -strict unofficial' : '';
     };
-    // ===== END SHARED: dolby vision strict mp4 arg =====
+    // ===== END SHARED: mp4 strict compliance arg =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
     // -=-=-= escMeta  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -1531,9 +1539,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const { deleted, log } = deleteImportedSidecars(probed.streams, probed.tags, isMp4);
         return skip(log ? `☑[import_remove_sidecar=true] Working in ${workLibDir()}\n${log}` : `☑[import_remove_sidecar=true] No imported sidecar is waiting to be removed\n`);
     }
-    // Preserve Dolby Vision's dvcC/dvvC boxes on either -c copy remux below (see dvStrictMp4Arg) - a plain copy of a DV HEVC/AV1 stream drops them,
-    // demoting DV to plain HEVC/AV1.
-    const dvStrictArg = dvStrictMp4Arg(dstContainer, streams);
+    // The -strict level either -c copy remux below needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses without
+    // it. Only subtitle streams are ever added or dropped here, so every audio/video stream is copied and the copied-subset argument stays at its default.
+    const strictArg = mp4StrictArg(dstContainer, streams);
     // The stream-summary token line. The input summary and every "Expected results" line are meant to be the SAME view of the stream set before and after,
     // and those result lines sit in mutually exclusive branches - so hand-typed copies could drift in a way only one run type ever shows.
     const summariseAll = (list) => list.map((s) => summariseStream(enrichStream(s))).join('');
@@ -1543,7 +1551,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // so it both keeps sibling plugins' global awk_* tags (awk_video/awk_recovered) through a -c copy and lands this plugin's own awk_sub_worker marker at
     // all - without it an mp4 marker silently vanishes and the next pass re-imports every sidecar it should have skipped.
     const commitPreset = (out) => {
-        let full = out + dvStrictArg;
+        let full = out + strictArg;
         if (isMp4) full += ' -movflags use_metadata_tags';
         full += globalOutputOpt;
         response.preset = `<io>${full}`;
@@ -1918,7 +1926,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const cur = keptSubs.find((s) => s.index === at);
             const curTitle = isMp4 ? (f.title || '') : (cur?.tags?.title || '');
             const curDisp = new Set(Object.keys(cur?.disposition || {}).filter((k) => cur.disposition[k] === 1));
-            const sameDisp = curDisp.size === f.disp.length && f.disp.every((k) => curDisp.has(k));
+            // `default` is muxer-managed rather than a role, so no sidecar name can carry it (see DISPOSITIONS) and f.disp never holds it. The track's own
+            // flag joins the wanted set instead, which both cancels it out of the comparison and stops the whole-set write below from stripping it. Without
+            // that a default-flagged track never matches its sidecar: one wasted retune remux under 'sidecar', a disagreement warning under 'embedded' on
+            // every pass that leaves the sidecar in place (that branch writes no marker, so nothing settles it), and on mkv the flag silently gone. Same
+            // rule as dedupeEmbeddedSubs, which keeps its own keeper's default for the same reason.
+            const wantDisp = new Set(f.disp);
+            if (cur?.disposition?.default === 1) wantDisp.add('default');
+            const sameDisp = curDisp.size === wantDisp.size && [...wantDisp].every((k) => curDisp.has(k));
             if (curTitle === (f.title || '') && langKey(resolveLang(cur) || 'und') === langKey(f.lang || 'und') && sameDisp) continue;
             const named = [f.lang, f.title, ...f.disp].filter(Boolean).join(' ');
             if (metadataMode !== 'sidecar') {
@@ -1928,7 +1943,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const outIdx = keptSubs.findIndex((s) => s.index === at);   // position among the SURVIVING subtitle streams (see retagArgs)
             retuneMeta += ` -metadata:s:s:${outIdx} "language=${langMetaValue(f.lang)}"`;
             retuneMeta += ` -metadata:s:s:${outIdx} "title=${escMeta(f.title || '')}"`;
-            retuneMeta += ` -disposition:s:${outIdx} ${f.disp.length ? f.disp.join('+') : '0'}`;
+            retuneMeta += ` -disposition:s:${outIdx} ${wantDisp.size ? [...wantDisp].join('+') : '0'}`;
             response.infoLog += `☐${streamTag(at)}[method_import_metadata=sidecar] Retagging the track already in the file from ${f.rel} (${named || 'no language, title or flags'})\n`;
         }
 
@@ -1955,13 +1970,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.infoLog += '☑[import_remove_sidecar=true] Already queued for removal by an earlier pass - nothing more to do until the post-processing stage runs\n';
                 return skip('☑Nothing to import - every sidecar was already in the file\n');
             }
+            // The marker is written whole, so anything left out of it is erased. Carry forward every sidecar still on disk that an earlier pass already
+            // settled (alreadyEmbedded), exactly as the mux path below does for the same reason: dropped from the marker, it is no longer skipped and the
+            // next pass imports it again as a duplicate track. A .mks bundle has no other way back - an archive is not comparable text, so its content can
+            // never re-settle it and the marker entry is the whole record. Nothing is unlinked in this branch, so every entry added here still exists.
+            const markList = [...new Set([...stranded, ...found.filter(alreadyEmbedded).map((f) => f.rel)])];
             // The only route left, so it is taken rather than offered: a lossless copy of the whole file is emitted purely to reach the post-processing stage
             // above. Making this a setting would only work for someone who already knew the trap existed, and by then they have been caught by it: asking for
             // the sidecars to be deleted IS asking for whatever it takes. It cannot repeat - one extra pass per file, ever - because the marker stamped here
             // lists them, so the next pass filters them out through alreadyEmbedded, whether or not the deletion that follows actually succeeded.
             response.infoLog += '☒[import_remove_sidecar=true] Every sidecar is already in the file and this node cannot reach the library to delete them - remuxing losslessly, since only an accepted transcode gives the server a pass in which to do it\n';
             for (const rel of stranded) response.infoLog += `☐[import_remove_sidecar=true] Queued for removal once accepted: ${rel}\n`;
-            commitPreset(` -map 0 -c copy -metadata "awk_sub_worker=${encodeMarkerList(stranded)}"`);
+            commitPreset(` -map 0 -c copy -metadata "awk_sub_worker=${encodeMarkerList(markList)}"`);
             response.infoLog += `☑Expected results: ${summariseAll(streams)}\n`;
             return response;
         }
