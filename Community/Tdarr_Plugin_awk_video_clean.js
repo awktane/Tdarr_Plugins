@@ -8,7 +8,7 @@ const details = () => ({
     Description: `Cleans and re-encodes the video stream. Audio and subtitles are copied unchanged (embedded cover-art video is dropped). Pick a top-level ACTION first (see its tooltip for full details) - the plugin does nothing until you choose a goal: hdr_cleanup_only (default, harmless HDR-only pass), normalize (compatibility conversion), shrink (space savings).\n\n
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '3.16.0',
+    Version: '3.17.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -39,7 +39,7 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nsource: keep the source codec (re-encode in place when something else forces it - height_cap / hdr_mode - or, under shrink, a same-codec size pass). This plugin only encodes HEVC/H.264/AV1, so any other source codec - VP9, MPEG-2, VC-1, VVC/H.266 - can't be kept through a forced transcode, and that file is skipped with a warning to pick hevc/h264/av1.
+                \\nsource: keep the source codec (re-encode in place when something else forces it - height_cap / hdr_mode / deinterlace - or, under shrink, a same-codec size pass). This plugin only encodes HEVC/H.264/AV1, so any other source codec - VP9, MPEG-2, VC-1, VVC/H.266 - can't be kept through a forced transcode, and that file is skipped with a warning to pick hevc/h264/av1.
                 \\nhevc (H.265): the recommended target - roughly half the bitrate of H.264 at the same quality.
                 \\nh264 (AVC): a COMPATIBILITY target only (larger files) for old / weak devices that can't do HEVC. Forced to 8-bit (10-bit H.264 breaks device support). HDR10 in H.264 plays poorly - prefer hevc for an HDR source.
                 \\nav1: most efficient, but slow on CPU; hardware AV1 needs a very new GPU (Intel Arc, RTX 40-series, RDNA3), else the libsvtav1 software encoder.
@@ -172,7 +172,7 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\ntrue (default): when a DV source is re-encoded, carry the DV RPU through so the output stays Dolby Vision. Forces the libx265 software encoder (only it keeps the RPU; every hardware HEVC encoder drops it, so a GPU/auto node drops to CPU for these files); forces the HEVC codec (overriding your codec choice) and 10-bit; overrides hdr_mode=strip_dynamic/tonemap_sdr for DV files (the DV is preserved, with a warning). Neither HDR10+ nor HDR Vivid can be carried (no ffmpeg-native path for either). A no-base DV that libx265 can't re-encode (e.g. an IPT-C2 profile 5) is skipped rather than corrupted.
+                \\ntrue (default): when a DV source is re-encoded, carry the DV RPU through so the output stays Dolby Vision. Only an HEVC source qualifies - libx265 is the sole encoder that carries the RPU and it can only take it from HEVC, so DV in any other codec (AV1, say) is not protected by this. For a source that does qualify it forces the libx265 software encoder (every hardware HEVC encoder drops the RPU, so a GPU/auto node drops to CPU for these files); forces the HEVC codec (overriding your codec choice) and 10-bit; overrides hdr_mode=strip_dynamic/tonemap_sdr for DV files (the DV is preserved, with a warning). Neither HDR10+ nor HDR Vivid can be carried (no ffmpeg-native path for either). A no-base DV that libx265 can't re-encode (e.g. an IPT-C2 profile 5) is skipped rather than corrupted.
                 \\nfalse: don't protect DV - a transcode that would destroy it still gets skipped under preserve, but strip_dynamic/tonemap_sdr are honoured (the DV layer is dropped/flattened as asked).`,
         },
         {
@@ -1481,7 +1481,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return skip(`☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} has no HDR10 base layer - a re-encode would leave a mis-coloured picture with no HDR fallback, left untouched; set hdr_mode=tonemap_sdr to flatten it to SDR\n`);
         }
         if (realTranscode && isDynamicHdr && !preserveDv && effHdrMode === 'preserve') {   // a transcode would drop the unprotected dynamic layer - protect it by skipping
-            return skip(`☒${streamTag(primary.index)}[hdr_mode=preserve] ${dynLabel} can't survive a re-encode - left untouched to protect it; ${dvSignal ? 'enable guard_dv to carry the Dolby Vision through, or ' : ''}set hdr_mode=strip_dynamic (keep the HDR10 base) or hdr_mode=tonemap_sdr (flatten to SDR)\n`);
+            // Only offer guard_dv when turning it on would actually change this file's outcome: it needs an HEVC source (libx265 is the only encoder that
+            // carries the RPU) and it must not already be on. Offering it to a DV-in-AV1 file, or to someone who has it enabled already, names a setting
+            // that cannot help and reads as the plugin not knowing its own state.
+            const guardDvWouldHelp = dvSignal && !guardDvLive && srcCodecName === 'hevc';
+            return skip(`☒${streamTag(primary.index)}[hdr_mode=preserve] ${dynLabel} can't survive a re-encode - left untouched to protect it; ${guardDvWouldHelp ? 'enable guard_dv to carry the Dolby Vision through, or ' : ''}set hdr_mode=strip_dynamic (keep the HDR10 base) or hdr_mode=tonemap_sdr (flatten to SDR)\n`);
         }
 
         if (realTranscode) {
