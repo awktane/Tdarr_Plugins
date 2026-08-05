@@ -6,7 +6,7 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can promote the default, SDH or descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time it's needed).\n`,
-    Version: '4.14.0',
+    Version: '4.15.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -80,7 +80,7 @@ const details = () => ({
                 language/role/codec tier, so a client whose ceiling is that layout auto-picks the best track it can play (e.g. the 5.1) rather than a 22.2/7.1 it
                 must down-convert. The demoted tail stays in the requested descending order (largest first) - the cap only shifts which serveable track leads, it
                 never re-sorts the tail. If order_quality also caps, a track over EITHER cap is demoted. The cap only applies to descending - ascending already
-                puts the smallest first.
+                puts the smallest first. Tracks promoted by audio_first outrank the cap and still lead the audio.
                 \\nSet to disabled to skip channel ordering entirely. If both order_channel and order_quality are disabled, audio is not reordered by channels or quality (language/role/order_codec still apply).`
         },
         {
@@ -99,7 +99,8 @@ const details = () => ({
                 \\ndescending <=1024k caps by bitrate: tracks above 1024k (lossless-scale TrueHD/DTS-HD MA, including a lossless track whose bitrate is unknown) are
                 demoted to the END of their own language/role/codec tier so the client's auto-pick leads with a manageable track it can serve without a heavy
                 transcode, not the huge one. The demoted tail stays in the requested descending order; ordering within each group is by the quality score. Also
-                demoted if order_channel caps and this track is over that cap too (see order_channel).
+                demoted if order_channel caps and this track is over that cap too (see order_channel). Tracks promoted by audio_first outrank the cap and
+                still lead the audio.
                 \\nSet to disabled to skip quality ordering entirely (if order_channel is disabled too, see order_channel for what that leaves).`
         },
         {

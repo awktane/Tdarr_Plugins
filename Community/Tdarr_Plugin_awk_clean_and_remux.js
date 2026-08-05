@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.14.0',
+    Version: '4.15.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -207,7 +207,7 @@ const details = () => ({
                 options: ['error', 'drop', 'mkv_fallback'],
             },
             tooltip: `What to do when a stream's codec CANNOT be stored in the target container. Without this the remux dies deep inside ffmpeg on an opaque "Could not find tag for codec ..." with nothing in the log saying which stream or why.
-                \\nmp4 refuses a long list that mkv accepts: TrueHD, MLP, WMA, most ADPCM, A-law / mu-law / 8-bit PCM, LATM AAC (what every DVB and broadcast capture carries), VP8, Theora, ProRes, DNxHD, FFV1, HuffYUV, MagicYUV, UtVideo, v210, DV, Cinepak, H.263, the WMV / MS-MPEG-4 family and the QuickTime-only codecs. A few fit in NEITHER container - AC-4, Blu-ray PCM, SMPTE 302M, IMA-QT ADPCM, Nellymoser - so for those no container choice is a way out.
+                \\nmp4 refuses a long list that mkv accepts: MLP, WMA, most ADPCM, A-law / mu-law / 8-bit PCM, LATM AAC (what every DVB and broadcast capture carries), VP8, Theora, ProRes, DNxHD, FFV1, HuffYUV, MagicYUV, UtVideo, v210, DV, Cinepak, H.263, the WMV / MS-MPEG-4 family and the QuickTime-only codecs. TrueHD mp4 stores only as experimental, so a TrueHD track arriving from another container is gated the same way; one that is ALREADY in an mp4-family file is kept as it stands. A few fit in NEITHER container - AC-4, Blu-ray PCM, SMPTE 302M, IMA-QT ADPCM, Nellymoser - so for those no container choice is a way out.
                 \\n=====
                 \\nActions
                 \\n=====

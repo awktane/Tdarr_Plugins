@@ -8,7 +8,7 @@ const details = () => ({
     Description: `Cleans and re-encodes the video stream. Audio and subtitles are copied unchanged (embedded cover-art video is dropped). Pick a top-level ACTION first (see its tooltip for full details) - the plugin does nothing until you choose a goal: hdr_cleanup_only (default, harmless HDR-only pass), normalize (compatibility conversion), shrink (space savings).\n\n
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '3.15.0',
+    Version: '3.16.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -39,11 +39,11 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nsource: keep the source codec (re-encode in place when something else forces it - height_cap / hdr_mode - or, under shrink, a same-codec size pass). A source codec with no encoder in this build - legacy ones like VP9/MPEG-2/VC-1, and decode-only newcomers like VVC/H.266 - can't be kept through a forced transcode, so that file is skipped with a warning to pick hevc/h264/av1.
+                \\nsource: keep the source codec (re-encode in place when something else forces it - height_cap / hdr_mode - or, under shrink, a same-codec size pass). This plugin only encodes HEVC/H.264/AV1, so any other source codec - VP9, MPEG-2, VC-1, VVC/H.266 - can't be kept through a forced transcode, and that file is skipped with a warning to pick hevc/h264/av1.
                 \\nhevc (H.265): the recommended target - roughly half the bitrate of H.264 at the same quality.
                 \\nh264 (AVC): a COMPATIBILITY target only (larger files) for old / weak devices that can't do HEVC. Forced to 8-bit (10-bit H.264 breaks device support). HDR10 in H.264 plays poorly - prefer hevc for an HDR source.
                 \\nav1: most efficient, but slow on CPU; hardware AV1 needs a very new GPU (Intel Arc, RTX 40-series, RDNA3), else the libsvtav1 software encoder.
-                \\nDolby Vision needs HEVC: with guard_dv on, a DV source is forced to HEVC regardless of this setting (only libx265 carries the DV RPU).`,
+                \\nDolby Vision needs HEVC: with guard_dv on, a DV source that is already HEVC is kept as HEVC regardless of this setting (only libx265 carries the DV RPU, and only from an HEVC source).`,
         },
         {
             name: 'deinterlace',

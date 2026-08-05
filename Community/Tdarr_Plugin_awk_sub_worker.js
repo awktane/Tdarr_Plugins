@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.36.0',
+    Version: '3.37.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -75,7 +75,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['true', 'false']
             },
-            tooltip: `On import, delete each sidecar whose path, relative to the video's directory, is listed in the file's global awk_sub_worker marker (stamped by the mux pass) once an embedded subtitle matching its language and title confirms the content really is in the file.
+            tooltip: `On import, delete each sidecar whose path, relative to the video's directory, is listed in the file's global awk_sub_worker marker (stamped by the mux pass) once its own text is confirmed to be one of the embedded subtitles - matching language and title is the fallback, used only for a .mks bundle or when the embedded text cannot be read at all.
                 \\n=====
                 \\nActions
                 \\n=====
