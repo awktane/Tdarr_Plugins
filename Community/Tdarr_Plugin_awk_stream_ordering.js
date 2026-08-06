@@ -6,52 +6,58 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then
-        main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can promote the original-language, default or descriptive
-        track above language for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can promote the default, SDH or
-        descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the
-        fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart -
-        rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time it's needed).\n`,
-    Version: '4.16.4',
+        main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can lift whichever track the file flags original, default
+        or descriptive above language, for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can lift the track flagged
+        default, SDH or descriptive. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags:
+        encoder/provenance, or the fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote
+        playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time
+        it's needed).\n`,
+    Version: '4.17.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
             name: 'audio_first',
             type: 'string',
-            defaultValue: 'language',
+            defaultValue: 'disabled',
             inputUI: {
                 type: 'dropdown',
-                options: ['language', 'original', 'default', 'descriptive'],
+                options: ['disabled', 'original_tagged', 'default_tagged', 'descriptive_tagged'],
             },
-            tooltip: `Which audio track sorts first. This key sits above every other audio key.
+            tooltip: `Which audio track sorts first. This key sits above every other audio key. Every option but disabled promotes the track the FILE
+                itself flags - a container disposition, or the role named in the track title - which is what _tagged means here.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nlanguage (default): normal ordering - order_language decides.
-                \\noriginal: promote the original-language track (the ffmpeg 'original' disposition, or an 'original' title) above language, so a foreign
-                film leads with its original audio rather than a dub. Falls back to language ordering when no track is flagged original.
-                \\ndefault: promote the track already flagged default (the ffmpeg 'default' disposition), so the source's chosen audio stays first. Where
-                several tracks carry the flag - a source track and a downmix that inherited it, say - the highest-priority one by normal ordering leads.
-                Falls back to language ordering when no track is flagged default.
-                \\ndescriptive: promote the descriptive (audio-description) track above language. Falls back to language ordering when there is no
+                \\ndisabled (default): promote nothing - the normal ordering stands, so order_language decides.
+                \\noriginal_tagged: promote the original-language track (the ffmpeg 'original' disposition, or an 'original' title) above language, so a
+                foreign film leads with its original audio rather than a dub. Falls back to normal ordering when no track is flagged original.
+                \\ndefault_tagged: promote the track already flagged default (the ffmpeg 'default' disposition), so the source's chosen audio stays first.
+                Where several tracks carry the flag - a source track and a downmix that inherited it, say - the highest-priority one by normal ordering
+                leads. Falls back to normal ordering when no track is flagged default.
+                \\ndescriptive_tagged: promote the descriptive (audio-description) track above language. Falls back to normal ordering when there is no
                 descriptive track.
-                \\nWhichever you pick, the first sorted track becomes the sole default - so descriptive makes the audio description your default audio.`,
+                \\nWhichever you pick, the first sorted track becomes the sole default - so descriptive_tagged makes the audio description your default
+                audio.`,
         },
         {
             name: 'subtitle_first',
             type: 'string',
-            defaultValue: 'normal',
+            defaultValue: 'disabled',
             inputUI: {
                 type: 'dropdown',
-                options: ['normal', 'default', 'sdh', 'descriptive'],
+                options: ['disabled', 'default_tagged', 'sdh_tagged', 'descriptive_tagged'],
             },
-            tooltip: `Which subtitle role is promoted to the top of its language. Forced subtitles and order_language priority still lead.
+            tooltip: `Which subtitle role is promoted to the top of its language. Forced subtitles and order_language priority still lead. Every option
+                but disabled promotes the track the FILE itself flags - a container disposition, or the role named in the track title - which is what
+                _tagged means here.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nnormal (default): the standard role order within each language - normal, then songs/lyrics, sdh, descriptive, commentary.
-                \\ndefault: lift the track flagged default (ffmpeg 'default' disposition) to the top of its language.
-                \\nsdh: lift SDH tracks (Subtitles for the Deaf and Hard-of-Hearing) to the top of their language.
-                \\ndescriptive: lift descriptive tracks to the top of their language.`,
+                \\ndisabled (default): promote nothing - the standard role order within each language stands, so normal, then songs/lyrics, sdh,
+                descriptive, commentary.
+                \\ndefault_tagged: lift the track flagged default (ffmpeg 'default' disposition) to the top of its language.
+                \\nsdh_tagged: lift SDH tracks (Subtitles for the Deaf and Hard-of-Hearing) to the top of their language.
+                \\ndescriptive_tagged: lift descriptive tracks to the top of their language.`,
         },
         {
             name: 'order_language',
@@ -930,10 +936,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const junkTagsMode = String(inputs.remove_junk_tags || 'disabled').toLowerCase();
     const methodFaststart = String(inputs.method_mp4_faststart || 'force').toLowerCase().trim();
     const dropdownChecks = [
-        ['audio_first',          inputs.audio_first,                                             ['language', 'original', 'default', 'descriptive']],
+        ['audio_first',          inputs.audio_first,                                             ['disabled', 'original_tagged', 'default_tagged', 'descriptive_tagged']],
         ['order_channel',        inputs.order_channel,                                           ['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled']],
         ['order_quality',        inputs.order_quality,                                           ['descending', 'descending <=1024k', 'ascending', 'disabled']],
-        ['subtitle_first',       inputs.subtitle_first,                                          ['normal', 'default', 'sdh', 'descriptive']],
+        ['subtitle_first',       inputs.subtitle_first,                                          ['disabled', 'default_tagged', 'sdh_tagged', 'descriptive_tagged']],
         ['remove_junk_tags',     junkTagsMode,                                                    ['disabled', 'encoder', 'descriptive']],
         ['method_mp4_faststart', methodFaststart,                                                ['force', 'strip']],
     ];
@@ -963,8 +969,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         const streamOrder = { video: 0, audio: 1, subtitle: 2 , attachment: 3, data: 4};
         const UNKNOWN_TYPE_ORDER = 99;   // a codec_type not in streamOrder (video/audio/subtitle/attachment/data) sorts last
-        const audioFirst = inputs.audio_first;       // 'language' (baseline) | 'original' | 'default' | 'descriptive'
-        const subtitleFirst = inputs.subtitle_first; // 'normal' (baseline) | 'default' | 'sdh' | 'descriptive'
+        const audioFirst = inputs.audio_first;       // 'disabled' (baseline) | 'original_tagged' | 'default_tagged' | 'descriptive_tagged'
+        const subtitleFirst = inputs.subtitle_first; // 'disabled' (baseline) | 'default_tagged' | 'sdh_tagged' | 'descriptive_tagged'
         const preferredLangKeys = orderLangTokens.map(langKey);   // normalised: en/eng/english/en-US and 639-2/B vs /T all rank together (langKey lowercases)
         const codecFirstList = splitList(inputs.order_codec).map(c => c.toLowerCase());   // canon codec names are lowercase, so the list must be too
 
@@ -1075,7 +1081,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // Does this audio stream's canonical codec match order_codec? Family-prefix: "dts" catches dtsma/dtshr/dtsexpress, "eac3" catches eac3atmos.
                 codecMatch: canon !== '' && codecFirstList.some(c => canon.startsWith(c)),
                 default: ffstream?.disposition?.default === 1,
-                original: hasDisposition(ffstream, 'original'),   // for audio_first='original': promote the original-language track above language
+                original: hasDisposition(ffstream, 'original'),   // for audio_first='original_tagged': promote the original-language track above language
 
                 // Role classification via the shared classifiers (single source of truth — keeps the sort and the summary line in agreement).
                 commentary: isCommentary(ffstream),
@@ -1088,12 +1094,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             });
         }
 
-        // audio_first='default': only ONE audio track can remain default (the normalisation below marks the first sorted audio the sole
+        // audio_first='default_tagged': only ONE audio track can remain default (the normalisation below marks the first sorted audio the sole
         // default). So promote the SINGLE default track that WINS the normal ordering, not every default flag - then the emitted order
         // already matches the post-normalisation state and is a fixpoint. Promoting every default would lead with a lower-priority
         // default on pass 1, then re-sort it once its default is stripped (a wasteful extra reorder remux before it settles). undefined
-        // when no track is flagged default, so audio_first='default' then falls through to normal ordering. Identity-compared below.
-        const winningDefault = audioFirst === 'default'
+        // when no track is flagged default, so audio_first='default_tagged' then falls through to normal ordering. Identity-compared below.
+        const winningDefault = audioFirst === 'default_tagged'
             ? streams.filter(s => s.type === 'audio' && s.default).sort((a, b) => compareAudioKeys(a, b) || a.index - b.index)[0]
             : undefined;
 
@@ -1101,18 +1107,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // returns 0 on a full tie, so the sort dispatcher below falls through to source-index order. Video: cover art / posters / thumbnails sort last.
         const compareVideoStreams = (a, b) => (a.coverArt !== b.coverArt) ? (a.coverArt ? 1 : -1) : 0;
         // Audio: audio_first promotes ONE track above every audio key (including language). Only one value is active, so at most one
-        // clause fires; each is a no-op when no track qualifies, falling through to the normal ordering. original: keeps a foreign
-        // film's original audio first (and default), not a dub. default: keeps the source's flagged-default audio first - promoting only
-        // the WINNING default (winningDefault) so the result is idempotent. descriptive: lifts the audio-description track first (and,
-        // via normalisation, makes it the default). Then language, role, order_codec, union cap, channel + quality via compareAudioKeys.
+        // clause fires; each is a no-op when no track qualifies, falling through to the normal ordering. original_tagged: keeps a foreign
+        // film's original audio first (and default), not a dub. default_tagged: keeps the source's flagged-default audio first - promoting
+        // only the WINNING default (winningDefault) so the result is idempotent. descriptive_tagged: lifts the audio-description track first
+        // (and, via normalisation, makes it the default). Then language, role, order_codec, union cap, channel + quality via compareAudioKeys.
         const compareAudioStreams = (a, b) => {
-            if (audioFirst === 'original' && a.original !== b.original)
+            if (audioFirst === 'original_tagged' && a.original !== b.original)
                 return a.original ? -1 : 1;
-            if (audioFirst === 'default') {
+            if (audioFirst === 'default_tagged') {
                 const aWin = a === winningDefault, bWin = b === winningDefault;
                 if (aWin !== bWin) return aWin ? -1 : 1;
             }
-            if (audioFirst === 'descriptive' && a.descriptive !== b.descriptive)
+            if (audioFirst === 'descriptive_tagged' && a.descriptive !== b.descriptive)
                 return a.descriptive ? -1 : 1;
             return compareAudioKeys(a, b);
         };
@@ -1125,11 +1131,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const bRank = b.langRank;
             if (aRank !== bRank)
                 return aRank - bRank;
-            if (subtitleFirst === 'default' && a.default !== b.default)
+            if (subtitleFirst === 'default_tagged' && a.default !== b.default)
                 return a.default ? -1 : 1;
-            else if (subtitleFirst === 'sdh' && a.sdh !== b.sdh)
+            else if (subtitleFirst === 'sdh_tagged' && a.sdh !== b.sdh)
                 return a.sdh ? -1 : 1;
-            else if (subtitleFirst === 'descriptive' && a.descriptive !== b.descriptive)
+            else if (subtitleFirst === 'descriptive_tagged' && a.descriptive !== b.descriptive)
                 return a.descriptive ? -1 : 1;
             const aRole = a.commentary ? 4 : (a.descriptive ? 3 : (a.sdh ? 2 : (a.lyrics ? 1 : 0)));
             const bRole = b.commentary ? 4 : (b.descriptive ? 3 : (b.sdh ? 2 : (b.lyrics ? 1 : 0)));
