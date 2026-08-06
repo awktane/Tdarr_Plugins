@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.20.3',
+    Version: '3.21.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1069,7 +1069,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //     alone; a type we can't drive (rkmpp, or a cross-platform mis-set) -> no usable GPU. 'node' falls every unusable case back to CPU; 'node_strict'
         //     instead ERRORS the file (at the fallthrough below), for users who never want a GPU job silently landing on the CPU.
         //   auto -> ignore the node type, try the platform priority list, then CPU.
-        //   an explicit family / cpu -> force it (regardless of worker type), then CPU.
+        //   cpu -> software, full stop. Pinning ONE hardware family is a per-node decision, not a library-wide one, so it is made at the node (above) rather
+        //     than offered here - a library setting would force every node in a mixed fleet onto the same encoder.
         // Only auto/node/node_strict are worker-type-aware; a CPU worker (and Dolby Vision, handled above) takes CPU and never strict-errors.
         const strict = encoderOpt === 'node_strict';
         const isNodeMode = encoderOpt === 'node' || strict;
@@ -1083,7 +1084,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             else if (hwList.includes(nodeHw)) families = strict ? [nodeHw] : [nodeHw, 'cpu'];  // node pinned to a family we can drive on this platform
             else families = strict ? [] : ['cpu'];                                  // node pinned to something we can't drive (rkmpp / cross-platform mis-set)
         } else {
-            families = [encoderOpt, 'cpu'];                                               // explicit family pin or cpu -> forced regardless of worker type
+            families = ['cpu'];                                                          // encoderOpt === 'cpu' - the only value left, and it forces software
         }
 
         for (const family of families) {
@@ -1313,7 +1314,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!['source', '2160', '1440', '1080', '720', '480'].includes(heightCapOpt)) failFile(`[height_cap=${heightCapOpt}] invalid value, check your settings`);
     if (!['slow', 'medium', 'fast'].includes(speed)) failFile(`[method_speed=${speed}] invalid value, check your settings`);
     if (!['source', '8', '10'].includes(bitDepthOpt)) failFile(`[method_bitdepth=${bitDepthOpt}] invalid value, check your settings`);
-    if (!['node', 'node_strict', 'auto', 'nvenc', 'qsv', 'vaapi', 'videotoolbox', 'amf', 'cpu'].includes(encoderOpt))
+    if (!['node', 'node_strict', 'auto', 'cpu'].includes(encoderOpt))
         failFile(`[method_encoder=${encoderOpt}] invalid value, check your settings`);
     if (!['preserve', 'strip_dynamic', 'tonemap_sdr'].includes(hdrMode)) failFile(`[hdr_mode=${hdrMode}] invalid value, check your settings`);
     if (!['disabled', 'enabled'].includes(deinterlaceOpt)) failFile(`[deinterlace=${deinterlaceOpt}] invalid value, check your settings`);
@@ -1668,9 +1669,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Build the transcode preset (encoder resolved per node) + the predicted output summary.
         const emitTranscode = (encodeTag) => {
             if (preserveDv) response.infoLog += `☐${streamTag(primary.index)}[guard_dv=true] ${dvLabel} - keeping the DV RPU through the re-encode (libx265)\n`;
-            if (preserveDv && !['auto', 'cpu', 'node', 'node_strict'].includes(encoderOpt))
-                response.infoLog += `☒${streamTag(primary.index)}[method_encoder=${encoderOpt}][guard_dv=true] Forced encoder overridden to `
-                    + `${ENCODER_NAME[targetCodecName].cpu} - ${encoderOpt} would drop the Dolby Vision RPU\n`;
             let sel = selectEncoder({ codec: targetCodecName, encoderOpt, otherArguments, forceCpu: preserveDv,
                 forceCpuWhy: 'for Dolby Vision - hardware encoders drop the RPU' });
             // Probe for captions only where the answer could change something: an H.264 target keeps them on every encoder it can pick, and an HEVC target
