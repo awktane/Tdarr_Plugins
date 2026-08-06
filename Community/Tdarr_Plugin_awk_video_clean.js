@@ -12,7 +12,7 @@ const details = () => ({
                      plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '3.18.2',
+    Version: '3.19.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1175,6 +1175,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         } else {   // cpu
             scale();
             parts.push(`-pix_fmt ${want10Bit ? 'yuv420p10le' : 'yuv420p'}`);
+            // Embedded closed captions (EIA-608/708 carried as A53 SEI inside the video bitstream) survive a re-encode only when the encoder is told to
+            // re-emit them, and the defaults disagree: libx264 already carries them, libx265 drops them unless -a53cc is on. libsvtav1 has no such option at
+            // all, so an av1 target loses them whatever we do (guard_captions warns about that path). Only hevc needs the explicit flag here.
+            if (codec === 'hevc') parts.push('-a53cc 1');
             // libx265 carries the decoded DV RPU through the encode; x265's DV coding needs VBV/HRD (bare CRF errors -22), so add a generous per-tier ceiling
             if (preserveDv) {
                 const dvVbvKbps = { sd: 10000, p720: 20000, p1080: 40000, p4k: 100000 }[heightTier(outHeight)];
