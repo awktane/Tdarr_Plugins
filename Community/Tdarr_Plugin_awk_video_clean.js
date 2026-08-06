@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.20.2',
+    Version: '3.20.3',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -22,7 +22,7 @@ const details = () => ({
             defaultValue: 'hdr_cleanup_only',
             inputUI: {
                 type: 'dropdown',
-                options: ['normalize', 'shrink', 'hdr_cleanup_only'],
+                options: ['hdr_cleanup_only', 'normalize', 'shrink'],
             },
             tooltip: `What this plugin is FOR on this run. Nothing happens until you pick a goal, so set this first and then tune the inputs below for
                 the action you chose.
@@ -244,7 +244,7 @@ const details = () => ({
             defaultValue: true,
             inputUI: {
                 type: 'dropdown',
-                options: ['false', 'true'],
+                options: ['true', 'false'],
             },
             tooltip: `Protect Dolby Vision through a transcode.
                 \\n=====
@@ -266,7 +266,7 @@ const details = () => ({
             defaultValue: true,
             inputUI: {
                 type: 'dropdown',
-                options: ['false', 'true'],
+                options: ['true', 'false'],
             },
             tooltip: `Protect a LOSSLESS or mastering-grade video source from being re-encoded: ProRes, DNxHD, FFV1, HuffYUV, FFVHuff, MagicYUV, UtVideo,
                     CineForm, v210 and raw video.
@@ -1308,7 +1308,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return n;
     })();
 
-    if (!['normalize', 'shrink', 'hdr_cleanup_only'].includes(action)) failFile(`[action=${action}] invalid value, check your settings`);
+    if (!['hdr_cleanup_only', 'normalize', 'shrink'].includes(action)) failFile(`[action=${action}] invalid value, check your settings`);
     if (!['source', 'hevc', 'h264', 'av1'].includes(codec)) failFile(`[codec=${codec}] invalid value, check your settings`);
     if (!['source', '2160', '1440', '1080', '720', '480'].includes(heightCapOpt)) failFile(`[height_cap=${heightCapOpt}] invalid value, check your settings`);
     if (!['slow', 'medium', 'fast'].includes(speed)) failFile(`[method_speed=${speed}] invalid value, check your settings`);

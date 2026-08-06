@@ -27,7 +27,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.19.2',
+    Version: '4.19.3',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -120,18 +120,18 @@ const details = () => ({
             defaultValue: 'invalid',
             inputUI: {
                 type: 'dropdown',
-                options: ['disabled', 'invalid', 'strict'],
+                options: ['invalid', 'strict', 'disabled'],
             },
             tooltip: `Standardise the language tag on tracks that already HAVE one - to set a language on UNtagged tracks use language_fill instead.
                 Applies to video, audio and subtitle streams; the form written follows method_tag_language.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\ndisabled: never change an existing language tag.
                 \\ninvalid (default): fix only the tags that are non-standard or would not survive the output container - spelled-out names, wrong case,
                 and 2-letter or region codes headed for mp4. Tags that already store cleanly (eng, or en/fre into mkv) are left alone.
                 \\nstrict: rewrite every language tag to the method_tag_language standard, valid ones included - en becomes eng, and fre/fra fold to your
                 chosen form.
+                \\ndisabled: never change an existing language tag.
                 \\nWhy it matters: mp4 cannot store a 2-letter code and silently drops the language on remux, so an "en" track would come out with no
                 language at all. Undetermined and non-language codes (und, mul, zxx, mis) are always left untouched.`,
         },
@@ -230,7 +230,7 @@ const details = () => ({
             defaultValue: 'container',
             inputUI: {
                 type: 'dropdown',
-                options: ['639-2/b', '639-2/t', 'container', 'bcp47'],
+                options: ['container', '639-2/t', '639-2/b', 'bcp47'],
             },
             tooltip: `Which language-code standard tag_language writes. Only takes effect while tag_language is not disabled, and you can still type any
                 form you like in the language lists regardless.
@@ -969,9 +969,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile(`[tag_disposition=${tagDisposition}] invalid value, check your settings`);
     if(!['disabled', 'audio', 'subtitle', 'both'].includes(tagTitle))
         failFile(`[tag_title=${tagTitle}] invalid value, check your settings`);
-    if(!['disabled', 'invalid', 'strict'].includes(tagLanguage))
+    if(!['invalid', 'strict', 'disabled'].includes(tagLanguage))
         failFile(`[tag_language=${tagLanguage}] invalid value, check your settings`);
-    if(!['639-2/b', '639-2/t', 'container', 'bcp47'].includes(methodTagLanguage))
+    if(!['container', '639-2/t', '639-2/b', 'bcp47'].includes(methodTagLanguage))
         failFile(`[method_tag_language=${methodTagLanguage}] invalid value, check your settings`);
     if(!['disabled', 'light', 'aggressive'].includes(recoverData))
         failFile(`[recover_bad_data=${recoverData}] invalid value, check your settings`);

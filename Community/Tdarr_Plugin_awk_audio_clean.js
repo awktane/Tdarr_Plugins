@@ -12,7 +12,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.19.0',
+    Version: '4.19.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -310,7 +310,7 @@ const details = () => ({
             defaultValue: 'default',
             inputUI: {
                 type: 'dropdown',
-                options: ['dialogue','default'],
+                options: ['default','dialogue'],
             },
             tooltip: `How a stereo (2.0) track is folded down from a surround source.
                 \\n=====
@@ -1541,7 +1541,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['method_deduplicate',    methodDeduplicate,    ['disabled', 'multi-stereo', 'multi-stereo-error', 'channel', 'channel-error']],
         ['method_layout_err',     methodLayoutErr,      ['keep', 'drop', 'remix']],
         ['method_loudnorm',       methodLoudnorm,       ['disabled', 'tv', 'cinema', 'quiet_room']],
-        ['method_stereo_downmix', methodStereoDownmix,  ['dialogue', 'default']],
+        ['method_stereo_downmix', methodStereoDownmix,  ['default', 'dialogue']],
         ['guard_lossless',        guardLossless,        ['enabled', 'disabled']],
         ['guard_object_audio',    guardObjectAudio,     ['enabled', 'disabled']],
         ['guard_original',        guardOriginal,        ['disabled', 'enabled']],
