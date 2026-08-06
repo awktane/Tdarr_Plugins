@@ -11,8 +11,9 @@ const details = () => ({
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one
                      plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
-                     -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '3.19.0',
+                     -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
+                     embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
+    Version: '3.20.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -209,6 +210,34 @@ const details = () => ({
             tooltip: `Encoder speed vs. efficiency. Slower spends more CPU/GPU time for a smaller file at the same quality.
                 \\nMaps to each encoder's native preset (libx265 slow/medium/fast, libsvtav1 4/6/8, NVENC p7/p5/p3, QSV veryslow/medium/veryfast, ...).
                     VAAPI/VideoToolbox have no comparable knob and ignore this.`,
+        },
+        {
+            name: 'guard_captions',
+            type: 'boolean',
+            defaultValue: false,
+            inputUI: {
+                type: 'dropdown',
+                options: ['false', 'true'],
+            },
+            tooltip: `Protect embedded closed captions through a transcode. These are not a subtitle track - they ride inside the video bitstream itself
+                    (A53/EIA-608, common on North American broadcast recordings), so re-encoding is the one thing that can destroy them, and only some
+                    encoders can carry them across.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\nfalse (default): don't look and don't protect. An HEVC target on a GPU node, or any AV1 target, silently loses the captions - no
+                    hardware HEVC encoder and no AV1 encoder can carry them. An HEVC target on a CPU node keeps them regardless of this setting, and so
+                    does any H.264 target.
+                \\ntrue: check whether this file actually has captions, and if it does, keep them. For an HEVC target that means dropping to the libx265
+                    software encoder (the only HEVC encoder that can re-emit them), which is slower than the GPU. For an AV1 target nothing can save them,
+                    so it warns and continues rather than silently changing your codec.
+                \\nThe check costs one bounded ffprobe read per candidate file - a few seconds, the same whether the file is a clip or a feature. It is
+                    skipped entirely when the answer could not change anything (an H.264 target, or HEVC already on the CPU encoder).
+                \\nA caption channel that is present but carries no text still counts as captions here, because telling the two apart needs a full decode.
+                    That costs a needless CPU encode, never data. Running sub_worker's embedded_cc over the file first settles it permanently: it records
+                    what it found, and this guard then stops re-checking that file.
+                \\nCaptions are better handled by extracting them to a real subtitle track - run sub_worker BEFORE this plugin. Once it has, this guard
+                    steps aside and the leftover bitstream copy is removed on the next re-encode, so you don't end up with the same captions twice.`,
         },
         {
             name: 'guard_dv',
@@ -933,6 +962,48 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ====== END INTERLACE DETECTION ======
 
+    // ====== CLOSED-CAPTION DETECTION ======
+    // Closed captions are not a stream. They ride INSIDE the video bitstream as A53/EIA-608 SEI, so no stream list mentions them and nothing short of a
+    // decode-side probe can see them - which is also why a re-encode is the one operation that can destroy them. ffprobe reports them as per-frame side data,
+    // and reading a BOUNDED window of frames answers the question at a cost independent of duration (measured 0.2-17s across the sample corpus, a clip and a
+    // feature alike) because -read_intervals stops the read instead of scanning to EOF. Do NOT reach for the movie=...[out0+subcc] filter to detect: it has no
+    // working bound - on a caption-FREE file the subtitle output never ends, so ffmpeg decodes the whole file hunting packets that never arrive.
+    const A53_PROBE_TIMEOUT_MS = 120000;
+    const A53_PROBE_MAX_BYTES = 8 * 1024 * 1024;
+    const A53_PROBE_FRAMES = 400;                         // captions are sparse, and a programme's opening is often silent; 400 frames spans enough to decide
+    const A53_SIDE_DATA = 'A53 Part 4 Closed Captions';   // ffprobe's spelling of the side-data type, and the only positive signal there is
+
+    // Tdarr hands a plugin otherArguments.ffmpegPath and nothing else; ffprobe sits beside it under the same name. Replace only the FINAL path component: the
+    // production path carries 'ffmpeg' as a DIRECTORY as well as the basename (.../assets/app/ffmpeg/darwin_arm64/ffmpeg), so a plain string replace rewrites
+    // the directory and yields a path to nothing. Returns '' when the binary can't be located, which every caller must read as "unknown", never as "no".
+    const deriveFfprobePath = (ffmpegPath) => {
+        const p = String(ffmpegPath || '').trim();
+        if (!p) return '';
+        const cut = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+        const base = p.slice(cut + 1);
+        if (!/^ffmpeg(\.exe)?$/i.test(base)) return '';   // an unexpected basename (a wrapper script, say): no safe derivation
+        const probe = p.slice(0, cut + 1) + base.replace(/^ffmpeg/i, 'ffprobe');
+        if (cut < 0) return probe;                        // a bare 'ffmpeg' means a PATH lookup, and 'ffprobe' resolves the same way
+        try { return fs.existsSync(probe) ? probe : ''; } catch (e) { return ''; }
+    };
+
+    // Does the primary video stream carry A53 caption side data? Returns true / false / 'unknown' - and 'unknown' is NOT 'no': it means the probe could not
+    // run, so a caller stays fail-safe rather than concluding the file is caption-free. `cap` is the test-injected verdict (__awkCap.captions): supplying it
+    // short-circuits the spawn entirely, which is how the harness stays free of real binaries.
+    const probeA53Captions = (filePath, ffprobePath, cap) => {
+        if (cap === true || cap === false) return cap;
+        if (!filePath || !ffprobePath) return 'unknown';
+        try {
+            const { spawnSync } = require('child_process');
+            const args = ['-v', 'error', '-select_streams', 'v:0', '-read_intervals', `%+#${A53_PROBE_FRAMES}`,
+                '-show_frames', '-show_entries', 'frame=side_data_list', '-of', 'default=nw=1', filePath];
+            const r = spawnSync(ffprobePath, args, { encoding: 'utf8', timeout: A53_PROBE_TIMEOUT_MS, maxBuffer: A53_PROBE_MAX_BYTES });
+            if (!r || r.status !== 0) return 'unknown';
+            return String(r.stdout || '').includes(A53_SIDE_DATA);
+        } catch (e) { return 'unknown'; }
+    };
+    // ====== END CLOSED-CAPTION DETECTION ======
+
     // Route the HDR->SDR tonemap to the GPU filter that rides the chosen encoder's device stack, keeping every node's output in the ONE
     // consistent tonemap_* family (cuda ~= opencl ~= videotoolbox, SSIM ~0.9997 - validated on real NVIDIA/Intel/Mac hardware). CPU 'tonemapx'
     // is the ~0.79-different outlier, used only as a fallback when no GPU tonemap initialises or the encoder is software. nvenc->cuda (native,
@@ -966,7 +1037,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Resolve the encoder for THIS node. Returns { family, encoderName, notes:[infoLog lines] }, or { strictFail, notes } when node_strict forbids the CPU
     // fallback. method_encoder picks the candidate list - see the comment on `families` below. Tests inject a capability object + platform via
     // otherArguments.__awkCap (workerType and nodeHardwareType sit on otherArguments itself) to avoid any real ffmpeg/nvidia-smi spawn.
-    const selectEncoder = ({ codec, encoderOpt, otherArguments, forceCpu }) => {
+    const selectEncoder = ({ codec, encoderOpt, otherArguments, forceCpu, forceCpuWhy }) => {
         const inj = otherArguments && otherArguments.__awkCap;
         const platform = (inj && inj.platform) || os.platform();
         const workerType = String((otherArguments && otherArguments.workerType) || '').toLowerCase();
@@ -984,8 +1055,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const pushFallbackNote = (family, reason) => {
             if (encoderOpt === family) notes.push(`☒[method_encoder=${encoderOpt}] ${reason}; using ${ENCODER_NAME[codec].cpu}\n`);
         };
-        if (forceCpu) {   // Dolby Vision preservation: HW HEVC encoders drop the RPU, so libx265 is the only option regardless of node/pin
-            notes.push(`☐[method_encoder=${encoderOpt}] Encoder: ${ENCODER_NAME[codec].cpu} (forced for Dolby Vision - hardware encoders drop the RPU)\n`);
+        // Data the hardware encoders cannot carry (a Dolby Vision RPU, embedded closed captions) leaves the software encoder as the only option regardless of
+        // node or pin. forceCpuWhy names which, so the log says what the slower encode bought.
+        if (forceCpu) {
+            notes.push(`☐[method_encoder=${encoderOpt}] Encoder: ${ENCODER_NAME[codec].cpu} (forced ${forceCpuWhy})\n`);
             return cpuChoice();
         }
 
@@ -1113,7 +1186,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (see the HDR-detection block below). Decode stays on software frames (nvenc via the shared nvdecPreset helper) so one CPU scale filter and -pix_fmt path
     // work uniformly across families; VAAPI is the exception - it needs its frames uploaded, so it carries an explicit device + format,hwupload filter.
     const buildVideoArgs = ({ family, encoderName, codec, qNorm, speed, want10Bit, willDownscale, outHeight, dstContainer, file, tonemap,
-        tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter }) => {
+        tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter, dropCaptions }) => {
         const { getNvdecHwaccelPreset, getNvenc10BitFormatArg } = require('../methods/nvdecPreset');
         const q = nativeQuality(codec, family, qNorm);
         const spd = nativeSpeed(codec, family, speed);
@@ -1175,10 +1248,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         } else {   // cpu
             scale();
             parts.push(`-pix_fmt ${want10Bit ? 'yuv420p10le' : 'yuv420p'}`);
-            // Embedded closed captions (EIA-608/708 carried as A53 SEI inside the video bitstream) survive a re-encode only when the encoder is told to
-            // re-emit them, and the defaults disagree: libx264 already carries them, libx265 drops them unless -a53cc is on. libsvtav1 has no such option at
-            // all, so an av1 target loses them whatever we do (guard_captions warns about that path). Only hevc needs the explicit flag here.
-            if (codec === 'hevc') parts.push('-a53cc 1');
             // libx265 carries the decoded DV RPU through the encode; x265's DV coding needs VBV/HRD (bare CRF errors -22), so add a generous per-tier ceiling
             if (preserveDv) {
                 const dvVbvKbps = { sd: 10000, p720: 20000, p1080: 40000, p4k: 100000 }[heightTier(outHeight)];
@@ -1186,6 +1255,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
+        // Embedded closed captions (A53 SEI in the bitstream) survive a re-encode only when the encoder re-emits them, and only three encoders in this build
+        // can: libx264 and h264_videotoolbox, both defaulting ON, and libx265, defaulting OFF. Hardware HEVC and every AV1 encoder have no -a53cc option at
+        // all and drop captions whatever we ask - which is what guard_captions exists to see coming. So the flag is emitted only where the default is not what
+        // this file needs: turned ON for libx265 when the captions are being kept, and OFF for the H.264 pair when they are not. dropCaptions means sub_worker
+        // already lifted them into a sidecar or proved the channel empty, so leaving the bitstream copy would show the same captions twice in a player.
+        if (codec === 'hevc' && family === 'cpu' && !dropCaptions) parts.push('-a53cc 1');
+        if (codec === 'h264' && dropCaptions && (family === 'cpu' || family === 'videotoolbox')) parts.push('-a53cc 0');
         // hvc1 = Apple/QuickTime HEVC-in-mp4 (primary only); a no-base DV (e.g. profile 5) needs dvh1 or the DV box is dropped. The encode path tags hevc
         // ONLY - see qtVideoTag for why it and the copy path differ
         if (codec === 'hevc' && isQtVideoContainer(dstContainer)) parts.push(preserveDvNoBase ? '-tag:v:0 dvh1' : '-tag:v:0 hvc1');
@@ -1211,6 +1287,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const encoderOpt = String(inputs.method_encoder || 'node').toLowerCase().trim();
     const hdrMode = String(inputs.hdr_mode || 'preserve').toLowerCase().trim();
     const deinterlaceOpt = String(inputs.deinterlace || 'disabled').toLowerCase().trim();
+    const guardCaptions = String(inputs.guard_captions) === 'true';   // boolean, default FALSE - opt-in, unlike the two guards below (see its tooltip)
     const guardDv = String(inputs.guard_dv) !== 'false';   // boolean (loadDefaultValues coerces it), default true
     const guardLossless = String(inputs.guard_lossless) !== 'false';   // boolean, default true
 
@@ -1562,13 +1639,59 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // core only; the stored -v<version> suffix is forensic, not part of the fence
         const alreadyFenced = priorSig !== '' && priorSig.replace(/-v[^-]*$/, '') === videoSigCore;
 
+        // ---- embedded closed captions ---- They live in the video bitstream, so this is the only plugin that can lose them and the only one that can remove
+        // them deliberately. Two separate jobs here: carry out the removal sub_worker asked for, and (under guard_captions) notice captions that the encoder
+        // this node is about to choose would destroy. Neither is part of the awk_video fingerprint above, and that omission is deliberate rather than an
+        // oversight: neither can FIRE a transcode, they only change how one that is already happening is performed. Fingerprinting them would re-encode a
+        // finished file a second time - to strip a caption track, or to "protect" captions the first encode already destroyed and no later encode can restore.
+        const ccTokens = getTagCI(file.ffProbeData.format?.tags || {}, 'awk_cc').toLowerCase().split(',').map((t) => t.trim());
+        const ccExported = ccTokens.includes('strip');     // sub_worker exported them, but could not remove the bitstream copy under its own -c copy pass
+        const ccChannelEmpty = ccTokens.includes('none');  // sub_worker decoded the channel and it carried no caption text at all
+        const dropCaptions = ccExported || ccChannelEmpty;
+        // Only `true` is information. Tdarr's optional caption scan reads false both for a file that genuinely has none and for one its bundled CCExtractor
+        // could not parse (measured: every mp4, and MPEG-2 inside Matroska), so a false still has to be probed. Memoized to at most one probe per file - that
+        // cost is the whole reason the check is skipped wherever the answer could not change the outcome.
+        let ccVerdict = null;
+        const detectCaptions = () => {
+            if (ccVerdict) return ccVerdict;
+            if (file.hasClosedCaptions === true) { ccVerdict = { present: true, via: 'the library caption scan' }; return ccVerdict; }
+            // An injected capability object means a synthetic node, so never spawn past it: a missing key reads as "no captions" rather than falling through
+            // to a real probe. Mirrors the idet and tonemap probes.
+            const inj = otherArguments && otherArguments.__awkCap;
+            const r = probeA53Captions(file.file, deriveFfprobePath((otherArguments && otherArguments.ffmpegPath) || 'ffmpeg'),
+                inj ? inj.captions === true : undefined);
+            ccVerdict = { present: r === true, unknown: r === 'unknown', via: 'a bitstream scan' };
+            return ccVerdict;
+        };
+
         // Build the transcode preset (encoder resolved per node) + the predicted output summary.
         const emitTranscode = (encodeTag) => {
             if (preserveDv) response.infoLog += `☐${streamTag(primary.index)}[guard_dv=true] ${dvLabel} - keeping the DV RPU through the re-encode (libx265)\n`;
             if (preserveDv && !['auto', 'cpu', 'node', 'node_strict'].includes(encoderOpt))
                 response.infoLog += `☒${streamTag(primary.index)}[method_encoder=${encoderOpt}][guard_dv=true] Forced encoder overridden to `
                     + `${ENCODER_NAME[targetCodecName].cpu} - ${encoderOpt} would drop the Dolby Vision RPU\n`;
-            const sel = selectEncoder({ codec: targetCodecName, encoderOpt, otherArguments, forceCpu: preserveDv });
+            let sel = selectEncoder({ codec: targetCodecName, encoderOpt, otherArguments, forceCpu: preserveDv,
+                forceCpuWhy: 'for Dolby Vision - hardware encoders drop the RPU' });
+            // Probe for captions only where the answer could change something: an H.264 target keeps them on every encoder it can pick, and an HEVC target
+            // that already landed on libx265 keeps them through the -a53cc 1 above. That leaves HEVC on hardware (recoverable - force the CPU encoder) and
+            // AV1 anywhere (not recoverable - no AV1 encoder has the option), which is why the two branches below end differently.
+            if (guardCaptions && !dropCaptions && (targetCodecName === 'av1' || (targetCodecName === 'hevc' && sel.family !== 'cpu'))) {
+                const cc = detectCaptions();
+                if (cc.unknown)
+                    response.infoLog += `☒${streamTag(primary.index)}[guard_captions=true] Could not check for closed captions on this node (no ffprobe`
+                        + ` beside ffmpeg) - continuing without the protection\n`;
+                else if (cc.present && targetCodecName === 'hevc') {
+                    response.infoLog += `☐${streamTag(primary.index)}[guard_captions=true] Closed captions found by ${cc.via} - encoding on the CPU so they`
+                        + ` survive; extract them with sub_worker's embedded_cc to keep the hardware encoder\n`;
+                    sel = selectEncoder({ codec: targetCodecName, encoderOpt, otherArguments, forceCpu: true,
+                        forceCpuWhy: 'to keep the embedded closed captions - only libx265 re-emits them' });
+                } else if (cc.present)
+                    response.infoLog += `☒${streamTag(primary.index)}[codec=${codec}][guard_captions=true] Closed captions found by ${cc.via}, and no AV1`
+                        + ` encoder can carry them - they will be lost; extract them with sub_worker's embedded_cc first to keep them\n`;
+            }
+            if (dropCaptions)
+                response.infoLog += `☐${streamTag(primary.index)} Dropping the embedded closed captions - sub_worker `
+                    + `${ccExported ? 'exported them to a subtitle, and keeping both would show them twice' : 'found the caption channel carries no text'}\n`;
             sel.notes.forEach((n) => { response.infoLog += n; });
             if (sel.strictFail) failFile(sel.strictFail);   // node_strict: the node's GPU encoder can't run and CPU fallback is forbidden
             const tonemapBackend = tonemap ? resolveTonemapBackend({ family: sel.family, otherArguments }) : null;
@@ -1580,7 +1703,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // output needs the dvh1 tag - hvc1 drops the DV box entirely; a stream WITH a base keeps hvc1.
             const preserveDvNoBase = preserveDv && (dvNoBaseLayer || (!!dovi && dovi.compatId === 0));
             const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, codec: targetCodecName, qNorm, speed, want10Bit, willDownscale,
-                outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter });
+                outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter, dropCaptions });
             let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy${coverArtDrops}${strictArg} -metadata "awk_video=${videoSig}"`;
             if (isMp4Family(dstContainer)) out += ' -movflags use_metadata_tags';   // keep the global tag through an mp4/mov copy
             out += globalOutputOpt;
