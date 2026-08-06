@@ -12,7 +12,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.18.0',
+    Version: '4.19.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -2207,9 +2207,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
 
         // Measure, then decide the correction filter comma-chained onto preFilter, or return unchanged (changed:false) when already within
-        // LOUDNORM_TOLERANCE_LU of the preset target. measured_thresh has NO uppercase alias (unlike measured_I/measured_LRA/measured_TP, which
-        // accept either case) - keep it exactly lowercase. Pass-1's JSON field names (input_i/input_lra/input_tp/target_offset) are NOT the same
-        // strings as pass-2's filter option names (measured_I/measured_LRA/measured_TP/offset) - same numbers, different names on each side.
+        // LOUDNORM_TOLERANCE_LU of the preset target. `measured` says whether a measurement actually happened, and is what the awk_loudnorm cache stamp is
+        // gated on: changed:false normally means "measured, and the track is already at the target", but the track-cap branch above also returns changed:false
+        // WITHOUT measuring - stamping that would cache a claim nothing ever checked. measured_thresh has NO uppercase alias (unlike measured_I/measured_LRA/
+        // measured_TP, which accept either case) - keep it exactly lowercase. Pass-1's JSON field names (input_i/input_lra/input_tp/target_offset) are NOT the
+        // same strings as pass-2's filter option names (measured_I/measured_LRA/measured_TP/offset) - same numbers, different names on each side.
         // Cap the loudnorm analysis passes per file: each is a synchronous full-duration ffmpeg spawn, so a pathological/crafted file declaring a huge number
         // of audio tracks could otherwise tie up a worker for hours. A real file has a handful of audio tracks, so this bound is invisible in practice; past
         // it the remaining tracks are left at source loudness with a single warning rather than measured, and a later queue pass can normalize them.
@@ -2223,7 +2225,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         + `the first ${LOUDNORM_MAX_TRACKS}, leaving the rest at source loudness (a later pass can normalize them)\n`;
                     loudnormCapWarned = true;
                 }
-                return { filter: preFilter, changed: false };
+                return { filter: preFilter, changed: false, measured: false };
             }
             loudnormMeasureCount++;
             const analysis = measureLoudness(srcAudioIdx, preFilter, preset);
@@ -2236,14 +2238,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // defeat the tolerance test AND then bake a literal measured_I=-inf into the correction filter that the real pass-2 transcode rejects ("out of
             // range [-99 - 0]"). Silence can't be loudness-normalized anyway, so treat any non-finite measured integrated loudness as within-tolerance (skip).
             if (!Number.isFinite(Number(stats.input_i)) || Math.abs(Number(stats.input_i) - preset.I) <= LOUDNORM_TOLERANCE_LU)
-                return { filter: preFilter, changed: false };
+                return { filter: preFilter, changed: false, measured: true };
             const corrected = `loudnorm=I=${preset.I}:LRA=${preset.LRA}:TP=${preset.TP}:measured_I=${stats.input_i}:measured_LRA=${stats.input_lra}`
                 + `:measured_TP=${stats.input_tp}:measured_thresh=${stats.input_thresh}:offset=${stats.target_offset}:linear=true`;
-            return { filter: preFilter ? `${preFilter},${corrected}` : corrected, changed: true };
+            return { filter: preFilter ? `${preFilter},${corrected}` : corrected, changed: true, measured: true };
         };
 
-        // Caching tag for the untouched-track path only (a track untouched by anything else this run - the only case where "nothing about this
-        // stream changed since we last checked it" is actually guaranteed). Written as "<preset>-<plugin version>" but matched on the preset portion
+        // Caching tag, stamped wherever this run measured the track: the leftovers loop below, AND every re-encode a loudnorm correction rode along on
+        // (a downmix, a codec_force, a remix). Both are equally true statements about the OUTPUT - the ride-along sites measure the post-pre-filter signal
+        // and apply the correction in the same command, so the track they emit is at the preset target just as surely as one the leftovers loop passed over.
+        // Skipping the ride-along stamp costs a whole extra queue pass: the next run re-measures the track, finds it within tolerance, and remuxes the entire
+        // file to write nothing but this tag. Measured on the real jellyfin binary across nine source/preset/downmix combinations - including a +37.7 dB and a
+        // -7.5 dB correction - the two-pass output lands at most 0.240 LU from target, a 4x margin inside LOUDNORM_TOLERANCE_LU, so trusting the correction
+        // rather than re-measuring it is sound. Written as "<preset>-<plugin version>" but matched on the preset portion
         // ONLY - the version rides along unused today, reserved in case a future fix must distinguish a cache written by a known-buggy version.
         // Matroska uppercases unrecognized custom tag names on write (confirmed against the real ffmpeg binary), so read-back must be case-insensitive:
         // readLoudnormTag goes through the shared getTagCI helper.
@@ -2257,6 +2264,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // track that genuinely needs correction still re-encodes once regardless of container, then measures within tolerance next run.
         const loudnormTagPersists = ['mkv', 'webm', 'mka'].includes(String(file.container).toLowerCase());
         const loudnormStampArg = (idx) => (loudnormTagPersists ? ` -metadata:s:a:${idx} "awk_loudnorm=${loudnormTagValue()}"` : '');
+        // A loudnorm correction that RIDES ALONG on a re-encode some other setting fired (a downmix, a codec_force, a remix) has no line of its own - it is
+        // chained into that operation's own filter and command. These two render its share of that line so the eight ride-along sites can't drift: the tag
+        // stacks onto whatever tag the operation already carries, so the user can see that the settings combined, and the stamp caches the measurement so the
+        // next pass doesn't re-measure a track this one already normalized. Gated separately - `changed` is "a correction was applied" (nothing to announce
+        // when the track was already at target), `measured` is "an analysis actually ran" (see buildLoudnormFilter's track cap).
+        const loudnormRideTag = (changed) => (changed ? `[method_loudnorm=${methodLoudnorm}]` : '');
+        const loudnormRideStamp = (idx, measured) => (measured ? loudnormStampArg(idx) : '');
         const langMetaArg = (idx, lang) => (lang ? ` -metadata:s:a:${idx} "language=${escMeta(lang)}"` : '');
         // ===== END LOUDNORM =====
 
@@ -2267,24 +2281,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // filter (aformat=channel_layouts=stereo, verified equivalent to -ac 2) rather than bare -ac when loudnorm is active, so the downmix can be
         // comma-chained BEFORE loudnorm's analysis/correction filter instead of ffmpeg silently applying the implicit -ac conversion AFTER an explicit
         // -filter:a (which would measure/correct the wrong, pre-downmix signal).
+        // Returns { arg, measured, changed }, not a bare string: the caller needs `measured` to stamp the awk_loudnorm cache tag and `changed` to say in the
+        // log that a loudness correction rode along on its downmix. Callers that don't run loudnorm can ignore both - they read false.
         const stereoArg = (idx, srcStream) => {
             const matrix = (methodStereoDownmix === 'dialogue') ? downmixMatrix(srcStream) : null;
             if (methodLoudnorm === 'disabled')
-                return matrix ? ` -filter:a:${idx} "${matrix}"` : ` -ac:a:${idx} 2`;
+                return { arg: matrix ? ` -filter:a:${idx} "${matrix}"` : ` -ac:a:${idx} 2`, measured: false, changed: false };
             const preFilter = matrix || 'aformat=channel_layouts=stereo';
             const srcAudioIdx = inputAudioIdxMap.get(srcStream.index);
-            const { filter } = buildLoudnormFilter(srcStream.index, srcAudioIdx, preFilter, LOUDNORM_PRESETS[methodLoudnorm]);
-            return ` -filter:a:${idx} "${filter}"`;
+            const { filter, changed, measured } = buildLoudnormFilter(srcStream.index, srcAudioIdx, preFilter, LOUDNORM_PRESETS[methodLoudnorm]);
+            return { arg: ` -filter:a:${idx} "${filter}"`, measured, changed };
         };
 
         // 6ch (5.1) channel/filter snippet for a new or replaced 5.1 track, mirroring stereoArg for the surround case: a bare -ac 6 when loudnorm is off, else
         // an explicit aformat=channel_layouts=5.1 (verified equivalent to -ac 6) chained BEFORE loudnorm's analysis/correction so it measures the post-downmix
         // signal - the same -ac ordering trap stereoArg documents. Shared by append6ch and the in-place downmix_to_six 'replace' branch so the two can't drift.
         const sixArg = (idx, srcStream) => {
-            if (methodLoudnorm === 'disabled') return ` -ac:a:${idx} 6`;
-            const { filter } = buildLoudnormFilter(srcStream.index, inputAudioIdxMap.get(srcStream.index), 'aformat=channel_layouts=5.1',
-                LOUDNORM_PRESETS[methodLoudnorm]);
-            return ` -filter:a:${idx} "${filter}"`;
+            if (methodLoudnorm === 'disabled') return { arg: ` -ac:a:${idx} 6`, measured: false, changed: false };
+            const { filter, changed, measured } = buildLoudnormFilter(srcStream.index, inputAudioIdxMap.get(srcStream.index),
+                'aformat=channel_layouts=5.1', LOUDNORM_PRESETS[methodLoudnorm]);
+            return { arg: ` -filter:a:${idx} "${filter}"`, measured, changed };
         };
 
         // Emit an APPENDED downmix track - a brand-new output stream derived from the ORIGINAL input audio via -map 0:a:N, whether or not that source stream
@@ -2296,11 +2312,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const newTitle = escMeta(buildTitle(srcStream, '5.1'));
             const dstBitArg = encoderArgsIdx(surroundCodec, 6, newStreamOutputIdx);
             const dstBitStr = resolveBitrate(surroundCodec, 6);
-            const sixFilter = sixArg(newStreamOutputIdx, srcStream);
-            workDone += `☐${streamTag(srcStream.index)}[downmix_to_six=${downmixToSix}] Adding ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s from `
-                + `${srcCodecStr} ${srcStream.channels}ch @ ${srcRateStr}${logSuffix}\n`;
-            extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${audioEncoder(surroundCodec)}${dstBitArg}${sixFilter}`
-                + ` -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+            const six = sixArg(newStreamOutputIdx, srcStream);
+            workDone += `☐${streamTag(srcStream.index)}[downmix_to_six=${downmixToSix}]${loudnormRideTag(six.changed)} Adding ${surroundCodec} 6ch @ `
+                + `${dstBitStr / 1000} kb/s from ${srcCodecStr} ${srcStream.channels}ch @ ${srcRateStr}${logSuffix}\n`;
+            extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${audioEncoder(surroundCodec)}${dstBitArg}${six.arg}`
+                + `${loudnormRideStamp(newStreamOutputIdx, six.measured)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
             extraArguments += langMetaArg(newStreamOutputIdx, langForWrite(srcStream));
             newStreamOutputIdx++;
             appendedAudio.push({ srcStream, codec: surroundCodec, channels: 6, bps: dstBitStr });
@@ -2310,10 +2326,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const append2ch = (srcStream, srcAudioIdx, srcCodecStr, srcRateStr, langKeyVal, logSuffix) => {
             const newTitle = escMeta(buildTitle(srcStream, '2.0'));
             const enc = stereoEnc(newStreamOutputIdx);
-            workDone += `☐${streamTag(srcStream.index)}[downmix_to_stereo=${downmixToStereo}] Adding ${enc.logCodec} stereo @ ${enc.rate}`
-                + `${enc.label ? ` (${enc.label})` : ''} from ${srcCodecStr} ${srcStream.channels}ch @ ${srcRateStr}${logSuffix}\n`;
-            extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${enc.frag}${stereoArg(newStreamOutputIdx, srcStream)}`
-                + ` -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+            const two = stereoArg(newStreamOutputIdx, srcStream);
+            workDone += `☐${streamTag(srcStream.index)}[downmix_to_stereo=${downmixToStereo}]${loudnormRideTag(two.changed)} Adding ${enc.logCodec} `
+                + `stereo @ ${enc.rate}${enc.label ? ` (${enc.label})` : ''} from ${srcCodecStr} ${srcStream.channels}ch @ ${srcRateStr}${logSuffix}\n`;
+            extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${enc.frag}${two.arg}`
+                + `${loudnormRideStamp(newStreamOutputIdx, two.measured)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
             extraArguments += langMetaArg(newStreamOutputIdx, langForWrite(srcStream));
             newStreamOutputIdx++;
             appendedAudio.push({ srcStream, ...enc.record });
@@ -2358,10 +2375,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // Thread the setting that actually put this track on the stereo tier, so the log names the input the user would go change.
                 const tierTag = ffstream.isTdarrSecondaryTrack ? `downmix_secondary=${downmixSecondary}`
                     : (langStereoKeys.includes(ffstream.awkLangKey) ? 'language_stereo' : `language_unlisted=${langUnlisted}`);
-                workDone += `☐${streamTag(ffstream.index)}[${tierTag}] Transcoding ${ffstreamCodec} ${ffstreamChannels}ch @ ${srcRateStr} → `
-                    + `${enc.logCodec} stereo @ ${enc.rate} (${enc.label ? `${enc.label}, ` : ''}`
+                const two = stereoArg(outputAudioIdx, ffstream);
+                workDone += `☐${streamTag(ffstream.index)}[${tierTag}]${loudnormRideTag(two.changed)} Transcoding ${ffstreamCodec} ${ffstreamChannels}ch `
+                    + `@ ${srcRateStr} → ${enc.logCodec} stereo @ ${enc.rate} (${enc.label ? `${enc.label}, ` : ''}`
                     + `${ffstream.isTdarrSecondaryTrack ? 'secondary' : 'stereo tier'})\n`;
-                extraArguments += ` -c:a:${outputAudioIdx} ${enc.frag}${stereoArg(outputAudioIdx, ffstream)}`
+                extraArguments += ` -c:a:${outputAudioIdx} ${enc.frag}${two.arg}${loudnormRideStamp(outputAudioIdx, two.measured)}`
                     + ` -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                 extraArguments += langMetaArg(outputAudioIdx, writeLang);
                 modifiedAudioIdx.add(outputAudioIdx);
@@ -2381,11 +2399,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const dstBitStr = resolveBitrate(surroundCodec, 6);
                     // guardBlocks already passed for sixMode==='replace' (loudnorm rides on that guarantee - see stereoArg above); sixArg builds the
                     // -ac 6 / aformat=channel_layouts=5.1 snippet.
-                    const sixFilter = sixArg(outputAudioIdx, ffstream);
-                    workDone += `☐${streamTag(ffstream.index)}[downmix_to_six=${downmixToSix}] Transcoding ${ffstreamCodec} ${ffstreamChannels}ch @ `
-                        + `${srcRateStr} → ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s\n`;
-                    extraArguments += ` -c:a:${outputAudioIdx} ${audioEncoder(surroundCodec)}${dstBitArg}${sixFilter}`
-                        + ` -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                    const six = sixArg(outputAudioIdx, ffstream);
+                    workDone += `☐${streamTag(ffstream.index)}[downmix_to_six=${downmixToSix}]${loudnormRideTag(six.changed)} Transcoding `
+                        + `${ffstreamCodec} ${ffstreamChannels}ch @ ${srcRateStr} → ${surroundCodec} 6ch @ ${dstBitStr / 1000} kb/s\n`;
+                    extraArguments += ` -c:a:${outputAudioIdx} ${audioEncoder(surroundCodec)}${dstBitArg}${six.arg}`
+                        + `${loudnormRideStamp(outputAudioIdx, six.measured)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     extraArguments += langMetaArg(outputAudioIdx, writeLang);
                     modifiedAudioIdx.add(outputAudioIdx);
                     outputAudioOverride.set(outputAudioIdx, { codec: surroundCodec, channels: 6, bps: dstBitStr });
@@ -2409,9 +2427,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const newTitle = escMeta(buildTitle(ffstream, '2.0'));
                     // Downmix source is surround; its bitrate describes N channels not 2, so stereoEnc uses the 2ch target (as in the stereo tier above).
                     const enc = stereoEnc(outputAudioIdx);
-                    workDone += `☐${streamTag(ffstream.index)}[downmix_to_stereo=${downmixToStereo}] Transcoding ${ffstreamCodec} ${ffstreamChannels}ch `
-                        + `@ ${srcRateStr} → ${enc.logCodec} stereo @ ${enc.rate}${enc.label ? ` (${enc.label})` : ''}\n`;
-                    extraArguments += ` -c:a:${outputAudioIdx} ${enc.frag}${stereoArg(outputAudioIdx, ffstream)}`
+                    const two = stereoArg(outputAudioIdx, ffstream);
+                    workDone += `☐${streamTag(ffstream.index)}[downmix_to_stereo=${downmixToStereo}]${loudnormRideTag(two.changed)} Transcoding `
+                        + `${ffstreamCodec} ${ffstreamChannels}ch @ ${srcRateStr} → ${enc.logCodec} stereo @ ${enc.rate}`
+                        + `${enc.label ? ` (${enc.label})` : ''}\n`;
+                    extraArguments += ` -c:a:${outputAudioIdx} ${enc.frag}${two.arg}${loudnormRideStamp(outputAudioIdx, two.measured)}`
                         + ` -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                     extraArguments += langMetaArg(outputAudioIdx, writeLang);
                     modifiedAudioIdx.add(outputAudioIdx);
@@ -2491,10 +2511,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // bitrate isn't a comparable floor).
                             const newTitle = escMeta(buildTitle(ffstream, '2.0'));
                             const enc = stereoEnc(outputAudioIdx);
-                            workDone += `☐${streamTag(ffstream.index)}[method_layout_err=${methodLayoutErr}] Remixing ${ffstreamCodec} ${forceChannels}ch `
-                                + `@ ${srcRateStr} (${layoutName}, opus-incompatible) → ${enc.logCodec} stereo @ ${enc.rate}`
-                                + `${enc.label ? ` (${enc.label})` : ''}\n`;
-                            extraArguments += ` -c:a:${outputAudioIdx} ${enc.frag}${stereoArg(outputAudioIdx, ffstream)}`
+                            const two = stereoArg(outputAudioIdx, ffstream);
+                            workDone += `☐${streamTag(ffstream.index)}[method_layout_err=${methodLayoutErr}]${loudnormRideTag(two.changed)} Remixing `
+                                + `${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} (${layoutName}, opus-incompatible) → ${enc.logCodec} stereo @ `
+                                + `${enc.rate}${enc.label ? ` (${enc.label})` : ''}\n`;
+                            extraArguments += ` -c:a:${outputAudioIdx} ${enc.frag}${two.arg}${loudnormRideStamp(outputAudioIdx, two.measured)}`
                                 + ` -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                             extraArguments += langMetaArg(outputAudioIdx, writeLang);   // re-assert the language, as every other in-place transcode does
                             modifiedAudioIdx.add(outputAudioIdx);
@@ -2508,13 +2529,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // No pre-filter (same channel count, no relabel) - measure the source directly. guardBlocks for this force already
                             // passed above (loudnorm rides on that guarantee - see stereoArg).
                             let aacVbrFilter = '';
+                            let aacVbrLoud = { measured: false, changed: false };
                             if (methodLoudnorm !== 'disabled') {
-                                const { filter } = buildLoudnormFilter(ffstream.index, srcAudioIdx, '', LOUDNORM_PRESETS[methodLoudnorm]);
+                                const { filter, changed, measured } = buildLoudnormFilter(ffstream.index, srcAudioIdx, '', LOUDNORM_PRESETS[methodLoudnorm]);
                                 if (filter) aacVbrFilter = ` -filter:a:${outputAudioIdx} "${filter}"`;
+                                aacVbrLoud = { measured, changed };
                             }
-                            workDone += `☐${streamTag(ffstream.index)}[codec_force=${forceCodec}] Transcoding ${ffstreamCodec} ${forceChannels}ch @ `
-                                + `${srcRateStr} → aac ${forceChannels}ch @ ${approxRate} (${label})\n`;
-                            extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${aacVbrFilter}`;
+                            workDone += `☐${streamTag(ffstream.index)}[codec_force=${forceCodec}]${loudnormRideTag(aacVbrLoud.changed)} Transcoding `
+                                + `${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → aac ${forceChannels}ch @ ${approxRate} (${label})\n`;
+                            extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${aacVbrFilter}`
+                                + `${loudnormRideStamp(outputAudioIdx, aacVbrLoud.measured)}`;
                             modifiedAudioIdx.add(outputAudioIdx);
                             outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: forceChannels, bps: 0, approxRate });
                             forced = true;
@@ -2528,18 +2552,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // (if any) is the pre-filter loudnorm's measurement must be chained after, so the analysis reflects the actual
                             // post-relabel signal - though a lossless channelmap relabel doesn't change loudness, keeping the chain order consistent.
                             let layoutFilter = '';
+                            let layoutLoud = { measured: false, changed: false };
                             if (methodLoudnorm !== 'disabled') {
-                                const { filter } = buildLoudnormFilter(ffstream.index, srcAudioIdx, relabelFilter, LOUDNORM_PRESETS[methodLoudnorm]);
+                                const { filter, changed, measured } = buildLoudnormFilter(ffstream.index, srcAudioIdx, relabelFilter,
+                                    LOUDNORM_PRESETS[methodLoudnorm]);
                                 if (filter) layoutFilter = ` -filter:a:${outputAudioIdx} "${filter}"`;
+                                layoutLoud = { measured, changed };
                             } else if (relabelFilter) {
                                 layoutFilter = ` -filter:a:${outputAudioIdx} "${relabelFilter}"`;
                             }
                             const dstBitArg = encoderArgsIdx(targetCodec, forceChannels, outputAudioIdx, srcBitrate, ffstream.isTdarrLossless,
                                 ffstream.awkQuality);
                             const dstBitStr = resolveBitrate(targetCodec, forceChannels, srcBitrate, ffstream.isTdarrLossless, ffstream.awkQuality);
-                            workDone += `☐${streamTag(ffstream.index)}[codec_force=${forceCodec}] Transcoding ${ffstreamCodec} ${forceChannels}ch @ `
-                                + `${srcRateStr} → ${targetCodec} ${forceChannels}ch @ ${dstBitStr / 1000} kb/s${note}\n`;
-                            extraArguments += ` -c:a:${outputAudioIdx} ${audioEncoder(targetCodec)}${dstBitArg}${layoutFilter}`;
+                            workDone += `☐${streamTag(ffstream.index)}[codec_force=${forceCodec}]${loudnormRideTag(layoutLoud.changed)} Transcoding `
+                                + `${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → ${targetCodec} ${forceChannels}ch @ `
+                                + `${dstBitStr / 1000} kb/s${note}\n`;
+                            extraArguments += ` -c:a:${outputAudioIdx} ${audioEncoder(targetCodec)}${dstBitArg}${layoutFilter}`
+                                + `${loudnormRideStamp(outputAudioIdx, layoutLoud.measured)}`;
                             modifiedAudioIdx.add(outputAudioIdx);
                             outputAudioOverride.set(outputAudioIdx, { codec: targetCodec, channels: forceChannels, bps: dstBitStr });
                             forced = true;
@@ -2649,8 +2678,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             workDone += `☐${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${rawCodec} ${channels}ch → `
                                 + `${enc.logCodec} stereo @ ${enc.rate} (${enc.label ? `${enc.label}; ` : ''}remixed - libopus can't encode a `
                                 + `${lay || `${channels}ch`} layout)\n`;
-                            extraArguments += ` -c:a:${outputAudioIdx} ${enc.frag}${stereoArg(outputAudioIdx, stream)}`
-                                + `${loudnormStampArg(outputAudioIdx)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                            const two = stereoArg(outputAudioIdx, stream);
+                            extraArguments += ` -c:a:${outputAudioIdx} ${enc.frag}${two.arg}`
+                                + `${loudnormRideStamp(outputAudioIdx, two.measured)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                             extraArguments += langMetaArg(outputAudioIdx, writeLang);
                             outputAudioOverride.set(outputAudioIdx, enc.record);
                             modifiedAudioIdx.add(outputAudioIdx);
@@ -2668,12 +2698,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
 
                 const srcBitrate = Number(stream.bit_rate || 0);
-                const { filter, changed } = buildLoudnormFilter(stream.index, srcAudioIdx, loudnormRelabel, preset);
+                const { filter, changed, measured } = buildLoudnormFilter(stream.index, srcAudioIdx, loudnormRelabel, preset);
                 if (!changed) {
                     // Already within tolerance. On a tag-persisting container, stamp it (a metadata-only remux) so a FUTURE run can skip re-measuring while
                     // the preset stays the same. On a container that would drop the tag, do NOTHING (a true no-op) - stamping there would just remux every
-                    // reprocess forever without ever caching (see loudnormTagPersists above).
-                    if (loudnormTagPersists) {
+                    // reprocess forever without ever caching (see loudnormTagPersists above). A track the analysis cap left unmeasured also lands here with
+                    // changed:false, and must NOT be stamped: the cache would claim a loudness nothing ever read, and every future run would trust it and
+                    // skip the track for good. It is simply left at source loudness, as the cap warning says, for a later pass to pick up.
+                    if (loudnormTagPersists && measured) {
                         workDone += `☐${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Stamping awk_loudnorm=${methodLoudnorm} (already `
                             + `within tolerance) - future runs skip re-measuring while loudnorm stays "${methodLoudnorm}"\n`;
                         extraArguments += loudnormStampArg(outputAudioIdx);
