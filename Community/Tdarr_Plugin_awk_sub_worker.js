@@ -13,7 +13,7 @@ const details = () => ({
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
                 \\nScope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.38.0',
+    Version: '3.38.1',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -442,6 +442,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const HDR10P_RE = /2094|hdr10\+|hdr10 plus/;
     const VIVID_HDR_RE = /hdr vivid|cuva/;
     const DYNAMIC_HDR_RE = new RegExp(`${HDR10P_RE.source}|${VIVID_HDR_RE.source}`);
+    // -=-=-= isDdEx  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Dolby Surround EX: a rear-surround (6.1) channel matrix-folded into an ordinary 5.1 AC-3/E-AC-3, so the track carries strictly MORE than a plain 5.1
+    // twin while still decoding as plain 5.1 on a non-EX decoder. mediaInfo's Format_Settings_Mode is the flag's only home - ffprobe does not expose it. One
+    // definition so summariseStream's dd-ex token below and audio_clean's dedup tie-break (which keeps the EX copy over a plain 5.1 twin on an exact quality
+    // tie) can never disagree about what counts as EX.
+    const isDdEx = (s) => /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '');
     // -=-=-= summariseStream  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Per type: video codec + resolution/10bit/hdr (+/cover for cover-art/still images); data & attachment codec only. Audio & subtitle append /default, then
     // EVERY role marker that applies, so a track flagged two ways shows both. Audio: /commentary /description then /dub /original. Subtitle: /forced then
@@ -493,9 +499,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const rate = (out && out.rate) || (bps > 0 ? `${Math.round(bps / 1000)}k` : '');
             const role = `${isCommentary(s) ? '/commentary' : ''}${isDescriptive(s) ? '/description' : ''}`;
             const prov = `${hasDisposition(s, 'dub') ? '/dub' : ''}${hasDisposition(s, 'original') ? '/original' : ''}`;
-            // Dolby Surround EX marker (a rear channel matrix-folded into a 5.1 AC-3), read inline from mediaInfo Format_Settings_Mode - the flag's only home
-            // (this shared helper can't call audio_clean's local isMatrixSurroundSource). Marks the EX copy so its token differs from a plain 5.1 twin.
-            const surEx = !out && /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '') ? 'dd-ex' : '';
+            // Dolby Surround EX marker, via the shared isDdEx above - marks the EX copy so its token differs from a plain 5.1 twin.
+            const surEx = !out && isDdEx(s) ? 'dd-ex' : '';
             // A re-encode is named by the codec it is being encoded TO - resolved through a bare object so no source profile/long-name/mediaInfo can leak in.
             const name = out ? codecDisplayName({ codec_name: out.codec }) : codecDisplayName(s);
             return `[audio:${[lang, ch, surEx, name, rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
@@ -661,7 +666,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         webvtt:   { ext: 'vtt', enc: 'webvtt' },
     };
     const isTextSub = (codec) => Object.prototype.hasOwnProperty.call(TEXT_SUB, String(codec).toLowerCase());
-    const TEXT_EXTS = ['srt', 'ass', 'vtt'];
+    // Both directions of the table above, derived from it so a new codec row is ONE edit: the loose-text sidecar extensions parseSidecar accepts (a bundle
+    // is admitted by BUNDLE_EXT instead, so 'mks' must never be a TEXT_SUB ext - extract would write one no import could read back), and the reverse ext ->
+    // codec name for a sidecar not muxed in yet. Several codecs share an ext, so the reverse keeps the FIRST row declaring it - the canonical spelling
+    // ffprobe reports back for a sidecar that row's encoder wrote (subrip for .srt, ass for .ass, webvtt for .vtt). Keep the canonical codec first.
+    const TEXT_EXTS = [...new Set(Object.values(TEXT_SUB).map((t) => t.ext))];
+    const EXT_TO_CODEC = Object.fromEntries(TEXT_EXTS.map((ext) => [ext, Object.keys(TEXT_SUB).find((c) => TEXT_SUB[c].ext === ext)]));
     // STYLED subtitles render through fonts that exist only as attachments inside the container, so extracting one to a loose text file and letting the
     // fonts be removed as orphaned destroys the styling irrecoverably. Such a subtitle is exported as a Matroska BUNDLE instead - the subtitle plus every
     // font attachment in one file - so the fonts travel with it. Matroska is the only container that can do this: mp4/mov reject ass and carry no
@@ -1455,7 +1465,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const parseLangFilter = (v) => { const l = String(v || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean); return l.length ? new Set(l.map(langKey)) : null; };   // keys, so en/eng/English match
     // Synthetic stream so a not-yet-muxed sidecar renders through summariseStream in the expected-results line.
     const sidecarToStream = (f) => {
-        const codec = (f.bundle || f.ext === 'ass') ? 'ass' : (f.ext === 'srt' ? 'subrip' : 'webvtt');   // a bundle always carries a styled subtitle
+        // A bundle always carries a styled subtitle. Every other sidecar maps back through EXT_TO_CODEC behind the same TEXT_EXTS gate parseSidecar applies,
+        // so an ext outside the table cannot reach here - the webvtt fallback only guards a future caller that reads a sidecar without going through it.
+        const codec = f.bundle ? 'ass' : (TEXT_EXTS.includes(f.ext) ? EXT_TO_CODEC[f.ext] : 'webvtt');
         const disposition = {}; for (const d of DISPOSITIONS.concat(EXTRA_DISPOSITIONS)) if ((f.dispTokens.concat(f.extraTokens || [])).includes(d.token)) disposition[d.ff] = 1;
         return { codec_type: 'subtitle', codec_name: codec, index: -1, tags: { language: f.lang, title: f.title }, disposition };
     };

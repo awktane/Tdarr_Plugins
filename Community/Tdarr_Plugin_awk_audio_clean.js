@@ -7,7 +7,7 @@ const details = () => ({
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X/AC-4), high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly tagged audio tracks`,
-    Version: '4.17.0',
+    Version: '4.17.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -847,6 +847,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const HDR10P_RE = /2094|hdr10\+|hdr10 plus/;
     const VIVID_HDR_RE = /hdr vivid|cuva/;
     const DYNAMIC_HDR_RE = new RegExp(`${HDR10P_RE.source}|${VIVID_HDR_RE.source}`);
+    // -=-=-= isDdEx  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Dolby Surround EX: a rear-surround (6.1) channel matrix-folded into an ordinary 5.1 AC-3/E-AC-3, so the track carries strictly MORE than a plain 5.1
+    // twin while still decoding as plain 5.1 on a non-EX decoder. mediaInfo's Format_Settings_Mode is the flag's only home - ffprobe does not expose it. One
+    // definition so summariseStream's dd-ex token below and audio_clean's dedup tie-break (which keeps the EX copy over a plain 5.1 twin on an exact quality
+    // tie) can never disagree about what counts as EX.
+    const isDdEx = (s) => /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '');
     // -=-=-= summariseStream  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Per type: video codec + resolution/10bit/hdr (+/cover for cover-art/still images); data & attachment codec only. Audio & subtitle append /default, then
     // EVERY role marker that applies, so a track flagged two ways shows both. Audio: /commentary /description then /dub /original. Subtitle: /forced then
@@ -898,9 +904,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const rate = (out && out.rate) || (bps > 0 ? `${Math.round(bps / 1000)}k` : '');
             const role = `${isCommentary(s) ? '/commentary' : ''}${isDescriptive(s) ? '/description' : ''}`;
             const prov = `${hasDisposition(s, 'dub') ? '/dub' : ''}${hasDisposition(s, 'original') ? '/original' : ''}`;
-            // Dolby Surround EX marker (a rear channel matrix-folded into a 5.1 AC-3), read inline from mediaInfo Format_Settings_Mode - the flag's only home
-            // (this shared helper can't call audio_clean's local isMatrixSurroundSource). Marks the EX copy so its token differs from a plain 5.1 twin.
-            const surEx = !out && /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '') ? 'dd-ex' : '';
+            // Dolby Surround EX marker, via the shared isDdEx above - marks the EX copy so its token differs from a plain 5.1 twin.
+            const surEx = !out && isDdEx(s) ? 'dd-ex' : '';
             // A re-encode is named by the codec it is being encoded TO - resolved through a bare object so no source profile/long-name/mediaInfo can leak in.
             const name = out ? codecDisplayName({ codec_name: out.codec }) : codecDisplayName(s);
             return `[audio:${[lang, ch, surEx, name, rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
@@ -1368,13 +1373,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // independent third guard) and used as a dedup tie-breaker so an object-audio track is preferred over an otherwise-equal plain one.
     const isObjectAudioSource = (stream) => codecInfo[resolveCodecName(stream)]?.objectAudio === true;
 
-    // Resolve whether a source stream is Dolby Surround EX - a rear-surround (6.1) channel matrix-encoded into a normal 5.1 AC-3/E-AC-3,
-    // so it carries strictly MORE than a plain 5.1 twin while still decoding as ordinary 5.1 on a non-EX decoder. Read only from
-    // mediaInfo's Format_Settings_Mode (ffprobe doesn't expose the flag). Stored per-stream as isTdarrMatrixSurround and used ONLY as a
-    // dedup tie-breaker (mirrors the object-audio one): on an otherwise-exact quality tie the EX copy is kept over a plain 5.1 twin, so
-    // the richer track survives regardless of source order. Not object audio (ffmpeg re-encodes the AC-3 fine), so no guard.
-    const isMatrixSurroundSource = (stream) => /surround ex/i.test(mediaInfoFor(stream)?.Format_Settings_Mode || '');
-
     // Parse inputs, in the SAME order as the Inputs array in details() - so a new input lands at the matching offset in both places and the two cannot drift.
     // Every input is type:'string' (there are no type:'boolean' ones, which would be coerced and could not be out-of-set). The 16 dropdowns are validated
     // against their option sets by the table below; the two free-text language lists have no option set, so their tokens go through the language RECOGNISER
@@ -1526,7 +1524,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // True when the source has Atmos/DTS:X/MPEG-H/AC-4 object audio ffmpeg can't re-encode - read by guard_object_audio and the dedup tie-break.
                 isTdarrObjectAudio: isObjectAudioSource(stream),
                 // True when the source is a Dolby Surround EX (matrix-6.1) AC-3 - read only by the dedup tie-break, to keep the EX copy over a plain 5.1 twin.
-                isTdarrMatrixSurround: isMatrixSurroundSource(stream)
+                // Not object audio (ffmpeg re-encodes the AC-3 fine), so unlike isTdarrObjectAudio it backs no guard.
+                isTdarrMatrixSurround: isDdEx(stream)
             };
         });
 
@@ -1670,11 +1669,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (dedupeGuardBlocks(s, kept)) continue;
                     // Show the removed track's bitrate and the kept track's for contrast - duplicates are decided by quality score (largely bitrate-driven),
                     // so this makes the choice transparent. The abort message below and the ordinary removal log are two renderings of the same comparison,
-                    // so they share one pair; only one of the two ever executes per hit.
+                    // so they share these tokens; only one of the two ever executes per hit. The codec renders through codecDisplayName, so a DTS subtype or
+                    // an Atmos layer reads here exactly as it does in the input summary; dd-ex is appended separately because a matrixed rear channel is not a
+                    // codec, so without it the EX tiebreak below prints two identical ac3 tokens. It reads the same per-stream flag the sort order does.
                     const rmRate = hasKnownRate(s) ? ` @ ${kbpsToken(s.bit_rate)}` : '';
                     const keptRate = hasKnownRate(kept) ? ` @ ${kbpsToken(kept.bit_rate)}` : '';
+                    const rmEx = s.isTdarrMatrixSurround ? ' dd-ex' : '';
+                    const keptEx = kept.isTdarrMatrixSurround ? ' dd-ex' : '';
                     if (methodDeduplicateErrorMode) {
-                        failFile(`${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Duplicate audio track (${s.codec_name || 'unknown'} ${s.channels}ch ${s.awkRegionKey}${rmRate}) alongside stream ${kept.index} (${kept.codec_name || 'unknown'}${keptRate}) - aborting; tag/remove tracks manually and requeue, or switch method_deduplicate to a non-error mode`);
+                        failFile(`${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Duplicate audio track (${codecDisplayName(s)}${rmEx} ${s.channels}ch ${s.awkRegionKey}${rmRate}) alongside stream ${kept.index} (${codecDisplayName(kept)}${keptEx}${keptRate}) - aborting; tag/remove tracks manually and requeue, or switch method_deduplicate to a non-error mode`);
                     }
                     removedIndices.add(s.index);
                     // Name the sort key that actually decided this, walking the same order byQuality does. Quality is only the SECOND key, so a removed
@@ -1687,7 +1690,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     else if (!s.isTdarrObjectAudio && kept.isTdarrObjectAudio) why = 'no object audio';
                     else if (!s.isTdarrMatrixSurround && kept.isTdarrMatrixSurround) why = 'no matrixed rear channel';
                     else why = 'equal, keeping the earlier track';
-                    workDone += `☐${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Removing duplicate (${why}: ${s.codec_name || 'unknown'} ${s.channels}ch ${s.awkRegionKey}${rmRate}) - keeping stream ${kept.index} (${kept.codec_name || 'unknown'} ${kept.channels}ch${keptRate})\n`;
+                    workDone += `☐${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Removing duplicate (${why}: ${codecDisplayName(s)}${rmEx} ${s.channels}ch ${s.awkRegionKey}${rmRate}) - keeping stream ${kept.index} (${codecDisplayName(kept)}${keptEx} ${kept.channels}ch${keptRate})\n`;
                 } else
                     seen.set(key, s);
             }
@@ -1722,7 +1725,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //   downmix_secondary=delete removes an EXTRA, so it keeps the fall-back rule: only remove it when a plain (non-secondary) track of the SAME language
         //     survives to fall back on - a lone audio-description track, or the only track of its language, is kept.
         // Both are floored by countSurvivingAudio() > 1: no delete may ever leave the file with no audio at all.
-        const delToken = (s) => `${s.codec_name || 'unknown'} ${s.channels}ch ${s.awkLangKey}`;
+        const delToken = (s) => `${codecDisplayName(s)} ${s.channels}ch ${s.awkLangKey}`;
         // Language deletes resolve FIRST, so the plain-language fall-back set the role deletes read below reflects what actually survives them.
         for (const s of audioStreams) {
             if (s.awkTier !== 'delete' || s.isTdarrSecondaryTrack || removedIndices.has(s.index)) continue;
@@ -2027,19 +2030,40 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // out into a second command. The JSON is NOT the last thing on stderr: real ffmpeg (5.1+, every platform) prints the loudnorm summary during filter
         // teardown, then two more AV_LOG_INFO lines - "[out#0/null ...] muxing overhead: unknown" and a final "size=N/A time=... speed=..." trailer (neither
         // suppressible without also losing the JSON). So we take the LAST flat {...} block anywhere in stderr, not one anchored to end-of-string; last-match
-        // also skips a track title that contains literal braces (e.g. a "{weird}" title) since ffmpeg emits that BEFORE the loudnorm summary. Kill-switch for a
-        // wedged analysis pass, mirroring ENCODERS_PROBE_TIMEOUT_MS on the encoder probe - but far longer, since this pass decodes the whole track.
+        // also skips a track title that contains literal braces (e.g. a "{weird}" title) since ffmpeg emits that BEFORE the loudnorm summary. The timeout is
+        // the kill-switch for a WEDGED pass - the job ENCODERS_PROBE_TIMEOUT_MS does for the encoder probe - but this pass costs O(duration): it decodes the
+        // track end to end, so a flat ceiling cannot be right. On this Mac the production jellyfin-ffmpeg analyses an ac3/e-ac3 5.1 track at ~11x realtime
+        // (stereo aac ~29x) with the box idle, but at only ~3.4x with six other analyses running - and a Tdarr node normally DOES run several workers, so the
+        // budget has to assume the loaded rate. At ~3.4x a 2-hour 5.1 track needs ~35 min and a 3-hour one ~52 min, both far past the flat 10-minute ceiling
+        // this replaces. Budget three wall-seconds per second of audio: ~33x headroom on an idle node and ~10x on a loaded one, so only a genuine hang trips
+        // it - which matters because tripping it FAILS THE FILE (the caller below turns any analysis error into failFile), so a ceiling a long legitimate
+        // track can reach quarantines the video rather than merely skipping the correction. The floor keeps a short track's ceiling sane and absorbs spawn/
+        // cold-storage latency. The cap bounds the hang and a corrupt header declaring a nonsense duration, and binds from ~80 minutes of audio upward -
+        // deliberate, since past that the scaled budget already exceeds any real analysis. An unreadable duration falls back to the cap: work of unknown
+        // length must never be killed early, because killing it quarantines the file.
         // LOUDNORM_ANALYSIS_MAX_BYTES is load-bearing, not arbitrary: Node's spawnSync default maxBuffer is 1 MB and the JSON we need rides on STDERR behind
         // unbounded ffmpeg output, so an overflow truncates it away and surfaces as the generic "could not find loudnorm measurement JSON" below.
-        const LOUDNORM_ANALYSIS_TIMEOUT_MS = 10 * 60 * 1000;
+        const LOUDNORM_ANALYSIS_MIN_TIMEOUT_MS = 10 * 60 * 1000;
+        const LOUDNORM_ANALYSIS_MAX_TIMEOUT_MS = 4 * 60 * 60 * 1000;
+        const LOUDNORM_ANALYSIS_MS_PER_AUDIO_SEC = 3000;
+        const loudnormAnalysisDurationSec = Number(file.ffProbeData.format?.duration) || 0;
+        const loudnormAnalysisTimeoutMs = loudnormAnalysisDurationSec > 0
+            ? Math.min(LOUDNORM_ANALYSIS_MAX_TIMEOUT_MS,
+                Math.max(LOUDNORM_ANALYSIS_MIN_TIMEOUT_MS, Math.round(loudnormAnalysisDurationSec * LOUDNORM_ANALYSIS_MS_PER_AUDIO_SEC)))
+            : LOUDNORM_ANALYSIS_MAX_TIMEOUT_MS;
         const LOUDNORM_ANALYSIS_MAX_BYTES = 64 * 1024 * 1024;
         const measureLoudness = (srcAudioIdx, preFilter, preset) => {
             const { spawnSync } = require('child_process');
             const analysisFilter = `${preFilter ? `${preFilter},` : ''}loudnorm=I=${preset.I}:LRA=${preset.LRA}:TP=${preset.TP}:print_format=json`;
             const args = ['-nostats', '-hide_banner', '-i', file.file, '-map', `0:a:${srcAudioIdx}`, '-af', analysisFilter, '-f', 'null', '-'];
-            const result = spawnSync((otherArguments && otherArguments.ffmpegPath) || 'ffmpeg', args, { timeout: LOUDNORM_ANALYSIS_TIMEOUT_MS, maxBuffer: LOUDNORM_ANALYSIS_MAX_BYTES, encoding: 'utf-8' });
+            const result = spawnSync((otherArguments && otherArguments.ffmpegPath) || 'ffmpeg', args, { timeout: loudnormAnalysisTimeoutMs, maxBuffer: LOUDNORM_ANALYSIS_MAX_BYTES, encoding: 'utf-8' });
+            // A tripped `timeout` sets BOTH error (code ETIMEDOUT) and signal (SIGTERM), and error is tested first - so the timeout must be named HERE or it
+            // reports as a failure to launch, which is the opposite of what happened. The bare signal branch below is then only an external kill (an OOM
+            // killer, an operator), which is worth telling apart from a timeout because the remedies differ.
+            if (result.error && result.error.code === 'ETIMEDOUT')
+                return { error: `ffmpeg exceeded the ${Math.round(loudnormAnalysisTimeoutMs / 60000)} min analysis timeout for this file's duration` };
             if (result.error) return { error: `could not start ffmpeg (${result.error.message})` };
-            if (result.signal) return { error: `ffmpeg was killed (signal ${result.signal}, likely a timeout)` };
+            if (result.signal) return { error: `ffmpeg was killed from outside (signal ${result.signal})` };
             if (result.status !== 0) return { error: `ffmpeg exited with status ${result.status}` };
             const jsonBlocks = String(result.stderr || '').match(/\{[^{}]*\}/g);
             // Keep the LAST block that parses AND carries input_i (the brace-bearing-title case is why - see above).
@@ -2056,9 +2080,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // accept either case) - keep it exactly lowercase. Pass-1's JSON field names (input_i/input_lra/input_tp/target_offset) are NOT the same
         // strings as pass-2's filter option names (measured_I/measured_LRA/measured_TP/offset) - same numbers, different names on each side.
         // Cap the loudnorm analysis passes per file: each is a synchronous full-duration ffmpeg spawn, so a pathological/crafted file declaring a huge number
-        // of audio tracks could otherwise tie up a worker for hours (LOUDNORM_ANALYSIS_TIMEOUT_MS never fires - each pass finishes well under it). A real file
-        // has a handful of audio tracks, so this bound is invisible in practice; past it the remaining tracks are left at source loudness with a single warning
-        // rather than measured, and a later queue pass can normalize them.
+        // of audio tracks could otherwise tie up a worker for hours. A real file has a handful of audio tracks, so this bound is invisible in practice; past
+        // it the remaining tracks are left at source loudness with a single warning rather than measured, and a later queue pass can normalize them.
         const LOUDNORM_MAX_TRACKS = 24;
         let loudnormMeasureCount = 0;
         let loudnormCapWarned = false;

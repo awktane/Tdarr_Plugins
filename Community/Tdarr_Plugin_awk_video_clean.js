@@ -8,7 +8,7 @@ const details = () => ({
     Description: `Cleans and re-encodes the video stream. Audio and subtitles are copied unchanged (embedded cover-art video is dropped). Pick a top-level ACTION first (see its tooltip for full details) - the plugin does nothing until you choose a goal: hdr_cleanup_only (default, harmless HDR-only pass), normalize (compatibility conversion), shrink (space savings).\n\n
                      -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin.\n\n`,
-    Version: '3.18.0',
+    Version: '3.18.1',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -525,6 +525,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const HDR10P_RE = /2094|hdr10\+|hdr10 plus/;
     const VIVID_HDR_RE = /hdr vivid|cuva/;
     const DYNAMIC_HDR_RE = new RegExp(`${HDR10P_RE.source}|${VIVID_HDR_RE.source}`);
+    // -=-=-= isDdEx  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Dolby Surround EX: a rear-surround (6.1) channel matrix-folded into an ordinary 5.1 AC-3/E-AC-3, so the track carries strictly MORE than a plain 5.1
+    // twin while still decoding as plain 5.1 on a non-EX decoder. mediaInfo's Format_Settings_Mode is the flag's only home - ffprobe does not expose it. One
+    // definition so summariseStream's dd-ex token below and audio_clean's dedup tie-break (which keeps the EX copy over a plain 5.1 twin on an exact quality
+    // tie) can never disagree about what counts as EX.
+    const isDdEx = (s) => /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '');
     // -=-=-= summariseStream  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Per type: video codec + resolution/10bit/hdr (+/cover for cover-art/still images); data & attachment codec only. Audio & subtitle append /default, then
     // EVERY role marker that applies, so a track flagged two ways shows both. Audio: /commentary /description then /dub /original. Subtitle: /forced then
@@ -576,9 +582,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const rate = (out && out.rate) || (bps > 0 ? `${Math.round(bps / 1000)}k` : '');
             const role = `${isCommentary(s) ? '/commentary' : ''}${isDescriptive(s) ? '/description' : ''}`;
             const prov = `${hasDisposition(s, 'dub') ? '/dub' : ''}${hasDisposition(s, 'original') ? '/original' : ''}`;
-            // Dolby Surround EX marker (a rear channel matrix-folded into a 5.1 AC-3), read inline from mediaInfo Format_Settings_Mode - the flag's only home
-            // (this shared helper can't call audio_clean's local isMatrixSurroundSource). Marks the EX copy so its token differs from a plain 5.1 twin.
-            const surEx = !out && /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '') ? 'dd-ex' : '';
+            // Dolby Surround EX marker, via the shared isDdEx above - marks the EX copy so its token differs from a plain 5.1 twin.
+            const surEx = !out && isDdEx(s) ? 'dd-ex' : '';
             // A re-encode is named by the codec it is being encoded TO - resolved through a bare object so no source profile/long-name/mediaInfo can leak in.
             const name = out ? codecDisplayName({ codec_name: out.codec }) : codecDisplayName(s);
             return `[audio:${[lang, ch, surEx, name, rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
@@ -1241,6 +1246,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // to, so neither a lossless strip nor a normal re-encode keeps a valid picture. The transfer - not the DOVI compat id - is
         // the reliable signal (a compat-0 stream that DOES carry a PQ transfer re-encodes fine; profile 7/8/10 carry smpte2084/HLG).
         const dvNoBaseLayer = dvSignal && !HDR_TRANSFERS.includes(srcXfer);
+        // The HDR curve hdrFmt implies, for the three sites that stamp one when the stream's resolved transfer is not a known HDR curve: the tonemap island's
+        // setparams (the gate below explains why) and the two predicted output streams, lossless strip and transcode. At most one of the three runs per file,
+        // so holding the HLG spellings here is what makes an added spelling reach all three instead of only one.
+        const inferredHdrCurve = /hlg|log-gamma|b67/.test(hdrFmt) ? 'arib-std-b67' : 'smpte2084';   // PQ unless hdrFmt names an HLG spelling
 
         // ---- Dolby Vision guard (action-aware) ---- guard_dv protects DV through a transcode: forces HEVC + libx265 (CPU, below) + 10-bit + RPU
         // passthrough, and overrides a strip_dynamic/tonemap_sdr request for a DV file. INERT under hdr_cleanup_only (a lossless-only action - a
@@ -1261,7 +1270,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const willDownscale = action !== 'hdr_cleanup_only' && maxH > 0 && dispHeight > maxH;
         const outHeight = willDownscale ? maxH : dispHeight;
         const qualityForHeight = (h) => ({ sd: qualitySd, p720: quality720, p1080: quality1080, p4k: quality4k }[heightTier(h)]);
-        const qNorm = qualityForHeight(outHeight || dispHeight);
+        const qNorm = qualityForHeight(outHeight);
 
         // tonemap_sdr flattens ALL HDR -> SDR (a real re-encode). effHdrMode is never tonemap_sdr under hdr_cleanup_only (hard-errored) or for a
         // guard-protected DV file. The tonemap_* filters self-tag bt709 (verified), so no explicit colour flags; where it runs: see resolveTonemapBackend.
@@ -1270,7 +1279,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // is known (mediaInfo / dynamic metadata) but the stream's own transfer is NOT a recognised HDR curve - absent (a stripped VUI) OR
         // present-but-non-HDR (a mislabelled bt2020-10) - stamp the inferred HDR curve onto the island so the filter has a valid HDR input.
         const tonemapSetparams = (tonemap && !HDR_TRANSFERS.includes(srcXfer))
-            ? `setparams=color_trc=${/hlg|log-gamma|b67/.test(hdrFmt) ? 'arib-std-b67' : 'smpte2084'}:color_primaries=bt2020:colorspace=bt2020nc,`
+            ? `setparams=color_trc=${inferredHdrCurve}:color_primaries=bt2020:colorspace=bt2020nc,`
             : '';
 
         // ---- interlace repair ---- Inert under hdr_cleanup_only for the same reason tonemap_sdr is: it changes pixels, so it can never be the lossless-only
@@ -1347,7 +1356,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // the dvhe/dvh1 fourcc, the DOVI record, and the mediaInfo join (via the index) - leaving the HDR10/HLG base's own transfer, inferred off
             // HDR_Format when neither probe reported one. Everything else about the stream is untouched, since this path is a -c:v copy.
             const strippedVideo = { ...primary, codec_tag_string: '', side_data_list: [], index: -1 };
-            if (!HDR_TRANSFERS.includes(srcXfer)) strippedVideo.color_transfer = /hlg|log-gamma|b67/.test(hdrFmt) ? 'arib-std-b67' : 'smpte2084';
+            if (!HDR_TRANSFERS.includes(srcXfer)) strippedVideo.color_transfer = inferredHdrCurve;
             response.infoLog += `☑Expected results: ${keptStreams().map((s) => (s === primary ? summariseStream(strippedVideo) : summariseStream(enrichStream(s)))).join('')}\n`;
             return response;
         };
@@ -1468,7 +1477,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Predict the re-encoded stream through the shared summariseStream (single source of truth for the [video:...]
             // token) so Expected-results matches the input-summary format; depth is exact via bits_per_raw_sample with
             // pix_fmt/profile cleared, and a tonemapped output is SDR (bt709, detached mediaInfo so no 'hdr' token).
-            const outStream = { ...primary, codec_name: targetCodecName, height: outHeight || dispHeight, bits_per_raw_sample: want10Bit ? 10 : 8, pix_fmt: '', profile: '' };
+            const outStream = { ...primary, codec_name: targetCodecName, height: outHeight, bits_per_raw_sample: want10Bit ? 10 : 8, pix_fmt: '', profile: '' };
             if (tonemap) { outStream.color_transfer = 'bt709'; outStream.index = -1; }
             // Unless guard_dv carried it, the re-encode DISCARDS the DYNAMIC HDR layer - the Dolby Vision RPU and the HDR10+ SEI alike, since no encoder this
             // plugin drives carries either - so the prediction must not still read 'dv' or 'hdr10+'. Clear every carrier summariseStream's dynamic tests read:
@@ -1478,7 +1487,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // above and must keep it, so the stamp skips that case.
             if (isDynamicHdr && !preserveDv) {
                 outStream.codec_tag_string = ''; outStream.side_data_list = []; outStream.index = -1;
-                if (!tonemap && !HDR_TRANSFERS.includes(srcXfer)) outStream.color_transfer = /hlg|log-gamma|b67/.test(hdrFmt) ? 'arib-std-b67' : 'smpte2084';
+                if (!tonemap && !HDR_TRANSFERS.includes(srcXfer)) outStream.color_transfer = inferredHdrCurve;
             }
             const outVideoToken = summariseStream(outStream);
             response.infoLog += `☑Expected results: ${keptStreams().map((s) => (s === primary ? outVideoToken : summariseStream(enrichStream(s)))).join('')}\n`;

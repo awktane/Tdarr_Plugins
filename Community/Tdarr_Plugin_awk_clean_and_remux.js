@@ -19,7 +19,7 @@ const details = () => ({
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.16.0',
+    Version: '4.16.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -590,6 +590,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const HDR10P_RE = /2094|hdr10\+|hdr10 plus/;
     const VIVID_HDR_RE = /hdr vivid|cuva/;
     const DYNAMIC_HDR_RE = new RegExp(`${HDR10P_RE.source}|${VIVID_HDR_RE.source}`);
+    // -=-=-= isDdEx  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Dolby Surround EX: a rear-surround (6.1) channel matrix-folded into an ordinary 5.1 AC-3/E-AC-3, so the track carries strictly MORE than a plain 5.1
+    // twin while still decoding as plain 5.1 on a non-EX decoder. mediaInfo's Format_Settings_Mode is the flag's only home - ffprobe does not expose it. One
+    // definition so summariseStream's dd-ex token below and audio_clean's dedup tie-break (which keeps the EX copy over a plain 5.1 twin on an exact quality
+    // tie) can never disagree about what counts as EX.
+    const isDdEx = (s) => /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '');
     // -=-=-= summariseStream  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Per type: video codec + resolution/10bit/hdr (+/cover for cover-art/still images); data & attachment codec only. Audio & subtitle append /default, then
     // EVERY role marker that applies, so a track flagged two ways shows both. Audio: /commentary /description then /dub /original. Subtitle: /forced then
@@ -641,9 +647,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const rate = (out && out.rate) || (bps > 0 ? `${Math.round(bps / 1000)}k` : '');
             const role = `${isCommentary(s) ? '/commentary' : ''}${isDescriptive(s) ? '/description' : ''}`;
             const prov = `${hasDisposition(s, 'dub') ? '/dub' : ''}${hasDisposition(s, 'original') ? '/original' : ''}`;
-            // Dolby Surround EX marker (a rear channel matrix-folded into a 5.1 AC-3), read inline from mediaInfo Format_Settings_Mode - the flag's only home
-            // (this shared helper can't call audio_clean's local isMatrixSurroundSource). Marks the EX copy so its token differs from a plain 5.1 twin.
-            const surEx = !out && /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '') ? 'dd-ex' : '';
+            // Dolby Surround EX marker, via the shared isDdEx above - marks the EX copy so its token differs from a plain 5.1 twin.
+            const surEx = !out && isDdEx(s) ? 'dd-ex' : '';
             // A re-encode is named by the codec it is being encoded TO - resolved through a bare object so no source profile/long-name/mediaInfo can leak in.
             const name = out ? codecDisplayName({ codec_name: out.codec }) : codecDisplayName(s);
             return `[audio:${[lang, ch, surEx, name, rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
@@ -849,10 +854,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return s.length > max ? `${s.slice(0, max)}…` : s;
     };
 
+    // Undetermined / non-language codes we never rewrite (und, mul, zxx, mis, reserved qaa-qtz). Also the set knownLangToken accepts in the two free-text
+    // language inputs, so one definition keeps input acceptance and the tag-canonicalisation side from disagreeing about what counts as a language.
+    const isNonLang = (k) => k === 'und' || k === 'mul' || k === 'zxx' || k === 'mis' || /^q[a-t][a-z]$/.test(k);
     // A recognised language token, given its already-folded langKey: any real language in any form (langKey folds en/eng/English/en-US/pt-BR to a base
-    // code) or a valid special/private code (und/mul/zxx/mis/qaa-qtz, mirroring isNonLang). Both free-text language inputs are checked through this, so
-    // an unrecognised token (typo/garbage) fails the file rather than silently changing which streams survive.
-    const knownLangToken = (key) => key === 'und' || key === 'mul' || key === 'zxx' || key === 'mis' || /^q[a-t][a-z]$/.test(key) || !!langName(key);
+    // code) or one of the isNonLang special/private codes. Both free-text language inputs are checked through this, so an unrecognised token (typo/garbage)
+    // fails the file rather than silently changing which streams survive.
+    const knownLangToken = (key) => isNonLang(key) || !!langName(key);
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language token failure =====
     // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // The failFile message echoes the offending token capped at 200 chars, with control characters collapsed to a space: free text is unbounded and Tdarr
@@ -925,8 +933,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         sq:'alb',hy:'arm',eu:'baq',bo:'tib',my:'bur',zh:'chi',cs:'cze',nl:'dut',ka:'geo',de:'ger',el:'gre',is:'ice',mk:'mac',mi:'mao',ms:'may',
         fa:'per',ro:'rum',sk:'slo',cy:'wel',fr:'fre',
     };
-    // Undetermined / non-language codes we never rewrite (und, mul, zxx, mis, reserved qaa-qtz).
-    const isNonLang = (k) => k === 'und' || k === 'mul' || k === 'zxx' || k === 'mis' || /^q[a-t][a-z]$/.test(k);
     // Canonical BCP-47 tag keeping the region/script subtag - the mkv write side only; '' for a bare code, non-language, or unrecognised region tag.
     // getCanonicalLocales folds+cases the base and keeps region/script (por-BR->pt-BR, PT-br->pt-BR, eng-US->en-US, zh-Hans, es-419); langName rejects a
     // garbage base (xx-YY) and getCanonicalLocales throws on malformed input (_ . normalised to - first). No mp4 path calls this: mp4's mdhd cannot store
@@ -1526,12 +1532,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let inputArgs = '';   // recovery args that must precede -i (e.g. -err_detect); placed on the input side of the preset
         let workDone = '';
         let convert = false;
-        let videoDropped = 0;
         // Per-type OUTPUT ordinals, not source indices: they number the streams this run actually emits, and are threaded into -metadata:s:<t>:N, the
         // subtitle format conversion -c:s:N, and the hvc1 -tag:v:N. Start at -1 so the increment in each branch yields 0 for the first stream of that type.
         // subtitle and video are decremented again when their stream is dropped, so the survivors stay contiguous; audio needs no decrement, because the one
-        // path that drops audio (method_unmuxable=drop) removes the stream BEFORE the type branches increment anything. The video decrement is load-bearing
-        // beyond numbering - the all-video-dropped guard after the loop recognises that case by videoStreamIndex having fallen back to -1.
+        // path that drops audio (method_unmuxable=drop) removes the stream BEFORE the type branches increment anything.
         let subtitleStreamIndex = -1;
         let audioStreamIndex = -1;
         let videoStreamIndex = -1;
@@ -1568,7 +1572,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const subCodecOverride = new Map();
         // Drop one input stream. The three writes are NOT independent: removedIndices is the sole input to the "Expected results" summary filter and to the
         // orphaned-font survivor test, so a drop site that maps a stream out without recording it makes the summary advertise a stream the command deletes.
-        // Per-branch extras (a stream-index decrement, videoDropped, the continue) stay at the call site.
+        // Per-branch extras (a stream-index decrement, the continue) stay at the call site.
         const dropStream = (index) => {
             extraArguments += ` -map -0:${index}`;
             removedIndices.add(index);
@@ -1596,7 +1600,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (unmuxableDrops.has(ffstream.index)) {
                 workDone += `☐${streamTag(ffstream.index)}[method_unmuxable=drop] Remove ${ffstreamType}-${ffstreamCodec} - ${dstContainer} cannot store it\n`;
                 dropStream(ffstream.index);
-                if (ffstreamType === 'video') videoDropped++;
                 continue;
             }
 
@@ -1754,7 +1757,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     //language_sub: drop a subtitle whose (possibly filled) language is not on the keep list. A blank list keeps every language.
                     if(subLanguage.length > 0 && !langListMatch(workLang, subLangKeys)) {
                         // logSafe's 200-char cap matters here: the whole language_sub list is echoed once PER dropped subtitle.
-                        workDone += `☐${streamTag(ffstream.index)}[language_sub=${logSafe(inputs.language_sub)}] Remove subtitle language (${streamLang})\n`;
+                        workDone += `☐${streamTag(ffstream.index)}[language_sub=${logSafe(inputs.language_sub)}] Remove subtitle language (${workLang})\n`;
                         delStream = true;
                     } else if (removeSubSdh === 'enabled' && isSdh(ffstream) && hasPlainSameLang(plainSubLangs, workLang)) {
                         workDone += `☐${streamTag(ffstream.index)}[remove_sub_sdh=${removeSubSdh}] Remove accessibility subtitle SDH/CC (${logSafe(roleTextLower(ffstream))})\n`;
@@ -1854,7 +1857,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (isCoverArt(ffstream)) {
                     workDone += `☐${streamTag(ffstream.index)} Remove ${isImageCodec ? 'image' : 'cover-art/thumbnail'} (${ffstreamType}-${ffstreamCodec})\n`;
                     dropStream(ffstream.index);
-                    videoDropped++;
                     videoStreamIndex--;
                     continue;
                 }            
@@ -1958,7 +1960,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
-        if(videoDropped > 0 && videoStreamIndex === -1)
+        // Every path that can drop a video stream (method_unmuxable=drop above, cover art in the video branch) records it in removedIndices, so the
+        // survivors are read from there. Gated on the file having had video to begin with, so an audio-only file is untouched.
+        if(file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'video')
+            && !file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'video' && !removedIndices.has(s.index)))
             failFile('Removing the specified streams would leave the file with no video streams - check your removal settings');
 
         // method_unmuxable=drop is the ONLY path here that removes an audio stream (audio_clean owns every other audio keep/drop), so it needs its own
@@ -2022,7 +2027,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if(!fflags.includes('genpts'))
                 fflags += '+genpts';
             extraArguments = ` -avoid_negative_ts make_zero${extraArguments}`;
-        } else if (runRecover && tsLight && !extraArguments.includes('avoid_negative_ts'))
+        } else if (runRecover && tsLight)
             extraArguments = ` -avoid_negative_ts make_zero${extraArguments}`;   // normalize negative starts on any container we rebuild
 
         // recover_bad_data: light = +ignidx + -err_detect ignore_err (drops nothing), aggressive additionally drops corrupt frames.
