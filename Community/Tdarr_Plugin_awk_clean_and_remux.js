@@ -27,7 +27,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.18.0',
+    Version: '4.19.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -42,11 +42,12 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nmkv removes eia_608, ttml, xsub, dvb_teletext, and any other subtitle format
-                    the mkv muxer can't carry. mov_text is converted to srt for compatibility.
+                \\nmkv removes ttml, xsub, dvb_teletext, and any other subtitle format the mkv muxer can't carry AND ffmpeg can't read
+                    as text. mov_text is converted to srt for compatibility, and a closed-caption (eia_608) track to plain text.
                 \\nmp4 additionally removes the image-based subtitles mkv keeps (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle), plus
-                    arib_caption and hdmv_text_subtitle. Text-based subtitles (subrip, srt, ass, ssa, webvtt, text) are converted to
-                    mov_text. Genpts may be required to fix timestamps. HEVC video is tagged hvc1 so Apple/QuickTime can play it.`,
+                    arib_caption and hdmv_text_subtitle. Text-based subtitles (subrip, srt, ass, ssa, webvtt, text, eia_608) are
+                    converted to mov_text - the exception is a STYLED ass/ssa, which is exported as a font bundle instead of being
+                    flattened. Genpts may be required to fix timestamps. HEVC video is tagged hvc1 so Apple/QuickTime can play it.`,
         },
         {
             name: 'language_fill',
@@ -1086,20 +1087,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ====== END LANGUAGE TAG CANONICALIZATION ======
 
     // Subtitle codecs dropped purely by container/format, regardless of language - never assigned language_fill, and excluded from the language_fill_mode tally
-    // below. alwaysDropSubs is unmuxable by BOTH containers: eia_608 (closed-caption data embedded in the video bitstream, not a real subtitle stream), xsub
-    // (no Matroska CodecID and no mp4 tag - AVI is its only home) and dvb_teletext (matroska rejects codec 94215; it CAN decode to srt, but only with a
-    // per-broadcaster teletext PAGE that ffprobe does not expose - it lives in 2 bytes of stream extradata - and guessing yields the entire teletext service,
-    // ~1300x the size and not subtitles). mkvOnlyDropSubs is the opposite case, carried by mp4 but not mkv: ttml muxes into mp4 as stpp (verified, 1 packet,
-    // codec_tag=stpp) while matroska has no CodecID for it. mp4OnlyDropSubs muxes fine in mkv but not mp4: the image-based PGS/VobSub/DVB formats, plus
-    // arib_caption and hdmv_text_subtitle (both decode-only for mp4; hdmv_text_subtitle copies into mkv fine). Note arib_caption is effectively unreachable -
-    // the build has no libaribb24, so ARIB captions arrive as bin_data/data streams and never carry this codec name.
-    const alwaysDropSubs  = ['eia_608', 'xsub', 'dvb_teletext'];
+    // below. alwaysDropSubs is unmuxable by BOTH containers AND not decodable to text: xsub (no Matroska CodecID and no mp4 tag - AVI is its only home) and
+    // dvb_teletext (matroska rejects codec 94215; it CAN decode to srt, but only with a per-broadcaster teletext PAGE that ffprobe does not expose - it lives
+    // in 2 bytes of stream extradata - and guessing yields the entire teletext service, ~1300x the size and not subtitles). mkvOnlyDropSubs is the opposite
+    // case, carried by mp4 but not mkv: ttml muxes into mp4 as stpp (verified, 1 packet, codec_tag=stpp) while matroska has no CodecID for it.
+    // mp4OnlyDropSubs muxes fine in mkv but not mp4: the image-based PGS/VobSub/DVB formats, plus arib_caption and hdmv_text_subtitle (both decode-only for
+    // mp4; hdmv_text_subtitle copies into mkv fine). Note arib_caption is effectively unreachable - the build has no libaribb24, so ARIB captions arrive as
+    // bin_data/data streams and never carry this codec name.
+    const alwaysDropSubs  = ['xsub', 'dvb_teletext'];
     const mkvOnlyDropSubs = ['ttml'];
     const mp4OnlyDropSubs = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'arib_caption', 'hdmv_text_subtitle'];
     // Legacy PC/fansub text codecs with no Matroska CodecID and no native mp4 support: a bare -c copy would fail the
     // remux, but ffmpeg decodes them as text, so BOTH container branches below convert them (mkv -> srt, mp4 -> mov_text).
     // Hoisted once so the two branches can't drift (a codec added to one list but not the other aborts a remux).
     const legacyTextSubs = ['microdvd', 'mpl2', 'jacosub', 'sami', 'realtext', 'subviewer', 'subviewer1', 'vplayer', 'pjs', 'stl'];
+    // eia_608 as a real SUBTITLE STREAM - rare, but it exists (a QuickTime 608 capture in the corpus carries one). It is NOT the same thing as the closed
+    // captions embedded in a video bitstream, which are not a stream at all and are sub_worker's embedded_cc business. Neither container can store it, but
+    // ffmpeg DECODES it, so it converts like any other undecodable-but-readable format rather than being thrown away: measured, a real 608 stream yields
+    // clean readable text through both targets. It converts to `text` rather than `srt` on mkv, and that is the whole point of listing it separately -
+    // cc_dec emits ASS internally, and the srt encoder passes unknown override tags THROUGH: measured 17 `{\an7}`-style tokens on positioned caption content
+    // against 0 for `text`, which Plex then renders as literal words on screen. Both land as subrip inside matroska, so the choice costs nothing but the
+    // overrides. (mov_text strips them too, so the mp4 side needs no special case.)
+    const CC_STREAM_SUBS = ['eia_608'];
     const subFormatDropped = (codec) => alwaysDropSubs.includes(codec)
         || (dstContainer === 'mkv' && mkvOnlyDropSubs.includes(codec))
         || (dstContainer === 'mp4' && mp4OnlyDropSubs.includes(codec));
@@ -1834,7 +1843,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 subtitleStreamIndex++;
 
                 // Image subs (PGS/VobSub/DVB/xsub) are governed by remove_imagesubs - see imageSubDropped for what each mode drops and IMAGE_SUB for the
-                // sidecar an 'export' writes first. Subs no container can carry, plus those this one can't (eia_608/xsub/dvb_teletext, ttml on mkv,
+                // sidecar an 'export' writes first. Subs no container can carry, plus those this one can't (xsub/dvb_teletext, ttml on mkv,
                 // arib/hdmv_text on mp4), are dropped by subFormatDropped. A kept image sub (unsupported + carriable) and every other sub then fall through to
                 // the language/accessibility filters below. The export has to SUCCEED for the drop to be safe (the sidecar is the only surviving copy), so when
                 // the joined path can't be embedded in the quoted preset token (pathIsPresetSafe - a " or control char in the library directory, which has to
@@ -1890,7 +1899,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     workDone += `☐${streamTag(ffstream.index)}${imgCause} Remove image-based subtitle (${ffstreamType}-${ffstreamCodec})\n`;
                     delStream = true;
                 } else if (subFormatDropped(ffstreamCodec)) {
-                    // Container/format can't carry it. alwaysDropSubs (eia_608/xsub/dvb_teletext) drop in ANY container - no setting governs them, so no tag;
+                    // Container/format can't carry it. alwaysDropSubs (xsub/dvb_teletext) drop in ANY container - no setting governs them, so no tag;
                     // the rest (ttml on mkv; image subs, arib/hdmv_text on mp4) drop only because of the chosen container, so they carry [container=<dst>].
                     const dropCause = alwaysDropSubs.includes(ffstreamCodec) ? '' : `[container=${dstContainer}]`;
                     workDone += `☐${streamTag(ffstream.index)}${dropCause} Remove unsupported (${ffstreamType}-${ffstreamCodec})\n`;
@@ -1994,14 +2003,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // mp4: only mov_text is natively supported, so every decodable text codec converts to it — subrip/srt/ass/ssa/webvtt/text plus
                 //      legacyTextSubs — or they hit the bare -c copy and fail the whole remux. text is raw UTF-8 that ffmpeg normalises to subrip on mux.
                 let subConvertTarget = null;
-                if (dstContainer === 'mkv' && ['mov_text', ...legacyTextSubs].includes(ffstreamCodec)) subConvertTarget = 'srt';
-                else if (dstContainer === 'mp4' && ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'text', ...legacyTextSubs].includes(ffstreamCodec))
+                if (dstContainer === 'mkv' && CC_STREAM_SUBS.includes(ffstreamCodec)) subConvertTarget = 'text';   // NOT srt - see CC_STREAM_SUBS
+                else if (dstContainer === 'mkv' && ['mov_text', ...legacyTextSubs].includes(ffstreamCodec)) subConvertTarget = 'srt';
+                else if (dstContainer === 'mp4'
+                    && ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'text', ...CC_STREAM_SUBS, ...legacyTextSubs].includes(ffstreamCodec))
                     subConvertTarget = 'mov_text';
                 if (subConvertTarget) {
+                    // The ENCODER and the codec that ends up in the container are the same everywhere except `text`, which matroska stores as subrip
+                    // (S_TEXT/UTF8). Both the log and the predicted-output summary name what the file will actually carry, not the flag we passed.
+                    const landsAs = subConvertTarget === 'text' ? 'subrip' : subConvertTarget;
                     workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Unsupported codec - converting ${ffstreamCodec} subtitle`
-                        + ` to ${subConvertTarget}\n`;
+                        + ` to ${landsAs}\n`;
                     extraArguments += metadataCommand+` -c:s:${subtitleStreamIndex} ${subConvertTarget}`;
-                    subCodecOverride.set(ffstream.index, subConvertTarget);
+                    subCodecOverride.set(ffstream.index, landsAs);
                     convert = true;
                     continue;
                 }
