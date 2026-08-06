@@ -20,12 +20,14 @@ const details = () => ({
                          and imports title keywords into the real ffmpeg disposition flags\n\n
                      -Forcefully removes unsupported image based subtitles; optionally removes all image
                          based subtitles, or exports them to hidden OCR sidecars, via remove_imagesubs\n\n
-                     -Converts unsupported subtitles to a supported format\n\n
+                     -Converts unsupported subtitles to a supported format. The exception is a STYLED ass/ssa subtitle on an mp4 target: mp4 can only
+                         store it as mov_text, which turns its positioning and drawing tags into literal on-screen text, so it is exported to a hidden
+                         .mks bundle carrying the subtitle plus the container's fonts and dropped from the video instead\n\n
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.16.2',
+    Version: '4.17.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1161,6 +1163,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // remove_imagesubs-specific drop beyond subFormatDropped, used by subDroppedAnyReason for the language_fill tally + accessibility plain-track guard.
     const imageSubDropped = (codec) => isImageSub(codec) && (removeImageSubs === 'all' || removeImageSubs === 'export');
 
+    // ===== SHARED [clean_and_remux, sub_worker]: styled subtitle test =====
+    // -=-=-= STYLED_SUBS / isStyledSub  [clean_and_remux, sub_worker] =-=-=-
+    // ASS/SSA are the subtitle formats whose CONTENT is markup: positioning, drawing commands and style overrides live inside the cue text itself. Every
+    // other text format degrades gracefully when converted - srt and webvtt lose only colour and alignment - but flattening a styled subtitle renders its
+    // overrides as literal on-screen words, so both plugins must recognise the pair before deciding what to do with a subtitle, and must recognise the
+    // same pair. Bitmap subtitle formats are not styled text and are handled separately in both.
+    const STYLED_SUBS = ['ass', 'ssa'];
+    const isStyledSub = (codec) => STYLED_SUBS.includes(String(codec).toLowerCase());
+    // ===== END SHARED: styled subtitle test =====
+    // A styled subtitle cannot go into mp4 without being flattened into mov_text, which turns its override tags into literal on-screen text (measured: 99.6%
+    // of lines in a real anime ASS carry one). So on an mp4 target it is EXPORTED as a Matroska bundle carrying the subtitle plus the container's font
+    // attachments - the fonts exist nowhere else - and dropped from the video, rather than converted into garbage. mkv carries ass natively and never
+    // reaches this. The name wears sub_worker's bundle marker so its import reads it back as a bundle rather than as an image-subtitle sidecar.
+    const styledSubExported = (codec) => dstContainer === 'mp4' && isStyledSub(codec);
+    // Matroska is the only container that can hold a subtitle and its fonts together (mp4 carries no attachments at all), and .mks is its subtitle-only
+    // extension, so a media server that does not skip dotfiles still does not read the bundle as a video. The 'styled' mark is sub_worker's bundle token:
+    // with it the file reimports as a bundle, fonts and all - which is what makes the export a round trip rather than a one-way archive.
+    const STYLED_BUNDLE = { ext: 'mks', fmt: 'matroska', mark: 'styled' };
+
     // ===== SHARED [clean_and_remux, sub_worker]: preset path safety =====
     // -=-=-= pathIsPresetSafe  [clean_and_remux, sub_worker] =-=-=-
     // True when a real on-disk path can be embedded in a preset's quoted "${path}" token. Tdarr never shells out, but its worker tokenises each preset
@@ -1305,13 +1326,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ===== END SHARED: sidecar placement =====
 
-    // Hidden dot-prefixed sidecar name for an exported image subtitle: ".<video>.s<index>.<lang>[.forced].<ext>". The leading
+    // Hidden dot-prefixed sidecar name for an exported subtitle: ".<video>.s<index>.<lang>[.forced][.<mark>].<ext>". The leading
     // dot makes Plex/Jellyfin ignore it (Jellyfin skips **/.* ; Plex ignores .sup/.mks by extension). Emby is the exception -
     // it scans dot-prefixed files, so an exported .mks needs a .embyignore entry there (called out in the remove_imagesubs
     // tooltip). Name safety is handled by the shared derivation above; the emit site below still CHECKS the joined path.
-    const imageSidecarName = (ffstream, ext) => {
+    // `mark` carries sub_worker's bundle token on a STYLED-subtitle export, which is what tells its import to read the file
+    // back as a font bundle; an image-subtitle export deliberately has none, so importing one can never re-add the picture
+    // subtitle this pass just removed.
+    const exportSidecarName = (ffstream, ext, mark) => {
         const forced = ffstream.disposition?.forced === 1 ? '.forced' : '';
-        return `.${videoBase}.s${ffstream.index}.${sidecarLangToken(ffstream)}${forced}.${ext}`;
+        return `.${videoBase}.s${ffstream.index}.${sidecarLangToken(ffstream)}${forced}${mark ? `.${mark}` : ''}.${ext}`;
     };
     // A subtitle removed regardless of language - by container/format (subFormatDropped) or by remove_imagesubs (imageSubDropped). Neither is ever assigned
     // language_fill, and neither counts as a survivor for the language_fill_mode untagged tally or the remove_sub_sdh plain-track guard.
@@ -1637,18 +1661,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // test (imageSubDropped on an image codec, and not a track subFilterDrops discards), so the two cannot select different streams.
         let exportRefusedCount = 0;   // image-sub exports that could not be written this run - any at all fails the file, see the check after the stream loop
         const placedSidecars = new Set(); const failedSidecars = new Map();
-        if (isUnmappedNode && removeImageSubs === 'export') {
+        // The font attachments a styled-subtitle bundle carries. Read once here: they are the same set for every styled subtitle in the file, and the
+        // pre-scan below needs them before the stream loop runs.
+        const styledFontIndices = (file.ffProbeData.streams || [])
+            .filter((s) => codecTypeOf(s) === 'attachment' && isFontAttachment(s)).map((s) => s.index);
+        if (isUnmappedNode) {
             const exportJobs = [];
             for (const s of (file.ffProbeData.streams || [])) {
                 const codec = (s?.codec_name || '').toLowerCase();
-                if (codecTypeOf(s) !== 'subtitle' || !imageSubDropped(codec) || subFilterDrops(s)) continue;
-                const sidecarSpec = IMAGE_SUB[codec];
-                const name = imageSidecarName(s, sidecarSpec.ext);
+                if (codecTypeOf(s) !== 'subtitle' || subFilterDrops(s)) continue;
+                // Two kinds of export land here, and they differ only in what goes into the file: an image subtitle copied alone, or a styled subtitle
+                // bundled with the container's fonts. Both must be uploaded BEFORE the stream loop decides anything, since neither can ride along as an
+                // extra output of the remux on this node - that output would land in the node-local mirror and be discarded with the job.
+                const styled = styledSubExported(codec);
+                const image = imageSubDropped(codec) && removeImageSubs === 'export';
+                if (!styled && !image) continue;
+                const spec = styled ? STYLED_BUNDLE : IMAGE_SUB[codec];
+                const name = exportSidecarName(s, spec.ext, styled ? STYLED_BUNDLE.mark : '');
                 const dest = serverSidePath(path.join(libDir, name));
                 if (!dest) { failedSidecars.set(name, 'no path translator maps this library directory back to the server'); continue; }
                 // Already on the server (a re-run, or a prior export the drop never followed): count it placed rather than re-extracting and re-uploading it.
                 if (sidecarExistsRemote(dest)) { placedSidecars.add(name); continue; }
-                exportJobs.push({ name, dest, args: ['-map', `0:${s.index}`, '-c:s', 'copy', '-f', sidecarSpec.fmt] });
+                const maps = styled ? ['-map', `0:${s.index}`, ...styledFontIndices.flatMap((i) => ['-map', `0:${i}`]), '-c', 'copy', '-f', spec.fmt]
+                    : ['-map', `0:${s.index}`, '-c:s', 'copy', '-f', spec.fmt];
+                exportJobs.push({ name, dest, args: maps });
             }
             if (exportJobs.length) {
                 const { placed, failed } = placeSidecars(exportJobs);
@@ -1802,7 +1838,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 let exportRefused = false;
                 if (imageSubDrop && removeImageSubs === 'export' && !exportSuppressed) {
                     const sidecarSpec = IMAGE_SUB[ffstreamCodec];   // { ext, fmt } - see IMAGE_SUB for why each codec gets that container
-                    const sidecarName = imageSidecarName(ffstream, sidecarSpec.ext);
+                    const sidecarName = exportSidecarName(ffstream, sidecarSpec.ext);
                     const sidecarPath = path.join(libDir, sidecarName);
                     // Unmapped: the export already ran, above this loop - the drop is allowed only for a sidecar the server confirmed it holds, and the
                     // line is ☑ rather than ☐ because it reports work already done. A refusal reads like the unsafe-path one below and keeps the subtitle.
@@ -1876,6 +1912,43 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     dropStream(ffstream.index);
                     subtitleStreamIndex--;
                     continue;
+                }
+
+                // A styled subtitle bound for mp4: export the bundle and drop the track rather than flatten it (see styledSubExported). Placed AFTER every
+                // removal filter, so a subtitle that language_sub or remove_sub_sdh discards is never exported first - the bundle is permanent and would
+                // hand the user an archive of a track they excluded. The export must SUCCEED for the drop to be safe, since the bundle then holds the only
+                // styled copy; a refusal falls through to the mov_text conversion below with a ☒ naming the loss, which is what this file would have got
+                // anyway - a mangled subtitle beats a vanished one.
+                if (styledSubExported(ffstreamCodec)) {
+                    const sidecarName = exportSidecarName(ffstream, STYLED_BUNDLE.ext, STYLED_BUNDLE.mark);
+                    const sidecarPath = path.join(libDir, sidecarName);
+                    const fontMaps = styledFontIndices.map((i) => ` -map 0:${i}`).join('');
+                    const fontNote = styledFontIndices.length
+                        ? ` with ${styledFontIndices.length} font attachment${styledFontIndices.length === 1 ? '' : 's'}` : ' (no embedded fonts to carry)';
+                    let exported = false;
+                    if (isUnmappedNode) {
+                        if (placedSidecars.has(sidecarName)) { exported = true; workDone += `☑${streamTag(ffstream.index)}[container=mp4] Exported styled`
+                            + ` ${ffstreamCodec} subtitle -> ${sidecarName}${fontNote}\n`; }
+                        else response.infoLog += `☒${streamTag(ffstream.index)}[container=mp4] Could not place ${sidecarName} in the library`
+                            + ` - ${failedSidecars.get(sidecarName)}; converting to mov_text instead, which loses the styling\n`;
+                    } else if (pathIsPresetSafe(sidecarPath)) {
+                        // ffmpeg aborts the whole run rather than overwrite an output file, so an existing bundle is left alone and the drop still goes
+                        // ahead - it already holds this subtitle, and re-exporting could only destroy a copy the user may have edited.
+                        let bundleExists = false;
+                        try { bundleExists = fs.statSync(sidecarPath).size > 0; } catch (e) { bundleExists = false; }
+                        exported = true;
+                        if (bundleExists) workDone += `☑${streamTag(ffstream.index)}[container=mp4] Styled-subtitle bundle already exists,`
+                            + ` not overwriting: ${sidecarName}\n`;
+                        else {
+                            sidecarOut += ` -map 0:${ffstream.index}${fontMaps} -c copy -f ${STYLED_BUNDLE.fmt} "${sidecarPath}"`;
+                            workDone += `☐${streamTag(ffstream.index)}[container=mp4] Export styled ${ffstreamCodec} subtitle -> ${sidecarName}${fontNote}`
+                                + ' - mp4 cannot carry it without flattening the styling into on-screen text\n';
+                        }
+                    } else {
+                        response.infoLog += `☒${streamTag(ffstream.index)}[container=mp4] Library directory contains a quote or control character - cannot`
+                            + ` write ${sidecarName} safely; converting to mov_text instead, which loses the styling\n`;
+                    }
+                    if (exported) { dropStream(ffstream.index); subtitleStreamIndex--; continue; }
                 }
 
                 //Trim the surrounding whitespace and quotes (cleanStreamTitle); the busy-title clear follows tag_disposition below, not here.
@@ -2045,16 +2118,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         // Resolve deferred font attachments now that subtitle removals are final. Embedded fonts are only consumed by styled text subtitles (ASS/SSA). Keep the
-        // fonts if any such subtitle survives in the output; otherwise they are orphaned and removed. mp4 output never keeps fonts: ASS/SSA are converted to
-        // mov_text (which needs no fonts) and mp4 cannot carry font attachments anyway, so dstContainer gates this to mkv. The source codec is read from
-        // ffProbeData (it is still 'ass'/'ssa' there even when converted), which is why the mkv gate — not just the survivor check — is required.
-        // A styled subtitle extracted by awk_sub_worker takes its fonts with it (they ride along in its .mks bundle and come back on reimport), so an ASS/SSA
-        // missing from the container genuinely means these fonts are orphaned - removing them is correct wherever this plugin sits in the stack.
+        // fonts if any such subtitle survives in the output; otherwise they are orphaned and removed. mp4 output never keeps fonts: it cannot carry a font
+        // attachment at all, and its styled subtitles have either left in a bundle that took the fonts with them or been flattened to mov_text, which needs
+        // none - so dstContainer gates this to mkv. The source codec is read from ffProbeData (still 'ass'/'ssa' there even when converted), which is why the
+        // mkv gate - not just the survivor check - is required.
+        // A styled subtitle extracted by awk_sub_worker likewise takes its fonts with it (they ride along in its .mks bundle and come back on reimport), so an
+        // ASS/SSA missing from the container genuinely means these fonts are orphaned - removing them is correct wherever this plugin sits in the stack.
         if (deferredFontIndices.length > 0) {
             const fontsNeeded = dstContainer === 'mkv' && file.ffProbeData.streams.some(s =>
                 codecTypeOf(s) === 'subtitle'
                 && !removedIndices.has(s.index)
-                && ['ass', 'ssa'].includes((s.codec_name || '').toLowerCase()));
+                && isStyledSub(s.codec_name));
 
             if (!fontsNeeded) {
                 for (const idx of deferredFontIndices) {

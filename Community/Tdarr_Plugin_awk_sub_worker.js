@@ -29,7 +29,7 @@ const details = () => ({
                 \\nScope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on
                 import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.39.0',
+    Version: '3.39.1',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -759,11 +759,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The fixed marker token before the extension is what makes a bundle name unambiguous: clean_and_remux's remove_imagesubs=export writes its own
     // dot-prefixed .mks image-subtitle sidecars in the same "<base>.s<index>.<lang>[.forced]" shape, and importing one of those as a bundle would
     // silently re-add the image subtitle that pass had just exported and removed. It is stripped before the disposition tokens, so it never occupies
-    // the language slot, and no disposition token spells 'styled'.
-    const STYLED_SUBS = ['ass', 'ssa'];
+    // the language slot, and no disposition token spells 'styled'. clean_and_remux writes the token on its OWN styled-subtitle bundles for the same
+    // reason, so those DO come back through the import as bundles - which is the whole point of exporting them in that form.
     const BUNDLE_EXT = 'mks';
     const BUNDLE_TOKEN = 'styled';
+
+    // ===== SHARED [clean_and_remux, sub_worker]: styled subtitle test =====
+    // -=-=-= STYLED_SUBS / isStyledSub  [clean_and_remux, sub_worker] =-=-=-
+    // ASS/SSA are the subtitle formats whose CONTENT is markup: positioning, drawing commands and style overrides live inside the cue text itself. Every
+    // other text format degrades gracefully when converted - srt and webvtt lose only colour and alignment - but flattening a styled subtitle renders its
+    // overrides as literal on-screen words, so both plugins must recognise the pair before deciding what to do with a subtitle, and must recognise the
+    // same pair. Bitmap subtitle formats are not styled text and are handled separately in both.
+    const STYLED_SUBS = ['ass', 'ssa'];
     const isStyledSub = (codec) => STYLED_SUBS.includes(String(codec).toLowerCase());
+    // ===== END SHARED: styled subtitle test =====
 
     // Dispositions encoded as filename tokens, in fixed order. `ff` is the ffmpeg -disposition name restored on import; `flags` are the ffprobe
     // disposition keys that, when set on the source, emit this token on extract. They differ only for SDH: hearing_impaired and captions are
