@@ -29,7 +29,7 @@ const details = () => ({
                 \\nScope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on
                 import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.39.1',
+    Version: '3.39.2',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1879,10 +1879,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const ccStripAllowed = () => {
             if (!ccVideo) return false;
             const xfer = String(ccVideo.color_transfer || '').toLowerCase().trim();
-            const mi = mediaInfoFor(file, ccVideo) || {};
+            const mi = mediaInfoFor(ccVideo) || {};
             const hdrFmt = String(mi.HDR_Format || mi.HDR_Format_Compatibility || '').toLowerCase();
             return String(ccVideo.codec_name || '').toLowerCase().trim() === 'h264'
-                && !isDolbyVisionVideo(file, ccVideo) && !HDR_TRANSFERS.includes(xfer) && !DYNAMIC_HDR_RE.test(hdrFmt);
+                && !isDolbyVisionVideo(ccVideo, mi) && !HDR_TRANSFERS.includes(xfer) && !DYNAMIC_HDR_RE.test(hdrFmt);
         };
 
         if (action === 'extract') {
