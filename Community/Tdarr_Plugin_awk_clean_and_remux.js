@@ -27,7 +27,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.17.0',
+    Version: '4.18.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1129,6 +1129,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // TO; the gate degrades them to error/drop and says so. (s302m and pcm_bluray occur naturally only in MPEG-TS and on Blu-ray respectively, which is how a
     // file can be carrying a codec neither of our two output containers accepts.)
     const UNMUXABLE_ANYWHERE = ['ac4', 'adpcm_ima_qt', 'nellymoser', 'pcm_bluray', 's302m'];
+    // Refused by MATROSKA but muxable into mp4 - the mirror image of MP4_UNMUXABLE, and the direction that matters most in practice because mkv is the
+    // default container. Derived the same way and measured on this build: mpegh_3d_audio answers "No wav codec tag found for codec mpegh_3d_audio" on
+    // matroska and muxes into mp4 without complaint.
+    //
+    // This half is deliberately SHORTER than the mp4 half, and that is a statement about what can be proven rather than about matroska. Only a codec this
+    // build can encode, or that exists as a real sample, is testable at all, and matroska turned out to accept nearly everything offered: every lossless
+    // video codec (ffv1/huffyuv/ffvhuff/magicyuv/utvideo), wmav1/wmav2, the adpcm family bar the two already listed above, aac_latm, VVC, DTS and TrueHD.
+    //
+    // rawvideo is the one measured failure NOT listed here, and it is left out on purpose: matroska refuses it only for RGB pixel formats ("Raw RGB is not
+    // supported Natively in Matroska") while yuv420p/yuv422p/gray mux fine. The gate is keyed on codec_name alone, so listing it would wrongly refuse every
+    // YUV rawvideo file - the opposite of this table's fail-safe direction, where a missing row costs a diagnosis and a wrong row costs the user their file.
+    const MKV_UNMUXABLE = ['mpegh_3d_audio'];
     // The one codec mp4 gates rather than refuses: it answers "truehd in MP4 support is experimental, add '-strict -2'" (rc 88), and an OUTPUT-side -strict
     // experimental / -2 does satisfy it (-strict unofficial does not). That flag is deliberately NOT used to force a conversion - it writes a valid but
     // non-standard file most players cannot decode, trading a loud diagnosable failure for a quiet unplayable one - so a truehd mkv bound for mp4 is gated
@@ -1138,7 +1150,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Which of the three the codec falls into for the CURRENT destination, or '' when it muxes fine. Read once per stream by the gate below.
     const unmuxableClass = (codec) => {
         if (UNMUXABLE_ANYWHERE.includes(codec)) return 'anywhere';
-        if (dstContainer !== 'mp4') return '';
+        if (dstContainer !== 'mp4') return MKV_UNMUXABLE.includes(codec) ? 'mkv' : '';
         if (MP4_STRICT_GATED.includes(codec)) return isMp4Family(srcContainer) ? '' : 'mp4';   // already-mp4 TrueHD is preserved with -strict, see above
         return MP4_UNMUXABLE.includes(codec) ? 'mp4' : '';
     };
@@ -1548,9 +1560,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 .some((s) => MP4_STRICT_GATED.includes((s.codec_name || '').toLowerCase().trim()) && !offenderIndices.has(s.index));
             if (offenders.length) {
                 const names = [...new Set(offenders.map((o) => o.codec))].join(', ');
-                // A codec NEITHER container accepts has nowhere to fall back to, so mkv_fallback degrades to error and says why - silently doing nothing, or
-                // silently dropping a track the user asked to keep, would both be worse than stopping.
-                const stuck = offenders.filter((o) => o.cls === 'anywhere');
+                // A codec the fallback container cannot store either has nowhere to go, so mkv_fallback degrades to error and says why - silently doing
+                // nothing, or silently dropping a track the user asked to keep, would both be worse than stopping. Two ways to end up there: no container
+                // accepts the codec ('anywhere'), or MATROSKA is the one refusing it ('mkv'), where falling back to mkv is no answer at all.
+                const stuck = offenders.filter((o) => o.cls === 'anywhere' || o.cls === 'mkv');
                 if (methodUnmuxable === 'mkv_fallback' && stuck.length) {
                     failFile(`[method_unmuxable=mkv_fallback] ${[...new Set(stuck.map((o) => o.codec))].join(', ')} cannot be stored in mkv either,`
                         + ' so there is no container to fall back to - set method_unmuxable=drop to remove '
