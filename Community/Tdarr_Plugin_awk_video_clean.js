@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.20.1',
+    Version: '3.20.2',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -24,20 +24,20 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['normalize', 'shrink', 'hdr_cleanup_only'],
             },
-            tooltip: `What this plugin is FOR on this run. Nothing happens until you pick a goal - the default is a harmless HDR-only pass,
-                    so set this first, then tune the inputs below for the action you chose.
+            tooltip: `What this plugin is FOR on this run. Nothing happens until you pick a goal, so set this first and then tune the inputs below for
+                the action you chose.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nhdr_cleanup_only (default, harmless): only hdr_mode is live, and only losslessly - strip_dynamic drops the Dolby Vision / HDR10+
-                    dynamic layer with a plain -c:v copy (no re-encode, base HDR10 kept); anything that can't be done losslessly is skipped.
-                    codec / height_cap / bit-depth / quality / encoder are all inert here. A safe do-nothing default.
-                \\nnormalize: compatibility conversion. Re-encodes when the source doesn't match your codec / height_cap / hdr_mode target,
-                    in EITHER direction (e.g. AV1->HEVC for an old TV, or downscale 4K->1080p). method_bitdepth rides along on whatever else fires
-                    but never triggers a re-encode by itself.
-                \\nshrink: save space. Re-encodes toward a more efficient codec (efficiency AV1 > HEVC > H.264) and never downgrades efficiency
-                    - a request that would (e.g. HEVC on an AV1 source) falls back to a same-codec re-encode gated by guard_shrink_bitrate.
-                    Per file, skips anything it can't make smaller (logged, not failed).`,
+                \\nhdr_cleanup_only (default, harmless): only hdr_mode is live, and only where it can act losslessly - strip_dynamic drops the Dolby
+                Vision / HDR10+ dynamic layer with a plain -c:v copy, keeping the base HDR10, and anything that cannot be done losslessly is skipped.
+                codec, height_cap, bit depth, quality and encoder are all inert. A safe do-nothing default.
+                \\nnormalize: compatibility conversion. Re-encodes whenever the source does not match your codec, height_cap or hdr_mode target, in
+                EITHER direction - AV1 to HEVC for an old TV, or 4K down to 1080p. method_bitdepth rides along on whatever else fires but never triggers
+                a re-encode by itself.
+                \\nshrink: save space. Re-encodes toward a more efficient codec (AV1 > HEVC > H.264) and never downgrades efficiency - a request that
+                would, such as HEVC on an AV1 source, falls back to a same-codec re-encode gated by guard_shrink_bitrate. Anything it cannot make smaller
+                is skipped for that file and logged, not failed.`,
         },
         {
             name: 'codec',
@@ -47,21 +47,21 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['source', 'hevc', 'h264', 'av1'],
             },
-            tooltip: `Target video codec. Efficiency (smaller at equal quality): AV1 > HEVC > H.264.
-                    Live under normalize / shrink; inert under hdr_cleanup_only.
+            tooltip: `Target video codec. Efficiency, meaning smaller at equal quality: AV1 > HEVC > H.264. Live under normalize and shrink; inert under
+                hdr_cleanup_only.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nsource: keep the source codec (re-encode in place when something else forces it - height_cap / hdr_mode / deinterlace - or, under
-                    shrink, a same-codec size pass). This plugin only encodes HEVC/H.264/AV1, so any other source codec - VP9, MPEG-2, VC-1, VVC/H.266 -
-                    can't be kept through a forced transcode, and that file is skipped with a warning to pick hevc/h264/av1.
+                \\nsource (default): keep the source codec, re-encoding in place only when something else forces it - height_cap, hdr_mode or deinterlace,
+                or a same-codec size pass under shrink. This plugin only encodes HEVC, H.264 and AV1, so any other source codec (VP9, MPEG-2, VC-1,
+                VVC/H.266) cannot be kept through a forced transcode; that file is skipped with a warning to pick one.
                 \\nhevc (H.265): the recommended target - roughly half the bitrate of H.264 at the same quality.
-                \\nh264 (AVC): a COMPATIBILITY target only (larger files) for old / weak devices that can't do HEVC.
-                    Forced to 8-bit (10-bit H.264 breaks device support). HDR10 in H.264 plays poorly - prefer hevc for an HDR source.
-                \\nav1: most efficient, but slow on CPU; hardware AV1 needs a very new GPU (Intel Arc, RTX 40-series, RDNA3),
-                    else the libsvtav1 software encoder.
-                \\nDolby Vision needs HEVC: with guard_dv on, a DV source that is already HEVC is kept as HEVC regardless of this setting
-                    (only libx265 carries the DV RPU, and only from an HEVC source).`,
+                \\nh264 (AVC): a COMPATIBILITY target only, and a larger file, for old or weak devices that cannot do HEVC. Forced to 8-bit, since 10-bit
+                H.264 breaks device support. HDR10 plays poorly in H.264, so prefer hevc for an HDR source.
+                \\nav1: the most efficient, but slow on CPU. Hardware AV1 needs a very new GPU (Intel Arc, RTX 40-series, RDNA3); otherwise the libsvtav1
+                software encoder does it.
+                \\nDolby Vision needs HEVC: with guard_dv on, a DV source that is already HEVC stays HEVC whatever you set here, because only libx265
+                carries the DV RPU and only from an HEVC source.`,
         },
         {
             name: 'deinterlace',
@@ -72,24 +72,22 @@ const details = () => ({
                 options: ['disabled', 'enabled'],
             },
             tooltip: `Repair interlaced (combed) video. Old TV material stores each frame as two half-pictures captured a fraction of a second apart,
-                    which show as comb teeth on any modern display. Live under normalize / shrink; inert under hdr_cleanup_only
-                    (a pixel change is never lossless).
-                \\nYou are NOT asked which kind of source it is - that is detected from the actual pixels, because containers routinely mislabel it.
-                    There are two kinds and they need opposite repairs. Material SHOT on video (sport, news, soaps, camcorders) has no original full
-                    frame to recover, so the missing lines are interpolated and every half-picture becomes a frame of its own - 1080i60 comes out as
-                    60fps, keeping all the motion the file actually holds. Material shot on FILM and padded out for broadcast (nearly every film DVD,
-                    much anime) still contains its original frames intact, so those are rebuilt exactly and come back at their own rate (24fps) with
-                    nothing invented.
-                \\nRepairing before any downscale is the whole point: shrinking combed video blends the two half-pictures into each other permanently,
-                    and no later pass can undo it.
-                \\nWorth knowing: shot-on-video material therefore comes out at double the frame rate, because that is what it contains - roughly a
-                    third more bitrate and half again the encode time. Film-originated video is unaffected, and so is anything already progressive, so
-                    on a normal mixed library this applies to a small slice of it.
+                which show as comb teeth on any modern display. Live under normalize and shrink; inert under hdr_cleanup_only, since a pixel change is
+                never lossless.
                 \\n=====
                 \\nActions
                 \\n=====
                 \\ndisabled (default): leave interlaced video alone.
-                \\nenabled: detect and repair, keeping everything the file contains.`,
+                \\nenabled: detect and repair, keeping everything the file contains.
+                \\nRepairing before any downscale is the whole point: shrinking combed video blends the two half-pictures into each other permanently, and
+                no later pass can undo it.
+                \\nYou are not asked which kind of source it is - that is detected from the actual pixels, because containers routinely mislabel it, and
+                the two kinds need opposite repairs. Material SHOT on video (sport, news, soaps, camcorders) has no original full frame to recover, so the
+                missing lines are interpolated and every half-picture becomes a frame of its own: 1080i60 comes out as 60fps, keeping all the motion the
+                file actually holds. Material shot on FILM and padded out for broadcast (nearly every film DVD, much anime) still contains its original
+                frames intact, so those are rebuilt exactly and come back at their own 24fps with nothing invented.
+                \\nSo shot-on-video material comes out at double the frame rate, costing roughly a third more bitrate and half again the encode time.
+                Film-originated and already-progressive video are unaffected, so on a normal mixed library this touches only a small slice of it.`,
         },
         {
             name: 'hdr_mode',
@@ -100,23 +98,23 @@ const details = () => ({
                 options: ['preserve', 'strip_dynamic', 'tonemap_sdr'],
             },
             tooltip: `How to handle HDR. Static HDR10/HLG colour metadata is always carried through any encode automatically; this controls the dynamic
-                    layer (Dolby Vision / HDR10+ / HDR Vivid) and whether to keep HDR at all.
+                layer - Dolby Vision, HDR10+ and HDR Vivid - and whether to keep HDR at all.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\npreserve (recommended): keep HDR as-is. Static HDR10/HLG transcodes normally; Dolby Vision / HDR10+ / HDR Vivid is protected - with
-                    guard_dv on, DV is preserved through a transcode (libx265), and under hdr_cleanup_only nothing is touched.
-                \\nstrip_dynamic: drop just the dynamic layer, keep the base HDR10. When it's the ONLY thing to do (no codec/resolution change) this is
-                    LOSSLESS - a -c:v copy with a bitstream filter (dovi_rpu / hevc_metadata), no quality cost. Needs a base layer: single-layer DV with
-                    no HDR10 base (e.g. profile 5) has nothing to fall back to and is skipped (use tonemap_sdr). HDR Vivid (CUVA) has NO lossless strip
-                    path at ALL - no bitstream filter in this ffmpeg can remove it - so a Vivid file is skipped here too; tonemap_sdr, or a re-encode via
-                    normalize/shrink, is the only way to be rid of it. Folds into a real transcode if codec/height_cap also fire. Overridden per file by
-                    guard_dv (which preserves the DV instead).
-                \\ntonemap_sdr: tonemap ALL HDR (static + dynamic) down to SDR (bt709) - always a real re-encode (a pixel operation, never lossless),
-                    so NOT valid under action=hdr_cleanup_only. For SDR-only playback: correct colour on non-HDR displays, no per-play server
-                    tonemapping. Runs GPU-accelerated on the node's encoder hardware (one consistent look across NVIDIA/Intel/AMD/Apple), CPU fallback
-                    otherwise. Lossy and one-way (HDR master discarded); the only safe flatten for a no-base DV. Follows method_bitdepth (source ->
-                    10-bit SDR; set 8 for max compatibility).`,
+                \\npreserve (default, recommended): keep HDR as it is. Static HDR10/HLG transcodes normally, and Dolby Vision / HDR10+ / HDR Vivid is
+                protected - with guard_dv on, DV survives a transcode via libx265, and under hdr_cleanup_only nothing is touched at all.
+                \\nstrip_dynamic: drop just the dynamic layer and keep the base HDR10. When that is the ONLY thing to do, with no codec or resolution
+                change, it is LOSSLESS - a -c:v copy with a bitstream filter, at no quality cost - and it folds into a real transcode if codec or
+                height_cap also fire. Overridden per file by guard_dv, which preserves the DV instead.
+                \\ntonemap_sdr: tonemap ALL HDR, static and dynamic, down to SDR (bt709). Always a real re-encode, being a pixel operation, so it is NOT
+                valid under hdr_cleanup_only. Use it for SDR-only playback: correct colour on non-HDR displays, and no per-play tonemapping by the server.
+                It runs GPU-accelerated on the node's encoder hardware, for one consistent look across NVIDIA, Intel, AMD and Apple, falling back to the
+                CPU otherwise. Lossy and one-way, since the HDR master is discarded, and it follows method_bitdepth - source gives 10-bit SDR, set 8 for
+                maximum compatibility.
+                \\nstrip_dynamic needs a base layer to fall back to, so it skips two cases: a single-layer DV carrying no HDR10 base (profile 5), and HDR
+                Vivid (CUVA), which no bitstream filter in this ffmpeg can remove at all. For either, tonemap_sdr - or a re-encode under normalize/shrink -
+                is the only way to be rid of the dynamic layer.`,
         },
         {
             name: 'height_cap',
@@ -126,21 +124,21 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['source', '2160', '1440', '1080', '720', '480'],
             },
-            tooltip: `Cap the output resolution by height (only ever downscales, never upscales). The quality tier is re-derived for the new height.
-                    Live under normalize / shrink; inert under hdr_cleanup_only.
-                \\nsource: keep the source resolution.
-                \\n1080: downscale anything taller than 1080p to 1080p (the classic "shrink 4K to 1080p to save space").
-                    720 / 480 likewise. 2160 / 1440 cap only larger sources.`,
+            tooltip: `Cap the output resolution by height. It only ever downscales, never upscales, and the quality tier is re-derived for the new height.
+                Live under normalize and shrink; inert under hdr_cleanup_only.
+                \\nsource (default): keep the source resolution.
+                \\n1080 downscales anything taller to 1080p - the classic "shrink 4K to 1080p to save space". 720 and 480 do the same at their heights,
+                while 2160 and 1440 only cap sources larger than that.`,
         },
         {
             name: 'quality_sd',
             type: 'string',
             defaultValue: '21',
             inputUI: { type: 'text' },
-            tooltip: `Constant-quality target for SD output (height <= 576). HEVC-CRF scale: lower = higher quality / bigger file, higher = smaller.
-                    Typical range 18-28.
-                \\nThis number is used as-is for HEVC and H.264, and shifted onto the AV1 scale automatically. It maps to each encoder's native
-                    quality flag (libx265 -crf, NVENC -cq, QSV -global_quality, VAAPI -qp, ...).`,
+            tooltip: `Constant-quality target for SD output, meaning a height of 576 or less. HEVC-CRF scale: lower gives higher quality and a bigger
+                file, higher gives a smaller one. Typical range 18-28.
+                \\nThe number is used as-is for HEVC and H.264 and shifted onto the AV1 scale automatically, then mapped to whatever the chosen encoder
+                calls it (libx265 -crf, NVENC -cq, QSV -global_quality, VAAPI -qp, and so on).`,
         },
         {
             name: 'quality_720p',
@@ -171,11 +169,11 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['source', '8', '10'],
             },
-            tooltip: `Output bit depth. A PARAMETER, not a trigger: it shapes a re-encode that some OTHER input fired, and never causes one on its own
-                    (a bit-depth change alone is imperceptible and not worth a lossy pass).
-                \\nsource: match the source (10-bit stays 10-bit, 8-bit stays 8-bit). Recommended.
-                \\n8 / 10: force it when a re-encode is already happening. H.264 is always 8-bit regardless; Dolby Vision is always 10-bit
-                    (guard_dv keeps 10-bit even if you set 8).`,
+            tooltip: `Output bit depth. A PARAMETER, not a trigger: it shapes a re-encode some OTHER input fired and never causes one by itself, a
+                bit-depth change alone being imperceptible and not worth a lossy pass.
+                \\nsource (default, recommended): match the source - 10-bit stays 10-bit, 8-bit stays 8-bit.
+                \\n8 or 10 force the depth when a re-encode is already happening. H.264 is always 8-bit regardless, and Dolby Vision is always 10-bit, so
+                guard_dv keeps 10-bit even if you set 8.`,
         },
         {
             name: 'method_encoder',
@@ -185,19 +183,20 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['node', 'node_strict', 'auto', 'cpu'],
             },
-            tooltip: `Which encoder each node uses. To pin a specific encoder to a node (nvenc/qsv/vaapi/videotoolbox/amf), set it at the NODE level -
-                    Tdarr's "GPU worker hardware type" on that node - not here; that respects a mixed fleet instead of forcing one encoder everywhere.
+            tooltip: `Which encoder each node uses. To pin a specific encoder to a node (nvenc, qsv, vaapi, videotoolbox, amf), set it at the NODE level -
+                Tdarr's "GPU worker hardware type" for that node - rather than here, so a mixed fleet keeps its per-node choice instead of being forced
+                onto one encoder everywhere.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nnode (recommended, default): follow the node's own "GPU worker hardware type". If it's set to a specific encoder, use it, else fall
-                    back to the software encoder; if it's "any", pick the best available GPU encoder, else software. CPU workers always use software. So
-                    each node uses the encoder you assigned it - e.g. push jobs onto an idle iGPU (qsv) and keep a discrete GPU free.
-                \\nnode_strict: same as node, but ERROR the file instead of falling back to the software encoder - for when you never want a GPU job
-                    to silently land on the CPU. (Dolby Vision still uses the software encoder to preserve its metadata; CPU workers still use software;
-                    a node hardware type we can't drive, e.g. rkmpp, errors.)
-                \\nauto: ignore the node's hardware type and just pick the best available encoder for the node's hardware, else software.
-                \\ncpu: force the software encoder (libx265/libx264/libsvtav1) everywhere.`,
+                \\nnode (default, recommended): follow the node's own "GPU worker hardware type". Set to a specific encoder it uses that, otherwise
+                falling back to software; set to "any" it picks the best available GPU encoder, else software. CPU workers always use software. So each
+                node uses the encoder you assigned it - push jobs onto an idle iGPU (qsv), say, and keep a discrete GPU free.
+                \\nnode_strict: as node, but ERROR the file rather than fall back to the software encoder, for when a GPU job must never land on the CPU
+                quietly. Dolby Vision still uses software to preserve its metadata, CPU workers still use software, and a node hardware type this plugin
+                cannot drive (rkmpp, for one) errors.
+                \\nauto: ignore the node's hardware type and simply pick the best encoder its hardware offers, else software.
+                \\ncpu: force the software encoder (libx265, libx264, libsvtav1) everywhere.`,
         },
         {
             name: 'method_speed',
@@ -207,9 +206,9 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['slow', 'medium', 'fast'],
             },
-            tooltip: `Encoder speed vs. efficiency. Slower spends more CPU/GPU time for a smaller file at the same quality.
-                \\nMaps to each encoder's native preset (libx265 slow/medium/fast, libsvtav1 4/6/8, NVENC p7/p5/p3, QSV veryslow/medium/veryfast, ...).
-                    VAAPI/VideoToolbox have no comparable knob and ignore this.`,
+            tooltip: `Encoder speed against efficiency. A slower setting spends more CPU or GPU time to reach a smaller file at the same quality.
+                \\nMaps to each encoder's own preset (libx265 slow/medium/fast, libsvtav1 4/6/8, NVENC p7/p5/p3, QSV veryslow/medium/veryfast, and so on).
+                VAAPI and VideoToolbox have no comparable control and ignore this.`,
         },
         {
             name: 'guard_captions',
@@ -225,19 +224,19 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nfalse (default): don't look and don't protect. An HEVC target on a GPU node, or any AV1 target, silently loses the captions - no
-                    hardware HEVC encoder and no AV1 encoder can carry them. An HEVC target on a CPU node keeps them regardless of this setting, and so
-                    does any H.264 target.
-                \\ntrue: check whether this file actually has captions, and if it does, keep them. For an HEVC target that means dropping to the libx265
-                    software encoder (the only HEVC encoder that can re-emit them), which is slower than the GPU. For an AV1 target nothing can save them,
-                    so it warns and continues rather than silently changing your codec.
-                \\nThe check costs one bounded ffprobe read per candidate file - a few seconds, the same whether the file is a clip or a feature. It is
-                    skipped entirely when the answer could not change anything (an H.264 target, or HEVC already on the CPU encoder).
-                \\nA caption channel that is present but carries no text still counts as captions here, because telling the two apart needs a full decode.
-                    That costs a needless CPU encode, never data. Running sub_worker's embedded_cc over the file first settles it permanently: it records
-                    what it found, and this guard then stops re-checking that file.
-                \\nCaptions are better handled by extracting them to a real subtitle track - run sub_worker BEFORE this plugin. Once it has, this guard
-                    steps aside and the leftover bitstream copy is removed on the next re-encode, so you don't end up with the same captions twice.`,
+                \\nfalse (default): do not look and do not protect. An HEVC target on a GPU node, or any AV1 target, loses the captions silently - no
+                hardware HEVC encoder and no AV1 encoder can carry them. An HEVC target on a CPU node keeps them regardless of this setting, and so does
+                any H.264 target.
+                \\ntrue: check whether this file really has captions and, if it does, keep them. For an HEVC target that means dropping to the libx265
+                software encoder, the only HEVC encoder that can re-emit them, which is slower than the GPU. For an AV1 target nothing can save them, so
+                it warns and continues rather than silently changing your codec.
+                \\nCaptions are better handled by lifting them into a real subtitle track - run sub_worker BEFORE this plugin. Once it has, this guard
+                steps aside and the leftover bitstream copy is removed on the next re-encode, so you do not end up with the same captions twice.
+                \\nThe check costs one bounded ffprobe read per candidate file, a few seconds whether the file is a clip or a feature, and is skipped
+                entirely when the answer could not change anything - an H.264 target, or HEVC already on the CPU encoder.
+                \\nA caption channel that is present but carries no text still counts as captions here, since telling the two apart needs a full decode.
+                That costs a needless CPU encode, never data. Running sub_worker's embedded_cc over the file settles it permanently: it records what it
+                found, and this guard then stops re-checking that file.`,
         },
         {
             name: 'guard_dv',
@@ -251,15 +250,15 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\ntrue (default): when a DV source is re-encoded, carry the DV RPU through so the output stays Dolby Vision. Only an HEVC source
-                    qualifies - libx265 is the sole encoder that carries the RPU and it can only take it from HEVC, so DV in any other codec (AV1, say)
-                    is not protected by this. For a source that does qualify it forces the libx265 software encoder (every hardware HEVC encoder drops
-                    the RPU, so a GPU/auto node drops to CPU for these files); forces the HEVC codec (overriding your codec choice) and 10-bit;
-                    overrides hdr_mode=strip_dynamic/tonemap_sdr for DV files (the DV is preserved, with a warning). Neither HDR10+ nor HDR Vivid can
-                    be carried (no ffmpeg-native path for either). A no-base DV that libx265 can't re-encode (e.g. an IPT-C2 profile 5) is skipped
-                    rather than corrupted.
-                \\nfalse: don't protect DV - a transcode that would destroy it still gets skipped under preserve, but strip_dynamic/tonemap_sdr are
-                    honoured (the DV layer is dropped/flattened as asked).`,
+                \\ntrue (default): carry the DV RPU through a re-encode so the output stays Dolby Vision. To manage that it forces the libx265 software
+                encoder, the HEVC codec (overriding your codec choice) and 10-bit, and it overrides hdr_mode=strip_dynamic or tonemap_sdr on DV files,
+                preserving the DV with a warning.
+                \\nfalse: do not protect DV. A transcode that would destroy it is still skipped under hdr_mode=preserve, but strip_dynamic and tonemap_sdr
+                are honoured, and the DV layer is dropped or flattened as asked.
+                \\nOnly an HEVC source qualifies: libx265 is the sole encoder that carries the RPU, and only from HEVC, so DV in any other codec (AV1,
+                say) is not protected here. Since every hardware HEVC encoder drops the RPU, a GPU or auto node falls back to the CPU for these files.
+                \\nNeither HDR10+ nor HDR Vivid can be carried, there being no ffmpeg-native path for either. A no-base DV that libx265 cannot re-encode,
+                such as an IPT-C2 profile 5, is skipped rather than corrupted.`,
         },
         {
             name: 'guard_lossless',
@@ -274,27 +273,28 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\ntrue (default): skip the whole file when the source video is one of those codecs and anything would re-encode it - normalize,
-                    shrink, height_cap and tonemap_sdr alike. Every encode here is lossy AND lands 4:2:0 at 8 or 10 bit, so a 4:2:2 / 4:4:4 / 12-bit
-                    master loses chroma resolution and bit depth on top of the compression: detail an intermediate format exists to keep, which no later
-                    pass can bring back.
-                \\nfalse: treat a lossless source like any other and convert it. Choose this deliberately - it replaces an editing/archival master
-                    with a lossy delivery encode.
-                \\nNote for an mp4 TARGET this rarely comes up: most of these codecs cannot be stored in mp4 at all, so clean_and_remux (which runs
-                    first) stops the file before video_clean sees it.`,
+                \\ntrue (default): skip the whole file when the source video is one of those codecs and anything would re-encode it - normalize, shrink,
+                height_cap and tonemap_sdr alike.
+                \\nfalse: treat a lossless source like any other and convert it. Choose this deliberately, since it replaces an editing or archival master
+                with a lossy delivery encode.
+                \\nWhy it is worth guarding: every encode here is lossy AND lands 4:2:0 at 8 or 10 bit, so a 4:2:2, 4:4:4 or 12-bit master loses chroma
+                resolution and bit depth on top of the compression - exactly the detail an intermediate format exists to keep, and no later pass can bring
+                it back.
+                \\nWith an mp4 TARGET this rarely comes up: most of these codecs cannot be stored in mp4 at all, so clean_and_remux, which runs first,
+                stops the file before video_clean ever sees it.`,
         },
         {
             name: 'guard_shrink_bitrate',
             type: 'string',
             defaultValue: '1000',
             inputUI: { type: 'text' },
-            tooltip: `Applies to action=shrink ONLY: skip the size re-encode when the source video bitrate is already below this (kbps). 0 disables the
-                    guard; the default 1000 leaves genuinely lean sources alone (rarely triggers - most content sits well above 1000 kbps at any
-                    resolution).
-                \\nShrink uses constant quality, which can't predict the output size, so re-encoding an already-lean source can GROW it - this floor
-                    prevents that.
-                \\nDoes NOT apply to normalize (a compatibility conversion must run regardless of size). Also exempt even under shrink (these can't
-                    grow a file): a height_cap downscale, tonemap_sdr, and the lossless strip_dynamic copy.`,
+            tooltip: `Applies to action=shrink ONLY: skip the size re-encode when the source video bitrate is already below this, in kbps. 0 disables the
+                guard. The default of 1000 leaves genuinely lean sources alone and rarely triggers, most content sitting well above 1000 kbps at any
+                resolution.
+                \\nWhy: shrink works at constant quality, which cannot predict the output size, so re-encoding an already-lean source can GROW it. This
+                floor prevents that.
+                \\nnormalize ignores this entirely, a compatibility conversion having to run whatever the size. Three things are exempt even under shrink,
+                none of which can grow a file: a height_cap downscale, tonemap_sdr, and the lossless strip_dynamic copy.`,
         },
     ],
 });

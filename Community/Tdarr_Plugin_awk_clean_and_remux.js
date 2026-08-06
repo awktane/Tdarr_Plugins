@@ -27,7 +27,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.19.0',
+    Version: '4.19.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -38,30 +38,26 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['mkv', 'mp4'],
             },
-            tooltip: `Specify output container of file. Any streams that are not supported by the output container will be removed.
+            tooltip: `Output container. Any stream the target cannot carry is converted or removed, so this choice decides which of your subtitles survive.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nmkv removes ttml, xsub, dvb_teletext, and any other subtitle format the mkv muxer can't carry AND ffmpeg can't read
-                    as text. mov_text is converted to srt for compatibility, and a closed-caption (eia_608) track to plain text.
-                \\nmp4 additionally removes the image-based subtitles mkv keeps (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle), plus
-                    arib_caption and hdmv_text_subtitle. Text-based subtitles (subrip, srt, ass, ssa, webvtt, text, eia_608) are
-                    converted to mov_text - the exception is a STYLED ass/ssa, which is exported as a font bundle instead of being
-                    flattened. Genpts may be required to fix timestamps. HEVC video is tagged hvc1 so Apple/QuickTime can play it.`,
+                \\nmkv (default): keeps almost everything. Removes ttml, xsub and dvb_teletext, plus any other subtitle format the mkv muxer cannot carry
+                and ffmpeg cannot read as text. mov_text becomes srt, and a closed-caption (eia_608) track becomes plain text.
+                \\nmp4: also removes the image-based subtitles mkv keeps (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle), plus arib_caption and
+                hdmv_text_subtitle. Text subtitles (subrip, srt, ass, ssa, webvtt, text, eia_608) become mov_text - except a STYLED ass/ssa, which is
+                exported as a font bundle rather than flattened. HEVC video is tagged hvc1 so Apple and QuickTime can play it.`,
         },
         {
             name: 'language_fill',
             type: 'string',
             defaultValue: '',
             inputUI: { type: 'text' },
-            tooltip: `Specify language tag here to force upon subtitle/audio tracks that are missing a
-                    language tag. Blank language or und tracks will be filled with this language tag.
-                \\nTakes precedence over language_sub if track language is und or blank.
-                \\nMust follow ISO-639-2 3 letter format. https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes
-                \\nExample:\\n
-                    eng
-                \\nExample:\\n
-                    jpn`,
+            tooltip: `Force this language onto audio and subtitle tracks that carry no language tag, or are tagged "und". Blank (default) leaves them as
+                they are.
+                \\nTakes precedence over language_sub when a track's language is blank or und.
+                \\nMust be an ISO-639-2 3-letter code: https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes
+                \\nExample:\\neng`,
         },
         {
             name: 'language_fill_mode',
@@ -71,38 +67,32 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['single-or-error', 'force-any'],
             },
-            tooltip: `Only applies when language_fill is set. It decides what to do when language_fill would
-                    assign the SAME language to more than one untagged audio or subtitle stream of a type.
-                \\nThose streams can't be told apart by language — the only way to know is by listening — so filling them
-                    identically lets a later plugin treat them as duplicates and remove one, causing silent content loss (e.g.
-                    deleting the only Japanese track because it was tagged the same as English). With language_fill blank the
-                    streams keep "und" (audio_clean's dedup skips und, so nothing collides) and this setting does nothing.
-                \\nThis is not the "which track is the original language" check — for that, enable
-                    guard_audio_language. This runs before the remux, so any abort costs no mux.
+            tooltip: `Only applies when language_fill is set. Decides what to do when language_fill would give the SAME language to more than one untagged
+                audio or subtitle stream of a type.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nIf single-or-error - (Default) a single untagged stream of a type is filled and
-                    kept; two or more abort the file to the error queue. Tag them manually and requeue.
-                \\nIf force-any       - fill and keep them all, however many there are, never aborting (accepts the duplicate-collision risk described above).`,
+                \\nsingle-or-error (default) - a single untagged stream of a type is filled and kept; two or more abort the file to the error queue. Tag
+                them manually and requeue.
+                \\nforce-any - fill and keep them all, however many there are, never aborting.
+                \\nWhy the default stops: identically tagged streams cannot be told apart by language - only by listening - so a later plugin can treat
+                them as duplicates and delete one, silently losing content (e.g. dropping the only Japanese track because it was tagged as English). The
+                abort happens before the remux, so it costs no mux.
+                \\nThis is not the "which track is the original language" check - that is guard_audio_language.`,
         },
         {
             name: 'language_sub',
             type: 'string',
             defaultValue: '',
             inputUI: { type: 'text' },
-            tooltip: `Specify language tags here for the subtitle tracks you'd like to keep. If blank then no tracks will be removed.
-                \\nStreams with no language tag are treated as though they had language_fill as their language or "und" if language_fill isn't set
-                \\nOne form is enough - en, eng, or English all match the same language (including
-                    region variants like en-US), so you don't need to list every variant.
-                \\nExample:\\n
-                    eng,fra
-                    \\nEnglish and French.
-                \\nThe special codes und (undefined), mul (multiple languages) and mis (no language
-                    code) are matched literally - include them if you want to keep such tracks.
-                \\nExample:\\n
-                    eng,und
-                    \\nEnglish and both subtitles marked as und or with no language set`,
+            tooltip: `Subtitle languages to KEEP, comma-separated. Blank (default) keeps every subtitle.
+                \\nOne form is enough - en, eng, or English all match the same language, region variants like en-US included.
+                \\nA track with no language tag counts as language_fill's value, or "und" when language_fill is blank.
+                \\nExample:\\neng,fra
+                \\nKeep English and French subtitles only.
+                \\nThe special codes und (undefined), mul (multiple languages) and mis (no language code) match literally - list them to keep those tracks.
+                \\nExample:\\neng,und
+                \\nKeep English, plus anything marked und or carrying no language at all.`,
         },
         {
             name: 'tag_disposition',
@@ -112,13 +102,17 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['disabled', 'audio', 'subtitle', 'both'],
             },
-            tooltip: `Import disposition keywords found in a track's title into the real ffmpeg disposition
-                    flags. Choose which stream types to apply to: disabled, audio, subtitle, or both.
-                \\nScans each title for words such as Commentary, Descriptive, SDH, Forced, Lyrics, Dub, and Original (and similar)
-                    and adds the matching ffmpeg disposition flag when it isn't already set. Existing flags are preserved.
-                \\nAudio surfaces Commentary/Descriptive/Dub/Original; subtitle surfaces Commentary/Descriptive/SDH/Forced/Lyrics. This makes the
-                    flags the source of truth. Pair it with tag_title so title-only keywords are captured into the flags before the title is rebuilt.
-                \\nDoes not touch the default flag - that is managed by track order in the stream ordering plugin.`,
+            tooltip: `Turn role keywords found in a track's TITLE into real ffmpeg disposition flags, so the flags become the source of truth rather than
+                the text. A flag is only ever added, never cleared.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\ndisabled (default): leave dispositions alone.
+                \\naudio: surface Commentary, Descriptive, Dub and Original on audio tracks.
+                \\nsubtitle: surface Commentary, Descriptive, SDH, Forced and Lyrics on subtitle tracks.
+                \\nboth: apply to audio and subtitle tracks.
+                \\nPair it with tag_title so title-only keywords reach the flags before the title is rebuilt. The default flag is untouched here - track
+                order in the stream ordering plugin owns that.`,
         },
         {
             name: 'tag_language',
@@ -128,19 +122,18 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['disabled', 'invalid', 'strict'],
             },
-            tooltip: `Standardise the language tag on tracks that already HAVE one (to set a language on UNtagged tracks use
-                    language_fill instead). Fixes tags that would be lost or misread - e.g. the full word "English" becomes "eng", and a
-                    2-letter code like "en" becomes 3-letter when the output is mp4 (mp4 cannot store 2-letter codes and silently drops
-                    the language on remux). Applies to video, audio and subtitle streams. Output form follows method_tag_language.
+            tooltip: `Standardise the language tag on tracks that already HAVE one - to set a language on UNtagged tracks use language_fill instead.
+                Applies to video, audio and subtitle streams; the form written follows method_tag_language.
                 \\n=====
                 \\nActions
                 \\n=====
                 \\ndisabled: never change an existing language tag.
-                \\ninvalid (default): only fix tags that are non-standard or won't store correctly in the output container - spelled-out names, wrong
-                    case, and 2-letter/region codes headed to mp4. Tags that already store cleanly (e.g. eng, or en/fre into mkv) are left alone.
-                \\nstrict: rewrite every language tag to the exact method_tag_language standard, even valid ones
-                    (en becomes eng, and fre/fra are folded to your chosen bibliographic/terminologic form).
-                \\nUndetermined / non-language codes (und, mul, zxx, mis) are always left untouched.`,
+                \\ninvalid (default): fix only the tags that are non-standard or would not survive the output container - spelled-out names, wrong case,
+                and 2-letter or region codes headed for mp4. Tags that already store cleanly (eng, or en/fre into mkv) are left alone.
+                \\nstrict: rewrite every language tag to the method_tag_language standard, valid ones included - en becomes eng, and fre/fra fold to your
+                chosen form.
+                \\nWhy it matters: mp4 cannot store a 2-letter code and silently drops the language on remux, so an "en" track would come out with no
+                language at all. Undetermined and non-language codes (und, mul, zxx, mis) are always left untouched.`,
         },
         {
             name: 'tag_title',
@@ -150,13 +143,18 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['disabled', 'audio', 'subtitle', 'both'],
             },
-            tooltip: `Rebuild stream titles from what the track actually is. Choose which stream types to apply to: disabled, audio, subtitle, or both.
-                \\nAudio: builds a channel-based title (7.1, 6.1, 5.1, 5.0, 4.0, 3.1, 3.0, 2.1, Stereo, Mono)
-                    with any disposition roles appended, e.g. "5.1 - Commentary" or "5.1 -> 2.0 - Descriptive".
-                \\nSubtitle: only titles we own (empty or already just role words) are set to the role
-                    tag(s), e.g. "SDH" or "Forced Commentary"; custom subtitle titles are left untouched.
-                \\nRole tags come from the track's real disposition flags and title keywords (Commentary, Descriptive,
-                    SDH, Forced, Lyrics, Dub, Original). The default flag is intentionally not surfaced.`,
+            tooltip: `Rebuild stream titles from what the track actually is.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\ndisabled (default): leave titles alone.
+                \\naudio: build a channel-based title - 7.1, 6.1, 5.1, 5.0, 4.0, 3.1, 3.0, 2.1, Stereo or Mono - with any roles appended, e.g.
+                "5.1 - Commentary" or "5.1 -> 2.0 - Descriptive".
+                \\nsubtitle: set the title to its role tags, e.g. "SDH" or "Forced Commentary". Only titles this plugin owns are rewritten - an empty one,
+                or one that is already nothing but role words - so a custom subtitle title is left untouched.
+                \\nboth: apply to audio and subtitle tracks.
+                \\nRole tags come from the track's real disposition flags and title keywords (Commentary, Descriptive, SDH, Forced, Lyrics, Dub, Original).
+                The default flag is deliberately not surfaced.`,
         },
         {
             name: 'remove_busytitle',
@@ -166,10 +164,9 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['false','true'],
             },
-            tooltip: `Should audio/subtitle metadata titles be removed if they contain more than 3 periods?
-                    This removes most invalid or unnecessary titles that are added by some sources.
-                \\nExample:\\n
-                This.Title.Has.Too.Many.Periods would have title set to blank`,
+            tooltip: `Blank the title of any audio or subtitle track whose title holds more than 3 periods. That clears most of the junk titles some
+                sources write, which are usually the release filename rather than a description of the track.
+                \\nExample:\\nThis.Title.Has.Too.Many.Periods is blanked`,
         },
         {
             name: 'remove_comments',
@@ -179,7 +176,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['false','true'],
             },
-            tooltip: `Should comments be removed from all streams? These are not usually shown by players and often contain unnecessary information.`,
+            tooltip: `Remove the comment tag from every stream. Players rarely show it and it usually carries nothing worth keeping.`,
         },
         {
             name: 'remove_imagesubs',
@@ -189,26 +186,25 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['unsupported', 'all', 'export'],
             },
-            tooltip: `What to do with image-based (bitmap) subtitles - hdmv_pgs_subtitle (Blu-ray PGS), dvd_subtitle
-                    (VobSub), dvb_subtitle. They can't be searched, restyled, or turned into text without OCR.
+            tooltip: `What to do with image-based (bitmap) subtitles - hdmv_pgs_subtitle (Blu-ray PGS), dvd_subtitle (VobSub) and dvb_subtitle. They are
+                pictures, so they cannot be searched or restyled, and cannot become text without OCR.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nunsupported (default): keep them where the container carries them (mkv), drop them only where it can't (mp4 can't store these).
-                \\nall: remove all image-based subtitles from any container (use when you only want text subtitles).
-                \\nexport: save each image subtitle to a hidden sidecar next to the video (PGS -> ".<name>.<lang>.sup", VobSub/DVB ->
-                    ".<name>.<lang>.mks") and then remove it. The leading dot keeps Plex/Jellyfin from indexing it; run an external OCR tool
-                    on the sidecars to produce .srt, then reimport with awk_sub_worker. One-way - these are never reimported by this plugin.
-                \\nRemote-node caveat: the sidecar lands next to the source file, which reaches the server only if this node shares the
-                    library filesystem. On an unmapped/remote node Tdarr copies back the transcoded video but NOT the sidecar, so the image
-                    subtitle is lost (and image subs can't be OCR-recovered once gone) - run export only on filesystem-sharing nodes.
-                \\nEmby caveat: Emby does NOT skip dot-prefixed files, so an exported sidecar may surface as a stray library item (it
-                    ignores .sup outright). This matters most for the xsub .avi: that is a full VIDEO container holding no video, so
-                    Emby indexes it as a broken zero-duration title, where a stray .mks is merely an odd entry. On Emby, add a
-                    .embyignore file (4.9+) listing ".*" in the library root, or OCR and delete the sidecars before the next scan.
-                \\nxsub (DivX) is ALWAYS removed whatever this is set to - no container can carry it - but export
-                    still saves it first, to a ".<name>.<lang>.avi" (AVI is the only format that holds xsub).
-                \\nText subtitles are never affected. ttml is kept on mp4 (it stores as stpp) and removed only on mkv, which has no CodecID for it.`,
+                \\nunsupported (default): keep them wherever the container can carry them (mkv), and drop them only where it cannot (mp4).
+                \\nall: remove every image-based subtitle from any container. Use this when you only want text subtitles.
+                \\nexport: save each one to a hidden sidecar beside the video (PGS -> ".<name>.<lang>.sup", VobSub/DVB -> ".<name>.<lang>.mks") and then
+                remove it. The leading dot keeps Plex and Jellyfin from indexing it. Run an external OCR tool over the sidecars to produce .srt, then
+                reimport with awk_sub_worker. One-way - this plugin never reimports them.
+                \\nxsub (DivX) is ALWAYS removed whatever this is set to, since no container can carry it, but export still saves it first to a
+                ".<name>.<lang>.avi" - AVI being the only format that holds xsub.
+                \\nRun export only on a node that shares the library filesystem. The sidecar is written beside the source file, and on an unmapped or
+                remote node Tdarr copies the transcoded video back but NOT the sidecar - so the subtitle is lost, and an image subtitle cannot be
+                recovered once gone.
+                \\nOn Emby, exported sidecars need care: Emby does not skip dot-prefixed files, so a stray .mks or .avi may surface as a library item
+                (.sup it ignores outright). The xsub .avi is the worst case, since Emby reads it as a broken zero-duration title. Add a .embyignore file
+                (4.9+) listing ".*" in the library root, or OCR and delete the sidecars before the next scan.
+                \\nText subtitles are never affected. ttml is kept on mp4, where it stores as stpp, and removed only on mkv, which has no CodecID for it.`,
         },
         {
             name: 'remove_sub_sdh',
@@ -218,11 +214,15 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['disabled', 'enabled'],
             },
-            tooltip: `Remove SDH / Closed Caption subtitles (for the deaf/hard-of-hearing). Detected by
-                    the real ffmpeg disposition flag or by keywords in the title/handler/description.
-                \\nSafety: a track is only removed when a "plain" subtitle of the same language survives - one carrying no commentary/descriptive/SDH/lyrics
-                    role, in a format the output container keeps and not stripped by remove_imagesubs. So extras are removed, never the last usable track.
-                \\nAudio-description (visual_impaired) audio is not handled here - audio_clean's downmix_secondary owns it, along with commentary and M&E.`,
+            tooltip: `Remove SDH / Closed Caption subtitles - the ones written for deaf and hard-of-hearing viewers. Detected from the real ffmpeg
+                disposition flag, or from keywords in the title, handler or description.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\ndisabled (default): keep them.
+                \\nenabled: remove them, but only where a plain subtitle of the same language survives - one carrying no commentary, descriptive, SDH or
+                lyrics role, in a format the output container keeps and not stripped by remove_imagesubs. So extras go, never your last usable track.
+                \\nAudio description (visual_impaired audio) is not handled here - audio_clean's downmix_secondary owns it, along with commentary and M&E.`,
         },
         {
             name: 'method_tag_language',
@@ -232,19 +232,19 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['639-2/b', '639-2/t', 'container', 'bcp47'],
             },
-            tooltip: `Which language-code standard tag_language writes (only takes effect when tag_language is not
-                    disabled). Affects mainly the ~20 languages with two 3-letter codes (e.g. French fre/fra, German
-                    ger/deu) plus the 2-vs-3-letter choice; you can still type any form in the language lists regardless.
-                \\nBy convention Matroska (mkv) uses ISO-639-2/B and mp4's mdhd box uses ISO-639-2/T; both containers accept either form.
+            tooltip: `Which language-code standard tag_language writes. Only takes effect while tag_language is not disabled, and you can still type any
+                form you like in the language lists regardless.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\ncontainer (default): write each container its native form - 2-letter (en, fr) for
-                    mkv, 3-letter terminologic (eng, fra) for mp4. Most spec-accurate per container.
-                \\n639-2/t: terminologic 3-letter codes everywhere - fra, deu, zho (matches mp4's mdhd; 3-letter is also the common mkv convention).
+                \\ncontainer (default): give each container its native form - 2-letter (en, fr) for mkv, 3-letter terminologic (eng, fra) for mp4. The
+                most spec-accurate per container.
+                \\n639-2/t: terminologic 3-letter codes everywhere - fra, deu, zho. Matches mp4's mdhd box, and 3-letter is the common mkv convention too.
                 \\n639-2/b ("mkv classic"): bibliographic 3-letter codes everywhere - fre, ger, chi.
-                \\nbcp47: like container on mp4 (3-letter terminologic) but on mkv keeps the full BCP-47 tag - a region (ISO-3166) subtag like
-                    pt-BR/es-419 or a script (ISO-15924) subtag like zh-Hans; mp4 can't store a region so it still folds to 3-letter (por).`,
+                \\nbcp47: like container on mp4, but on mkv keeps the full BCP-47 tag - a region subtag such as pt-BR or es-419, or a script subtag such
+                as zh-Hans. mp4 cannot store a region, so there it still folds to 3-letter (por).
+                \\nThis mainly affects the ~20 languages that have two 3-letter codes (French fre/fra, German ger/deu), plus the 2-vs-3-letter choice. By
+                convention mkv uses ISO-639-2/B and mp4's mdhd box uses ISO-639-2/T, though both containers accept either.`,
         },
         {
             name: 'method_unmuxable',
@@ -254,22 +254,22 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['error', 'drop', 'mkv_fallback'],
             },
-            tooltip: `What to do when a stream's codec CANNOT be stored in the target container. Without this the remux dies deep
-                    inside ffmpeg on an opaque "Could not find tag for codec ..." with nothing in the log saying which stream or why.
-                \\nmp4 refuses a long list that mkv accepts: MLP, WMA, most ADPCM, A-law / mu-law / 8-bit PCM, LATM AAC (what every DVB and
-                    broadcast capture carries), VP8, Theora, ProRes, DNxHD, FFV1, HuffYUV, MagicYUV, UtVideo, v210, DV, Cinepak, H.263, the WMV
-                    / MS-MPEG-4 family and the QuickTime-only codecs. TrueHD mp4 stores only as experimental, so a TrueHD track arriving from
-                    another container is gated the same way; one that is ALREADY in an mp4-family file is kept as it stands. A few fit in
-                    NEITHER container - AC-4, Blu-ray PCM, SMPTE 302M, IMA-QT ADPCM, Nellymoser - so for those no container choice is a way out.
+            tooltip: `What to do when a stream's codec CANNOT be stored in the target container. Without this the remux dies deep inside ffmpeg on an
+                opaque "Could not find tag for codec ...", with nothing in the log saying which stream or why.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nerror (default): stop and quarantine the file, naming the codec and the container. Nothing is changed, so the decision
-                    stays yours - the safest option, and the only one that never loses a track nor overrides your container choice.
-                \\ndrop: remove the offending streams and remux the rest. For a track you are happy to lose. Removing
-                    every video stream, or every audio stream, still fails the file rather than writing a stump.
-                \\nmkv_fallback: keep THIS file in mkv with every stream intact - your container setting still applies to every
-                    other file. A codec mkv cannot store either falls back to error, since there is nothing to fall back TO.`,
+                \\nerror (default): stop and quarantine the file, naming the codec and the container. Nothing is changed, so the decision stays yours -
+                the safest option, and the only one that never loses a track nor overrides your container choice.
+                \\ndrop: remove the offending streams and remux the rest, for a track you are happy to lose. Removing every video stream, or every audio
+                stream, still fails the file rather than writing a stump.
+                \\nmkv_fallback: keep THIS file in mkv with every stream intact; your container setting still applies to every other file. A codec mkv
+                cannot store either falls back to error, there being nothing to fall back TO.
+                \\nmp4 refuses a long list that mkv accepts: MLP, WMA, most ADPCM, A-law / mu-law / 8-bit PCM, LATM AAC (what every DVB and broadcast
+                capture carries), VP8, Theora, ProRes, DNxHD, FFV1, HuffYUV, MagicYUV, UtVideo, v210, DV, Cinepak, H.263, the WMV / MS-MPEG-4 family, and
+                the QuickTime-only codecs. TrueHD stores in mp4 only as experimental, so a TrueHD track arriving from another container is gated the same
+                way, while one ALREADY in an mp4-family file is kept as it stands.
+                \\nA few fit in NEITHER container - AC-4, Blu-ray PCM, SMPTE 302M, IMA-QT ADPCM, Nellymoser - so for those no container choice is a way out.`,
         },
         {
             name: 'guard_audio_language',
@@ -279,15 +279,19 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['disabled', 'enabled'],
             },
-            tooltip: `An EARLY WARNING for multi-language files whose original language isn't marked. audio_clean is what actually keeps or drops audio
-                    by language, but it can only trust a track marked 'original' - it has no way to tell which of several untagged languages is the real
-                    original. This checks for that risk here, BEFORE the remux, so a file that needs your attention costs you nothing to find out about.
-                \\nWhen enabled: if the file has MORE THAN ONE audio language among its genuine (non-commentary/descriptive) tracks and NO
-                    audio track is marked original (the ffmpeg 'original' disposition flag, or an "original" keyword in the title/handler), the
-                    file is aborted to the error queue. Mark the original track and requeue - audio_clean's guard_original can then protect it.
-                \\nLanguages are compared folded, so en/eng/English/en-US count as one; an untagged track counts as the language language_fill would give
-                    it, or "und" when language_fill is blank. A file with a single audio language, or one that already marks its original, passes untouched.
-                \\nIf disabled - (Default) no check; audio_clean handles whatever it finds.`,
+            tooltip: `An EARLY WARNING for multi-language files whose original language is not marked. It runs before the remux, so a file that needs your
+                attention costs nothing to find.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\ndisabled (default): no check. audio_clean handles whatever it finds.
+                \\nenabled: abort the file to the error queue when it carries MORE THAN ONE audio language among its genuine (non-commentary,
+                non-descriptive) tracks and NO audio track is marked original - either the ffmpeg 'original' disposition flag or an "original" keyword in
+                the title or handler. Mark the original track and requeue; audio_clean's guard_original can then protect it.
+                \\nWhy it is worth catching early: audio_clean is what keeps or drops audio by language, but it can only trust a track marked original -
+                it has no way to tell which of several untagged languages is the real one.
+                \\nLanguages are compared folded, so en/eng/English/en-US count as one, and an untagged track counts as whatever language_fill would give
+                it, or "und" when that is blank. A file with a single audio language, or one that already marks its original, passes untouched.`,
         },
         {
             name: 'recover_bad_data',
@@ -297,17 +301,16 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['disabled', 'light', 'aggressive'],
             },
-            tooltip: `Push a structurally damaged file through: visible/audible glitches, the job aborting on this file, won't seek, or a wrong duration.
-                 \\nTry light first; if it doesn't help switch to aggressive.
-                 \\n=====
-                 \\nActions
-                 \\n=====
-                 \\ndisabled: no data recovery.
-                 \\nlight (risk-free): -fflags +ignidx and -err_detect ignore_err - ignores a broken/corrupt index (AVI idx1,
-                     MOV/MP4 sample tables) and keeps reading past detected errors instead of failing. Drops no frames.
-                 \\naggressive: additionally -fflags +discardcorrupt - drops packets flagged
-                     corrupt, which may cause small video/audio blips where the damage is.
-                 \\nThe mode actually applied is recorded in an awk_recovered tag. Recovery re-runs only when a recover_bad_* mode changes, then settles.`,
+            tooltip: `Push a structurally damaged file through: visible or audible glitches, the job aborting on this file, video that will not seek, or a
+                wrong duration. Try light first, and move to aggressive only if it does not help.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\ndisabled (default): no data recovery.
+                \\nlight (risk-free): -fflags +ignidx and -err_detect ignore_err. Ignores a broken or corrupt index (AVI idx1, MOV/MP4 sample tables) and
+                keeps reading past detected errors instead of failing. Drops no frames.
+                \\naggressive: also -fflags +discardcorrupt, which drops packets flagged corrupt. Expect small video or audio blips wherever the damage is.
+                \\nRecovery re-runs only when you change one of the recover_bad_* settings, then settles - it will not reprocess the file on every pass.`,
         },
         {
             name: 'recover_bad_timestamps',
@@ -317,20 +320,19 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['disabled', 'light', 'aggressive'],
             },
-            tooltip: `Fix a broken presentation timeline: stutter, audio/video desync, or ffmpeg errors like "first pts value must
-                    set", "Timestamps are unset in a packet for stream", "Non-monotonous DTS in output stream", or "DTS out of order".
-                 \\nTry light first; if the error persists switch to aggressive.
-                 \\n=====
-                 \\nActions
-                 \\n=====
-                 \\ndisabled: no timestamp recovery.
-                 \\nlight (risk-free): -fflags +genpts and -avoid_negative_ts make_zero - regenerates
-                     missing PTS and shifts negative start times to zero. Touches no frame data.
-                 \\naggressive: additionally -fflags +igndts - ignores the source DTS and fully rebuilds the timeline
-                     (fixes "Non-monotonous DTS"). Can produce odd results, so only use it if light didn't help.
-                 \\nThe mode actually applied is recorded in an awk_recovered tag. Recovery re-runs only when a recover_bad_* mode
-                     changes, then settles (it won't reprocess every pass). Container-forced timestamp fixes still always apply,
-                     for the whole MPEG-TS family (ts/m2ts/mts/m2t), the whole MPEG-PS family (mpg/mpeg/vob/evo), and avi.`,
+            tooltip: `Fix a broken presentation timeline: stutter, audio and video drifting out of sync, or ffmpeg errors such as "first pts value must
+                set", "Timestamps are unset in a packet for stream", "Non-monotonous DTS in output stream" or "DTS out of order". Try light first, and
+                move to aggressive only if the error persists.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\ndisabled (default): no timestamp recovery.
+                \\nlight (risk-free): -fflags +genpts and -avoid_negative_ts make_zero. Regenerates missing PTS and shifts negative start times to zero.
+                Touches no frame data.
+                \\naggressive: also -fflags +igndts, which ignores the source DTS and rebuilds the timeline outright - this is what fixes "Non-monotonous
+                DTS". It can produce odd results, so only reach for it if light did not help.
+                \\nRe-runs only on a recover_bad_* change, as for recover_bad_data. Container-forced timestamp fixes apply regardless, for the whole
+                MPEG-TS family (ts/m2ts/mts/m2t), the whole MPEG-PS family (mpg/mpeg/vob/evo), and avi.`,
         },
     ],
 });

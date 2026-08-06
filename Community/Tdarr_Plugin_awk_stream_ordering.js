@@ -11,7 +11,7 @@ const details = () => ({
         descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the
         fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart -
         rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time it's needed).\n`,
-    Version: '4.16.2',
+    Version: '4.16.3',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -22,18 +22,19 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['language', 'original', 'default', 'descriptive'],
             },
-            tooltip: `Which audio track sorts first (this key sits above every other audio key).
+            tooltip: `Which audio track sorts first. This key sits above every other audio key.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nlanguage (default): normal ordering - order_language decides, and the first sorted track becomes the sole default.
-                \\noriginal: promote the original-language track (ffmpeg 'original' disposition, or an 'original' title) above language, so a foreign film keeps
-                its original audio first (and default) instead of a dub. Falls back to language ordering when no track is flagged original.
-                \\ndefault: promote the track already flagged default (ffmpeg 'default' disposition) above language, so the source's chosen default audio stays
-                first. If several tracks are flagged default (e.g. a source track and a downmix that inherited the flag), the highest-priority one by the normal
-                ordering leads and becomes the sole default. Falls back to language ordering when no track is flagged default.
-                \\ndescriptive: promote the descriptive (audio-description) track above language. Falls back to language ordering when no descriptive track is
-                present. Note: the first sorted track becomes the sole default, so this makes the description the default audio.`,
+                \\nlanguage (default): normal ordering - order_language decides.
+                \\noriginal: promote the original-language track (the ffmpeg 'original' disposition, or an 'original' title) above language, so a foreign
+                film leads with its original audio rather than a dub. Falls back to language ordering when no track is flagged original.
+                \\ndefault: promote the track already flagged default (the ffmpeg 'default' disposition), so the source's chosen audio stays first. Where
+                several tracks carry the flag - a source track and a downmix that inherited it, say - the highest-priority one by normal ordering leads.
+                Falls back to language ordering when no track is flagged default.
+                \\ndescriptive: promote the descriptive (audio-description) track above language. Falls back to language ordering when there is no
+                descriptive track.
+                \\nWhichever you pick, the first sorted track becomes the sole default - so descriptive makes the audio description your default audio.`,
         },
         {
             name: 'subtitle_first',
@@ -43,11 +44,11 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['normal', 'default', 'sdh', 'descriptive'],
             },
-            tooltip: `Which subtitle role is promoted to the top of its language (forced subtitles and order_language priority still lead).
+            tooltip: `Which subtitle role is promoted to the top of its language. Forced subtitles and order_language priority still lead.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nnormal (default): standard role order within each language - normal, then songs/lyrics, sdh, descriptive, commentary.
+                \\nnormal (default): the standard role order within each language - normal, then songs/lyrics, sdh, descriptive, commentary.
                 \\ndefault: lift the track flagged default (ffmpeg 'default' disposition) to the top of its language.
                 \\nsdh: lift SDH tracks (Subtitles for the Deaf and Hard-of-Hearing) to the top of their language.
                 \\ndescriptive: lift descriptive tracks to the top of their language.`,
@@ -57,24 +58,24 @@ const details = () => ({
             type: 'string',
             defaultValue: '',
             inputUI: { type: 'text' },
-            tooltip: `Comma separated language priority list (e.g. eng,jpn,und). Listed languages sort first; blank (the default) skips language ordering.
-                 \\nLanguages not in the list are not reordered by language - they sort by the other keys (role/codec/channel/quality) and keep their original
-                 order.
-                 \\nOne form is enough - en, eng, or English all match the same language (including region variants like en-US), so you don't need to list every
-                 variant.
-                 \\nExample: (order_channel descending and order_language eng,jpn)\\n
-                 A file containing ger 2.0,fre 2.0,eng 2.0,jpn 2.0,eng 5.1,jpn 5.1 would be reordered eng 5.1,eng 2.0,jpn 5.1,jpn 2.0,ger 2.0,fre 2.0`,
+            tooltip: `Comma-separated language priority list. Listed languages sort first; blank (the default) skips language ordering.
+                \\nOne form is enough - en, eng, or English all match the same language, region variants like en-US included.
+                \\nA language not in the list is not reordered by language: it sorts by the other keys (role, codec, channel, quality) and keeps its
+                original position relative to the others.
+                \\nExample: with order_channel descending and order_language eng,jpn\\nger 2.0, fre 2.0, eng 2.0, jpn 2.0, eng 5.1, jpn 5.1 is reordered to
+                eng 5.1, eng 2.0, jpn 5.1, jpn 2.0, ger 2.0, fre 2.0`,
         },
         {
             name: 'order_codec',
             type: 'string',
             defaultValue: '',
             inputUI: { type: 'text' },
-            tooltip: `Comma separated list of preferred audio codecs (e.g. eac3,aac). Blank to disable.
-                \\nMatching streams are grouped above non-matching ones within their language; each group is still ordered by order_channel then order_quality.
-                List order is a membership set, not a ranking. Sits below role, above channels/quality.
-                \\nFamily-prefix match on the canonical codec: dts matches DTS-HD MA/HR/Express, eac3 includes Atmos. Use dtsma/dtshr/dtsexpress/eac3atmos for a
-                specific variant.`,
+            tooltip: `Comma-separated list of preferred audio codecs. Blank (the default) skips codec ordering.
+                \\nMatching streams are grouped above non-matching ones within their language, and each group is still ordered by order_channel then
+                order_quality. The list is a membership set, not a ranking. It sits below role and above channels and quality.
+                \\nMatching is by family prefix on the canonical codec: dts matches DTS-HD MA, HR and Express, and eac3 includes Atmos. Use dtsma, dtshr,
+                dtsexpress or eac3atmos to name a specific variant.
+                \\nExample:\\neac3,aac`,
         },
         {
             name: 'order_channel',
@@ -84,18 +85,22 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled'],
             },
-            tooltip: `Audio channel ordering preference - streams are ordered by channel then rating of codec/bitrate. Generally descending is recommended.
-                \\nExample:\\n
-                    descending: 5.1,2.0
-                \\nExample:\\n
-                    ascending: 2.0,5.1
-                \\ndescending <=6 / <=8 cap the surround: any track above the cap (<=6 = up to 5.1, <=8 = up to 7.1) is demoted to the END of its own
-                language/role/codec tier, so a client whose ceiling is that layout auto-picks the best track it can play (e.g. the 5.1) rather than a 22.2/7.1
-                it must down-convert. The demoted tail stays in the requested descending order (largest first) - the cap only shifts which serveable track
-                leads, it never re-sorts the tail. If order_quality also caps, a track over EITHER cap is demoted. The cap only applies to descending -
-                ascending already puts the smallest first. Tracks promoted by audio_first outrank the cap and still lead the audio.
-                \\nSet to disabled to skip channel ordering entirely. If both order_channel and order_quality are disabled, audio is not reordered by channels
-                or quality (language/role/order_codec still apply).`
+            tooltip: `Audio channel ordering - streams are ordered by channel count, then by the codec and bitrate rating. Descending is generally
+                recommended.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\ndescending (default): most channels first, so 5.1 then 2.0.
+                \\ndescending <=6: as descending, but any track above 5.1 is demoted to the END of its own language/role/codec tier.
+                \\ndescending <=8: the same, with the cap at 7.1 instead.
+                \\nascending: fewest channels first, so 2.0 then 5.1.
+                \\ndisabled: skip channel ordering entirely. With order_quality disabled as well, audio is not reordered by channels or quality at all,
+                though language, role and order_codec still apply.
+                \\nWhy cap: a client whose ceiling is 5.1 or 7.1 then auto-picks the best track it can actually play, rather than landing on a 22.2 it must
+                down-convert. The demoted tail keeps the requested descending order, largest first - the cap only shifts which serveable track leads, it
+                never re-sorts the tail.
+                \\nThe cap applies to descending only, since ascending already puts the smallest first. If order_quality also caps, a track over EITHER cap
+                is demoted. Tracks promoted by audio_first outrank the cap and still lead the audio.`
         },
         {
             name: 'order_quality',
@@ -105,18 +110,20 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['descending', 'descending <=1024k', 'ascending', 'disabled'],
             },
-            tooltip: `Audio quality ordering preference - orders streams by their computed quality score (codec + bitrate vs transparent). Generally descending
-                is recommended.
-                \\nExample:\\n
-                    descending: 640k,128k
-                \\nExample:\\n
-                    ascending: 128k,640k
-                \\ndescending <=1024k caps by bitrate: tracks above 1024k (lossless-scale TrueHD/DTS-HD MA, including a lossless track whose bitrate is unknown)
-                are demoted to the END of their own language/role/codec tier so the client's auto-pick leads with a manageable track it can serve without a
-                heavy transcode, not the huge one. The demoted tail stays in the requested descending order; ordering within each group is by the quality score.
-                Also demoted if order_channel caps and this track is over that cap too (see order_channel). Tracks promoted by audio_first outrank the cap and
-                still lead the audio.
-                \\nSet to disabled to skip quality ordering entirely (if order_channel is disabled too, see order_channel for what that leaves).`
+            tooltip: `Audio quality ordering - streams are ordered by their computed quality score, which weighs codec and bitrate against what is
+                transparent for that codec. Descending is generally recommended.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\ndescending (default): best quality first, so 640k then 128k.
+                \\ndescending <=1024k: as descending, but tracks above 1024k - lossless-scale TrueHD and DTS-HD MA, including a lossless track whose bitrate
+                is unknown - are demoted to the END of their own language/role/codec tier.
+                \\nascending: lowest quality first, so 128k then 640k.
+                \\ndisabled: skip quality ordering entirely. See order_channel for what disabling both leaves.
+                \\nWhy cap: the client's auto-pick then leads with a track it can serve without a heavy transcode, rather than the huge one. The demoted
+                tail keeps the requested descending order, and ordering within each group is still by quality score.
+                \\nA track is demoted here too if order_channel caps and it is over that cap as well. Tracks promoted by audio_first outrank the cap and
+                still lead the audio.`
         },
         {
             name: 'remove_junk_tags',
@@ -126,22 +133,23 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['disabled', 'encoder', 'descriptive'],
             },
-            tooltip: `Strip junk metadata tags the file carries (both container-global and per-stream), riding this plugin's reorder remux so no extra pass is
-                needed. Only tags actually present are cleared, so files without them are untouched. Runs last, so it also clears the per-stream encoder tag a
-                video/audio re-encode leaves behind - which a first-in-stack plugin could only catch on a later pass.
+            tooltip: `Strip junk metadata tags the file carries, both container-global and per-stream, riding this plugin's reorder remux so no extra pass
+                is needed. Only tags actually present are cleared, so a file without them is untouched.
                 \\n=====
                 \\nActions
                 \\n=====
                 \\ndisabled (default): leave all tags.
-                \\nencoder: remove only encoder/muxer provenance tags nobody reads - encoded_by, and per-stream encoder (a leftover "Lavc.../HandBrake" tag).
-                Safe on any library.
-                \\ndescriptive: also remove descriptive movie/TV metadata and iTunes/app flags - genre, date, description, synopsis, show, network,
-                season/episode, media_type, artist, album, composer, copyright, keywords, compilation, sort-order keys, etc.
-                \\nAlways kept: title and comment, stream language tags, per-track bitrate statistics (BPS), the container-level encoder tag (muxer-managed),
-                and creation date.
-                \\nNote: a media server set to read local/in-file metadata DOES read some mp4 descriptive tags (genre/date/description/show/etc.) - Plex with
-                local media assets enabled, and Jellyfin/Emby with an nfo or in-file metadata reader - so use descriptive only if you don't rely on in-file
-                metadata.`,
+                \\nencoder: remove only encoder and muxer provenance nobody reads - encoded_by, and the per-stream encoder tag (a leftover
+                "Lavc.../HandBrake" string). Safe on any library.
+                \\ndescriptive: also remove descriptive movie and TV metadata and iTunes/app flags - genre, date, description, synopsis, show, network,
+                season/episode, media_type, artist, album, composer, copyright, keywords, compilation, sort-order keys and the like.
+                \\nAlways kept, whichever you pick: title and comment, stream language tags, per-track bitrate statistics (BPS), the container-level encoder
+                tag, and the creation date.
+                \\nRunning last is what lets this clear the per-stream encoder tag a video or audio re-encode leaves behind, which a first-in-stack plugin
+                could only catch a pass later.
+                \\nBefore choosing descriptive: a media server set to read local or in-file metadata DOES read some mp4 descriptive tags - genre, date,
+                description, show and so on. That means Plex with local media assets enabled, and Jellyfin or Emby with an nfo or in-file metadata reader.
+                Use it only if you do not rely on in-file metadata.`,
         },
         {
             name: 'method_mp4_faststart',
@@ -151,17 +159,17 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['force', 'strip'],
             },
-            tooltip: `mp4/mov only: where the moov atom (the index) sits in the file. At the FRONT, players start and seek instantly on progressive download /
-                remote direct-play; at the end they must fetch the tail first. mkv is unaffected.
+            tooltip: `mp4 and mov only: where the moov atom, the file's index, sits. At the FRONT, players start and seek instantly on progressive download
+                and remote direct-play; at the end, they have to fetch the tail first. mkv is unaffected.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nforce (default): front-load the moov atom. Rides this plugin's normal reorder remux when there is reordering to do, and otherwise forces ONE
-                extra lossless -c copy remux the first time the file isn't already front-loaded (detected without decoding). Already-fronted files are left
-                untouched, so it settles after one pass and never loops.
-                \\nstrip: actively REMOVE faststart - it does not leave the file alone. Any remux this plugin performs (reordering, disposition normalisation,
-                remove_junk_tags) writes the moov atom at the END, the mov muxer's default, so an mp4 that arrived front-loaded comes out back-loaded and cannot
-                be restored by a later pass. Only pick this if you never stream this library remotely.`,
+                \\nforce (default): front-load the moov atom. It rides this plugin's normal reorder remux where there is reordering to do, and otherwise
+                forces ONE extra lossless -c copy remux the first time a file is not already front-loaded (detected without decoding). An already-fronted
+                file is left untouched, so this settles after one pass and never loops.
+                \\nstrip: actively REMOVE faststart - it does not simply leave the file alone. Any remux this plugin performs, whether for reordering,
+                disposition normalisation or remove_junk_tags, writes the moov atom at the END, the mov muxer's default. So an mp4 that arrived
+                front-loaded comes out back-loaded, and no later pass can restore it. Only pick this if you never stream this library remotely.`,
         },
     ],
 });

@@ -34,7 +34,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.39.3',
+    Version: '3.39.4',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -44,20 +44,21 @@ const details = () => ({
             inputUI: {
                 type: 'dropdown',
                 options: ['import', 'extract'] },
-            tooltip: `Which direction to run.
+            tooltip: `Which direction to run. Either way remove_source decides whether the source copy is deleted once the content is confirmed at the
+                other end - it defaults to on, so by default a subtitle MOVES rather than being copied.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nextract: pull embedded text subtitles out to sidecar files (and remove them from the video unless remove_source is off).
-                \\nimport: mux sidecar files back into the video (and delete the sidecar once embedded unless remove_source is off).`,
+                \\nextract: pull embedded text subtitles out of the video into sidecar files beside it.
+                \\nimport: mux sidecar files sitting beside the video back into it.`,
         },
         {
             name: 'only_languages',
             type: 'string',
             defaultValue: '',
             inputUI: { type: 'text' },
-            tooltip: `Optional comma-separated languages to act on (e.g. eng,jpn). Blank = all languages. One form is enough - en, eng, or English all match the
-                same language (including region variants like en-US), so you don't need to list every variant.
+            tooltip: `Limit both actions to these languages, comma-separated. Blank (default) acts on every language.
+                \\nOne form is enough - en, eng, or English all match the same language, region variants like en-US included.
                 \\nExample:\\neng,fra`,
         },
         {
@@ -68,22 +69,22 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['enabled_only_sidecar', 'enabled_checkmedia', 'disabled']
             },
-            tooltip: `What counts as a copy of a subtitle you already have. The TEXT always decides, so genuinely different tracks - two commentaries, a real
-                forced track vs a full one - are never collapsed; only byte-for-byte duplicates are.
+            tooltip: `What counts as a copy of a subtitle you already have. The TEXT decides, so only byte-for-byte duplicates are ever collapsed - two
+                commentaries, or a real forced track beside a full one, are different text and both survive.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nenabled_only_sidecar (default) - judge the SIDECARS only. On import, mux one track per byte-identical group of sidecars, combining their
-                flags (a plain + SDH pair imports once, tagged SDH), and skip a sidecar whose text is ALREADY one of the embedded tracks rather than adding a
-                second copy of it. Every member of a group is listed in the marker, so remove_source cleans up the whole group. Nothing is removed from the video.
-                \\nenabled_checkmedia - all of the above, and also READS the video's own subtitle tracks, in BOTH actions, which is what lets it find two
-                problems the sidecars alone cannot show: a subtitle the video carries twice (the lowest-numbered copy survives and inherits the others' flags,
-                title and language, so no tagging is lost), and a subtitle track that contains no text at all - an empty track a player still lists, which is
-                worth nothing to anyone. This is the only setting that deletes a subtitle you did not ask to extract, and it costs one extra read of the file.
-                \\ndisabled - mux every sidecar as its own track, even byte-identical copies (you may end up with duplicate subtitles).
-                \\nWhether the sidecar FILES are deleted afterwards is remove_source's decision alone, whatever this is set to. Note that embedded closed
-                captions are not subtitle tracks at all and are never touched here - they are embedded_cc's business; once it has turned them into a sidecar or
-                a real track, they are ordinary subtitles and dedup treats them like any other.`,
+                \\nenabled_only_sidecar (default) - compare the SIDECARS only. On import a byte-identical group becomes a single track carrying their
+                combined flags (a plain + SDH pair imports once, tagged SDH), and a sidecar whose text is already embedded is skipped instead of added a
+                second time. Nothing is removed from the video.
+                \\nenabled_checkmedia - also read the video's own subtitle tracks, in both actions. That catches two problems the sidecars alone cannot
+                show: a subtitle the video carries twice (the first copy survives and inherits the others' flags, title and language, so no tagging is
+                lost), and a track holding no text at all, which a player still lists. This is the only setting that deletes a subtitle you did not ask to
+                extract, and it costs one extra read of the file.
+                \\ndisabled - mux every sidecar as its own track, byte-identical copies included, so you may end up with duplicate subtitles.
+                \\nDeleting the sidecar FILES afterwards is remove_source's decision whatever this is set to, and it removes every member of a collapsed
+                group rather than only the one that was muxed. Embedded closed captions are not subtitle tracks and are never seen here; once embedded_cc
+                has turned them into a sidecar or a track they are ordinary subtitles and deduplicate like any other.`,
         },
         {
             name: 'embedded_cc',
@@ -100,20 +101,17 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\ndisabled (default): leave them alone.
-                \\nenabled: read the captions out of the video. Which way they go is decided by action, exactly as it is for ordinary subtitles - extract
-                writes them to a Plex sidecar beside the video, import turns them into an embedded subtitle track instead (that route runs over two passes:
-                one to read the captions out to a hidden file, the next to mux them in, and the hidden file is cleaned up afterwards).
-                \\nThe captions are tagged as undetermined language and flagged SDH. CEA-608 carries no language of its own, so anything else would be a
-                guess; clean_and_remux can fill the language in on a later pass if you want one.
-                \\nCost: reading the captions means DECODING the video (roughly 3x faster than playback on 4K), so it is far more expensive than an ordinary
-                subtitle extract, which only copies. It is paid only on a file that a cheap up-front check says actually has captions, and only once - the
-                result is remembered in the file so no later pass repeats it.
-                \\nLimits worth knowing. ffmpeg's caption reader is weaker than a dedicated tool: on a set of six broadcast carriage variants it read one
-                where CCExtractor read four, so a file can be flagged as having captions and still yield nothing (that is reported, never passed off as
-                success). Styling - italics and colour - is dropped, because keeping it produces markup that Plex renders as literal on-screen text. Roll-up
-                captions repeat each line across three cues, which is what roll-up IS rather than a fault.
-                \\nRemoval is remove_source's decision, as for any other subtitle. Removing captions from the video needs either a compatible source (H.264,
-                not HDR, not Dolby Vision) or a later re-encode by video_clean, which picks up the request automatically.`,
+                \\nenabled: read the captions out and hand them to action - extract writes a sidecar beside the video, import turns them into an embedded
+                subtitle track over two passes, one to read and one to mux. Either way they arrive tagged undetermined language and flagged SDH, because
+                CEA-608 carries no language of its own and anything else would be a guess; clean_and_remux can fill the language in later.
+                \\nCost: reading captions DECODES the video, roughly 3x faster than playback on 4K, so it is far more expensive than an ordinary subtitle
+                extract, which only copies. It is paid only on a file a cheap up-front check says has captions, and only once - the verdict is remembered
+                in the file.
+                \\nExpect less than a dedicated tool: ffmpeg's caption reader can come up empty on a file that genuinely has them (reported, never passed
+                off as success), styling such as italics and colour is dropped, and roll-up captions repeat each line across three cues, which is what
+                roll-up is rather than a fault.
+                \\nRemoving the captions from the video is remove_source's decision, as for any other subtitle. It needs either a compatible source (H.264,
+                not HDR, not Dolby Vision) or a later re-encode by video_clean, which picks the request up automatically.`,
         },
         {
             name: 'remove_source',
@@ -123,29 +121,22 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['true', 'false']
             },
-            tooltip: `Remove the source copy once its content is confirmed at the destination - the one setting for both directions, since it is one intention.
-                Off = copy without removing, and you keep both.
+            tooltip: `Remove the source copy once the content is confirmed at the destination. One setting for both directions because it is one intention:
+                on, a subtitle MOVES; off, it is copied and you keep both.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\ntrue (default) on EXTRACT - remove each text subtitle from the video after it is written to a sidecar. Styled ASS/SSA rely on embedded fonts,
-                so they are exported as a .mks bundle holding the subtitle and those fonts together, and the fonts are removed along with it; the styling
-                survives the round-trip whatever else runs in between. The sidecar lands next to the video in the library on any node - one that shares the
-                library filesystem writes it there directly, while an unmapped node, which only ever sees a local copy, extracts the sidecar itself and uploads
-                it through Tdarr's file API. Either way the embedded track goes ONLY once the sidecar is confirmed in place, so a failed write costs you nothing
-                but the extraction. For embedded closed captions this also removes the caption data from the video bitstream - see embedded_cc.
-                \\ntrue (default) on IMPORT - delete each sidecar whose path, relative to the video's directory, is listed in the file's global awk_sub_worker
-                marker (stamped by the mux pass) once its own text is confirmed to be one of the embedded subtitles; matching language and title is the fallback,
-                used only for a .mks bundle or when the embedded text cannot be read at all. That deletion runs in POST-PROCESSING, after you accept the
-                transcode: deleting earlier would destroy the sidecars of a run you then reject, leaving those subtitles nowhere. So ADD THIS PLUGIN TO THE
-                POST-PROCESSING PLUGIN STACK as well as the pre-processing one. Without that, nothing is ever lost - the sidecars simply stay on disk. That
-                stage runs on the SERVER, which is also how it cleans up for an unmapped node: one has no way of its own to delete a library file, since Tdarr's
-                API offers upload and download but no delete.
-                \\nfalse - keep both copies. Nothing is removed from the video on extract, and no sidecar is deleted on import.
-                \\nOne import case needs more than that: on an unmapped node with no mount, when every sidecar is ALREADY in the file, there is nothing to mux -
-                so no transcode, no acceptance, and no post-processing pass in which to delete anything. There, true forces a lossless -c copy of the video
-                purely to reach that stage. It is a full read and write to remove a few kB of text, but it is the only route, it happens at most ONCE per file
-                (the pass marks those sidecars and the next one skips them), and asking for them to be deleted is taken as asking for whatever that costs.`,
+                \\ntrue (default) on EXTRACT - remove each text subtitle from the video, but only after its sidecar is confirmed written, so a failed write
+                costs you nothing but the extraction. For embedded closed captions this also strips the caption data out of the video bitstream - see
+                embedded_cc.
+                \\ntrue (default) on IMPORT - delete each sidecar once its text is confirmed to be one of the embedded subtitles.
+                \\nfalse - keep both copies: nothing leaves the video on extract, and no sidecar is deleted on import.
+                \\nADD THIS PLUGIN TO THE POST-PROCESSING PLUGIN STACK as well as the pre-processing one, or import will never delete anything. The deletion
+                has to wait until you accept the transcode, since deleting sooner would destroy the sidecars of a run you then reject. Miss that stack entry
+                and nothing is lost - the sidecars simply stay on disk.
+                \\nStyled ASS/SSA depend on fonts embedded in the video, so extract exports them as a .mks bundle holding the subtitle and those fonts
+                together, and removes the fonts along with it. That is what keeps the styling intact for a later reimport.
+                \\nOn a node that cannot see the library folder, both a sidecar's arrival and its deletion work differently - see method_unmapped.`,
         },
         {
             name: 'method_import_metadata',
@@ -155,16 +146,16 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['embedded', 'sidecar']
             },
-            tooltip: `Which side owns the language/title/flags when a sidecar's TEXT is already one of the embedded tracks - i.e. who wins a disagreement about
-                a subtitle that is already in the file. Reachable only when deduplicate is comparing text (either enabled value); a sidecar muxed as a
-                NEW track always takes its metadata from its filename, because nothing else describes it.
+            tooltip: `Who wins when a sidecar's TEXT is already one of the embedded tracks but its language, title or flags disagree. Reachable only while
+                deduplicate is comparing text (either enabled value); a sidecar muxed as a NEW track always takes its metadata from its filename, since
+                nothing else describes it.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nembedded - leave the track exactly as it is and report the difference. Safe with an OLD sidecar name: a name written before a flag existed
-                carries no token for it, and applying it would strip that flag off a track that has it.
-                \\nsidecar  - the filename wins, so renaming a sidecar retunes the track already in the file (language, title and flags, including clearing
-                flags you removed from the name). Use it when you renamed the sidecar deliberately; it costs one remux of the file.`,
+                \\nembedded (default) - leave the track as it is and report the difference. The safe choice with an older sidecar name: a name written
+                before a flag existed carries no token for it, and applying it would strip that flag off a track that has it.
+                \\nsidecar - the filename wins, so renaming a sidecar retunes the track already in the file - language, title and flags, including clearing
+                flags you took out of the name. Use it when you renamed a sidecar deliberately; it costs one remux of the file.`,
         },
         {
             name: 'method_unmapped',
@@ -174,21 +165,31 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['error', 'mount', 'text_file']
             },
-            tooltip: `What to do on an UNMAPPED node, which is only ever given a local copy of the video and never sees the library folder. Ignored entirely on
-                a normal (mapped) node.
-                \\nExtract already works everywhere - the sidecar is uploaded to the library through Tdarr's file API. It is IMPORT that has the problem:
-                finding sidecars means listing a directory, and the API offers no way to list one.
+            tooltip: `What to do on an UNMAPPED node - one handed a local copy of the video that never sees the library folder itself. Ignored entirely on a
+                normal (mapped) node, where all of this just works.
+                \\nEXTRACT already works on any node: a mapped node writes the sidecar straight into the library, an unmapped one extracts it locally and
+                uploads it through Tdarr's file API. IMPORT is the problem, because finding sidecars means listing a directory and that API cannot list one.
+                This setting is the answer to that.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nerror     - fail the file and say so. Nothing is silently skipped; run import on a node that can see the library.
-                \\nmount     - reach the library directly. The node's own path is tried first (a container bind-mounting the library at the server's own path,
-                e.g. /media, needs nothing more), then any "key=value" Node Tag set for this node in the server's web UI, which names where THIS node sees that
-                folder - for example "media=M:\\\\" when the server calls it /media. A tag is needed on Windows and macOS, where the server's path cannot exist
-                locally. Extract writes directly too in this mode, skipping the upload API.
-                \\ntext_file - read "<video>.subtitles.txt" next to the video: one filename per line, lines starting with # ignored. Extract seeds it with what
-                it wrote; after that it is yours to maintain, which is how a subtitle you OCR'd from an exported image sub gets imported. Each name must still
-                follow the sidecar naming convention, since that is where language, title and flags come from.`,
+                \\nerror (default) - fail the file and say why, so nothing is skipped silently. Run import on a node that can see the library.
+                \\nmount - reach the library directly. The node's own path is tried first, so a container bind-mounting the library at the server's own path
+                (e.g. /media) needs nothing more. Otherwise set this node's Node Tag field, on the server's node options page, to a "key=value" entry - key
+                being the FIRST folder of the server's path, value being where THIS node sees that same folder. Windows and macOS nodes need one, because the
+                server's path cannot exist locally. Tdarr keeps its own tags in that field too, so add yours alongside them rather than replacing them.
+                Extract writes directly in this mode as well, skipping the upload API.
+                \\nExample: server library /media/Shows, mounted on this Windows node as M:\\Shows
+                \\nmedia=M:
+                \\ntext_file - read "<video>.subtitles.txt" beside the video: one filename per line, lines starting with # ignored. Extract seeds the list
+                with what it wrote; after that it is yours to maintain, which is how a subtitle you OCR'd from an exported image sub gets imported. Each name
+                must still follow the sidecar naming convention, since that is where its language, title and flags come from.
+                \\nDELETING a sidecar (remove_source on import) is separate again: an unmapped node cannot delete a library file at all, since Tdarr's API
+                offers upload and download but not delete. The post-processing pass does it server-side instead, which is why that stack entry is required.
+                \\nOne case costs an extra pass: on an unmapped node with no mount, when every sidecar is ALREADY embedded there is nothing to mux - so no
+                transcode, no acceptance, and no post-processing run in which to delete anything. remove_source then forces a lossless -c copy of the video
+                purely to reach that stage. It is a full read and write to remove a few kB of text, but it is the only route and it happens at most ONCE per
+                file.`,
         },
     ],
 });
