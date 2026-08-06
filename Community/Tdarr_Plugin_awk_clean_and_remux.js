@@ -27,7 +27,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.19.1',
+    Version: '4.19.2',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -2224,19 +2224,31 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // further down is forced by the SOURCE container instead (needed to remux those formats at all) and always applies.
 
         // recover_bad_timestamps: light = +genpts, aggressive = full +igndts+genpts rebuild (igndts can misbehave without genpts, so it always pulls it in).
-        if(runRecover && tsAgg)
+        // Each repair is logged where it is decided, so the line and the flag it describes cannot drift apart. Recovery leaves nothing visible in the stream
+        // layout - no removal, no codec change - so without these lines the whole feature is invisible in the infoLog, and 'aggressive' discards data.
+        if(runRecover && tsAgg) {
             fflags += '+igndts+genpts';
-        else if(runRecover && tsLight)
+            workDone += `☐[recover_bad_timestamps=${recoverTs}] Rebuilding the timeline - ignoring the source DTS, regenerating PTS and shifting negative `
+                + 'start times to zero\n';
+        } else if(runRecover && tsLight) {
             fflags += '+genpts';
+            workDone += `☐[recover_bad_timestamps=${recoverTs}] Regenerating missing PTS and shifting negative start times to zero\n`;
+        }
 
         // Grouped by DEMUXER FAMILY, not by extension spelling - ffmpeg picks its demuxer by probing content, while file.container is nothing but the
         // lowercased extension. mpegts = ts/m2ts/mts/m2t · MPEG-PS = mpg/mpeg/vob/evo · avi. Add a new spelling to the family it demuxes as, not to the end.
         // Not hypothetical: identical MPEG-PS bytes named .vob hard-fail a bare -c copy remux ("Can't write packet with unknown timestamp", exit -22) while
         // the same bytes named .mpg are repaired here - and vob/evo/m2ts are all in Tdarr's DEFAULT containerFilter, so the gap was reachable out of the box.
         if (['ts', 'm2ts', 'mts', 'm2t', 'vob', 'evo', 'avi', 'mpg', 'mpeg'].includes(srcContainer)) {   // container-forced timestamp fix (always applied)
-            if(!fflags.includes('genpts'))
+            const already = fflags.includes('genpts');
+            if(!already)
                 fflags += '+genpts';
             extraArguments = ` -avoid_negative_ts make_zero${extraArguments}`;
+            // Independent of the recover_bad_* settings, so it needs saying even when they are disabled - otherwise a user sees a plain remux line and no
+            // sign that the timestamps were rewritten. Suppressed when a recover_bad_timestamps line above already said the same thing.
+            if(!already)
+                workDone += `☐[container=${dstContainer}] Repairing ${srcContainer} timestamps - this source format cannot be remuxed without regenerating `
+                    + 'PTS and shifting negative start times to zero\n';
         } else if (runRecover && tsLight)
             extraArguments = ` -avoid_negative_ts make_zero${extraArguments}`;   // normalize negative starts on any container we rebuild
 
@@ -2244,9 +2256,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if(runRecover && dataLight) {
             fflags += '+ignidx';
             inputArgs += ' -err_detect ignore_err';
+            workDone += `☐[recover_bad_data=${recoverData}] Ignoring a broken or corrupt index and continuing past demux errors - nothing is discarded\n`;
         }
-        if(runRecover && dataAgg)
+        if(runRecover && dataAgg) {
             fflags += '+discardcorrupt';
+            workDone += `☐[recover_bad_data=${recoverData}] Also dropping packets flagged corrupt - this discards data, expect brief video or audio blips `
+                + 'wherever the damage is\n';
+        }
         if(fflags !== '')
             fflags = `-fflags ${fflags}`;
 

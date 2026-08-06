@@ -11,7 +11,7 @@ const details = () => ({
         descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the
         fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart -
         rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time it's needed).\n`,
-    Version: '4.16.3',
+    Version: '4.16.4',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -1192,6 +1192,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
+        // Describe the reorder itself. It is this plugin's headline change and the only one that leaves no other trace in the log: a pure reorder emits no
+        // ☐ line at all today, so the log runs straight from the input summary to Expected results and the user has to diff the two token lists to see that
+        // anything happened. The two causes are reported separately because they answer different questions and a user acts on them differently - regrouping
+        // is the fixed video → audio → subtitle → attachment → data precedence that no setting changes, while a within-group sort is what the order_* and
+        // audio_first/subtitle_first settings decide. Both lines stay BARE of an [input=value] tag: regrouping has no setting behind it, and a within-group
+        // sort is the combined verdict of the whole order_* precedence chain, so naming any one of them would be a guess (see the infoLog contract).
+        const originalOrder = streams.slice().sort((a, b) => a.origPos - b.origPos);
+        const typeSeq = (arr) => arr.map((s) => s.type).join(',');
+        const regrouped = typeSeq(originalOrder) !== typeSeq(streams);
+        const sortedWithin = [];   // "<n> <type>" per type group whose members changed order among themselves
+        for (const t of new Set(streams.map((s) => s.type))) {
+            const positions = streams.filter((s) => s.type === t).map((s) => s.origPos);
+            if (!positions.every((p, i) => i === 0 || positions[i - 1] < p)) sortedWithin.push(`${positions.length} ${t}`);
+        }
+
         // remove_junk_tags (global): clear the provenance / descriptive container tags present, matched case-insensitively. escMeta guards the key.
         if (junkTagsMode !== 'disabled')
             for (const k of Object.keys(file.ffProbeData.format?.tags || {})) {
@@ -1214,6 +1229,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         response.processFile = true;
         response.reQueueAfter = true;
+        if (regrouped)
+            response.infoLog += '☐Regrouping streams into video → audio → subtitle → attachment → data order\n';
+        if (sortedWithin.length) {
+            const list = sortedWithin.length > 1
+                ? `${sortedWithin.slice(0, -1).join(', ')} and ${sortedWithin[sortedWithin.length - 1]}`
+                : sortedWithin[0];
+            response.infoLog += `☐Sorting the ${list} streams within their group${sortedWithin.length > 1 ? 's' : ''}\n`;
+        }
         // Logged whenever the moov actually moves, not only when faststart is the sole reason for the pass: +faststart rides every remux this plugin emits
         // (see mp4MovflagsArg below), so a reorder or a disposition fix front-loads the file just as surely, and a ☐ line marks a change about to be made.
         if (needsFront)
