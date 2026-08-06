@@ -26,10 +26,15 @@ const details = () => ({
                 description (<video>.English(Commentary).srt), which becomes the track title. hi is only read as hearing-impaired when a real language precedes
                 it, so <video>.hi.srt stays Hindi.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
+                \\nembedded_cc (off by default) turns EMBEDDED CLOSED CAPTIONS into a real subtitle. Those are not a track at all - they are caption data
+                carried inside the video picture (EIA-608/708, standard on North American broadcast recordings), which is why no player lists them beside the
+                subtitles. extract writes them to a sidecar, import turns them into an embedded track. Reading them decodes the video, so it happens only on a
+                file a cheap check says has them, and the verdict is remembered so no later pass repeats it.
                 \\nScope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on
-                import (see its tooltip for the disabled/enabled modes).
-                \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.39.2',
+                import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
+                \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
+                closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
+    Version: '3.39.3',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
