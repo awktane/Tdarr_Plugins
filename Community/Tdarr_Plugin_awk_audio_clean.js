@@ -12,7 +12,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.19.1',
+    Version: '4.20.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1371,15 +1371,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return ch * 208000;                         // aac: the top of native aac's own clamp range (exceeding it is graceful, but pointless)
     };
 
+    // How far above the transparent point a matched source rate may sit before we stop believing it. A source ALREADY carrying more than this in the codec we
+    // are re-encoding it to is either an unusual mastering choice or - far more likely - a misread: resolveStreamBitrate falls back to StreamSize/Duration,
+    // which reports the whole container's bytes when mediaInfo gives no per-track size. Clamping there costs nothing real, since twice transparent is already
+    // well past the point extra bits buy audible quality; leaving it unclamped would size a file off a bogus number. It should almost never fire.
+    const SAME_FORMAT_TRANSPARENT_MULTIPLE = 2;
+    // The two bounds a matched source rate answers to, and NEITHER subsumes the other: the sanity multiple above binds for aac 5.1+, opus and eac3, while the
+    // encoder's own limit binds for mono/stereo aac (208k/ch) and ac3 (640k). targetTable is the transparent point here - for the four encodable codecs it and
+    // scoreThresholds read the same CODEC_TARGET_BPS ladder, so the encode target and the scored transparent point cannot drift apart.
+    const sameFormatCeiling = (codec, channels) =>
+        Math.min(encoderLimit(codec, channels), SAME_FORMAT_TRANSPARENT_MULTIPLE * targetTable(codec, channels));
+
     // Target bitrate for a re-encode whose OUTPUT FORMAT EQUALS ITS INPUT FORMAT - same codec family, same channel count. That happens whenever a track is
     // re-encoded for a reason OTHER than changing its codec (loudnorm's gain correction, or codec_force aimed at the codec the track already uses). Nothing
     // about the format is changing, so deriving a fresh ladder target can only build in a loss (below source) or waste (above it): match the source instead.
-    // Bounded by the encoder's real limit, then snapped up to a valid ac3 preset - a no-op for an ac3 source, whose rate is already one of them. Returns 0
-    // when no probe reported a source rate, which tells the caller to fall back to resolveBitrate's ladder target as before.
+    // Bounded by sameFormatCeiling, then snapped up to a valid ac3 preset - a no-op for an ac3 source, whose rate is already one of them. Returns 0 when no
+    // probe reported a source rate, which tells the caller to fall back to resolveBitrate's ladder target as before.
     const sameFormatBitrate = (codec, channels, srcBps = 0) => {
         const src = Number(srcBps) || 0;
         if (src <= 0) return 0;
-        let bps = Math.min(src, encoderLimit(codec, channels));
+        let bps = Math.min(src, sameFormatCeiling(codec, channels));
         if (codec === 'ac3') bps = ac3Presets.find(p => p >= bps) ?? ac3Presets[ac3Presets.length - 1];
         return Math.round(bps / 1000) * 1000;
     };
