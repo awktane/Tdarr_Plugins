@@ -12,7 +12,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.17.3',
+    Version: '4.18.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -156,7 +156,9 @@ const details = () => ({
                 \\nall - as 6below, but also transcodes surround tracks above six channels, each subject to its codec's own channel ceiling (ac3/eac3 6ch,
                 aac/opus 8ch). It differs from 6below only in that threshold.
                 \\nA guard-protected track is left in its source codec in every mode, 'all' included. A stream carrying more channels than the target codec
-                can hold is not transcoded.`,
+                can hold is not transcoded.
+                \\nA track already in the target codec is left alone, so switching codec_stereo between aac and aac_vbr changes nothing on its own - that is
+                a rate-control change, not worth a lossy re-encode. It does apply if method_loudnorm re-encodes the track anyway.`,
         },
         {
             name: 'codec_stereo',
@@ -293,6 +295,9 @@ const details = () => ({
                 \\nA track already within about 1 LU of the target is left completely untouched, with no re-encode. A track whose codec this plugin cannot
                 encode - a kept DTS core or MP3, say - converges to codec_surround or codec_stereo, respecting each codec's channel ceiling, but only as a
                 side effect of a correction genuinely needed, never on a track that is already close enough.
+                \\nA track re-encoded in its own codec keeps its source bitrate, so the correction costs nothing beyond the re-encode itself. Only a genuine
+                codec change picks a new target rate. If codec_force covers the track, its codec_surround/codec_stereo choice applies here as well: the
+                encode is already being spent, so the setting is honoured even where codec_force alone would have declined it as not worth a re-encode.
                 \\nIt applies whether or not the track is being downmixed, forced or converted for some other reason this run: an otherwise untouched track
                 is measured and corrected on its own, while one already being modified rides on that same re-encode instead of a separate one.
                 \\nOn a Matroska container (mkv, webm, mka) a track untouched by anything else this run is stamped with an awk_loudnorm tag once measured,
@@ -1354,16 +1359,43 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return bps;
     };
 
-    // Per-codec audio argument string scoped to a specific output stream index (e.g. -b:a:2 instead of -b:a). ffmpeg accepts the stream-qualified
-    // forms; we use them so each track gets its own settings when a single command touches several. srcLossless and srcQuality are forwarded to
-    // resolveBitrate (srcLossless skips the source cap for lossless sources; srcQuality gates the guarded source-cap on the force path).
-    const encoderArgsIdx = (codec, channels, idx, srcBps = 0, srcLossless = false, srcQuality = Infinity) => {
-        const bps = resolveBitrate(codec, channels, srcBps, srcLossless, srcQuality);
+    // The highest rate a re-encode may actually ASK each encoder for. Distinct from codecCeiling, which bounds a CONVERGENCE target (a foreign source landing
+    // on one of our codecs) well below what the encoder would accept; this is the encoder's own limit, and applies where the rate we want is simply the
+    // source's. Verified on jellyfin-ffmpeg 7.1.4 (Linux/Windows/Mac): ac3 clamps at exactly 640k, eac3 at 6144k, native aac silently clamps around
+    // 185-208k/ch - but libopus HARD-ERRORS above 256k/ch, so for opus this is a real limit that aborts the job rather than a courtesy clamp.
+    const encoderLimit = (codec, channels) => {
+        const ch = Math.max(1, Number(channels) || 1);
+        if (codec === 'ac3') return 640000;
+        if (codec === 'eac3') return 6144000;
+        if (codec === 'opus') return ch * 256000;   // libopus errors above this - never exceed it
+        return ch * 208000;                         // aac: the top of native aac's own clamp range (exceeding it is graceful, but pointless)
+    };
+
+    // Target bitrate for a re-encode whose OUTPUT FORMAT EQUALS ITS INPUT FORMAT - same codec family, same channel count. That happens whenever a track is
+    // re-encoded for a reason OTHER than changing its codec (loudnorm's gain correction, or codec_force aimed at the codec the track already uses). Nothing
+    // about the format is changing, so deriving a fresh ladder target can only build in a loss (below source) or waste (above it): match the source instead.
+    // Bounded by the encoder's real limit, then snapped up to a valid ac3 preset - a no-op for an ac3 source, whose rate is already one of them. Returns 0
+    // when no probe reported a source rate, which tells the caller to fall back to resolveBitrate's ladder target as before.
+    const sameFormatBitrate = (codec, channels, srcBps = 0) => {
+        const src = Number(srcBps) || 0;
+        if (src <= 0) return 0;
+        let bps = Math.min(src, encoderLimit(codec, channels));
+        if (codec === 'ac3') bps = ac3Presets.find(p => p >= bps) ?? ac3Presets[ac3Presets.length - 1];
+        return Math.round(bps / 1000) * 1000;
+    };
+
+    // Per-codec audio argument string for an ALREADY-RESOLVED rate, scoped to a specific output stream index (e.g. -b:a:2 instead of -b:a). ffmpeg accepts the
+    // stream-qualified forms; we use them so each track gets its own settings when a single command touches several.
+    const encoderArgsBps = (codec, idx, bps) => {
         if (bps <= 0) return '';
         if (codec === 'opus')
             return ` -vbr:a:${idx} on -compression_level:a:${idx} 10 -b:a:${idx} ${bps / 1000}k`;
         return ` -b:a:${idx} ${bps / 1000}k`;
     };
+    // The same string for a codec CHANGE, where the rate comes from the transcode ladder. srcLossless and srcQuality are forwarded to resolveBitrate
+    // (srcLossless skips the source cap for lossless sources; srcQuality gates the guarded source-cap on the force path).
+    const encoderArgsIdx = (codec, channels, idx, srcBps = 0, srcLossless = false, srcQuality = Infinity) =>
+        encoderArgsBps(codec, idx, resolveBitrate(codec, channels, srcBps, srcLossless, srcQuality));
 
     // ffmpeg's -c:a encoder TOKEN for a resolved audio codec name. Only opus differs from its own name: the encoder is libopus — ffmpeg's native `opus`
     // encoder is flagged experimental and aborts the whole job with "encoder 'opus' is experimental" unless `-strict -2` is added, so a bare `-c:a opus`
@@ -1474,6 +1506,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // writing that would degrade clean_and_remux's canonical BCP-47 region/script case (pt-BR -> pt-br) and trip a later re-repair remux, so the writes read
     // the stored tag verbatim (ffprobe tag, then mediaInfo), preserving case. audio_clean never NORMALISES a language tag - that is clean_and_remux's job.
     const langForWrite = (s) => (s.tags?.language || '').trim() || (mediaInfoFor(s)?.Language ?? '').trim();
+    // Does codec_force's scope cover a track of this shape? ('6below' takes every stereo track plus any surround track up to 6ch; 'all' drops that 6ch bound.)
+    // ONE predicate for the two places that consult the setting, because they ask DIFFERENT questions of it: the FORCE CODEC block asks "is a re-encode worth
+    // spending on this track?", while loudnorm's leftovers loop - which only runs once a re-encode is already happening for the gain correction - asks "since
+    // we are encoding anyway, whose codec applies?". A second hand-copied scope test is exactly how those two would drift apart.
+    const forceCovers = (isStereo, channels) => forceCodec === 'all'
+        || (forceCodec === '6below' && (isStereo || channels <= 6))
+        || (forceCodec === '2below' && isStereo);
     // Stereo (2ch) encode tokens for the configured stereoCodec, folding the aac_vbr (per-node VBR via aacVbrArgsIdx) vs fixed-bitrate branch otherwise
     // duplicated at every 2ch downmix/remix emit site. Returns the -c:a fragment (encoder + bitrate/quality args), the codec name + rate string + label for the
     // log line, and the output-summary record; each caller keeps its own -map prefix, log verb/suffix and outputAudioOverride/appendedAudio target inline.
@@ -2402,12 +2441,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // stereoCodecFamily above). The logs below keep the RAW codec name so the track is still identifiable.
                 const targetCodecFamily = aacFamily(targetCodec);
 
+                // Family equality ends it here: a rate-control-only change (an aac track under codec_stereo=aac_vbr) is not worth a lossy generation on its own.
+                // That is a judgement about SPENDING an encode, though, not about which codec is wanted - so when loudnorm re-encodes the track anyway, the
+                // leftovers loop revisits the setting and does honour it. See the codec choice there.
                 if (codecFamilyOf(ffstream) !== targetCodecFamily) {
-                    const shouldForce =
-                        forceCodec === 'all' ||
-                        (forceCodec === '6below' && !isStereo && forceChannels <= 6) ||
-                        (forceCodec === '6below' && isStereo) ||
-                        (forceCodec === '2below' && isStereo);
+                    const shouldForce = forceCovers(isStereo, forceChannels);
 
                     const targetMaxCh = codecMaxCh(targetCodec);
 
@@ -2557,24 +2595,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 const rawCodec = (stream.codec_name || '').trim().toLowerCase();
                 const isStereo = channels <= 2;
-                // Keep the current codec if it's already one this plugin can encode - never force convergence to codec_surround/codec_stereo just
-                // because they differ from what's already there (that is codec_force's job). Only converge when the current codec is genuinely
-                // outside this plugin's encodable domain (e.g. a kept DTS-core or MP3 track).
+                // WHICH codec this re-encode lands on. Two candidates, in preference order:
+                //   keepCodec - the codec the track already has, whenever this plugin can encode it. This is what codec_force=false means ("leave every
+                //       existing codec as it is"), and the only option at all for a source outside our encodable domain (a kept DTS core, an MP3).
+                //   configuredCodec - codec_stereo/codec_surround, used when codec_force's scope covers this track. The FORCE CODEC block may have declined
+                //       it as not worth a lossy generation on its own, but here the generation is already being spent on the gain correction, so declining
+                //       again would discard the user's setting for nothing. This is what makes codec_stereo=aac_vbr reach a track that is already aac.
+                // A target that is guard-protected or over its codec's channel limit falls back to the other candidate rather than cancelling the pass -
+                // mirroring codec_force's own "left as <source codec>" behaviour, so enabling codec_force can never silently switch loudnorm off.
                 const configuredCodec = isStereo ? stereoCodec : surroundCodec;
-                const targetCodec = ENCODABLE_CODECS.includes(rawCodec) ? rawCodec : configuredCodec;
+                const keepCodec = ENCODABLE_CODECS.includes(rawCodec) ? rawCodec : configuredCodec;
+                const codecMaxChFor = (c) => codecMaxCh(aacFamily(c));
+                const reachable = (c) => channels <= codecMaxChFor(c) && !guardBlocks(stream, c, channels, channels);
+                const wantCodec = forceCovers(isStereo, channels) ? configuredCodec : keepCodec;
+                const targetCodec = reachable(wantCodec) ? wantCodec : (reachable(keepCodec) ? keepCodec : null);
+                if (targetCodec === null) {
+                    // Both candidates are out of reach; report against keepCodec, the one the track would otherwise have stayed in.
+                    if (channels > codecMaxChFor(keepCodec))
+                        skipDone += `☒${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Skipping - ${rawCodec} ${channels}ch exceeds the `
+                            + `${codecMaxChFor(keepCodec)}ch limit for ${aacFamily(keepCodec)}\n`;
+                    else
+                        skipDone += `☒${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - would lose detail vs `
+                            + `${codecDisplayName(stream)} ${channels}ch (guard_lossless=${guardLossless}, guard_quality=${guardQuality}, `
+                            + `guard_object_audio=${guardObjectAudio}); left as ${rawCodec}\n`;
+                    continue;
+                }
                 const targetFamily = aacFamily(targetCodec);
-                const maxCh = codecMaxCh(targetFamily);
-                if (channels > maxCh) {
-                    skipDone += `☒${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Skipping - ${rawCodec} ${channels}ch exceeds the `
-                        + `${maxCh}ch limit for ${targetFamily}\n`;
-                    continue;
-                }
-                if (guardBlocks(stream, targetCodec, channels, channels)) {
-                    skipDone += `☒${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - would lose detail vs `
-                        + `${codecDisplayName(stream)} ${channels}ch (guard_lossless=${guardLossless}, guard_quality=${guardQuality}, `
-                        + `guard_object_audio=${guardObjectAudio}); left as ${rawCodec}\n`;
-                    continue;
-                }
 
                 // Cache check: this stream isn't being touched by anything else this run, so if it already carries a tag matching the CURRENT preset,
                 // its content hasn't changed since we last measured/corrected it against this exact target - trust it and skip the measurement
@@ -2644,10 +2690,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     modifiedAudioIdx.add(outputAudioIdx);
                     outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels, bps: 0, approxRate });
                 } else {
-                    const dstBitArg = encoderArgsIdx(targetCodec, channels, outputAudioIdx, srcBitrate, stream.isTdarrLossless, stream.awkQuality);
-                    const dstBitStr = resolveBitrate(targetCodec, channels, srcBitrate, stream.isTdarrLossless, stream.awkQuality);
+                    // Format in == format out (the plain loudnorm case, and codec_force aimed at the codec the track already uses): match the source rate
+                    // rather than re-deriving a ladder target, which would re-encode a 192k mono aac at the 160k aac ceiling and build in a loss nobody
+                    // asked for. Only a genuine codec change takes resolveBitrate's transcode target. An unmeasurable source rate falls back to it too.
+                    const sameFormat = targetFamily === codecFamilyOf(stream);
+                    const matchedBps = sameFormat ? sameFormatBitrate(targetFamily, channels, srcBitrate) : 0;
+                    const dstBitStr = matchedBps || resolveBitrate(targetCodec, channels, srcBitrate, stream.isTdarrLossless, stream.awkQuality);
+                    const dstBitArg = encoderArgsBps(targetCodec, outputAudioIdx, dstBitStr);
                     const srcRateStr = srcRateToken(stream);
-                    const note = targetCodec !== rawCodec ? ` (converged from ${rawCodec})` : '';
+                    const note = sameFormat ? (matchedBps ? ' (source rate matched)' : '') : ` (converged from ${rawCodec})`;
                     workDone += `☐${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${rawCodec} ${channels}ch @ ${srcRateStr} → `
                         + `${targetCodec} ${channels}ch @ ${dstBitStr / 1000} kb/s${note}\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${audioEncoder(targetCodec)}${dstBitArg} -filter:a:${outputAudioIdx} "${filter}"`
