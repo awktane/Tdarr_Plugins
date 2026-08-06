@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.20.0',
+    Version: '3.20.1',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -962,7 +962,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ====== END INTERLACE DETECTION ======
 
-    // ====== CLOSED-CAPTION DETECTION ======
+    // ===== SHARED [sub_worker, video_clean]: closed-caption probe =====
+    // -=-=-= A53 probe constants / deriveFfprobePath / probeA53Captions  [sub_worker, video_clean] =-=-=-
     // Closed captions are not a stream. They ride INSIDE the video bitstream as A53/EIA-608 SEI, so no stream list mentions them and nothing short of a
     // decode-side probe can see them - which is also why a re-encode is the one operation that can destroy them. ffprobe reports them as per-frame side data,
     // and reading a BOUNDED window of frames answers the question at a cost independent of duration (measured 0.2-17s across the sample corpus, a clip and a
@@ -1002,7 +1003,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return String(r.stdout || '').includes(A53_SIDE_DATA);
         } catch (e) { return 'unknown'; }
     };
-    // ====== END CLOSED-CAPTION DETECTION ======
+    // ===== END SHARED: closed-caption probe =====
 
     // Route the HDR->SDR tonemap to the GPU filter that rides the chosen encoder's device stack, keeping every node's output in the ONE
     // consistent tonemap_* family (cuda ~= opencl ~= videotoolbox, SSIM ~0.9997 - validated on real NVIDIA/Intel/Mac hardware). CPU 'tonemapx'
