@@ -3,17 +3,33 @@ const details = () => ({
     Name: 'Subtitle sidecar worker - extract embedded text subs to sidecars and reimport them',
     Type: 'Subtitle',
     Operation: 'Transcode',
-    Description: `Round-trips text subtitles between the container and media-server-style sidecar files so they can be reviewed/edited on disk (by hand or an external script).
+    Description: `Round-trips text subtitles between the container and media-server-style sidecar files so they can be reviewed/edited on disk (by hand or an
+                external script).
 
-                \\naction=extract writes each embedded TEXT subtitle to a sidecar next to the video (native format: srt/ass/vtt) and, by default, removes those tracks from the file.
-                \\nA STYLED subtitle (ASS/SSA) in a file that has embedded fonts is exported as a bundle named .<video>.s<streamIndex>[.<title>].<lang>[.<flags>].styled.mks - one Matroska holding the subtitle plus those fonts, which leave the video with it (they exist nowhere else, and Matroska is the only container that can carry both). The leading dot hides it from Plex/Jellyfin. Import restores the subtitle and its fonts together. An mp4 target cannot hold font attachments at all, so a bundle is left on disk until the file is mkv again.
-                \\naction=import muxes matching sidecars back into the file (restoring language, title, and disposition) and, by default, deletes the sidecar once it is safely embedded. Import never drops a subtitle - anything not already embedded is muxed in (a copy already present just becomes a duplicate, never a loss).
-                \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename: <video>.s<streamIndex>[.<title>][.<other flags>].<lang>[.<forced|sdh>].<ext> - the stream index keeps names unique, the title is reversibly encoded, and the language plus at most ONE server-documented flag sit last so Plex/Jellyfin/Emby auto-detect them (Plex accepts only one, and forced wins the slot because it drives automatic selection). Every other flag - commentary, descriptive, original, visual_impaired - rides AHEAD of the language, where media servers ignore it and this plugin still reads it, so nothing is lost and nothing confuses them.
-                \\nImport ALSO recognizes sidecars named the way those servers do, with no s<index> (e.g. <video>.en.forced.srt), anchored on the language token: the flag spellings foreign (= forced), cc and hi (= sdh) and default (ignored) are all understood, as is Emby's parenthesized description (<video>.English(Commentary).srt), which becomes the track title. hi is only read as hearing-impaired when a real language precedes it, so <video>.hi.srt stays Hindi.
+                \\naction=extract writes each embedded TEXT subtitle to a sidecar next to the video (native format: srt/ass/vtt) and, by default, removes those
+                tracks from the file.
+                \\nA STYLED subtitle (ASS/SSA) in a file that has embedded fonts is exported as a bundle named
+                .<video>.s<streamIndex>[.<title>].<lang>[.<flags>].styled.mks - one Matroska holding the subtitle plus those fonts, which leave the video with
+                it (they exist nowhere else, and Matroska is the only container that can carry both). The leading dot hides it from Plex/Jellyfin. Import
+                restores the subtitle and its fonts together. An mp4 target cannot hold font attachments at all, so a bundle is left on disk until the file is
+                mkv again.
+                \\naction=import muxes matching sidecars back into the file (restoring language, title, and disposition) and, by default, deletes the sidecar
+                once it is safely embedded. Import never drops a subtitle - anything not already embedded is muxed in (a copy already present just becomes a
+                duplicate, never a loss).
+                \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename:
+                <video>.s<streamIndex>[.<title>][.<other flags>].<lang>[.<forced|sdh>].<ext> - the stream index keeps names unique, the title is reversibly
+                encoded, and the language plus at most ONE server-documented flag sit last so Plex/Jellyfin/Emby auto-detect them (Plex accepts only one, and
+                forced wins the slot because it drives automatic selection). Every other flag - commentary, descriptive, original, visual_impaired - rides
+                AHEAD of the language, where media servers ignore it and this plugin still reads it, so nothing is lost and nothing confuses them.
+                \\nImport ALSO recognizes sidecars named the way those servers do, with no s<index> (e.g. <video>.en.forced.srt), anchored on the language
+                token: the flag spellings foreign (= forced), cc and hi (= sdh) and default (ignored) are all understood, as is Emby's parenthesized
+                description (<video>.English(Commentary).srt), which becomes the track title. hi is only read as hearing-impaired when a real language precedes
+                it, so <video>.hi.srt stays Hindi.
                 \\nBitmap subtitles (PGS/VobSub/DVB) can't become text and are always left embedded and untouched.
-                \\nScope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on import (see its tooltip for the disabled/enabled modes).
+                \\nScope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on
+                import (see its tooltip for the disabled/enabled modes).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last).`,
-    Version: '3.38.1',
+    Version: '3.38.2',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -35,7 +51,8 @@ const details = () => ({
             type: 'string',
             defaultValue: '',
             inputUI: { type: 'text' },
-            tooltip: `Optional comma-separated languages to act on (e.g. eng,jpn). Blank = all languages. One form is enough - en, eng, or English all match the same language (including region variants like en-US), so you don't need to list every variant.
+            tooltip: `Optional comma-separated languages to act on (e.g. eng,jpn). Blank = all languages. One form is enough - en, eng, or English all match the
+                same language (including region variants like en-US), so you don't need to list every variant.
                 \\nExample:\\neng,fra`,
         },
         {
@@ -46,12 +63,17 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['enabled', 'enabled_embedded', 'disabled']
             },
-            tooltip: `What counts as a copy of a subtitle you already have. The TEXT always decides, so genuinely different tracks - two commentaries, a real forced track vs a full one - are never collapsed; only byte-for-byte duplicates are.
+            tooltip: `What counts as a copy of a subtitle you already have. The TEXT always decides, so genuinely different tracks - two commentaries, a real
+                forced track vs a full one - are never collapsed; only byte-for-byte duplicates are.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nenabled - on import, mux one track per byte-identical group of sidecars, combining their flags (a plain + SDH pair imports once, tagged SDH), and skip a sidecar whose text is ALREADY one of the embedded tracks rather than adding a second copy of it. Every member of a group is listed in the marker, so import_remove_sidecar cleans up the whole group. Nothing is removed from the video.
-                \\nenabled_embedded - all of the above, and in BOTH actions also removes a subtitle the video itself carries twice. The lowest-numbered copy survives and inherits the others' flags, title and language, so no tagging is lost. This is the only setting that deletes a subtitle you did not ask to extract, and it costs one extra read of the file to compare the tracks.
+                \\nenabled - on import, mux one track per byte-identical group of sidecars, combining their flags (a plain + SDH pair imports once, tagged SDH),
+                and skip a sidecar whose text is ALREADY one of the embedded tracks rather than adding a second copy of it. Every member of a group is listed in
+                the marker, so import_remove_sidecar cleans up the whole group. Nothing is removed from the video.
+                \\nenabled_embedded - all of the above, and in BOTH actions also removes a subtitle the video itself carries twice. The lowest-numbered copy
+                survives and inherits the others' flags, title and language, so no tagging is lost. This is the only setting that deletes a subtitle you did not
+                ask to extract, and it costs one extra read of the file to compare the tracks.
                 \\ndisabled - mux every sidecar as its own track, even byte-identical copies (you may end up with duplicate subtitles).
                 \\nWhether the sidecar FILES are deleted afterwards is import_remove_sidecar's decision alone, whatever this is set to.`,
         },
@@ -64,8 +86,11 @@ const details = () => ({
                 options: ['true', 'false']
             },
             tooltip: `On extract, remove each text subtitle from the video after it is written to a sidecar. Off = write sidecars but keep the embedded tracks.
-                \\nStyled ASS/SSA rely on embedded fonts, so they are exported as a .mks bundle holding the subtitle and those fonts together, and the fonts are removed from the video along with it - the styling survives the round-trip whatever else runs in between.
-                \\nThe sidecar lands next to the video in the library on any node. A node that shares the library filesystem writes it there directly; an unmapped node, which only ever sees a local copy of the file, extracts the sidecar itself and uploads it through Tdarr's file API. Either way the embedded track is removed ONLY once the sidecar is confirmed in place, so a failed write costs you nothing but the extraction.`,
+                \\nStyled ASS/SSA rely on embedded fonts, so they are exported as a .mks bundle holding the subtitle and those fonts together, and the fonts are
+                removed from the video along with it - the styling survives the round-trip whatever else runs in between.
+                \\nThe sidecar lands next to the video in the library on any node. A node that shares the library filesystem writes it there directly; an
+                unmapped node, which only ever sees a local copy of the file, extracts the sidecar itself and uploads it through Tdarr's file API. Either way
+                the embedded track is removed ONLY once the sidecar is confirmed in place, so a failed write costs you nothing but the extraction.`,
         },
         {
             name: 'import_remove_sidecar',
@@ -75,13 +100,23 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['true', 'false']
             },
-            tooltip: `On import, delete each sidecar whose path, relative to the video's directory, is listed in the file's global awk_sub_worker marker (stamped by the mux pass) once its own text is confirmed to be one of the embedded subtitles - matching language and title is the fallback, used only for a .mks bundle or when the embedded text cannot be read at all.
+            tooltip: `On import, delete each sidecar whose path, relative to the video's directory, is listed in the file's global awk_sub_worker marker
+                (stamped by the mux pass) once its own text is confirmed to be one of the embedded subtitles - matching language and title is the fallback, used
+                only for a .mks bundle or when the embedded text cannot be read at all.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\ntrue (default) - delete them once they are safely embedded. The deletion runs in POST-PROCESSING, after you accept the transcode: deleting earlier would destroy the sidecars of a run you then reject, leaving those subtitles nowhere. So ADD THIS PLUGIN TO THE POST-PROCESSING PLUGIN STACK as well as the pre-processing one. Without that, nothing is ever lost, but the sidecars simply stay on disk. That stage runs on the SERVER, which is also how it cleans up for an unmapped node - one has no way of its own to delete a library file, since Tdarr's API offers upload and download but no delete.
+                \\ntrue (default) - delete them once they are safely embedded. The deletion runs in POST-PROCESSING, after you accept the transcode: deleting
+                earlier would destroy the sidecars of a run you then reject, leaving those subtitles nowhere. So ADD THIS PLUGIN TO THE POST-PROCESSING PLUGIN
+                STACK as well as the pre-processing one. Without that, nothing is ever lost, but the sidecars simply stay on disk. That stage runs on the
+                SERVER, which is also how it cleans up for an unmapped node - one has no way of its own to delete a library file, since Tdarr's API offers
+                upload and download but no delete.
                 \\nfalse - leave every sidecar on disk.
-                \\nOne case needs more than that: on an unmapped node with no mount, when every sidecar is ALREADY in the file, there is nothing to mux - so no transcode, no acceptance, and no post-processing pass in which to delete anything. There, true forces a lossless -c copy of the video purely to reach that stage. It is a full read and write to remove a few kB of text, but it is the only route, it happens at most ONCE per file (the pass marks those sidecars and the next one skips them), and asking for them to be deleted is taken as asking for whatever that costs. Set false if you would rather keep them.`,
+                \\nOne case needs more than that: on an unmapped node with no mount, when every sidecar is ALREADY in the file, there is nothing to mux - so no
+                transcode, no acceptance, and no post-processing pass in which to delete anything. There, true forces a lossless -c copy of the video purely to
+                reach that stage. It is a full read and write to remove a few kB of text, but it is the only route, it happens at most ONCE per file (the pass
+                marks those sidecars and the next one skips them), and asking for them to be deleted is taken as asking for whatever that costs. Set false if
+                you would rather keep them.`,
         },
         {
             name: 'method_import_metadata',
@@ -91,12 +126,16 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['embedded', 'sidecar']
             },
-            tooltip: `Which side owns the language/title/flags when a sidecar's TEXT is already one of the embedded tracks - i.e. who wins a disagreement about a subtitle that is already in the file. Reachable only when deduplicate is comparing text (enabled or enabled_embedded); a sidecar muxed as a NEW track always takes its metadata from its filename, because nothing else describes it.
+            tooltip: `Which side owns the language/title/flags when a sidecar's TEXT is already one of the embedded tracks - i.e. who wins a disagreement about
+                a subtitle that is already in the file. Reachable only when deduplicate is comparing text (enabled or enabled_embedded); a sidecar muxed as a
+                NEW track always takes its metadata from its filename, because nothing else describes it.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nembedded - leave the track exactly as it is and report the difference. Safe with an OLD sidecar name: a name written before a flag existed carries no token for it, and applying it would strip that flag off a track that has it.
-                \\nsidecar  - the filename wins, so renaming a sidecar retunes the track already in the file (language, title and flags, including clearing flags you removed from the name). Use it when you renamed the sidecar deliberately; it costs one remux of the file.`,
+                \\nembedded - leave the track exactly as it is and report the difference. Safe with an OLD sidecar name: a name written before a flag existed
+                carries no token for it, and applying it would strip that flag off a track that has it.
+                \\nsidecar  - the filename wins, so renaming a sidecar retunes the track already in the file (language, title and flags, including clearing
+                flags you removed from the name). Use it when you renamed the sidecar deliberately; it costs one remux of the file.`,
         },
         {
             name: 'method_unmapped',
@@ -106,14 +145,21 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['error', 'mount', 'text_file']
             },
-            tooltip: `What to do on an UNMAPPED node, which is only ever given a local copy of the video and never sees the library folder. Ignored entirely on a normal (mapped) node.
-                \\nExtract already works everywhere - the sidecar is uploaded to the library through Tdarr's file API. It is IMPORT that has the problem: finding sidecars means listing a directory, and the API offers no way to list one.
+            tooltip: `What to do on an UNMAPPED node, which is only ever given a local copy of the video and never sees the library folder. Ignored entirely on
+                a normal (mapped) node.
+                \\nExtract already works everywhere - the sidecar is uploaded to the library through Tdarr's file API. It is IMPORT that has the problem:
+                finding sidecars means listing a directory, and the API offers no way to list one.
                 \\n=====
                 \\nActions
                 \\n=====
                 \\nerror     - fail the file and say so. Nothing is silently skipped; run import on a node that can see the library.
-                \\nmount     - reach the library directly. The node's own path is tried first (a container bind-mounting the library at the server's own path, e.g. /media, needs nothing more), then any "key=value" Node Tag set for this node in the server's web UI, which names where THIS node sees that folder - for example "media=M:\\\\" when the server calls it /media. A tag is needed on Windows and macOS, where the server's path cannot exist locally. Extract writes directly too in this mode, skipping the upload API.
-                \\ntext_file - read "<video>.subtitles.txt" next to the video: one filename per line, lines starting with # ignored. Extract seeds it with what it wrote; after that it is yours to maintain, which is how a subtitle you OCR'd from an exported image sub gets imported. Each name must still follow the sidecar naming convention, since that is where language, title and flags come from.`,
+                \\nmount     - reach the library directly. The node's own path is tried first (a container bind-mounting the library at the server's own path,
+                e.g. /media, needs nothing more), then any "key=value" Node Tag set for this node in the server's web UI, which names where THIS node sees that
+                folder - for example "media=M:\\\\" when the server calls it /media. A tag is needed on Windows and macOS, where the server's path cannot exist
+                locally. Extract writes directly too in this mode, skipping the upload API.
+                \\ntext_file - read "<video>.subtitles.txt" next to the video: one filename per line, lines starting with # ignored. Extract seeds it with what
+                it wrote; after that it is yours to maintain, which is how a subtitle you OCR'd from an exported image sub gets imported. Each name must still
+                follow the sidecar naming convention, since that is where language, title and flags come from.`,
         },
     ],
 });
@@ -357,7 +403,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Look up a tag value case-insensitively - matroska UPPER-CASES tag keys on write, so a plugin reading its
     // sibling's awk_* marker gets an uppercased key back. Returns the raw value (or '' if absent); callers trim/decode
     // as needed. One source so the four plugins that read each other's markers can't drift on the lookup convention.
-    const getTagCI = (tags, name) => { const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === name); return hit === undefined ? '' : String(tags[hit] ?? ''); };
+    const getTagCI = (tags, name) => {
+        const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === name);
+        return hit === undefined ? '' : String(tags[hit] ?? '');
+    };
     // ===== END SHARED: case-insensitive tag lookup =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream / language / preset helpers =====
@@ -385,7 +434,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const dur = Number(ffmedia.Duration || 0);
         if (size > 0 && dur > 0) {
             const bps = Math.round((size * 8) / dur);
-            if (bps > 1000 && bps < 100000000) return bps;   // clamp to a plausible audio range so a stray unit (ms Duration, etc.) or corrupt size can't inject garbage
+            // clamp to a plausible audio range so a stray unit (ms Duration, etc.) or corrupt size can't inject garbage
+            if (bps > 1000 && bps < 100000000) return bps;
         }
         return 0;
     };
@@ -402,7 +452,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (s === 'quad') return 4;
         const m = s.match(/(\d+)\.(\d+)(?:\.(\d+))?/);              // "5.1"->6, "7.1(side)"->8, "7.1.4" Atmos -> 12 (front + LFE + height)
         if (m) return Number(m[1]) + Number(m[2]) + Number(m[3] || 0);
-        const tokens = s.split(/[+\s,]+/).filter((t) => t && !t.endsWith(':'));   // "FL+FR+FC+LFE" -> 4; drop MediaInfo ChannelPositions labels ("Front:", "Side:")
+        // "FL+FR+FC+LFE" -> 4; drop MediaInfo ChannelPositions labels ("Front:", "Side:")
+        const tokens = s.split(/[+\s,]+/).filter((t) => t && !t.endsWith(':'));
         return tokens.length > 1 ? tokens.length : 0;
     };
     const resolveChannels = (ffstream) => {
@@ -512,7 +563,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // here - isDescriptive reads that subtitle-scoped raw flag itself, on the same terms, so the summary and the classifiers cannot disagree about it.
             const descriptive = isDescriptive(s);
             const role = `${isCommentary(s) ? '/commentary' : ''}${descriptive ? '/description' : ''}${isSdh(s) ? '/sdh' : ''}${isLyrics(s) ? '/lyrics' : ''}`;
-            const forced = hasDisposition(s, 'forced') ? '/forced' : '';   // flag OR title keyword, same test the classifiers use - so the summary token and the sort key can never disagree
+            // flag OR title keyword, same test the classifiers use - so the summary token and the sort key can never disagree
+            const forced = hasDisposition(s, 'forced') ? '/forced' : '';
             return `[sub:${[lang, codec].filter(Boolean).join(' ')}${def}${forced}${role}${s.disposition?.original === 1 ? '/original' : ''}]`;
         }
         if (type === 'attachment') {
@@ -595,7 +647,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // The failFile message echoes the offending token capped at 200 chars, with control characters collapsed to a space: free text is unbounded and Tdarr
     // persists the whole error message, and a raw newline in the echo would split the line into a continuation carrying no ☐/☑/☒ status symbol.
-    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
+    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)}] not a recognised language`
+        + ' - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)');
     // ===== END SHARED: language token failure =====
 
     // ===== SHARED [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean]: dolby vision detection =====
@@ -614,7 +667,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // negative would silently lose the boxes.
     const isDolbyVisionVideo = (ffstream, ffmedia) => DV_FOURCC_RE.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
         || String(ffmedia?.HDR_Format || ffmedia?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
-        || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : []).some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
+        || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : [])
+            .some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
     // -=-=-= mp4StrictArg  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -780,7 +834,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // title (untrusted container metadata), losing only chars the loop would trim anyway (output identical, still flagged).
         if (raw.length > NAME_BYTE_CAP) { raw = raw.slice(0, NAME_BYTE_CAP); titleTruncated = true; }
         let enc = encodeTitle(raw);
-        while (raw.length > 0 && Buffer.byteLength(`${enc}${'.'.repeat(fixedLen ? 1 : 0)}`, 'utf8') + fixedLen > NAME_BYTE_CAP) { raw = raw.slice(0, -1); enc = encodeTitle(raw); titleTruncated = true; }
+        while (raw.length > 0 && Buffer.byteLength(`${enc}${'.'.repeat(fixedLen ? 1 : 0)}`, 'utf8') + fixedLen > NAME_BYTE_CAP) {
+            raw = raw.slice(0, -1); enc = encodeTitle(raw); titleTruncated = true;
+        }
         return enc;
     };
 
@@ -902,7 +958,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const clearStaged = () => { try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch (e) { /* see above */ } };
         const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', String(file._id || file.file || '')];
         for (const j of staged) args.push(...j.args, j.tmp);
-        const ff = spawnSync(String(otherArguments?.ffmpegPath || 'ffmpeg'), args, { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 });
+        const ff = spawnSync(String(otherArguments?.ffmpegPath || 'ffmpeg'), args,
+            { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 });
         if (ff.error || ff.status !== 0) {
             const why = ff.error ? `extraction failed (${ff.error.code || ff.error.message})`
                 : `extraction failed (ffmpeg exit ${ff.status}: ${String(ff.stderr || '').trim().slice(0, 200)})`;
@@ -932,7 +989,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // audio_clean, stream_ordering and sub_worker via langKey (free-text language-list validation / sidecar name recognition).
     const langDisplayName = (() => {
         let dn = null;
-        return (code) => { try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(code) || ''; } catch (e) { return ''; } };
+        return (code) => {
+            try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(code) || ''; }
+            catch (e) { return ''; }
+        };
     })();
     // ===== END SHARED: language display name =====
     // Recognise a filename token as a real language (2/3-letter ISO code or English name) so a server-native sidecar can
@@ -1043,7 +1103,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (DISP_AMBIGUOUS_LANG.has(toks[toks.length - 1]) && !isKnownLang(toks[toks.length - 2] || '')) break;
             rawDisp.unshift(toks.pop());
         }
-        const dispTokens = [...new Set(rawDisp.filter((t) => !DISP_IGNORE.has(t)).map((t) => DISP_ALIAS[t] || t))];   // drop ignored (default), normalise aliases (cc/hi->sdh, foreign->forced), dedupe
+        // drop ignored (default), normalise aliases (cc/hi->sdh, foreign->forced), dedupe
+        const dispTokens = [...new Set(rawDisp.filter((t) => !DISP_IGNORE.has(t)).map((t) => DISP_ALIAS[t] || t))];
         if (!toks.length) return null;
         let lang = toks.pop();                                            // language is the next-from-right token
         if (!lang) return null;
@@ -1107,7 +1168,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const url = serverApiUrl();
             if (!url) return cached;
             const { spawnSync } = require('child_process');
-            const r = spawnSync('curl', ['-sS', '-m', String(NODE_TAG_FETCH_S), ...apiAuthArgs(), `${url}/api/v2/get-nodes`], { encoding: 'utf8', timeout: NODE_TAG_FETCH_S * 1000, maxBuffer: 8 * 1024 * 1024 });
+            const r = spawnSync('curl', ['-sS', '-m', String(NODE_TAG_FETCH_S), ...apiAuthArgs(), `${url}/api/v2/get-nodes`],
+                { encoding: 'utf8', timeout: NODE_TAG_FETCH_S * 1000, maxBuffer: 8 * 1024 * 1024 });
             if (r.error || r.status !== 0) return cached;
             try {
                 const reg = JSON.parse(String(r.stdout || '')) || {};
@@ -1138,12 +1200,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         for (const [label, dir] of candidates) {
             try { fs.readdirSync(dir); return { dir, via: label }; } catch (e) {
                 const code = (e && e.code) || '';
-                tried.push(`${label} (${dir}) - ${code === 'ENOENT' ? 'not there' : (code === 'EACCES' || code === 'EPERM' ? 'exists but unreadable from this node, check credentials' : code || e.message)}`);
+                tried.push(`${label} (${dir}) - ${code === 'ENOENT' ? 'not there'
+                    : (code === 'EACCES' || code === 'EPERM' ? 'exists but unreadable from this node, check credentials' : code || e.message)}`);
             }
         }
-        return { dir: '', why: `nothing reachable. Tried: ${tried.join('; ')}${nodeTagPairs().length ? '' : '. No "key=value" Node Tag is set for this node'}` };
+        return { dir: '',
+            why: `nothing reachable. Tried: ${tried.join('; ')}${nodeTagPairs().length ? '' : '. No "key=value" Node Tag is set for this node'}` };
     };
-    const mountedLib = (() => { let c = null; return () => { if (!c) c = (isUnmappedNode && unmappedMode === 'mount') ? resolveMountedLibDir() : { dir: '' }; return c; }; })();
+    const mountedLib = (() => {
+        let c = null;
+        return () => { if (!c) c = (isUnmappedNode && unmappedMode === 'mount') ? resolveMountedLibDir() : { dir: '' }; return c; };
+    })();
 
     // Every path below goes through these two rather than libDir/isUnmappedNode directly: with a resolved mount the node behaves exactly like a mapped one,
     // reading and writing the real library, and the API routes are only for a node that genuinely cannot reach it.
@@ -1192,7 +1259,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!dest) { response.infoLog += `☒[method_unmapped=text_file] Cannot work out the server path for ${rel}\n`; continue; }
             const why = downloadLibraryFile(dest, path.join(libDir, rel));
             if (!why) { got.push(rel); continue; }
-            if (embeddedAlready && embeddedAlready.has(rel)) { response.infoLog += `☑[method_unmapped=text_file] ${listName} still lists ${rel}, which an earlier pass already embedded and removed\n`; continue; }
+            if (embeddedAlready && embeddedAlready.has(rel)) {
+                response.infoLog += `☑[method_unmapped=text_file] ${listName} still lists ${rel}, which an earlier pass already embedded and removed\n`;
+                continue;
+            }
             response.infoLog += `☒[method_unmapped=text_file] ${listName} lists ${rel} but it could not be fetched - ${why}\n`;
         }
         return got;
@@ -1242,10 +1312,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const entry = line.trim();
             if (!entry || entry.startsWith('#')) continue;
             const norm = entry.replace(/\\/g, '/');
-            if (/^([a-zA-Z]:|\/|\\)/.test(entry) || norm.startsWith('//')) { bad.push([entry, 'absolute paths are not allowed, name a file inside the video\'s own folder']); continue; }
+            if (/^([a-zA-Z]:|\/|\\)/.test(entry) || norm.startsWith('//')) {
+                bad.push([entry, 'absolute paths are not allowed, name a file inside the video\'s own folder']); continue;
+            }
             if (norm.split('/').includes('..')) { bad.push([entry, '".." is not allowed, a listed file must sit inside the video\'s own folder']); continue; }
             const full = path.resolve(workLibDir(), norm);
-            if (full !== path.resolve(workLibDir()) && !full.startsWith(path.resolve(workLibDir()) + path.sep)) { bad.push([entry, 'resolves outside the video\'s folder']); continue; }
+            if (full !== path.resolve(workLibDir()) && !full.startsWith(path.resolve(workLibDir()) + path.sep)) {
+                bad.push([entry, 'resolves outside the video\'s folder']); continue;
+            }
             ok.push(norm);
         }
         return { ok, bad };
@@ -1268,7 +1342,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const subs = top.filter((d) => d.isDirectory() && SIDECAR_SUBDIRS.includes(d.name.toLowerCase())).map((d) => d.name).sort();
         for (const s of subs) {
             let inner = [];
-            try { inner = fs.readdirSync(path.join(workLibDir(), s)); } catch (e) { continue; }   // unreadable subfolder: the sidecars beside the video still import
+            // unreadable subfolder: the sidecars beside the video still import
+            try { inner = fs.readdirSync(path.join(workLibDir(), s)); } catch (e) { continue; }
             for (const n of inner.sort()) rels.push(`${s}/${n}`);
         }
         return { rels };
@@ -1310,7 +1385,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const r = spawnSync(ffprobePath, ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', target],
             { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 });
         if (r.error || r.status !== 0) return null;
-        try { const j = JSON.parse(r.stdout); return Array.isArray(j.streams) ? { streams: j.streams, tags: j.format?.tags || {} } : null; } catch (e) { return null; }
+        try {
+            const j = JSON.parse(r.stdout); return Array.isArray(j.streams) ? { streams: j.streams, tags: j.format?.tags || {} } : null;
+        } catch (e) { return null; }
     };
 
     // The CONTENT of every embedded text subtitle, as a sha1 keyed by source stream index. This is the only sound answer to "is this sidecar already in the
@@ -1341,11 +1418,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             outs.set(s.index, out);
         }
         const { spawnSync } = require('child_process');
-        const r = spawnSync(String(otherArguments?.ffmpegPath || 'ffmpeg'), args, { encoding: 'utf8', timeout: SUB_EXTRACT_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 });
+        const r = spawnSync(String(otherArguments?.ffmpegPath || 'ffmpeg'), args,
+            { encoding: 'utf8', timeout: SUB_EXTRACT_TIMEOUT_MS, maxBuffer: 8 * 1024 * 1024 });
         if (!r.error && r.status === 0) {
             const map = new Map();
             for (const [idx, out] of outs) {
-                try { map.set(idx, crypto.createHash('sha1').update(fs.readFileSync(out)).digest('hex')); } catch (e) { /* a stream that wrote nothing simply has no hash, and matches nothing */ }
+                try { map.set(idx, crypto.createHash('sha1').update(fs.readFileSync(out)).digest('hex')); } catch (e) {
+                    /* a stream that wrote nothing simply has no hash, and matches nothing */
+                }
             }
             embeddedHashCache = map;
         }
@@ -1370,7 +1450,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const ordered = g.slice().sort((a, b) => a.index - b.index);
             const keep = ordered[0]; const drop = ordered.slice(1);
             out.dropIdx.push(...drop.map((s) => s.index));
-            out.log += `☐${streamTag(keep.index)}[deduplicate=enabled_embedded] Removing ${drop.length} duplicate subtitle stream${drop.length === 1 ? '' : 's'} (${drop.map((s) => `s${s.index}`).join(', ')}) - byte-identical to this one\n`;
+            out.log += `☐${streamTag(keep.index)}[deduplicate=enabled_embedded] Removing ${drop.length} duplicate subtitle stream${
+                drop.length === 1 ? '' : 's'} (${drop.map((s) => `s${s.index}`).join(', ')}) - byte-identical to this one\n`;
             // `default` is the one flag NOT unioned: it says which track a player should pick, not what the subtitle IS, so this plugin never tracks it
             // (see DISPOSITIONS). Folding it would let a duplicate hand the survivor a default flag it never had, silently changing what plays - so the
             // keeper simply keeps its own, and the disposition write below, which replaces the whole set, neither invents nor strips it.
@@ -1383,7 +1464,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const sameDisp = keepDisp.size === disp.size && [...disp].every((k) => keepDisp.has(k));
             if (sameDisp && (keep.tags?.title || '') === title && langKey(resolveLang(keep) || 'und') === langKey(lang)) continue;
             out.retag = (out.retag || []).concat([{ index: keep.index, lang, title, disp: [...disp] }]);
-            out.log += `☐${streamTag(keep.index)}[deduplicate=enabled_embedded] Folding the removed streams' tags onto it (${[lang, title, ...disp].filter(Boolean).join(' ')})\n`;
+            out.log += `☐${streamTag(keep.index)}[deduplicate=enabled_embedded] Folding the removed streams' tags onto it (${
+                [lang, title, ...disp].filter(Boolean).join(' ')})\n`;
         }
         return out;
     };
@@ -1428,7 +1510,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const marked = new Set(decodeMarkerList(getTagCI(globalTags || {}, 'awk_sub_worker')));
         if (!marked.size) return { deleted: 0, log: '' };
         const scan = scanSidecarDirs();
-        if (scan.err) return { deleted: 0, log: `☒[${delReason}] Cannot read the library directory to remove imported sidecars: ${scan.err.message || scan.err}\n` };
+        if (scan.err) {
+            return { deleted: 0, log: `☒[${delReason}] Cannot read the library directory to remove imported sidecars: ${scan.err.message || scan.err}\n` };
+        }
         const embedded = streamList.filter((s) => codecTypeOf(s) === 'subtitle');
         const anyFont = streamList.some((s) => codecTypeOf(s) === 'attachment' && isFontAttachment(s));
         // Language + title is a proxy for "this is in the file"; the TEXT is the fact itself, and only the fact may authorise an unlink. So the content test
@@ -1462,13 +1546,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
 
-    const parseLangFilter = (v) => { const l = String(v || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean); return l.length ? new Set(l.map(langKey)) : null; };   // keys, so en/eng/English match
+    // Fold each token through langKey, so en/eng/English match
+    const parseLangFilter = (v) => {
+        const l = String(v || '').toLowerCase().split(',').map((x) => x.trim()).filter(Boolean);
+        return l.length ? new Set(l.map(langKey)) : null;
+    };
     // Synthetic stream so a not-yet-muxed sidecar renders through summariseStream in the expected-results line.
     const sidecarToStream = (f) => {
         // A bundle always carries a styled subtitle. Every other sidecar maps back through EXT_TO_CODEC behind the same TEXT_EXTS gate parseSidecar applies,
         // so an ext outside the table cannot reach here - the webvtt fallback only guards a future caller that reads a sidecar without going through it.
         const codec = f.bundle ? 'ass' : (TEXT_EXTS.includes(f.ext) ? EXT_TO_CODEC[f.ext] : 'webvtt');
-        const disposition = {}; for (const d of DISPOSITIONS.concat(EXTRA_DISPOSITIONS)) if ((f.dispTokens.concat(f.extraTokens || [])).includes(d.token)) disposition[d.ff] = 1;
+        const disposition = {};
+        for (const d of DISPOSITIONS.concat(EXTRA_DISPOSITIONS)) if ((f.dispTokens.concat(f.extraTokens || [])).includes(d.token)) disposition[d.ff] = 1;
         return { codec_type: 'subtitle', codec_name: codec, index: -1, tags: { language: f.lang, title: f.title }, disposition };
     };
 
@@ -1481,7 +1570,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // silently flip the branch. This stage can legitimately arrive without ffProbeData (probeCurrentFile falls back to ffprobe), so the probe guard below
     // belongs to pre-processing alone.
     const isPostProcessing = !!otherArguments?.homePath && !otherArguments?.configVars && !otherArguments?.job;
-    if (!isPostProcessing && (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))) failFile('No ffProbe stream data available, cannot process this file');
+    if (!isPostProcessing && (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))) {
+        failFile('No ffProbe stream data available, cannot process this file');
+    }
     const action = String(inputs.action);
     if (action !== 'extract' && action !== 'import') failFile(`[action=${action}] invalid value, check your settings`);
     // Deleting the sidecar FILES is import_remove_sidecar's decision alone in every mode - this setting only ever decides what counts as a duplicate. An
@@ -1493,7 +1584,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const dedupeStreams = dedupeMode === 'enabled_embedded'; // only this one also removes a duplicate the file already carries
     if (!['error', 'mount', 'text_file'].includes(unmappedMode)) failFile(`[method_unmapped=${inputs.method_unmapped}] invalid value, check your settings`);
     const metadataMode = String(inputs.method_import_metadata || 'embedded').toLowerCase();
-    if (!['embedded', 'sidecar'].includes(metadataMode)) failFile(`[method_import_metadata=${inputs.method_import_metadata}] invalid value, check your settings`);
+    if (!['embedded', 'sidecar'].includes(metadataMode)) {
+        failFile(`[method_import_metadata=${inputs.method_import_metadata}] invalid value, check your settings`);
+    }
     if (file.fileMedium && file.fileMedium !== 'video') return skip('☑Not a video file - skipping\n');
     // A language token that is not a language FAILS the file. only_languages scopes which subtitles are touched at all, so a typo ('eng,fer') silently matches
     // nothing and every subtitle in that language is quietly left out of the extract - the user gets a clean run that did none of the work they asked for, with
@@ -1549,7 +1642,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const probed = probeCurrentFile();
         if (!probed) return skip('☒[import_remove_sidecar=true] Cannot read the accepted file to confirm what is embedded - every sidecar is left in place\n');
         const { deleted, log } = deleteImportedSidecars(probed.streams, probed.tags, isMp4);
-        return skip(log ? `☑[import_remove_sidecar=true] Working in ${workLibDir()}\n${log}` : `☑[import_remove_sidecar=true] No imported sidecar is waiting to be removed\n`);
+        return skip(log ? `☑[import_remove_sidecar=true] Working in ${workLibDir()}\n${log}`
+            : `☑[import_remove_sidecar=true] No imported sidecar is waiting to be removed\n`);
     }
     // The -strict level either -c copy remux below needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses without
     // it. Only subtitle streams are ever added or dropped here, so every audio/video stream is copied and the copied-subset argument stays at its default.
@@ -1590,7 +1684,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // nothing to fall back to). Same wording as that failure, so the two read as one problem.
             if (isUnmappedNode && unmappedMode === 'mount' && !mountedLib().dir) {
                 response.infoLog += `☒[method_unmapped=mount] Could not reach the library from this node - ${mountedLib().why}\n`;
-                response.infoLog += '☒[method_unmapped=mount] Placing sidecars through the file API instead; import will FAIL on this node until the mount works\n';
+                response.infoLog += '☒[method_unmapped=mount] Placing sidecars through the file API instead; '
+                    + 'import will FAIL on this node until the mount works\n';
             } else if (isUnmappedNode && unmappedMode === 'mount') {
                 response.infoLog += `☑[method_unmapped=mount] Writing to the library at ${mountedLib().dir} (via ${mountedLib().via})\n`;
             }
@@ -1616,7 +1711,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // embedded track, which would then be the only remaining copy.
                 if (!pathIsPresetSafe(full)) {
                     refused += 1;
-                    response.infoLog += `☒${streamTag(s.index)} Library directory contains a quote or control character - cannot write ${name} safely, keeping the embedded subtitle\n`;
+                    response.infoLog += `☒${streamTag(s.index)} Library directory contains a quote or control character - cannot write ${name} safely, `
+                        + 'keeping the embedded subtitle\n';
                     continue;
                 }
                 // An unmapped node cannot reach the library to test or write the sidecar locally, so both happen through the server. With no translator
@@ -1624,7 +1720,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const remoteDest = placeViaApi() ? serverSidePath(full) : '';
                 if (placeViaApi() && !remoteDest) {
                     refused += 1;
-                    response.infoLog += `☒${streamTag(s.index)} No path translator maps this library directory back to the server - cannot write ${name}, keeping the embedded subtitle\n`;
+                    response.infoLog += `☒${streamTag(s.index)} No path translator maps this library directory back to the server - cannot write ${name}, `
+                        + 'keeping the embedded subtitle\n';
                     continue;
                 }
                 // An existing sidecar is preserved (never overwrite the user's edits) - but only if it has content. A 0-byte sidecar is the fingerprint of
@@ -1643,9 +1740,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // A bundle is muxed with -c copy so the subtitle and every font stay byte-exact; matroska auto-detects .mkv but NOT .mks, so -f is required.
                 else if (bundle) {
                     sidecarOut += ` -map 0:${s.index}${fontMaps} -c copy -f matroska "${full}"`; wrote += 1;
-                    response.infoLog += `☐${streamTag(s.index)} Extract -> ${name} (styled subtitle bundled with ${fontIndices.length} font${fontIndices.length === 1 ? '' : 's'})\n`;
+                    response.infoLog += `☐${streamTag(s.index)} Extract -> ${name} (styled subtitle bundled with ${fontIndices.length} font${
+                        fontIndices.length === 1 ? '' : 's'})\n`;
                 }
-                else { sidecarOut += ` -map 0:${s.index} -c:s ${enc} "${full}"`; wrote += 1; response.infoLog += `☐${streamTag(s.index)} Extract -> ${name}\n`; }
+                else {
+                    sidecarOut += ` -map 0:${s.index} -c:s ${enc} "${full}"`; wrote += 1; response.infoLog += `☐${streamTag(s.index)} Extract -> ${name}\n`;
+                }
                 if (bundle) bundled += 1;
                 if (removeAfterExtract) removedIndices.add(s.index);
             }
@@ -1657,7 +1757,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 for (const j of placeJobs) {
                     if (!placed.has(j.name)) {
                         refused += 1;
-                        response.infoLog += `☒${streamTag(j.index)} Could not place ${j.name} in the library - ${failed.get(j.name)}, keeping the embedded subtitle\n`;
+                        response.infoLog += `☒${streamTag(j.index)} Could not place ${j.name} in the library - ${failed.get(j.name)}, `
+                            + 'keeping the embedded subtitle\n';
                         continue;
                     }
                     wrote += 1;
@@ -1670,8 +1771,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (unmappedMode === 'text_file') {
                     const placedNames = placeJobs.filter((j) => placed.has(j.name)).map((j) => j.name);
                     const why = placedNames.length ? seedSubtitleList(placedNames) : 'nothing was placed to list';
-                    if (!why) response.infoLog += `☑[method_unmapped=text_file] Created ${videoBase}${SUBTITLE_LIST_SUFFIX} listing ${placedNames.length} sidecar${placedNames.length === 1 ? '' : 's'} - edit it to add your own\n`;
-                    else if (why !== 'exists' && why !== 'nothing was placed to list') response.infoLog += `☒[method_unmapped=text_file] Could not create ${videoBase}${SUBTITLE_LIST_SUFFIX} - ${why}\n`;
+                    if (!why) response.infoLog += `☑[method_unmapped=text_file] Created ${videoBase}${SUBTITLE_LIST_SUFFIX} listing ${
+                        placedNames.length} sidecar${placedNames.length === 1 ? '' : 's'} - edit it to add your own\n`;
+                    else if (why !== 'exists' && why !== 'nothing was placed to list') response.infoLog += `☒[method_unmapped=text_file] Could not create ${
+                        videoBase}${SUBTITLE_LIST_SUFFIX} - ${why}\n`;
                 }
             }
             // The fonts leave with the styled subtitles that need them, but only once a bundle actually holds them (bundled) and no styled subtitle is
@@ -1680,7 +1783,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (removeAfterExtract && bundled
                 && !streams.some((s) => codecTypeOf(s) === 'subtitle' && isStyledSub(s.codec_name) && !removedIndices.has(s.index))) {
                 for (const idx of fontIndices) removedIndices.add(idx);
-                response.infoLog += `☐[extract_remove_stream=true] Removing ${fontIndices.length} font attachment${fontIndices.length === 1 ? '' : 's'} - now archived in the styled-subtitle bundle\n`;
+                response.infoLog += `☐[extract_remove_stream=true] Removing ${fontIndices.length} font attachment${
+                    fontIndices.length === 1 ? '' : 's'} - now archived in the styled-subtitle bundle\n`;
             }
             if (titleTruncated) response.infoLog += '☒A subtitle title was too long for the filename and was truncated\n';
             // sidecarOut rather than wrote, because on an unmapped node the sidecars are already written and only a removal still needs a remux: with
@@ -1722,9 +1826,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let listedRels = null;   // non-null once method_unmapped=text_file has supplied the names, since there is no directory to scan
         if (isUnmappedNode) {
             if (unmappedMode === 'error') {
-                failFile('[method_unmapped=error] This node is unmapped and cannot see the library to find sidecars - set method_unmapped to mount or text_file, or run import on a node that shares the library filesystem');
+                failFile('[method_unmapped=error] This node is unmapped and cannot see the library to find sidecars - '
+                    + 'set method_unmapped to mount or text_file, or run import on a node that shares the library filesystem');
             }
-            if (unmappedMode === 'mount' && !mountedLib().dir) failFile(`[method_unmapped=mount] Could not reach the library from this node - ${mountedLib().why}`);
+            if (unmappedMode === 'mount' && !mountedLib().dir) {
+                failFile(`[method_unmapped=mount] Could not reach the library from this node - ${mountedLib().why}`);
+            }
             if (unmappedMode === 'mount') response.infoLog += `☑[method_unmapped=mount] Reading the library at ${mountedLib().dir} (via ${mountedLib().via})\n`;
             // Every route says WHERE it read from, this one included - see the mapped-route note below for why that line matters.
             if (unmappedMode === 'text_file') {
@@ -1740,26 +1847,34 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // outcome a mapped node reaches by scanning the folder and finding no sidecars; only the way it looks is different.
                 const listWhy = downloadLibraryFile(listDest, listLocal);
                 if (listWhy) {
-                    response.infoLog += `☑[method_unmapped=text_file] No ${listName} in the library, so there is nothing listed to import - extract creates one when it writes sidecars, or add it yourself with one filename per line\n`;
+                    response.infoLog += `☑[method_unmapped=text_file] No ${listName} in the library, so there is nothing listed to import - extract creates `
+                        + 'one when it writes sidecars, or add it yourself with one filename per line\n';
                     listedRels = [];   // nothing to import - but the file's own duplicate subtitle streams are still worth collapsing, so fall through
                 }
                 if (listedRels === null) {
                     let listText = '';
-                    try { listText = fs.readFileSync(listLocal, 'utf8'); } catch (e) { failFile(`[method_unmapped=text_file] Fetched ${listName} but could not read it back: ${e && e.message ? e.message : e}`); }
+                    try { listText = fs.readFileSync(listLocal, 'utf8'); } catch (e) {
+                        failFile(`[method_unmapped=text_file] Fetched ${listName} but could not read it back: ${e && e.message ? e.message : e}`);
+                    }
                     const parsed = readSubtitleList(listText);
                     for (const [entry, why] of parsed.bad) response.infoLog += `☒[method_unmapped=text_file] Ignoring "${entry}" in ${listName} - ${why}\n`;
                     // An empty list is the same "nothing to import" as no list at all - a user who emptied it, or left only comments, has said so. A list whose
                     // every line was REJECTED is different: those were written with intent and not one can be used, which is a mistake worth stopping on.
-                    if (!parsed.ok.length && parsed.bad.length) failFile(`[method_unmapped=text_file] ${listName} lists no usable filenames - every line was rejected, see above`);
+                    if (!parsed.ok.length && parsed.bad.length) {
+                        failFile(`[method_unmapped=text_file] ${listName} lists no usable filenames - every line was rejected, see above`);
+                    }
                     if (!parsed.ok.length) {
-                        response.infoLog += `☑[method_unmapped=text_file] ${listName} lists no filenames, so there is nothing to import - add one filename per line\n`;
+                        response.infoLog += `☑[method_unmapped=text_file] ${listName} lists no filenames, so there is nothing to import - `
+                            + 'add one filename per line\n';
                         listedRels = [];
                     } else {
                         listedRels = fetchListedSidecars(parsed.ok, listName, importedSet);
                         // Names an earlier pass already embedded and removed are not a shortfall, so they count out of the total rather than as failures.
                         const spent = parsed.ok.filter((rel) => importedSet.has(rel) && !listedRels.includes(rel)).length;
                         const wanted = parsed.ok.length - spent;
-                        response.infoLog += `☑[method_unmapped=text_file] Read ${parsed.ok.length} filename${parsed.ok.length === 1 ? '' : 's'} from ${listName}, fetched ${listedRels.length} of the ${wanted} still to import${spent ? ` (${spent} already embedded and removed)` : ''}\n`;
+                        response.infoLog += `☑[method_unmapped=text_file] Read ${parsed.ok.length} filename${parsed.ok.length === 1 ? '' : 's'} from ${
+                            listName}, fetched ${listedRels.length} of the ${wanted} still to import${
+                            spent ? ` (${spent} already embedded and removed)` : ''}\n`;
                     }
                 }
             }
@@ -1770,7 +1885,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // wrong copy of the library. It also says when the node type is UNKNOWN: that comes from otherArguments.configVars, which only the classic worker
         // supplies, so a caller passing less (the flow shim passes no configVars at all) leaves an unmapped node indistinguishable from a mapped one, and the
         // mapped assumption points every read and every delete at the mirror. Naming both the directory and the missing configuration turns that into one line.
-        if (!isUnmappedNode) response.infoLog += `☑Reading sidecars from ${workLibDir()}${otherArguments?.configVars ? '' : ' (node type unknown - Tdarr passed no node configuration for this run)'}\n`;
+        if (!isUnmappedNode) response.infoLog += `☑Reading sidecars from ${workLibDir()}${
+            otherArguments?.configVars ? '' : ' (node type unknown - Tdarr passed no node configuration for this run)'}\n`;
         const scan = listedRels ? { rels: listedRels } : scanSidecarDirs();
         if (scan.err) failFile(`Cannot read the library directory to find sidecars: ${scan.err.message || scan.err}`);
         // Every drop from here down says so. A sidecar that is on disk and never mentioned again is indistinguishable from one the plugin never saw, and
@@ -1781,7 +1897,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (!langFilter || langFilter.has(langKey(f.lang))) return true;
                 // The tag echoes a free-text input, so it gets the same treatment failLangToken gives its token: control characters collapsed (a raw newline
                 // would split the line into a continuation with no ☐/☑/☒ symbol) and capped, since nothing bounds the list and this line is per-sidecar.
-                response.infoLog += `☑[only_languages=${String(inputs.only_languages ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)}] Skipping ${f.rel} - ${f.lang} is not in the list\n`;
+                response.infoLog += `☑[only_languages=${String(inputs.only_languages ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)}] Skipping ${
+                    f.rel} - ${f.lang} is not in the list\n`;
                 return false;
             })
             // An mp4-family target carries no font attachments at all, so importing a styled-subtitle bundle there would embed the subtitle and strand
@@ -1789,7 +1906,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // (dropping it from `found` also keeps it out of the deletion pass below); remux the file to mkv and run import again to restore it.
             .filter((f) => {
                 if (!f.bundle || !isMp4) return true;
-                response.infoLog += `☒Cannot import ${f.rel} - an ${dstContainer} target carries no font attachments, keeping the styled-subtitle bundle on disk\n`;
+                response.infoLog += `☒Cannot import ${f.rel} - an ${dstContainer} target carries no font attachments, `
+                    + 'keeping the styled-subtitle bundle on disk\n';
                 return false;
             });
         // A file that LOOKS like a subtitle but does not parse as a sidecar is almost always a hand-named one, and saying nothing about it turns a typo into
@@ -1865,7 +1983,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const contentKey = (f) => sidecarSha1(f.rel) || `unreadable:${f.rel}`;
         const groups = []; const groupHash = new Map();
         if (!dedupeSidecars) { for (const f of candidates) groups.push([f]); }
-        else { const byHash = new Map(); for (const f of candidates) { const h = contentKey(f); let g = byHash.get(h); if (!g) { g = []; byHash.set(h, g); groups.push(g); groupHash.set(g, h); } g.push(f); } }
+        else {
+            const byHash = new Map();
+            for (const f of candidates) {
+                const h = contentKey(f); let g = byHash.get(h);
+                if (!g) { g = []; byHash.set(h, g); groups.push(g); groupHash.set(g, h); }
+                g.push(f);
+            }
+        }
 
         // One import per group: union the members' disposition tokens (byte-identical plain + SDH -> SDH), and take the first non-"und" language and
         // first non-empty title. The physical file muxed is the member with the most-specific dispositions (deterministic tie-break by name); its
@@ -1949,14 +2074,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (curTitle === (f.title || '') && langKey(resolveLang(cur) || 'und') === langKey(f.lang || 'und') && sameDisp) continue;
             const named = [f.lang, f.title, ...f.disp].filter(Boolean).join(' ');
             if (metadataMode !== 'sidecar') {
-                response.infoLog += `☒${streamTag(at)}[method_import_metadata=${metadataMode}] The sidecar name and the embedded track disagree on metadata - keeping the track's own (name: ${named})\n`;
+                response.infoLog += `☒${streamTag(at)}[method_import_metadata=${metadataMode}] The sidecar name and the embedded track disagree on metadata `
+                    + `- keeping the track's own (name: ${named})\n`;
                 continue;
             }
             const outIdx = keptSubs.findIndex((s) => s.index === at);   // position among the SURVIVING subtitle streams (see retagArgs)
             retuneMeta += ` -metadata:s:s:${outIdx} "language=${langMetaValue(f.lang)}"`;
             retuneMeta += ` -metadata:s:s:${outIdx} "title=${escMeta(f.title || '')}"`;
             retuneMeta += ` -disposition:s:${outIdx} ${wantDisp.size ? [...wantDisp].join('+') : '0'}`;
-            response.infoLog += `☐${streamTag(at)}[method_import_metadata=sidecar] Retagging the track already in the file from ${f.rel} (${named || 'no language, title or flags'})\n`;
+            response.infoLog += `☐${streamTag(at)}[method_import_metadata=sidecar] Retagging the track already in the file from ${f.rel} (${
+                named || 'no language, title or flags'})\n`;
         }
 
         // Sidecars that were only ever redundant, with nothing at all to mux alongside them. There is no transcode to wait on here, so the deletion the user
@@ -1979,7 +2106,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // decoded title differs from the track's - a hand-added copy under a name of the user's own choosing is exactly that, and would otherwise
             // re-force on every pass. Nothing is lost by stopping: that earlier pass's marker still names them, so post-processing deletes them when it runs.
             if (!stranded.some((rel) => !importedSet.has(rel))) {
-                response.infoLog += '☑[import_remove_sidecar=true] Already queued for removal by an earlier pass - nothing more to do until the post-processing stage runs\n';
+                response.infoLog += '☑[import_remove_sidecar=true] Already queued for removal by an earlier pass - '
+                    + 'nothing more to do until the post-processing stage runs\n';
                 return skip('☑Nothing to import - every sidecar was already in the file\n');
             }
             // The marker is written whole, so anything left out of it is erased. Carry forward every sidecar still on disk that an earlier pass already
@@ -1991,7 +2119,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // above. Making this a setting would only work for someone who already knew the trap existed, and by then they have been caught by it: asking for
             // the sidecars to be deleted IS asking for whatever it takes. It cannot repeat - one extra pass per file, ever - because the marker stamped here
             // lists them, so the next pass filters them out through alreadyEmbedded, whether or not the deletion that follows actually succeeded.
-            response.infoLog += '☒[import_remove_sidecar=true] Every sidecar is already in the file and this node cannot reach the library to delete them - remuxing losslessly, since only an accepted transcode gives the server a pass in which to do it\n';
+            response.infoLog += '☒[import_remove_sidecar=true] Every sidecar is already in the file and this node cannot reach the library to delete them - '
+                + 'remuxing losslessly, since only an accepted transcode gives the server a pass in which to do it\n';
             for (const rel of stranded) response.infoLog += `☐[import_remove_sidecar=true] Queued for removal once accepted: ${rel}\n`;
             commitPreset(` -map 0 -c copy -metadata "awk_sub_worker=${encodeMarkerList(markList)}"`);
             response.infoLog += `☑Expected results: ${summariseAll(streams)}\n`;
@@ -2000,7 +2129,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!toMux.length && !retuneMeta && !removedIndices.size && alreadyInFile.length && removeSidecarAfterImport) {
             let gone = 0; const removedRels = new Set();
             for (const rel of alreadyInFile.flatMap((f) => f.members.map((m) => m.rel))) {
-                try { fs.unlinkSync(path.join(workLibDir(), rel)); gone += 1; removedRels.add(rel); response.infoLog += `☑[import_remove_sidecar=true] Deleted sidecar (its content is already in the file): ${rel}\n`; }
+                try {
+                    fs.unlinkSync(path.join(workLibDir(), rel)); gone += 1; removedRels.add(rel);
+                    response.infoLog += `☑[import_remove_sidecar=true] Deleted sidecar (its content is already in the file): ${rel}\n`;
+                }
                 catch (e) { response.infoLog += `☒[import_remove_sidecar=true] Could not delete sidecar ${rel}: ${e && e.message ? e.message : e}\n`; }
             }
             response.infoLog += deleteSpentSubtitleList('import_remove_sidecar=true', removedRels);   // same cleanup whichever route removed them
@@ -2039,8 +2171,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const flagsBack = f.dispTokens.concat(f.extraTokens || []);
                 const flagText = flagsBack.length ? ` ${flagsBack.join('+')}` : '';
                 const origin = f.members.find(stillEmbedded);
-                if (origin) response.infoLog += `☒${streamTag(origin.index)} Importing ${f.rel} as a SECOND copy - the stream it was extracted from is still in the file${embeddedHashes && embeddedHashes.size ? ' and its text differs' : ''}, so both will be present\n`;
-                if (f.members.length > 1) response.infoLog += `☑[deduplicate=${dedupeMode}] Deduplicated ${f.members.length} byte-identical sidecars -> ${f.rel} (${f.lang}${flagText})\n`;
+                if (origin) response.infoLog += `☒${streamTag(origin.index)} Importing ${f.rel} as a SECOND copy - the stream it was extracted from is still `
+                    + `in the file${embeddedHashes && embeddedHashes.size ? ' and its text differs' : ''}, so both will be present\n`;
+                if (f.members.length > 1) response.infoLog += `☑[deduplicate=${dedupeMode}] Deduplicated ${f.members.length} byte-identical sidecars -> ${
+                    f.rel} (${f.lang}${flagText})\n`;
                 response.infoLog += `☐Import ${f.rel} -> subtitle ${outIdx} (${f.lang}${flagText})${restoreFonts ? ' and its bundled font attachments' : ''}\n`;
             });
             // Consumed = every sidecar this pass accounted for, INCLUDING the ones already in the file. They are not muxed, but their content is provably
@@ -2052,7 +2186,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // longer carries - is harmless either way, since the entry only counts while the confirmation agrees with it.
             const priorStillPresent = found.filter(alreadyEmbedded).map((f) => f.rel);
             const markList = [...new Set([...consumed, ...priorStillPresent])];
-            for (const idx of removedIndices) extraMaps = ` -map -0:${idx}${extraMaps}`;   // drops first, so the -map 0 they subtract from is still the whole file
+            // drops first, so the -map 0 they subtract from is still the whole file
+            for (const idx of removedIndices) extraMaps = ` -map -0:${idx}${extraMaps}`;
             meta += retagArgs(dupes.retag, keptSubs);
             let out = `${inputSide} -map 0${extraMaps} -c copy${meta} -metadata "awk_sub_worker=${encodeMarkerList(markList)}"`;
             commitPreset(out);

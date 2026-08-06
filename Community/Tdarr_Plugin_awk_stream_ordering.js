@@ -5,8 +5,13 @@ const details = () => ({
     Name: 'Re-order streams video, audio, subtitle, then anything else',
     Type: 'Any',
     Operation: 'Transcode',
-    Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can promote the original-language, default or descriptive track above language for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can promote the default, SDH or descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time it's needed).\n`,
-    Version: '4.16.1',
+    Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then
+        main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can promote the original-language, default or descriptive
+        track above language for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can promote the default, SDH or
+        descriptive track. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the
+        fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart -
+        rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time it's needed).\n`,
+    Version: '4.16.2',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -22,9 +27,13 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\nlanguage (default): normal ordering - order_language decides, and the first sorted track becomes the sole default.
-                \\noriginal: promote the original-language track (ffmpeg 'original' disposition, or an 'original' title) above language, so a foreign film keeps its original audio first (and default) instead of a dub. Falls back to language ordering when no track is flagged original.
-                \\ndefault: promote the track already flagged default (ffmpeg 'default' disposition) above language, so the source's chosen default audio stays first. If several tracks are flagged default (e.g. a source track and a downmix that inherited the flag), the highest-priority one by the normal ordering leads and becomes the sole default. Falls back to language ordering when no track is flagged default.
-                \\ndescriptive: promote the descriptive (audio-description) track above language. Falls back to language ordering when no descriptive track is present. Note: the first sorted track becomes the sole default, so this makes the description the default audio.`,
+                \\noriginal: promote the original-language track (ffmpeg 'original' disposition, or an 'original' title) above language, so a foreign film keeps
+                its original audio first (and default) instead of a dub. Falls back to language ordering when no track is flagged original.
+                \\ndefault: promote the track already flagged default (ffmpeg 'default' disposition) above language, so the source's chosen default audio stays
+                first. If several tracks are flagged default (e.g. a source track and a downmix that inherited the flag), the highest-priority one by the normal
+                ordering leads and becomes the sole default. Falls back to language ordering when no track is flagged default.
+                \\ndescriptive: promote the descriptive (audio-description) track above language. Falls back to language ordering when no descriptive track is
+                present. Note: the first sorted track becomes the sole default, so this makes the description the default audio.`,
         },
         {
             name: 'subtitle_first',
@@ -49,8 +58,10 @@ const details = () => ({
             defaultValue: '',
             inputUI: { type: 'text' },
             tooltip: `Comma separated language priority list (e.g. eng,jpn,und). Listed languages sort first; blank (the default) skips language ordering.
-                 \\nLanguages not in the list are not reordered by language - they sort by the other keys (role/codec/channel/quality) and keep their original order.
-                 \\nOne form is enough - en, eng, or English all match the same language (including region variants like en-US), so you don't need to list every variant.
+                 \\nLanguages not in the list are not reordered by language - they sort by the other keys (role/codec/channel/quality) and keep their original
+                 order.
+                 \\nOne form is enough - en, eng, or English all match the same language (including region variants like en-US), so you don't need to list every
+                 variant.
                  \\nExample: (order_channel descending and order_language eng,jpn)\\n
                  A file containing ger 2.0,fre 2.0,eng 2.0,jpn 2.0,eng 5.1,jpn 5.1 would be reordered eng 5.1,eng 2.0,jpn 5.1,jpn 2.0,ger 2.0,fre 2.0`,
         },
@@ -60,8 +71,10 @@ const details = () => ({
             defaultValue: '',
             inputUI: { type: 'text' },
             tooltip: `Comma separated list of preferred audio codecs (e.g. eac3,aac). Blank to disable.
-                \\nMatching streams are grouped above non-matching ones within their language; each group is still ordered by order_channel then order_quality. List order is a membership set, not a ranking. Sits below role, above channels/quality.
-                \\nFamily-prefix match on the canonical codec: dts matches DTS-HD MA/HR/Express, eac3 includes Atmos. Use dtsma/dtshr/dtsexpress/eac3atmos for a specific variant.`,
+                \\nMatching streams are grouped above non-matching ones within their language; each group is still ordered by order_channel then order_quality.
+                List order is a membership set, not a ranking. Sits below role, above channels/quality.
+                \\nFamily-prefix match on the canonical codec: dts matches DTS-HD MA/HR/Express, eac3 includes Atmos. Use dtsma/dtshr/dtsexpress/eac3atmos for a
+                specific variant.`,
         },
         {
             name: 'order_channel',
@@ -77,11 +90,12 @@ const details = () => ({
                 \\nExample:\\n
                     ascending: 2.0,5.1
                 \\ndescending <=6 / <=8 cap the surround: any track above the cap (<=6 = up to 5.1, <=8 = up to 7.1) is demoted to the END of its own
-                language/role/codec tier, so a client whose ceiling is that layout auto-picks the best track it can play (e.g. the 5.1) rather than a 22.2/7.1 it
-                must down-convert. The demoted tail stays in the requested descending order (largest first) - the cap only shifts which serveable track leads, it
-                never re-sorts the tail. If order_quality also caps, a track over EITHER cap is demoted. The cap only applies to descending - ascending already
-                puts the smallest first. Tracks promoted by audio_first outrank the cap and still lead the audio.
-                \\nSet to disabled to skip channel ordering entirely. If both order_channel and order_quality are disabled, audio is not reordered by channels or quality (language/role/order_codec still apply).`
+                language/role/codec tier, so a client whose ceiling is that layout auto-picks the best track it can play (e.g. the 5.1) rather than a 22.2/7.1
+                it must down-convert. The demoted tail stays in the requested descending order (largest first) - the cap only shifts which serveable track
+                leads, it never re-sorts the tail. If order_quality also caps, a track over EITHER cap is demoted. The cap only applies to descending -
+                ascending already puts the smallest first. Tracks promoted by audio_first outrank the cap and still lead the audio.
+                \\nSet to disabled to skip channel ordering entirely. If both order_channel and order_quality are disabled, audio is not reordered by channels
+                or quality (language/role/order_codec still apply).`
         },
         {
             name: 'order_quality',
@@ -91,15 +105,16 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['descending', 'descending <=1024k', 'ascending', 'disabled'],
             },
-            tooltip: `Audio quality ordering preference - orders streams by their computed quality score (codec + bitrate vs transparent). Generally descending is recommended.
+            tooltip: `Audio quality ordering preference - orders streams by their computed quality score (codec + bitrate vs transparent). Generally descending
+                is recommended.
                 \\nExample:\\n
                     descending: 640k,128k
                 \\nExample:\\n
                     ascending: 128k,640k
-                \\ndescending <=1024k caps by bitrate: tracks above 1024k (lossless-scale TrueHD/DTS-HD MA, including a lossless track whose bitrate is unknown) are
-                demoted to the END of their own language/role/codec tier so the client's auto-pick leads with a manageable track it can serve without a heavy
-                transcode, not the huge one. The demoted tail stays in the requested descending order; ordering within each group is by the quality score. Also
-                demoted if order_channel caps and this track is over that cap too (see order_channel). Tracks promoted by audio_first outrank the cap and
+                \\ndescending <=1024k caps by bitrate: tracks above 1024k (lossless-scale TrueHD/DTS-HD MA, including a lossless track whose bitrate is unknown)
+                are demoted to the END of their own language/role/codec tier so the client's auto-pick leads with a manageable track it can serve without a
+                heavy transcode, not the huge one. The demoted tail stays in the requested descending order; ordering within each group is by the quality score.
+                Also demoted if order_channel caps and this track is over that cap too (see order_channel). Tracks promoted by audio_first outrank the cap and
                 still lead the audio.
                 \\nSet to disabled to skip quality ordering entirely (if order_channel is disabled too, see order_channel for what that leaves).`
         },
@@ -111,15 +126,22 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['disabled', 'encoder', 'descriptive'],
             },
-            tooltip: `Strip junk metadata tags the file carries (both container-global and per-stream), riding this plugin's reorder remux so no extra pass is needed. Only tags actually present are cleared, so files without them are untouched. Runs last, so it also clears the per-stream encoder tag a video/audio re-encode leaves behind - which a first-in-stack plugin could only catch on a later pass.
+            tooltip: `Strip junk metadata tags the file carries (both container-global and per-stream), riding this plugin's reorder remux so no extra pass is
+                needed. Only tags actually present are cleared, so files without them are untouched. Runs last, so it also clears the per-stream encoder tag a
+                video/audio re-encode leaves behind - which a first-in-stack plugin could only catch on a later pass.
                 \\n=====
                 \\nActions
                 \\n=====
                 \\ndisabled (default): leave all tags.
-                \\nencoder: remove only encoder/muxer provenance tags nobody reads - encoded_by, and per-stream encoder (a leftover "Lavc.../HandBrake" tag). Safe on any library.
-                \\ndescriptive: also remove descriptive movie/TV metadata and iTunes/app flags - genre, date, description, synopsis, show, network, season/episode, media_type, artist, album, composer, copyright, keywords, compilation, sort-order keys, etc.
-                \\nAlways kept: title and comment, stream language tags, per-track bitrate statistics (BPS), the container-level encoder tag (muxer-managed), and creation date.
-                \\nNote: a media server set to read local/in-file metadata DOES read some mp4 descriptive tags (genre/date/description/show/etc.) - Plex with local media assets enabled, and Jellyfin/Emby with an nfo or in-file metadata reader - so use descriptive only if you don't rely on in-file metadata.`,
+                \\nencoder: remove only encoder/muxer provenance tags nobody reads - encoded_by, and per-stream encoder (a leftover "Lavc.../HandBrake" tag).
+                Safe on any library.
+                \\ndescriptive: also remove descriptive movie/TV metadata and iTunes/app flags - genre, date, description, synopsis, show, network,
+                season/episode, media_type, artist, album, composer, copyright, keywords, compilation, sort-order keys, etc.
+                \\nAlways kept: title and comment, stream language tags, per-track bitrate statistics (BPS), the container-level encoder tag (muxer-managed),
+                and creation date.
+                \\nNote: a media server set to read local/in-file metadata DOES read some mp4 descriptive tags (genre/date/description/show/etc.) - Plex with
+                local media assets enabled, and Jellyfin/Emby with an nfo or in-file metadata reader - so use descriptive only if you don't rely on in-file
+                metadata.`,
         },
         {
             name: 'method_mp4_faststart',
@@ -129,12 +151,17 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['force', 'strip'],
             },
-            tooltip: `mp4/mov only: where the moov atom (the index) sits in the file. At the FRONT, players start and seek instantly on progressive download / remote direct-play; at the end they must fetch the tail first. mkv is unaffected.
+            tooltip: `mp4/mov only: where the moov atom (the index) sits in the file. At the FRONT, players start and seek instantly on progressive download /
+                remote direct-play; at the end they must fetch the tail first. mkv is unaffected.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nforce (default): front-load the moov atom. Rides this plugin's normal reorder remux when there is reordering to do, and otherwise forces ONE extra lossless -c copy remux the first time the file isn't already front-loaded (detected without decoding). Already-fronted files are left untouched, so it settles after one pass and never loops.
-                \\nstrip: actively REMOVE faststart - it does not leave the file alone. Any remux this plugin performs (reordering, disposition normalisation, remove_junk_tags) writes the moov atom at the END, the mov muxer's default, so an mp4 that arrived front-loaded comes out back-loaded and cannot be restored by a later pass. Only pick this if you never stream this library remotely.`,
+                \\nforce (default): front-load the moov atom. Rides this plugin's normal reorder remux when there is reordering to do, and otherwise forces ONE
+                extra lossless -c copy remux the first time the file isn't already front-loaded (detected without decoding). Already-fronted files are left
+                untouched, so it settles after one pass and never loops.
+                \\nstrip: actively REMOVE faststart - it does not leave the file alone. Any remux this plugin performs (reordering, disposition normalisation,
+                remove_junk_tags) writes the moov atom at the END, the mov muxer's default, so an mp4 that arrived front-loaded comes out back-loaded and cannot
+                be restored by a later pass. Only pick this if you never stream this library remotely.`,
         },
     ],
 });
@@ -593,7 +620,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const dur = Number(ffmedia.Duration || 0);
         if (size > 0 && dur > 0) {
             const bps = Math.round((size * 8) / dur);
-            if (bps > 1000 && bps < 100000000) return bps;   // clamp to a plausible audio range so a stray unit (ms Duration, etc.) or corrupt size can't inject garbage
+            // clamp to a plausible audio range so a stray unit (ms Duration, etc.) or corrupt size can't inject garbage
+            if (bps > 1000 && bps < 100000000) return bps;
         }
         return 0;
     };
@@ -610,7 +638,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (s === 'quad') return 4;
         const m = s.match(/(\d+)\.(\d+)(?:\.(\d+))?/);              // "5.1"->6, "7.1(side)"->8, "7.1.4" Atmos -> 12 (front + LFE + height)
         if (m) return Number(m[1]) + Number(m[2]) + Number(m[3] || 0);
-        const tokens = s.split(/[+\s,]+/).filter((t) => t && !t.endsWith(':'));   // "FL+FR+FC+LFE" -> 4; drop MediaInfo ChannelPositions labels ("Front:", "Side:")
+        // "FL+FR+FC+LFE" -> 4; drop MediaInfo ChannelPositions labels ("Front:", "Side:")
+        const tokens = s.split(/[+\s,]+/).filter((t) => t && !t.endsWith(':'));
         return tokens.length > 1 ? tokens.length : 0;
     };
     const resolveChannels = (ffstream) => {
@@ -720,7 +749,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // here - isDescriptive reads that subtitle-scoped raw flag itself, on the same terms, so the summary and the classifiers cannot disagree about it.
             const descriptive = isDescriptive(s);
             const role = `${isCommentary(s) ? '/commentary' : ''}${descriptive ? '/description' : ''}${isSdh(s) ? '/sdh' : ''}${isLyrics(s) ? '/lyrics' : ''}`;
-            const forced = hasDisposition(s, 'forced') ? '/forced' : '';   // flag OR title keyword, same test the classifiers use - so the summary token and the sort key can never disagree
+            // flag OR title keyword, same test the classifiers use - so the summary token and the sort key can never disagree
+            const forced = hasDisposition(s, 'forced') ? '/forced' : '';
             return `[sub:${[lang, codec].filter(Boolean).join(' ')}${def}${forced}${role}${s.disposition?.original === 1 ? '/original' : ''}]`;
         }
         if (type === 'attachment') {
@@ -821,7 +851,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // audio_clean, stream_ordering and sub_worker via langKey (free-text language-list validation / sidecar name recognition).
     const langDisplayName = (() => {
         let dn = null;
-        return (code) => { try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(code) || ''; } catch (e) { return ''; } };
+        return (code) => {
+            try { dn = dn || new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' }); return dn.of(code) || ''; }
+            catch (e) { return ''; }
+        };
     })();
     // ===== END SHARED: language display name =====
 
@@ -829,7 +862,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // The failFile message echoes the offending token capped at 200 chars, with control characters collapsed to a space: free text is unbounded and Tdarr
     // persists the whole error message, and a raw newline in the echo would split the line into a continuation carrying no ☐/☑/☒ status symbol.
-    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)}] not a recognised language - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)`);
+    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)}] not a recognised language`
+        + ' - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)');
     // ===== END SHARED: language token failure =====
 
     // ===== SHARED [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean]: dolby vision detection =====
@@ -848,7 +882,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // negative would silently lose the boxes.
     const isDolbyVisionVideo = (ffstream, ffmedia) => DV_FOURCC_RE.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
         || String(ffmedia?.HDR_Format || ffmedia?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
-        || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : []).some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
+        || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : [])
+            .some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
     // -=-=-= mp4StrictArg  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -982,11 +1017,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // 'encoder' tag (muxer-managed: every mux re-stamps it, so stripping would loop). Per-stream 'encoder' - including the Lavc tag an upstream re-encode
         // stamps - is NOT re-added on a -c copy, so running last clears it in the SAME remux (a first-in-stack plugin could only catch it a pass later).
         const JUNK_ENCODER_GLOBAL = new Set(['encoded_by']);
-        const JUNK_DESCRIPTIVE = new Set(['compilation', 'gapless_playback', 'hd_video', 'purchase_date', 'sort_name', 'sort_album', 'sort_album_artist', 'sort_artist',
-            'sort_composer', 'sort_show', 'genre', 'date', 'description', 'synopsis', 'show', 'episode_id', 'network', 'episode_sort', 'season_number', 'media_type', 'artist',
-            'album', 'album_artist', 'composer', 'grouping', 'lyrics', 'copyright', 'keywords']);
+        const JUNK_DESCRIPTIVE = new Set(['compilation', 'gapless_playback', 'hd_video', 'purchase_date', 'sort_name', 'sort_album', 'sort_album_artist',
+            'sort_artist', 'sort_composer', 'sort_show', 'genre', 'date', 'description', 'synopsis', 'show', 'episode_id', 'network', 'episode_sort',
+            'season_number', 'media_type', 'artist', 'album', 'album_artist', 'composer', 'grouping', 'lyrics', 'copyright', 'keywords']);
         const JUNK_PERSTREAM = new Set(['encoded_by', 'encoder']);   // only encoder-tier keys are safe per-stream (descriptive ones are functional, kept)
-        const junkGlobalStrip = (lowerKey) => junkTagsMode !== 'disabled' && (JUNK_ENCODER_GLOBAL.has(lowerKey) || (junkTagsMode === 'descriptive' && JUNK_DESCRIPTIVE.has(lowerKey)));
+        const junkGlobalStrip = (lowerKey) => junkTagsMode !== 'disabled'
+            && (JUNK_ENCODER_GLOBAL.has(lowerKey) || (junkTagsMode === 'descriptive' && JUNK_DESCRIPTIVE.has(lowerKey)));
         // Per-stream encoder/encoded_by clears for the stream at OUTPUT index outIdx - the post-sort position -metadata:s:<index> targets, not the source
         // ffprobe index. Present-only, so a clean stream adds nothing and never forces a mux on its own. escMeta guards the probe-derived key.
         const streamJunkClears = (ffstream, outIdx) => {
@@ -1022,7 +1058,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // derive any new bitrate-cap key from THIS field, not from a raw bit_rate. A LOSSLESS track whose bitrate neither probe reports (0) is still
                 // a heavy, hard-to-serve track, so it must count as OVER any bitrate cap (Infinity), never under it. A non-lossless bitrate-0 track (e.g. a
                 // freshly-transcoded aac) is genuinely small and stays 0 = under-cap. Only the '<=Nk' cap reads this; plain descending/ascending ignore it.
-                capBitrate: (streamType === 'audio' && !(enrichedStream.bit_rate > 0) && codecInfo[canon]?.lossless === true) ? Infinity : (enrichedStream.bit_rate || 0),
+                capBitrate: (streamType === 'audio' && !(enrichedStream.bit_rate > 0) && codecInfo[canon]?.lossless === true)
+                    ? Infinity : (enrichedStream.bit_rate || 0),
                 forced: hasDisposition(ffstream, 'forced'),   // flag OR title keyword - a "Forced"/"Foreign Parts Only" title counts where the flag isn't set
                 // Only score audio, and only when order_quality actually reads the score: scoring video/subtitle/data would spam bogus "unknown audio codec" /
                 // "no bitrate reported" notices, and with order_quality=disabled the score is dead - scoring anyway warns about values the sort ignores.
@@ -1128,7 +1165,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
             // remove_junk_tags (per-stream): clear this stream's encoder tags, keyed on its OUTPUT index i (see streamJunkClears).
             const streamJunk = streamJunkClears(streams[i].stream, i);
-            if (streamJunk) { junkArgs += streamJunk; junkLog += `☐${streamTag(streams[i].index)}[remove_junk_tags=${junkTagsMode}] Remove encoder tag(s) from ${streams[i].type} stream\n`; }
+            if (streamJunk) {
+                junkArgs += streamJunk;
+                junkLog += `☐${streamTag(streams[i].index)}[remove_junk_tags=${junkTagsMode}] Remove encoder tag(s) from ${streams[i].type} stream\n`;
+            }
 
             if (streams[i].type === 'audio') {
                 audioIndex++;
@@ -1149,7 +1189,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             for (const k of Object.keys(file.ffProbeData.format?.tags || {})) {
                 const lk = k.toLowerCase();
                 if (lk === 'title' || lk === 'comment' || lk === 'creation_time' || lk.startsWith('awk_')) continue;
-                if (junkGlobalStrip(lk)) { junkArgs += ` -metadata "${escMeta(k)}="`; junkLog += `☐[remove_junk_tags=${junkTagsMode}] Remove ${k} tag from file\n`; }
+                if (junkGlobalStrip(lk)) {
+                    junkArgs += ` -metadata "${escMeta(k)}="`;
+                    junkLog += `☐[remove_junk_tags=${junkTagsMode}] Remove ${k} tag from file\n`;
+                }
             }
 
         // method_mp4_faststart: front-load the mp4 moov atom. A plain ride-along isn't enough (we skip when order is already correct), so force a one-time
