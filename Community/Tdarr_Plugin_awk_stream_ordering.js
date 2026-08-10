@@ -12,7 +12,7 @@ const details = () => ({
         encoder/provenance, or the fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote
         playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time
         it's needed).\n`,
-    Version: '4.17.0',
+    Version: '4.18.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -964,6 +964,65 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // One guard around all the reordering work below: a deliberate failFile abort (AwkFailFile) rethrows unchanged, and any UNEXPECTED error fails the
     // file too — annotated and carrying the full infoLog — instead of silently skipping. (Input validation runs above this, failing via failFile too.)
     try {
+        // ====== TRUNCATION CHECK ======
+        // An encode that is OOM-killed, or that dies with the output file never finalised, can still leave a file ffmpeg exits 0 on and Tdarr accepts - the
+        // library then quietly keeps a video that stops a few minutes in. This plugin is designed to run LAST, so it is the one that sees the finished article,
+        // and the check sits ahead of everything else here BECAUSE the ordinary outcome is `skip` a few hundred lines down: on the final cycle the streams are
+        // usually already in order, and a check placed beside the reordering work would be dead in exactly the case it exists for.
+        //
+        // Compared against otherArguments.originalLibraryFile, which is the file as it entered the library rather than the previous stage's output, and which
+        // Tdarr scans in full - ffProbeData and mediaInfo alike. Signals are tried in order and the first that resolves on BOTH sides decides, so a container
+        // that stores one but not the other cannot make a healthy file look broken. FRAME COUNT is deliberately not among them: video_clean's interlace repair
+        // emits bwdif=mode=send_field, which DOUBLES the frame count at field rate, so a frame comparison reports a 2x change on a perfectly good file. Wall
+        // time survives that operation untouched. Container duration comes last and only when the audio track count is unchanged, since it is the maximum
+        // across all streams - audio_clean dropping a commentary track longer than the video legitimately shrinks it - and Matroska frequently stores no
+        // per-stream duration on the ffprobe side, which is why mediaInfo leads.
+        const durVideoStream = (obj) => (obj?.ffProbeData?.streams || []).find(s => codecTypeOf(s) === 'video' && !isCoverArt(s));
+        const durAudioCount = (obj) => (obj?.ffProbeData?.streams || []).filter(s => codecTypeOf(s) === 'audio').length;
+        const durPos = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
+        const DURATION_SIGNALS = [
+            { name: 'the mediaInfo video-track duration',
+                read: (o) => { const v = durVideoStream(o); if (!v) return 0;
+                    return durPos(((o?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === v.index) || {}).Duration); } },
+            { name: 'the ffprobe video-stream duration', read: (o) => durPos(durVideoStream(o)?.duration) },
+            { name: 'the container duration', read: (o) => durPos(o?.ffProbeData?.format?.duration), needsSameAudio: true },
+        ];
+        // Tolerance is ±1%, fixed, with no input to relax it: a user hitting a false positive would have no recourse but removing the plugin, so the
+        // headroom is deliberately double the ±0.5% the long-standing community duration-check plugin defaults to. A dead encode is short by far more.
+        const DURATION_TOLERANCE_PCT = 1;
+        const originalFile = otherArguments?.originalLibraryFile;
+        if (originalFile?.ffProbeData) {
+            const sameAudio = durAudioCount(originalFile) === durAudioCount(file);
+            const newVideo = durVideoStream(file);
+            const durTag = newVideo ? streamTag(newVideo.index) : '';
+            let verdict = null;
+            let oldAny = 0;
+            let newAny = 0;
+            for (const sig of DURATION_SIGNALS) {
+                if (sig.needsSameAudio && !sameAudio) continue;
+                const o = sig.read(originalFile);
+                const n = sig.read(file);
+                if (!oldAny) oldAny = o;
+                if (!newAny) newAny = n;
+                if (!verdict && o && n) verdict = { name: sig.name, old: o, now: n };
+            }
+            if (verdict) {
+                const pct = (verdict.now / verdict.old) * 100;
+                if (Math.abs(pct - 100) > DURATION_TOLERANCE_PCT)
+                    failFile(`${durTag} output duration ${verdict.now.toFixed(1)} s is ${pct.toFixed(1)}% of the original ${verdict.old.toFixed(1)} s`
+                        + ` - the transcode did not run to completion`
+                        + `\n☒${durTag} the file has been failed rather than accepted; check this node's log for an out-of-memory kill`
+                        + `\n☒${durTag} (compared using ${verdict.name})`);
+            } else if (oldAny && !newAny) {
+                // A severely truncated or unfinalised output is precisely the file most likely to probe with no duration at all, so treating "no duration" as
+                // "nothing to compare" would silence the guard on exactly what it hunts. Reaching here means NO signal resolved on the new side while at least
+                // one did on the old, so it cannot fire merely because a container stores one signal and not another.
+                failFile(`${durTag} the output reports no duration at all while the original had ${oldAny.toFixed(1)} s - that is what a truncated or`
+                    + ` unfinalised transcode looks like`
+                    + `\n☒${durTag} the file has been failed rather than accepted; check this node's log for an out-of-memory kill`);
+            }
+        }
+
         // Input summary — the streams exactly as they arrived, before re-ordering.
         response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
 
