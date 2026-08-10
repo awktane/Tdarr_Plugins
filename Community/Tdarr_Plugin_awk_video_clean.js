@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.21.0',
+    Version: '3.22.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1183,12 +1183,211 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // mp4/m4v/mov WITHOUT m4a: isMp4Family includes m4a and is right for the -movflags use_metadata_tags decision, but not for tagging a video stream.
     const isQtVideoContainer = (container) => ['mp4', 'm4v', 'mov'].includes(container);
 
+    // ====== ENCODE MEMORY MODEL ======
+    // A CPU 4K encode needs GIGABYTES of anonymous memory, and a node that cannot supply them does not report an error: the kernel SIGKILLs ffmpeg and Tdarr
+    // logs a bare "CLI code: 137" with nothing in it pointing at memory. This block predicts the peak so the plugin can say so FIRST - a warning where the
+    // encode will merely swap, a failFile where it provably cannot fit at all. It is guidance rather than a failsafe by design: most encodes finish even while
+    // swapping (measured - two concurrent 4K libx265 encodes saturated a 5 GB ceiling and both completed, at a 9% per-worker cost), so refusing is deliberately
+    // hard to trigger. Every coefficient below was fitted against jellyfin-ffmpeg 7.1.4 on a 4-core Linux cgroup-v2 node and reproduces measurement to within
+    // 0.6% across H.264, HEVC and AV1 sources; awk-ffmpeg-test's gen_memprobe re-proves the model whenever the local ffmpeg build changes.
+
+    // Per-encoder peak coefficients in MB: `base` is fixed overhead, `kEnc` the MB per megapixel of the OUTPUT frame, both measured at method_speed=slow.
+    // `floor` is the fraction of that peak the encoder still reaches squeezed to a single frame thread (measured via frame-threads=1 / -x264-params threads=1 /
+    // -svtav1-params lp=1). The plugin emits NONE of those knobs - the floor exists only to give the refusal a bound no node's core count or preset choice can
+    // undercut. Each depth is measured rather than derived: the 10-bit/8-bit ratio differs per encoder (borrowing libx265's mis-predicts libsvtav1 by 24%).
+    // The four hardware rows carry their 10-bit measurement only and reuse it at 8 bits, over-stating an 8-bit hardware encode by roughly a fifth - harmless,
+    // since a hardware encode peaks at 664-1409 MB and can never refuse (no `floor` row), so that figure only ever hardens a warning. `threadScaled` marks the
+    // one encoder whose per-frame-thread cost was measured; the rest carry no thread term, which under-states them on a big node - see MEM_FRAME_THREADS.
+    const MEM_ENCODER = {
+        libx265:           { base10: 97,  kEnc10: 301, base8: 103, kEnc8: 182, floor: 0.960, threadScaled: true },
+        libx264:           { base10: 89,  kEnc10: 240, base8: 89,  kEnc8: 240, floor: 0.808 },   // H.264 output is always 8-bit; the 10-bit pair never resolves
+        libsvtav1:         { base10: 251, kEnc10: 518, base8: 161, kEnc8: 418, floor: 0.677 },
+        hevc_nvenc:        { base10: 113, kEnc10: 108, base8: 113, kEnc8: 108 },
+        hevc_qsv:          { base10: 76,  kEnc10: 51,  base8: 76,  kEnc8: 51 },
+        hevc_vaapi:        { base10: 80,  kEnc10: 23,  base8: 80,  kEnc8: 23 },
+        hevc_videotoolbox: { base10: 42,  kEnc10: 41,  base8: 42,  kEnc8: 41 },
+    };
+    // Which measured row stands in for a family's other codecs. Justified by measurement, not convenience: h264_nvenc at 4K 8-bit came within 5% of
+    // hevc_nvenc, so the FAMILY dominates the codec. The three CPU encoders are each measured directly and need no stand-in.
+    const MEM_ENCODER_BY_FAMILY = { nvenc: 'hevc_nvenc', qsv: 'hevc_qsv', vaapi: 'hevc_vaapi', videotoolbox: 'hevc_videotoolbox' };
+    // Decode-side peak, MB per megapixel of the SOURCE frame, per source codec and per whether -thread_type slice is on the command (see MEM_SLICE_CODECS).
+    // A 4.9x spread across codecs, so a single constant would be wrong in both directions - and AV1 is both the most expensive decoder and one of the two the
+    // flag cannot help, which compounds with libsvtav1 being the hungriest encoder: AV1 -> AV1 is the most memory-expensive path this plugin can take.
+    const MEM_DECODER = {
+        mpeg2video: { def: 10.4, slice: 10.4 },
+        vp9:        { def: 18.1, slice: 11.5 },
+        h264:       { def: 23.0, slice: 8.8 },
+        hevc8:      { def: 32.1, slice: 18.2 },
+        hevc10:     { def: 47.9, slice: 28.2 },
+        av1:        { def: 50.2, slice: 50.2 },
+    };
+    // method_speed scales the whole peak by a resolution-independent factor (slow is where the coefficients above were fitted).
+    const MEM_PRESET = { slow: 1.000, medium: 0.909, fast: 0.805 };
+    // Filters are NOT additive: tonemapx measured +42 MB at 10-bit and bwdif +55 MB, but tonemap + deinterlace + downscale STACKED came in at +78 MB rather
+    // than 97 - they share frame buffers. So one filter costs its own figure and both cost the measured stacked one. A downscale on its own was never measured
+    // apart from that stack and contributes nothing here, which under-states it slightly. guard_dv's VBV (-maxrate/-bufsize) measured +0 MB and needs no term.
+    const MEM_FILTER_TONEMAP = 42;
+    const MEM_FILTER_DEINT = 55;
+    const MEM_FILTER_STACKED = 78;
+    const memFilterSurcharge = (tonemapOn, deintOn) => (tonemapOn && deintOn ? MEM_FILTER_STACKED
+        : (tonemapOn ? MEM_FILTER_TONEMAP : (deintOn ? MEM_FILTER_DEINT : 0)));
+    // x265 picks its frame-thread count from the visible CPU count, and every extra frame thread holds another full reference frame - measured at 132 MB per
+    // thread on a 4K 10-bit encode (Linux) and 137 MB (Windows), i.e. ~15.9 MB per megapixel per thread, a property of the encoder rather than the platform.
+    // The ladder was confirmed on three platforms (4 visible threads -> 2 frame threads, 8 -> 3, 20 -> 4) and SATURATES at the largest step measured instead of
+    // extrapolating x265's documented table upward, so a 32-core node is under-estimated - which under-warns, the safe direction, and only warnings read this
+    // (the refusal reads the single-thread floor). MEM_ENCODER's libx265 row was fitted on the 4-core node, so only the difference from that count is added.
+    const MEM_FRAME_THREADS = (cores) => (cores >= 16 ? 4 : cores >= 8 ? 3 : cores >= 4 ? 2 : 1);
+    const MEM_FIT_FRAME_THREADS = 2;
+    const MEM_MB_PER_THREAD_MPIXEL = 15.9;
+    // Source codecs where -thread_type slice pays. Measured saving at 4K: h264 126 MB, hevc 115-163 MB, vp9 55 MB - and exactly ZERO for av1 (libdav1d ignores
+    // the flag) and mpeg2, so the flag is emitted only where it buys something. See buildVideoArgs for why it may only ever ride the INPUT side.
+    const MEM_SLICE_CODECS = ['h264', 'hevc', 'vp9'];
+    const MEM_BYTES_PER_MB = 1048576;
+    // Warn when the expected peak eats this much of what is actually free. Below 1 so the warning lands while there is still room to act on it.
+    const MEM_HEADROOM_FRACTION = 0.8;
+
+    // cgroup v1 writes LONG_MAX rounded down to a page size for "no limit", which is a DIFFERENT number on a 64 KiB-page arm64 host - so test the magnitude
+    // rather than hardcoding either sentinel.
+    const MEM_UNLIMITED_BYTES = 2 ** 62;
+    const memReadFile = (p) => { try { return String(fs.readFileSync(p, 'utf8')); } catch (e) { return ''; } };
+    // A cgroup limit file. 'max' (v2) and a LONG_MAX-ish sentinel (v1) both mean "no limit at THIS level", which is not the same as no limit at all - a
+    // container cannot see a constraining parent from the inside - so both return Infinity and the caller falls through to the host reading rather than
+    // concluding the encode has infinite room. NaN means the file was absent or unparseable.
+    const memCgroupLimit = (raw) => {
+        const t = String(raw || '').trim();
+        if (!t) return NaN;
+        if (t === 'max') return Infinity;
+        const n = Number(t);
+        return Number.isFinite(n) && n > 0 ? (n >= MEM_UNLIMITED_BYTES ? Infinity : n) : NaN;
+    };
+    const memStatField = (raw, key) => { const m = new RegExp(`^${key}\\s+(\\d+)`, 'm').exec(String(raw || '')); return m ? Number(m[1]) : NaN; };
+    const memInfoField = (raw, key) => { const m = new RegExp(`^${key}:\\s+(\\d+)\\s+kB`, 'm').exec(String(raw || '')); return m ? Number(m[1]) * 1024 : NaN; };
+    // cgroup v1 keeps the memory controller under its own mount and /proc/self/cgroup names this process's path within it. Inside a container that path is
+    // usually already the namespace root, so the bare mount is tried first and the named path only as a fallback.
+    const memCgroupV1Dirs = () => {
+        const dirs = ['/sys/fs/cgroup/memory'];
+        const line = memReadFile('/proc/self/cgroup').split('\n').find((l) => l.split(':')[1] === 'memory');
+        const rel = line ? line.split(':').slice(2).join(':') : '';
+        if (rel && rel !== '/') dirs.push(`/sys/fs/cgroup/memory${rel}`);
+        return dirs;
+    };
+    // Which filesystem holds a path: the LONGEST mount point in /proc/self/mountinfo that is a prefix of it. Tdarr hands a classic plugin cacheFilePath as a
+    // full FILE path inside the transcode cache, never a mount point, so an equality test against the mount-point field would match nothing. The fstype is the
+    // field immediately AFTER the ' - ' separator - the LAST field is the super-options string, which is why a naive read of it returns mount options instead
+    // of a filesystem type. Mount points escape spaces as \040.
+    const memFsTypeOfPath = (p) => {
+        if (!p) return '';
+        let bestPoint = '';
+        let bestType = '';
+        for (const line of memReadFile('/proc/self/mountinfo').split('\n')) {
+            const f = line.split(' ');
+            const sep = f.indexOf('-');
+            if (sep < 5 || sep + 1 >= f.length) continue;
+            const point = String(f[4] || '').replace(/\\040/g, ' ');
+            if (!point || !(p === point || p.startsWith(point === '/' ? '/' : `${point}/`))) continue;
+            if (point.length >= bestPoint.length) { bestPoint = point; bestType = f[sep + 1]; }
+        }
+        return bestType;
+    };
+    // Resolve this node's memory budget, in bytes. `scope` is 'container' when a real cgroup limit was found - the ONLY scope allowed to refuse a file, since
+    // a cgroup is the only place a hard OOM kill lives; bare metal (Linux, Windows or macOS alike) grows swap or a pagefile on demand and degrades instead.
+    // Returns null when nothing could be established, which makes the whole check inert. os.totalmem() is never consulted on Linux: it reports the HOST from
+    // inside Docker (measured 11,454,416 kB against a 1 GiB cgroup limit, an 11x overshoot) and always returns something, so a ladder reaching it can never
+    // admit ignorance. Node's own process.availableMemory()/constrainedMemory() are no better - the first subtracts memory.current, which is dominated by
+    // reclaimable page cache and reads near-zero in a transcoding container, and the second returns memory.high, a throttle point rather than the kill point.
+    // Occupancy comes from memory.stat `anon` (v2) / `rss` (v1) for the same reason: measured idle on a real node, anon was 103 MB against memory.current's
+    // 1317 MB, a 12x difference that would discard a quarter of the container before the encode even started. Tests inject the whole verdict through
+    // __awkCap.mem, and an injected capability object with NO mem key means "no verdict" - the check goes inert rather than falling through to a real /sys
+    // read on a machine that has none.
+    const memNodeBudget = (otherArguments) => {
+        const inj = otherArguments && otherArguments.__awkCap;
+        if (inj) return inj.mem ? { swapBytes: 0, anonBytes: 0, scope: 'container', cacheFsType: '', cores: 0, ...inj.mem } : null;
+        let limitBytes = NaN;
+        let swapBytes = 0;
+        let anonBytes = 0;
+        let scope = 'unknown';
+        if (os.platform() === 'linux') {
+            const v2 = memCgroupLimit(memReadFile('/sys/fs/cgroup/memory.max'));
+            if (Number.isFinite(v2)) {
+                limitBytes = v2;
+                scope = 'container';
+                const sw = memCgroupLimit(memReadFile('/sys/fs/cgroup/memory.swap.max'));
+                swapBytes = Number.isNaN(sw) ? 0 : sw;   // 'max' -> Infinity -> the cgroup can never OOM-kill this encode, so it can never be refused
+                anonBytes = memStatField(memReadFile('/sys/fs/cgroup/memory.stat'), 'anon') || 0;
+            } else {
+                // cgroup v1 still ships on Synology DSM, unRAID and older LXC. Its swap file reports limit PLUS swap combined, not swap alone.
+                for (const dir of memCgroupV1Dirs()) {
+                    const lim = memCgroupLimit(memReadFile(`${dir}/memory.limit_in_bytes`));
+                    if (!Number.isFinite(lim)) continue;
+                    limitBytes = lim;
+                    scope = 'container';
+                    const memsw = memCgroupLimit(memReadFile(`${dir}/memory.memsw.limit_in_bytes`));
+                    swapBytes = Number.isFinite(memsw) ? Math.max(0, memsw - lim) : (Number.isNaN(memsw) ? 0 : Infinity);
+                    anonBytes = memStatField(memReadFile(`${dir}/memory.stat`), 'rss') || 0;
+                    break;
+                }
+            }
+            if (scope !== 'container') {   // no cgroup limit at this level: fall back to the host's own numbers, which may only ever inform a warning
+                const info = memReadFile('/proc/meminfo');
+                const total = memInfoField(info, 'MemTotal');
+                const avail = memInfoField(info, 'MemAvailable');
+                if (Number.isFinite(total)) {
+                    limitBytes = total;
+                    scope = 'host';
+                    swapBytes = memInfoField(info, 'SwapTotal') || 0;
+                    anonBytes = Number.isFinite(avail) ? Math.max(0, total - avail) : 0;
+                }
+            }
+        } else {
+            // macOS swap and a system-managed Windows pagefile both grow on demand, so neither has a ceiling worth reading - and it does not matter, because
+            // host scope never refuses and swap only ever feeds the refusal comparison.
+            const total = os.totalmem();
+            if (Number.isFinite(total) && total > 0) { limitBytes = total; scope = 'host'; anonBytes = Math.max(0, total - os.freemem()); }
+        }
+        if (!Number.isFinite(limitBytes) || limitBytes <= 0) return null;
+        const cachePath = String((otherArguments && otherArguments.cacheFilePath) || '');
+        return { limitBytes, swapBytes, anonBytes, scope, cacheFsType: cachePath ? memFsTypeOfPath(cachePath) : '', cores: 0 };
+    };
+
+    const memCpuCount = (pinned) => { if (Number(pinned) > 0) return Number(pinned); try { return (os.cpus() || []).length || 1; } catch (e) { return 1; } };
+    const memEncoderRow = (encoderName, family) => (Object.prototype.hasOwnProperty.call(MEM_ENCODER, encoderName) ? MEM_ENCODER[encoderName]
+        : (Object.prototype.hasOwnProperty.call(MEM_ENCODER_BY_FAMILY, family) ? MEM_ENCODER[MEM_ENCODER_BY_FAMILY[family]] : null));
+    const memDecoderRow = (codecName, is10) => {
+        const key = codecName === 'hevc' ? (is10 ? 'hevc10' : 'hevc8') : codecName;
+        return Object.prototype.hasOwnProperty.call(MEM_DECODER, key) ? MEM_DECODER[key] : null;
+    };
+    // Predicted peak resident MB for one encode. `floor: true` returns the LOWER BOUND instead - a single frame thread, the fastest preset, no filters - and
+    // that is the only figure the refusal may read: it says "even under the most favourable threading and preset this cannot fit", so it cannot false-positive
+    // from a node's core count or the user's speed setting. Returns null rather than a guess when the source dimensions are unreadable or the encoder has no
+    // measured row: a fabricated number could refuse a file that would have encoded perfectly well, and there is no input a user could set to override it.
+    // The membership gates above are why a crafted codec or encoder name cannot resolve to an inherited Object.prototype member and read as a real row.
+    const memoryEstimate = ({ family, encoderName, srcCodec, srcIs10, srcW, srcH, dispH, outH, want10, speedName, cores,
+        sliceOn, tonemapOn, deintOn, floor }) => {
+        const row = memEncoderRow(encoderName, family);
+        if (!row) return null;
+        const srcMpix = (Number(srcW) * Number(srcH)) / 1e6;
+        // Source megapixels come from the CODED dimensions, never from dispHeight: that value is rotation-swapped for the height_cap decision, so a rotated 4K
+        // phone clip would estimate 7539 MB against 2735 MB real - a 2.76x overshoot - if the pixel count were derived from it.
+        if (!Number.isFinite(srcMpix) || srcMpix <= 0 || !(Number(dispH) > 0) || !(Number(outH) > 0)) return null;
+        const outMpix = srcMpix * ((Number(outH) / Number(dispH)) ** 2);
+        const dec = memDecoderRow(srcCodec, srcIs10);
+        // An unmeasured source codec contributes no decode term rather than a guessed one - it under-states the peak, which under-warns and under-refuses.
+        const kDec = dec ? (sliceOn ? dec.slice : dec.def) : 0;
+        const mb = (want10 ? row.base10 : row.base8) + kDec * srcMpix + (want10 ? row.kEnc10 : row.kEnc8) * outMpix;
+        if (floor) return mb * (row.floor || 1) * MEM_PRESET.fast;
+        const threadMb = row.threadScaled
+            ? Math.max(0, MEM_FRAME_THREADS(memCpuCount(cores)) - MEM_FIT_FRAME_THREADS) * MEM_MB_PER_THREAD_MPIXEL * outMpix : 0;
+        return (mb + threadMb + memFilterSurcharge(tonemapOn, deintOn)) * (MEM_PRESET[speedName] || 1);
+    };
+    const memGb = (bytes) => `${(bytes / (1024 ** 3)).toFixed(1)} GB`;
+    const memMbGb = (mb) => memGb(mb * MEM_BYTES_PER_MB);
+
     // Build the video-encode arguments for the chosen encoder: decode-side (input) flags + the output -c:v block (encoder, quality, speed, pixel format, the
     // video filter chain, QuickTime fourCC). Returns { inputSide, videoOut }. Source colour metadata carries through automatically - no explicit colour flags
     // (see the HDR-detection block below). Decode stays on software frames (nvenc via the shared nvdecPreset helper) so one CPU scale filter and -pix_fmt path
     // work uniformly across families; VAAPI is the exception - it needs its frames uploaded, so it carries an explicit device + format,hwupload filter.
     const buildVideoArgs = ({ family, encoderName, codec, qNorm, speed, want10Bit, willDownscale, outHeight, dstContainer, file, tonemap,
-        tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter, dropCaptions }) => {
+        tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter, dropCaptions, sliceDecode }) => {
         const { getNvdecHwaccelPreset, getNvenc10BitFormatArg } = require('../methods/nvdecPreset');
         const q = nativeQuality(codec, family, qNorm);
         const spd = nativeSpeed(codec, family, speed);
@@ -1267,6 +1466,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // hvc1 = Apple/QuickTime HEVC-in-mp4 (primary only); a no-base DV (e.g. profile 5) needs dvh1 or the DV box is dropped. The encode path tags hevc
         // ONLY - see qtVideoTag for why it and the copy path differ
         if (codec === 'hevc' && isQtVideoContainer(dstContainer)) parts.push(preserveDvNoBase ? '-tag:v:0 dvh1' : '-tag:v:0 hvc1');
+        // Slice-threaded DECODING, which costs 55-163 MB less at 4K than the default frame threading (see MEM_SLICE_CODECS for the per-codec figures). It rides
+        // the INPUT side and must never move across the <io> marker: before -i the flag configures the DECODER, and decoding is normative, so it cannot alter
+        // the output - proven bit-exact on Linux, Windows and macOS across five decoder settings and all three CPU encoders. AFTER the marker the identical
+        // flag would configure the ENCODER, where slice threading splits each frame into independently-coded slices and breaks intra prediction and deblocking
+        // across their boundaries - a real compression-efficiency loss that no test here could see, since the command would still run and still exit 0.
+        if (sliceDecode) inputSide = `${inputSide}${inputSide ? ' ' : ''}-thread_type slice`;
         const vfArg = vf.length ? ` -filter:v:0 "${vf.join(',')}"` : '';   // :v:0 - filtering a copied secondary video stream would error
         return { inputSide, videoOut: `${parts.filter(Boolean).join(' ')}${vfArg}` };
     };
@@ -1666,11 +1871,93 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return ccVerdict;
         };
 
+        // A defect in the estimator must never cost a user their file. What it does is advisory arithmetic over probe data the plugin does not control, so an
+        // unexpected throw inside it is swallowed and the encode proceeds exactly as it would have without the check at all - the pre-3.22.0 behaviour. The one
+        // exception is the deliberate refusal, an AwkFailFile that has to reach the error queue; that is the same rethrow shape failUnexpected uses.
+        const memoryVerdict = (...args) => {
+            try { memoryVerdictInner(...args); } catch (e) { if (e instanceof AwkFailFile) throw e; }
+        };
+        // Say what this encode will cost the node BEFORE ffmpeg is ever spawned: a failFile where it provably cannot fit, a warning where it will fit only by
+        // swapping. See the ENCODE MEMORY MODEL block for the coefficients, and for why the refusal reads a single-frame-thread FLOOR rather than the expected
+        // figure. Nothing here touches processFile or the emitted preset - a warning stays a warning, and a file that is merely tight still encodes.
+        const memoryVerdictInner = (sel, selUnforced, sliceOn) => {
+            const budget = memNodeBudget(otherArguments);
+            if (!budget || budget.scope === 'unknown') return;
+            const common = { family: sel.family, encoderName: sel.encoderName, srcCodec: srcCodecName, srcIs10, srcW: srcWidth, srcH: srcHeight,
+                dispH: dispHeight, outH: outHeight, want10: want10Bit, speedName: speed, cores: budget.cores, sliceOn };
+            const floorMb = memoryEstimate({ ...common, floor: true });
+            const expectMb = memoryEstimate({ ...common, tonemapOn: tonemap, deintOn: !!deintFilter });
+            if (floorMb === null || expectMb === null) return;   // unreadable source dimensions, or an unmeasured encoder: say nothing rather than guess
+            const tag = streamTag(primary.index);
+            const limit = budget.limitBytes;
+            const freeBytes = Math.max(0, limit - budget.anonBytes);
+            // The kill line is the limit PLUS swap, not the limit: a cgroup only OOM-kills once BOTH are exhausted, and two concurrent 4K encodes were measured
+            // saturating a 5 GB ceiling and completing by swapping 2 GB. Only container scope may refuse at all - bare metal grows swap or a pagefile on demand
+            // and degrades instead of killing, so a host-scope node warns and encodes.
+            const refuse = budget.scope === 'container' && floorMb * MEM_BYTES_PER_MB > limit + budget.swapBytes;
+            const tight = expectMb * MEM_BYTES_PER_MB > MEM_HEADROOM_FRACTION * freeBytes;
+            // Which hardware encoder a guard gave up, and which guard did it. guard_captions is free (selUnforced holds the pre-force answer); guard_dv forced
+            // the CPU inside selectEncoder itself, so its counterfactual costs one extra -encoders/nvidia-smi probe - bought only for a file already flagged.
+            let hwAlt = null;
+            let forcedBy = '';
+            if (sel.family === 'cpu' && (refuse || tight)) {
+                if (selUnforced !== sel && selUnforced.family && selUnforced.family !== 'cpu') { hwAlt = selUnforced; forcedBy = 'guard_captions=true'; }
+                else if (preserveDv) {
+                    const alt = selectEncoder({ codec: targetCodecName, encoderOpt, otherArguments, forceCpu: false });
+                    if (alt.family && alt.family !== 'cpu') { hwAlt = alt; forcedBy = 'guard_dv=true'; }   // its notes are discarded - it never ran
+                }
+            }
+            const label = `${outHeight}p ${want10Bit ? '10-bit' : '8-bit'} ${sel.encoderName}`;
+            if (refuse) {
+                // Every alternative is quoted on the SAME single-thread floor basis as the refusal itself, so a user can check the arithmetic against the limit
+                // that was just named instead of comparing two differently-derived figures.
+                const altFloor = (over) => memoryEstimate({ ...common, ...over, floor: true });
+                const trades = [];
+                if (outHeight > 1080) { const m = altFloor({ outH: 1080 }); if (m !== null) trades.push(`height_cap=1080 (~${memMbGb(m)})`); }
+                if (want10Bit && targetCodecName !== 'h264') {
+                    const m = altFloor({ want10: false });
+                    if (m !== null) trades.push(`method_bitdepth=8 (~${memMbGb(m)})`);
+                }
+                if (hwAlt) {
+                    const m = altFloor({ family: hwAlt.family, encoderName: hwAlt.encoderName });
+                    if (m !== null) trades.push(`${forcedBy.split('=')[0]}=false to allow ${hwAlt.encoderName}`
+                        + ` (~${memMbGb(m)}, at a real bitrate-efficiency cost)`);
+                }
+                const swapNote = budget.swapBytes > 0 && Number.isFinite(budget.swapBytes)
+                    ? ` (a ${memGb(limit)} limit plus ${memGb(budget.swapBytes)} of swap)` : '';
+                // Round the suggestion up to a whole GB and leave room for the node itself, measured at ~224 MB of anonymous memory beside the encode.
+                const suggestGb = Math.max(1, Math.ceil(((expectMb + 224) * MEM_BYTES_PER_MB) / (1024 ** 3)));
+                let msg = `${tag} ${label} needs at least ~${memMbGb(floorMb)} and this node allows ${memGb(limit + budget.swapBytes)}${swapNote}`
+                    + ` - the encode would be killed with no error at all, so it is being failed here instead`
+                    + `\n☒${tag} fix: raise this node's memory limit to about ${suggestGb} GB, or run fewer transcode workers on it`;
+                if (forcedBy) msg += `\n☒${tag}[${forcedBy}] that is what forced this onto the CPU encoder, and the CPU encoders are the expensive ones`;
+                if (trades.length) msg += `\n☒${tag} cheaper if you would rather trade quality: ${trades.join(', ')}`;
+                failFile(msg);
+            }
+            if (tight)
+                response.infoLog += `☒${tag} this encode needs about ${memMbGb(expectMb)} and only ${memGb(freeBytes)} is free on this node - it should still`
+                    + ` finish, but by swapping, which is far slower than giving the node more memory\n`;
+            if (hwAlt) {
+                const m = memoryEstimate({ ...common, family: hwAlt.family, encoderName: hwAlt.encoderName, tonemapOn: tonemap, deintOn: !!deintFilter });
+                if (m !== null) response.infoLog += `☒${tag}[${forcedBy}] that forces the CPU encoder - about ${memMbGb(expectMb)} against ${memMbGb(m)} for`
+                    + ` ${hwAlt.encoderName}, which this node could otherwise have used\n`;
+            }
+            // A RAM-backed transcode cache is invisible to the model above: those pages are anonymous, count against the same cgroup limit, and cannot be
+            // reclaimed under pressure the way a disk-backed cache's page cache can - so the estimate understates the node by however large the output grows.
+            if (budget.scope === 'container' && ['tmpfs', 'ramfs'].includes(String(budget.cacheFsType || '').toLowerCase()))
+                response.infoLog += `☒the transcode cache is on ${budget.cacheFsType} - those pages count against this node's memory limit and cannot be`
+                    + ` reclaimed, so the figure above understates what this node will really use\n`;
+        };
+
         // Build the transcode preset (encoder resolved per node) + the predicted output summary.
         const emitTranscode = (encodeTag) => {
             if (preserveDv) response.infoLog += `☐${streamTag(primary.index)}[guard_dv=true] ${dvLabel} - keeping the DV RPU through the re-encode (libx265)\n`;
             let sel = selectEncoder({ codec: targetCodecName, encoderOpt, otherArguments, forceCpu: preserveDv,
                 forceCpuWhy: 'for Dolby Vision - hardware encoders drop the RPU' });
+            // What this node would have chosen before guard_captions could force it onto the CPU. Free here and nowhere else: the memory check below needs the
+            // counterfactual to say what a forced CPU encode is costing, and after the reassignment 20 lines down that answer is gone. (guard_dv's own force
+            // happened inside the call above, so ITS counterfactual has to be bought with a second call - see the cliff warning.)
+            const selUnforced = sel;
             // Probe for captions only where the answer could change something: an H.264 target keeps them on every encoder it can pick, and an HEVC target
             // that already landed on libx265 keeps them through the -a53cc 1 above. That leaves HEVC on hardware (recoverable - force the CPU encoder) and
             // AV1 anywhere (not recoverable - no AV1 encoder has the option), which is why the two branches below end differently.
@@ -1693,6 +1980,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     + `${ccExported ? 'exported them to a subtitle, and keeping both would show them twice' : 'found the caption channel carries no text'}\n`;
             sel.notes.forEach((n) => { response.infoLog += n; });
             if (sel.strictFail) failFile(sel.strictFail);   // node_strict: the node's GPU encoder can't run and CPU fallback is forbidden
+            // Slice decoding is worth emitting only where it saves something and only on a CPU encode: on a hardware route the slower slice decode could in
+            // principle starve a 100+ fps encoder, and a hardware encode peaks low enough (664-1409 MB) that it rarely approaches a limit anyway.
+            const sliceDecode = sel.family === 'cpu' && MEM_SLICE_CODECS.includes(srcCodecName);
+            // Before resolveTonemapBackend, which spawns a real ffmpeg probe: a refusal here must not first pay for a probe whose answer it will never use.
+            memoryVerdict(sel, selUnforced, sliceDecode);
             const tonemapBackend = tonemap ? resolveTonemapBackend({ family: sel.family, otherArguments }) : null;
             if (tonemap) response.infoLog += tonemapBackend === 'cpu'
                 ? `☒${streamTag(primary.index)}[hdr_mode=tonemap_sdr] Tonemapping HDR -> SDR on CPU (tonemapx) - no GPU tonemap available on this node;`
@@ -1702,7 +1994,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // output needs the dvh1 tag - hvc1 drops the DV box entirely; a stream WITH a base keeps hvc1.
             const preserveDvNoBase = preserveDv && (dvNoBaseLayer || (!!dovi && dovi.compatId === 0));
             const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, codec: targetCodecName, qNorm, speed, want10Bit, willDownscale,
-                outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter, dropCaptions });
+                outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter, dropCaptions,
+                sliceDecode });
             let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy${coverArtDrops}${strictArg} -metadata "awk_video=${videoSig}"`;
             if (isMp4Family(dstContainer)) out += ' -movflags use_metadata_tags';   // keep the global tag through an mp4/mov copy
             out += globalOutputOpt;
