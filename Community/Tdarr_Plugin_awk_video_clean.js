@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.22.0',
+    Version: '3.23.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -122,13 +122,13 @@ const details = () => ({
             defaultValue: 'source',
             inputUI: {
                 type: 'dropdown',
-                options: ['source', '2160', '1440', '1080', '720', '480'],
+                options: ['source', '2160', '1440', '1080', '720'],
             },
             tooltip: `Cap the output resolution by height. It only ever downscales, never upscales, and the quality tier is re-derived for the new height.
                 Live under normalize and shrink; inert under hdr_cleanup_only.
                 \\nsource (default): keep the source resolution.
-                \\n1080 downscales anything taller to 1080p - the classic "shrink 4K to 1080p to save space". 720 and 480 do the same at their heights,
-                while 2160 and 1440 only cap sources larger than that.`,
+                \\n1080 downscales anything taller to 1080p - the classic "shrink 4K to 1080p to save space". 720 does the same at its height, while 2160
+                and 1440 only cap sources larger than that.`,
         },
         {
             name: 'quality_sd',
@@ -1516,7 +1516,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     if (!['hdr_cleanup_only', 'normalize', 'shrink'].includes(action)) failFile(`[action=${action}] invalid value, check your settings`);
     if (!['source', 'hevc', 'h264', 'av1'].includes(codec)) failFile(`[codec=${codec}] invalid value, check your settings`);
-    if (!['source', '2160', '1440', '1080', '720', '480'].includes(heightCapOpt)) failFile(`[height_cap=${heightCapOpt}] invalid value, check your settings`);
+    if (!['source', '2160', '1440', '1080', '720'].includes(heightCapOpt)) failFile(`[height_cap=${heightCapOpt}] invalid value, check your settings`);
     if (!['slow', 'medium', 'fast'].includes(speed)) failFile(`[method_speed=${speed}] invalid value, check your settings`);
     if (!['source', '8', '10'].includes(bitDepthOpt)) failFile(`[method_bitdepth=${bitDepthOpt}] invalid value, check your settings`);
     if (!['node', 'node_strict', 'auto', 'cpu'].includes(encoderOpt))
