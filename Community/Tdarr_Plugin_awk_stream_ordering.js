@@ -1,4 +1,5 @@
 /* eslint no-plusplus: ["error", { "allowForLoopAfterthoughts": true }] */
+// #region details() — input form + tooltips
 const details = () => ({
     id: 'Tdarr_Plugin_awk_stream_ordering',
     Stage: 'Pre-processing',
@@ -181,6 +182,7 @@ const details = () => ({
         },
     ],
 });
+// #endregion
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const plugin = (file, librarySettings, inputs, otherArguments) => {
@@ -229,6 +231,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         infoLog: '',
     };
 
+    // #region SHARED helpers (1 section: file-failure helpers)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: file-failure helpers =====
     // -=-=-= AwkFailFile / failFile / failUnexpected [all five] =-=-=-
     // Fail the whole file (Tdarr's error queue) carrying the full infoLog: a returned processFile:false is Tdarr's "no work / skip" signal, NOT a failure -
@@ -250,6 +253,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // keeps its own `return`, so a skip still reads as a terminal where it stands.
     const skip = (msg) => { response.infoLog += msg; response.processFile = false; return response; };
     // ===== END SHARED: file-failure helpers =====
+    // #endregion
 
     // =====================================================================
     // SHARED CODE — duplicated verbatim because Tdarr loads each plugin as one self-contained file. Split into labeled sections; each is
@@ -257,6 +261,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
+    // #region SHARED helpers (14 sections: stream codec type … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -895,6 +900,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s))) ? ' -strict unofficial' : '';
     };
     // ===== END SHARED: mp4 strict compliance arg =====
+    // #endregion
 
     // Fail the file cleanly on missing/partial probe data, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
@@ -920,6 +926,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // unmatched entry simply scores as "not listed" and the tracks the user meant to promote stay wherever they were, which reads exactly like the ordering
     // rules not working. order_codec is genuinely open (codec names come and go, and an unknown one is inert rather than misleading), so it stays unchecked.
     // The und/mul/zxx/mis/qaa-qtz allowance matches every other language input - 'und' is a real ordering target, since untagged tracks sort somewhere too.
+    // #region SHARED helpers (1 section: language token recognition)
     // ===== SHARED [audio_clean, stream_ordering, sub_worker]: language token recognition =====
     // -=-=-= knownLangToken  [audio_clean, stream_ordering, sub_worker] =-=-=-
     // Is an already-folded langKey a recognised language token: any real language in any form (langKey folds en/eng/English/en-US/pt-BR to one base code), or
@@ -928,6 +935,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // the file is per-plugin and stays above this section, since it depends on what that plugin's input scopes; the message itself is failLangToken.
     const knownLangToken = (key) => key === 'und' || key === 'mul' || key === 'zxx' || key === 'mis' || /^q[a-t][a-z]$/.test(key) || !!langDisplayName(key);
     // ===== END SHARED: language token recognition =====
+    // #endregion
     const orderLangTokens = splitList(inputs.order_language);
     for (const tok of orderLangTokens)
         if (!knownLangToken(langKey(tok))) failLangToken('order_language', tok);

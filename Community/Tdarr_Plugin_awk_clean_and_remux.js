@@ -1,4 +1,5 @@
 /* eslint no-plusplus: ["error", { "allowForLoopAfterthoughts": true }] */
+// #region details() — input form + tooltips
 const details = () => ({
     id: 'Tdarr_Plugin_awk_clean_and_remux',
     Stage: 'Pre-processing',
@@ -342,6 +343,7 @@ const details = () => ({
         },
     ],
 });
+// #endregion
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const plugin = (file, librarySettings, inputs, otherArguments) => {
@@ -358,6 +360,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         infoLog: '',
     };
 
+    // #region SHARED helpers (1 section: file-failure helpers)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: file-failure helpers =====
     // -=-=-= AwkFailFile / failFile / failUnexpected [all five] =-=-=-
     // Fail the whole file (Tdarr's error queue) carrying the full infoLog: a returned processFile:false is Tdarr's "no work / skip" signal, NOT a failure -
@@ -379,6 +382,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // keeps its own `return`, so a skip still reads as a terminal where it stands.
     const skip = (msg) => { response.infoLog += msg; response.processFile = false; return response; };
     // ===== END SHARED: file-failure helpers =====
+    // #endregion
 
     // =====================================================================
     // SHARED CODE — duplicated verbatim because Tdarr loads each plugin as one self-contained file. Split into labeled sections; each is
@@ -386,6 +390,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
+    // #region SHARED helpers (13 sections: stream codec type … ffmpeg metadata escaping)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -857,6 +862,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .replace(/"/g, "'")                // double-quote → single-quote (safe inside the quoted value)
         .replace(/<io>/gi, '(io)');        // preset split marker → inert text (a value may never carry a second marker)
     // ===== END SHARED: ffmpeg metadata escaping =====
+    // #endregion
 
     // Missing/partial probe data fails the file with a clear reason, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
@@ -906,6 +912,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const methodTagLanguage = String(inputs.method_tag_language || 'container').toLowerCase();
     const guardAudioLanguage = String(inputs.guard_audio_language || 'disabled').toLowerCase();
 
+    // #region SHARED helpers (1 section: language display name)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language display name =====
     // -=-=-= langDisplayName  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // Memoised ICU DisplayNames (built once, reused): the recognised English name for an ALREADY-normalised language code, or '' for a non-language/unknown
@@ -919,6 +926,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
     })();
     // ===== END SHARED: language display name =====
+    // #endregion
     // Recognised language name for a tag's primary subtag, or '' - tells a real code (en, eng) from a spelled-out name ("english") or garbage. shortLang strips
     // any region/variant subtag first, so en-US is judged as en. Used by knownLangToken (both free-text language inputs), canonicalRegionTag and storesCleanly.
     const langName = (tag) => langDisplayName(shortLang(String(tag).toLowerCase()));
@@ -938,6 +946,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // code) or one of the isNonLang special/private codes. Both free-text language inputs are checked through this, so an unrecognised token (typo/garbage)
     // fails the file rather than silently changing which streams survive.
     const knownLangToken = (key) => isNonLang(key) || !!langName(key);
+    // #region SHARED helpers (1 section: language token failure)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language token failure =====
     // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // The failFile message echoes the offending token capped at 200 chars, with control characters collapsed to a space: free text is unbounded and Tdarr
@@ -945,6 +954,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)}] not a recognised language`
         + ' - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)');
     // ===== END SHARED: language token failure =====
+    // #endregion
     // Value checks resume here (container was checked above): the free-text language inputs first, their cross-check once both are known-good, then the
     // dropdowns. A bad language_fill would be written into a stream and demote it downstream; a bad language_sub is worse - ONE unrecognised token makes
     // every subtitle fail the match and get mapped out on a remux that reports success.
@@ -991,6 +1001,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (matching) are shared, the ISO639_2_B/toCanonicalTag write-side logic below is clean_and_remux-only. Verified on this build: mp4's
     // mdhd stores only a lowercase 3-letter ISO 639-2 code (2-letter / uppercase / region are silently dropped, so a plain mkv->mp4 remux
     // of an "en"-tagged stream loses its language), mkv stores any recognised code; und/mul/zxx/mis are never rewritten.
+    // #region SHARED helpers (1 section: iso639-1 to iso639-2 map)
     // ===== SHARED [clean_and_remux, sub_worker]: iso639-1 to iso639-2 map =====
     // -=-=-= ISO639_1_TO_2  [clean_and_remux, sub_worker] =-=-=-
     // ISO 639-1 (2-letter) -> ISO 639-2/T (terminologic 3-letter), complete for every current 639-1 code; each row
@@ -1012,6 +1023,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         yo:'yor',za:'zha',zh:'zho',zu:'zul',
     };
     // ===== END SHARED: iso639-1 to iso639-2 map =====
+    // #endregion
     // The 20 languages whose 639-2/B (bibliographic) code differs from /T above, keyed by 639-1. method_tag_language=639-2/b uses these; /t uses the table.
     const ISO639_2_B = {
         sq:'alb',hy:'arm',eu:'baq',bo:'tib',my:'bur',zh:'chi',cs:'cze',nl:'dut',ka:'geo',de:'ger',el:'gre',is:'ice',mk:'mac',mi:'mao',ms:'may',
@@ -1175,6 +1187,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // remove_imagesubs-specific drop beyond subFormatDropped, used by subDroppedAnyReason for the language_fill tally + accessibility plain-track guard.
     const imageSubDropped = (codec) => isImageSub(codec) && (removeImageSubs === 'all' || removeImageSubs === 'export');
 
+    // #region SHARED helpers (1 section: styled subtitle test)
     // ===== SHARED [clean_and_remux, sub_worker]: styled subtitle test =====
     // -=-=-= STYLED_SUBS / isStyledSub  [clean_and_remux, sub_worker] =-=-=-
     // ASS/SSA are the subtitle formats whose CONTENT is markup: positioning, drawing commands and style overrides live inside the cue text itself. Every
@@ -1184,6 +1197,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const STYLED_SUBS = ['ass', 'ssa'];
     const isStyledSub = (codec) => STYLED_SUBS.includes(String(codec).toLowerCase());
     // ===== END SHARED: styled subtitle test =====
+    // #endregion
     // A styled subtitle cannot go into mp4 without being flattened into mov_text, which turns its override tags into literal on-screen text (measured: 99.6%
     // of lines in a real anime ASS carry one). So on an mp4 target it is EXPORTED as a Matroska bundle carrying the subtitle plus the container's font
     // attachments - the fonts exist nowhere else - and dropped from the video, rather than converted into garbage. mkv carries ass natively and never
@@ -1194,6 +1208,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // with it the file reimports as a bundle, fonts and all - which is what makes the export a round trip rather than a one-way archive.
     const STYLED_BUNDLE = { ext: 'mks', fmt: 'matroska', mark: 'styled' };
 
+    // #region SHARED helpers (2 sections: preset path safety … font attachment test)
     // ===== SHARED [clean_and_remux, sub_worker]: preset path safety =====
     // -=-=-= pathIsPresetSafe  [clean_and_remux, sub_worker] =-=-=-
     // True when a real on-disk path can be embedded in a preset's quoted "${path}" token. Tdarr never shells out, but its worker tokenises each preset
@@ -1217,9 +1232,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return ['ttf', 'otf'].includes((s.codec_name || '').trim().toLowerCase()) || isFontMime(mime) || FONT_EXTS.includes(ext);
     };
     // ===== END SHARED: font attachment test =====
+    // #endregion
 
     const path = require('path'); const fs = require('fs');   // fs: the sidecar placement section below (temp staging dir + sizes) and the export exists-check
 
+    // #region SHARED helpers (2 sections: sidecar path derivation … sidecar placement)
     // ===== SHARED [clean_and_remux, sub_worker]: sidecar path derivation =====
     // -=-=-= libFilePath / libDir / videoBase / sidecarLangToken  [clean_and_remux, sub_worker] =-=-=-
     // Where a sidecar is written, plus the two metadata-derived name parts that get interpolated into the quoted "${path}" token of a preset. These two plugins
@@ -1351,6 +1368,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { placed, failed, empty };
     };
     // ===== END SHARED: sidecar placement =====
+    // #endregion
 
     // Hidden dot-prefixed sidecar name: ".<video>.s<index>.<lang>[.forced][.<mark>].<ext>". The dot makes Plex/Jellyfin ignore it; Emby scans dotfiles, so
     // an exported .mks needs a .embyignore entry there (called out in the remove_imagesubs tooltip). `mark` carries sub_worker's bundle token on a
@@ -1366,6 +1384,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // the remove_sub_sdh plain-track guard: a track this run deletes cannot be the plain track another track falls back on.
     const subDroppedAnyReason = (codec) => subFormatDropped(codec) || imageSubDropped(codec) || styledSubExported(codec);
 
+    // #region SHARED helpers (1 section: title canonicalization)
     // ===== SHARED [audio_clean, clean_and_remux]: title canonicalization =====
     // Canonical audio-title machinery, shared so audio_clean's downmix titles come out already in clean_and_remux's tag_title form (no wasted remux).
     // Canonical form: "<channel/downmix base> - <role tags>", roles LAST ("5.1 -> 2.0 - Commentary"). canonicalAudioTitle is the entry point.
@@ -1463,6 +1482,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return suffix ? `${base} - ${suffix}` : base;
     };
     // ===== END SHARED: title canonicalization =====
+    // #endregion
 
     // Channel layout string from ffprobe, falling back to mediaInfo (ChannelLayout/ChannelPositions) - lets us spot the LFE that separates 3.1 from 4.0 and
     // 2.1 from 3.0 even when ffprobe omits channel_layout. Feeds channelLabel's hasLfe argument at the tag_title call site.

@@ -1,3 +1,4 @@
+// #region details() — input form + tooltips
 const details = () => ({
     id: 'Tdarr_Plugin_awk_sub_worker',
     Name: 'Subtitle sidecar worker - extract embedded text subs to sidecars and reimport them',
@@ -193,6 +194,7 @@ const details = () => ({
         },
     ],
 });
+// #endregion
 
 // eslint-disable-next-line no-unused-vars
 const plugin = (file, librarySettings, inputs, otherArguments) => {
@@ -216,6 +218,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
+    // #region SHARED helpers (15 sections: file-failure helpers … ffmpeg metadata escaping)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: file-failure helpers =====
     // -=-=-= AwkFailFile / failFile / failUnexpected [all five] =-=-=-
     // Fail the whole file (Tdarr's error queue) carrying the full infoLog: a returned processFile:false is Tdarr's "no work / skip" signal, NOT a failure -
@@ -721,6 +724,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .replace(/"/g, "'")                // double-quote → single-quote (safe inside the quoted value)
         .replace(/<io>/gi, '(io)');        // preset split marker → inert text (a value may never carry a second marker)
     // ===== END SHARED: ffmpeg metadata escaping =====
+    // #endregion
 
     // ============= SUBTITLE SIDECAR HELPERS (non-shared) =============
     // Text subtitle codecs we can round-trip, mapped to the sidecar's native extension + ffmpeg encoder. Bitmap
@@ -752,6 +756,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const BUNDLE_EXT = 'mks';
     const BUNDLE_TOKEN = 'styled';
 
+    // #region SHARED helpers (1 section: styled subtitle test)
     // ===== SHARED [clean_and_remux, sub_worker]: styled subtitle test =====
     // -=-=-= STYLED_SUBS / isStyledSub  [clean_and_remux, sub_worker] =-=-=-
     // ASS/SSA are the subtitle formats whose CONTENT is markup: positioning, drawing commands and style overrides live inside the cue text itself. Every
@@ -761,6 +766,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const STYLED_SUBS = ['ass', 'ssa'];
     const isStyledSub = (codec) => STYLED_SUBS.includes(String(codec).toLowerCase());
     // ===== END SHARED: styled subtitle test =====
+    // #endregion
 
     // Dispositions encoded as filename tokens, in fixed order. `ff` is the ffmpeg -disposition name restored on import; `flags` are the ffprobe
     // disposition keys that, when set on the source, emit this token on extract. They differ only for SDH: hearing_impaired and captions are
@@ -867,6 +873,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return enc;
     };
 
+    // #region SHARED helpers (5 sections: preset path safety … language display name)
     // ===== SHARED [clean_and_remux, sub_worker]: preset path safety =====
     // -=-=-= pathIsPresetSafe  [clean_and_remux, sub_worker] =-=-=-
     // True when a real on-disk path can be embedded in a preset's quoted "${path}" token. Tdarr never shells out, but its worker tokenises each preset
@@ -1036,6 +1043,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
     })();
     // ===== END SHARED: language display name =====
+    // #endregion
     // Recognise a filename token as a real language, so a server-native sidecar can be anchored on it without mis-reading an arbitrary token. NOT
     // interchangeable with the shared knownLangToken - they differ in both directions: this one takes a RAW token and folds it itself, so it recognises
     // 'English' (the Emby paren split and the server-native anchor depend on that), while knownLangToken takes an ALREADY-FOLDED key and answers false for
@@ -1043,6 +1051,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // languages at all - reading 'und' as one turns '<video>.und.hi.srt' from Hindi into an SDH flag on an undetermined track.
     const isRealLanguageToken = (token) => { const k = langKey(token); if (!k) return false; return !!langDisplayName(k); };
 
+    // #region SHARED helpers (3 sections: iso639-1 to iso639-2 map … closed-caption handoff)
     // ===== SHARED [clean_and_remux, sub_worker]: iso639-1 to iso639-2 map =====
     // -=-=-= ISO639_1_TO_2  [clean_and_remux, sub_worker] =-=-=-
     // ISO 639-1 (2-letter) -> ISO 639-2/T (terminologic 3-letter), complete for every current 639-1 code; each row
@@ -1126,6 +1135,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const CC_TOKENS = { strip: 'strip', none: 'none', imported: 'imported' };
     const ccTokensOf = (tags) => getTagCI(tags || {}, CC_TAG).toLowerCase().split(',').map((t) => t.trim()).filter(Boolean);
     // ===== END SHARED: closed-caption handoff =====
+    // #endregion
     // Normalise a sidecar language token to a lowercase 3-letter ISO 639-2/T code for an mp4-family import target (mdhd silently drops 2-letter/spelled codes).
     // langKey folds spelled names and 639-2/B onto the 2-letter key, which ISO639_1_TO_2 maps to /T; an already-3-letter code (eng, fil, und) or an unmappable
     // token is left as-is. Mirrors clean_and_remux's toCanonicalTag three(false); mkv keeps the raw token where it is already a code (see normSidecarLang).
@@ -1757,6 +1767,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // nothing and every subtitle in that language is quietly left out of the extract - the user gets a clean run that did none of the work they asked for, with
     // no way to tell it apart from a file that genuinely had no such subtitle. Stopping is the far cheaper failure. The und/mul/zxx/mis/qaa-qtz allowance is
     // load-bearing, NOT laxness: the filter is compared against langKey(resolveLang(s) || 'und'), so scoping on 'und' is how untagged subtitles are selected.
+    // #region SHARED helpers (1 section: language token recognition)
     // ===== SHARED [audio_clean, stream_ordering, sub_worker]: language token recognition =====
     // -=-=-= knownLangToken  [audio_clean, stream_ordering, sub_worker] =-=-=-
     // Is an already-folded langKey a recognised language token: any real language in any form (langKey folds en/eng/English/en-US/pt-BR to one base code), or
@@ -1765,6 +1776,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // the file is per-plugin and stays above this section, since it depends on what that plugin's input scopes; the message itself is failLangToken.
     const knownLangToken = (key) => key === 'und' || key === 'mul' || key === 'zxx' || key === 'mis' || /^q[a-t][a-z]$/.test(key) || !!langDisplayName(key);
     // ===== END SHARED: language token recognition =====
+    // #endregion
     const onlyLangRaw = splitList(inputs.only_languages);
     for (const tok of onlyLangRaw) if (!knownLangToken(langKey(tok))) failLangToken('only_languages', tok);
 

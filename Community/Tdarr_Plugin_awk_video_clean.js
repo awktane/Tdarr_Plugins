@@ -1,4 +1,5 @@
 /* eslint no-plusplus: ["error", { "allowForLoopAfterthoughts": true }] */
+// #region details() — input form + tooltips
 const details = () => ({
     id: 'Tdarr_Plugin_awk_video_clean',
     Stage: 'Pre-processing',
@@ -298,6 +299,7 @@ const details = () => ({
         },
     ],
 });
+// #endregion
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
 const plugin = (file, librarySettings, inputs, otherArguments) => {
@@ -313,6 +315,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         FFmpegMode: true,
         infoLog: '',
     };
+    // #region SHARED helpers (1 section: file-failure helpers)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: file-failure helpers =====
     // -=-=-= AwkFailFile / failFile / failUnexpected [all five] =-=-=-
     // Fail the whole file (Tdarr's error queue) carrying the full infoLog: a returned processFile:false is Tdarr's "no work / skip" signal, NOT a failure -
@@ -334,6 +337,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // keeps its own `return`, so a skip still reads as a terminal where it stands.
     const skip = (msg) => { response.infoLog += msg; response.processFile = false; return response; };
     // ===== END SHARED: file-failure helpers =====
+    // #endregion
 
     // =====================================================================
     // SHARED CODE — duplicated verbatim because Tdarr loads each plugin as one self-contained file. Split into labeled sections; each is
@@ -341,6 +345,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
+    // #region SHARED helpers (8 sections: stream codec type … stream / language / preset helpers)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -719,11 +724,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // source stream - whole-file summaries, and brand-new/appended streams that have no source index of their own.
     const streamTag = (index) => `[s${String(index).padStart(2, ' ')}]`;
     // ===== END SHARED: stream / language / preset helpers =====
+    // #endregion
     // "Carries dynamic HDR of any kind", COMPOSED from the two per-format recognisers above so a spelling added to one list can never be missed by the union.
     // isDynamicHdr is the only question in the suite that genuinely spans both formats - a re-encode flattens either to static HDR10 - so this is a local, not
     // a shared helper: every other consumer wants ONE format (HDR10+ has a lossless strip path, HDR Vivid has none) and must reach for the narrower test.
     const DYNAMIC_HDR_RE = new RegExp(`${HDR10P_RE.source}|${VIVID_HDR_RE.source}`);
 
+    // #region SHARED helpers (4 sections: ffmpeg metadata escaping … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
     // -=-=-= escMeta [all five] =-=-=-
     // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array for child_process.spawn, so shell metacharacters
@@ -790,6 +797,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s))) ? ' -strict unofficial' : '';
     };
     // ===== END SHARED: mp4 strict compliance arg =====
+    // #endregion
 
     const os = require('os');
     const fs = require('fs');
@@ -950,6 +958,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ====== END INTERLACE DETECTION ======
 
+    // #region SHARED helpers (2 sections: closed-caption probe … closed-caption handoff)
     // ===== SHARED [sub_worker, video_clean]: closed-caption probe =====
     // -=-=-= A53 probe constants / deriveFfprobePath / probeA53Captions  [sub_worker, video_clean] =-=-=-
     // Closed captions are not a stream. They ride INSIDE the video bitstream as A53/EIA-608 SEI, so no stream list mentions them and nothing short of a
@@ -1011,6 +1020,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const CC_TOKENS = { strip: 'strip', none: 'none', imported: 'imported' };
     const ccTokensOf = (tags) => getTagCI(tags || {}, CC_TAG).toLowerCase().split(',').map((t) => t.trim()).filter(Boolean);
     // ===== END SHARED: closed-caption handoff =====
+    // #endregion
 
     // Route the HDR->SDR tonemap to the GPU filter that rides the chosen encoder's device stack, keeping every node's output in the ONE
     // consistent tonemap_* family (cuda ~= opencl ~= videotoolbox, SSIM ~0.9997 - validated on real NVIDIA/Intel/Mac hardware). CPU 'tonemapx'
