@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.23.0',
+    Version: '3.24.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1005,6 +1005,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ===== END SHARED: closed-caption probe =====
 
+    // ===== SHARED [sub_worker, video_clean]: closed-caption handoff =====
+    // -=-=-= CC_TAG / CC_TOKENS / ccTokensOf  [sub_worker, video_clean] =-=-=-
+    // The cross-plugin channel for embedded closed captions. They live in the video BITSTREAM rather than in a stream list, so sub_worker can read them out
+    // to a sidecar or a subtitle track but can only DELETE them where its own -c copy pass may filter the bitstream (H.264, not HDR, not Dolby Vision);
+    // video_clean is the only plugin that re-encodes video, so it is the only one that can be rid of them on anything else. The request therefore travels in
+    // a global CC_TAG tag on the file, written by sub_worker and read by video_clean. It is SHARED so a token added or renamed on one side cannot go missing
+    // on the other: a writer and a reader whose vocabularies drift fail SILENTLY, leaving the captions in the file twice. Deliberately not the awk_sub_worker
+    // marker - that is a list of sidecar PATHS whose reader matches entries against paths, so a flag word pushed in there would be read as a filename.
+    //   strip    - the captions are out (a sidecar or a subtitle track holds them) but the bitstream copy is still there; drop it on the next re-encode.
+    //   none     - the caption channel was decoded and carried no caption text at all, so no later pass need pay for that decode again.
+    //   imported - the captions are already embedded as a real subtitle track, so sub_worker must not read them out a second time.
+    // The value is a COMMA LIST and every reader splits it, because the states genuinely combine: an imported round trip that could not strip in its own pass
+    // records `imported,strip`, and an empty channel on a source the filter refuses records `none,strip`. A writer therefore EXTENDS the tag rather than
+    // replacing it with one token - a whole-value overwrite would erase a pending request instead of deferring it.
+    const CC_TAG = 'awk_cc';
+    const CC_TOKENS = { strip: 'strip', none: 'none', imported: 'imported' };
+    const ccTokensOf = (tags) => getTagCI(tags || {}, CC_TAG).toLowerCase().split(',').map((t) => t.trim()).filter(Boolean);
+    // ===== END SHARED: closed-caption handoff =====
+
     // Route the HDR->SDR tonemap to the GPU filter that rides the chosen encoder's device stack, keeping every node's output in the ONE
     // consistent tonemap_* family (cuda ~= opencl ~= videotoolbox, SSIM ~0.9997 - validated on real NVIDIA/Intel/Mac hardware). CPU 'tonemapx'
     // is the ~0.79-different outlier, used only as a fallback when no GPU tonemap initialises or the encoder is software. nvenc->cuda (native,
@@ -1604,13 +1623,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The two non-DV dynamic formats, kept APART because their strip paths differ: HDR10+ has one (hevc_metadata=remove_hdr10plus, HEVC only) and HDR Vivid
         // has none - no bitstream filter in this build removes a CUVA block, verified against a real pure-Vivid file (the HDR10+ half went, every CUVA frame
         // stayed). A file can carry both, so these are independent flags rather than a single "which format is it".
-        const isHdr10Plus = !dvSignal && (HDR10P_RE.test(hdrFmt) || ffprobeDynamicHdr);
+        // The ffprobe leg here has to be HDR10+-SPECIFIC rather than the shared ffprobeDynamicHdr, which also matches 'dovi'/'dolby vision' and the DV
+        // fourcc: reusing that would make every Dolby Vision file claim an HDR10+ layer it does not carry. And the flag deliberately does NOT exclude
+        // dvSignal, because a real release can carry both at once and the two are stripped by different filters - a DV-excluded flag hid the HDR10+ half
+        // entirely, so the strip removed only the RPU while the log reported the file done with dynamic HDR.
+        const ffprobeHdr10Plus = dvSideData.some((sd) => {
+            const t = String(sd?.side_data_type || '').toLowerCase();
+            return /smpte ?2094|hdr dynamic metadata/.test(t) && !/dovi|dolby vision/.test(t);
+        });
+        const isHdr10Plus = HDR10P_RE.test(hdrFmt) || ffprobeHdr10Plus;
         const isHdrVivid = VIVID_HDR_RE.test(hdrFmt);
+        // Which layers a lossless strip can actually reach on THIS source, gated by what each bitstream filter accepts on the production build:
+        // dovi_rpu takes hevc and av1, hevc_metadata takes hevc only (`ffmpeg -h bsf=<name>` on jellyfin 7.1.4). Fed anything else the filter does not warn
+        // or skip - it fails to initialise and takes the whole command down.
+        const stripDv = dvSignal && ['hevc', 'av1'].includes(srcCodecName);
+        const stripHdr10Plus = isHdr10Plus && srcCodecName === 'hevc';
         // Names the dynamic layer(s) actually present, so a message never has to guess between DV, HDR10+ and Vivid. DV wins the label outright (its profile
         // string is the useful detail); otherwise every non-DV format present is named. Falls back to the generic term if a probe flagged dynamic HDR without
         // naming a format (a bare ffprobe side-data hit).
-        const dynLabel = dvSignal ? dvLabel
-            : ([isHdr10Plus ? 'HDR10+' : '', isHdrVivid ? 'HDR Vivid' : ''].filter(Boolean).join(' + ') || 'dynamic HDR');
+        const dynLabel = ([dvSignal ? dvLabel : '', isHdr10Plus ? 'HDR10+' : '', isHdrVivid ? 'HDR Vivid' : ''].filter(Boolean).join(' + ') || 'dynamic HDR');
         const srcXfer = (primary.color_transfer || mi?.transfer_characteristics || '').toLowerCase().trim();
         // IPT-C2 is Dolby Vision profile 5's own colour matrix, and libx265 cannot re-encode it. Read from the source alone, independent of guard_dv, so the
         // guard's skip below and the "enable guard_dv" advice on the dynamic-HDR skip key on one fact and can never send a file round the two of them.
@@ -1665,20 +1696,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // action's business. The detection decode is the one real cost of turning this on, so it runs ONLY when the setting is live - never on the default.
         // Tests inject otherArguments.__awkCap.idet to pin a verdict without spawning ffmpeg, exactly as they do for the encoder and tonemap probes.
         const deinterlaceLive = deinterlaceOpt !== 'disabled' && action !== 'hdr_cleanup_only';
-        const idet = (() => {
-            if (!deinterlaceLive) return { kind: 'disabled' };
+        // LAZY and memoised, like the caption probe and unlike an eager IIFE: this is a real ffmpeg decode (measured 5.4 s wall / 35 s CPU on an idle Mac at
+        // 4K, and an idle figure is ~3x optimistic against a node that is also transcoding), and Tdarr re-cycles the stack until every plugin skips, so an
+        // eager one is paid again on every cycle and every later library scan for files that were always going to skip. Everything that can decide the file's
+        // fate WITHOUT the verdict - guard_lossless, the no-encoder refusal, the DV/HDR refusals, the awk_video fence - is a pure function of stream metadata,
+        // so realTranscode() below tries the three metadata triggers first and only reaches for this when interlace repair would be the sole reason to encode,
+        // which is exactly the case where the decode is genuinely load-bearing. Nothing may read idetMemo's value except through idet().
+        let idetMemo = null;
+        const idet = () => {
+            if (idetMemo) return idetMemo;
+            if (!deinterlaceLive) { idetMemo = { kind: 'disabled' }; return idetMemo; }
             // An injected capability object means a synthetic node, so NEVER spawn past it - a missing idet key reads as "no verdict", it does not fall through
             // to a real decode. Mirrors resolveTonemapBackend, which likewise stops at the injection rather than probing.
             const inj = otherArguments && otherArguments.__awkCap;
-            if (inj) return inj.idet || { kind: 'unknown' };
+            if (inj) { idetMemo = inj.idet || { kind: 'unknown' }; return idetMemo; }
             // Sample from a third of the way in, capped, so a long programme is not read from its (often progressive) opening titles and a short clip still
             // starts at 0. Duration comes from the format header; an absent one simply samples from the start.
             const durSec = Number(file.ffProbeData.format?.duration) || 0;
             const startSec = durSec > 90 ? Math.min(Math.floor(durSec / 3), 600) : 0;
-            return detectInterlace((otherArguments && otherArguments.ffmpegPath) || 'ffmpeg', file.file, startSec);
-        })();
+            idetMemo = detectInterlace((otherArguments && otherArguments.ffmpegPath) || 'ffmpeg', file.file, startSec);
+            return idetMemo;
+        };
         // A repaired file re-detects as progressive on any later pass, so this converges by itself and needs no reprocess fence of its own.
-        const deinterlaceNeeded = idet.kind === 'interlaced' || idet.kind === 'telecine';
+        const deinterlaceNeeded = () => idet().kind === 'interlaced' || idet().kind === 'telecine';
         // Film-originated video is REBUILT (its original frames are still in there), video-origin video is INTERPOLATED. deint=all because a genuinely
         // interlaced file often carries no per-frame interlaced flag - that is why the decision came from the pixels - so deint=interlaced would skip it.
         // Parity is bwdif's DISPLAY order, which only the container's uncrossed values state unambiguously ('tt' = top stored and top displayed, 'bb' = bottom
@@ -1689,15 +1729,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Choosing the wrong parity costs SSIM 0.9377 against 0.9816, so the crossed values are ignored and idet decides from the pixels, which was exact
         // both ways (100/0 and 0/100, with the frame flags cleared as well); bwdif's own parity=auto is the last resort (see detectInterlace's parity note).
         const srcFieldOrder = String(primary.field_order || '').toLowerCase().trim();
-        const deintParity = srcFieldOrder === 'tt' ? 'tff' : (srcFieldOrder === 'bb' ? 'bff' : (idet.parity || 'auto'));
+        const deintParity = () => (srcFieldOrder === 'tt' ? 'tff' : (srcFieldOrder === 'bb' ? 'bff' : (idet().parity || 'auto')));
         // send_field, not send_frame: a shot-on-video source genuinely holds one distinct moment per FIELD, so emitting one frame per field (1080i60 -> 60p)
         // keeps what the file contains, while the half-rate alternative would discard every second moment purely to save space. It costs ~31% bitrate and ~58%
         // encode time (measured, libx265 CRF 23 on real 1080i broadcast). A telecined source is unaffected either way - its original frames come back at their
         // own rate, so there is no second field to keep and the question does not arise.
-        const deintFilter = !deinterlaceNeeded ? ''
-            : (idet.kind === 'telecine'
+        const deintFilter = () => (!deinterlaceNeeded() ? ''
+            : (idet().kind === 'telecine'
                 ? 'fieldmatch,bwdif=deint=interlaced,decimate'   // rebuild the original frames; bwdif only touches what fieldmatch could not pair
-                : `bwdif=mode=send_field:parity=${deintParity}:deint=all`);
+                : `bwdif=mode=send_field:parity=${deintParity()}:deint=all`));
+        // The two verdict REPORTS - "I looked and there was no combing", "I could not read one at all". They claim no work, so unlike the ☐ repair lines they
+        // are safe to emit on a file nothing else happens to; the setting costs a decode, so what it found is information the user paid for. Reads the MEMO,
+        // never idet(), so asking for the line can never itself provoke the decode: where a guard settled the file without the verdict there is nothing to
+        // report, because nothing was paid for. Emitted at the two points where the decision is final - inside emitTranscode, and past the transcode branch.
+        const deintVerdictLine = () => {
+            if (!idetMemo || ['disabled', 'interlaced', 'telecine'].includes(idetMemo.kind)) return '';
+            const combedPct = idetMemo.total ? `${Math.round((idetMemo.combed / idetMemo.total) * 100)}%` : '?';
+            return idetMemo.kind === 'progressive'
+                ? `☑${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] No combing found (${combedPct} combed frames) - nothing to repair\n`
+                : `☒${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Could not read an interlace verdict from this file - left as-is\n`;
+        };
 
         // ---- shared emit helpers ----
         const coverArtStreams = videoStreams.filter((s) => isCoverArt(s));                                 // embedded cover-art / still-image "video" streams
@@ -1726,8 +1777,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // removes HDR10+ (HEVC only). The stream stays the source codec/res/depth with its HDR10 base retained, so it needs no awk_video
         // fence (once stripped it is no longer dynamic-HDR, so a re-run is a natural no-op). On mp4 the fourCC is reset (dvh1 -> hvc1).
         const emitLosslessStrip = () => {
-            const bsf = dvSignal ? 'dovi_rpu=strip=1' : 'hevc_metadata=remove_hdr10plus=1';
-            response.infoLog += `☐${streamTag(primary.index)}[hdr_mode=strip_dynamic] Stripping ${dynLabel} losslessly (-c:v copy, base HDR10 retained)\n`;
+            // One filter per layer present, chained - the bsf option takes a comma list, and dovi_rpu + hevc_metadata coexist (proven on the production
+            // build against a real DV file). A file carrying BOTH needs both: picking one and reporting a completed strip left the other layer in place.
+            // Neither filter covers every codec, so each is gated (stripDv / stripHdr10Plus) and tryLosslessStrip refuses or annotates whatever is left over.
+            const bsfList = [stripDv ? 'dovi_rpu=strip=1' : '', stripHdr10Plus ? 'hevc_metadata=remove_hdr10plus=1' : ''].filter(Boolean);
+            // A dynamic-HDR file neither flag claims (a bare ffprobe side-data hit naming no format) keeps the HDR10+ filter it has always had - the
+            // fall-back that gives the generic 'dynamic HDR' label something to act on.
+            const bsf = (bsfList.length ? bsfList : ['hevc_metadata=remove_hdr10plus=1']).join(',');
+            const stripped = [stripDv ? dvLabel : '', stripHdr10Plus ? 'HDR10+' : ''].filter(Boolean).join(' + ') || dynLabel;
+            const leftover = isHdr10Plus && !stripHdr10Plus ? `, but the HDR10+ layer stays - no filter here removes it from ${srcCodecName || 'this codec'}`
+                : '';
+            response.infoLog += `☐${streamTag(primary.index)}[hdr_mode=strip_dynamic] Stripping ${stripped} losslessly (-c:v copy, base HDR10 retained)`
+                + `${leftover}\n`;
             let out = `-map 0 -c copy -bsf:v:0 ${bsf}${coverArtDrops}${qtVideoTag(srcCodecName)} -c:a copy -c:s copy${strictArg}${globalOutputOpt}`;
             // same as the transcode path: keep sibling plugins' GLOBAL awk_* markers through an mp4/mov copy
             if (isMp4Family(dstContainer)) out += ' -movflags use_metadata_tags';
@@ -1744,19 +1805,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return response;
         };
 
-        // Lossless dynamic-HDR strip eligibility, shared by hdr_cleanup_only and the no-real-transcode strip path: a no-base DV, any HDR Vivid, and
-        // HDR10+-in-non-HEVC all have no lossless path (skip); otherwise do the strip. The callers point users at slightly different next steps, so each
-        // passes its own three skip messages. Vivid is tested BEFORE the HDR10+ leg on purpose: on a file carrying both, stripping only the HDR10+ half would
-        // leave the file still dynamic-HDR while the log reported a completed strip.
-        const tryLosslessStrip = (noBaseMsg, vividMsg, hdr10PlusMsg) => {
+        // Lossless dynamic-HDR strip eligibility, shared by hdr_cleanup_only and the no-real-transcode strip path: a no-base DV, any HDR Vivid, a DV signal
+        // on a codec dovi_rpu refuses, and an HDR10+ layer with nothing else strippable beside it all have no lossless path (skip); otherwise do the strip.
+        // The callers point users at slightly different next steps, so each passes its own four skip messages. Vivid is tested FIRST on purpose: no filter
+        // here removes a CUVA block, so on a file carrying it stripping any other layer would leave the file still dynamic-HDR while the log reported a
+        // completed strip - the one case where a partial strip is worse than none, because nothing about it converges.
+        const tryLosslessStrip = (noBaseMsg, vividMsg, hdr10PlusMsg, dvCodecMsg) => {
             if (dvNoBaseLayer) { return skip(noBaseMsg); }
             if (isHdrVivid) { return skip(vividMsg); }
-            if (isHdr10Plus && srcCodecName !== 'hevc') { return skip(hdr10PlusMsg); }
+            // Refuse a DV signal on a codec dovi_rpu cannot run on. Its HDR10+ sibling has always had this gate; without the DV one the plugin emits a filter
+            // ffmpeg rejects outright ("Codec 'h264' is not supported by the bitstream filter 'dovi_rpu'", exit 234), so Tdarr errors the file with a bare
+            // ffmpeg message instead of a readable skip. Reachable through any of dvSignal's three codec-agnostic signals - a parsed DOVI record, a dvav/dva1
+            // fourcc, or a mediaInfo HDR_Format naming Dolby Vision - on any source whose base layer happens to carry a PQ/HLG transfer. The cost is one-sided:
+            // a wrong skip leaves the file untouched, a wrong emit quarantines it. Note the accepted set is hevc AND av1, wider than the HDR10+ leg's hevc.
+            if (dvSignal && !stripDv) { return skip(dvCodecMsg); }
+            // Only when NOTHING is left to strip. On a DV+HDR10+ file that dovi_rpu can still handle the strip goes ahead and emitLosslessStrip names the
+            // HDR10+ layer that stays, rather than abandoning a removal that is genuinely available.
+            if (isHdr10Plus && !stripHdr10Plus && !stripDv) { return skip(hdr10PlusMsg); }
             return emitLosslessStrip();
         };
         // The tail of a Vivid refusal: whatever ELSE the file carries also stays, since the whole strip is abandoned. Naming it stops the message implying a
         // partial strip ran.
-        const vividAlso = dvSignal ? `, so the ${dvLabel} alongside it stays too` : (isHdr10Plus ? ', so the HDR10+ layer alongside it stays too' : '');
+        const vividAlsoNames = [dvSignal ? dvLabel : '', isHdr10Plus ? 'HDR10+ layer' : ''].filter(Boolean).join(' and the ');
+        const vividAlso = vividAlsoNames ? `, so the ${vividAlsoNames} alongside it stays too` : '';
 
         // ================= decide, gated by action =================
         if (action === 'hdr_cleanup_only') {
@@ -1775,7 +1846,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] HDR Vivid has no lossless strip path (no bitstream filter here can remove a CUVA block)`
                     + `${vividAlso} - left untouched; switch to action=normalize or shrink with hdr_mode=tonemap_sdr to flatten it to SDR\n`,
                 `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] HDR10+ in ${srcCodecName || 'this codec'} has no lossless strip path (needs HEVC)`
-                    + ` - left untouched; use action=normalize/shrink to re-encode it away\n`);
+                    + ` - left untouched; use action=normalize/shrink to re-encode it away\n`,
+                `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} in ${srcCodecName || 'this codec'} has no lossless strip path`
+                    + ` (needs HEVC or AV1) - left untouched; use action=normalize/shrink to re-encode it away\n`);
         }
 
         // ---- action = normalize | shrink (real-transcode capable) ---- Resolve the codec trigger + final target codec. depth is a PARAMETER (never a
@@ -1827,7 +1900,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const vkbps = Math.round((resolveStreamBitrate(primary) || 0) / 1000);
             if (vkbps > 0 && vkbps < guardShrinkKbps) { codecTrigger = false; belowFloorKbps = vkbps; }
         }
-        const realTranscode = codecTrigger || heightTrigger || tonemapTrigger || deintTrigger;
+        // Three of the four triggers are pure stream metadata; the fourth is the idet DECODE. Split so the cheap ones are tried first and the decode is
+        // reached only when interlace repair would be the sole reason to encode - the case where the verdict really is load-bearing. Every consumer below
+        // therefore calls realTranscode() with its own cheap metadata test to the LEFT of it, so a file that guard_lossless / the DV and HDR refusals / the
+        // awk_video fence were always going to settle never spawns ffmpeg to be told something it does not use.
+        const cheapTranscode = codecTrigger || heightTrigger || tonemapTrigger;
+        const realTranscode = () => cheapTranscode || deintTrigger();
         const canEncodeTarget = ENCODABLE.includes(targetCodecName);
 
         // Idempotency fence: a settings fingerprint stored as a container-global awk_video tag. Essential for shrink (a constant-quality
@@ -1851,9 +1929,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // this node is about to choose would destroy. Neither is part of the awk_video fingerprint above, and that omission is deliberate rather than an
         // oversight: neither can FIRE a transcode, they only change how one that is already happening is performed. Fingerprinting them would re-encode a
         // finished file a second time - to strip a caption track, or to "protect" captions the first encode already destroyed and no later encode can restore.
-        const ccTokens = getTagCI(file.ffProbeData.format?.tags || {}, 'awk_cc').toLowerCase().split(',').map((t) => t.trim());
-        const ccExported = ccTokens.includes('strip');     // sub_worker exported them, but could not remove the bitstream copy under its own -c copy pass
-        const ccChannelEmpty = ccTokens.includes('none');  // sub_worker decoded the channel and it carried no caption text at all
+        // Read through the shared closed-caption handoff vocabulary rather than bare literals, so a token sub_worker renames cannot go on quietly meaning
+        // nothing here. It is a comma list: an imported round trip that could not strip in its own pass arrives as `imported,strip`.
+        const ccTokens = ccTokensOf(file.ffProbeData.format?.tags);
+        const ccExported = ccTokens.includes(CC_TOKENS.strip);    // sub_worker took them out, but could not remove the bitstream copy under its -c copy pass
+        const ccChannelEmpty = ccTokens.includes(CC_TOKENS.none); // sub_worker decoded the channel and it carried no caption text at all
         const dropCaptions = ccExported || ccChannelEmpty;
         // Only `true` is information. Tdarr's optional caption scan reads false both for a file that genuinely has none and for one its bundled CCExtractor
         // could not parse (measured: every mp4, and MPEG-2 inside Matroska), so a false still has to be probed. Memoized to at most one probe per file - that
@@ -1886,7 +1966,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const common = { family: sel.family, encoderName: sel.encoderName, srcCodec: srcCodecName, srcIs10, srcW: srcWidth, srcH: srcHeight,
                 dispH: dispHeight, outH: outHeight, want10: want10Bit, speedName: speed, cores: budget.cores, sliceOn };
             const floorMb = memoryEstimate({ ...common, floor: true });
-            const expectMb = memoryEstimate({ ...common, tonemapOn: tonemap, deintOn: !!deintFilter });
+            const expectMb = memoryEstimate({ ...common, tonemapOn: tonemap, deintOn: !!deintFilter() });
             if (floorMb === null || expectMb === null) return;   // unreadable source dimensions, or an unmeasured encoder: say nothing rather than guess
             const tag = streamTag(primary.index);
             const limit = budget.limitBytes;
@@ -1938,7 +2018,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.infoLog += `☒${tag} this encode needs about ${memMbGb(expectMb)} and only ${memGb(freeBytes)} is free on this node - it should still`
                     + ` finish, but by swapping, which is far slower than giving the node more memory\n`;
             if (hwAlt) {
-                const m = memoryEstimate({ ...common, family: hwAlt.family, encoderName: hwAlt.encoderName, tonemapOn: tonemap, deintOn: !!deintFilter });
+                const m = memoryEstimate({ ...common, family: hwAlt.family, encoderName: hwAlt.encoderName, tonemapOn: tonemap, deintOn: !!deintFilter() });
                 if (m !== null) response.infoLog += `☒${tag}[${forcedBy}] that forces the CPU encoder - about ${memMbGb(expectMb)} against ${memMbGb(m)} for`
                     + ` ${hwAlt.encoderName}, which this node could otherwise have used\n`;
             }
@@ -1958,6 +2038,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // counterfactual to say what a forced CPU encode is costing, and after the reassignment 20 lines down that answer is gone. (guard_dv's own force
             // happened inside the call above, so ITS counterfactual has to be bought with a second call - see the cliff warning.)
             const selUnforced = sel;
+            // node_strict's refusal is acted on HERE, before anything can replace `sel`. selectEncoder's refusal shape is { strictFail, notes } with no
+            // `family` key at all, so a later `sel.family !== 'cpu'` test reads undefined and passes - and the guard_captions branch below would then
+            // REASSIGN sel to a plain CPU choice carrying no strictFail, destroying the refusal it was about to be checked for. A file the user pinned to
+            // node_strict would silently take a multi-hour software encode for the sole reason that it carries captions. Checking first also skips the
+            // bounded caption probe (0.2-17 s) on a file that was already decided to fail.
+            if (sel.strictFail) { sel.notes.forEach((n) => { response.infoLog += n; }); failFile(sel.strictFail); }
             // Probe for captions only where the answer could change something: an H.264 target keeps them on every encoder it can pick, and an HEVC target
             // that already landed on libx265 keeps them through the -a53cc 1 above. That leaves HEVC on hardware (recoverable - force the CPU encoder) and
             // AV1 anywhere (not recoverable - no AV1 encoder has the option), which is why the two branches below end differently.
@@ -1979,7 +2065,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.infoLog += `☐${streamTag(primary.index)} Dropping the embedded closed captions - sub_worker `
                     + `${ccExported ? 'exported them to a subtitle, and keeping both would show them twice' : 'found the caption channel carries no text'}\n`;
             sel.notes.forEach((n) => { response.infoLog += n; });
-            if (sel.strictFail) failFile(sel.strictFail);   // node_strict: the node's GPU encoder can't run and CPU fallback is forbidden
             // Slice decoding is worth emitting only where it saves something and only on a CPU encode: on a hardware route the slower slice decode could in
             // principle starve a 100+ fps encoder, and a hardware encode peaks low enough (664-1409 MB) that it rarely approaches a limit anyway.
             const sliceDecode = sel.family === 'cpu' && MEM_SLICE_CODECS.includes(srcCodecName);
@@ -1994,14 +2079,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // output needs the dvh1 tag - hvc1 drops the DV box entirely; a stream WITH a base keeps hvc1.
             const preserveDvNoBase = preserveDv && (dvNoBaseLayer || (!!dovi && dovi.compatId === 0));
             const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, codec: targetCodecName, qNorm, speed, want10Bit, willDownscale,
-                outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter, dropCaptions,
-                sliceDecode });
+                outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter: deintFilter(),
+                dropCaptions, sliceDecode });
             let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy${coverArtDrops}${strictArg} -metadata "awk_video=${videoSig}"`;
             if (isMp4Family(dstContainer)) out += ' -movflags use_metadata_tags';   // keep the global tag through an mp4/mov copy
             out += globalOutputOpt;
             response.preset = `${enc.inputSide}<io>${out}`;
             response.processFile = true;
             response.infoLog += coverArtLog;
+            // The interlace repair's own ☐ line lands HERE, with the preset, for the reason coverArtLog states: every guard between the detection and this
+            // point can still end the run with nothing emitted, and a ☐ line means a change about to be MADE. It also makes the frame-rate change legible on
+            // the files it happens to, and its absence legible on the film-originated ones where it never applies.
+            if (deinterlaceNeeded()) {
+                const v = idet();
+                const pct = (n) => (v.total ? `${Math.round((n / v.total) * 100)}%` : '?');
+                response.infoLog += v.kind === 'telecine'
+                    ? `☐${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Film-originated video detected (${pct(v.repeats)} repeated fields)`
+                        + ' - rebuilding its original frames exactly, at its own frame rate\n'
+                    : `☐${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Interlaced video detected (${pct(v.combed)} combed frames,`
+                        + ` ${deintParity()} field order) - keeping every field as its own frame, so the output runs at double the frame rate\n`;
+            } else response.infoLog += deintVerdictLine();
             response.infoLog += `☐${streamTag(primary.index)}${encodeTag} Transcoding video @ ${sel.encoderName} q${Math.round(qNorm)}\n`;
             // Predict the re-encoded stream through the shared summariseStream (single source of truth for the [video:...]
             // token) so Expected-results matches the input-summary format; depth is exact via bits_per_raw_sample with
@@ -2023,49 +2120,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return response;
         };
 
-        // Say what the detection found and what is being done about it, whichever way it went - including when it found nothing. The setting costs a decode
-        // pass per file, so "I looked and there was no combing" is information the user paid for and should see. It also makes the frame-rate change legible
-        // on the files it happens to, and its absence legible on the film-originated ones where it never applies.
-        if (deinterlaceLive) {
-            const pct = (n) => (idet.total ? `${Math.round((n / idet.total) * 100)}%` : '?');
-            if (idet.kind === 'telecine') {
-                response.infoLog += `☐${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Film-originated video detected `
-                    + `(${pct(idet.repeats)} repeated fields) - rebuilding its original frames exactly, at its own frame rate\n`;
-            } else if (idet.kind === 'interlaced') {
-                response.infoLog += `☐${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Interlaced video detected `
-                    + `(${pct(idet.combed)} combed frames, ${deintParity} field order)`
-                    + ` - keeping every field as its own frame, so the output runs at double the frame rate\n`;
-            } else if (idet.kind === 'progressive') {
-                response.infoLog += `☑${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] No combing found (${pct(idet.combed)} combed frames)`
-                    + ` - nothing to repair\n`;
-            } else {
-                response.infoLog += `☒${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Could not read an interlace verdict from this file`
-                    + ` - left as-is\n`;
-            }
-        }
-
         // Skips that a pending real transcode would otherwise turn destructive.
         // guard_lossless leads the block: it is the one that says "don't touch this file at all", so it should answer for a lossless source whatever else also
         // applies. It keys on realTranscode, so the lossless -c:v copy paths (hdr_cleanup_only, a bare strip_dynamic) still run - they cost the master nothing.
-        if (realTranscode && guardLossless && LOSSLESS_VIDEO_CODECS.includes(srcCodecName)) {
+        if (guardLossless && LOSSLESS_VIDEO_CODECS.includes(srcCodecName) && realTranscode()) {
             return skip(`☒${streamTag(primary.index)}[guard_lossless=true] ${srcCodecName} is a lossless/mastering source - a re-encode would flatten it`
                 + ` to lossy 4:2:0 ${want10Bit ? '10' : '8'}-bit; set guard_lossless=false to convert it anyway\n`);
         }
-        if (realTranscode && !canEncodeTarget) {   // codec=source resolved to a legacy codec with no encoder, but height_cap/tonemap/deinterlace force one
+        if (!canEncodeTarget && realTranscode()) {   // codec=source resolved to a legacy codec with no encoder, but height_cap/tonemap/deinterlace force one
             return skip(`☒${streamTag(primary.index)}[codec=source] Source codec ${srcCodecName || 'unknown'} has no encoder - can't keep it through the `
                 + `${heightTrigger ? 'downscale' : (tonemapTrigger ? 'tonemap' : 'interlace repair')}`
                 + `; set codec=hevc/h264/av1 to convert it\n`);
         }
-        if (realTranscode && dvIptC2) {
+        if (dvIptC2 && realTranscode()) {
             return skip(`☒${streamTag(primary.index)}[guard_dv=true] ${dvLabel} uses the IPT-C2 colour matrix that libx265 cannot re-encode`
                 + ` - left untouched; set guard_dv=false and hdr_mode=tonemap_sdr to flatten it to SDR\n`);
         }
-        if (realTranscode && effHdrMode === 'strip_dynamic' && dvNoBaseLayer) {
+        if (effHdrMode === 'strip_dynamic' && dvNoBaseLayer && realTranscode()) {
             return skip(`☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} has no HDR10 base layer - a re-encode would leave a mis-coloured`
                 + ` picture with no HDR fallback, left untouched; set hdr_mode=tonemap_sdr to flatten it to SDR\n`);
         }
         // a transcode would drop the unprotected dynamic layer - protect it by skipping
-        if (realTranscode && isDynamicHdr && !preserveDv && effHdrMode === 'preserve') {
+        if (isDynamicHdr && !preserveDv && effHdrMode === 'preserve' && realTranscode()) {
             // Only offer guard_dv when turning it on would actually change this file's outcome: it needs an HEVC source (libx265 is the only encoder that
             // carries the RPU), it must not already be on, and it must not use the IPT-C2 matrix libx265 cannot re-encode - that file skips again on the very
             // next pass with the opposite advice. Naming a setting that cannot help reads as the plugin not knowing its own state.
@@ -2075,7 +2151,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 + `set hdr_mode=strip_dynamic (keep the HDR10 base) or hdr_mode=tonemap_sdr (flatten to SDR)\n`);
         }
 
-        if (realTranscode) {
+        if (realTranscode()) {
             if (alreadyFenced) {
                 return skip(`☑${streamTag(primary.index)}[action=${action}] Already processed by awk_video at this exact setting (${videoSig})`
                     + ` - left untouched\n`);
@@ -2085,13 +2161,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 willDownscale && `${outHeight}p`,
                 want10Bit !== srcIs10 && (want10Bit ? '10-bit' : '8-bit'),   // depth piggybacks a transcode fired by something else
                 tonemap && 'tonemap_sdr',
-                deinterlaceNeeded && (idet.kind === 'telecine' ? 'film-restore' : 'deinterlace'),
+                deinterlaceNeeded() && (idet().kind === 'telecine' ? 'film-restore' : 'deinterlace'),
             ].filter(Boolean);
             if (reasonTags.length === 0) reasonTags.push('shrink');   // a same-codec shrink with no other visible transform
             return emitTranscode(`[${reasonTags.join('][')}]`);
         }
 
         // ---- no real transcode: a lossless strip, a bitrate skip, or a benign no-op ----
+        // Reaching here means realTranscode() was evaluated in full, so the interlace verdict (if the setting bought one) is settled and can be reported.
+        response.infoLog += deintVerdictLine();
         if (effHdrMode === 'strip_dynamic' && isDynamicHdr) {   // strip_dynamic is the sole reason - do it losslessly (or skip when it can't be lossless)
             return tryLosslessStrip(
                 `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} has no HDR10 base layer - can't strip losslessly;`
@@ -2099,7 +2177,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] HDR Vivid has no lossless strip path (no bitstream filter here can remove a CUVA block)`
                     + `${vividAlso} - left untouched; set hdr_mode=tonemap_sdr to flatten it to SDR\n`,
                 `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] HDR10+ in ${srcCodecName || 'this codec'} has no lossless strip path (needs HEVC)`
-                    + ` - left untouched\n`);
+                    + ` - left untouched\n`,
+                `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} in ${srcCodecName || 'this codec'} has no lossless strip path`
+                    + ` (needs HEVC or AV1) - left untouched\n`);
         }
         if (belowFloorKbps > 0) {
             return skip(`☑${streamTag(primary.index)}[guard_shrink_bitrate=${guardShrinkKbps}] Source video bitrate ${belowFloorKbps}k is below the `

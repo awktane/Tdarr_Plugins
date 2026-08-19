@@ -27,7 +27,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.19.3',
+    Version: '4.20.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -212,7 +212,7 @@ const details = () => ({
             defaultValue: 'disabled',
             inputUI: {
                 type: 'dropdown',
-                options: ['disabled', 'enabled'],
+                options: ['disabled', 'if_plain_survives', 'all'],
             },
             tooltip: `Remove SDH / Closed Caption subtitles - the ones written for deaf and hard-of-hearing viewers. Detected from the real ffmpeg
                 disposition flag, or from keywords in the title, handler or description.
@@ -220,8 +220,10 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\ndisabled (default): keep them.
-                \\nenabled: remove them, but only where a plain subtitle of the same language survives - one carrying no commentary, descriptive, SDH or
-                lyrics role, in a format the output container keeps and not stripped by remove_imagesubs. So extras go, never your last usable track.
+                \\nif_plain_survives: remove them, but only where a plain subtitle of the same language survives - one carrying no commentary, descriptive,
+                SDH or lyrics role, in a format the output container keeps, not stripped by remove_imagesubs and not exported to a bundle. So extras go,
+                never your last usable subtitle of that language.
+                \\nall: remove every one of them, whatever else the file carries. A file can legitimately end up with no subtitles at all.
                 \\nAudio description (visual_impaired audio) is not handled here - audio_clean's downmix_secondary owns it, along with commentary and M&E.`,
         },
         {
@@ -963,7 +965,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             + ' add it to language_sub or clear language_fill');
     if(!['single-or-error', 'force-any'].includes(fillMode))
         failFile(`[language_fill_mode=${fillMode}] invalid value, check your settings`);
-    if(!['disabled', 'enabled'].includes(removeSubSdh))
+    if(!['disabled', 'if_plain_survives', 'all'].includes(removeSubSdh))
         failFile(`[remove_sub_sdh=${removeSubSdh}] invalid value, check your settings`);
     if(!['disabled', 'audio', 'subtitle', 'both'].includes(tagDisposition))
         failFile(`[tag_disposition=${tagDisposition}] invalid value, check your settings`);
@@ -1360,9 +1362,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const forced = ffstream.disposition?.forced === 1 ? '.forced' : '';
         return `.${videoBase}.s${ffstream.index}.${sidecarLangToken(ffstream)}${forced}${mark ? `.${mark}` : ''}.${ext}`;
     };
-    // A subtitle removed regardless of language - by container/format (subFormatDropped) or by remove_imagesubs (imageSubDropped). Neither is ever assigned
-    // language_fill, and neither counts as a survivor for the language_fill_mode untagged tally or the remove_sub_sdh plain-track guard.
-    const subDroppedAnyReason = (codec) => subFormatDropped(codec) || imageSubDropped(codec);
+    // A subtitle removed regardless of language - by container/format (subFormatDropped), by remove_imagesubs (imageSubDropped), or by the mp4 styled-subtitle
+    // bundle export (styledSubExported), which maps the track out of the video. None is ever assigned language_fill, and none counts as a survivor for the
+    // language_fill_mode untagged tally or the remove_sub_sdh plain-track guard: a track this run deletes cannot be the plain track another track falls back on.
+    const subDroppedAnyReason = (codec) => subFormatDropped(codec) || imageSubDropped(codec) || styledSubExported(codec);
 
     // ===== SHARED [audio_clean, clean_and_remux]: title canonicalization =====
     // The canonical audio-title machinery both plugins share, so audio_clean's downmix titles come out already in clean_and_remux's tag_title form and a
@@ -1520,16 +1523,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // failFile (quarantine), and a non-video file the plugin only means to skip must never be routed to the error queue.
     if (file.fileMedium !== 'video') return skip('☑File is not a video\n');
 
-    // remove_sub_sdh safety guard. A "plain" subtitle carries no commentary/descriptive/SDH/lyrics role - a genuine dialogue subtitle. remove_sub_sdh removes
-    // an SDH/CC subtitle only when its language still has a plain subtitle that SURVIVES the language, format, and remove_imagesubs filters, so we strip
-    // extras, never the last usable track. resolveWorkLang shares canonicalLangMeta's fillApplies rule so the language this guard filters on and the tag that
-    // gets written can't drift. Audio has no equivalent here: audio_clean's downmix_secondary owns audio-description removal and carries its own
-    // plain-same-language fall-back rule. These are the definitions; plainSubLangs is FILLED after the muxability gate below, because the survives-the-format
-    // -filter test reads dstContainer and mkv_fallback can still rewrite it.
+    // remove_sub_sdh safety guard. A "plain" subtitle carries no commentary/descriptive/SDH/lyrics role - a genuine dialogue subtitle. On if_plain_survives an
+    // SDH/CC subtitle goes only when its language still has a plain subtitle that SURVIVES every whole-file drop reason (subDroppedAnyReason: the language,
+    // format, remove_imagesubs and styled-bundle-export filters), so extras go and the last usable track of that language stays; on `all` it goes regardless,
+    // and a file legitimately ending with no subtitles at all is an accepted outcome there. resolveWorkLang shares canonicalLangMeta's fillApplies rule so the
+    // language this guard filters on and the tag that gets written can't drift. Audio has no equivalent here: audio_clean's downmix_secondary owns
+    // audio-description removal and carries its own plain-same-language fall-back rule. These are the definitions; plainSubLangs is FILLED after the muxability
+    // gate below, because the survives-the-format-filter test reads dstContainer and mkv_fallback can still rewrite it. sdhRemoved is the single predicate every
+    // site consults (the pre-scan, the language_fill_mode tally and the stream loop), so the two tiers cannot be spelled differently in three places.
     const plainSubLangs = new Set();
     const isPlainTrack = (s) => !isCommentary(s) && !isDescriptive(s) && !isSdh(s) && !isLyrics(s);
     const hasPlainSameLang = (set, wl) => set.has(langKey(wl));
     const resolveWorkLang = (s) => { const sl = resolveLang(s); return fillApplies(sl, true) ? fillLanguage : (sl || 'und'); };
+    const sdhRemoved = (s, wl) => removeSubSdh !== 'disabled' && isSdh(s) && (removeSubSdh === 'all' || hasPlainSameLang(plainSubLangs, wl));
     // The two filters that discard a subtitle on its own merits rather than because of its codec or the container - language_sub and remove_sub_sdh - as a
     // predicate the remove_imagesubs=export sites can consult BEFORE writing anything. Mirrors the stream loop's own tests exactly, so the answer here and
     // the drop it takes there can never disagree. Only the export needs it: exporting is one-way, so a sidecar written for a track those filters were about
@@ -1537,7 +1543,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const subFilterDrops = (s) => {
         const wl = resolveWorkLang(s);
         if (subLanguage.length > 0 && !langListMatch(wl, subLangKeys)) return true;
-        return removeSubSdh === 'enabled' && isSdh(s) && hasPlainSameLang(plainSubLangs, wl);
+        return sdhRemoved(s, wl);
     };
 
     // One guard around all the per-file work (the input summary, the muxability / guard_audio_language / language_fill_mode pre-checks, the unmapped-node
@@ -1603,10 +1609,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         // Fill the remove_sub_sdh plain-track set (declared above). This runs HERE, after the muxability gate, because subDroppedAnyReason reads
-        // dstContainer through subFormatDropped and mkv_fallback rewrites dstContainer for this file - computed any earlier, a PGS/VobSub/DVB track would be
-        // counted as format-dropped under the abandoned mp4 target when the output is now mkv, where it survives. Still ahead of the language_fill_mode
-        // pre-check below, which subtracts the SDH tracks this guard will drop.
-        if (removeSubSdh === 'enabled') {
+        // dstContainer through subFormatDropped and styledSubExported, and mkv_fallback rewrites dstContainer for this file - computed any earlier, a
+        // PGS/VobSub/DVB track would be counted as format-dropped under the abandoned mp4 target when the output is now mkv, where it survives. Still ahead
+        // of the language_fill_mode pre-check below, which subtracts the SDH tracks this guard will drop. Only if_plain_survives consults the set; `all`
+        // removes unconditionally, so filling it there would be wasted work.
+        if (removeSubSdh === 'if_plain_survives') {
             for (const s of (file.ffProbeData?.streams || [])) {
                 if (codecTypeOf(s) !== 'subtitle' || !isPlainTrack(s)) continue;
                 if (subDroppedAnyReason((s.codec_name || '').toLowerCase())) continue;
@@ -1649,7 +1656,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const keptByLangFilter = (keys) => keys.length === 0 || langListMatch(fillLanguage, keys);
             // An untagged SDH subtitle the remove_sub_sdh guard would drop is excluded too -
             // mirrors the loop's own removal predicate (untagged tracks resolve to fillLanguage).
-            const removedBySdh = (s) => removeSubSdh === 'enabled' && isSdh(s) && hasPlainSameLang(plainSubLangs, fillLanguage);
+            const removedBySdh = (s) => sdhRemoved(s, fillLanguage);
             const untaggedAudio = streams.filter((s) => codecTypeOf(s) === 'audio' && isUntagged(s) && !unmuxableDrops.has(s.index)).length;
             if (untaggedAudio > 1)
                 failFile(`[language_fill_mode=${fillMode}] ${untaggedAudio} audio streams have no language tag`
@@ -1808,6 +1815,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const mediaTitle = (ffmedia?.Title ?? '').trim().toLowerCase();
                 return mediaTitle !== '' && mediaTitle === handler;
             };
+            // The same handler echo, but for a track that has a REAL title too: mediaInfo does not merely substitute the handler, it JOINS the two with " / "
+            // (verified on the bundled MediaInfoLib 23.07 - mkv gives "Main Feature / Movie.2020.1080p.x264-GRP", mp4 the same pair handler-first), so an
+            // exact-equality test sees nothing and a dot count over the join charges the handler's periods to the title. Drop the handler part and what is
+            // left is the track's own title (empty when the handler was all of it). Needed because ffprobe does not surface an mp4 track's udta/name box at
+            // all, so on mp4 the joined mediaInfo Title is the only place a per-track title appears. The handler itself is normalised by emitHandlerMeta.
+            const mediaTitleSansHandler = () => {
+                const handler = (getTagCI(ffstream.tags, 'handler_name') || '').trim();
+                const mediaTitle = (ffmedia?.Title ?? '').trim();
+                if (!handler || !mediaTitle) return mediaTitle;
+                return mediaTitle.split(' / ').filter((part) => part.trim() !== handler).join(' / ').trim();
+            };
             // Write a changed title, or reconcile ONLY when the ffprobe tag is missing but mediaInfo has a REAL one (mediaTitleIsHandler filters the handler
             // echo): the write adds the ffprobe tag so both probes agree next pass. The reverse (ffprobe has a title mediaInfo never reports) must NOT fire, or
             // a container that never surfaces Title to mediaInfo would remux every pass.
@@ -1909,9 +1927,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
 
                 if (!delStream) {
-                    // Decide removal BEFORE standardising the tag, so a subtitle dropped by language_sub / remove_sub_sdh never logs a language
-                    // correction it won't keep. workLang here equals canonicalLangMeta's own workLang (same fillApplies rule), so the keep/drop
-                    // decision is unchanged - the tag write is just skipped for a stream about to be mapped out.
+                    // Decide removal BEFORE standardising the tag, so a subtitle dropped by language_sub / remove_sub_sdh / the styled-bundle export never
+                    // logs a language correction it won't keep. workLang here equals canonicalLangMeta's own workLang (same fillApplies rule), so the
+                    // keep/drop decision is unchanged - the tag write is just skipped for a stream about to be mapped out.
                     workLang = resolveWorkLang(ffstream);
 
                     //language_sub: drop a subtitle whose (possibly filled) language is not on the keep list. A blank list keeps every language.
@@ -1919,15 +1937,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         // logSafe's 200-char cap matters here: the whole language_sub list is echoed once PER dropped subtitle.
                         workDone += `☐${streamTag(ffstream.index)}[language_sub=${logSafe(inputs.language_sub)}] Remove subtitle language (${workLang})\n`;
                         delStream = true;
-                    } else if (removeSubSdh === 'enabled' && isSdh(ffstream) && hasPlainSameLang(plainSubLangs, workLang)) {
+                    } else if (sdhRemoved(ffstream, workLang)) {
                         workDone += `☐${streamTag(ffstream.index)}[remove_sub_sdh=${removeSubSdh}] Remove accessibility subtitle SDH/CC`
                             + ` (${logSafe(roleTextLower(ffstream))})\n`;
                         delStream = true;
-                    }
-
-                    // Kept subtitle: fill a blank language and/or standardise the tag (tag_language) now that we know it survives.
-                    if (!delStream) {
-                        emitLangMeta('s', subtitleStreamIndex, 'subtitle', true);
                     }
                 }
 
@@ -1974,6 +1987,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     }
                     if (exported) { dropStream(ffstream.index); subtitleStreamIndex--; continue; }
                 }
+
+                // Kept subtitle: fill a blank language and/or standardise the tag (tag_language) now that it has survived BOTH the removal filters above and
+                // the styled-bundle export - the last thing on this branch that can still map the stream out. Written as a reorder rather than a
+                // styledSubExported guard on the call, because the export can legitimately be REFUSED (unmapped node with no route, or a library directory
+                // carrying a quote / control character); the track then survives as mov_text below and still wants its language tag.
+                emitLangMeta('s', subtitleStreamIndex, 'subtitle', true);
 
                 //Trim the surrounding whitespace and quotes (cleanStreamTitle); the busy-title clear follows tag_disposition below, not here.
                 let newStreamTitle = cleanStreamTitle(streamTitle);
@@ -2100,9 +2119,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 emitCommentRemoval('v', videoStreamIndex, 'video');
 
-                if(removeBusytitle === true && (tooManyPeriods(ffstream.tags?.title ?? '') || tooManyPeriods(ffmedia?.Title ?? ''))) {
-                    workDone += `☐${streamTag(ffstream.index)}[remove_busytitle=true] Remove title (video) "${logSafe((ffstream.tags?.title ?? '').trim())}"`
-                        + ` and "${logSafe((ffmedia?.Title ?? '').trim())}"\n`;
+                // Busy-title removal (video). Test ONE effective title the way the audio and subtitle branches do - ffprobe's tag wins, mediaInfo is the
+                // fallback - and take mediaInfo's with the handler echo removed, or a scene-release handler_name blanks a perfectly good title that was
+                // never busy (and the handler is separately normalised by emitHandlerMeta on this same command, so the wipe would buy nothing).
+                const videoTitle = (ffstream.tags?.title ?? '').trim() || mediaTitleSansHandler();
+                if(removeBusytitle === true && tooManyPeriods(videoTitle)) {
+                    workDone += `☐${streamTag(ffstream.index)}[remove_busytitle=true] Remove title (video) "${logSafe(videoTitle)}"\n`;
                     metadataCommand += ` -metadata:s:v:${videoStreamIndex} "title="`;
                 }
 

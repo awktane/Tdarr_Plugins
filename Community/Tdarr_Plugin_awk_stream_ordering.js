@@ -12,7 +12,7 @@ const details = () => ({
         encoder/provenance, or the fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote
         playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time
         it's needed).\n`,
-    Version: '4.18.0',
+    Version: '4.19.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -981,20 +981,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const durAudioCount = (obj) => (obj?.ffProbeData?.streams || []).filter(s => codecTypeOf(s) === 'audio').length;
         const durPos = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
         const DURATION_SIGNALS = [
+            // The join must require @type 'Video' as well as the StreamOrder match: MPEG-TS gives its video track the two-part StreamOrder "0-0"
+            // (Number() -> NaN, so it never matches) while its MENU track reports a bare "0", and without the type test the guard silently compares a
+            // menu/chapter track's duration instead of the video's.
             { name: 'the mediaInfo video-track duration',
                 read: (o) => { const v = durVideoStream(o); if (!v) return 0;
-                    return durPos(((o?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === v.index) || {}).Duration); } },
+                    return durPos(((o?.mediaInfo?.track || []).find(t => t['@type'] === 'Video' && Number(t.StreamOrder) === v.index) || {}).Duration); } },
             { name: 'the ffprobe video-stream duration', read: (o) => durPos(durVideoStream(o)?.duration) },
             { name: 'the container duration', read: (o) => durPos(o?.ffProbeData?.format?.duration), needsSameAudio: true },
         ];
-        // Tolerance is ±1%, fixed, with no input to relax it: a user hitting a false positive would have no recourse but removing the plugin, so the
-        // headroom is deliberately double the ±0.5% the long-standing community duration-check plugin defaults to. A dead encode is short by far more.
+        // Tolerance is 1% SHORT, fixed, with no input to relax it: a user hitting a false positive would have no recourse but removing the plugin, so the
+        // headroom is deliberately double the 0.5% the long-standing community duration-check plugin defaults to. A dead encode is short by far more.
+        // Deliberately one-sided. An output LONGER than its source cannot have been truncated or OOM-killed, and it is a state healthy files reach: both
+        // leading signals are PTS-derived, so an MPEG-TS/AVI capture with a timestamp discontinuity under-reports its own length, and clean_and_remux's
+        // recover_* remux (-fflags +genpts+ignidx) exists to repair exactly those - after which the file reports its TRUE, longer duration. This plugin runs
+        // last, so it is the stage that sees that pair. Failing it would quarantine a correctly repaired file and send the user hunting an OOM kill that
+        // never happened. An over-length alarm, if ever wanted, needs its own branch and its own wording - none of the text below is true of it.
         const DURATION_TOLERANCE_PCT = 1;
         const originalFile = otherArguments?.originalLibraryFile;
         if (originalFile?.ffProbeData) {
             const sameAudio = durAudioCount(originalFile) === durAudioCount(file);
             const newVideo = durVideoStream(file);
-            const durTag = newVideo ? streamTag(newVideo.index) : '';
+            // Carries its own trailing separator, so an audio-only file (or one whose only video stream is cover art - durVideoStream excludes those) does not
+            // leave a bare space sitting directly after the ☒ status symbol.
+            const durTag = newVideo ? `${streamTag(newVideo.index)} ` : '';
             let verdict = null;
             let oldAny = 0;
             let newAny = 0;
@@ -1008,18 +1018,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             if (verdict) {
                 const pct = (verdict.now / verdict.old) * 100;
-                if (Math.abs(pct - 100) > DURATION_TOLERANCE_PCT)
-                    failFile(`${durTag} output duration ${verdict.now.toFixed(1)} s is ${pct.toFixed(1)}% of the original ${verdict.old.toFixed(1)} s`
+                if (pct < 100 - DURATION_TOLERANCE_PCT)
+                    failFile(`${durTag}output duration ${verdict.now.toFixed(1)} s is ${pct.toFixed(1)}% of the original ${verdict.old.toFixed(1)} s`
                         + ` - the transcode did not run to completion`
-                        + `\n☒${durTag} the file has been failed rather than accepted; check this node's log for an out-of-memory kill`
-                        + `\n☒${durTag} (compared using ${verdict.name})`);
+                        + `\n☒${durTag}the file has been failed rather than accepted; check this node's log for an out-of-memory kill`
+                        + `\n☒${durTag}(compared using ${verdict.name})`);
             } else if (oldAny && !newAny) {
                 // A severely truncated or unfinalised output is precisely the file most likely to probe with no duration at all, so treating "no duration" as
                 // "nothing to compare" would silence the guard on exactly what it hunts. Reaching here means NO signal resolved on the new side while at least
                 // one did on the old, so it cannot fire merely because a container stores one signal and not another.
-                failFile(`${durTag} the output reports no duration at all while the original had ${oldAny.toFixed(1)} s - that is what a truncated or`
+                failFile(`${durTag}the output reports no duration at all while the original had ${oldAny.toFixed(1)} s - that is what a truncated or`
                     + ` unfinalised transcode looks like`
-                    + `\n☒${durTag} the file has been failed rather than accepted; check this node's log for an out-of-memory kill`);
+                    + `\n☒${durTag}the file has been failed rather than accepted; check this node's log for an out-of-memory kill`);
             }
         }
 

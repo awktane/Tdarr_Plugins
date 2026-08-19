@@ -12,7 +12,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.20.0',
+    Version: '4.21.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1699,13 +1699,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // the dedupe sort is measured-bitrate-first, so a survivor can carry a LOWER awkQuality than the removed track; a quality clause would wrongly block
         // those drops. The channel-count check protects the higher-channel duplicate under BOTH quality tiers ('enabled' and 'strict'), so 'strict' is
         // genuinely ⊇ 'enabled' (its documented "most protective" role) even on a channel-dropping dedup.
-        const dedupeGuardBlocks = (removed, survivor) => {
-            if (removed.awkTier !== 'surround') return false;   // a track already headed for stereo/delete is deduped freely (the dedup loop skips secondaries)
-            if (guardLossless === 'enabled' && removed.isTdarrLossless && !survivor.isTdarrLossless) return true;   // dropping the last lossless copy
+        // Returns the guard that blocked the drop as an `input=value` token (falsy '' when nothing blocks), so the call site can name the setting the user
+        // actually has to change instead of listing all three - one definition, so the clause and the message it produces cannot drift.
+        const dedupeGuardBlock = (removed, survivor) => {
+            if (removed.awkTier !== 'surround') return '';   // a track already headed for stereo/delete is deduped freely (the dedup loop skips secondaries)
+            // dropping the last lossless copy
+            if (guardLossless === 'enabled' && removed.isTdarrLossless && !survivor.isTdarrLossless) return `guard_lossless=${guardLossless}`;
             // dropping the last object-audio (Atmos/DTS:X) copy
-            if (guardObjectAudio === 'enabled' && removed.isTdarrObjectAudio && !survivor.isTdarrObjectAudio) return true;
-            if (guardQuality !== 'disabled' && removed.channels > survivor.channels) return true;     // survivor has fewer channels (enabled AND strict)
-            return false;
+            if (guardObjectAudio === 'enabled' && removed.isTdarrObjectAudio && !survivor.isTdarrObjectAudio) return `guard_object_audio=${guardObjectAudio}`;
+            // survivor has fewer channels (enabled AND strict)
+            if (guardQuality !== 'disabled' && removed.channels > survivor.channels) return `guard_quality=${guardQuality}`;
+            return '';
         };
 
         // Identify lower-quality duplicates among MAIN tracks only. Within each group keep only the highest quality stream; the rest are marked for removal
@@ -1725,7 +1729,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //       infinite create/remove loop between the two options.
         // Note: dedup runs across ALL audio streams regardless of the language settings (those govern each track's tier, not what's a
         // genuine duplicate - a duplicate in a non-preferred language is still a duplicate).
-        // guard_lossless/guard_quality/guard_object_audio (dedupeGuardBlocks) keep a duplicate whose removal would lose detail the survivor
+        // guard_lossless/guard_quality/guard_object_audio (dedupeGuardBlock) keep a duplicate whose removal would lose detail the survivor
         // can't hold (a last lossless copy, or a higher-channel track under quality) instead of removing it, and never -errors on it.
         const methodDeduplicateErrorMode = methodDeduplicate === 'multi-stereo-error' || methodDeduplicate === 'channel-error';
         const methodDeduplicateGroupBy = methodDeduplicateErrorMode ? methodDeduplicate.replace(/-error$/, '') : methodDeduplicate;
@@ -1773,7 +1777,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 // A track no probe can measure a channel count for is left out of the grouping entirely, the same rule codec_force and method_loudnorm
                 // already apply: an unmeasurable count is never guessed. It matters more here than there, because every comparison against it silently
-                // reads false - the tier test would file a surround track under 'stereo' and dedupeGuardBlocks' channel clause could not intervene, so a
+                // reads false - the tier test would file a surround track under 'stereo' and dedupeGuardBlock's channel clause could not intervene, so a
                 // real 2.0 track (or the surround master itself) would be deleted as its duplicate. `continue` rather than a seen entry, so it can be
                 // neither removed nor the survivor that removes something else.
                 const ch = resolveChannels(s);
@@ -1797,16 +1801,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const key = `${s.awkRegionKey}|${tier}`;
                 if (seen.has(key)) {
                     const kept = seen.get(key);
-                    if (dedupeGuardBlocks(s, kept)) continue;
                     // Show the removed track's bitrate and the kept track's for contrast - duplicates are decided by quality score (largely bitrate-driven),
-                    // so this makes the choice transparent. The abort message below and the ordinary removal log are two renderings of the same comparison,
-                    // so they share these tokens; only one of the two ever executes per hit. The codec renders through codecDisplayName, so a DTS subtype or
+                    // so this makes the choice transparent. The guard-block, abort and ordinary removal messages are three renderings of the same comparison,
+                    // so they share these tokens; only one of the three ever executes per hit. The codec renders through codecDisplayName, so a DTS subtype or
                     // an Atmos layer reads here exactly as it does in the input summary; dd-ex is appended separately because a matrixed rear channel is not a
                     // codec, so without it the EX tiebreak below prints two identical ac3 tokens. It reads the same per-stream flag the sort order does.
                     const rmRate = hasKnownRate(s) ? ` @ ${kbpsToken(s.bit_rate)}` : '';
                     const keptRate = hasKnownRate(kept) ? ` @ ${kbpsToken(kept.bit_rate)}` : '';
                     const rmEx = s.isTdarrMatrixSurround ? ' dd-ex' : '';
                     const keptEx = kept.isTdarrMatrixSurround ? ' dd-ex' : '';
+                    // A guard-blocked duplicate SURVIVES (documented in the method_deduplicate tooltip) - but say so, or a user with two obvious duplicates
+                    // watches dedup do nothing and cannot tell an exemption from a bug. Same reasoning as the und and no-channel-count exemptions above, and
+                    // it also has to precede the -error abort: a duplicate a guard is protecting is not a duplicate the user is being asked to resolve.
+                    const guardBlock = dedupeGuardBlock(s, kept);
+                    if (guardBlock) {
+                        skipDone += `☒${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}][${guardBlock}] Keeping duplicate `
+                            + `${codecDisplayName(s)}${rmEx} ${s.channels}ch ${s.awkRegionKey}${rmRate} - removing it would lose detail stream `
+                            + `${kept.index} (${codecDisplayName(kept)}${keptEx} ${kept.channels}ch${keptRate}) can't hold\n`;
+                        continue;
+                    }
                     if (methodDeduplicateErrorMode) {
                         failFile(`${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Duplicate audio track (${codecDisplayName(s)}${rmEx} `
                             + `${s.channels}ch ${s.awkRegionKey}${rmRate}) alongside stream ${kept.index} (${codecDisplayName(kept)}${keptEx}${keptRate})`
@@ -1814,7 +1827,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     }
                     removedIndices.add(s.index);
                     // Name the sort key that actually decided this, walking the same order byQuality does. Quality is only the SECOND key, so a removed
-                    // track can outscore its survivor (see dedupeGuardBlocks' note) - and a removal decided on channels or a tiebreak explains nothing at
+                    // track can outscore its survivor (see dedupeGuardBlock's note) - and a removal decided on channels or a tiebreak explains nothing at
                     // all unless the survivor's channel count is rendered beside its bitrate.
                     let why;
                     if (!trustedRate(s) && trustedRate(kept)) why = 'no measured bitrate';
@@ -1860,7 +1873,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //   downmix_secondary=delete removes an EXTRA, so it keeps the fall-back rule: only remove it when a plain (non-secondary) track of the SAME language
         //     survives to fall back on - a lone audio-description track, or the only track of its language, is kept.
         // Both are floored by countSurvivingAudio() > 1: no delete may ever leave the file with no audio at all.
-        const delToken = (s) => `${codecDisplayName(s)} ${s.channels}ch ${s.awkLangKey}`;
+        // The channel clause is dropped when no probe could measure a count, the same truthiness test summariseStream applies to its own `Nch` token -
+        // enrichStream's `resolveChannels(s) || s.channels` falls back to the RAW ffprobe field, which is `undefined` for exactly those streams, so an
+        // unguarded interpolation renders "undefinedch" in a user-facing status line. The other consumers of the count skip such a stream outright; these
+        // two delete paths do not need it to decide, only to print it.
+        const delToken = (s) => `${codecDisplayName(s)}${s.channels > 0 ? ` ${s.channels}ch` : ''} ${s.awkLangKey}`;
         // Language deletes resolve FIRST, so the plain-language fall-back set the role deletes read below reflects what actually survives them.
         for (const s of audioStreams) {
             if (s.awkTier !== 'delete' || s.isTdarrSecondaryTrack || removedIndices.has(s.index)) continue;
@@ -2683,13 +2700,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // lossless relabel to an opus-safe layout, chained ahead of loudnorm
                             loudnormRelabel = `channelmap=map=${relabel.map}:channel_layout=${relabel.layout}`;
                         } else if (methodLayoutErr === 'remix' && !remixDefer) {
+                            // MEASURE FIRST, then decide. The gain correction is the only mandate this loop has - with method_loudnorm=disabled it never runs
+                            // at all and the track keeps its source codec and channels - so a track already within LOUDNORM_TOLERANCE_LU (or one the analysis
+                            // cap left unmeasured) must not be flattened from surround to stereo for nothing. Every other exit of this loop already bails on
+                            // !changed; this is the one that used to commit before looking. Contrast the codec_force remix, which is correct to fire
+                            // unconditionally: there the codec change IS the requested operation and loudnorm merely rides along.
+                            const two = stereoArg(outputAudioIdx, stream);
+                            if (!two.changed) {
+                                if (loudnormTagPersists && two.measured) {
+                                    workDone += `☐${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Stamping awk_loudnorm=${methodLoudnorm} `
+                                        + `(already within tolerance) - future runs skip re-measuring while loudnorm stays "${methodLoudnorm}"\n`;
+                                    extraArguments += loudnormStampArg(outputAudioIdx);
+                                    convert = true;
+                                }
+                                continue;
+                            }
                             const newTitle = escMeta(buildTitle(stream, '2.0'));
                             const writeLang = langForWrite(stream);
                             const enc = stereoEnc(outputAudioIdx);
                             workDone += `☐${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${rawCodec} ${channels}ch → `
                                 + `${enc.logCodec} stereo @ ${enc.rate} (${enc.label ? `${enc.label}; ` : ''}remixed - libopus can't encode a `
                                 + `${lay || `${channels}ch`} layout)\n`;
-                            const two = stereoArg(outputAudioIdx, stream);
                             extraArguments += ` -c:a:${outputAudioIdx} ${enc.frag}${two.arg}`
                                 + `${loudnormRideStamp(outputAudioIdx, two.measured)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
                             extraArguments += langMetaArg(outputAudioIdx, writeLang);
