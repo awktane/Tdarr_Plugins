@@ -12,7 +12,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.22.0',
+    Version: '4.23.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -489,7 +489,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // matchesKeyword. Read by summariseStream, stream_ordering's sort keys, audio_clean's secondary-track detection, and clean_and_remux's title/flag tagging.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                                            tag: 'Commentary'  },
-        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','descriptions','dvs','audio description','visually impaired','visual impaired'], tag: 'Descriptive' },
+        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','descriptions','dvs','audio description','described video','visually impaired','visual impaired'], tag: 'Descriptive' },
         descriptions:     { streams:['subtitle'],                 keywords: ['descriptive','descriptions','dvs'],                      tag: 'Descriptive' },
         hearing_impaired: { streams:['subtitle'],                 keywords: ['sdh','hearing impaired','hard of hearing','hoh','deaf'], tag: 'SDH'         },
         captions:         { streams:['subtitle'],                 keywords: ['caption','captions','cc'],                               tag: 'SDH'         },
@@ -739,6 +739,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Older codecs
         mp3:         { score: 78,  transparent: 320000 },
         mp2:         { score: 73,  transparent: 256000 },
+        mp1:         { score: 68,  transparent: 384000 },  // MPEG-1 Layer I (old MPEG-1/VCD, DVB captures) - needs more bitrate than mp2/mp3 to match them
         adpcm:       { score: 60,  transparent: 256000 },
         cook:        { score: 58,  transparent: 128000 },
 
@@ -749,8 +750,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         speex:       { score: 42,  transparent:  44000 },  // VoIP / old web audio
         amr_wb:      { score: 42,  transparent:  23850 },  // AMR wideband (G.722.2), top mode
         sipr:        { score: 38,  transparent:  32000 },  // RealAudio SIPR / ACELP.NET
+        ra_288:      { score: 36,  transparent:  15200 },  // RealAudio 2.0 (28.8) - the codec a real .rm/.rmvb rip carries; ralf/cook/sipr are its siblings
         gsm:         { score: 35,  transparent:  13200 },  // GSM 06.10 full-rate (folds gsm_ms)
         amr_nb:      { score: 32,  transparent:  12200 },  // AMR narrowband, top mode - every .3gp phone recording
+        ra_144:      { score: 30,  transparent:   8000 },  // RealAudio 1.0 (14.4) - fixed 8 kbps, the oldest of the family
         truespeech:  { score: 30,  transparent:   9600 },  // DSP Group TrueSpeech, very old
     };
     // -=-=-= unknownCodecs  [audio_clean, stream_ordering] =-=-=-
@@ -894,10 +897,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // bitrate in MP4) fall back to mediaInfo. Every summary and scoring call site uses this so logged tokens and the scoring path enrich identically.
     const enrichStream = (s) => ({ ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate, channels: resolveChannels(s) || s.channels });
     // -=-=-= is10Bit  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // True when a video stream is 10-bit (or deeper): raw sample depth or mediaInfo BitDepth >= 10, a 10-bit pixel format (p10le/p10be), or a 10-bit
-    // profile (Main 10 / High 10). Single source for summariseStream's 10bit token and video_clean's re-encode depth decision so the two can't drift.
+    // True when a video stream is 10-bit (or deeper): raw sample depth or mediaInfo BitDepth >= 10, a 10-to-16-bit pixel format (p10le through p16be), or a
+    // 10-bit profile (Main 10 / High 10). The pixel-format leg spans the whole range because it is the LAST resort - it only decides the answer when
+    // neither probe reports a depth, and a 12/14/16-bit master read as 8-bit is the costliest way to be wrong. The profile leg stays 10-only on purpose:
+    // the deeper HEVC/AVC profile names carry no depth digit ('Rext', 'High 4:4:4 Predictive'), and matching them would call an 8-bit 4:4:4 file 10-bit.
+    // Single source for summariseStream's 10bit token and video_clean's re-encode depth decision so the two can't drift.
     const is10Bit = (s, mi = mediaInfoFor(s)) => Number(s.bits_per_raw_sample || mi?.BitDepth || 0) >= 10
-        || /p10(le|be)?$|10le|10be/.test((s.pix_fmt || '').toLowerCase()) || /10/.test((s.profile || '').toLowerCase());
+        || /p(1[0-6])(le|be)?$|1[0-6]le|1[0-6]be/.test((s.pix_fmt || '').toLowerCase()) || /10/.test((s.profile || '').toLowerCase());
     // -=-=-= FONT_EXTS + isFontMime  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Embedded-font file extensions + a font-mimetype test. Read by summariseStream's [attach:...] token and isFontAttachment (clean_and_remux/sub_worker).
     const FONT_EXTS = ['ttf', 'otf', 'ttc', 'otc', 'pfb', 'pfa', 'woff', 'woff2', 'eot'];
@@ -1100,8 +1106,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : [])
             .some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
-    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
-    // -=-=-= mp4StrictArg  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
+    // -=-=-= mp4StrictArg  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // The ' -strict <level>' an mp4/mov -c copy needs, or '' when it needs none. Two independent reasons share one flag, because `experimental` is a strict
     // SUPERSET of `unofficial` and does both jobs:
     //   experimental - a TrueHD stream copied INTO mp4, which the muxer otherwise refuses outright ("truehd in MP4 support is experimental, add '-strict -2'",
@@ -1112,7 +1118,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //                  mask it (not just the first video stream); HEVC-DV, AVC-DV and AV1-DV all qualify.
     // Pass the RAW file.ffProbeData.streams as `streams`: codec_tag_string / side_data_list (the DV signals) live only there. `copied` is the subset of them
     // this run emits as a -c copy and defaults to all of them - a caller that drops or re-encodes tracks passes its own survivor list, so a TrueHD track on
-    // its way out never pulls in a flag the output does not need. clean_and_remux does the equivalent inline (MP4_STRICT_GATED + its per-stream DV emit).
+    // its way out never pulls in a flag the output does not need. clean_and_remux passes the set surviving its muxability gate, where a TrueHD arriving from
+    // a NON-mp4 source is refused, dropped or the reason the target falls back to mkv - so the only TrueHD that can reach this test there is one mp4 already
+    // held (see clean_and_remux's MP4_STRICT_GATED). Never decide this by regex over the half-built argument string: that string carries container-supplied
+    // -metadata title values verbatim, so a track titled " -strict foo" reads as a flag already emitted and the mp4 remux silently drops a DV file's boxes.
     const mp4StrictArg = (container, streams, copied) => {
         if (!isMp4Family(container)) return '';
         const list = Array.isArray(streams) ? streams : [];

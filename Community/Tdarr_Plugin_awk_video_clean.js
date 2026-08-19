@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.25.0',
+    Version: '3.26.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -268,8 +268,8 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['true', 'false'],
             },
-            tooltip: `Protect a LOSSLESS or mastering-grade video source from being re-encoded: ProRes, DNxHD, FFV1, HuffYUV, FFVHuff, MagicYUV, UtVideo,
-                    CineForm, v210 and raw video.
+            tooltip: `Protect a LOSSLESS or mastering-grade video source from being re-encoded: ProRes, DNxHD, CineForm, FFV1, HuffYUV, FFVHuff, MagicYUV,
+                    UtVideo, Lagarith, SheerVideo, QuickTime/Microsoft RLE, and uncompressed video (raw, v210/v410/v408/v308, y41p, r210/r10k).
                 \\n=====
                 \\nActions
                 \\n=====
@@ -361,7 +361,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // matchesKeyword. Read by summariseStream, stream_ordering's sort keys, audio_clean's secondary-track detection, and clean_and_remux's title/flag tagging.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                                            tag: 'Commentary'  },
-        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','descriptions','dvs','audio description','visually impaired','visual impaired'], tag: 'Descriptive' },
+        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','descriptions','dvs','audio description','described video','visually impaired','visual impaired'], tag: 'Descriptive' },
         descriptions:     { streams:['subtitle'],                 keywords: ['descriptive','descriptions','dvs'],                      tag: 'Descriptive' },
         hearing_impaired: { streams:['subtitle'],                 keywords: ['sdh','hearing impaired','hard of hearing','hoh','deaf'], tag: 'SDH'         },
         captions:         { streams:['subtitle'],                 keywords: ['caption','captions','cc'],                               tag: 'SDH'         },
@@ -531,6 +531,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // video-only hvc1 gate is deliberately mp4/m4v/mov WITHOUT m4a and stays separate).
     const isMp4Family = (container) => ['mp4', 'm4v', 'mov', 'm4a'].includes(String(container || '').toLowerCase());
     // ===== END SHARED: mp4-family container =====
+    // Can a container carry a GLOBAL awk_* marker back out of a mux? Matroska and its siblings store an arbitrary tag natively; the mp4 family keeps one only
+    // because every mux here adds -movflags use_metadata_tags. Everything else drops it silently, and that is not always fixable: measured on the production
+    // build, .3gp/.3g2 discard a custom global tag WITH the flag as well as without, so no marker can exist in one at all. Membership is the fail-safe
+    // direction - an unlisted container is assumed marker-hostile, which costs a declined size pass rather than an encode that can never converge. This
+    // plugin keeps the source container, so the answer is the SOURCE's; clean_and_remux always writes mkv or mp4, which is the way out of a hostile one.
+    const markerPersists = (container) => ['mkv', 'mka', 'mks', 'webm'].includes(String(container || '').toLowerCase()) || isMp4Family(container);
     // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: case-insensitive tag lookup =====
     // -=-=-= getTagCI  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
     // Look up a tag value case-insensitively - matroska UPPER-CASES tag keys on write, so a plugin reading its
@@ -603,10 +609,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // bitrate in MP4) fall back to mediaInfo. Every summary and scoring call site uses this so logged tokens and the scoring path enrich identically.
     const enrichStream = (s) => ({ ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate, channels: resolveChannels(s) || s.channels });
     // -=-=-= is10Bit  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // True when a video stream is 10-bit (or deeper): raw sample depth or mediaInfo BitDepth >= 10, a 10-bit pixel format (p10le/p10be), or a 10-bit
-    // profile (Main 10 / High 10). Single source for summariseStream's 10bit token and video_clean's re-encode depth decision so the two can't drift.
+    // True when a video stream is 10-bit (or deeper): raw sample depth or mediaInfo BitDepth >= 10, a 10-to-16-bit pixel format (p10le through p16be), or a
+    // 10-bit profile (Main 10 / High 10). The pixel-format leg spans the whole range because it is the LAST resort - it only decides the answer when
+    // neither probe reports a depth, and a 12/14/16-bit master read as 8-bit is the costliest way to be wrong. The profile leg stays 10-only on purpose:
+    // the deeper HEVC/AVC profile names carry no depth digit ('Rext', 'High 4:4:4 Predictive'), and matching them would call an 8-bit 4:4:4 file 10-bit.
+    // Single source for summariseStream's 10bit token and video_clean's re-encode depth decision so the two can't drift.
     const is10Bit = (s, mi = mediaInfoFor(s)) => Number(s.bits_per_raw_sample || mi?.BitDepth || 0) >= 10
-        || /p10(le|be)?$|10le|10be/.test((s.pix_fmt || '').toLowerCase()) || /10/.test((s.profile || '').toLowerCase());
+        || /p(1[0-6])(le|be)?$|1[0-6]le|1[0-6]be/.test((s.pix_fmt || '').toLowerCase()) || /10/.test((s.profile || '').toLowerCase());
     // -=-=-= FONT_EXTS + isFontMime  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Embedded-font file extensions + a font-mimetype test. Read by summariseStream's [attach:...] token and isFontAttachment (clean_and_remux/sub_worker).
     const FONT_EXTS = ['ttf', 'otf', 'ttc', 'otc', 'pfb', 'pfa', 'woff', 'woff2', 'eot'];
@@ -793,8 +802,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : [])
             .some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
-    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
-    // -=-=-= mp4StrictArg  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
+    // -=-=-= mp4StrictArg  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // The ' -strict <level>' an mp4/mov -c copy needs, or '' when it needs none. Two independent reasons share one flag, because `experimental` is a strict
     // SUPERSET of `unofficial` and does both jobs:
     //   experimental - a TrueHD stream copied INTO mp4, which the muxer otherwise refuses outright ("truehd in MP4 support is experimental, add '-strict -2'",
@@ -805,7 +814,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //                  mask it (not just the first video stream); HEVC-DV, AVC-DV and AV1-DV all qualify.
     // Pass the RAW file.ffProbeData.streams as `streams`: codec_tag_string / side_data_list (the DV signals) live only there. `copied` is the subset of them
     // this run emits as a -c copy and defaults to all of them - a caller that drops or re-encodes tracks passes its own survivor list, so a TrueHD track on
-    // its way out never pulls in a flag the output does not need. clean_and_remux does the equivalent inline (MP4_STRICT_GATED + its per-stream DV emit).
+    // its way out never pulls in a flag the output does not need. clean_and_remux passes the set surviving its muxability gate, where a TrueHD arriving from
+    // a NON-mp4 source is refused, dropped or the reason the target falls back to mkv - so the only TrueHD that can reach this test there is one mp4 already
+    // held (see clean_and_remux's MP4_STRICT_GATED). Never decide this by regex over the half-built argument string: that string carries container-supplied
+    // -metadata title values verbatim, so a track titled " -strict foo" reads as a flag already emitted and the mp4 remux silently drops a DV file's boxes.
     const mp4StrictArg = (container, streams, copied) => {
         if (!isMp4Family(container)) return '';
         const list = Array.isArray(streams) ? streams : [];
@@ -852,8 +864,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const ENCODABLE = Object.keys(ENCODER_NAME);
     // Lossless / mastering-grade video codecs, read only by guard_lossless. Deliberately NOT a shared block: no other plugin re-encodes video, so nothing else
     // has a use for it. Raw ffprobe codec_name spellings. The membership test is what makes the guard fail-safe - an unrecognised codec is not protected,
-    // never wrongly skipped. (Lossless MODES of lossy codecs - x264 -qp 0, for one - are out of scope: neither probe reports them.)
-    const LOSSLESS_VIDEO_CODECS = ['ffv1', 'huffyuv', 'ffvhuff', 'hymt', 'magicyuv', 'utvideo', 'v210', 'v210x', 'rawvideo', 'prores', 'dnxhd', 'cfhd'];
+    // never wrongly skipped. (Lossless MODES of lossy codecs - x264 -qp 0, for one - are out of scope: neither probe reports them.) Grouped by what a source
+    // actually is: compressed lossless intermediates, then the RLE/screen-capture family, then the uncompressed packed layouts that arrive under their own
+    // codec_name rather than as 'rawvideo'. Every name here is a decoder on the production build, so none is dead membership.
+    const LOSSLESS_VIDEO_CODECS = ['ffv1', 'huffyuv', 'ffvhuff', 'hymt', 'magicyuv', 'utvideo', 'lagarith', 'sheervideo', 'prores', 'dnxhd', 'cfhd',
+        'qtrle', 'msrle', 'rawvideo', 'v210', 'v210x', 'v410', 'v408', 'v308', 'y41p', 'r210', 'r10k'];
 
     // Query the ffmpeg build's encoder list + hardware presence for this node: encoders from `-encoders`, NVIDIA from nvidia-smi,
     // VAAPI/QSV from a /dev/dri check. Tdarr reloads each classic plugin fresh per file and selectEncoder calls this once, so it runs once per file.
@@ -1914,6 +1929,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const vkbps = Math.round((resolveStreamBitrate(primary) || 0) / 1000);
             if (vkbps > 0 && vkbps < guardShrinkKbps) { codecTrigger = false; belowFloorKbps = vkbps; }
         }
+        // A same-codec size pass has ONE stop - the awk_video fence below - and a container that cannot store the tag has nowhere to keep it: the next pass
+        // recomputes the identical fingerprint, finds nothing, and re-emits a byte-identical preset, which Tdarr refuses as an infinite transcode loop and
+        // ERRORS the file (across separate library scans, where that guard does not apply, it is generational re-encoding instead). Drop the codec trigger
+        // rather than the file: a height_cap, tonemap or deinterlace pass converges on its own evidence and still runs. normalize needs no fence at all - it
+        // fires only on a codec mismatch, which the encode itself removes.
+        let fenceUnstorable = false;
+        if (action === 'shrink' && codecTrigger && !markerPersists(dstContainer)) {
+            codecTrigger = false;
+            fenceUnstorable = true;
+            response.infoLog += `☒${streamTag(primary.index)}[action=shrink][container=${dstContainer}] A size pass records what it did in an awk_video tag`
+                + ` and ${dstContainer} cannot store one, so every later pass would re-encode this file again - declining the shrink;`
+                + ' remux to mkv or mp4 first (clean_and_remux does that) to enable it\n';
+        }
         // Three of the four triggers are pure stream metadata; the fourth is the idet DECODE. Split so the cheap ones are tried first and the decode is
         // reached only when interlace repair would be the sole reason to encode - the case where the verdict really is load-bearing. Every consumer below
         // therefore calls realTranscode() with its own cheap metadata test to the LEFT of it, so a file that guard_lossless / the DV and HDR refusals / the
@@ -2195,6 +2223,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} in ${srcCodecName || 'this codec'} has no lossless strip path`
                     + ` (needs HEVC or AV1) - left untouched\n`);
         }
+        // The declined size pass already logged WHY above; say only that nothing else was left, so the run does not end on the "already at the target"
+        // line, which would contradict it.
+        if (fenceUnstorable)
+            return skip(`☑${streamTag(primary.index)}[action=shrink] Nothing else to do for this file\n`);
         if (belowFloorKbps > 0) {
             return skip(`☑${streamTag(primary.index)}[guard_shrink_bitrate=${guardShrinkKbps}] Source video bitrate ${belowFloorKbps}k is below the `
                 + `${guardShrinkKbps}k floor - already efficient, left untouched\n`);

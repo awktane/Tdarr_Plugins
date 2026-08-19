@@ -27,7 +27,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.21.0',
+    Version: '4.22.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -334,7 +334,7 @@ const details = () => ({
                 \\naggressive: also -fflags +igndts, which ignores the source DTS and rebuilds the timeline outright - this is what fixes "Non-monotonous
                 DTS". It can produce odd results, so only reach for it if light did not help.
                 \\nRe-runs only on a recover_bad_* change, as for recover_bad_data. Container-forced timestamp fixes apply regardless, for the whole
-                MPEG-TS family (ts/m2ts/mts/m2t), the whole MPEG-PS family (mpg/mpeg/vob/evo), and avi.`,
+                MPEG-TS family (ts/m2ts/mts/m2t/tp/trp/tod), the whole MPEG-PS family (mpg/mpeg/vob/evo/m2p/vro/mod), and avi.`,
         },
     ],
 });
@@ -402,7 +402,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // matchesKeyword. Read by summariseStream, stream_ordering's sort keys, audio_clean's secondary-track detection, and clean_and_remux's title/flag tagging.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                                            tag: 'Commentary'  },
-        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','descriptions','dvs','audio description','visually impaired','visual impaired'], tag: 'Descriptive' },
+        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','descriptions','dvs','audio description','described video','visually impaired','visual impaired'], tag: 'Descriptive' },
         descriptions:     { streams:['subtitle'],                 keywords: ['descriptive','descriptions','dvs'],                      tag: 'Descriptive' },
         hearing_impaired: { streams:['subtitle'],                 keywords: ['sdh','hearing impaired','hard of hearing','hoh','deaf'], tag: 'SDH'         },
         captions:         { streams:['subtitle'],                 keywords: ['caption','captions','cc'],                               tag: 'SDH'         },
@@ -644,10 +644,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // bitrate in MP4) fall back to mediaInfo. Every summary and scoring call site uses this so logged tokens and the scoring path enrich identically.
     const enrichStream = (s) => ({ ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate, channels: resolveChannels(s) || s.channels });
     // -=-=-= is10Bit  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // True when a video stream is 10-bit (or deeper): raw sample depth or mediaInfo BitDepth >= 10, a 10-bit pixel format (p10le/p10be), or a 10-bit
-    // profile (Main 10 / High 10). Single source for summariseStream's 10bit token and video_clean's re-encode depth decision so the two can't drift.
+    // True when a video stream is 10-bit (or deeper): raw sample depth or mediaInfo BitDepth >= 10, a 10-to-16-bit pixel format (p10le through p16be), or a
+    // 10-bit profile (Main 10 / High 10). The pixel-format leg spans the whole range because it is the LAST resort - it only decides the answer when
+    // neither probe reports a depth, and a 12/14/16-bit master read as 8-bit is the costliest way to be wrong. The profile leg stays 10-only on purpose:
+    // the deeper HEVC/AVC profile names carry no depth digit ('Rext', 'High 4:4:4 Predictive'), and matching them would call an 8-bit 4:4:4 file 10-bit.
+    // Single source for summariseStream's 10bit token and video_clean's re-encode depth decision so the two can't drift.
     const is10Bit = (s, mi = mediaInfoFor(s)) => Number(s.bits_per_raw_sample || mi?.BitDepth || 0) >= 10
-        || /p10(le|be)?$|10le|10be/.test((s.pix_fmt || '').toLowerCase()) || /10/.test((s.profile || '').toLowerCase());
+        || /p(1[0-6])(le|be)?$|1[0-6]le|1[0-6]be/.test((s.pix_fmt || '').toLowerCase()) || /10/.test((s.profile || '').toLowerCase());
     // -=-=-= FONT_EXTS + isFontMime  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Embedded-font file extensions + a font-mimetype test. Read by summariseStream's [attach:...] token and isFontAttachment (clean_and_remux/sub_worker).
     const FONT_EXTS = ['ttf', 'otf', 'ttc', 'otc', 'pfb', 'pfa', 'woff', 'woff2', 'eot'];
@@ -836,6 +839,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : [])
             .some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
+    // -=-=-= mp4StrictArg  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The ' -strict <level>' an mp4/mov -c copy needs, or '' when it needs none. Two independent reasons share one flag, because `experimental` is a strict
+    // SUPERSET of `unofficial` and does both jobs:
+    //   experimental - a TrueHD stream copied INTO mp4, which the muxer otherwise refuses outright ("truehd in MP4 support is experimental, add '-strict -2'",
+    //                  rc 88); `unofficial` does NOT satisfy it. Matched on the raw codec_name, not resolveCodecName, whose refined truehdatmos would not equal
+    //                  'truehd'. mkv needs nothing, which is why the container test leads.
+    //   unofficial   - a Dolby Vision video stream, so the mov muxer keeps its dvcC/dvvC boxes; a plain copy drops them, demoting DV to plain HEVC/AV1
+    //                  (verified on real HEVC + AV1 DV samples). Found via isDolbyVisionVideo with cover art excluded, so a leading cover-art stream cannot
+    //                  mask it (not just the first video stream); HEVC-DV, AVC-DV and AV1-DV all qualify.
+    // Pass the RAW file.ffProbeData.streams as `streams`: codec_tag_string / side_data_list (the DV signals) live only there. `copied` is the subset of them
+    // this run emits as a -c copy and defaults to all of them - a caller that drops or re-encodes tracks passes its own survivor list, so a TrueHD track on
+    // its way out never pulls in a flag the output does not need. clean_and_remux passes the set surviving its muxability gate, where a TrueHD arriving from
+    // a NON-mp4 source is refused, dropped or the reason the target falls back to mkv - so the only TrueHD that can reach this test there is one mp4 already
+    // held (see clean_and_remux's MP4_STRICT_GATED). Never decide this by regex over the half-built argument string: that string carries container-supplied
+    // -metadata title values verbatim, so a track titled " -strict foo" reads as a flag already emitted and the mp4 remux silently drops a DV file's boxes.
+    const mp4StrictArg = (container, streams, copied) => {
+        if (!isMp4Family(container)) return '';
+        const list = Array.isArray(streams) ? streams : [];
+        const kept = Array.isArray(copied) ? copied : list;
+        if (kept.some((s) => codecTypeOf(s) === 'audio' && (s?.codec_name || '').toLowerCase().trim() === 'truehd')) return ' -strict experimental';
+        return list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s))) ? ' -strict unofficial' : '';
+    };
+    // ===== END SHARED: mp4 strict compliance arg =====
 
     // ===== SHARED [audio_clean, clean_and_remux]: language list match =====
     // -=-=-= langListMatch  [audio_clean, clean_and_remux] =-=-=-
@@ -1596,20 +1623,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // dstContainer, since mkv_fallback rewrites it. Audio and video only: the three subtitle tables above already handle subtitles, by conversion
             // where one exists and by dropping where none does, and that behaviour is not this input's to override.
         const unmuxableDrops = new Set();
-        let mp4StrictNeeded = false;
         {
             const offenders = (file.ffProbeData.streams || [])
                 .filter((s) => ['audio', 'video'].includes(codecTypeOf(s)))
                 .map((s) => ({ s, codec: (s.codec_name || '').toLowerCase().trim() }))
                 .map((o) => ({ ...o, cls: unmuxableClass(o.codec) }))
                 .filter((o) => o.cls);
-            const offenderIndices = new Set(offenders.map((o) => o.s.index));
-            // The mp4-family TrueHD that the gate deliberately does NOT treat as an offender still needs its flag, or the very remux we just allowed fails.
-            // Read against the OFFENDER list rather than the raw streams, so the flag can only ever describe a gated stream this run KEEPS: a gated stream
-            // that IS an offender is either mapped out by method_unmuxable=drop below, or the reason mkv_fallback rewrites the target and clears the flag -
-            // and a -strict left on a command whose gated stream is gone contradicts the refusal rationale at MP4_STRICT_GATED.
-            mp4StrictNeeded = dstContainer === 'mp4' && (file.ffProbeData.streams || [])
-                .some((s) => MP4_STRICT_GATED.includes((s.codec_name || '').toLowerCase().trim()) && !offenderIndices.has(s.index));
             if (offenders.length) {
                 const names = [...new Set(offenders.map((o) => o.codec))].join(', ');
                 // A codec the fallback container cannot store either has nowhere to go, so mkv_fallback degrades to error and says why - silently doing
@@ -1638,10 +1657,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     response.infoLog += `☒${streamTag(offenders[0].s.index)}[method_unmuxable=mkv_fallback] ${names} cannot be stored in ${abandoned}`
                         + ' - keeping this file in mkv instead'
                         + `${srcContainer === 'mkv' ? ' (it is already mkv, so no remux is needed for the container)' : ''}\n`;
-                    mp4StrictNeeded = false;   // the target is mkv now, and mkv needs no -strict for TrueHD
                 }
             }
         }
+
+        // The ' -strict <level>' this remux needs, or '' (see mp4StrictArg). Computed HERE, right after the muxability gate, because it reads the FINAL target
+        // container - mkv_fallback rewrites it, and mkv needs no flag at all - and the set of streams that gate leaves behind. That survivor set is what keeps
+        // the flag honest: a TrueHD arriving from a NON-mp4 source is an offender, so it is either mapped out by method_unmuxable=drop, refused outright by
+        // error, or the reason the target became mkv - and a -strict describing a stream this run no longer keeps would contradict MP4_STRICT_GATED's refusal
+        // rationale. Only unmuxableDrops can remove an AUDIO stream here, so the survivor set is complete at this point even though the loop has not run.
+        const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams,
+            (file.ffProbeData.streams || []).filter((s) => !unmuxableDrops.has(s.index)));
 
         // Fill the remove_sub_sdh plain-track set (declared above). This runs HERE, after the muxability gate, because subDroppedAnyReason reads
         // dstContainer through subFormatDropped and styledSubExported, and mkv_fallback rewrites dstContainer for this file - computed any earlier, a
@@ -1771,10 +1797,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             removedIndices.add(index);
             convert = true;
         };
-        // TrueHD already living in an mp4-family file, re-muxed back into one: without its -strict experimental (see MP4_STRICT_GATED) the very remux the
-        // muxability gate allowed would fail. Emitted here rather than at the gate because extraArguments is built inside this block. Not a `convert = true`
-        // trigger - it is inert unless some other work emits a command, and forcing a remux to add a flag would be a loop.
-        if (mp4StrictNeeded) extraArguments += ' -strict experimental';
+        // The -strict level settled at the muxability gate: TrueHD already living in an mp4-family file and re-muxed back into one would see the very remux
+        // that gate allowed FAIL without it, and a Dolby Vision stream would lose its dvcC/dvvC boxes to a plain mp4 copy. Emitted here rather than at the
+        // gate because extraArguments is built inside this block. Not a `convert = true` trigger - it is inert unless some other work emits a command, and
+        // forcing a remux just to add a flag would be a loop (an untouched file keeps its boxes).
+        extraArguments += strictArg;
 
             // Font attachments whose removal is deferred until after the main loop, when we know which subtitle streams survive. Decided here (not inline)
             // because an attachment can appear before its subtitles in the file, so we cannot know whether a styled subtitle survives at the moment we reach
@@ -2141,18 +2168,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     convert = true;
                 }
 
-                // Dolby Vision in mp4: the dvcC/dvvC configuration boxes are "unofficial" in ISO mp4, so ffmpeg's muxer only writes them
-                // under -strict unofficial. Without it a -c copy remux keeps the in-band RPU + the dvhe tag but DROPS those boxes, weakening
-                // DV detection (verified on the real profile-5 sample). Add the flag so any remux this plugin performs preserves DV fully. It
-                // only SHAPES a remux another change already triggered - it does not set convert, since an untouched file keeps its boxes.
-                // The boxes are not codec-specific, so neither is this gate: DV rides HEVC (dvhe/dvh1), AVC (dvav/dva1) and AV1 (dav1) alike, and an AV1 DV
-                // stream loses its boxes to a plain mp4 copy exactly as an HEVC one does (verified on a real profile-10 AV1 sample).
-                // Any -strict value already on the command satisfies this too: `experimental` (emitted for mp4-family TrueHD) is a strict superset of
-                // `unofficial` and preserves the DV configuration box just as well (verified - profile 8 retained), so a second one would be redundant.
-                if (dstContainer === 'mp4' && isDolbyVision && !/ -strict \S+/.test(extraArguments)) {
-                    extraArguments += ' -strict unofficial';
-                }
-
                 emitCommentRemoval('v', videoStreamIndex, 'video');
 
                 // Busy-title removal (video). Test ONE effective title the way the audio and subtitle branches do - ffprobe's tag wins, mediaInfo is the
@@ -2294,10 +2309,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         // Grouped by DEMUXER FAMILY, not by extension spelling - ffmpeg picks its demuxer by probing content, while file.container is nothing but the
-        // lowercased extension. mpegts = ts/m2ts/mts/m2t · MPEG-PS = mpg/mpeg/vob/evo · avi. Add a new spelling to the family it demuxes as, not to the end.
-        // Not hypothetical: identical MPEG-PS bytes named .vob hard-fail a bare -c copy remux ("Can't write packet with unknown timestamp", exit -22) while
-        // the same bytes named .mpg are repaired here - and vob/evo/m2ts are all in Tdarr's DEFAULT containerFilter, so the gap was reachable out of the box.
-        if (['ts', 'm2ts', 'mts', 'm2t', 'vob', 'evo', 'avi', 'mpg', 'mpeg'].includes(srcContainer)) {   // container-forced timestamp fix (always applied)
+        // lowercased extension. mpegts = ts/m2ts/mts/m2t/tp/trp/tod · MPEG-PS = mpg/mpeg/vob/evo/m2p/vro/mod · avi. Add a new spelling to the family it
+        // demuxes as, not to the end. Not hypothetical: identical MPEG-PS bytes named .vob hard-fail a bare -c copy remux ("Can't write packet with unknown
+        // timestamp", exit -22) while the same bytes named .mpg are repaired here - and vob/evo/m2ts are all in Tdarr's DEFAULT containerFilter, so the gap
+        // was reachable out of the box. The PVR/camcorder spellings (tp/trp from Topfield/LG/Samsung, tod/mod from JVC Everio, m2p, DVD-VR's vro) are not in
+        // that default filter - but neither are mts/m2t, which this list always carried, so the bar is "every real spelling of the family", not Tdarr's
+        // defaults. All measured on the production build: identical bytes probe as mpegts under ts/tp/trp/tod and as mpeg under mpg/vob/m2p/vro/mod.
+        if (['ts', 'm2ts', 'mts', 'm2t', 'tp', 'trp', 'tod',
+            'mpg', 'mpeg', 'vob', 'evo', 'm2p', 'vro', 'mod', 'avi'].includes(srcContainer)) {   // container-forced timestamp fix (always applied)
             const already = fflags.includes('genpts');
             if(!already)
                 fflags += '+genpts';
