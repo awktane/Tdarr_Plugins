@@ -1,0 +1,13 @@
+# awk Tdarr plugins - the five Tdarr_Plugin_awk_*.js files use the house style documented in
+# ~/Claude/CLAUDE.md (Code style): 4-space indent, 160-char wrap. Scoped so the ~100 third-party
+# community plugins (2-space, repo airbnb style) are untouched.
+root = false
+
+[Community/Tdarr_Plugin_awk_*.js]
+indent_style = space
+indent_size = 4
+max_line_length = 160
+end_of_line = lf
+charset = utf-8
+trim_trailing_whitespace = true
+insert_final_newline = true
