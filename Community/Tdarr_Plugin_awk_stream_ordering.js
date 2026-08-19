@@ -11,8 +11,10 @@ const details = () => ({
         default, SDH or descriptive. The first audio track is marked the sole default. Can also strip junk metadata tags (remove_junk_tags:
         encoder/provenance, or the fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote
         playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time
-        it's needed).\n`,
-    Version: '4.21.1',
+        it's needed).\n\nBecause it runs last it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file
+        that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the signature of an out-of-memory-killed or
+        unfinalised encode from an earlier stage. A longer output is accepted. This check is always on and has no setting.\n`,
+    Version: '4.21.2',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -1002,16 +1004,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // per-stream duration on the ffprobe side, which is why mediaInfo leads.
         const durVideoStream = (obj) => (obj?.ffProbeData?.streams || []).find(s => codecTypeOf(s) === 'video' && !isCoverArt(s));
         const durAudioCount = (obj) => (obj?.ffProbeData?.streams || []).filter(s => codecTypeOf(s) === 'audio').length;
-        const durPos = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
+        // Every DURATION_SIGNALS row must answer with a real duration or 0 - 0 IS the "no signal" sentinel the oldAny/newAny/verdict accumulation below
+        // reads by truthiness, and the failFile at the end of that accumulation turns "the old side had one and the new side has none" into a
+        // quarantine. A row that returns something else (a NaN, a negative, an already-coerced value) breaks the guard silently.
+        const durPositive = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
         const DURATION_SIGNALS = [
             // The join must require @type 'Video' as well as the StreamOrder match: MPEG-TS gives its video track the two-part StreamOrder "0-0"
             // (Number() -> NaN, so it never matches) while its MENU track reports a bare "0", and without the type test the guard silently compares a
             // menu/chapter track's duration instead of the video's.
             { name: 'the mediaInfo video-track duration',
                 read: (o) => { const v = durVideoStream(o); if (!v) return 0;
-                    return durPos(((o?.mediaInfo?.track || []).find(t => t['@type'] === 'Video' && Number(t.StreamOrder) === v.index) || {}).Duration); } },
-            { name: 'the ffprobe video-stream duration', read: (o) => durPos(durVideoStream(o)?.duration) },
-            { name: 'the container duration', read: (o) => durPos(o?.ffProbeData?.format?.duration), needsSameAudio: true },
+                    return durPositive(((o?.mediaInfo?.track || []).find(t => t['@type'] === 'Video'
+                        && Number(t.StreamOrder) === v.index) || {}).Duration); } },
+            { name: 'the ffprobe video-stream duration', read: (o) => durPositive(durVideoStream(o)?.duration) },
+            { name: 'the container duration', read: (o) => durPositive(o?.ffProbeData?.format?.duration), needsSameAudio: true },
         ];
         // Tolerance is 1% SHORT, fixed, with no input to relax it: a user hitting a false positive would have no recourse but removing the plugin, so the
         // headroom is deliberately double the 0.5% the long-standing community duration-check plugin defaults to. A dead encode is short by far more.
