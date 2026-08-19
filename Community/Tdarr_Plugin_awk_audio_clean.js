@@ -1665,15 +1665,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             candidateStreams = candidateStreams.filter(stream => stream.awkTier === 'stereo'
                 || (!stream.awkSecondaryTrack && stream.awkTier === 'surround'));
 
-        // guard_lossless/guard_quality/guard_object_audio block a destructive operation on a track only when it would irreversibly lose detail the destination
-        // can't hold; see those three tooltips for the full independence rationale (a fully independent set, not a fallback chain). Code-specific facts:
-        // protection is earned PER OPERATION — each decision site calls guardBlocks with its own real target codec/channels, not a single "best" track flag.
-        // Only a genuine tier-'surround' track is protectable (a secondary track never is, nor one already sent to stereo/delete); a dormant language setting
-        // leaves a foreign-only track at 'surround', so it stays protectable. guard_quality alone decides the channel-drop rule and the quality-margin math
-        // below: 'strict' protects on ANY predicted score drop, 'enabled' (default) only when the drop EXCEEDS QUALITY_MARGIN. Comparable-codec swaps pass
-        // (640k eac3 → 640k ac3 = 5pt; 1509k DTS 5.1 → 640k ac3 = 7pt); flattening a premium master is kept (Atmos → ac3 = 8pt, DTS-HD → ac3 = 10pt).
-        // QUALITY_MARGIN = 7 is the DTS(91)-vs-ac3(84) base-score gap, so a DTS core → ac3 sits exactly at the margin on the pass side (a drop must STRICTLY
-        // exceed the margin to protect) - preserving the force-DTS-to-ac3 behaviour.
+        // guard_lossless/guard_quality/guard_object_audio block a destructive operation only when it would irreversibly lose detail the destination can't
+        // hold (a fully independent set, not a fallback chain - see the tooltips). Protection is earned PER OPERATION: each decision site calls
+        // guardBlocks with its own real target codec/channels. Only a genuine tier-'surround' track is protectable (never a secondary, nor one already
+        // sent to stereo/delete); a dormant language setting leaves a foreign-only track at 'surround', so it stays protectable. guard_quality decides the
+        // channel-drop rule and the margin math: 'strict' protects on ANY predicted score drop, 'enabled' (default) only when the drop EXCEEDS
+        // QUALITY_MARGIN. Comparable swaps pass (640k eac3 -> 640k ac3 = 5pt; 1509k DTS 5.1 -> 640k ac3 = 7pt); flattening a premium master is kept
+        // (Atmos -> ac3 = 8pt, DTS-HD -> ac3 = 10pt). QUALITY_MARGIN = 7 is the DTS(91)-vs-ac3(84) base-score gap, so DTS core -> ac3 sits exactly at the
+        // margin on the pass side (a drop must STRICTLY exceed it to protect) - preserving the force-DTS-to-ac3 behaviour.
         const QUALITY_MARGIN = 7;
         const guardBlocks = (stream, targetCodec, targetChannels, srcChannels) => {
             if (stream.awkSecondaryTrack || stream.awkTier !== 'surround') return false;
@@ -2065,13 +2064,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return canonicalAudioTitle(cleanStreamTitle(raw), bareLabel, titleTagsFor(srcStream));
         };
 
-        // Lo/Ro stereo downmix matrices, generated from each source layout's exact channel order. WHY layout-keyed and not channel-count-keyed: several
-        // standard layouts share a channel count but order their channels differently (e.g. 6 channels can be 5.1, 5.1(side), 6.0, 6.0(front), or hexagonal).
-        // A count-based matrix would silently mis-route - dropping the wrong channel as "LFE" or panning a back-center where a surround belongs - producing
-        // audio that sounds wrong without any error. So we resolve the EXACT layout to its canonical channel list and build the matrix from speaker roles (the
-        // per-speaker gains and their rationale live with SPEAKER_GAINS below). Any layout without a verified channel list returns null and the caller falls
-        // back to ffmpeg's safe -ac 2 downmix. Canonical ffmpeg channel lists per layout (verified against ffmpeg-utils "Channel Layout" docs); position in
-        // the array is the cN index used by the pan filter.
+        // Lo/Ro stereo downmix matrices, keyed by EXACT layout, never channel count: several standard layouts share a count but order their channels
+        // differently (6ch can be 5.1, 5.1(side), 6.0, 6.0(front), hexagonal), and a count-based matrix would silently mis-route - dropping the wrong
+        // channel as "LFE", panning a back-center where a surround belongs - audio that sounds wrong with no error. The matrix is built from speaker roles
+        // (gains + rationale at SPEAKER_GAINS below); a layout without a verified channel list returns null and the caller falls back to ffmpeg's safe
+        // -ac 2. Channel lists verified against ffmpeg-utils "Channel Layout" docs; array position is the pan filter's cN index.
         const CANON_LAYOUTS = {
             '3.1':            ['FL', 'FR', 'FC', 'LFE'],
             '4.0':            ['FL', 'FR', 'FC', 'BC'],
@@ -2217,14 +2214,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
 
         // Measure, then decide the correction filter comma-chained onto preFilter, or return unchanged (changed:false) when already within
-        // LOUDNORM_TOLERANCE_LU of the preset target. `measured` says whether a measurement actually happened, and is what the awk_loudnorm cache stamp is
-        // gated on: changed:false normally means "measured, and the track is already at the target", but the track-cap branch above also returns changed:false
-        // WITHOUT measuring - stamping that would cache a claim nothing ever checked. measured_thresh has NO uppercase alias (unlike measured_I/measured_LRA/
-        // measured_TP, which accept either case) - keep it exactly lowercase. Pass-1's JSON field names (input_i/input_lra/input_tp/target_offset) are NOT the
-        // same strings as pass-2's filter option names (measured_I/measured_LRA/measured_TP/offset) - same numbers, different names on each side.
-        // Cap the loudnorm analysis passes per file: each is a synchronous full-duration ffmpeg spawn, so a pathological/crafted file declaring a huge number
-        // of audio tracks could otherwise tie up a worker for hours. A real file has a handful of audio tracks, so this bound is invisible in practice; past
-        // it the remaining tracks are left at source loudness with a single warning rather than measured, and a later queue pass can normalize them.
+        // LOUDNORM_TOLERANCE_LU of target. `measured` gates the awk_loudnorm cache stamp: the track-cap branch also returns changed:false WITHOUT
+        // measuring, and stamping that would cache a claim nothing ever checked. measured_thresh has NO uppercase alias (unlike measured_I/_LRA/_TP) -
+        // keep it exactly lowercase. Pass-1's JSON field names (input_i/input_lra/input_tp/target_offset) are NOT pass-2's filter option names
+        // (measured_I/measured_LRA/measured_TP/offset) - same numbers, different names per side. The per-file analysis cap exists because each pass is a
+        // synchronous full-duration spawn - a crafted file declaring many audio tracks could tie up a worker for hours; past the cap the rest are left at
+        // source loudness with one warning, for a later queue pass.
         const LOUDNORM_MAX_TRACKS = 24;
         let loudnormMeasureCount = 0;
         let loudnormCapWarned = false;
@@ -2623,14 +2618,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 const ffstreamCodec = (ffstream.codec_name || '').trim().toLowerCase();
                 const isStereo = channels <= 2;
-                // WHICH codec this re-encode lands on. Two candidates, in preference order:
-                //   keepCodec - the codec the track already has, whenever this plugin can encode it. This is what codec_force=false means ("leave every
-                //       existing codec as it is"), and the only option at all for a source outside our encodable domain (a kept DTS core, an MP3).
-                //   configuredCodec - codec_stereo/codec_surround, used when codec_force's scope covers this track. The FORCE CODEC block may have declined
-                //       it as not worth a lossy generation on its own, but here the generation is already being spent on the gain correction, so declining
-                //       again would discard the user's setting for nothing. This is what makes codec_stereo=aac_vbr reach a track that is already aac.
-                // A target that is guard-protected or over its codec's channel limit falls back to the other candidate rather than cancelling the pass -
-                // mirroring codec_force's own "left as <source codec>" behaviour, so enabling codec_force can never silently switch loudnorm off.
+                // WHICH codec this re-encode lands on. Two candidates, in preference order: keepCodec - the codec the track already has, whenever this
+                // plugin can encode it (what codec_force=false means, and the only option for a source outside our encodable domain: a kept DTS core,
+                // an MP3); configuredCodec - codec_stereo/codec_surround, when codec_force's scope covers this track (the FORCE CODEC block may have
+                // declined it as not worth a lossy generation on its own, but the generation is already being spent on the gain correction - this is
+                // what makes codec_stereo=aac_vbr reach a track already aac). A guard-protected or over-channel-limit target falls back to the other
+                // candidate rather than cancelling the pass, so enabling codec_force can never silently switch loudnorm off.
                 const configuredCodec = isStereo ? stereoCodec : surroundCodec;
                 const keepCodec = ENCODABLE_CODECS.includes(ffstreamCodec) ? ffstreamCodec : configuredCodec;
                 const codecMaxChFor = (c) => codecMaxCh(aacFamily(c));
@@ -2779,13 +2772,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
 
         if (convert === true) {
-            // Dispositions (default flag) are intentionally left untouched. ffmpeg copies the source stream's disposition onto mapped/transcoded
-            // outputs, so a downmix_to_stereo track created from a default-flagged surround source also carries the default flag - two tracks
-            // marked default. This is acceptable: the tracks are near-identical content at different channel counts and most players handle
-            // multiple default flags without issue. Removing or reassigning the default flag is a separate concern outside this plugin's scope.
-            // mp4/mov muxers drop a custom GLOBAL metadata tag (e.g. clean_and_remux's awk_recovered, set upstream) on a -c copy remux unless told
-            // to keep it, which would re-trigger recovery on the next pass. Preserve it. (Per-stream custom tags like awk_loudnorm are NOT rescued
-            // by this flag - verified against the real mov muxer - which is why loudnorm caches on Matroska only; see loudnormTagPersists.)
+            // Dispositions (default flag) are intentionally untouched: ffmpeg copies the source disposition onto mapped/transcoded outputs, so a
+            // downmix from a default-flagged source also carries default - two default tracks, acceptable (near-identical content, players cope);
+            // reassigning default is outside this plugin's scope. mp4/mov muxers drop a custom GLOBAL tag (clean_and_remux's awk_recovered) on a -c copy
+            // remux unless told to keep it, which would re-trigger recovery next pass - preserve it. (Per-stream custom tags like awk_loudnorm are NOT
+            // rescued by this flag, verified against the real mov muxer - why loudnorm caches on Matroska only; see loudnormTagPersists.)
             const mp4KeepTags = isMp4Family(file.container) ? ' -movflags use_metadata_tags' : '';
             // The -strict level this mp4/mov -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses
             // without it. The second list is what this run actually COPIES - a track removedIndices drops, or an in-place transcode replaces (recorded in

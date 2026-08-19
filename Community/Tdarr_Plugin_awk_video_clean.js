@@ -1728,11 +1728,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // ---- shared emit helpers ----
         const coverArtStreams = videoStreams.filter((s) => isCoverArt(s));                                 // embedded cover-art / still-image "video" streams
         const coverArtDrops = coverArtStreams.map((s) => ` -map -0:${s.index}`).join('');                  // dropped from every output this plugin emits
-        // clean_and_remux logs the identical removal, and the infoLog contract gives a queued change its own ☐ line - without this the only trace is the
-        // stream's absence from the ☑ summary, which a user has to spot by diffing two lines. Appended by whichever preset path runs rather than built
-        // here, because on a skipped file no preset is emitted and nothing is dropped, so an unconditional line would announce work that never happens.
-        // No [input=...] tag: no user setting causes this, the stream simply is not video. In the designed run order clean_and_remux has already dropped
-        // these, so this only ever fires when video_clean runs standalone or first - exactly when no other plugin's log explains the removal.
+        // A queued change gets its own ☐ line - without this the only trace is the stream's absence from the ☑ summary. Appended by whichever preset path
+        // runs (on a skipped file nothing is dropped, so an unconditional line would announce work that never happens). No [input=...] tag: no setting
+        // causes this, the stream simply is not video. In the designed run order clean_and_remux has already dropped these, so this only fires when
+        // video_clean runs standalone or first - exactly when no other plugin's log explains the removal.
         const coverArtLog = coverArtStreams
             .map((s) => `☐${streamTag(s.index)} Remove cover-art/thumbnail (video-${(s.codec_name || 'unknown').trim().toLowerCase()})\n`)
             .join('');
@@ -1792,11 +1791,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const vividAlso = vividAlsoNames ? `, so the ${vividAlsoNames} alongside it stays too` : '';
 
         // Lossless dynamic-HDR strip eligibility, shared by hdr_cleanup_only and the no-real-transcode strip path: a no-base DV, any HDR Vivid, a DV signal
-        // on a codec dovi_rpu refuses, and an HDR10+ layer with nothing else strippable beside it all have no lossless path (skip); otherwise do the strip.
-        // The four skip messages are built HERE so their explanations cannot drift between the two callers; only the next step differs, so each caller passes
-        // just its own two advice fragments (hdr_cleanup_only has to send the user to another action, the transcode-capable path only to another hdr_mode).
-        // Vivid is tested FIRST on purpose: no filter here removes a CUVA block, so on a file carrying it stripping any other layer would leave the file still
-        // dynamic-HDR while the log reported a completed strip - the one case where a partial strip is worse than none, because nothing about it converges.
+        // on a codec dovi_rpu refuses, and an HDR10+ layer with nothing else strippable all have no lossless path (skip); otherwise strip. The four skip
+        // messages are built HERE so they cannot drift between the two callers - each passes only its own two advice fragments. Vivid is tested FIRST on
+        // purpose: no filter here removes a CUVA block, so stripping any other layer would leave the file still dynamic-HDR while the log reported a
+        // completed strip - the one case where a partial strip is worse than none, because nothing about it converges.
         const tryLosslessStrip = (tonemapAdvice, reencodeAdvice) => {
             const head = `☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] `;
             if (dvNoBaseLayer) { return skip(`${head}${dvLabel} has no HDR10 base layer - can't strip losslessly; ${tonemapAdvice}\n`); }
@@ -1804,11 +1802,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return skip(`${head}HDR Vivid has no lossless strip path (no bitstream filter here can remove a CUVA block)${vividAlso}`
                     + ` - left untouched; ${tonemapAdvice}\n`);
             }
-            // Refuse a DV signal on a codec dovi_rpu cannot run on. Its HDR10+ sibling has always had this gate; without the DV one the plugin emits a filter
-            // ffmpeg rejects outright ("Codec 'h264' is not supported by the bitstream filter 'dovi_rpu'", exit 234), so Tdarr errors the file with a bare
-            // ffmpeg message instead of a readable skip. Reachable through any of dvSignal's three codec-agnostic signals - a parsed DOVI record, a dvav/dva1
-            // fourcc, or a mediaInfo HDR_Format naming Dolby Vision - on any source whose base layer happens to carry a PQ/HLG transfer. The cost is one-sided:
-            // a wrong skip leaves the file untouched, a wrong emit quarantines it. Note the accepted set is hevc AND av1, wider than the HDR10+ leg's hevc.
+            // Refuse a DV signal on a codec dovi_rpu cannot run on - without this gate the plugin emits a filter ffmpeg rejects outright ("Codec 'h264' is
+            // not supported by the bitstream filter 'dovi_rpu'", exit 234), erroring the file with a bare ffmpeg message instead of a readable skip.
+            // Reachable through any of dvSignal's three codec-agnostic signals on any source whose base layer carries a PQ/HLG transfer. The cost is
+            // one-sided: a wrong skip leaves the file untouched, a wrong emit quarantines it. The accepted set is hevc AND av1, wider than HDR10+'s hevc.
             if (dvSignal && !stripDv) {
                 return skip(`${head}${dvLabel} in ${srcCodecName || 'this codec'} has no lossless strip path (needs HEVC or AV1)`
                     + ` - left untouched${reencodeAdvice}\n`);
@@ -1926,13 +1923,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // core only; the stored -v<version> suffix is forensic, not part of the fence
         const alreadyFenced = priorSig !== '' && priorSig.replace(/-v[^-]*$/, '') === videoSigCore;
 
-        // ---- embedded closed captions ---- They live in the video bitstream, so this is the only plugin that can lose them and the only one that can remove
-        // them deliberately. Two separate jobs here: carry out the removal sub_worker asked for, and (under guard_captions) notice captions that the encoder
-        // this node is about to choose would destroy. Neither is part of the awk_video fingerprint above, and that omission is deliberate rather than an
-        // oversight: neither can FIRE a transcode, they only change how one that is already happening is performed. Fingerprinting them would re-encode a
-        // finished file a second time - to strip a caption track, or to "protect" captions the first encode already destroyed and no later encode can restore.
-        // Read through the shared closed-caption handoff vocabulary rather than bare literals, so a token sub_worker renames cannot go on quietly meaning
-        // nothing here. It is a comma list: an imported round trip that could not strip in its own pass arrives as `imported,strip`.
+        // ---- embedded closed captions ---- They live in the video bitstream, so this is the only plugin that can lose them and the only one that can
+        // remove them deliberately. Two jobs: carry out the removal sub_worker asked for, and (guard_captions) notice captions the encoder this node is
+        // about to choose would destroy. Neither is in the awk_video fingerprint, deliberately: neither can FIRE a transcode, they only change how one
+        // already happening is performed - fingerprinting them would re-encode a finished file a second time, to strip a caption track or to "protect"
+        // captions the first encode already destroyed. Read through the shared handoff vocabulary, never bare literals (a token sub_worker renames must
+        // not go on quietly meaning nothing here); it is a comma list - `imported,strip` arrives from a round trip that could not strip in its own pass.
         const ccTokens = ccTokensOf(file.ffProbeData.format?.tags);
         const ccExported = ccTokens.includes(CC_TOKENS.strip);    // sub_worker took them out, but could not remove the bitstream copy under its -c copy pass
         const ccChannelEmpty = ccTokens.includes(CC_TOKENS.none); // sub_worker decoded the channel and it carried no caption text at all
@@ -2108,12 +2104,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // pix_fmt/profile cleared, and a tonemapped output is SDR (bt709, detached mediaInfo so no 'hdr' token).
             const outStream = { ...primary, codec_name: targetCodecName, height: outHeight, bits_per_raw_sample: want10Bit ? 10 : 8, pix_fmt: '', profile: '' };
             if (tonemap) { outStream.color_transfer = 'bt709'; outStream.index = -1; }
-            // Unless guard_dv carried it, the re-encode DISCARDS the DYNAMIC HDR layer - the Dolby Vision RPU and the HDR10+ SEI alike, since no encoder this
-            // plugin drives carries either - so the prediction must not still read 'dv' or 'hdr10+'. Clear every carrier summariseStream's dynamic tests read:
-            // the dvhe/dvh1/... fourcc, a DOVI side-data record, and the mediaInfo HDR_Format (detached by dropping the index mediaInfoFor joins on). The
-            // surviving HDR10/HLG base still shows 'hdr', from the stream's own transfer characteristics - or, when neither probe reported one, from the curve
-            // inferred off HDR_Format and stamped here, for the same reason tonemapSetparams stamps it onto the filter island. A tonemap already landed bt709
-            // above and must keep it, so the stamp skips that case.
+            // Unless guard_dv carried it, the re-encode DISCARDS the dynamic HDR layer (DV RPU and HDR10+ SEI alike - no encoder this plugin drives
+            // carries either), so the prediction must not still read 'dv' or 'hdr10+'. Clear every carrier summariseStream's dynamic tests read: the
+            // fourcc, the DOVI side-data record, and the mediaInfo HDR_Format (detached by dropping the joined index). The surviving HDR10/HLG base still
+            // shows 'hdr' from the stream's own transfer - or, when neither probe reported one, from the curve inferred off HDR_Format and stamped here
+            // (same reason tonemapSetparams stamps the island). A tonemap already landed bt709 above and must keep it, so the stamp skips that case.
             if (isDynamicHdr && !preserveDv) {
                 outStream.codec_tag_string = ''; outStream.side_data_list = []; outStream.index = -1;
                 if (!tonemap && !HDR_TRANSFERS.includes(srcXfer)) outStream.color_transfer = inferredHdrCurve;
