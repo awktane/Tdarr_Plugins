@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.24.0',
+    Version: '3.25.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -747,11 +747,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // reliable backslash-escape convention, so we substitute rather than strip:
     //    backslash          -> forward-slash (readable, inert)
     //    double-quote       -> single-quote (safe inside the quoted value; preserves titles like "Director's Cut" and "AC3/Stereo")
-    //    control characters -> space (avoids fusing words that a bare delete would join).
+    //    control characters -> space (avoids fusing words that a bare delete would join)
+    //    <io>               -> (io), because that is the preset's OWN input/output split marker: Tdarr splits on it and keeps only the first two parts,
+    //                         so a second one inside a value silently DELETES every argument after it - the value is written truncated and the trailing
+    //                         stream drops, -metadata writes and muxer flags never reach ffmpeg, with no error from either Tdarr or ffmpeg.
     const escMeta = (value) => String(value || '')
         .replace(/[\x00-\x1f\x7f]/g, ' ')  // control characters (newlines, null bytes, etc.) → space
         .replace(/\\/g, '/')               // backslash → forward-slash (inert, readable)
-        .replace(/"/g, "'");               // double-quote → single-quote (safe inside the quoted value)
+        .replace(/"/g, "'")                // double-quote → single-quote (safe inside the quoted value)
+        .replace(/<io>/gi, '(io)');        // preset split marker → inert text (a value may never carry a second marker)
     // ===== END SHARED: ffmpeg metadata escaping =====
 
     // ===== SHARED [audio_clean, video_clean]: ffmpeg encoder probe =====
@@ -1517,9 +1521,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const guardDv = String(inputs.guard_dv) !== 'false';   // boolean (loadDefaultValues coerces it), default true
     const guardLossless = String(inputs.guard_lossless) !== 'false';   // boolean, default true
 
+    // The two free-text NUMERIC inputs are the only user-typed values this plugin echoes back, and failFile's message becomes the file's stored error, so
+    // they get the same treatment as every other free-text echo in the suite (clean_and_remux's logSafe, the shared failLangToken): control characters to
+    // space, because infoLog is newline-delimited and a raw newline turns the rest of the paste into a status line the plugin never wrote, and a 200-char
+    // cap, because loadDefaultValues only trims and Tdarr persists the whole message however large the value was.
+    const inputEcho = (v) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200);
     const parseQuality = (v, name) => {
         const n = Number(String(v).trim());
-        if (!Number.isFinite(n) || n < 0 || n > 63) failFile(`[${name}=${v}] must be a number between 0 and 63, check your settings`);
+        if (!Number.isFinite(n) || n < 0 || n > 63) failFile(`[${name}=${inputEcho(v)}] must be a number between 0 and 63, check your settings`);
         return n;
     };
     const qualitySd = parseQuality(inputs.quality_sd, 'quality_sd');
@@ -1529,7 +1538,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const guardShrinkKbps = (() => {
         const n = Number(String(inputs.guard_shrink_bitrate).trim());
         if (!Number.isFinite(n) || n < 0)
-            failFile(`[guard_shrink_bitrate=${inputs.guard_shrink_bitrate}] must be a non-negative number (kbps), check your settings`);
+            failFile(`[guard_shrink_bitrate=${inputEcho(inputs.guard_shrink_bitrate)}] must be a non-negative number (kbps), check your settings`);
         return n;
     })();
 
@@ -1764,8 +1773,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Apple/QuickTime fourCC for a COPIED stream, gated on isQtVideoContainer rather than isMp4Family (see its definition). The CODEC COVERAGE difference
         // against the encode path above is intentional and must stay: this path copies an arbitrary source codec (so it maps all three), while the encode path
         // only ever emits a fourCC for hevc and picks dvh1-vs-hvc1 from whether the DV RPU survives - a choice a copy cannot make. Do not merge the two.
+        // The key is an ffprobe codec_name, so the read is gated the same way the memory tables gate theirs: TABLE[key] || fallback cannot tell an absent
+        // key from one inherited off Object.prototype, and every prototype member is truthy, so the fallback would never fire for it.
+        const QT_VIDEO_TAG = { hevc: ' -tag:v:0 hvc1', av1: ' -tag:v:0 av01', h264: ' -tag:v:0 avc1' };
         const qtVideoTag = (cn) => (isQtVideoContainer(dstContainer)
-            ? ({ hevc: ' -tag:v:0 hvc1', av1: ' -tag:v:0 av01', h264: ' -tag:v:0 avc1' }[cn] || '') : '');
+            ? (Object.prototype.hasOwnProperty.call(QT_VIDEO_TAG, cn) ? QT_VIDEO_TAG[cn] : '') : '');
         // input streams minus dropped cover-art video
         const keptStreams = () => file.ffProbeData.streams.filter((s) => !(isCoverArt(s) && codecTypeOf(s) === 'video'));
         // Both presets below copy the audio and subtitles into the SAME container they came from, so an mp4-family output still carrying TrueHD needs the mov
@@ -1861,7 +1873,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // fire on a mismatch either direction; codec=source never mismatches
             codecTrigger = ENCODABLE.includes(targetCodecName) && srcCodecName !== targetCodecName;
         } else {   // shrink: upgrade to a more efficient codec, else a same-codec size pass; never downgrade efficiency
-            const srcEff = CODEC_EFFICIENCY[srcCodecName] || 0;
+            // Same membership gate as qtVideoTag, for the same reason - srcCodecName is probe-sourced. The two sibling reads below key on `codec`, which is
+            // validated against the dropdown's own option set, so only this one needs it.
+            const srcEff = Object.prototype.hasOwnProperty.call(CODEC_EFFICIENCY, srcCodecName) ? CODEC_EFFICIENCY[srcCodecName] : 0;
             if (codec !== 'source' && (CODEC_EFFICIENCY[codec] || 0) > srcEff && !preserveDv) {
                 codecTrigger = true;   // upgrade (targetCodecName already = codec)
             } else {

@@ -27,7 +27,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.20.0',
+    Version: '4.21.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -852,11 +852,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // reliable backslash-escape convention, so we substitute rather than strip:
     //    backslash          -> forward-slash (readable, inert)
     //    double-quote       -> single-quote (safe inside the quoted value; preserves titles like "Director's Cut" and "AC3/Stereo")
-    //    control characters -> space (avoids fusing words that a bare delete would join).
+    //    control characters -> space (avoids fusing words that a bare delete would join)
+    //    <io>               -> (io), because that is the preset's OWN input/output split marker: Tdarr splits on it and keeps only the first two parts,
+    //                         so a second one inside a value silently DELETES every argument after it - the value is written truncated and the trailing
+    //                         stream drops, -metadata writes and muxer flags never reach ffmpeg, with no error from either Tdarr or ffmpeg.
     const escMeta = (value) => String(value || '')
         .replace(/[\x00-\x1f\x7f]/g, ' ')  // control characters (newlines, null bytes, etc.) → space
         .replace(/\\/g, '/')               // backslash → forward-slash (inert, readable)
-        .replace(/"/g, "'");               // double-quote → single-quote (safe inside the quoted value)
+        .replace(/"/g, "'")                // double-quote → single-quote (safe inside the quoted value)
+        .replace(/<io>/gi, '(io)');        // preset split marker → inert text (a value may never carry a second marker)
     // ===== END SHARED: ffmpeg metadata escaping =====
 
     // Missing/partial probe data fails the file with a clear reason, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
@@ -1211,10 +1215,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= pathIsPresetSafe  [clean_and_remux, sub_worker] =-=-=-
     // True when a real on-disk path can be embedded in a preset's quoted "${path}" token. Tdarr never shells out, but its worker tokenises each preset
     // half with a quote-aware parser before spawning ffmpeg, so a " anywhere in the path closes the wrapper mid-token and everything after it becomes
-    // fresh argv entries (a raw control character breaks the token just as badly). The name parts WE generate are sanitised at their source, but the
-    // library DIRECTORY is a real path that has to stay literal - it can only be checked, never rewritten - so a caller that fails this test refuses
-    // that one sidecar with a ☒ line rather than emit the token.
-    const pathIsPresetSafe = (p) => !/["\x00-\x1f\x7f]/.test(String(p));
+    // fresh argv entries (a raw control character breaks the token just as badly). The literal <io> is refused for a second reason: it is the preset's own
+    // input/output split marker, and Tdarr reads only the first two parts, so a path carrying one silently DELETES every argument after it. The name parts
+    // WE generate are sanitised at their source, but the library DIRECTORY is a real path that has to stay literal - it can only be checked, never
+    // rewritten - so a caller that fails this test refuses that one sidecar with a ☒ line rather than emit the token.
+    const pathIsPresetSafe = (p) => !/["\x00-\x1f\x7f]/.test(String(p)) && !/<io>/i.test(String(p));
     // ===== END SHARED: preset path safety =====
 
     // ===== SHARED [clean_and_remux, sub_worker]: font attachment test =====
@@ -1239,12 +1244,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // out twice - it is security-relevant, and a copy outside the shared markers is one awk-shared-block-check structurally cannot compare.
     // originalLibraryFile is the true on-disk file; file.file is the fallback so the plugin still works when a caller (or the test harness) omits it.
     // videoBase and sidecarLangToken are sanitised at their source: a crafted filename or container language tag must not inject a path separator or
-    // ".." (escaping libDir) or a " that closes the quote and appends ffmpeg args. The library DIRECTORY is deliberately NOT sanitised - a real path
-    // has to stay literal - so callers CHECK the joined path with pathIsPresetSafe instead and refuse that one sidecar when it fails.
+    // ".." (escaping libDir) or a " that closes the quote and appends ffmpeg args, and must not carry the preset's own <io> split marker (Tdarr reads
+    // only the first two parts, so a second marker deletes every argument after it). Nothing bounds a container language tag either, so the token is
+    // capped as well: 32 clears every real ISO 639 / BCP-47 value by a wide margin, while an uncapped one runs past NAME_MAX, and ffmpeg answers an
+    // unopenable output path by refusing EVERY output of the run - the whole remux - rather than just that sidecar. The library DIRECTORY is deliberately
+    // NOT sanitised - a real path has to stay literal - so callers CHECK the joined path with pathIsPresetSafe and refuse that one sidecar when it fails.
     const libFilePath = otherArguments?.originalLibraryFile?.file || file.file || '';
     const libDir = path.dirname(libFilePath);
-    const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '');
-    const sidecarLangToken = (s) => (resolveLang(s) || 'und').replace(/[^a-z0-9-]/g, '') || 'und';
+    const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '').replace(/<io>/gi, '');
+    const sidecarLangToken = (s) => (resolveLang(s) || 'und').replace(/[^a-z0-9-]/g, '').slice(0, 32) || 'und';
     // ===== END SHARED: sidecar path derivation =====
 
     // ===== SHARED [clean_and_remux, sub_worker]: sidecar placement =====
@@ -1285,9 +1293,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The server's base URL with any trailing slashes removed, so every caller can append '/api/v2/...' without doubling the separator. '' means the node
     // config carries no server URL at all, which each caller has to treat as "no route" rather than building a request against an empty host.
     const serverApiUrl = () => String(nodeConfig.serverURL || '').replace(/\/+$/, '');
-    const apiAuthArgs = () => {
-        const key = String(nodeConfig.apiKey || '');
-        return key ? ['-H', `x-api-key: ${key}`, '-H', `tdarrKey: ${key}`, '-H', `Authorization: Bearer ${key}`] : [];
+    // The server API key authenticates every request in this section, and it is not scoped to one sidecar - it authorises upload and download across the
+    // whole library. As -H arguments it would sit in the node's process table (/proc/<pid>/cmdline is world-readable on Linux, and this route runs almost
+    // exclusively on dockerised Linux nodes) for the life of the spawn, readable by any other local account or co-tenant container. So the headers go in
+    // on STDIN as a curl config and argv carries only `--config -`, and only when there is a key at all. Every call site is free to use stdin for this:
+    // none of them feeds curl a body that way (-d is inline and -F opens the file itself). The value sits inside curl's double-quoted config syntax, so a
+    // backslash or quote in the key is escaped and control characters - which would end the line and start a fresh directive - are dropped.
+    const apiAuthKey = () => String(nodeConfig.apiKey || '').replace(/[\x00-\x1f\x7f]/g, '').replace(/([\\"])/g, '\\$1');
+    const apiAuthArgs = () => (apiAuthKey() ? ['--config', '-'] : []);
+    const apiAuthInput = () => {
+        const key = apiAuthKey();
+        return key ? `header = "x-api-key: ${key}"\nheader = "tdarrKey: ${key}"\nheader = "Authorization: Bearer ${key}"\n` : '';
     };
     // Is a non-empty sidecar already at this server path? Download is the only read the API offers, so the test IS a fetch - discarded to the null device
     // and measured with curl's own counters, never buffered back through spawnSync (a large body silently exceeds maxBuffer and reports a failure that
@@ -1298,7 +1314,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!url) return false;
         const r = spawnSync('curl', ['-sS', '-m', SIDECAR_SPAWN_TIMEOUT_S, '-o', nullDevice, '-w', '%{http_code} %{size_download}', ...apiAuthArgs(),
             '-X', 'POST', '-H', 'Content-Type: application/json', '-d', JSON.stringify({ filePath: dest }), `${url}/api/v2/file/download`],
-            { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS });
+            { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, input: apiAuthInput() });
         const [code, got] = String(r.stdout || '').trim().split(/\s+/);
         return code === '200' && Number(got) > 0;
     };
@@ -1341,7 +1357,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!size) { failed.set(j.name, 'extraction produced no data'); continue; }
             const up = spawnSync('curl', ['-sS', '-m', SIDECAR_SPAWN_TIMEOUT_S, '-o', nullDevice, '-w', '%{http_code}', ...apiAuthArgs(),
                 '--form-string', `filePath=${j.dest}`, '--form-string', `fileSize=${size}`, '--form-string', `nodeID=${String(nodeConfig.nodeID || '')}`,
-                '-F', `file=@${j.tmp}`, `${url}/api/v2/file/upload`], { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS });
+                '-F', `file=@${j.tmp}`, `${url}/api/v2/file/upload`], { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, input: apiAuthInput() });
             const code = String(up.stdout || '').trim();
             if (!up.error && code === '200') placed.add(j.name);
             else failed.set(j.name, `upload rejected (${up.error ? (up.error.code || up.error.message) : `HTTP ${code || 'no response'}`})`);
@@ -1402,7 +1418,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //Clean up titles - remove surrounding whitespace/quotes (no reason for them), and dedupe repeated segments ("Stereo / Stereo" -> "Stereo").
     //Busy-title removal (>3 periods) is applied by callers AFTER tagging, not here - roles are captured into flags before an over-dotted title clears.
     function cleanStreamTitle(rawTitle) {
-        let title = (rawTitle || '').trim().replace(/^["']+|["']+$/g, '');
+        // Strip the surrounding quotes by index. /^["']+|["']+$/ is quadratic in an INTERIOR quote run: the ^-anchored branch can only try offset 0, so
+        // once a word character leads, ["']+$ re-scans from every offset inside the run, consumes it greedily and gives back a character at a time against
+        // a failing $ (60k quote characters measured 5.7 s of blocked worker). Same defect, same reasoning and the same output as the whitespace
+        // pre-collapse below - a title is unbounded container metadata, so neither may be left to backtrack.
+        let title = (rawTitle || '').trim();
+        let qa = 0; let qb = title.length;
+        while (qa < qb && (title[qa] === '"' || title[qa] === "'")) qa += 1;
+        while (qb > qa && (title[qb - 1] === '"' || title[qb - 1] === "'")) qb -= 1;
+        title = title.slice(qa, qb);
         if (title) {
             // Collapse whitespace runs BEFORE the split: the leading \s* otherwise backtracks a character at a time from every offset inside a long run,
             // which is quadratic in that run's length (an interior 80k-space title measured 20 s of blocked worker). Output is unchanged - every part is
@@ -1422,16 +1446,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const dispKeysFor = (type) => Object.keys(dispositionTypes).filter(k => dispositionTypes[k].streams.includes(type));
     const titleTagsFor = (s) => [...new Set(dispKeysFor(codecTypeOf(s))
         .filter(k => dispositionTypes[k].tag && hasDisposition(s, k)).map(k => dispositionTypes[k].tag))];
-    // -=-=-= stripWords / stripDispositionWords  [audio_clean, clean_and_remux] =-=-=-
+    // -=-=-= stripWords / trimNonWord / stripDispositionWords  [audio_clean, clean_and_remux] =-=-=-
     // Single-word keywords stripped when recovering the channel/base portion of a title (multi-word
     // keywords like "hearing impaired" can't appear as a lone channel token, so they are skipped).
     const stripWords = new Set(Object.values(dispositionTypes).flatMap(d => d.keywords).filter(w => !w.includes(' ')));
+    // Trim a token's non-word edges by index, for the reason cleanStreamTitle's quote strip does: /^[^\w]+|[^\w]+$/ backtracks from every offset inside a
+    // long interior non-word run. \w is ASCII-only, so every non-Latin LETTER counts as non-word and an ordinary whitespace-free CJK/Cyrillic title is one
+    // token long enough to trigger it (60k characters measured 5.7 s of blocked worker) - no crafted punctuation needed. Output is identical.
+    const WORD_CHAR = /\w/;
+    const trimNonWord = (tok) => {
+        const s = String(tok);
+        let a = 0; let b = s.length;
+        while (a < b && !WORD_CHAR.test(s[a])) a += 1;
+        while (b > a && !WORD_CHAR.test(s[b - 1])) b -= 1;
+        return s.slice(a, b);
+    };
     // Drop disposition keywords and stray separators from a title, leaving the channel/downmix base.
     // Splits on whitespace, keeps the "->" downmix arrow, drops lone separators and any keyword token.
     const stripDispositionWords = (title) => (title || '')
         .split(/\s+/)
         .filter(tok => !['-', '/', '|', '•'].includes(tok)
-            && !stripWords.has(tok.replace(/^[^\w]+|[^\w]+$/g, '').toLowerCase()))
+            && !stripWords.has(trimNonWord(tok).toLowerCase()))
         .join(' ')
         .trim();
     // -=-=-= canonicalAudioTitle  [audio_clean, clean_and_remux] =-=-=-
@@ -1908,7 +1943,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         }
                     } else {
                         exportRefused = true; exportRefusedCount += 1;
-                        response.infoLog += `☒${streamTag(ffstream.index)}[remove_imagesubs=export] Library directory contains a quote or control character`
+                        response.infoLog += `☒${streamTag(ffstream.index)}[remove_imagesubs=export] Library directory has a quote, control char or <io>`
                             + ` - cannot write ${sidecarName} safely, keeping the subtitle\n`;
                     }
                 }
@@ -1935,7 +1970,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     //language_sub: drop a subtitle whose (possibly filled) language is not on the keep list. A blank list keeps every language.
                     if(subLanguage.length > 0 && !langListMatch(workLang, subLangKeys)) {
                         // logSafe's 200-char cap matters here: the whole language_sub list is echoed once PER dropped subtitle.
-                        workDone += `☐${streamTag(ffstream.index)}[language_sub=${logSafe(inputs.language_sub)}] Remove subtitle language (${workLang})\n`;
+                        workDone += `☐${streamTag(ffstream.index)}[language_sub=${logSafe(inputs.language_sub)}] `
+                            + `Remove subtitle language (${logSafe(workLang)})\n`;
                         delStream = true;
                     } else if (sdhRemoved(ffstream, workLang)) {
                         workDone += `☐${streamTag(ffstream.index)}[remove_sub_sdh=${removeSubSdh}] Remove accessibility subtitle SDH/CC`
@@ -1982,7 +2018,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                                 + ' - mp4 cannot carry it without flattening the styling into on-screen text\n';
                         }
                     } else {
-                        response.infoLog += `☒${streamTag(ffstream.index)}[container=mp4] Library directory contains a quote or control character - cannot`
+                        response.infoLog += `☒${streamTag(ffstream.index)}[container=mp4] Library directory has a quote, control char or <io> - cannot`
                             + ` write ${sidecarName} safely; converting to mov_text instead, which loses the styling\n`;
                     }
                     if (exported) { dropStream(ffstream.index); subtitleStreamIndex--; continue; }

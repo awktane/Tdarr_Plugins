@@ -34,7 +34,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.40.0',
+    Version: '3.41.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -730,11 +730,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // reliable backslash-escape convention, so we substitute rather than strip:
     //    backslash          -> forward-slash (readable, inert)
     //    double-quote       -> single-quote (safe inside the quoted value; preserves titles like "Director's Cut" and "AC3/Stereo")
-    //    control characters -> space (avoids fusing words that a bare delete would join).
+    //    control characters -> space (avoids fusing words that a bare delete would join)
+    //    <io>               -> (io), because that is the preset's OWN input/output split marker: Tdarr splits on it and keeps only the first two parts,
+    //                         so a second one inside a value silently DELETES every argument after it - the value is written truncated and the trailing
+    //                         stream drops, -metadata writes and muxer flags never reach ffmpeg, with no error from either Tdarr or ffmpeg.
     const escMeta = (value) => String(value || '')
         .replace(/[\x00-\x1f\x7f]/g, ' ')  // control characters (newlines, null bytes, etc.) → space
         .replace(/\\/g, '/')               // backslash → forward-slash (inert, readable)
-        .replace(/"/g, "'");               // double-quote → single-quote (safe inside the quoted value)
+        .replace(/"/g, "'")                // double-quote → single-quote (safe inside the quoted value)
+        .replace(/<io>/gi, '(io)');        // preset split marker → inert text (a value may never carry a second marker)
     // ===== END SHARED: ffmpeg metadata escaping =====
 
     // ============= SUBTITLE SIDECAR HELPERS (non-shared) =============
@@ -883,10 +887,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= pathIsPresetSafe  [clean_and_remux, sub_worker] =-=-=-
     // True when a real on-disk path can be embedded in a preset's quoted "${path}" token. Tdarr never shells out, but its worker tokenises each preset
     // half with a quote-aware parser before spawning ffmpeg, so a " anywhere in the path closes the wrapper mid-token and everything after it becomes
-    // fresh argv entries (a raw control character breaks the token just as badly). The name parts WE generate are sanitised at their source, but the
-    // library DIRECTORY is a real path that has to stay literal - it can only be checked, never rewritten - so a caller that fails this test refuses
-    // that one sidecar with a ☒ line rather than emit the token.
-    const pathIsPresetSafe = (p) => !/["\x00-\x1f\x7f]/.test(String(p));
+    // fresh argv entries (a raw control character breaks the token just as badly). The literal <io> is refused for a second reason: it is the preset's own
+    // input/output split marker, and Tdarr reads only the first two parts, so a path carrying one silently DELETES every argument after it. The name parts
+    // WE generate are sanitised at their source, but the library DIRECTORY is a real path that has to stay literal - it can only be checked, never
+    // rewritten - so a caller that fails this test refuses that one sidecar with a ☒ line rather than emit the token.
+    const pathIsPresetSafe = (p) => !/["\x00-\x1f\x7f]/.test(String(p)) && !/<io>/i.test(String(p));
     // ===== END SHARED: preset path safety =====
 
     // ===== SHARED [clean_and_remux, sub_worker]: font attachment test =====
@@ -909,12 +914,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // out twice - it is security-relevant, and a copy outside the shared markers is one awk-shared-block-check structurally cannot compare.
     // originalLibraryFile is the true on-disk file; file.file is the fallback so the plugin still works when a caller (or the test harness) omits it.
     // videoBase and sidecarLangToken are sanitised at their source: a crafted filename or container language tag must not inject a path separator or
-    // ".." (escaping libDir) or a " that closes the quote and appends ffmpeg args. The library DIRECTORY is deliberately NOT sanitised - a real path
-    // has to stay literal - so callers CHECK the joined path with pathIsPresetSafe instead and refuse that one sidecar when it fails.
+    // ".." (escaping libDir) or a " that closes the quote and appends ffmpeg args, and must not carry the preset's own <io> split marker (Tdarr reads
+    // only the first two parts, so a second marker deletes every argument after it). Nothing bounds a container language tag either, so the token is
+    // capped as well: 32 clears every real ISO 639 / BCP-47 value by a wide margin, while an uncapped one runs past NAME_MAX, and ffmpeg answers an
+    // unopenable output path by refusing EVERY output of the run - the whole remux - rather than just that sidecar. The library DIRECTORY is deliberately
+    // NOT sanitised - a real path has to stay literal - so callers CHECK the joined path with pathIsPresetSafe and refuse that one sidecar when it fails.
     const libFilePath = otherArguments?.originalLibraryFile?.file || file.file || '';
     const libDir = path.dirname(libFilePath);
-    const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '');
-    const sidecarLangToken = (s) => (resolveLang(s) || 'und').replace(/[^a-z0-9-]/g, '') || 'und';
+    const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '').replace(/<io>/gi, '');
+    const sidecarLangToken = (s) => (resolveLang(s) || 'und').replace(/[^a-z0-9-]/g, '').slice(0, 32) || 'und';
     // ===== END SHARED: sidecar path derivation =====
 
     // ===== SHARED [clean_and_remux, sub_worker]: sidecar placement =====
@@ -955,9 +963,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The server's base URL with any trailing slashes removed, so every caller can append '/api/v2/...' without doubling the separator. '' means the node
     // config carries no server URL at all, which each caller has to treat as "no route" rather than building a request against an empty host.
     const serverApiUrl = () => String(nodeConfig.serverURL || '').replace(/\/+$/, '');
-    const apiAuthArgs = () => {
-        const key = String(nodeConfig.apiKey || '');
-        return key ? ['-H', `x-api-key: ${key}`, '-H', `tdarrKey: ${key}`, '-H', `Authorization: Bearer ${key}`] : [];
+    // The server API key authenticates every request in this section, and it is not scoped to one sidecar - it authorises upload and download across the
+    // whole library. As -H arguments it would sit in the node's process table (/proc/<pid>/cmdline is world-readable on Linux, and this route runs almost
+    // exclusively on dockerised Linux nodes) for the life of the spawn, readable by any other local account or co-tenant container. So the headers go in
+    // on STDIN as a curl config and argv carries only `--config -`, and only when there is a key at all. Every call site is free to use stdin for this:
+    // none of them feeds curl a body that way (-d is inline and -F opens the file itself). The value sits inside curl's double-quoted config syntax, so a
+    // backslash or quote in the key is escaped and control characters - which would end the line and start a fresh directive - are dropped.
+    const apiAuthKey = () => String(nodeConfig.apiKey || '').replace(/[\x00-\x1f\x7f]/g, '').replace(/([\\"])/g, '\\$1');
+    const apiAuthArgs = () => (apiAuthKey() ? ['--config', '-'] : []);
+    const apiAuthInput = () => {
+        const key = apiAuthKey();
+        return key ? `header = "x-api-key: ${key}"\nheader = "tdarrKey: ${key}"\nheader = "Authorization: Bearer ${key}"\n` : '';
     };
     // Is a non-empty sidecar already at this server path? Download is the only read the API offers, so the test IS a fetch - discarded to the null device
     // and measured with curl's own counters, never buffered back through spawnSync (a large body silently exceeds maxBuffer and reports a failure that
@@ -968,7 +984,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!url) return false;
         const r = spawnSync('curl', ['-sS', '-m', SIDECAR_SPAWN_TIMEOUT_S, '-o', nullDevice, '-w', '%{http_code} %{size_download}', ...apiAuthArgs(),
             '-X', 'POST', '-H', 'Content-Type: application/json', '-d', JSON.stringify({ filePath: dest }), `${url}/api/v2/file/download`],
-            { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS });
+            { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, input: apiAuthInput() });
         const [code, got] = String(r.stdout || '').trim().split(/\s+/);
         return code === '200' && Number(got) > 0;
     };
@@ -1011,7 +1027,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!size) { failed.set(j.name, 'extraction produced no data'); continue; }
             const up = spawnSync('curl', ['-sS', '-m', SIDECAR_SPAWN_TIMEOUT_S, '-o', nullDevice, '-w', '%{http_code}', ...apiAuthArgs(),
                 '--form-string', `filePath=${j.dest}`, '--form-string', `fileSize=${size}`, '--form-string', `nodeID=${String(nodeConfig.nodeID || '')}`,
-                '-F', `file=@${j.tmp}`, `${url}/api/v2/file/upload`], { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS });
+                '-F', `file=@${j.tmp}`, `${url}/api/v2/file/upload`], { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, input: apiAuthInput() });
             const code = String(up.stdout || '').trim();
             if (!up.error && code === '200') placed.add(j.name);
             else failed.set(j.name, `upload rejected (${up.error ? (up.error.code || up.error.message) : `HTTP ${code || 'no response'}`})`);
@@ -1294,7 +1310,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!url) return cached;
             const { spawnSync } = require('child_process');
             const r = spawnSync('curl', ['-sS', '-m', String(NODE_TAG_FETCH_S), ...apiAuthArgs(), `${url}/api/v2/get-nodes`],
-                { encoding: 'utf8', timeout: NODE_TAG_FETCH_S * 1000, maxBuffer: 8 * 1024 * 1024 });
+                { encoding: 'utf8', timeout: NODE_TAG_FETCH_S * 1000, maxBuffer: 8 * 1024 * 1024, input: apiAuthInput() });
             if (r.error || r.status !== 0) return cached;
             try {
                 const reg = JSON.parse(String(r.stdout || '')) || {};
@@ -1354,7 +1370,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         try { fs.mkdirSync(path.dirname(local), { recursive: true }); } catch (e) { /* already there */ }
         const r = spawnSync('curl', ['-sS', '-m', String(LIBRARY_DOWNLOAD_S), '-o', local, '-w', '%{http_code}', ...apiAuthArgs(),
             '-X', 'POST', '-H', 'Content-Type: application/json', '-d', JSON.stringify({ filePath: dest }), `${url}/api/v2/file/download`],
-            { encoding: 'utf8', timeout: LIBRARY_DOWNLOAD_S * 1000 });
+            { encoding: 'utf8', timeout: LIBRARY_DOWNLOAD_S * 1000, input: apiAuthInput() });
         const code = String(r.stdout || '').trim();
         let size = 0; try { size = fs.statSync(local).size; } catch (e) { size = 0; }
         if (!r.error && r.status === 0 && code === '200' && size > 0) return '';
@@ -1421,7 +1437,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const size = fs.statSync(tmp).size;
         const up = spawnSync('curl', ['-sS', '-m', String(SIDECAR_UPLOAD_S), '-o', nullDevice, '-w', '%{http_code}', ...apiAuthArgs(),
             '--form-string', `filePath=${dest}`, '--form-string', `fileSize=${size}`, '--form-string', `nodeID=${String(nodeConfig.nodeID || '')}`,
-            '-F', `file=@${tmp}`, `${url}/api/v2/file/upload`], { encoding: 'utf8', timeout: SIDECAR_UPLOAD_S * 1000 });
+            '-F', `file=@${tmp}`, `${url}/api/v2/file/upload`], { encoding: 'utf8', timeout: SIDECAR_UPLOAD_S * 1000, input: apiAuthInput() });
         try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
         const code = String(up.stdout || '').trim();
         return (!up.error && code === '200') ? '' : `upload rejected (${up.error ? (up.error.code || up.error.message) : `HTTP ${code || 'no response'}`})`;
@@ -1540,7 +1556,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         embeddedHashCache = null;
         const target = String(file._id || file.file || libFilePath || '');
         const wanted = subs.filter((s) => isTextSub(s.codec_name));
-        if (!target || !wanted.length) { embeddedHashCache = new Map(); return embeddedHashCache; }
+        // The two are NOT the same answer, and every caller acts on the difference (see the contract above): with no path there is nothing to read, so the
+        // probe could not run; a readable file that simply holds no text subtitle stream IS a run, and its empty map is positive evidence that no text
+        // sidecar is embedded here.
+        if (!target) return embeddedHashCache;   // null - the probe could not run
+        if (!wanted.length) { embeddedHashCache = new Map(); return embeddedHashCache; }
         let dir = '';
         try { dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_subcmp_')); } catch (e) { return embeddedHashCache; }
         // Files rather than stdout: one run writing N outputs is one pass over the container, where N stdout captures would be N passes - and a large ASS
@@ -1631,8 +1651,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // archive go while the styling stayed broken. Metadata can only ever say "something like this is here", never "this one is here" - a sidecar the user
     // edited keeps its name and matches just as well - so it decides alone only for a bundle (an archive is not comparable text) or when the text cannot be
     // read at all. Otherwise both readers require the sidecar's own bytes to be one of the tracks.
-    const markerConfirmsEmbedded = (f, subs, anyFont, mp4Target) => (!f.bundle || anyFont) && subs.some((s) =>
-        langKey(resolveLang(s) || 'und') === langKey(f.lang || 'und') && (mp4Target || (s.tags?.title || '') === (f.title || '')));
+    // Only a TEXT subtitle can be the embedded copy of a loose sidecar - a PGS/VobSub track holds pictures and could never hold the sidecar's text at all -
+    // so a bitmap stream is not eligible to stand in for one however well its language and title happen to match. A bundle keeps the whole subtitle set in
+    // view: an .mks is confirmed by the fonts travelling with it, and its own subtitle is styled text either way.
+    const markerConfirmsEmbedded = (f, subs, anyFont, mp4Target) => (!f.bundle || anyFont)
+        && subs.filter((s) => f.bundle || isTextSub(s.codec_name)).some((s) =>
+            langKey(resolveLang(s) || 'und') === langKey(f.lang || 'und') && (mp4Target || (s.tags?.title || '') === (f.title || '')));
 
     // The subtitle list is a file the USER may have typed into, so it is only ever removed once it demonstrably has nothing left to say: every name in it is
     // gone from disk, AND at least one of those names was a sidecar we actually embedded. Both halves matter. The first makes a hand-added or mistyped line
@@ -1683,7 +1707,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
         const confirmed = (f) => {
             if (!f.bundle && contentConfirms(f)) return 'its text is in the file';
-            const metaOnly = f.bundle || !hashes || !hashes.size;   // an archive, or a probe that could not run - the two cases the text cannot settle
+            // An EMPTY map is not a failed probe - it is the probe saying the accepted file holds no text for this sidecar to be, which is the strongest
+            // possible answer against deleting it. Only a null map (nothing could be read at all) hands the decision back to the metadata resemblance.
+            const metaOnly = f.bundle || !hashes;   // an archive, or a probe that could not run - the two cases the text cannot settle
             return (metaOnly && markerConfirmsEmbedded(f, embedded, anyFont, mp4Target)) ? 'the file carries a matching subtitle' : '';
         };
         let deleted = 0; let log = '';
@@ -1845,7 +1871,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const name = ccName;
             const full = path.join(workLibDir(), name);
             if (!pathIsPresetSafe(full))
-                return { job: null, note: `☒[embedded_cc=enabled] Library directory contains a quote or control character - cannot write ${name} safely\n` };
+                return { job: null, note: `☒[embedded_cc=enabled] Library directory has a quote, control char or <io> - cannot write ${name} safely\n` };
+            // The caption SOURCE path needs the same test, and the joined path above cannot stand in for it: videoBase strips a quote out of the NAME, so one
+            // living in the video's own filename is invisible there while surviving verbatim in file.file - which is what the two mapped branches interpolate
+            // into their quoted "movie=..." token. escapeMoviePath answers the filtergraph's parsers, not Tdarr's tokeniser, so a " there closes the token and
+            // turns the rest into fresh argv entries, and an <io> truncates the whole command. Only the preset route is exposed: the unmapped route hands the
+            // same string to spawnSync as one argv element, so it is gated on !placeViaApi() and keeps working.
+            if (!placeViaApi() && !pathIsPresetSafe(String(file.file || '')))
+                return { job: null, note: '☒[embedded_cc=enabled] The video path has a quote, control char or <io> - cannot read the captions safely\n' };
             const remoteDest = placeViaApi() ? serverSidePath(full) : '';
             if (placeViaApi() && !remoteDest)
                 return { job: null, note: `☒[embedded_cc=enabled] No path translator maps this library directory back to the server - cannot write ${name}\n` };
@@ -1999,7 +2032,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // embedded track, which would then be the only remaining copy.
                 if (!pathIsPresetSafe(full)) {
                     refused += 1;
-                    response.infoLog += `☒${streamTag(s.index)} Library directory contains a quote or control character - cannot write ${name} safely, `
+                    response.infoLog += `☒${streamTag(s.index)} Library directory has a quote, control char or <io> - cannot write ${name} safely, `
                         + 'keeping the embedded subtitle\n';
                     continue;
                 }
@@ -2338,7 +2371,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // finds the track already matching and does nothing. See the group-level skip below.
         const candidates = found.filter((f) => {
             if (pathIsPresetSafe(path.join(workLibDir(), f.rel))) return true;
-            response.infoLog += `☒Skipping sidecar with an unsafe filename (contains a quote or control character), cannot import safely: ${f.rel}\n`;
+            response.infoLog += `☒Skipping sidecar with an unsafe filename (a quote, control char or <io>), cannot import safely: ${f.rel}\n`;
             return false;
         });
 
@@ -2381,10 +2414,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // So a group is only settled once its own bytes are one of the surviving tracks - otherwise an edit made between two passes would be skipped as
         // "already embedded" and silently never reach the file. A bundle is an archive rather than comparable text, and a probe that could not run proves
         // nothing either way, so both fall back to the marker's metadata match. Group-level by construction: every member of a group is byte-identical.
+        // A sidecar with no CUES of its own can never be confirmed by content: importing it produces a track that decodes to nothing and so gets no hash
+        // at all (see embeddedTextHashes), so "its bytes are not among the surviving hashes" would hold on every pass and the marker skip could never fire
+        // - the same empty subtitle would be muxed in again on every cycle, one more dead track each time. Content settles nothing here, so the marker's
+        // metadata match decides, exactly as it does for a bundle. An unreadable or oversized sidecar answers false and takes the ordinary content route,
+        // which imports - the recoverable direction.
+        const groupHasNoCues = (f) => {
+            try {
+                const p = path.join(workLibDir(), f.rel);
+                if (fs.statSync(p).size > SIDECAR_HASH_MAX) return false;
+                return hasNoCues(fs.readFileSync(p, 'utf8'), f.ext);
+            } catch (e) { return false; }
+        };
         const contentSettles = (f) => {
-            if (f.bundle) return true;
+            if (f.bundle || groupHasNoCues(f)) return true;
             const eh = survivingTextHashes();
-            if (!eh || !eh.size) return true;
+            if (!eh) return true;          // the probe could not run, so nothing is proven either way and the marker's metadata match decides
+            if (!eh.size) return false;    // the probe RAN and no surviving track holds text, so this sidecar is demonstrably not in the file - import it
             return [...eh.values()].includes(groupHash.get(f.members) || contentKey(f));
         };
         // The marker skip, now that a group has ONE identity. A group is done only when EVERY member is confirmed embedded AND the group's text is really

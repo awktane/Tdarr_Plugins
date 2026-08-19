@@ -12,7 +12,7 @@ const details = () => ({
         encoder/provenance, or the fuller descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote
         playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time
         it's needed).\n`,
-    Version: '4.19.0',
+    Version: '4.20.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -814,11 +814,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // reliable backslash-escape convention, so we substitute rather than strip:
     //    backslash          -> forward-slash (readable, inert)
     //    double-quote       -> single-quote (safe inside the quoted value; preserves titles like "Director's Cut" and "AC3/Stereo")
-    //    control characters -> space (avoids fusing words that a bare delete would join).
+    //    control characters -> space (avoids fusing words that a bare delete would join)
+    //    <io>               -> (io), because that is the preset's OWN input/output split marker: Tdarr splits on it and keeps only the first two parts,
+    //                         so a second one inside a value silently DELETES every argument after it - the value is written truncated and the trailing
+    //                         stream drops, -metadata writes and muxer flags never reach ffmpeg, with no error from either Tdarr or ffmpeg.
     const escMeta = (value) => String(value || '')
         .replace(/[\x00-\x1f\x7f]/g, ' ')  // control characters (newlines, null bytes, etc.) → space
         .replace(/\\/g, '/')               // backslash → forward-slash (inert, readable)
-        .replace(/"/g, "'");               // double-quote → single-quote (safe inside the quoted value)
+        .replace(/"/g, "'")                // double-quote → single-quote (safe inside the quoted value)
+        .replace(/<io>/gi, '(io)');        // preset split marker → inert text (a value may never carry a second marker)
     // ===== END SHARED: ffmpeg metadata escaping =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language matching =====

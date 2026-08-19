@@ -12,7 +12,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.21.0',
+    Version: '4.22.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1148,11 +1148,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // reliable backslash-escape convention, so we substitute rather than strip:
     //    backslash          -> forward-slash (readable, inert)
     //    double-quote       -> single-quote (safe inside the quoted value; preserves titles like "Director's Cut" and "AC3/Stereo")
-    //    control characters -> space (avoids fusing words that a bare delete would join).
+    //    control characters -> space (avoids fusing words that a bare delete would join)
+    //    <io>               -> (io), because that is the preset's OWN input/output split marker: Tdarr splits on it and keeps only the first two parts,
+    //                         so a second one inside a value silently DELETES every argument after it - the value is written truncated and the trailing
+    //                         stream drops, -metadata writes and muxer flags never reach ffmpeg, with no error from either Tdarr or ffmpeg.
     const escMeta = (value) => String(value || '')
         .replace(/[\x00-\x1f\x7f]/g, ' ')  // control characters (newlines, null bytes, etc.) → space
         .replace(/\\/g, '/')               // backslash → forward-slash (inert, readable)
-        .replace(/"/g, "'");               // double-quote → single-quote (safe inside the quoted value)
+        .replace(/"/g, "'")                // double-quote → single-quote (safe inside the quoted value)
+        .replace(/<io>/gi, '(io)');        // preset split marker → inert text (a value may never carry a second marker)
     // ===== END SHARED: ffmpeg metadata escaping =====
 
     // ===== SHARED [audio_clean, video_clean]: ffmpeg encoder probe =====
@@ -1206,7 +1210,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //Clean up titles - remove surrounding whitespace/quotes (no reason for them), and dedupe repeated segments ("Stereo / Stereo" -> "Stereo").
     //Busy-title removal (>3 periods) is applied by callers AFTER tagging, not here - roles are captured into flags before an over-dotted title clears.
     function cleanStreamTitle(rawTitle) {
-        let title = (rawTitle || '').trim().replace(/^["']+|["']+$/g, '');
+        // Strip the surrounding quotes by index. /^["']+|["']+$/ is quadratic in an INTERIOR quote run: the ^-anchored branch can only try offset 0, so
+        // once a word character leads, ["']+$ re-scans from every offset inside the run, consumes it greedily and gives back a character at a time against
+        // a failing $ (60k quote characters measured 5.7 s of blocked worker). Same defect, same reasoning and the same output as the whitespace
+        // pre-collapse below - a title is unbounded container metadata, so neither may be left to backtrack.
+        let title = (rawTitle || '').trim();
+        let qa = 0; let qb = title.length;
+        while (qa < qb && (title[qa] === '"' || title[qa] === "'")) qa += 1;
+        while (qb > qa && (title[qb - 1] === '"' || title[qb - 1] === "'")) qb -= 1;
+        title = title.slice(qa, qb);
         if (title) {
             // Collapse whitespace runs BEFORE the split: the leading \s* otherwise backtracks a character at a time from every offset inside a long run,
             // which is quadratic in that run's length (an interior 80k-space title measured 20 s of blocked worker). Output is unchanged - every part is
@@ -1226,16 +1238,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const dispKeysFor = (type) => Object.keys(dispositionTypes).filter(k => dispositionTypes[k].streams.includes(type));
     const titleTagsFor = (s) => [...new Set(dispKeysFor(codecTypeOf(s))
         .filter(k => dispositionTypes[k].tag && hasDisposition(s, k)).map(k => dispositionTypes[k].tag))];
-    // -=-=-= stripWords / stripDispositionWords  [audio_clean, clean_and_remux] =-=-=-
+    // -=-=-= stripWords / trimNonWord / stripDispositionWords  [audio_clean, clean_and_remux] =-=-=-
     // Single-word keywords stripped when recovering the channel/base portion of a title (multi-word
     // keywords like "hearing impaired" can't appear as a lone channel token, so they are skipped).
     const stripWords = new Set(Object.values(dispositionTypes).flatMap(d => d.keywords).filter(w => !w.includes(' ')));
+    // Trim a token's non-word edges by index, for the reason cleanStreamTitle's quote strip does: /^[^\w]+|[^\w]+$/ backtracks from every offset inside a
+    // long interior non-word run. \w is ASCII-only, so every non-Latin LETTER counts as non-word and an ordinary whitespace-free CJK/Cyrillic title is one
+    // token long enough to trigger it (60k characters measured 5.7 s of blocked worker) - no crafted punctuation needed. Output is identical.
+    const WORD_CHAR = /\w/;
+    const trimNonWord = (tok) => {
+        const s = String(tok);
+        let a = 0; let b = s.length;
+        while (a < b && !WORD_CHAR.test(s[a])) a += 1;
+        while (b > a && !WORD_CHAR.test(s[b - 1])) b -= 1;
+        return s.slice(a, b);
+    };
     // Drop disposition keywords and stray separators from a title, leaving the channel/downmix base.
     // Splits on whitespace, keeps the "->" downmix arrow, drops lone separators and any keyword token.
     const stripDispositionWords = (title) => (title || '')
         .split(/\s+/)
         .filter(tok => !['-', '/', '|', '•'].includes(tok)
-            && !stripWords.has(tok.replace(/^[^\w]+|[^\w]+$/g, '').toLowerCase()))
+            && !stripWords.has(trimNonWord(tok).toLowerCase()))
         .join(' ')
         .trim();
     // -=-=-= canonicalAudioTitle  [audio_clean, clean_and_remux] =-=-=-
@@ -1657,6 +1680,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
         });
 
+        // awkLangKey/awkRegionKey are whatever the CONTAINER stored: resolveLang hands back the raw tag, langKey only trims and lowercases it, and an
+        // unparseable tag comes straight back out of Intl.getCanonicalLocales' catch verbatim. That is correct for MATCHING (an unrecognised tag on a
+        // stream is data, and must keep flowing through language_unlisted), but not for PRINTING: a raw newline splits a status line in two and the
+        // continuation carries no ☐/☑/☒, so container text renders as a status line the plugin never wrote, and Tdarr persists the whole infoLog, so an
+        // unbounded tag is an unbounded log. Clamp at the echo sites, never in the shared langKey - the key itself is the match/dedup identity and must
+        // stay byte-exact. Same expression and same reasoning as summariseStream's tok().
+        const langTok = (v) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 64);
+
         // candidateStreams: the pool for workStreams. A track earns a place when there is genuinely something to do with it - it is a genuine surround track
         // (the only kind eligible for downmix_to_six/downmix_to_stereo), or its tier is 'stereo' (the in-place stereo downmix), or codec_force is set, which
         // must be able to standardize the codec of EVERY track including commentary and unlisted-language ones (e.g. codec_force='all' must touch them all).
@@ -1816,13 +1847,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const guardBlock = dedupeGuardBlock(s, kept);
                     if (guardBlock) {
                         skipDone += `☒${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}][${guardBlock}] Keeping duplicate `
-                            + `${codecDisplayName(s)}${rmEx} ${s.channels}ch ${s.awkRegionKey}${rmRate} - removing it would lose detail stream `
+                            + `${codecDisplayName(s)}${rmEx} ${s.channels}ch ${langTok(s.awkRegionKey)}${rmRate} - removing it would lose detail stream `
                             + `${kept.index} (${codecDisplayName(kept)}${keptEx} ${kept.channels}ch${keptRate}) can't hold\n`;
                         continue;
                     }
                     if (methodDeduplicateErrorMode) {
                         failFile(`${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Duplicate audio track (${codecDisplayName(s)}${rmEx} `
-                            + `${s.channels}ch ${s.awkRegionKey}${rmRate}) alongside stream ${kept.index} (${codecDisplayName(kept)}${keptEx}${keptRate})`
+                            + `${s.channels}ch ${langTok(s.awkRegionKey)}${rmRate}) alongside stream ${kept.index} `
+                            + `(${codecDisplayName(kept)}${keptEx}${keptRate})`
                             + ` - aborting; tag/remove tracks manually and requeue, or switch method_deduplicate to a non-error mode`);
                     }
                     removedIndices.add(s.index);
@@ -1837,7 +1869,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     else if (!s.isTdarrMatrixSurround && kept.isTdarrMatrixSurround) why = 'no matrixed rear channel';
                     else why = 'equal, keeping the earlier track';
                     workDone += `☐${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Removing duplicate (${why}: ${codecDisplayName(s)}${rmEx}`
-                        + ` ${s.channels}ch ${s.awkRegionKey}${rmRate}) - keeping stream ${kept.index} (${codecDisplayName(kept)}${keptEx} `
+                        + ` ${s.channels}ch ${langTok(s.awkRegionKey)}${rmRate}) - keeping stream ${kept.index} (${codecDisplayName(kept)}${keptEx} `
                         + `${kept.channels}ch${keptRate})\n`;
                 } else
                     seen.set(key, s);
@@ -1877,7 +1909,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // enrichStream's `resolveChannels(s) || s.channels` falls back to the RAW ffprobe field, which is `undefined` for exactly those streams, so an
         // unguarded interpolation renders "undefinedch" in a user-facing status line. The other consumers of the count skip such a stream outright; these
         // two delete paths do not need it to decide, only to print it.
-        const delToken = (s) => `${codecDisplayName(s)}${s.channels > 0 ? ` ${s.channels}ch` : ''} ${s.awkLangKey}`;
+        const delToken = (s) => `${codecDisplayName(s)}${s.channels > 0 ? ` ${s.channels}ch` : ''} ${langTok(s.awkLangKey)}`;
         // Language deletes resolve FIRST, so the plain-language fall-back set the role deletes read below reflects what actually survives them.
         for (const s of audioStreams) {
             if (s.awkTier !== 'delete' || s.isTdarrSecondaryTrack || removedIndices.has(s.index)) continue;
@@ -1892,8 +1924,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         for (const s of audioStreams) {
             if (s.awkTier !== 'delete' || !s.isTdarrSecondaryTrack || removedIndices.has(s.index)) continue;
             if (!plainLangsSurviving.has(s.awkLangKey)) {
-                skipDone += `☒${streamTag(s.index)}[downmix_secondary=delete] Not removing ${delToken(s)} - no plain ${s.awkLangKey} track survives to `
-                    + `fall back on\n`;
+                skipDone += `☒${streamTag(s.index)}[downmix_secondary=delete] Not removing ${delToken(s)} - no plain `
+                    + `${langTok(s.awkLangKey)} track survives to fall back on\n`;
                 continue;
             }
             if (countSurvivingAudio() <= 1) {
