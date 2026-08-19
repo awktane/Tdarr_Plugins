@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.26.0',
+    Version: '3.26.1',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -531,12 +531,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // video-only hvc1 gate is deliberately mp4/m4v/mov WITHOUT m4a and stays separate).
     const isMp4Family = (container) => ['mp4', 'm4v', 'mov', 'm4a'].includes(String(container || '').toLowerCase());
     // ===== END SHARED: mp4-family container =====
+    // ===== SHARED [sub_worker, video_clean]: marker persistence =====
+    // -=-=-= markerPersists  [sub_worker, video_clean] =-=-=-
     // Can a container carry a GLOBAL awk_* marker back out of a mux? Matroska and its siblings store an arbitrary tag natively; the mp4 family keeps one only
-    // because every mux here adds -movflags use_metadata_tags. Everything else drops it silently, and that is not always fixable: measured on the production
-    // build, .3gp/.3g2 discard a custom global tag WITH the flag as well as without, so no marker can exist in one at all. Membership is the fail-safe
-    // direction - an unlisted container is assumed marker-hostile, which costs a declined size pass rather than an encode that can never converge. This
-    // plugin keeps the source container, so the answer is the SOURCE's; clean_and_remux always writes mkv or mp4, which is the way out of a hostile one.
+    // because every mux here adds -movflags use_metadata_tags. The listed set is what was MEASURED to keep one on the production build; an unlisted container
+    // is assumed marker-hostile whether or not its muxer happens to preserve a tag, because that is the fail-safe direction - it costs a declined pass rather
+    // than one that can never converge. Some are not fixable at all: .3gp/.3g2 discard a custom global tag WITH the flag as well as without, so no marker can
+    // exist in one. Both carriers keep the SOURCE container, so the answer is the source's; clean_and_remux always writes mkv or mp4, which is the way out of
+    // a hostile one. The stake is the same wherever a marker records work: a pass that cannot remember what it did does it again, and where the arguments come
+    // out identical Tdarr ERRORS the file as an infinite transcode loop rather than merely repeating the cost.
     const markerPersists = (container) => ['mkv', 'mka', 'mks', 'webm'].includes(String(container || '').toLowerCase()) || isMp4Family(container);
+    // ===== END SHARED: marker persistence =====
     // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: case-insensitive tag lookup =====
     // -=-=-= getTagCI  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
     // Look up a tag value case-insensitively - matroska UPPER-CASES tag keys on write, so a plugin reading its
@@ -552,6 +557,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= mediaInfoFor  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Find the mediaInfo track corresponding to an ffprobe stream (matched by StreamOrder === ffprobe index); undefined when absent. The single join point
     // between the two probes - resolveStreamBitrate/resolveChannels/resolveLang and the per-plugin language/loop sites all go through it.
+    // Deliberately NOT memoised, unlike the roleTextLower WeakMap nearby: the scan measures ~20 microseconds per file against a transcode measured in
+    // minutes, so a cache would only lengthen a byte-identical five-carrier section.
     const mediaInfoFor = (s) => (file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === s.index);
     // -=-=-= resolveLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Resolve a stream's language: ffprobe tags.language, then mediaInfo Language (files often tag one probe but not the other), trimmed + lowercased. Empty
@@ -607,6 +614,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= enrichStream  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Enrich a stream with both-probe bitrate + channels before summariseStream/audioQuality/scoring, so ffprobe-unreadable values (e.g. DTS-HD MA
     // bitrate in MP4) fall back to mediaInfo. Every summary and scoring call site uses this so logged tokens and the scoring path enrich identically.
+    // The enriched .channels is NOT a drop-in for resolveChannels() in a numeric test: on a stream no probe can measure, resolveChannels returns 0 but the
+    // `|| s.channels` fallback lands `undefined` here, and `undefined <= 0` is false - so any guard keying on 0 must call resolveChannels() itself.
     const enrichStream = (s) => ({ ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate, channels: resolveChannels(s) || s.channels });
     // -=-=-= is10Bit  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // True when a video stream is 10-bit (or deeper): raw sample depth or mediaInfo BitDepth >= 10, a 10-to-16-bit pixel format (p10le through p16be), or a
@@ -624,17 +633,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The HDR transfer curves: ffmpeg's two HDR color_trc enums (smpte2084 = PQ, arib-std-b67 = HLG) plus the MediaInfo spellings (pq, hlg).
     // The single source for every HDR-curve test: summariseStream's vHdr token below, and video_clean's isHdr / dvNoBaseLayer / tonemap-setparams gate.
     const HDR_TRANSFERS = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'];
-    // -=-=-= HDR10P_RE / VIVID_HDR_RE / DYNAMIC_HDR_RE  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // -=-=-= HDR10P_RE / VIVID_HDR_RE  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Recognises dynamic HDR from a lowercased HDR_Format string, split BY FORMAT because the two are not interchangeable downstream: HDR10+ has a lossless
     // strip path (hevc_metadata=remove_hdr10plus, HEVC only) while HDR Vivid has none - no bitstream filter here can remove a CUVA block. The spellings are
     // the ones real files use; a bare '2094' suffices for HDR10+ since only it carries a 2094 block (plain static HDR10 is SMPTE ST 2086), and production
-    // MediaInfo 23.07 spells Vivid 'HDR Vivid'. DYNAMIC_HDR_RE is COMPOSED from the two, so a spelling can never be added to one list and missed by the union.
-    // summariseStream's HDR token and video_clean's isDynamicHdr both read these, so the display token and the protective re-encode skip cannot disagree. DV is
-    // recognised separately (isDolbyVisionVideo / dvSignal). Note a probe limit these patterns cannot cover: production MediaInfo 23.07 reports no Video track
-    // at all for an H.266/VVC file, so a VVC stream can never be recognised as dynamic HDR by any path here.
+    // MediaInfo 23.07 spells Vivid 'HDR Vivid'. Every carrier reads the two SEPARATELY (summariseStream's hdr10+/vivid token); nothing here composes a
+    // union of them, because every decision but one wants a SINGLE format, and the union in scope invites the wrong test (video_clean, whose isDynamicHdr is
+    // that one exception, builds it as a local). DV is recognised separately (isDolbyVisionVideo / dvSignal). Note a probe limit these cannot cover: production
+    // MediaInfo 23.07 reports no Video track at all for an H.266/VVC file, so a VVC stream can never be recognised as dynamic HDR by any path here.
     const HDR10P_RE = /2094|hdr10\+|hdr10 plus/;
     const VIVID_HDR_RE = /hdr vivid|cuva/;
-    const DYNAMIC_HDR_RE = new RegExp(`${HDR10P_RE.source}|${VIVID_HDR_RE.source}`);
     // -=-=-= isDdEx  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Dolby Surround EX: a rear-surround (6.1) channel matrix-folded into an ordinary 5.1 AC-3/E-AC-3, so the track carries strictly MORE than a plain 5.1
     // twin while still decoding as plain 5.1 on a non-EX decoder. mediaInfo's Format_Settings_Mode is the flag's only home - ffprobe does not expose it. One
@@ -747,6 +755,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // stream - omitted on whole-file summaries and on brand-new/appended streams (imports, downmix appends) that have no source index of their own.
     const streamTag = (index) => `[s${String(index).padStart(2, ' ')}]`;
     // ===== END SHARED: stream / language / preset helpers =====
+    // "Carries dynamic HDR of any kind", COMPOSED from the two per-format recognisers above so a spelling added to one list can never be missed by the union.
+    // isDynamicHdr is the only question in the suite that genuinely spans both formats - a re-encode flattens either to static HDR10 - so this is a local, not
+    // a shared helper: every other consumer wants ONE format (HDR10+ has a lossless strip path, HDR Vivid has none) and must reach for the narrower test.
+    const DYNAMIC_HDR_RE = new RegExp(`${HDR10P_RE.source}|${VIVID_HDR_RE.source}`);
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
     // -=-=-= escMeta  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -783,14 +795,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ===== END SHARED: ffmpeg encoder probe =====
 
-    // ===== SHARED [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean]: dolby vision detection =====
-    // -=-=-= DV_FOURCC_RE  [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: dolby vision detection =====
+    // -=-=-= DV_FOURCC_RE  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // The DV fourccs: HEVC dvhe/dvh1, AVC dvav/dva1, AV1 dav1. Named so the set has ONE definition - video_clean's dvCodecTag tests the same constant to build
     // its encode-side dvSignal, which would otherwise carry a second copy of the literal that no structural check can compare against this one. Non-global, so
     // `.test()` on one shared instance is stateless.
     const DV_FOURCC_RE = /^(dvhe|dvh1|dvav|dva1|dav1)$/;
 
-    // -=-=-= isDolbyVisionVideo  [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean] =-=-=-
+    // -=-=-= isDolbyVisionVideo  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // True when a video stream carries Dolby Vision, both-probe: a dvhe/dvh1/dvav/dva1/dav1 fourcc, a mediaInfo HDR_Format naming Dolby Vision, or an ffprobe
     // DOVI configuration record / dolby-vision side_data. The four -c copy plugins add `-strict unofficial` to an mp4/mov remux with it, so ffmpeg's mov
     // muxer keeps the dvcC/dvvC config boxes (a plain copy drops them, demoting DV to plain HEVC - verified on a real sample). video_clean uses it only for
@@ -861,7 +873,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // The codecs this plugin has an encoder for, derived from the table above so a new target cannot be added to one and missed in the other
     // (codec=source keeps the source codec only when it is one of these). Membership only, so key order is immaterial.
-    const ENCODABLE = Object.keys(ENCODER_NAME);
+    const ENCODABLE_CODECS = Object.keys(ENCODER_NAME);
     // Lossless / mastering-grade video codecs, read only by guard_lossless. Deliberately NOT a shared block: no other plugin re-encodes video, so nothing else
     // has a use for it. Raw ffprobe codec_name spellings. The membership test is what makes the guard fail-safe - an unrecognised codec is not protected,
     // never wrongly skipped. (Lossless MODES of lossy codecs - x264 -qp 0, for one - are out of scope: neither probe reports them.) Grouped by what a source
@@ -950,9 +962,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const rx = new RegExp(re, 'g');
         let best = null; let hit;
         while ((hit = rx.exec(text)) !== null) if (hit.slice(1).some((n) => Number(n) > 0)) best = hit;
-        return best ? hit0Nums(best) : null;
+        // The CAPTURE GROUPS as numbers - index 0, the whole match, is dropped, so the caller's [0] is group 1. Both consumers index on that: the four-name
+        // destructure below, and rep[1] + rep[2] meaning Top + Bottom.
+        return best ? best.slice(1).map(Number) : null;
     };
-    const hit0Nums = (m) => m.slice(1).map(Number);
     const detectInterlace = (ffmpegPath, inputPath, startSec) => {
         try {
             // Sampled from a way into the file, not the head: logos, black and title cards are commonly progressive even in an interlaced programme, so a
@@ -1441,7 +1454,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const cpuTonemap = 'tonemapx=tonemap=bt2390:transfer=bt709:matrix=bt709:primaries=bt709:range=tv';
         const gpuIsland = `format=p010le,hwupload,tonemap_${tonemapBackend}=${GPU_TONEMAP_OPTS}${outFmt},hwdownload,format=${outFmt}`;
         const tmDevice = `-init_hw_device ${tonemapBackend}=tm -filter_hw_device tm`;   // single-device families: the island replaces any hwaccel decode
-        const scale = (fmt) => {   // the tonemap island (GPU) or tonemapx (CPU), then an optional trailing format filter
+        const pushTonemap = (fmt) => {   // the tonemap island (GPU) or tonemapx (CPU), then an optional trailing format filter; the downscale is NOT here
             if (tonemap) vf.push(tonemapSetparams + (useGpuTm ? gpuIsland : cpuTonemap));
             if (fmt) vf.push(fmt);
         };
@@ -1458,12 +1471,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (family === 'nvenc') {
             // '-hwaccel cuda' (system-memory frames) or '' for software decode
             inputSide = useGpuTm ? tmDevice : getNvdecHwaccelPreset(file, { softwareFrames: true });
-            scale();
+            pushTonemap();
             parts.push(useGpuTm ? `-pix_fmt ${want10Bit ? 'p010le' : 'yuv420p'}`
                 : (want10Bit ? getNvenc10BitFormatArg(file, { softwareFrames: true }).trim() : '-pix_fmt yuv420p'));
         } else if (family === 'qsv') {
             if (useGpuTm) inputSide = tmDevice;
-            scale();
+            pushTonemap();
             if (want10Bit) { parts.push('-pix_fmt p010le'); if (codec === 'hevc') parts.push('-profile:v main10'); } else parts.push('-pix_fmt nv12');
         } else if (family === 'vaapi') {
             if (useGpuTm) {   // two devices: opencl tonemaps, frames download to software, then re-upload to vaapi for the encoder (proven on Intel)
@@ -1472,20 +1485,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     + `,hwdownload,format=${outFmt},hwupload=derive_device=vaapi`);
             } else {
                 inputSide = '-vaapi_device /dev/dri/renderD128';
-                scale(`format=${want10Bit ? 'p010' : 'nv12'}`);
+                pushTonemap(`format=${want10Bit ? 'p010' : 'nv12'}`);
                 vf.push('hwupload');
             }
         } else if (family === 'amf') {
             if (useGpuTm) inputSide = tmDevice;
-            scale();
+            pushTonemap();
             parts.push(want10Bit ? '-pix_fmt p010le' : '-pix_fmt yuv420p');
         } else if (family === 'videotoolbox') {
             if (useGpuTm) inputSide = tmDevice;
-            scale();
+            pushTonemap();
             parts.push(want10Bit ? '-pix_fmt p010le' : '-pix_fmt yuv420p');
             if (want10Bit && codec === 'hevc') parts.push('-profile:v main10');
         } else {   // cpu
-            scale();
+            pushTonemap();
             parts.push(`-pix_fmt ${want10Bit ? 'yuv420p10le' : 'yuv420p'}`);
             // libx265 carries the decoded DV RPU through the encode; x265's DV coding needs VBV/HRD (bare CRF errors -22), so add a generous per-tier ceiling
             if (preserveDv) {
@@ -1613,7 +1626,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const srcIs10 = is10Bit(primary, mi);
         // Efficiency rank for shrink's never-downgrade rule: vp9~hevc and vp8~h264, so an efficient WebM/VP source isn't "upgraded" to a less-efficient
         // codec; a genuinely-legacy codec (mpeg2/vc1/xvid, absent here) ranks below every target via the `|| 0` fallback, so old-codec -> h264 stays a valid
-        // shrink upgrade. vvc (H.266) outranks av1 and is DECODE-only in this build: a rank does NOT make a codec encodable (ENCODABLE derives from
+        // shrink upgrade. vvc (H.266) outranks av1 and is DECODE-only in this build: a rank does NOT make a codec encodable (ENCODABLE_CODECS derives from
         // ENCODER_NAME, which has no vvc row), so the entry does exactly one job - stop shrink re-encoding a VVC source down to HEVC/AV1, the very downgrade
         // this rule exists to prevent. codec=source on a VVC file still skips with the no-encoder warning.
         const CODEC_EFFICIENCY = { vvc: 4, av1: 3, hevc: 2, vp9: 2, h264: 1, vp8: 1 };
@@ -1886,7 +1899,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let codecTrigger = false;
         if (action === 'normalize') {
             // fire on a mismatch either direction; codec=source never mismatches
-            codecTrigger = ENCODABLE.includes(targetCodecName) && srcCodecName !== targetCodecName;
+            codecTrigger = ENCODABLE_CODECS.includes(targetCodecName) && srcCodecName !== targetCodecName;
         } else {   // shrink: upgrade to a more efficient codec, else a same-codec size pass; never downgrade efficiency
             // Same membership gate as qtVideoTag, for the same reason - srcCodecName is probe-sourced. The two sibling reads below key on `codec`, which is
             // validated against the dropdown's own option set, so only this one needs it.
@@ -1899,7 +1912,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // is a compatibility transform with no size rationale at all - refusing both to protect the codec choice abandons the transform the user
                 // actually asked for. A pure codec-swap with no forced transform still refuses; codec=source is untouched (it skips with the warning below).
                 const forcedTransform = heightTrigger || tonemapTrigger;
-                const yieldToTransform = !preserveDv && forcedTransform && codec !== 'source' && ENCODABLE.includes(codec) && !ENCODABLE.includes(srcCodecName);
+                const yieldToTransform = !preserveDv && forcedTransform && codec !== 'source'
+                    && ENCODABLE_CODECS.includes(codec) && !ENCODABLE_CODECS.includes(srcCodecName);
                 if (yieldToTransform)
                     response.infoLog += `☒${streamTag(primary.index)}[action=shrink][codec=${codec}] ${codec} is no more efficient than the source `
                         + `${srcCodecName}, but the forced ${heightTrigger ? 'downscale' : 'tonemap'} saves more than the codec costs`
@@ -1909,7 +1923,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         + `${srcCodecName} - never downgrading; re-encoding as ${srcCodecName} to shrink instead\n`;
                 targetCodecName = preserveDv ? 'hevc' : (yieldToTransform ? codec : srcCodecName);   // same-codec size pass (guard_dv still forces hevc for DV)
                 // a legacy same-codec pass can't encode - caught by the !canEncodeTarget skip below
-                codecTrigger = ENCODABLE.includes(targetCodecName);
+                codecTrigger = ENCODABLE_CODECS.includes(targetCodecName);
             }
         }
         // Final output bit depth - computed only AFTER targetCodecName is final (guard_dv's override and shrink's never-downgrade fallback can each still
@@ -1948,7 +1962,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // awk_video fence were always going to settle never spawns ffmpeg to be told something it does not use.
         const cheapTranscode = codecTrigger || heightTrigger || tonemapTrigger;
         const realTranscode = () => cheapTranscode || deintTrigger();
-        const canEncodeTarget = ENCODABLE.includes(targetCodecName);
+        const canEncodeTarget = ENCODABLE_CODECS.includes(targetCodecName);
 
         // Idempotency fence: a settings fingerprint stored as a container-global awk_video tag. Essential for shrink (a constant-quality
         // same-codec re-encode would otherwise re-shrink every pass - a generational death spiral); harmless for normalize (which only fires on a

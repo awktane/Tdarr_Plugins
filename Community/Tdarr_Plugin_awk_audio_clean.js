@@ -12,7 +12,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.23.0',
+    Version: '4.23.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -840,6 +840,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= mediaInfoFor  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Find the mediaInfo track corresponding to an ffprobe stream (matched by StreamOrder === ffprobe index); undefined when absent. The single join point
     // between the two probes - resolveStreamBitrate/resolveChannels/resolveLang and the per-plugin language/loop sites all go through it.
+    // Deliberately NOT memoised, unlike the roleTextLower WeakMap nearby: the scan measures ~20 microseconds per file against a transcode measured in
+    // minutes, so a cache would only lengthen a byte-identical five-carrier section.
     const mediaInfoFor = (s) => (file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === s.index);
     // -=-=-= resolveLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Resolve a stream's language: ffprobe tags.language, then mediaInfo Language (files often tag one probe but not the other), trimmed + lowercased. Empty
@@ -895,6 +897,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= enrichStream  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Enrich a stream with both-probe bitrate + channels before summariseStream/audioQuality/scoring, so ffprobe-unreadable values (e.g. DTS-HD MA
     // bitrate in MP4) fall back to mediaInfo. Every summary and scoring call site uses this so logged tokens and the scoring path enrich identically.
+    // The enriched .channels is NOT a drop-in for resolveChannels() in a numeric test: on a stream no probe can measure, resolveChannels returns 0 but the
+    // `|| s.channels` fallback lands `undefined` here, and `undefined <= 0` is false - so any guard keying on 0 must call resolveChannels() itself.
     const enrichStream = (s) => ({ ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate, channels: resolveChannels(s) || s.channels });
     // -=-=-= is10Bit  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // True when a video stream is 10-bit (or deeper): raw sample depth or mediaInfo BitDepth >= 10, a 10-to-16-bit pixel format (p10le through p16be), or a
@@ -912,17 +916,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The HDR transfer curves: ffmpeg's two HDR color_trc enums (smpte2084 = PQ, arib-std-b67 = HLG) plus the MediaInfo spellings (pq, hlg).
     // The single source for every HDR-curve test: summariseStream's vHdr token below, and video_clean's isHdr / dvNoBaseLayer / tonemap-setparams gate.
     const HDR_TRANSFERS = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'];
-    // -=-=-= HDR10P_RE / VIVID_HDR_RE / DYNAMIC_HDR_RE  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // -=-=-= HDR10P_RE / VIVID_HDR_RE  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Recognises dynamic HDR from a lowercased HDR_Format string, split BY FORMAT because the two are not interchangeable downstream: HDR10+ has a lossless
     // strip path (hevc_metadata=remove_hdr10plus, HEVC only) while HDR Vivid has none - no bitstream filter here can remove a CUVA block. The spellings are
     // the ones real files use; a bare '2094' suffices for HDR10+ since only it carries a 2094 block (plain static HDR10 is SMPTE ST 2086), and production
-    // MediaInfo 23.07 spells Vivid 'HDR Vivid'. DYNAMIC_HDR_RE is COMPOSED from the two, so a spelling can never be added to one list and missed by the union.
-    // summariseStream's HDR token and video_clean's isDynamicHdr both read these, so the display token and the protective re-encode skip cannot disagree. DV is
-    // recognised separately (isDolbyVisionVideo / dvSignal). Note a probe limit these patterns cannot cover: production MediaInfo 23.07 reports no Video track
-    // at all for an H.266/VVC file, so a VVC stream can never be recognised as dynamic HDR by any path here.
+    // MediaInfo 23.07 spells Vivid 'HDR Vivid'. Every carrier reads the two SEPARATELY (summariseStream's hdr10+/vivid token); nothing here composes a
+    // union of them, because every decision but one wants a SINGLE format, and the union in scope invites the wrong test (video_clean, whose isDynamicHdr is
+    // that one exception, builds it as a local). DV is recognised separately (isDolbyVisionVideo / dvSignal). Note a probe limit these cannot cover: production
+    // MediaInfo 23.07 reports no Video track at all for an H.266/VVC file, so a VVC stream can never be recognised as dynamic HDR by any path here.
     const HDR10P_RE = /2094|hdr10\+|hdr10 plus/;
     const VIVID_HDR_RE = /hdr vivid|cuva/;
-    const DYNAMIC_HDR_RE = new RegExp(`${HDR10P_RE.source}|${VIVID_HDR_RE.source}`);
     // -=-=-= isDdEx  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // Dolby Surround EX: a rear-surround (6.1) channel matrix-folded into an ordinary 5.1 AC-3/E-AC-3, so the track carries strictly MORE than a plain 5.1
     // twin while still decoding as plain 5.1 on a non-EX decoder. mediaInfo's Format_Settings_Mode is the flag's only home - ffprobe does not expose it. One
@@ -1073,6 +1076,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ===== END SHARED: language matching =====
 
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: free-text list split =====
+    // -=-=-= splitList  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // Tokenise a free-text comma list exactly one way across the suite: split on commas, trim each token, drop the empties - so ' eng , , jpn ' and 'eng,jpn'
+    // are the same list. Every list a USER types goes through it (the language lists, stream_ordering's order_codec), because one settings string has to scope
+    // the same tracks at every stage: a split rule hardened in one file and not the others silently means something different per plugin, and the damage is
+    // invisible - an unmatched list reads as a clean run that did none of the requested work. Case is NOT folded here; each caller decides, since some lists
+    // match through langKey (which lowercases) and some against lowercase canon codec names. Values this suite itself wrote (the awk_* marker and tag lists)
+    // are a different concept and keep their own parsers.
+    const splitList = (v) => String(v || '').split(',').map(t => t.trim()).filter(Boolean);
+    // ===== END SHARED: free-text list split =====
+
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language display name =====
     // -=-=-= langDisplayName  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // Memoised ICU DisplayNames (built once, reused): the recognised English name for an ALREADY-normalised language code, or '' for a non-language/unknown
@@ -1087,14 +1101,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     })();
     // ===== END SHARED: language display name =====
 
-    // ===== SHARED [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean]: dolby vision detection =====
-    // -=-=-= DV_FOURCC_RE  [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: dolby vision detection =====
+    // -=-=-= DV_FOURCC_RE  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // The DV fourccs: HEVC dvhe/dvh1, AVC dvav/dva1, AV1 dav1. Named so the set has ONE definition - video_clean's dvCodecTag tests the same constant to build
     // its encode-side dvSignal, which would otherwise carry a second copy of the literal that no structural check can compare against this one. Non-global, so
     // `.test()` on one shared instance is stateless.
     const DV_FOURCC_RE = /^(dvhe|dvh1|dvav|dva1|dav1)$/;
 
-    // -=-=-= isDolbyVisionVideo  [clean_and_remux, audio_clean, sub_worker, stream_ordering, video_clean] =-=-=-
+    // -=-=-= isDolbyVisionVideo  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
     // True when a video stream carries Dolby Vision, both-probe: a dvhe/dvh1/dvav/dva1/dav1 fourcc, a mediaInfo HDR_Format naming Dolby Vision, or an ffprobe
     // DOVI configuration record / dolby-vision side_data. The four -c copy plugins add `-strict unofficial` to an mp4/mov remux with it, so ffmpeg's mov
     // muxer keeps the dvcC/dvvC config boxes (a plain copy drops them, demoting DV to plain HEVC - verified on a real sample). video_clean uses it only for
@@ -1525,9 +1539,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Every input is type:'string' (there are no type:'boolean' ones, which would be coerced and could not be out-of-set). The 16 dropdowns are validated
     // against their option sets by the table below; the two free-text language lists have no option set, so their tokens go through the language RECOGNISER
     // instead - that check sits further down because its predicate (knownLangToken) is declared below this block. Every check fails the file on a bad value.
-    const langStereo = String(inputs.language_stereo).toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
+    const langStereo = splitList(inputs.language_stereo).map(lang => lang.toLowerCase());
     const langStereoKeys = langStereo.map(langKey);         // normalised comparison keys (folds en/eng/english/en-US and 639-2/B vs /T)
-    const langSurround = String(inputs.language_surround).toLowerCase().split(',').map(lang => lang.trim()).filter(lang => lang !== '');
+    const langSurround = splitList(inputs.language_surround).map(lang => lang.toLowerCase());
     const langSurroundKeys = langSurround.map(langKey);
     const langUnlisted = String(inputs.language_unlisted).trim();
     const downmixSecondary = String(inputs.downmix_secondary).trim();
@@ -2409,7 +2423,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         for (let i = 0; i < workStreams.length; i++) {
             const ffstream = workStreams[i];
-            const ffstreamCodec = (ffstream.codec_name || '').toLowerCase();
+            const ffstreamCodec = (ffstream.codec_name || '').trim().toLowerCase();
             const ffstreamChannels = resolveChannels(ffstream);
             const writeLang = langForWrite(ffstream);
             const outputAudioIdx = outputAudioIdxMap.get(ffstream.index);
@@ -2519,7 +2533,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Also skip when the source has more channels than the target codec supports (ac3/eac3 max 6ch, opus/aac max 8ch) to avoid an ffmpeg encode
             // failure. Channel count is resolved from ffprobe, then mediaInfo, then a channel-layout string (resolveChannels): a track no source can
             // measure is left untouched rather than guessed, since a wrong count could route it to a codec that can't hold its real channels and fail.
-            const forceChannels = (forceCodec !== 'false' && !modifiedAudioIdx.has(outputAudioIdx)) ? resolveChannels(ffstream) : -1;
+            const forceChannels = (forceCodec !== 'false' && !modifiedAudioIdx.has(outputAudioIdx)) ? ffstreamChannels : -1;
             if (forceChannels === 0)
                 skipDone += `☒${streamTag(ffstream.index)}[codec_force=${forceCodec}] Skipping - no channel count in ffprobe, mediaInfo, or channel `
                     + `layout; can't safely choose a target codec or verify its channel limit\n`;
@@ -2679,19 +2693,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // buildLoudnormFilter at its own emit point); this loop only handles the leftovers.
         if (methodLoudnorm !== 'disabled') {
             const preset = LOUDNORM_PRESETS[methodLoudnorm];
-            for (const stream of audioStreams) {
-                if (removedIndices.has(stream.index)) continue;
-                const outputAudioIdx = outputAudioIdxMap.get(stream.index);
-                const srcAudioIdx = inputAudioIdxMap.get(stream.index);
+            for (const ffstream of audioStreams) {
+                if (removedIndices.has(ffstream.index)) continue;
+                const outputAudioIdx = outputAudioIdxMap.get(ffstream.index);
+                const srcAudioIdx = inputAudioIdxMap.get(ffstream.index);
                 if (outputAudioIdx === undefined || srcAudioIdx === undefined || modifiedAudioIdx.has(outputAudioIdx)) continue;
 
-                const channels = resolveChannels(stream);
+                const channels = resolveChannels(ffstream);
                 if (channels <= 0) {
-                    skipDone += `☒${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Skipping - no channel count in ffprobe, mediaInfo, or `
+                    skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Skipping - no channel count in ffprobe, mediaInfo, or `
                         + `channel layout; can't safely choose a target codec or verify its channel limit\n`;
                     continue;
                 }
-                const rawCodec = (stream.codec_name || '').trim().toLowerCase();
+                const ffstreamCodec = (ffstream.codec_name || '').trim().toLowerCase();
                 const isStereo = channels <= 2;
                 // WHICH codec this re-encode lands on. Two candidates, in preference order:
                 //   keepCodec - the codec the track already has, whenever this plugin can encode it. This is what codec_force=false means ("leave every
@@ -2702,20 +2716,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // A target that is guard-protected or over its codec's channel limit falls back to the other candidate rather than cancelling the pass -
                 // mirroring codec_force's own "left as <source codec>" behaviour, so enabling codec_force can never silently switch loudnorm off.
                 const configuredCodec = isStereo ? stereoCodec : surroundCodec;
-                const keepCodec = ENCODABLE_CODECS.includes(rawCodec) ? rawCodec : configuredCodec;
+                const keepCodec = ENCODABLE_CODECS.includes(ffstreamCodec) ? ffstreamCodec : configuredCodec;
                 const codecMaxChFor = (c) => codecMaxCh(aacFamily(c));
-                const reachable = (c) => channels <= codecMaxChFor(c) && !guardBlocks(stream, c, channels, channels);
+                const reachable = (c) => channels <= codecMaxChFor(c) && !guardBlocks(ffstream, c, channels, channels);
                 const wantCodec = forceCovers(isStereo, channels) ? configuredCodec : keepCodec;
                 const targetCodec = reachable(wantCodec) ? wantCodec : (reachable(keepCodec) ? keepCodec : null);
                 if (targetCodec === null) {
                     // Both candidates are out of reach; report against keepCodec, the one the track would otherwise have stayed in.
                     if (channels > codecMaxChFor(keepCodec))
-                        skipDone += `☒${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Skipping - ${rawCodec} ${channels}ch exceeds the `
+                        skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Skipping - ${ffstreamCodec} ${channels}ch exceeds the `
                             + `${codecMaxChFor(keepCodec)}ch limit for ${aacFamily(keepCodec)}\n`;
                     else
-                        skipDone += `☒${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - would lose detail vs `
-                            + `${codecDisplayName(stream)} ${channels}ch (guard_lossless=${guardLossless}, guard_quality=${guardQuality}, `
-                            + `guard_object_audio=${guardObjectAudio}); left as ${rawCodec}\n`;
+                        skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - would lose detail vs `
+                            + `${codecDisplayName(ffstream)} ${channels}ch (guard_lossless=${guardLossless}, guard_quality=${guardQuality}, `
+                            + `guard_object_audio=${guardObjectAudio}); left as ${ffstreamCodec}\n`;
                     continue;
                 }
                 const targetFamily = aacFamily(targetCodec);
@@ -2723,20 +2737,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // Cache check: this stream isn't being touched by anything else this run, so if it already carries a tag matching the CURRENT preset,
                 // its content hasn't changed since we last measured/corrected it against this exact target - trust it and skip the measurement
                 // subprocess entirely. A stale tag from a DIFFERENT preset (or no tag at all) falls through to a fresh measurement below.
-                if (loudnormTagMatchesPreset(stream)) continue;
+                if (loudnormTagMatchesPreset(ffstream)) continue;
 
-                // Converging a non-opus source to opus (rawCodec isn't opus-encodable, so targetCodec fell through to codec_surround=opus): if libopus can't
+                // Converging a non-opus source to opus (ffstreamCodec isn't opus-encodable, so targetCodec fell through to codec_surround=opus): if libopus
                 // encode this track's layout, a bare -c:a opus would abort the whole ffmpeg job. Relabel losslessly when possible (chained before loudnorm);
                 // otherwise defer to method_layout_err. 'remix' downmixes to codec_stereo (+ loudnorm) in place, unless a stereo already exists for this
                 // language (remixDefer, exactly as the codec_force path decides it - see the comment there); 'keep' - and 'drop', which can't remove a track
                 // once the audio index maps are built (the codec_force path drops such a track in the pre-pass) - leave it in its source codec, un-normalized.
                 let loudnormRelabel = '';
-                if (targetFamily === 'opus' && channels > 2 && rawCodec !== 'opus') {
-                    const lay = (stream.channel_layout || '').toLowerCase().trim();
+                if (targetFamily === 'opus' && channels > 2 && ffstreamCodec !== 'opus') {
+                    const lay = (ffstream.channel_layout || '').toLowerCase().trim();
                     if (!opusAcceptsLayout(channels, lay)) {
                         const relabel = OPUS_RELABEL[lay];
                         const remixDefer = !relabel && methodLayoutErr === 'remix'
-                            && (existing2chLangs.has(stream.awkRegionKey) || created2chLangs.has(stream.awkRegionKey));
+                            && (existing2chLangs.has(ffstream.awkRegionKey) || created2chLangs.has(ffstream.awkRegionKey));
                         if (relabel) {
                             // lossless relabel to an opus-safe layout, chained ahead of loudnorm
                             loudnormRelabel = `channelmap=map=${relabel.map}:channel_layout=${relabel.layout}`;
@@ -2746,20 +2760,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // cap left unmeasured) must not be flattened from surround to stereo for nothing. Every other exit of this loop already bails on
                             // !changed; this is the one that used to commit before looking. Contrast the codec_force remix, which is correct to fire
                             // unconditionally: there the codec change IS the requested operation and loudnorm merely rides along.
-                            const two = stereoArg(outputAudioIdx, stream);
+                            const two = stereoArg(outputAudioIdx, ffstream);
                             if (!two.changed) {
                                 if (loudnormTagPersists && two.measured) {
-                                    workDone += `☐${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Stamping awk_loudnorm=${methodLoudnorm} `
+                                    workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Stamping awk_loudnorm=${methodLoudnorm} `
                                         + `(already within tolerance) - future runs skip re-measuring while loudnorm stays "${methodLoudnorm}"\n`;
                                     extraArguments += loudnormStampArg(outputAudioIdx);
                                     convert = true;
                                 }
                                 continue;
                             }
-                            const newTitle = escMeta(buildTitle(stream, '2.0'));
-                            const writeLang = langForWrite(stream);
+                            const newTitle = escMeta(buildTitle(ffstream, '2.0'));
+                            const writeLang = langForWrite(ffstream);
                             const enc = stereoEnc(outputAudioIdx);
-                            workDone += `☐${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${rawCodec} ${channels}ch → `
+                            workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${ffstreamCodec} ${channels}ch → `
                                 + `${enc.logCodec} stereo @ ${enc.rate} (${enc.label ? `${enc.label}; ` : ''}remixed - libopus can't encode a `
                                 + `${lay || `${channels}ch`} layout)\n`;
                             extraArguments += ` -c:a:${outputAudioIdx} ${enc.frag}${two.arg}`
@@ -2768,20 +2782,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             outputAudioOverride.set(outputAudioIdx, enc.record);
                             modifiedAudioIdx.add(outputAudioIdx);
                             // register the remix-created stereo so a later same-language downmix / remix defers to it
-                            created2chLangs.add(stream.awkRegionKey);
+                            created2chLangs.add(ffstream.awkRegionKey);
                             convert = true;
                             continue;
                         } else {
                             const why = remixDefer ? 'a stereo already exists for this language' : `method_layout_err=${methodLayoutErr}`;
-                            skipDone += `☒${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - libopus can't encode a `
-                                + `${lay || `${channels}ch`} layout; left as ${rawCodec} (${why})\n`;
+                            skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - libopus can't encode a `
+                                + `${lay || `${channels}ch`} layout; left as ${ffstreamCodec} (${why})\n`;
                             continue;
                         }
                     }
                 }
 
-                const srcBitrate = Number(stream.bit_rate || 0);
-                const { filter, changed, measured } = buildLoudnormFilter(stream.index, srcAudioIdx, loudnormRelabel, preset);
+                const srcBitrate = Number(ffstream.bit_rate || 0);
+                const { filter, changed, measured } = buildLoudnormFilter(ffstream.index, srcAudioIdx, loudnormRelabel, preset);
                 if (!changed) {
                     // Already within tolerance. On a tag-persisting container, stamp it (a metadata-only remux) so a FUTURE run can skip re-measuring while
                     // the preset stays the same. On a container that would drop the tag, do NOTHING (a true no-op) - stamping there would just remux every
@@ -2789,7 +2803,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // changed:false, and must NOT be stamped: the cache would claim a loudness nothing ever read, and every future run would trust it and
                     // skip the track for good. It is simply left at source loudness, as the cap warning says, for a later pass to pick up.
                     if (loudnormTagPersists && measured) {
-                        workDone += `☐${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Stamping awk_loudnorm=${methodLoudnorm} (already `
+                        workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Stamping awk_loudnorm=${methodLoudnorm} (already `
                             + `within tolerance) - future runs skip re-measuring while loudnorm stays "${methodLoudnorm}"\n`;
                         extraArguments += loudnormStampArg(outputAudioIdx);
                         convert = true;
@@ -2799,7 +2813,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 if (targetCodec === 'aac_vbr') {
                     const { encoder, args, approxRate, label } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true, channels);
-                    workDone += `☐${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${rawCodec} ${channels}ch → aac `
+                    workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${ffstreamCodec} ${channels}ch → aac `
                         + `${channels}ch @ ${approxRate} (${label})\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args} -filter:a:${outputAudioIdx} "${filter}"${loudnormStampArg(outputAudioIdx)}`;
                     modifiedAudioIdx.add(outputAudioIdx);
@@ -2808,13 +2822,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // Format in == format out (the plain loudnorm case, and codec_force aimed at the codec the track already uses): match the source rate
                     // rather than re-deriving a ladder target, which would re-encode a 192k mono aac at the 160k aac ceiling and build in a loss nobody
                     // asked for. Only a genuine codec change takes resolveBitrate's transcode target. An unmeasurable source rate falls back to it too.
-                    const sameFormat = targetFamily === codecFamilyOf(stream);
+                    const sameFormat = targetFamily === codecFamilyOf(ffstream);
                     const matchedBps = sameFormat ? sameFormatBitrate(targetFamily, channels, srcBitrate) : 0;
-                    const dstBitStr = matchedBps || resolveBitrate(targetCodec, channels, srcBitrate, stream.isTdarrLossless, stream.awkQuality);
+                    const dstBitStr = matchedBps || resolveBitrate(targetCodec, channels, srcBitrate, ffstream.isTdarrLossless, ffstream.awkQuality);
                     const dstBitArg = encoderArgsBps(targetCodec, outputAudioIdx, dstBitStr);
-                    const srcRateStr = srcRateToken(stream);
-                    const note = sameFormat ? (matchedBps ? ' (source rate matched)' : '') : ` (converged from ${rawCodec})`;
-                    workDone += `☐${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${rawCodec} ${channels}ch @ ${srcRateStr} → `
+                    const srcRateStr = srcRateToken(ffstream);
+                    const note = sameFormat ? (matchedBps ? ' (source rate matched)' : '') : ` (converged from ${ffstreamCodec})`;
+                    workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${ffstreamCodec} ${channels}ch @ ${srcRateStr} → `
                         + `${targetCodec} ${channels}ch @ ${dstBitStr / 1000} kb/s${note}\n`;
                     extraArguments += ` -c:a:${outputAudioIdx} ${audioEncoder(targetCodec)}${dstBitArg} -filter:a:${outputAudioIdx} "${filter}"`
                         + `${loudnormStampArg(outputAudioIdx)}`;
