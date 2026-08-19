@@ -34,7 +34,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.44.0',
+    Version: '3.44.1',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -2282,10 +2282,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.infoLog += ccReadLine(ccVideo.index, ccPlan.job.name);
                 if (unmappedMode === 'text_file') seedSubtitleList([ccPlan.job.name]);
             } else {
-                const why = String(failed.get(ccPlan.job.name) || '');
                 // An empty channel is a VERDICT and has to be memoised, exactly as the mapped route memoises it through ccPlan.record: the tag is the only
                 // thing that stops the next pass paying for the same full-video decode, and it takes a mux of its own to write. Returning here defers any
-                // other import work by one pass, which is what the mapped route does too - and cheaply, since that pass no longer decodes.
+                // other import work by one pass, which is what the mapped route does too - and cheaply, since that pass no longer decodes. The two outcomes
+                // are EXCLUSIVE, as they are on the extract route: a channel that carried no text is not a placement that failed, and reporting both leaves
+                // the user reading a library/upload fault under a line that just said there was nothing to upload.
                 if (emptyExtractions.has(ccPlan.job.name)) {
                     response.infoLog += `☒${streamTag(ccVideo.index)}[embedded_cc=enabled] The caption channel carries no caption text${canRecord
                         ? ' - recorded it so no later pass re-reads it'
@@ -2295,8 +2296,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         response.infoLog += `☑Expected results: ${summariseAll(streams)}\n`;
                         return response;
                     }
+                } else {
+                    response.infoLog += `☒${streamTag(ccVideo.index)}[embedded_cc=enabled] Could not place ${ccPlan.job.name} in the library - ${
+                        failed.get(ccPlan.job.name)}\n`;
                 }
-                response.infoLog += `☒${streamTag(ccVideo.index)}[embedded_cc=enabled] Could not place ${ccPlan.job.name} in the library - ${why}\n`;
             }
         }
         // The global marker VALUE lists the sidecar paths (relative to the video's directory) an earlier pass consumed, so a later pass deletes exactly what
