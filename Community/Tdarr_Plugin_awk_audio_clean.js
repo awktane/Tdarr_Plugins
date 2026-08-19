@@ -12,7 +12,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.23.2',
+    Version: '4.24.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -2431,7 +2431,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The IN-PLACE twin of append2ch: replace this track with a stereo instead of adding one beside it. Four branches reach it - the stereo tier, the
         // downmix_to_stereo 'replace' branch, the codec_force opus remix and the loudnorm-leftovers remix - so it is factored for exactly append2ch's reason:
         // this emit defines an output audio stream, and four copies 300 lines apart would drift. registerLang claims the language's stereo slot
-        // (created2chLangs); the stereo tier passes nothing, because a stereo-tier track - a commentary among them - must never occupy the main-language slot.
+        // (created2chLangs), so every caller passes it for a GENUINE track and none does for a secondary one - a commentary must never occupy the
+        // main-language slot. The claim is what stops a second stereo being made for a language that already has one: the two post-loop consumers (the
+        // layout-drop derivatives and the loudnorm-leftovers remix) run after every branch here, so an unclaimed slot there costs the language's surround
+        // master - a guard_original track the loudnorm remix flattens to stereo beside the stereo-tier copy that was already made from its sibling.
         // Each caller keeps its own workDone line and its own terminal flag: codec_force sets `forced`, which funnels into convert further down, so setting
         // convert here would change what that branch means.
         const replace2ch = (srcStream, idx, enc, two, registerLang) => {
@@ -2483,7 +2486,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 workDone += `☐${streamTag(ffstream.index)}[${tierTag}]${loudnormRideTag(two.changed)} Transcoding ${ffstreamCodec} ${ffstreamChannels}ch `
                     + `@ ${srcRateStr} → ${enc.logCodec} stereo @ ${enc.rate} (${enc.label ? `${enc.label}, ` : ''}`
                     + `${ffstream.awkSecondaryTrack ? 'secondary' : 'stereo tier'})\n`;
-                replace2ch(ffstream, outputAudioIdx, enc, two);
+                replace2ch(ffstream, outputAudioIdx, enc, two, ffstream.awkSecondaryTrack ? '' : ffstreamRegionKey);
                 convert = true;
             }
             } else {
