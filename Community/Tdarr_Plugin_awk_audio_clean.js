@@ -12,7 +12,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.24.0',
+    Version: '4.25.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -2609,7 +2609,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                                 + `${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} (${layoutName}, opus-incompatible) → ${enc.logCodec} stereo @ `
                                 + `${enc.rate}${enc.label ? ` (${enc.label})` : ''}\n`;
                             // registers the remix-created stereo so a later same-language downmix / remix defers to it
-                            replace2ch(ffstream, outputAudioIdx, enc, two, ffstreamRegionKey);
+                            replace2ch(ffstream, outputAudioIdx, enc, two, ffstream.awkSecondaryTrack ? '' : ffstreamRegionKey);
                             forced = true;
                         } else if (targetCodec === 'aac_vbr') {
                             // aac_vbr stereo force: aacVbrArgsIdx picks this node's best VBR AAC encoder, at its leaner tier for a low-bitrate source.
@@ -2780,7 +2780,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                                 + `${enc.logCodec} stereo @ ${enc.rate} (${enc.label ? `${enc.label}; ` : ''}remixed - libopus can't encode a `
                                 + `${lay || `${channels}ch`} layout)\n`;
                             // registers the remix-created stereo so a later same-language downmix / remix defers to it
-                            replace2ch(ffstream, outputAudioIdx, enc, two, ffstream.awkRegionKey);
+                            replace2ch(ffstream, outputAudioIdx, enc, two, ffstream.awkSecondaryTrack ? '' : ffstream.awkRegionKey);
                             convert = true;
                             continue;
                         } else {
