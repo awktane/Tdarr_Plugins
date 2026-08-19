@@ -34,7 +34,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.44.1',
+    Version: '3.44.2',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -217,13 +217,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // =====================================================================
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: file-failure helpers =====
-    // -=-=-= AwkFailFile / failFile / failUnexpected  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Fail the whole file (send it to Tdarr's error queue) carrying the full infoLog as context. A returned processFile:false is Tdarr's "no work needed /
-    // skip" signal, NOT a failure — the flow's runClassicTranscodePlugin checks `if (result.error) throw` before `if (result.processFile !== true) continue`,
-    // so a skip return quietly moves on. To actually error the file a classic plugin must throw (works in classic AND flow mode). A raw throw discards the
-    // returned response, so failFile rides the accumulated infoLog (input summary + the ☒ reason) along as the Error message, thrown with a leading \n so the
-    // log starts on its own line instead of glued onto Tdarr's "...Plugin error! Error:" wrapper. The dedicated AwkFailFile type lets the body's outer catch
-    // (failUnexpected) tell a DELIBERATE failure (rethrow unchanged) from an unexpected bug (annotate + wrap, still fail w/ log).
+    // -=-=-= AwkFailFile / failFile / failUnexpected [all five] =-=-=-
+    // Fail the whole file (Tdarr's error queue) carrying the full infoLog: a returned processFile:false is Tdarr's "no work / skip" signal, NOT a failure -
+    // only a throw errors the file. A raw throw discards the returned response, so failFile rides the accumulated infoLog along as the Error message,
+    // with a leading \n so the log starts on its own line instead of glued onto Tdarr's "...Plugin error! Error:" wrapper. The dedicated AwkFailFile type
+    // lets the body's outer catch (failUnexpected) tell a DELIBERATE failure (rethrow unchanged) from an unexpected bug (annotate + wrap, still fail w/ log).
     class AwkFailFile extends Error {}
     const failFile = (msg) => {
         response.infoLog += `☒${msg}\n`;
@@ -234,28 +232,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.infoLog += `☒Unexpected error: ${err && err.message ? err.message : err}\n`;
         throw new AwkFailFile(`\n${response.infoLog}`);
     };
-    // -=-=-= skip  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // The OTHER terminal, and the one the helpers above exist to be told apart from. A benign skip means there is nothing for this plugin to do:
-    // processFile:false is Tdarr's "no work needed" signal, NOT a failure - the file is left untouched and the flow moves on to the next plugin, whereas a
-    // genuine failure has to throw (failFile). Every call site keeps its own `return`, so a skip still reads as a terminal where it stands.
+    // -=-=-= skip [all five] =-=-=-
+    // The OTHER terminal: a benign skip means there is nothing for this plugin to do - the file is left untouched and the flow moves on. Every call site
+    // keeps its own `return`, so a skip still reads as a terminal where it stands.
     const skip = (msg) => { response.infoLog += msg; response.processFile = false; return response; };
     // ===== END SHARED: file-failure helpers =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
-    // -=-=-= codecTypeOf  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // The stream's kind - video / audio / subtitle / attachment / data - normalised once, and the single most repeated test in the suite. jellyfin-ffprobe
-    // emits a fixed lowercase enum with no padding, so the trim and the lowercase are pure defensiveness; one definition keeps every site defensive the SAME
-    // way. Per-site spellings would not be: a padded value seen by the trimmed sites and skipped by the untrimmed ones lets two guards documented as mirroring
-    // each other classify the same stream differently. Optional-chained, so a nullish stream reads as "no type" rather than throwing.
+    // -=-=-= codecTypeOf [all five] =-=-=-
+    // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
+    // a fixed lowercase enum, so trim+lowercase are pure defensiveness - but one definition keeps every site defensive the SAME way, where per-site
+    // spellings could classify the same stream differently. Optional-chained, so a nullish stream reads as "no type" rather than throwing.
     const codecTypeOf = (s) => (s?.codec_type || '').trim().toLowerCase();
     // ===== END SHARED: stream codec type =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: role/disposition classifiers =====
-    // -=-=-= dispositionTypes  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Classifiers group the real ffmpeg disposition flags into the roles the pipeline sorts and tags by. dispositionTypes is keyed by the ffmpeg disposition;
-    // each entry declares the valid stream types (streams), the keywords that also indicate it (each keyword lives on one flag so title->flag promotion stays
-    // unambiguous), and the canonical title string (tag, null when never written). hasDisposition gates on codec_type, matching keywords whole-token via
-    // matchesKeyword. Read by summariseStream, stream_ordering's sort keys, audio_clean's secondary-track detection, and clean_and_remux's title/flag tagging.
+    // -=-=-= dispositionTypes [all five] =-=-=-
+    // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each keyword
+    // lives on ONE flag so title->flag promotion stays unambiguous), and the canonical title string (tag, null when never written). The single table every
+    // classifier, sort key, summary token and title tagger reads, so the lists can never drift.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                                            tag: 'Commentary'  },
         visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','descriptions','dvs','audio description','described video','visually impaired','visual impaired'], tag: 'Descriptive' },
@@ -273,11 +268,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         still_image:      { streams:['video'],                    keywords: [],                                                        tag: null          },
         timed_thumbnails: { streams:['video'],                    keywords: [],                                                        tag: null          },
     };
-    // -=-=-= roleTextLower  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Scrapes role-signal text from BOTH probes: dispositions are often incomplete and a title/description/handler can live in ffprobe OR mediaInfo but not
-    // both, so every text field is unioned before classifying (mediaInfo joined by StreamOrder, via mediaInfoFor). Whole-token matchesKeyword keeps generic
-    // values like "SoundHandler" inert. hasDisposition calls it repeatedly per stream, so memoize by stream object (WeakMap, per-run closure - GC'd with the
-    // file, never shared across runs).
+    // -=-=-= roleTextLower [all five] =-=-=-
+    // Role-signal text unioned from BOTH probes - a title/description/handler can live in ffprobe OR mediaInfo but not both. Memoized by stream object
+    // (WeakMap, per-run closure) because hasDisposition calls it repeatedly per stream.
     const roleTextCache = new WeakMap();
     const roleTextLower = (s) => {
         if (roleTextCache.has(s)) return roleTextCache.get(s);
@@ -286,11 +279,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         roleTextCache.set(s, text);
         return text;
     };
-    // -=-=-= matchesKeyword  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Whole-token keyword matcher: a keyword matches only when not flanked by a letter/digit, so '[sdh]', 'eng-sdh', and 'sdh.' match while
-    // 'deafening'/'aboriginal' do not. An internal space matches any run of non-alphanumerics ('hearing impaired' == 'hearing_impaired'). Keywords are
-    // regex-escaped; the 'u' flag enables \p{L}/\p{N}. text must already be lowercased. The compiled regex is a pure function of the keyword list, so it is
-    // memoized by keyword-array identity (WeakMap, per-run closure, GC'd with the run) instead of recompiled on every classifier call.
+    // -=-=-= matchesKeyword [all five] =-=-=-
+    // Whole-token keyword matcher: a keyword matches only when not flanked by a letter/digit - '[sdh]', 'eng-sdh', 'sdh.' match, 'deafening' does not -
+    // and an internal space matches any run of non-alphanumerics ('hearing impaired' == 'hearing_impaired'). text must already be lowercased. The compiled
+    // regex is a pure function of the keyword list, so it is memoized by keyword-array identity rather than recompiled per classifier call.
     const keywordRegexCache = new WeakMap();
     const matchesKeyword = (text, keywords) => {
         if (!keywords.length) return false;
@@ -304,19 +296,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return re.test(text);
     };
-    // -=-=-= hasDisposition  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // -=-=-= hasDisposition [all five] =-=-=-
     const hasDisposition = (s, key) => {
         const entry = dispositionTypes[key];
         if (!entry) return false;
         if (!entry.streams.includes(codecTypeOf(s))) return false;
         return s.disposition?.[key] === 1 || matchesKeyword(roleTextLower(s), entry.keywords);
     };
-    // -=-=-= role classifiers: isCommentary / isDescriptive / isSdh / isLyrics  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // -=-=-= role classifiers: isCommentary / isDescriptive / isSdh / isLyrics [all five] =-=-=-
     const isCommentary  = (s) => hasDisposition(s, 'comment');
-    // A subtitle can carry the raw visual_impaired flag - mkvtoolnix writes it and sub_worker's sidecar round trip restores it - but the table scopes that key
-    // to audio, where it means an audio-description TRACK, so hasDisposition rejects it on a subtitle. Read the subtitle case as a RAW flag, deliberately NOT
-    // by widening the table entry: that would also let its audio-oriented keywords ('audio description', 'visually impaired') invent the role from a
-    // subtitle's title, which the subtitle summary explicitly refuses to allow. 'descriptions' remains the keyword-matched subtitle spelling of the same role.
+    // A subtitle can carry the raw visual_impaired flag (mkvtoolnix writes it; the sidecar round trip restores it) but the table scopes that key to audio.
+    // Read the subtitle case as a RAW flag, deliberately NOT by widening the table entry - that would let its audio-oriented keywords ('audio description')
+    // invent the role from a subtitle's title. 'descriptions' remains the keyword-matched subtitle spelling of the same role.
     const isDescriptive = (s) => hasDisposition(s, 'visual_impaired') || hasDisposition(s, 'descriptions')
         || (codecTypeOf(s) === 'subtitle' && s.disposition?.visual_impaired === 1);
     const isSdh         = (s) => hasDisposition(s, 'hearing_impaired') || hasDisposition(s, 'captions');
@@ -324,7 +315,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: role/disposition classifiers =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: image / cover-art codecs =====
-    // -=-=-= IMAGE_CODECS / isCoverArt  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // -=-=-= IMAGE_CODECS / isCoverArt [all five] =-=-=-
     // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last;
     // summariseStream flags them /cover. Two codecs that LOOK like they belong are deliberately ABSENT, for one reason: they are also real
     // moving-picture codecs. mjpeg/mjpegb is camcorder/AVI-era footage, and jpeg2000 is the DCP / IMF / broadcast-mezzanine codec - listing
@@ -338,7 +329,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: image / cover-art codecs =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: codec name resolution =====
-    // -=-=-= codecAliases  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // -=-=-= codecAliases [all five] =-=-=-
     // Prefix → canonical codec key (e.g. wmav1 → wma).
     const codecAliases = [
         ['pcm_alaw',  'g711'],   // G.711 A-law: LOSSY 8-bit companded telephony (64 kbps/ch), NOT lossless - carve out before the generic pcm_ fold
@@ -355,17 +346,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['mpegh',  'mpegh3d'],   // ffmpeg reports MPEG-H 3D Audio as mpegh_3d_audio; map it to the codecInfo key so it scores + gets object-audio protection
         ['aac_latm', 'aac'],     // AAC in MPEG-TS/LATM (broadcast/DVR .ts captures) reports codec_name aac_latm; fold to aac so it scores + displays as AAC, not an unknown codec
     ];
-    // -=-=-= resolveCodecName  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the _x variant when DTS:X is detected)
-    // and eac3/truehd into eac3atmos/truehdatmos. Used by audioQuality (audio_clean, stream_ordering), isLosslessSource (audio_clean), and summariseStream
-    // (all five) purely for accurate display labeling - a plugin that doesn't score audio still benefits from showing "eac3atmos"/"dtsx" instead of a bare
-    // "eac3"/"dts" in its logs. codec_long_name for DTS in MP4/M4V is "DCA (DTS Coherent Acoustics)" (no subtype keyword), so longName alone can't tell the
-    // subtypes apart there; we also check the stream profile ("DTS-HD MA"/"HRA"/"Express") and fall back to mediaInfo's Format_Commercial_IfAny ("DTS-HD
-    // Master Audio"), which decodes the substream header. Atmos comes from longName, the ffprobe profile ("... + Dolby Atmos"), or the commercial name
-    // (profile/commercial being the reliable ones - an E-AC-3 longName carries no Atmos marker); an editable title tag does not imply a real Atmos substream.
-    // DTS:X detection is best-effort: MediaInfo exposes it via Format_AdditionalFeatures containing "XLL X" (vs plain "XLL" for MA without X), but MediaInfo's
-    // own maintainers note this is incomplete for an undocumented format - expect a real DTS:X track to sometimes still classify as the
-    // plain (non-X) subtype, never the reverse (this only fires on an actual reported value, never on absence of one, so it can't produce a false positive).
+    // -=-=-= resolveCodecName [all five] =-=-=-
+    // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the _x variant when DTS:X is
+    // detected) and eac3/truehd into eac3atmos/truehdatmos - scoring for the carriers that score, accurate display labels for the rest. Each refinement
+    // checks longName, the ffprobe profile AND mediaInfo's Format_Commercial_IfAny, because no single source is complete: DTS longName in MP4/M4V is
+    // "DCA (DTS Coherent Acoustics)" with no subtype keyword, and an E-AC-3 longName carries no Atmos marker (an editable title tag never counts - it
+    // does not imply a real Atmos substream). DTS:X detection is best-effort: MediaInfo's own maintainers note the "XLL X" signal is incomplete for an
+    // undocumented format, so a real DTS:X track may still classify as the plain subtype - never the reverse, since detection only fires on an actual
+    // reported value, never on the absence of one.
     const resolveCodecName = (stream) => {
         let codec = (stream?.codec_name || '').toLowerCase().trim();
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
@@ -394,12 +382,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
             const DTS_X_VARIANT = { dtsma: 'dtsmax', dtshr: 'dtshrx', dts: 'dtsx', dtsexpress: 'dtsexpressx' };
             if (DTS_X_VARIANT[codec]) {
-                // MediaInfo marks DTS:X with the token "XLL X" in Format_AdditionalFeatures (plain DTS-HD is "XLL"). Match it as a
-                // whole trailing token (\bxll x\b) NOT a raw substring, so a hypothetical "XLL X96"/"XLL XBR" can't false-positive
-                // (those core-extension tokens attach to plain DTS core, which has no XLL, but the boundary check makes the guarantee literal).
+                // MediaInfo marks DTS:X as the token "XLL X" in Format_AdditionalFeatures (plain DTS-HD is "XLL"). Matched as a whole token, NOT a raw
+                // substring, so a hypothetical "XLL X96"/"XLL XBR" can't false-positive.
                 const additionalFeatures = (mi?.Format_AdditionalFeatures || '').toLowerCase();
-                // MediaInfo signal, plus an ffprobe fallback: jellyfin reports DTS:X in `profile` (e.g. "DTS-HD MA + DTS:X"), the only
-                // object-audio signal when Tdarr supplies no mediaInfo track. /dts:?x/ matches "dts:x"/"dtsx"; no plain-DTS profile carries it.
+                // ffprobe fallback: jellyfin reports DTS:X in `profile` ("DTS-HD MA + DTS:X") - the only object-audio signal when mediaInfo is absent.
                 if (/\bxll x\b/.test(additionalFeatures) || /dts:?x/.test(profile))
                     codec = DTS_X_VARIANT[codec];
             }
@@ -408,11 +394,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         return codec;
     };
-    // -=-=-= codecDisplayName  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Friendly single-token display string for a summary line, used only for the codecs resolveCodecName REFINES beyond the
-    // bare container codec_name - the DTS subtypes and object-audio layers a raw "dts"/"eac3" hides. Any other codec falls
-    // back to its own raw codec_name unchanged (so pcm_s16le keeps its bit depth, wmav2 stays wmav2, etc. - this only ever
-    // ADDS subtype detail, never collapses an already-informative name). Single hyphenated tokens keep the terse token style.
+    // -=-=-= codecDisplayName [all five] =-=-=-
+    // Friendly display token for the codecs resolveCodecName REFINES beyond the bare codec_name; anything else falls back to its own raw codec_name
+    // (pcm_s16le keeps its bit depth) - this only ever ADDS subtype detail, never collapses an already-informative name.
     const CODEC_DISPLAY = {
         dtsma:   'dts-hd-ma',   dtsmax:      'dts-hd-ma-x',
         dtshr:   'dts-hd-hr',   dtshrx:      'dts-hd-hr-x',
@@ -422,7 +406,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
     // ===== END SHARED: codec name resolution =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: mp4-family container =====
-    // -=-=-= isMp4Family  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // -=-=-= isMp4Family [all five] =-=-=-
     // The mp4/mov container family whose -c copy needs `-movflags use_metadata_tags` to keep sibling plugins' GLOBAL awk_* markers through the remux (dropping
     // one re-triggers work upstream); also the container test behind the mp4 `-strict` gates. One source so no consumer drifts on the set (video_clean's
     // video-only hvc1 gate is deliberately mp4/m4v/mov WITHOUT m4a and stays separate).
@@ -451,21 +435,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: case-insensitive tag lookup =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream / language / preset helpers =====
-    // -=-=-= mediaInfoFor  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Find the mediaInfo track corresponding to an ffprobe stream (matched by StreamOrder === ffprobe index); undefined when absent. The single join point
-    // between the two probes - resolveStreamBitrate/resolveChannels/resolveLang and the per-plugin language/loop sites all go through it.
-    // Deliberately NOT memoised, unlike the roleTextLower WeakMap nearby: the scan measures ~20 microseconds per file against a transcode measured in
-    // minutes, so a cache would only lengthen a byte-identical five-carrier section.
+    // -=-=-= mediaInfoFor [all five] =-=-=-
+    // The single join point between the two probes: the mediaInfo track whose StreamOrder equals the ffprobe index; undefined when absent. Deliberately
+    // NOT memoised (unlike roleTextLower's WeakMap): the scan measures ~20 microseconds per file against a transcode measured in minutes.
     const mediaInfoFor = (s) => (file?.mediaInfo?.track || []).find(t => Number(t.StreamOrder) === s.index);
-    // -=-=-= resolveLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Resolve a stream's language: ffprobe tags.language, then mediaInfo Language (files often tag one probe but not the other), trimmed + lowercased. Empty
-    // when neither reports it; callers wanting a placeholder use `resolveLang(s) || 'und'`.
+    // -=-=-= resolveLang [all five] =-=-=-
+    // ffprobe tags.language, else mediaInfo Language (files often tag one probe but not the other); '' when neither reports it - callers wanting a
+    // placeholder use `resolveLang(s) || 'und'`.
     const resolveLang = (s) => { const t = (s.tags?.language || '').trim(); return (t || (mediaInfoFor(s)?.Language ?? '')).trim().toLowerCase(); };
-    // -=-=-= resolveStreamBitrate  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // ffprobe first, then mediaInfo fallbacks: ffprobe can't read per-stream bitrates from the container atom for some formats (e.g. DTS-HD MA in MP4/M4V).
-    // mediaInfo order: measured BitRate, declared BitRate_Nominal, then a bytes-based measurement (StreamSize bytes * 8 / Duration seconds) - the last is a
-    // real measurement (MediaInfo usually derives BitRate from it, but some containers report size+duration without a bitrate field), far better than the
-    // codec-target estimate audioQuality falls back to. Returns 0 only when truly unknown. Used to enrich streams before summariseStream/audioQuality.
+    // -=-=-= resolveStreamBitrate [all five] =-=-=-
+    // ffprobe first, then mediaInfo: some formats hide per-stream bitrate from ffprobe (e.g. DTS-HD MA in MP4/M4V). mediaInfo order: measured BitRate,
+    // declared BitRate_Nominal, then StreamSize*8/Duration - still a real measurement, far better than the codec-target estimate audioQuality falls back
+    // to. Returns 0 only when truly unknown.
     const resolveStreamBitrate = (ffstream) => {
         const ffBitrate = Number(ffstream.bit_rate || 0);
         if (ffBitrate > 0) return ffBitrate;
@@ -483,10 +464,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return 0;
     };
 
-    // -=-=-= resolveChannels (+ channelsFromLayout helper)  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Resolve an audio stream's channel count, ffprobe first then fallbacks (mirrors resolveStreamBitrate): mediaInfo Channels, then a channel-layout string
-    // from ffprobe channel_layout or mediaInfo ChannelLayout/ChannelPositions - "5.1(side)" -> 6, "stereo" -> 2, "FL+FR+LFE" -> 3. Returns 0 only when no
-    // source reports it, so channel-dependent logic (scoring, dedup, downmix, labelling, codec forcing) stays correct for tracks whose ffprobe entry omits it.
+    // -=-=-= resolveChannels (+ channelsFromLayout helper) [all five] =-=-=-
+    // Audio channel count, ffprobe first then fallbacks (mirrors resolveStreamBitrate): mediaInfo Channels, then a channel-layout string from either probe
+    // - "5.1(side)" -> 6, "FL+FR+LFE" -> 3. Returns 0 only when no source reports it.
     const channelsFromLayout = (layout) => {
         const s = String(layout || '').toLowerCase().trim();
         if (!s) return 0;
@@ -508,59 +488,50 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return channelsFromLayout(ffstream.channel_layout || ffmedia?.ChannelLayout || ffmedia?.ChannelPositions);
     };
 
-    // -=-=-= enrichStream  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Enrich a stream with both-probe bitrate + channels before summariseStream/audioQuality/scoring, so ffprobe-unreadable values (e.g. DTS-HD MA
-    // bitrate in MP4) fall back to mediaInfo. Every summary and scoring call site uses this so logged tokens and the scoring path enrich identically.
+    // -=-=-= enrichStream [all five] =-=-=-
+    // Both-probe bitrate + channels enrichment; every summary and scoring call site uses it so logged tokens and the scoring path enrich identically.
     // The enriched .channels is NOT a drop-in for resolveChannels() in a numeric test: on a stream no probe can measure, resolveChannels returns 0 but the
     // `|| s.channels` fallback lands `undefined` here, and `undefined <= 0` is false - so any guard keying on 0 must call resolveChannels() itself.
     const enrichStream = (s) => ({ ...s, bit_rate: resolveStreamBitrate(s) || s.bit_rate, channels: resolveChannels(s) || s.channels });
-    // -=-=-= is10Bit  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // True when a video stream is 10-bit (or deeper): raw sample depth or mediaInfo BitDepth >= 10, a 10-to-16-bit pixel format (p10le through p16be), or a
-    // 10-bit profile (Main 10 / High 10). The pixel-format leg spans the whole range because it is the LAST resort - it only decides the answer when
-    // neither probe reports a depth, and a 12/14/16-bit master read as 8-bit is the costliest way to be wrong. The profile leg stays 10-only on purpose:
-    // the deeper HEVC/AVC profile names carry no depth digit ('Rext', 'High 4:4:4 Predictive'), and matching them would call an 8-bit 4:4:4 file 10-bit.
-    // Single source for summariseStream's 10bit token and video_clean's re-encode depth decision so the two can't drift.
+    // -=-=-= is10Bit [all five] =-=-=-
+    // 10-bit or deeper: raw sample depth / mediaInfo BitDepth >= 10, a p10le-p16be pixel format, or a 10-bit profile name. The pixel-format leg spans
+    // 10-16 because it is the LAST resort and a 12/16-bit master read as 8-bit is the costliest miss; the profile leg stays 10-only because the deeper
+    // profile names carry no depth digit ('Rext'), and matching them would call an 8-bit 4:4:4 file 10-bit. Single source for the 10bit token and
+    // video_clean's re-encode depth decision.
     const is10Bit = (s, mi = mediaInfoFor(s)) => Number(s.bits_per_raw_sample || mi?.BitDepth || 0) >= 10
         || /p(1[0-6])(le|be)?$|1[0-6]le|1[0-6]be/.test((s.pix_fmt || '').toLowerCase()) || /10/.test((s.profile || '').toLowerCase());
-    // -=-=-= FONT_EXTS + isFontMime  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // -=-=-= FONT_EXTS + isFontMime [all five] =-=-=-
     // Embedded-font file extensions + a font-mimetype test. Read by summariseStream's [attach:...] token and isFontAttachment (clean_and_remux/sub_worker).
     const FONT_EXTS = ['ttf', 'otf', 'ttc', 'otc', 'pfb', 'pfa', 'woff', 'woff2', 'eot'];
     const isFontMime = (mime) => /font|truetype|opentype|sfnt/.test(mime);
-    // -=-=-= HDR_TRANSFERS  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // The HDR transfer curves: ffmpeg's two HDR color_trc enums (smpte2084 = PQ, arib-std-b67 = HLG) plus the MediaInfo spellings (pq, hlg).
-    // The single source for every HDR-curve test: summariseStream's vHdr token below, and video_clean's isHdr / dvNoBaseLayer / tonemap-setparams gate.
+    // -=-=-= HDR_TRANSFERS [all five] =-=-=-
+    // The HDR transfer curves - ffmpeg's two HDR color_trc enums (smpte2084 = PQ, arib-std-b67 = HLG) plus the MediaInfo spellings (pq, hlg). The single
+    // source for every HDR-curve test.
     const HDR_TRANSFERS = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'];
-    // -=-=-= HDR10P_RE / VIVID_HDR_RE  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Recognises dynamic HDR from a lowercased HDR_Format string, split BY FORMAT because the two are not interchangeable downstream: HDR10+ has a lossless
-    // strip path (hevc_metadata=remove_hdr10plus, HEVC only) while HDR Vivid has none - no bitstream filter here can remove a CUVA block. The spellings are
-    // the ones real files use; a bare '2094' suffices for HDR10+ since only it carries a 2094 block (plain static HDR10 is SMPTE ST 2086), and production
-    // MediaInfo 23.07 spells Vivid 'HDR Vivid'. Every carrier reads the two SEPARATELY (summariseStream's hdr10+/vivid token); nothing here composes a
-    // union of them, because every decision but one wants a SINGLE format, and the union in scope invites the wrong test (video_clean, whose isDynamicHdr is
-    // that one exception, builds it as a local). DV is recognised separately (isDolbyVisionVideo / dvSignal). Note a probe limit these cannot cover: production
-    // MediaInfo 23.07 reports no Video track at all for an H.266/VVC file, so a VVC stream can never be recognised as dynamic HDR by any path here.
+    // -=-=-= HDR10P_RE / VIVID_HDR_RE [all five] =-=-=-
+    // Dynamic-HDR recognisers over a lowercased HDR_Format, split BY FORMAT because they differ downstream: HDR10+ has a lossless strip path
+    // (hevc_metadata=remove_hdr10plus, HEVC only), HDR Vivid/CUVA has none. A bare '2094' suffices for HDR10+ (plain static HDR10 is ST 2086 only), and
+    // production MediaInfo 23.07 spells Vivid 'HDR Vivid'. No union is composed here - every decision but video_clean's local isDynamicHdr wants a SINGLE
+    // format. DV is recognised separately (isDolbyVisionVideo). Probe limit: production MediaInfo 23.07 reports no Video track at all for H.266/VVC, so a
+    // VVC stream can never be recognised as dynamic HDR by any path here.
     const HDR10P_RE = /2094|hdr10\+|hdr10 plus/;
     const VIVID_HDR_RE = /hdr vivid|cuva/;
-    // -=-=-= isDdEx  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Dolby Surround EX: a rear-surround (6.1) channel matrix-folded into an ordinary 5.1 AC-3/E-AC-3, so the track carries strictly MORE than a plain 5.1
-    // twin while still decoding as plain 5.1 on a non-EX decoder. mediaInfo's Format_Settings_Mode is the flag's only home - ffprobe does not expose it. One
-    // definition so summariseStream's dd-ex token below and audio_clean's dedup tie-break (which keeps the EX copy over a plain 5.1 twin on an exact quality
-    // tie) can never disagree about what counts as EX.
+    // -=-=-= isDdEx [all five] =-=-=-
+    // Dolby Surround EX: a rear-surround (6.1) channel matrix-folded into an ordinary 5.1 AC-3/E-AC-3 - strictly MORE than a plain 5.1 twin, still decodes
+    // as plain 5.1. mediaInfo's Format_Settings_Mode is the flag's only home (ffprobe does not expose it). One definition so summariseStream's dd-ex token
+    // and audio_clean's dedup tie-break can never disagree about what counts as EX.
     const isDdEx = (s) => /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '');
-    // -=-=-= summariseStream  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Per type: video codec + resolution/10bit/hdr (+/cover for cover-art/still images); data & attachment codec only. Audio & subtitle append /default, then
-    // EVERY role marker that applies, so a track flagged two ways shows both. Audio: /commentary /description then /dub /original. Subtitle: /forced then
-    // /commentary /description /sdh /lyrics then /original. /default reads the REAL disposition flag alone - a title keyword must not flip that selection
-    // flag. Every other marker uses the same test the sort keys do (real flag OR title keyword, via hasDisposition and the shared classifiers) so every
-    // plugin's summary lines up - except the subtitle branch's /original, also read as a raw flag and display only, since no classifier scopes it to a
-    // subtitle. subrip is shown as srt to match the friendlier name used when this pipeline converts subtitles. Audio uses codecDisplayName so a DTS subtype
-    // or object-audio layer the container codec_name hides (dts-hd-ma, eac3-atmos, dts-express-x) shows in the token. The optional second argument describes a
-    // RE-ENCODED output track as { codec, channels, bps, rate } - see the audio branch for what an encode keeps and what it drops. Because of it, NEVER pass
-    // this helper straight to .map(): Array.map would supply the element index as that argument.
+    // -=-=-= summariseStream [all five] =-=-=-
+    // The [type:details] summary token. Audio & subtitle append /default then EVERY role marker that applies. /default reads the REAL disposition flag
+    // alone - a title keyword must not flip a selection flag; every other marker uses the same flag-OR-title-keyword test the sort keys use, so every
+    // plugin's summary lines up. Exception: the subtitle /original is a raw flag, display only - no classifier scopes it to subtitles. subrip shows as
+    // srt. Audio uses codecDisplayName so a DTS subtype or object-audio layer the container codec_name hides shows in the token. The optional second
+    // argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - so NEVER pass this helper straight to .map(): Array.map would
+    // supply the element index as that argument.
     const summariseStream = (s, out) => {
-        // Every value below that comes from container metadata rather than from ffprobe's own bounded tables is clamped through this: control characters
-        // become spaces (a raw newline would split the summary into a continuation line carrying no ☐/☑/☒) and the token is cut to 64 chars. Nothing bounds
-        // a language tag, an attachment filename or a mimetype, and the whole infoLog is persisted by Tdarr - the same reasoning that caps the workDone
-        // lines. 64 clears every real value: the longest registered mimetype subtype is 59 chars, and language codes and font extensions are far shorter.
+        // Container-supplied values (language tags, attachment filenames, mimetypes) are unbounded and the whole infoLog is persisted by Tdarr, so every
+        // one is clamped: control characters become spaces (a raw newline would split the summary line) and the token caps at 64 chars - the longest
+        // registered mimetype subtype is 59, everything else is far shorter.
         const tok = (v) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 64);
         const type = codecTypeOf(s);
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
@@ -574,10 +545,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const vTenbit = is10Bit(s, vmi);
             const vXfer = (s.color_transfer || vmi?.transfer_characteristics || '').toLowerCase().trim();
             const vHdr = HDR_TRANSFERS.includes(vXfer) || !!String(vmi?.HDR_Format || '').trim();
-            // HDR sub-type marker, shown in place of 'hdr'. Dolby Vision via the shared isDolbyVisionVideo (fourcc / mediaInfo HDR_Format / DOVI record) - also
-            // surfacing Profile-5 DV whose non-standard transfer sets no hdr flag. HDR10+ and HDR Vivid are stream-visible only via mediaInfo (ffprobe carries
-            // their metadata per-FRAME, which Tdarr doesn't probe), so both degrade to plain 'hdr' when mediaInfo is absent. A stream can carry BOTH at once
-            // (real DVB multiplexes do), so the token names every format present rather than picking a winner - 'hdr10+/vivid'.
+            // HDR sub-type marker, shown in place of 'hdr'. DV via the shared isDolbyVisionVideo - also surfacing Profile-5 DV whose non-standard transfer
+            // sets no hdr flag. HDR10+ and HDR Vivid are stream-visible only via mediaInfo (ffprobe carries their metadata per-FRAME, which Tdarr doesn't
+            // probe), so both degrade to plain 'hdr' without it. A stream can carry BOTH at once (real DVB multiplexes do), so the token names every
+            // format present - 'hdr10+/vivid'.
             const vHdrFmt = String(vmi?.HDR_Format || vmi?.HDR_Format_Compatibility || '').toLowerCase();
             const vDv = isDolbyVisionVideo(s, vmi);
             const vDynTok = [HDR10P_RE.test(vHdrFmt) ? 'hdr10+' : '', VIVID_HDR_RE.test(vHdrFmt) ? 'vivid' : ''].filter(Boolean).join('/');
@@ -586,37 +557,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return `[video:${vParts}${isCoverArt(s) ? '/cover' : ''}]`;
         }
         if (type === 'audio') {
-            // What survives a RE-ENCODE is decided here, once, so a plugin's before/after summary lines are built by the same rules. Language and the
-            // disposition markers carry through an encode and still read off the source stream; the source-only mediaInfo markers do NOT - a fresh encode
-            // has neither the source's Dolby Surround EX matrix nor its commercial subtype, so claiming either on the output would state something false.
+            // What survives a RE-ENCODE is decided here, once: language and disposition markers carry through and still read off the source stream; the
+            // source-only mediaInfo markers (EX matrix, commercial subtype) do NOT - a fresh encode has neither, so claiming them would be false.
             const chNum = out ? out.channels : s.channels;
             const ch = chNum ? `${chNum}ch` : '';
-            // An explicit pre-formatted rate string wins, because a VBR encode's rate is an ESTIMATE ('~192k') that cannot be known until the encode runs;
-            // otherwise format the bit rate - from the override when this is an output token, from the stream itself when it is not.
+            // An explicit pre-formatted rate string wins - a VBR encode's rate is an ESTIMATE ('~192k') that cannot be known until the encode runs.
             const bps = Number((out ? out.bps : s.bit_rate) || 0);
             const rate = (out && out.rate) || (bps > 0 ? `${Math.round(bps / 1000)}k` : '');
             const role = `${isCommentary(s) ? '/commentary' : ''}${isDescriptive(s) ? '/description' : ''}`;
             const prov = `${hasDisposition(s, 'dub') ? '/dub' : ''}${hasDisposition(s, 'original') ? '/original' : ''}`;
-            // Dolby Surround EX marker, via the shared isDdEx above - marks the EX copy so its token differs from a plain 5.1 twin.
             const surEx = !out && isDdEx(s) ? 'dd-ex' : '';
             // A re-encode is named by the codec it is being encoded TO - resolved through a bare object so no source profile/long-name/mediaInfo can leak in.
             const name = out ? codecDisplayName({ codec_name: out.codec }) : codecDisplayName(s);
             return `[audio:${[lang, ch, surEx, name, rate].filter(Boolean).join(' ')}${def}${role}${prov}]`;
         }
         if (type === 'subtitle') {
-            // A subtitle can also carry 'visual_impaired' and 'original' - mkvtoolnix writes either, and sub_worker's sidecar round trip restores them - but
-            // dispositionTypes scopes both to audio, where they mean an audio-description track and the original-language one. 'original' is therefore read as
-            // a RAW flag here: exactly like /default and /forced, a title keyword must not be able to invent one. visual_impaired needs no special case
-            // here - isDescriptive reads that subtitle-scoped raw flag itself, on the same terms, so the summary and the classifiers cannot disagree about it.
+            // A subtitle can also carry 'visual_impaired' and 'original' (mkvtoolnix writes either; the sidecar round trip restores them) but
+            // dispositionTypes scopes both to audio - so 'original' is read as a RAW flag here, exactly like /default and /forced: a title keyword must
+            // not be able to invent one. visual_impaired needs no special case - isDescriptive reads that raw flag itself.
             const descriptive = isDescriptive(s);
             const role = `${isCommentary(s) ? '/commentary' : ''}${descriptive ? '/description' : ''}${isSdh(s) ? '/sdh' : ''}${isLyrics(s) ? '/lyrics' : ''}`;
-            // flag OR title keyword, same test the classifiers use - so the summary token and the sort key can never disagree
             const forced = hasDisposition(s, 'forced') ? '/forced' : '';
             return `[sub:${[lang, codec].filter(Boolean).join(' ')}${def}${forced}${role}${s.disposition?.original === 1 ? '/original' : ''}]`;
         }
         if (type === 'attachment') {
-            // codec_name is often absent/'none' on attachments (fonts especially). Fall back to the filename extension, then the mimetype: fonts read 'font',
-            // everything else uses the mimetype SUBTYPE (image/png -> png, text/html -> html) so a removed attachment is legible by what it actually is.
+            // codec_name is often absent/'none' on attachments (fonts especially): fall back to the filename extension, then the mimetype - fonts read
+            // 'font', everything else the mimetype SUBTYPE (image/png -> png) - so a removed attachment is legible by what it actually is.
             let label = codec;
             if (label === 'unknown' || label === 'none') {
                 const mime  = (s.tags?.mimetype || '').trim().toLowerCase();
@@ -631,7 +597,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return `[attach:${tok(label)}]`;
         }
         if (type === 'data') {
-            // Prefer a meaningful codec_name; when it's absent/generic, surface the mimetype SUBTYPE (text/html -> html) so a removed data stream is legible.
+            // As for attachments: when codec_name is absent/generic, surface the mimetype SUBTYPE so a removed data stream is legible.
             const dmime = (s.tags?.mimetype || '').trim().toLowerCase();
             const dsub = dmime.includes('/') ? dmime.slice(dmime.indexOf('/') + 1).replace(/^x-/, '') : '';
             return `[data:${tok((codec === 'unknown' || codec === 'none') && dsub ? dsub : codec)}]`;
@@ -639,31 +605,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return `[${type || 'unknown'}:${codec}]`;
     };
 
-    // -=-=-= globalOutputOpt  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Output-side ffmpeg options applied to EVERY run (the place for any universal muxer/output flag). Two flags: -max_muxing_queue_size 9999 raises the
-    // muxer packet-buffer ceiling for ffmpeg's "Too many packets buffered" interleave error (chiefly a transcode/recovery concern; mostly vestigial on
-    // ffmpeg 7.x which auto-sizes the queue, but cheap insurance); -flush_packets 0 buffers muxer writes instead of flushing per packet - the throughput-
-    // optimal choice for FILE muxing (helps high-latency/network temp storage, negligible cost when local), so it is always applied, not exposed as a toggle.
+    // -=-=-= globalOutputOpt [all five] =-=-=-
+    // Output-side options applied to EVERY run (the place for any universal muxer/output flag). -max_muxing_queue_size 9999 pre-empts ffmpeg's "Too many
+    // packets buffered" interleave error (mostly vestigial on ffmpeg 7.x, cheap insurance); -flush_packets 0 buffers muxer writes instead of flushing per
+    // packet - throughput-optimal for file muxing, so always applied rather than exposed as a toggle.
     const globalOutputOpt = ' -max_muxing_queue_size 9999 -flush_packets 0';
 
-    // -=-=-= streamTag  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // infoLog stream tag: the SOURCE ffprobe index of the stream a line concerns, as a fixed 5-char field so columns line up ([s 0],[s 9],[s10],[s99];
-    // an index >=100 widens to [s100]). Sits right after the status symbol, before any [input=value] tag. Used only where a line is about ONE source
-    // stream - omitted on whole-file summaries and on brand-new/appended streams (imports, downmix appends) that have no source index of their own.
+    // -=-=-= streamTag [all five] =-=-=-
+    // infoLog stream tag: the SOURCE ffprobe index as a fixed 5-char field so columns line up (widens past [s99]). Omitted where a line concerns no single
+    // source stream - whole-file summaries, and brand-new/appended streams that have no source index of their own.
     const streamTag = (index) => `[s${String(index).padStart(2, ' ')}]`;
     // ===== END SHARED: stream / language / preset helpers =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language matching =====
-    // Normalize any language identifier to a stable comparison key so en / eng / EN / English / en-US - and ISO 639-2/B vs /T (fre vs fra) - all
-    // compare equal, letting each plugin's language-list input accept one form and match every equivalent tag. Node ships full ICU, so no table or
-    // module is needed. video_clean does no language matching, so it is the one plugin that does NOT carry this section.
+    // Normalize any language identifier to a stable comparison key so en / eng / EN / English / en-US - and ISO 639-2/B vs /T (fre vs fra) - all compare
+    // equal. Node ships full ICU, so no table or module is needed.
     // -=-=-= shortLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // Short language code: strip any region/variant suffix so 'en-US', 'en_US', 'en.US' all compare as 'en'.
     const shortLang = (l) => l.replace(/[-_.].*$/, '');
     // -=-=-= langNameIndex  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
-    // Reverse map English language NAME -> 2-letter code (english->en), built once per run by probing every aa..zz pair (fallback:'none' returns
-    // undefined for the invalid pairs, leaving the 190 real ISO 639-1 languages). Lazily built on first spelled-out name, then memoised for the run.
-    // Null-prototype so a container tag spelling an Object.prototype member ('constructor') misses the map instead of resolving to an inherited value.
+    // Reverse map English language NAME -> 2-letter code (english->en), lazily built by probing every aa..zz pair through Intl.DisplayNames, memoised for
+    // the run. Null-prototype so a container tag spelling an Object.prototype member ('constructor') misses the map instead of resolving inherited junk.
     const langNameIndex = (() => {
         let idx = null;
         return () => {
@@ -710,40 +672,33 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: language token failure =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: dolby vision detection =====
-    // -=-=-= DV_FOURCC_RE  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // The DV fourccs: HEVC dvhe/dvh1, AVC dvav/dva1, AV1 dav1. Named so the set has ONE definition - video_clean's dvCodecTag tests the same constant to build
-    // its encode-side dvSignal, which would otherwise carry a second copy of the literal that no structural check can compare against this one. Non-global, so
-    // `.test()` on one shared instance is stateless.
+    // -=-=-= DV_FOURCC_RE [all five] =-=-=-
+    // The DV fourccs: HEVC dvhe/dvh1, AVC dvav/dva1, AV1 dav1. Named so the set has ONE definition (video_clean's dvCodecTag tests the same constant).
+    // Non-global, so `.test()` on one shared instance is stateless.
     const DV_FOURCC_RE = /^(dvhe|dvh1|dvav|dva1|dav1)$/;
 
-    // -=-=-= isDolbyVisionVideo  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // True when a video stream carries Dolby Vision, both-probe: a dvhe/dvh1/dvav/dva1/dav1 fourcc, a mediaInfo HDR_Format naming Dolby Vision, or an ffprobe
-    // DOVI configuration record / dolby-vision side_data. The four -c copy plugins add `-strict unofficial` to an mp4/mov remux with it, so ffmpeg's mov
-    // muxer keeps the dvcC/dvvC config boxes (a plain copy drops them, demoting DV to plain HEVC - verified on a real sample). video_clean uses it only for
-    // the summariseStream [video:...dv] display token; its guard_dv ENCODE routing uses the NARROWER dvSignal (needs a parsed DOVI record) instead, since
-    // libx265 -dolbyvision hard-requires a real RPU (see the note there). Pass the stream's paired mediaInfo (mediaInfoFor(stream)); a single-probe false
-    // negative would silently lose the boxes.
+    // -=-=-= isDolbyVisionVideo [all five] =-=-=-
+    // Both-probe DV test: the fourcc, a mediaInfo HDR_Format naming Dolby Vision, or an ffprobe DOVI configuration record / dolby-vision side_data. Drives
+    // the -c copy plugins' `-strict unofficial` (mp4StrictArg) and the summariseStream dv token. video_clean's guard_dv ENCODE routing deliberately uses
+    // the NARROWER dvSignal instead - libx265 -dolbyvision hard-requires a real RPU (see the note there). Pass the stream's paired mediaInfo
+    // (mediaInfoFor(stream)); a single-probe false negative would silently lose the boxes.
     const isDolbyVisionVideo = (ffstream, ffmedia) => DV_FOURCC_RE.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
         || String(ffmedia?.HDR_Format || ffmedia?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : [])
             .some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
-    // -=-=-= mp4StrictArg  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
+    // -=-=-= mp4StrictArg [all five] =-=-=-
     // The ' -strict <level>' an mp4/mov -c copy needs, or '' when it needs none. Two independent reasons share one flag, because `experimental` is a strict
     // SUPERSET of `unofficial` and does both jobs:
-    //   experimental - a TrueHD stream copied INTO mp4, which the muxer otherwise refuses outright ("truehd in MP4 support is experimental, add '-strict -2'",
-    //                  rc 88); `unofficial` does NOT satisfy it. Matched on the raw codec_name, not resolveCodecName, whose refined truehdatmos would not equal
-    //                  'truehd'. mkv needs nothing, which is why the container test leads.
+    //   experimental - a TrueHD stream copied INTO mp4, which the muxer otherwise refuses outright (rc 88); `unofficial` does NOT satisfy it. Matched on
+    //                  the raw codec_name, not resolveCodecName, whose refined truehdatmos would not equal 'truehd'.
     //   unofficial   - a Dolby Vision video stream, so the mov muxer keeps its dvcC/dvvC boxes; a plain copy drops them, demoting DV to plain HEVC/AV1
-    //                  (verified on real HEVC + AV1 DV samples). Found via isDolbyVisionVideo with cover art excluded, so a leading cover-art stream cannot
-    //                  mask it (not just the first video stream); HEVC-DV, AVC-DV and AV1-DV all qualify.
-    // Pass the RAW file.ffProbeData.streams as `streams`: codec_tag_string / side_data_list (the DV signals) live only there. `copied` is the subset of them
-    // this run emits as a -c copy and defaults to all of them - a caller that drops or re-encodes tracks passes its own survivor list, so a TrueHD track on
-    // its way out never pulls in a flag the output does not need. clean_and_remux passes the set surviving its muxability gate, where a TrueHD arriving from
-    // a NON-mp4 source is refused, dropped or the reason the target falls back to mkv - so the only TrueHD that can reach this test there is one mp4 already
-    // held (see clean_and_remux's MP4_STRICT_GATED). Never decide this by regex over the half-built argument string: that string carries container-supplied
-    // -metadata title values verbatim, so a track titled " -strict foo" reads as a flag already emitted and the mp4 remux silently drops a DV file's boxes.
+    //                  (verified on real HEVC + AV1 DV samples). Cover art is excluded so a leading cover-art stream cannot mask a real DV stream.
+    // Pass the RAW file.ffProbeData.streams as `streams`: the DV signals (codec_tag_string / side_data_list) live only there. `copied` is the subset this
+    // run emits as -c copy (defaults to all) - a caller that drops or re-encodes tracks passes its own survivor list, so a TrueHD track on its way out
+    // never pulls in a flag the output does not need. Never decide this by regex over the half-built argument string: it carries container-supplied
+    // -metadata title values verbatim, so a track titled " -strict foo" reads as already-emitted and the remux silently drops a DV file's boxes.
     const mp4StrictArg = (container, streams, copied) => {
         if (!isMp4Family(container)) return '';
         const list = Array.isArray(streams) ? streams : [];
@@ -754,17 +709,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: mp4 strict compliance arg =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
-    // -=-=-= escMeta  [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean] =-=-=-
-    // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array and hands it to child_process.spawn, so shell
-    // metacharacters ($ ` ; |) are inert and reach ffmpeg as literal metadata bytes. The only injection vector is breaking out of the quoted value to
-    // inject a new ffmpeg ARGUMENT, which needs a double quote (to close the wrapper) or a control character. Tdarr's tokenizer strips quotes with no
-    // reliable backslash-escape convention, so we substitute rather than strip:
-    //    backslash          -> forward-slash (readable, inert)
-    //    double-quote       -> single-quote (safe inside the quoted value; preserves titles like "Director's Cut" and "AC3/Stereo")
-    //    control characters -> space (avoids fusing words that a bare delete would join)
-    //    <io>               -> (io), because that is the preset's OWN input/output split marker: Tdarr splits on it and keeps only the first two parts,
-    //                         so a second one inside a value silently DELETES every argument after it - the value is written truncated and the trailing
-    //                         stream drops, -metadata writes and muxer flags never reach ffmpeg, with no error from either Tdarr or ffmpeg.
+    // -=-=-= escMeta [all five] =-=-=-
+    // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array for child_process.spawn, so shell metacharacters
+    // ($ ` ; |) are inert. The only injection vector is breaking out of the quoted value to inject a new ffmpeg ARGUMENT, which needs a double quote or a
+    // control character; Tdarr's tokenizer strips quotes with no reliable backslash-escape convention, so we substitute rather than strip (each line below
+    // says how). <io> must also be neutralised: it is the preset's OWN input/output split marker, and a second one inside a value silently DELETES every
+    // argument after it - trailing -metadata writes and muxer flags never reach ffmpeg, with no error from either Tdarr or ffmpeg.
     const escMeta = (value) => String(value || '')
         .replace(/[\x00-\x1f\x7f]/g, ' ')  // control characters (newlines, null bytes, etc.) → space
         .replace(/\\/g, '/')               // backslash → forward-slash (inert, readable)
@@ -791,17 +741,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ffprobe reports back for a sidecar that row's encoder wrote (subrip for .srt, ass for .ass, webvtt for .vtt). Keep the canonical codec first.
     const TEXT_EXTS = [...new Set(Object.values(TEXT_SUB).map((t) => t.ext))];
     const EXT_TO_CODEC = Object.fromEntries(TEXT_EXTS.map((ext) => [ext, Object.keys(TEXT_SUB).find((c) => TEXT_SUB[c].ext === ext)]));
-    // STYLED subtitles render through fonts that exist only as attachments inside the container, so extracting one to a loose text file and letting the
-    // fonts be removed as orphaned destroys the styling irrecoverably. Such a subtitle is exported as a Matroska BUNDLE instead - the subtitle plus every
-    // font attachment in one file - so the fonts travel with it. Matroska is the only container that can do this: mp4/mov reject ass and carry no
-    // attachments at all, WebM allows only WebVTT, and a fonts-ONLY Matroska is not an option either (ffmpeg exits 0 but writes an unreadable file).
-    // .mks is Matroska's subtitle-only extension - .mkv/.mka would mux byte-identically, but a server that does NOT skip dotfiles (Emby scans them) would
-    // scan those as a video or a music track. Verified on jellyfin-ffmpeg 7.1.4: language, title, disposition and the font bytes all survive the round-trip.
-    // The fixed marker token before the extension is what makes a bundle name unambiguous: clean_and_remux's remove_imagesubs=export writes its own
-    // dot-prefixed .mks image-subtitle sidecars in the same "<base>.s<index>.<lang>[.forced]" shape, and importing one of those as a bundle would
-    // silently re-add the image subtitle that pass had just exported and removed. It is stripped before the disposition tokens, so it never occupies
-    // the language slot, and no disposition token spells 'styled'. clean_and_remux writes the token on its OWN styled-subtitle bundles for the same
-    // reason, so those DO come back through the import as bundles - which is the whole point of exporting them in that form.
+    // STYLED subtitles render through fonts that exist only as container attachments, so extracting one to a loose text file destroys the styling
+    // irrecoverably - it is exported as a Matroska BUNDLE instead, subtitle plus every font attachment. Matroska is the only container that can: mp4/mov
+    // reject ass and carry no attachments, WebM allows only WebVTT, and a fonts-ONLY Matroska writes unreadable. .mks is Matroska's subtitle-only
+    // extension (.mkv/.mka mux identically, but a server that scans dotfiles - Emby - would read those as a video/music track). Verified on
+    // jellyfin-ffmpeg 7.1.4: language, title, disposition and the font bytes all survive the round trip. The fixed marker token before the extension is
+    // what makes a bundle name unambiguous: clean_and_remux's remove_imagesubs=export writes dot-prefixed .mks IMAGE-subtitle sidecars in the same name
+    // shape, and importing one of those as a bundle would silently re-add the image subtitle that pass had just removed. clean_and_remux writes the token
+    // on its OWN styled bundles, so those DO come back through the import as bundles - the whole point of exporting them in that form.
     const BUNDLE_EXT = 'mks';
     const BUNDLE_TOKEN = 'styled';
 
@@ -842,17 +789,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // hearing-impaired flag and Hindi. Such a token counts as a disposition only when a real language sits immediately before it (Jellyfin's own rule),
     // so <name>.en.hi.srt is English+SDH while <name>.hi.srt stays a Hindi track. See the guard in parseSidecar's disposition loop.
     const DISP_AMBIGUOUS_LANG = new Set(['hi']);
-    // Flags that must survive the round trip but that NO media server understands as a filename token. They are written BEFORE the language instead of
-    // after it, in the same region as our s<index> anchor and encoded title - Plex/Jellyfin/Emby parse right-to-left from the extension, so everything
-    // ahead of the language is ignored by them while the trailing <lang>[.disp] they do read stays exactly as it was. Putting one in the trailing run
-    // instead would hand them an unknown flag where they expect a known one, which is how a sidecar silently stops being imported at all.
-    // Both are raw ffmpeg dispositions, NOT roles dispositionTypes classifies (that table scopes each to audio, where they mean the original-language track
-    // and an audio-description one), yet mkvtoolnix writes either on a subtitle. Reading the raw flag is deliberate: they are carried purely so extract ->
-    // import returns the stream exactly as it was found, which must not depend on a title keyword or on any title-tagging setting. Container limits,
-    // measured on jellyfin-ffmpeg rather than assumed: Matroska stores both and keeps them through a -c copy remux; mp4 drops 'original' at the muxer
-    // whatever we do, and cannot tell 'visual_impaired' from 'descriptions' (setting either reads back as BOTH), so an mp4 round trip can widen those two
-    // into each other. The tokens use ffmpeg's own spelling, and an underscore is also something a language token can never be - sidecarLangToken restricts
-    // a language to [a-z0-9-], so 'visual_impaired' cannot collide with one the way 'hi'/Hindi does.
+    // Flags that must survive the round trip but that NO media server understands as a filename token. Written BEFORE the language: the servers parse
+    // right-to-left from the extension, so everything ahead of the language is ignored while the trailing <lang>[.disp] they do read stays as it was - an
+    // unknown flag in the trailing run is how a sidecar silently stops being imported at all. Both are raw ffmpeg dispositions, NOT dispositionTypes roles
+    // (that table scopes each to audio), yet mkvtoolnix writes either on a subtitle; reading the raw flag is deliberate, so extract -> import returns the
+    // stream exactly as found regardless of any title keyword or tagging setting. Container limits, measured on jellyfin-ffmpeg: Matroska keeps both
+    // through a -c copy remux; mp4 drops 'original' whatever we do, and cannot tell 'visual_impaired' from 'descriptions' (either reads back as BOTH). The
+    // tokens use ffmpeg's own spelling, and an underscore is something a language token can never be (sidecarLangToken restricts to [a-z0-9-]), so
+    // 'visual_impaired' cannot collide with a language the way 'hi'/Hindi does.
     const EXTRA_DISPOSITIONS = [
         { token: 'original',        ff: 'original',        flags: ['original'] },
         { token: 'visual_impaired', ff: 'visual_impaired', flags: ['visual_impaired'] },
@@ -967,17 +911,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ===== SHARED [clean_and_remux, sub_worker]: sidecar placement =====
     // -=-=-= nodeConfig / isUnmappedNode / serverSidePath  [clean_and_remux, sub_worker] =-=-=-
-    // These two plugins are the only ones that write a file NEXT TO the library video, and where that file lands depends on the node. A MAPPED node sees
-    // the real library, so a sidecar emitted as an extra output of Tdarr's own ffmpeg run is written straight into it - and because the sidecar and the
-    // strip that follows are outputs of the SAME command, they succeed or fail together. An UNMAPPED node never sees the library at all: Tdarr mirrors the
-    // library tree under its unmappedNodeCache, downloads the file into that mirror, and uploads only the transcode RESULT back - so a sidecar written
-    // beside it is discarded with the job while the strip succeeds, the one shape that loses subtitle content. nodeType is the authority for that
-    // difference; a filesystem probe false-passes, because the mirror genuinely is a writable directory holding a real copy of the video.
+    // Where a sidecar lands depends on the node. A MAPPED node sees the real library, so a sidecar emitted as an extra output of Tdarr's own ffmpeg run
+    // lands in it - and sidecar + strip are outputs of the SAME command, so they succeed or fail together. An UNMAPPED node works in a mirror and uploads
+    // only the transcode RESULT back - a sidecar written beside it is discarded while the strip succeeds, the one shape that loses subtitle content.
+    // nodeType is the authority; a filesystem probe false-passes, because the mirror genuinely is a writable directory holding a real copy of the video.
     const nodeConfig = otherArguments?.configVars?.config || {};
     const isUnmappedNode = String(nodeConfig.nodeType || '').toLowerCase() === 'unmapped';
-    // A node path -> the server's own path for it, through the translators Tdarr auto-populates on an unmapped node (e.g. /media -> /cache/tiny/media).
-    // The longest node prefix wins, so a nested mapping beats the parent it sits under. '' means no translator claims the path, which makes the server-side
-    // destination unknowable rather than guessable - a caller must refuse the export instead of inventing one.
+    // A node path -> the server's own path for it, via the translators Tdarr auto-populates on an unmapped node; longest node prefix wins. '' means no
+    // translator claims the path - the destination is unknowable, and a caller must refuse the export instead of inventing one.
     const serverSidePath = (p) => {
         const hit = (Array.isArray(nodeConfig.pathTranslators) ? nodeConfig.pathTranslators : [])
             .filter((t) => t && t.node && String(p).startsWith(String(t.node)))
@@ -986,29 +927,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     // -=-=-= sidecarExistsRemote / placeSidecars  [clean_and_remux, sub_worker] =-=-=-
-    // The unmapped route, in one place: ask the server whether a sidecar is already there, then extract and upload the ones that are not. Tdarr runs the
-    // preset only AFTER the plugin returns, so there is no post-ffmpeg hook to upload from - extraction has to happen HERE, and be confirmed placed before
-    // the caller may strip the embedded stream. Both routes are gated server-side on "Allow unmapped Nodes and source/cache file access through API", and
-    // the server cannot have handed this job to an unmapped node with that off, so the transport needs no capability probe (it is also why a MAPPED node
-    // must keep writing directly - that option is off by default, so routing its sidecar through the API would fail on a normal install). curl through
-    // spawnSync because a classic plugin is synchronous: Tdarr does await the result, but making the whole plugin async would ripple through every caller
-    // for one branch that runs on unmapped nodes alone. Values go through --form-string so a comma or semicolon in a title can never be read as curl -F
-    // syntax, and the file part names a temp path built from an index, never from the sidecar name.
+    // The unmapped route: Tdarr runs the preset only AFTER the plugin returns, so there is no post-ffmpeg hook - extraction happens HERE and must be
+    // confirmed placed before the caller may strip the embedded stream. The API is gated server-side on "Allow unmapped Nodes and source/cache file access
+    // through API", and the server cannot have handed this job to an unmapped node with that off - so no capability probe, and also why a MAPPED node must
+    // keep writing directly (the option is off by default). curl through spawnSync because a classic plugin is synchronous. Values go through
+    // --form-string so a comma/semicolon in a title can never be read as curl -F syntax; the file part names an index-built temp path, never the sidecar name.
     const nullDevice = process.platform === 'win32' ? 'NUL' : '/dev/null';
-    // One ceiling for every spawn in this section. Bounded by the container's size and the node's storage rather than by the sidecar, so it is generous -
-    // but a hung ffmpeg or curl is killed rather than holding the worker forever. curl takes seconds and spawnSync milliseconds; deriving one from the
-    // other keeps the two spellings from drifting.
+    // One generous ceiling for every spawn here - a hung ffmpeg or curl is killed rather than holding the worker forever. curl takes seconds and spawnSync
+    // milliseconds; deriving one from the other keeps the two spellings from drifting.
     const SIDECAR_SPAWN_TIMEOUT_MS = 1800000;
     const SIDECAR_SPAWN_TIMEOUT_S = String(SIDECAR_SPAWN_TIMEOUT_MS / 1000);
-    // The server's base URL with any trailing slashes removed, so every caller can append '/api/v2/...' without doubling the separator. '' means the node
-    // config carries no server URL at all, which each caller has to treat as "no route" rather than building a request against an empty host.
+    // The server base URL, trailing slashes stripped. '' means the config carries no URL at all - "no route", never a request against an empty host.
     const serverApiUrl = () => String(nodeConfig.serverURL || '').replace(/\/+$/, '');
-    // The server API key authenticates every request in this section, and it is not scoped to one sidecar - it authorises upload and download across the
-    // whole library. As -H arguments it would sit in the node's process table (/proc/<pid>/cmdline is world-readable on Linux, and this route runs almost
-    // exclusively on dockerised Linux nodes) for the life of the spawn, readable by any other local account or co-tenant container. So the headers go in
-    // on STDIN as a curl config and argv carries only `--config -`, and only when there is a key at all. Every call site is free to use stdin for this:
-    // none of them feeds curl a body that way (-d is inline and -F opens the file itself). The value sits inside curl's double-quoted config syntax, so a
-    // backslash or quote in the key is escaped and control characters - which would end the line and start a fresh directive - are dropped.
+    // The API key authorises upload/download across the WHOLE library. As -H arguments it would sit in the process table (/proc/<pid>/cmdline is
+    // world-readable on Linux, where this route almost always runs) for the life of the spawn - so the headers go in on STDIN as a curl config and argv
+    // carries only `--config -`. No call site feeds curl a body via stdin, so it is free for this. Inside curl's double-quoted config syntax a backslash
+    // or quote is escaped, and control characters - which would end the line and start a fresh directive - are dropped.
     const apiAuthKey = () => String(nodeConfig.apiKey || '').replace(/[\x00-\x1f\x7f]/g, '').replace(/([\\"])/g, '\\$1');
     const apiAuthArgs = () => (apiAuthKey() ? ['--config', '-'] : []);
     const apiAuthInput = () => {
@@ -1016,8 +950,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return key ? `header = "x-api-key: ${key}"\nheader = "tdarrKey: ${key}"\nheader = "Authorization: Bearer ${key}"\n` : '';
     };
     // Is a non-empty sidecar already at this server path? Download is the only read the API offers, so the test IS a fetch - discarded to the null device
-    // and measured with curl's own counters, never buffered back through spawnSync (a large body silently exceeds maxBuffer and reports a failure that
-    // never happened). Absent is the common case and answers with a cheap 404, and a hit skips the extraction entirely.
+    // and measured with curl's own counters, never buffered through spawnSync (a large body silently exceeds maxBuffer and fakes a failure).
     const sidecarExistsRemote = (dest) => {
         const { spawnSync } = require('child_process');
         const url = serverApiUrl();
@@ -1029,13 +962,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return code === '200' && Number(got) > 0;
     };
     // -=-=-= uploadLibraryFile  [clean_and_remux, sub_worker] =-=-=-
-    // The multipart POST to /api/v2/file/upload, in ONE place: the sidecar placement below and sub_worker's import-list seeder send the same request, and
-    // the field ORDER is why it must not be spelled out twice - the server parses the stream as it arrives, so filePath and fileSize have to precede the
-    // file part or the upload is rejected as pathless. The 200 IS the verification: the server compares what it wrote against the fileSize field and
-    // reports success only when they match, a stronger check than this side could make. timeoutS is the caller's, because the two differ by orders of
-    // magnitude (a sidecar is bounded by the container, a list is a few hundred bytes). Returns { ok: true }, else { ok: false, why } - plus empty: true
-    // for the one failure that is a VERDICT rather than a fault, a staged file with no bytes in it. That flag is the signal callers key on; the prose in
-    // `why` is for the user, and nothing may re-derive meaning from its wording.
+    // The multipart POST to /api/v2/file/upload, in ONE place because the field ORDER is load-bearing: the server parses the stream as it arrives, so
+    // filePath and fileSize must precede the file part or the upload is rejected as pathless. The 200 IS the verification - the server compares what it
+    // wrote against fileSize. timeoutS is the caller's (a sidecar and a few-hundred-byte list differ by orders of magnitude). Returns { ok: true }, else
+    // { ok: false, why } - plus empty: true for the one failure that is a VERDICT, not a fault: a staged file with no bytes. Callers key on that flag;
+    // the prose in `why` is for the user, and nothing may re-derive meaning from its wording.
     const uploadLibraryFile = (dest, localPath, timeoutS) => {
         const { spawnSync } = require('child_process');
         const url = serverApiUrl();
@@ -1050,11 +981,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!up.error && code === '200') return { ok: true };
         return { ok: false, why: `upload rejected (${up.error ? (up.error.code || up.error.message) : `HTTP ${code || 'no response'}`})` };
     };
-    // Extract every pending sidecar in ONE ffmpeg pass (even a tiny subtitle stream demuxes the whole container, so a second pass would re-read the lot),
-    // then upload each to its server path through uploadLibraryFile. Returns the names genuinely in the library - a caller may strip only those, and
-    // anything in `failed` keeps its embedded stream, exactly as a refused export does. `empty` names the subset of `failed` whose extraction produced
-    // zero bytes: that is not a transport fault but an answer about the source ("this channel holds nothing"), and a caller may memoise it so no later
-    // pass pays for the same decode. It is a Set precisely so nobody has to read it back out of a prose message.
+    // Extract every pending sidecar in ONE ffmpeg pass (even a tiny subtitle stream demuxes the whole container), then upload each. Returns the names
+    // genuinely in the library - a caller may strip only those; anything in `failed` keeps its embedded stream, exactly as a refused export does. `empty`
+    // names the subset whose extraction produced zero bytes - an answer about the source, not a transport fault, memoisable so no later pass pays for the
+    // same decode. A Set precisely so nobody has to read it back out of a prose message.
     const placeSidecars = (jobs) => {
         const os = require('os');
         const { spawnSync } = require('child_process');
@@ -1063,10 +993,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const failAll = (why) => { for (const j of jobs) failed.set(j.name, why); return { placed, failed, empty }; };
         const url = serverApiUrl();
         if (!url) return failAll('the node config carries no server URL to upload through');
-        // A PRIVATE staging directory, not predictable names in the shared temp dir. os.tmpdir() is world-writable on Unix, so a name derived
-        // from the pid and an index can be pre-created as a symlink by any other local user, and ffmpeg's -y then writes THROUGH it - overwriting
-        // whatever it points at, as the Tdarr user. mkdtemp's 0700 directory closes that window outright rather than racing it. Inside it the
-        // names can stay trivially short, since nothing else can get in; they still come from our own extension table, never the sidecar name.
+        // A PRIVATE staging directory: os.tmpdir() is world-writable on Unix, so a predictable name can be pre-created as a symlink by another local
+        // user and ffmpeg's -y then writes THROUGH it, as the Tdarr user. mkdtemp's 0700 directory closes that window outright. Inside it names stay
+        // trivially short - still from our own extension table, never the sidecar name.
         let stageDir = '';
         try { stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'awk_sidecar_')); }
         catch (e) { return failAll(`could not create a staging directory (${e && e.message ? e.message : e})`); }
@@ -1316,13 +1245,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     // ============= UNMAPPED-NODE LIBRARY ACCESS (method_unmapped) =============
-    // An unmapped node is handed a local MIRROR of the library under unmappedNodeCache, never the library itself, and Tdarr withholds the user's own path
-    // translators from it - configVars.config.pathTranslators carries only the mirror mappings Tdarr generates, and librarySettings.folder is the mirror
-    // too. So the node can work out that the server calls this folder /media/Show and reach nothing at that path. Two ways out, both measured on a real
-    // Windows node rather than assumed:
-    //   mount     - the server's path may simply work (a container bind-mounting the library at /media), and otherwise a Node Tag names where THIS node
-    //               sees it ("media=M:\"). Tags are the only PER-NODE setting a classic plugin can read: they reach flow plugins directly but not this
-    //               one, so they are fetched from /api/v2/get-nodes using the serverURL, apiKey and nodeID the node config already carries.
+    // An unmapped node is handed a local MIRROR of the library, never the library itself, and Tdarr withholds the user's own path translators from it -
+    // so the node can work out that the server calls this folder /media/Show and reach nothing at that path. Two ways out, both measured on a real
+    // Windows node:
+    //   mount     - the server's path may simply work (a container bind-mount), and otherwise a Node Tag names where THIS node sees it ("media=M:\").
+    //               Tags are the only PER-NODE setting a classic plugin can read - fetched from /api/v2/get-nodes with the serverURL/apiKey/nodeID the
+    //               node config already carries.
     //   text_file - no directory access at all; the user lists the filenames and each is fetched by name through the download API.
     const unmappedMode = String(inputs.method_unmapped || 'error').toLowerCase();
     const SUBTITLE_LIST_SUFFIX = '.subtitles.txt';
@@ -1458,16 +1386,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return r.status === 0 ? `HTTP ${code || 'no response'}` : `the transfer did not complete (curl exit ${r.status === null ? 'signalled' : r.status})`;
     };
 
-    // Pull every listed sidecar into this node's own copy of the library folder, at the same relative path. Everything downstream - the dedup hash, the
-    // -i inputs, the marker - then works on ordinary local files and needs to know nothing about how they arrived. The copy lives in the throwaway
-    // mirror, which is the right place for it: it is consumed by this one mux and goes with the job. A name that is missing because we already imported
-    // it and cleaned it up is the list going stale in the ordinary way, not a problem: the list is seeded once and never rewritten, so it still names
-    // files whose whole purpose has been served. The marker is what tells the two apart - it records what an earlier pass embedded - and without that
-    // distinction a completed round trip reports itself as one warning per subtitle it successfully handled. The NAME is checked before anything is
-    // fetched. readSubtitleList only proves an entry stays inside the video's folder; it says nothing about the entry being a subtitle, and the
-    // destination is path.join(libDir, rel) in the mirror that also holds the video being transcoded - so a line naming the video itself would have
-    // curl truncate it, or delete it outright on an HTTP error, before the first name test downstream ever ran. An entry has to parse as a sidecar to
-    // be usable at all (that is exactly what the import filters on), so testing it here costs nothing and is the only place the test is in time.
+    // Pull every listed sidecar into this node's mirror at the same relative path - everything downstream (dedup hash, -i inputs, marker) then works on
+    // ordinary local files. A name missing because an earlier pass imported and cleaned it up is the list going stale in the ordinary way (the list is
+    // seeded once, never rewritten); the marker is what tells that apart from a failure - without it a completed round trip reports one warning per
+    // subtitle it successfully handled. The NAME is checked BEFORE anything is fetched: readSubtitleList only proves an entry stays inside the video's
+    // folder, and the destination is in the mirror that also holds the video being transcoded - a line naming the video itself would have curl truncate
+    // it, or delete it on an HTTP error, before any downstream test ran. An entry has to parse as a sidecar to be usable at all, so testing here costs
+    // nothing and is the only place the test is in time.
     const fetchListedSidecars = (rels, listName, embeddedAlready) => {
         const got = [];
         for (const rel of rels) {
@@ -1718,18 +1643,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return out;
     };
 
-    // Does a marker-listed sidecar RESEMBLE something in the file? The marker records what the last import muxed and NOTHING ever clears it, so an
-    // extract pass strips the subtitles and leaves a tag behind still naming them, and the marker VALUE is ordinary container metadata any file can
-    // carry. Both readers therefore confirm it against the streams as they stand rather than trusting it. This is the METADATA half: an embedded
-    // subtitle matches on language + title, the identity our own import writes. On an mp4/mov target the container DROPS per-stream subtitle titles
-    // on the -c copy mux, so a re-probe cannot see the title - there we match on LANGUAGE alone, else a titled sidecar we DID embed never matches
-    // its now-title-less stream. A bundle additionally has to see a font attachment in the file: carrying fonts is its whole reason to exist, so
-    // confirming only its subtitle would let the archive go while the styling stayed broken. Metadata can only ever say "something like this is
-    // here", never "this one is here" - a sidecar the user edited keeps its name and matches just as well - so it decides alone only for a bundle
-    // (an archive is not comparable text) or when the text cannot be read at all. Otherwise both readers require the sidecar's own bytes to be one
-    // of the tracks. Only a TEXT subtitle can be the embedded copy of a loose sidecar - a PGS/VobSub track holds pictures and could never hold the
-    // sidecar's text at all - so a bitmap stream is not eligible to stand in for one however well its language and title happen to match. A bundle
-    // keeps the whole subtitle set in view: an .mks is confirmed by the fonts travelling with it, and its own subtitle is styled text either way.
+    // Does a marker-listed sidecar RESEMBLE something in the file? The marker records what the last import muxed and NOTHING ever clears it (an extract
+    // pass strips the subtitles and leaves the tag still naming them, and the value is ordinary container metadata any file can carry), so both readers
+    // confirm it against the streams as they stand rather than trusting it. This is the METADATA half: match on language + title, the identity our import
+    // writes - except on an mp4/mov target, which DROPS per-stream subtitle titles on the mux, so there language alone decides (else a titled sidecar we
+    // DID embed never matches its now-title-less stream). A bundle additionally has to see a font attachment - carrying fonts is its reason to exist.
+    // Metadata can only say "something like this is here", never "this one is here" (an edited sidecar keeps its name and matches just as well), so it
+    // decides alone only for a bundle (an archive is not comparable text) or when the text cannot be read; otherwise the sidecar's own bytes must be one
+    // of the tracks. Only a TEXT subtitle can stand in for a loose sidecar - a PGS/VobSub track holds pictures, however well its metadata matches.
     const markerConfirmsEmbedded = (f, subs, anyFont, mp4Target) => (!f.bundle || anyFont)
         && subs.filter((s) => f.bundle || isTextSub(s.codec_name)).some((s) =>
             langKey(resolveLang(s) || 'und') === langKey(f.lang || 'und') && (mp4Target || (s.tags?.title || '') === (f.title || '')));
@@ -2213,19 +2134,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     fontIndices.length === 1 ? '' : 's'} - now archived in the styled-subtitle bundle\n`;
             }
             if (titleTruncated) response.infoLog += '☒A subtitle title was too long for the filename and was truncated\n';
-            // sidecarOut rather than wrote, because on an unmapped node the sidecars are already written and only a removal still needs a remux: with
-            // remove_source off there is then genuinely nothing left for ffmpeg to do, and emitting a whole-file copy would earn nothing. Three distinct
-            // endings, and only one of them is a failure: extraction that was ASKED FOR and left NOTHING in the library - every eligible subtitle refused,
-            // whether by an unsafe library path or a placement that would not land. Returning processFile:false there files the video under success and the
-            // subtitles are never extracted, with nothing to draw the eye. A run where some sidecars did land keeps going and carries its ☒ lines into a
-            // successful log; that is a partial result, not a failed one - and a sidecar an earlier pass already placed (skipped) is landed just as much as
-            // one written this pass, since sitting in the library is the only property the rest of the round trip depends on. Removing captions is a BITSTREAM
-            // edit, so it has its own two routes rather than a -map exclusion. Where the source qualifies it happens right here, in the same -c copy pass as
-            // the extraction. Where it does not, the request is recorded in awk_cc and video_clean carries it out the next time it re-encodes this file -
-            // which is the only other moment the caption data can be touched. Saying so matters: until then a player shows the captions AND the new subtitle,
-            // and a user who was not told would read that as a failed export. Gated on ccPlaced, not merely on a caption job having been PLANNED: the removal
-            // may only follow a copy the library is confirmed to hold, which is the same rule an ordinary subtitle stream's removal already follows one screen
-            // above. A channel proven EMPTY asks for nothing either - there is nothing to remove, and the `none` memo already stops the decode repeating.
+            // sidecarOut rather than wrote: on an unmapped node the sidecars are already written, and with remove_source off there is genuinely nothing
+            // left for ffmpeg to do. Three endings, only one a failure: extraction ASKED FOR that left NOTHING in the library (every eligible subtitle
+            // refused) - processFile:false there would file the video under success with the subtitles never extracted. A run where some sidecars landed
+            // keeps going and carries its ☒ lines into a successful log (a partial result, not a failed one); a sidecar an earlier pass placed is landed
+            // just as much as one written this pass. Removing captions is a BITSTREAM edit with its own two routes: where the source qualifies it happens
+            // right here, in the same -c copy pass; otherwise the request is recorded in awk_cc for video_clean's next re-encode - saying so matters,
+            // because until then a player shows the captions AND the new subtitle. Gated on ccPlaced, not on a job having been PLANNED: removal may only
+            // follow a copy the library is confirmed to hold. A channel proven EMPTY asks for nothing - the `none` memo already stops the decode repeating.
             let ccStrip = '';
             if (ccPlan.job && ccPlaced && removeSource && !ccRecord.has(CC_TOKENS.none)) {
                 if (ccStripAllowed()) {
@@ -2515,16 +2431,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const all = embeddedTextHashes(embeddedSubs);
             return all && new Map([...all].filter(([idx]) => !removedIndices.has(idx)));
         };
-        // The CONTENT half of the same rule (the marker is never cleared - see markerConfirmsEmbedded). What is specific to THIS site: a sidecar
-        // the user EDITED between two passes keeps its name, so metadata still matches while the text no longer does. A group is therefore settled
-        // only once its own bytes are one of the surviving tracks, or that edit would be skipped as "already embedded" and silently never reach
-        // the file. A bundle is an archive rather than comparable text, and a probe that could not run proves nothing either way, so both fall
-        // back to the marker's metadata match. Group-level by construction: every member of a group is byte-identical. A sidecar with no CUES of
-        // its own can never be confirmed by content: importing it produces a track that decodes to nothing and so gets no hash at all (see
-        // embeddedTextHashes), so "its bytes are not among the surviving hashes" would hold on every pass and the marker skip could never fire
-        // - the same empty subtitle would be muxed in again on every cycle, one more dead track each time. Content settles nothing here, so the marker's
-        // metadata match decides, exactly as it does for a bundle. An unreadable or oversized sidecar answers false and takes the ordinary content route,
-        // which imports - the recoverable direction.
+        // The CONTENT half of the same rule (the marker is never cleared - see markerConfirmsEmbedded). Specific to THIS site: a sidecar the user EDITED
+        // keeps its name, so metadata still matches while the text no longer does - a group is settled only once its own bytes are one of the surviving
+        // tracks, or that edit would be skipped as "already embedded". A bundle (archive, not comparable text) and a probe that could not run fall back to
+        // the marker's metadata match. Group-level by construction: every member is byte-identical. A sidecar with no CUES can never be confirmed by
+        // content - importing it produces a track that decodes to nothing and gets no hash, so the marker skip could never fire and the same empty
+        // subtitle would be muxed in again every cycle, one more dead track each time; the marker's metadata match decides there too. An unreadable or
+        // oversized sidecar answers false and takes the ordinary content route, which imports - the recoverable direction.
         const groupHasNoCues = (f) => {
             try {
                 const p = path.join(workLibDir(), f.rel);
@@ -2568,15 +2481,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             for (const [idx, eh] of embeddedHashes) if (eh === h) return idx;
             return null;
         };
-        // A track that is already in the file needs no mux, so the only open question is its METADATA - and unlike a new track, it has metadata of
-        // its own to disagree with. method_import_metadata decides who wins. 'embedded' keeps the track's tags and reports the difference: a sidecar
-        // name is frozen at the moment it was written, so an old one carries no token for a flag that did not exist yet, and applying it would STRIP
-        // that flag off a track that has it. 'sidecar' makes the filename authoritative, which is what makes renaming a sidecar a way to retune the
-        // track already in the file - dispositions included, written as an explicit 0 when the name carries none so a flag removed by renaming
-        // actually goes away. Comparison ignores per-stream titles on mp4/mov, where the muxer drops them and a re-probe can never see one.
-        // retunedAt records the SOURCE index of every track a sidecar name retunes, so the embedded-dedup fold below can be told to leave that track
-        // alone. Both address an output subtitle by its position among the surviving streams, and ffmpeg takes the LAST -metadata/-disposition for a
-        // slot - so without this the fold, appended last, silently overwrites a retune the log has already announced as done.
+        // A track already in the file needs no mux, so the only open question is its METADATA - and unlike a new track it has metadata of its own to
+        // disagree with. method_import_metadata decides who wins: 'embedded' keeps the track's tags and reports the difference (a sidecar name is frozen
+        // when written, so an old one carries no token for a flag that did not exist yet, and applying it would STRIP that flag); 'sidecar' makes the
+        // filename authoritative - renaming a sidecar retunes the track, dispositions included, written as an explicit 0 when the name carries none.
+        // Comparison ignores per-stream titles on mp4/mov (the muxer drops them). retunedAt records each retuned SOURCE index so the embedded-dedup fold
+        // below leaves that track alone - ffmpeg takes the LAST -metadata/-disposition for a slot, so the fold, appended last, would silently overwrite a
+        // retune the log already announced as done.
         const alreadyInFile = []; const toMux = []; let retuneMeta = ''; const retunedAt = new Set();
         for (const f of merged) {
             const at = embeddedAt(f);
@@ -2609,17 +2520,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 named || 'no language, title or flags'})\n`;
         }
 
-        // Sidecars that were only ever redundant, with nothing at all to mux alongside them. There is no transcode to wait on here, so the deletion the user
-        // asked for happens now rather than in the post-processing pass that normally does it - and it is safe precisely because these files never entered the
-        // marker: a sidecar this pass muxed is filtered out upstream by alreadyEmbedded, so anything reaching here had its content in the file BEFORE this flow
-        // started, and is therefore in the accepted library copy no matter what the rest of the flow does or how it ends. It requires REACHING the library,
-        // which placeViaApi() is exactly the negation of. Without that, workLibDir() is the node-local mirror: under method_unmapped=text_file the sidecars
-        // there are the copies just downloaded to compare against, so unlinking them removes this run's own scratch files and reports a deletion that never
-        // touched the library. Nor can the usual route stand in - the file API has no delete, and with nothing to mux there is no transcode, no acceptance, and
-        // therefore no server-side pass to clean up afterwards. Nothing can do this job from here, so it says so and leaves the sidecars alone rather than
-        // claiming a deletion it did not perform. Both sidecar-cleanup shortcuts below require that the mux branch has nothing to do, so their condition must
-        // be the exact negation of its trigger (toMux || retuneMeta || removedIndices) - a queued embedded-dedup drop is work on the FILE, independent of
-        // whether any sidecar still needs importing, and returning here would discard it silently, leaving the duplicate in place with nothing logged.
+        // Sidecars that were only ever redundant, with nothing to mux alongside them: no transcode to wait on, so the deletion happens now rather than in
+        // post-processing - safe precisely because these never entered the marker (anything reaching here had its content in the file BEFORE this flow
+        // started, so it is in the accepted library copy however the flow ends). Requires REACHING the library, which placeViaApi() is the negation of:
+        // without that, workLibDir() is the node-local mirror, and under text_file the sidecars there are this run's own downloaded scratch copies -
+        // unlinking them reports a deletion that never touched the library. Nor can any other route stand in (the file API has no delete; with nothing to
+        // mux there is no acceptance and no server-side pass), so it says so and leaves them alone rather than claim a deletion it did not perform. Both
+        // cleanup shortcuts below must be the EXACT negation of the mux branch's trigger (toMux || retuneMeta || removedIndices) - a queued embedded-dedup
+        // drop is work on the FILE, and returning here would discard it silently.
         if (!toMux.length && !retuneMeta && !removedIndices.size && alreadyInFile.length && removeSource && placeViaApi()) {
             const stranded = alreadyInFile.flatMap((f) => f.members.map((m) => m.rel));
             // Forcing twice for the same sidecar is worse than not forcing at all: Tdarr ERRORS a file whose consecutive passes emit identical arguments
