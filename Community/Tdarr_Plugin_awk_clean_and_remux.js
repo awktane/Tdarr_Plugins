@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.24.0',
+    Version: '4.25.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -45,8 +45,9 @@ const details = () => ({
                 \\n=====
                 \\nmkv (default): keeps almost everything. Removes ttml, xsub and dvb_teletext, plus any other subtitle format the mkv muxer cannot carry
                 and ffmpeg cannot read as text. mov_text becomes srt, and a closed-caption (eia_608) track becomes plain text.
-                \\nmp4: also removes the image-based subtitles mkv keeps (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle), plus arib_caption and
-                hdmv_text_subtitle. Text subtitles (subrip, srt, ass, ssa, webvtt, text, eia_608) become mov_text - except a STYLED ass/ssa, which is
+                \\nmp4: also removes hdmv_pgs_subtitle and dvb_subtitle, plus arib_caption and hdmv_text_subtitle. dvd_subtitle (VobSub) survives -
+                mp4 stores it as mp4s - so remove_imagesubs alone decides its fate.
+                Text subtitles (subrip, srt, ass, ssa, webvtt, text, eia_608) become mov_text - except a STYLED ass/ssa, which is
                 exported as a font bundle rather than flattened. HEVC video is tagged hvc1 so Apple and QuickTime can play it.`,
         },
         {
@@ -195,7 +196,8 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nunsupported (default): keep them wherever the container can carry them (mkv), and drop them only where it cannot (mp4).
+                \\nunsupported (default): keep them wherever the container can carry them - all three on mkv, VobSub only on mp4 - and drop them
+                only where it cannot (PGS and DVB on mp4).
                 \\nall: remove every image-based subtitle from any container. Use this when you only want text subtitles.
                 \\nexport: save each one to a hidden sidecar beside the video (PGS -> ".<name>.<lang>.sup", VobSub/DVB -> ".<name>.<lang>.mks") and then
                 remove it. The leading dot keeps Plex and Jellyfin from indexing it. Run an external OCR tool over the sidecars to produce .srt, then
@@ -1118,11 +1120,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // alwaysDropSubs = unmuxable by BOTH containers AND not decodable to text: xsub (no Matroska CodecID, no mp4 tag - AVI is its only home) and
     // dvb_teletext (matroska rejects it; it CAN decode to srt, but only with a per-broadcaster teletext PAGE ffprobe does not expose - guessing yields the
     // whole teletext service, ~1300x the size). mkvOnlyDropSubs = carried by mp4 but not mkv: ttml muxes into mp4 as stpp (verified) while matroska has no
-    // CodecID for it. mp4OnlyDropSubs = fine in mkv, not mp4: the image-based PGS/VobSub/DVB formats, plus arib_caption and hdmv_text_subtitle
-    // (decode-only for mp4). arib_caption is effectively unreachable - no libaribb24 in the build, so ARIB captions arrive as bin_data streams.
+    // CodecID for it. mp4OnlyDropSubs = fine in mkv, not mp4: PGS and DVB (the mp4 muxer answers "Could not find tag for codec X in stream #N", measured),
+    // plus arib_caption and hdmv_text_subtitle (decode-only for mp4). VobSub is deliberately NOT here - mp4 DOES carry dvd_subtitle, as the private mp4s/0xE0
+    // object type: -c copy exits 0, codec_tag reads mp4s, the 152-byte palette extradata survives, ffmpeg decodes and renders it, and MediaInfo 23.07 reads it
+    // back as Format VobSub / CodecID mp4s-E0. It needs no -strict and no conversion. arib_caption is effectively unreachable - no libaribb24 in the build, so
+    // ARIB captions arrive as bin_data streams.
     const alwaysDropSubs  = ['xsub', 'dvb_teletext'];
     const mkvOnlyDropSubs = ['ttml'];
-    const mp4OnlyDropSubs = ['hdmv_pgs_subtitle', 'dvd_subtitle', 'dvb_subtitle', 'arib_caption', 'hdmv_text_subtitle'];
+    const mp4OnlyDropSubs = ['hdmv_pgs_subtitle', 'dvb_subtitle', 'arib_caption', 'hdmv_text_subtitle'];
     // Legacy PC/fansub text codecs with no Matroska CodecID and no native mp4 support: a bare -c copy would fail the
     // remux, but ffmpeg decodes them as text, so BOTH container branches below convert them (mkv -> srt, mp4 -> mov_text).
     // Hoisted once so the two branches can't drift (a codec added to one list but not the other aborts a remux).
@@ -1177,8 +1182,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return MP4_UNMUXABLE.includes(codec) ? 'mp4' : '';
     };
     // ====== END AUDIO / VIDEO CODEC x CONTAINER MUXABILITY ======
-    // Image-based subtitles (PGS/VobSub/DVB) mkv muxes natively; remove_imagesubs governs them (mp4 drops them via mp4OnlyDropSubs
-    // regardless). xsub is image-based too and stays in alwaysDropSubs because it muxes into NO container - but it is still EXPORTABLE:
+    // Image-based subtitles: mkv muxes PGS/VobSub/DVB natively and mp4 carries VobSub alone (as mp4s), so remove_imagesubs governs all three,
+    // while mp4OnlyDropSubs additionally drops PGS and DVB on mp4. xsub is image-based too and stays in alwaysDropSubs because it muxes into NO
+    // container - but it is still EXPORTABLE:
     // AVI is its native home and a -c:s copy into one preserves the codec and every packet (verified). Being in both lists is the point -
     // the export is the user's choice, the drop is not. IMAGE_SUB maps each image codec to its sidecar container: PGS -> raw .sup,
     // VobSub/DVB -> a single-stream Matroska .mks (no vobsub muxer exists), xsub -> .avi, all via -c:s copy. What decides the mapping is
