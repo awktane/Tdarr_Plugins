@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.25.0',
+    Version: '4.26.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1805,8 +1805,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 continue;
             }
 
-            //Original stream title: ffprobe's tag, falling back to mediaInfo's Title (a title this plugin writes lands in both).
-            const streamTitle = (ffstream.tags?.title || ffmedia?.Title || '');
+            // mediaInfo does not report a track's title on its own: it JOINS the container's HANDLER to it with " / ", and the ORDER is per-container -
+            // measured on the bundled MediaInfoLib 23.07, mp4 puts the handler first ("Main Feature / Movie.2020.x264-GRP") and mkv puts the title first.
+            // So filter by PART, never by prefix, and never compare the whole string: an exact-equality test sees nothing and a dot count over the join
+            // charges the handler's periods to the title. What is left is the track's own title, empty when the handler was all of it. This is needed at all
+            // because ffprobe does not surface an mp4 track's udta/name box, so on mp4 the joined mediaInfo Title is the ONLY place a per-track title
+            // appears. The handler itself is normalised separately by emitHandlerMeta. Read it case-insensitively - matroska stores the key uppercase.
+            // MediaInfoLib drops the Title entirely when the handler contains "Handler" (capital H, case-sensitive) or " handler", so the *Handler
+            // boilerplate never reaches here; what does is the naming that escapes that filter, Apple's "Core Media Audio"/"Core Media Video" above all.
+            const mediaTitleSansHandler = () => {
+                const handler = (getTagCI(ffstream.tags, 'handler_name') || '').trim();
+                const mediaTitle = (ffmedia?.Title ?? '').trim();
+                if (!handler || !mediaTitle) return mediaTitle;
+                return mediaTitle.split(' / ').filter((part) => part.trim() !== handler).join(' / ').trim();
+            };
+            //Original stream title: ffprobe's tag, falling back to mediaInfo's Title with the handler laundered out of it. Every branch uses the laundered
+            //value - taking the raw join here welded the handler into the title the plugin then WROTE, e.g. "Stereo / Commentary Track" on an mp4 audio track.
+            const mediaTitleClean = mediaTitleSansHandler();
+            const streamTitle = (ffstream.tags?.title || mediaTitleClean || '');
             const streamLang = resolveLang(ffstream);
             let workLang = streamLang || 'und';
 
@@ -1849,34 +1865,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 return title;
             };
-            // mediaInfo surfaces the container's HANDLER (mp4 udta handler / matroska HANDLER_NAME) AS the track Title, so a track whose mediaInfo Title merely
-            // echoes its own handler has no real title at all - boilerplate like SoundHandler/SubtitleHandler must never be promoted into a real title tag by
-            // the reconcile branch below. Read the handler case-insensitively (getTagCI): matroska stores it uppercase.
-            const mediaTitleIsHandler = () => {
-                const handler = (getTagCI(ffstream.tags, 'handler_name') || '').trim().toLowerCase();
-                const mediaTitle = (ffmedia?.Title ?? '').trim().toLowerCase();
-                return mediaTitle !== '' && mediaTitle === handler;
-            };
-            // The same handler echo, but for a track that has a REAL title too: mediaInfo does not merely substitute the handler, it JOINS the two with " / "
-            // (verified on the bundled MediaInfoLib 23.07 - mkv gives "Main Feature / Movie.2020.1080p.x264-GRP", mp4 the same pair handler-first), so an
-            // exact-equality test sees nothing and a dot count over the join charges the handler's periods to the title. Drop the handler part and what is
-            // left is the track's own title (empty when the handler was all of it). Needed because ffprobe does not surface an mp4 track's udta/name box at
-            // all, so on mp4 the joined mediaInfo Title is the only place a per-track title appears. The handler itself is normalised by emitHandlerMeta.
-            const mediaTitleSansHandler = () => {
-                const handler = (getTagCI(ffstream.tags, 'handler_name') || '').trim();
-                const mediaTitle = (ffmedia?.Title ?? '').trim();
-                if (!handler || !mediaTitle) return mediaTitle;
-                return mediaTitle.split(' / ').filter((part) => part.trim() !== handler).join(' / ').trim();
-            };
-            // Write a changed title, or reconcile ONLY when the ffprobe tag is missing but mediaInfo has a REAL one (mediaTitleIsHandler filters the handler
-            // echo): the write adds the ffprobe tag so both probes agree next pass. The reverse (ffprobe has a title mediaInfo never reports) must NOT fire, or
-            // a container that never surfaces Title to mediaInfo would remux every pass.
+            // Write a changed title, or reconcile ONLY when the ffprobe tag is missing but mediaInfo has a REAL one - REAL meaning what survives laundering,
+            // so a Title that was nothing but the handler echo reconciles to nothing and is never promoted into a title tag. The write adds the ffprobe tag so
+            // both probes agree next pass. The reverse (ffprobe has a title mediaInfo never reports) must NOT fire, or a container that never surfaces Title to
+            // mediaInfo would remux every pass.
             const emitTitleMeta = (typeLetter, idx, typeWord, streamTitle, newStreamTitle, titleCauses) => {
                 if (newStreamTitle !== streamTitle) {
                     workDone += `☐${streamTag(ffstream.index)}${titleCauses.length ? `[${titleCauses.join('][')}]` : ''} Change title (${typeWord})`
                         + ` "${logSafe(streamTitle)}" -> "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "title=${escMeta(newStreamTitle)}"`;
-                } else if (ffmedia && !(ffstream.tags?.title) && (ffmedia.Title ?? '') !== '' && !mediaTitleIsHandler()) {
+                } else if (ffmedia && !(ffstream.tags?.title) && mediaTitleClean !== '') {
                     workDone += `☐${streamTag(ffstream.index)} Change title (${typeWord}) - found "${logSafe(ffstream.tags?.title ?? '')}"`
                         + ` and "${logSafe(ffmedia?.Title ?? '')}" change to "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "title=${escMeta(newStreamTitle)}"`;
@@ -2149,7 +2147,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // Busy-title removal (video). Test ONE effective title the way the audio and subtitle branches do - ffprobe's tag wins, mediaInfo is the
                 // fallback - and take mediaInfo's with the handler echo removed, or a scene-release handler_name blanks a perfectly good title that was
                 // never busy (and the handler is separately normalised by emitHandlerMeta on this same command, so the wipe would buy nothing).
-                const videoTitle = (ffstream.tags?.title ?? '').trim() || mediaTitleSansHandler();
+                const videoTitle = (ffstream.tags?.title ?? '').trim() || mediaTitleClean;
                 if(removeBusytitle === true && tooManyPeriods(videoTitle)) {
                     workDone += `☐${streamTag(ffstream.index)}[remove_busytitle=true] Remove title (video) "${logSafe(videoTitle)}"\n`;
                     metadataCommand += ` -metadata:s:v:${videoStreamIndex} "title="`;
