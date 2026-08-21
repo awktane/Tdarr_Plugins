@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.28.1',
+    Version: '3.29.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1237,8 +1237,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // hevc_nvenc, so the FAMILY dominates the codec. The three CPU encoders are each measured directly and need no stand-in.
     const MEM_ENCODER_BY_FAMILY = { nvenc: 'hevc_nvenc', qsv: 'hevc_qsv', vaapi: 'hevc_vaapi', videotoolbox: 'hevc_videotoolbox' };
     // Decode-side peak, MB per megapixel of the SOURCE frame, per source codec and per whether -thread_type slice is on the command (see MEM_SLICE_CODECS).
-    // A 4.9x spread across codecs, so a single constant would be wrong in both directions - and AV1 is both the most expensive decoder and one of the two the
-    // flag cannot help, which compounds with libsvtav1 being the hungriest encoder: AV1 -> AV1 is the most memory-expensive path this plugin can take.
+    // A 6.0x spread across codecs, so a single constant would be wrong in both directions. ProRes is the priciest decoder and AV1 the priciest one the flag
+    // cannot help, which compounds with libsvtav1 being the hungriest encoder: AV1 -> AV1 is the most memory-expensive path this plugin can take.
+    // prores measured 2026-08-21 on the Linux node (VmHWM, 5 reps, medians reproducible to 0.2% across independent runs). Three things about that row:
+    //   * It is the 4:4:4 12-bit XQ figure, the WORST case. A 4:2:2 10-bit HQ source at the same 4K measured 362 MB against XQ's 552 - a 52% spread - so one
+    //     row cannot be right for both, and the expensive end is the one to carry: under-stating is what loses the refusal.
+    //   * The pair behind it is prores_ks at BOTH resolutions, so the re-encoder is a shared constant that cancels in the slope. That it may stand in for
+    //     camera-original media is measured, not assumed: real XQ 552 MB vs prores_ks XQ 542 MB at 4K, 1.8% apart.
+    //   * def == slice is correct rather than a shortcut - prores is not in MEM_SLICE_CODECS, so -thread_type slice is never emitted for it and the second
+    //     figure is never read.
+    // The av1 row's 50.2 was left alone though the same run measured ~47.5: it over-states by 5%, which under-refuses nothing, and re-fitting a row on one
+    // node's clip to chase 5% would trade a cross-platform fit for a local one.
     const MEM_DECODER = {
         mpeg2video: { def: 10.4, slice: 10.4 },
         vp9:        { def: 18.1, slice: 11.5 },
@@ -1246,6 +1255,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         hevc8:      { def: 32.1, slice: 18.2 },
         hevc10:     { def: 47.9, slice: 28.2 },
         av1:        { def: 50.2, slice: 50.2 },
+        prores:     { def: 62.4, slice: 62.4 },
     };
     // method_speed scales the whole peak by a resolution-independent factor (slow is where the coefficients above were fitted).
     const MEM_PRESET = { slow: 1.000, medium: 0.909, fast: 0.805 };
@@ -1271,6 +1281,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const MEM_BYTES_PER_MB = 1048576;
     // Warn when the expected peak eats this much of what is actually free. Below 1 so the warning lands while there is still room to act on it.
     const MEM_HEADROOM_FRACTION = 0.8;
+    // Peak memory depends slightly on CONTENT, and every coefficient here was fitted on one kind of it. Measured 2026-08-21 on the Linux node (VmHWM, 5 reps,
+    // 4K 10-bit libx265 at frame-threads=1, i.e. the floor's own threading): 4K cel animation 2958 MB vs 4K live action 2885 MB, a 2.5% difference against a
+    // 0.1% noise floor on identical input - small, but larger than the instrument. Carried at 2x the measured delta because ONE anime-vs-live pair bounds the
+    // two contents measured, not the population. Applied to the REFUSAL FLOOR ONLY: the floor is a genuine physical lower bound (single frame thread, fastest
+    // preset), not a safety allowance, so content variance rides on top of it rather than being absorbed by it - a floor fitted on the cheaper content
+    // under-states the true floor and therefore fails to refuse an encode that will OOM. The warning path is deliberately left unmargined; over-warning is
+    // cheap, and MEM_HEADROOM_FRACTION above is already generous. Two limits on the evidence, stated rather than implied: the delta was measured on a CPU
+    // libx265 encode, so applying it to a HARDWARE encoder extrapolates - harmless, because a hw peak of 664-1409 MB sits far below any real cgroup ceiling,
+    // but untested; and it is one anime-vs-live pair. NOTE this cannot be re-measured on the Mac: five runs of one identical input there spread 26%
+    // (1255-1583 MB, drifting upward) because macOS reports a compressed footprint under pressure.
+    const MEM_CONTENT_MARGIN = 1.05;
 
     // cgroup v1 writes LONG_MAX rounded down to a page size for "no limit", which is a DIFFERENT number on a 64 KiB-page arm64 host - so test the magnitude
     // rather than hardcoding either sentinel.
@@ -1397,7 +1418,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // An unmeasured source codec contributes no decode term rather than a guessed one - it under-states the peak, which under-warns and under-refuses.
         const kDec = dec ? (sliceOn ? dec.slice : dec.def) : 0;
         const mb = (want10 ? row.base10 : row.base8) + kDec * srcMpix + (want10 ? row.kEnc10 : row.kEnc8) * outMpix;
-        if (floor) return mb * (row.floor || 1) * MEM_PRESET.fast;
+        if (floor) return mb * (row.floor || 1) * MEM_PRESET.fast * MEM_CONTENT_MARGIN;
         const threadMb = row.threadScaled
             ? Math.max(0, MEM_FRAME_THREADS(memCpuCount(cores)) - MEM_FIT_FRAME_THREADS) * MEM_MB_PER_THREAD_MPIXEL * outMpix : 0;
         return (mb + threadMb + memFilterSurcharge(tonemapOn, deintOn)) * (MEM_PRESET[speedName] || 1);
