@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.27.0',
+    Version: '3.28.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -32,8 +32,8 @@ const details = () => ({
                 \\n=====
                 \\nhdr_cleanup_only (default, harmless): only hdr_mode is live, and only where it can act losslessly - strip_dynamic drops the Dolby
                 Vision / HDR10+ dynamic layer with a plain -c:v copy, keeping the base HDR10, and anything that cannot be done losslessly is skipped.
-                codec, height_cap, bit depth, quality and encoder are all inert. A safe do-nothing default.
-                \\nnormalize: compatibility conversion. Re-encodes whenever the source does not match your codec, height_cap or hdr_mode target, in
+                codec, downscale, bit depth, quality and encoder are all inert. A safe do-nothing default.
+                \\nnormalize: compatibility conversion. Re-encodes whenever the source does not match your codec, downscale or hdr_mode target, in
                 EITHER direction - AV1 to HEVC for an old TV, or 4K down to 1080p. method_bitdepth rides along on whatever else fires but never triggers
                 a re-encode by itself.
                 \\nshrink: save space. Re-encodes toward a more efficient codec (AV1 > HEVC > H.264) and never downgrades efficiency - a request that
@@ -53,7 +53,7 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nsource (default): keep the source codec, re-encoding in place only when something else forces it - height_cap, hdr_mode or deinterlace,
+                \\nsource (default): keep the source codec, re-encoding in place only when something else forces it - downscale, hdr_mode or deinterlace,
                 or a same-codec size pass under shrink. This plugin only encodes HEVC, H.264 and AV1, so any other source codec (VP9, MPEG-2, VC-1,
                 VVC/H.266) cannot be kept through a forced transcode; that file is skipped with a warning to pick one.
                 \\nhevc (H.265): the recommended target - roughly half the bitrate of H.264 at the same quality.
@@ -91,6 +91,21 @@ const details = () => ({
                 Film-originated and already-progressive video are unaffected, so on a normal mixed library this touches only a small slice of it.`,
         },
         {
+            name: 'downscale',
+            type: 'string',
+            defaultValue: 'disabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['disabled', '2160', '1440', '1080', '720'],
+            },
+            tooltip: `Fit the output inside the 16:9 frame this names - 1080 means 1920x1080, not a height of 1080. It only ever downscales, never
+                upscales, and the quality tier is re-derived for the new height. Live under normalize and shrink; inert under hdr_cleanup_only.
+                \\ndisabled (default): keep the source resolution.
+                \\n1080 fits anything larger into 1920x1080 - the classic "shrink 4K to 1080p to save space". 720 does the same at 1280x720, while 2160
+                and 1440 only shrink sources larger than their own frame. Cinema geometry is fitted by WIDTH too, so a 4096x1716 scope master lands
+                1920x804 instead of staying 2578 wide, and a 2048x858 DCI 2K master is no longer waved through a 1080 setting untouched.`,
+        },
+        {
             name: 'hdr_mode',
             type: 'string',
             defaultValue: 'preserve',
@@ -107,7 +122,7 @@ const details = () => ({
                 protected - with guard_dv on, DV survives a transcode via libx265, and under hdr_cleanup_only nothing is touched at all.
                 \\nstrip_dynamic: drop just the dynamic layer and keep the base HDR10. When that is the ONLY thing to do, with no codec or resolution
                 change, it is LOSSLESS - a -c:v copy with a bitstream filter, at no quality cost - and it folds into a real transcode if codec or
-                height_cap also fire. Overridden per file by guard_dv, which preserves the DV instead.
+                downscale also fire. Overridden per file by guard_dv, which preserves the DV instead.
                 \\ntonemap_sdr: tonemap ALL HDR, static and dynamic, down to SDR (bt709). Always a real re-encode, being a pixel operation, so it is NOT
                 valid under hdr_cleanup_only. Use it for SDR-only playback: correct colour on non-HDR displays, and no per-play tonemapping by the server.
                 It runs GPU-accelerated on the node's encoder hardware, for one consistent look across NVIDIA, Intel, AMD and Apple, falling back to the
@@ -116,20 +131,6 @@ const details = () => ({
                 \\nstrip_dynamic needs a base layer to fall back to, so it skips two cases: a single-layer DV carrying no HDR10 base (profile 5), and HDR
                 Vivid (CUVA), which no bitstream filter in this ffmpeg can remove at all. For either, tonemap_sdr - or a re-encode under normalize/shrink -
                 is the only way to be rid of the dynamic layer.`,
-        },
-        {
-            name: 'height_cap',
-            type: 'string',
-            defaultValue: 'source',
-            inputUI: {
-                type: 'dropdown',
-                options: ['source', '2160', '1440', '1080', '720'],
-            },
-            tooltip: `Cap the output resolution by height. It only ever downscales, never upscales, and the quality tier is re-derived for the new height.
-                Live under normalize and shrink; inert under hdr_cleanup_only.
-                \\nsource (default): keep the source resolution.
-                \\n1080 downscales anything taller to 1080p - the classic "shrink 4K to 1080p to save space". 720 does the same at its height, while 2160
-                and 1440 only cap sources larger than that.`,
         },
         {
             name: 'quality_sd',
@@ -275,7 +276,7 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\ntrue (default): skip the whole file when the source video is one of those codecs and anything would re-encode it - normalize, shrink,
-                height_cap and tonemap_sdr alike.
+                downscale and tonemap_sdr alike.
                 \\nfalse: treat a lossless source like any other and convert it. Choose this deliberately, since it replaces an editing or archival master
                 with a lossy delivery encode.
                 \\nWhy it is worth guarding: every encode here is lossy AND lands 4:2:0 at 8 or 10 bit, so a 4:2:2, 4:4:4 or 12-bit master loses chroma
@@ -295,7 +296,7 @@ const details = () => ({
                 \\nWhy: shrink works at constant quality, which cannot predict the output size, so re-encoding an already-lean source can GROW it. This
                 floor prevents that.
                 \\nnormalize ignores this entirely, a compatibility conversion having to run whatever the size. Three things are exempt even under shrink,
-                none of which can grow a file: a height_cap downscale, tonemap_sdr, and the lossless strip_dynamic copy.`,
+                none of which can grow a file: a downscale, tonemap_sdr, and the lossless strip_dynamic copy.`,
         },
     ],
 });
@@ -1388,7 +1389,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const row = memEncoderRow(encoderName, family);
         if (!row) return null;
         const srcMpix = (Number(srcW) * Number(srcH)) / 1e6;
-        // Source megapixels come from the CODED dimensions, never from dispHeight: that value is rotation-swapped for the height_cap decision, so a rotated 4K
+        // Source megapixels come from the CODED dimensions, never from dispHeight: that value is rotation-swapped for the downscale decision, so a rotated 4K
         // phone clip would estimate 7539 MB against 2735 MB real - a 2.76x overshoot - if the pixel count were derived from it.
         if (!Number.isFinite(srcMpix) || srcMpix <= 0 || !(Number(dispH) > 0) || !(Number(outH) > 0)) return null;
         const outMpix = srcMpix * ((Number(outH) / Number(dispH)) ** 2);
@@ -1510,7 +1511,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // coerced by loadDefaultValues, so a guard is dead code).
     const action = String(inputs.action || 'hdr_cleanup_only').toLowerCase().trim();
     const codec = String(inputs.codec || 'source').toLowerCase().trim();
-    const heightCapOpt = String(inputs.height_cap || 'source').toLowerCase().trim();
+    const downscaleOpt = String(inputs.downscale || 'disabled').toLowerCase().trim();
     const speed = String(inputs.method_speed || 'slow').toLowerCase().trim();
     const bitDepthOpt = String(inputs.method_bitdepth || 'source').toLowerCase().trim();
     const encoderOpt = String(inputs.method_encoder || 'node').toLowerCase().trim();
@@ -1543,7 +1544,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     if (!['hdr_cleanup_only', 'normalize', 'shrink'].includes(action)) failFile(`[action=${action}] invalid value, check your settings`);
     if (!['source', 'hevc', 'h264', 'av1'].includes(codec)) failFile(`[codec=${codec}] invalid value, check your settings`);
-    if (!['source', '2160', '1440', '1080', '720'].includes(heightCapOpt)) failFile(`[height_cap=${heightCapOpt}] invalid value, check your settings`);
+    if (!['disabled', '2160', '1440', '1080', '720'].includes(downscaleOpt)) failFile(`[downscale=${downscaleOpt}] invalid value, check your settings`);
+    // A RENAME is the one input change that fails SILENTLY. Tdarr keys saved settings by input NAME, so a stored height_cap never reaches the downscale
+    // input and every user of the old spelling would drop to 'disabled' with no error anywhere - a library that quietly stops downscaling. The orphaned
+    // key is still in inputs (loadDefaultValues only ever ADDS defaults, it never prunes), so stop on it exactly as a retired VALUE stops.
+    if (inputs.height_cap !== undefined)
+        failFile(`[height_cap=${inputEcho(inputs.height_cap)}] renamed to downscale, whose off value is "disabled" not "source" - re-save this plugin's `
+            + 'settings; it now fits the output inside the 16:9 frame you name rather than capping height alone, so non-16:9 sources shrink further');
     if (!['slow', 'medium', 'fast'].includes(speed)) failFile(`[method_speed=${speed}] invalid value, check your settings`);
     if (!['source', '8', '10'].includes(bitDepthOpt)) failFile(`[method_bitdepth=${bitDepthOpt}] invalid value, check your settings`);
     if (!['node', 'node_strict', 'auto', 'cpu'].includes(encoderOpt))
@@ -1576,7 +1583,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const srcWidth = Number(primary.width || mi?.Width || 0);
         const srcHeight = Number(primary.height || mi?.Height || 0);   // CODED height - what the decoder and the encoder see
         const srcCodecName = (primary.codec_name || '').toLowerCase().trim();
-        // DISPLAY orientation: a phone clip is routinely CODED 1920x1080 with a 90-degree rotation, so it DISPLAYS 1080x1920 - height_cap must judge what a
+        // DISPLAY orientation: a phone clip is routinely CODED 1920x1080 with a 90-degree rotation, so it DISPLAYS 1080x1920 - downscale must judge what a
         // viewer sees, or a portrait 4K reads as "already within 1080". The emitted command needs no help (ffmpeg autorotates before the filter chain, so
         // scale=-2:N sets the DISPLAYED height); only the fire/skip decision and the tier were reading the wrong number. Both probes, since neither is
         // complete (ffprobe: numeric side_data rotation on mp4 AND mkv; MediaInfo: string Rotation, mp4 only), and they disagree on sign and wrap (ffprobe
@@ -1585,7 +1592,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .find((sd) => /display matrix/i.test(String(sd?.side_data_type || '')));
         const rotationDeg = Number(displayMatrix?.rotation ?? mi?.Rotation ?? 0);
         const quarterTurned = Number.isFinite(rotationDeg) && Math.abs(Math.round(rotationDeg / 90)) % 2 === 1;
-        const dispHeight = quarterTurned && srcWidth > 0 ? srcWidth : srcHeight;   // the height height_cap and the quality tier both judge
+        const dispHeight = quarterTurned && srcWidth > 0 ? srcWidth : srcHeight;   // the height the downscale and the quality tier both judge
+        const dispWidth = quarterTurned && srcHeight > 0 ? srcHeight : srcWidth;    // its partner, for the 16:9 box test below
         // Output container = source container: clean_and_remux owns container policy; this plugin only re-encodes video (tagging the QuickTime fourCC below).
         const dstContainer = String(file.container || '').toLowerCase().trim();
         response.container = `.${dstContainer}`;
@@ -1676,9 +1684,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const dvIptC2 = preserveDv && srcIsIptC2;   // skip below rather than emit a command libx265 would reject
 
         // Resolution / downscale (only ever downscales) + the quality tier for the OUTPUT height. Inert under hdr_cleanup_only.
-        const maxH = heightCapOpt === 'source' ? 0 : Number(heightCapOpt);
-        const willDownscale = action !== 'hdr_cleanup_only' && maxH > 0 && dispHeight > maxH;
-        const outHeight = willDownscale ? maxH : dispHeight;
+        // The setting names a 16:9 FRAME, not a height: 1080 means "fit inside 1920x1080". Capping height alone under-shrinks everything wider than
+        // 16:9 by exactly (source AR / 16:9) - a 4096x1716 scope master answered a 1080 cap with 2578x1080, 34% MORE pixels than 1080p, and a
+        // 2048x858 DCI 2K master sailed through untouched because 858 <= 1080. Both measured on the production binary.
+        const maxH = downscaleOpt === 'disabled' ? 0 : Number(downscaleOpt);
+        const maxW = Math.round(maxH * 16 / 9);
+        // Only a HEIGHT is ever needed to express the box: scale=-2:N derives the width from the coded aspect, so fitting the frame collapses to the
+        // smaller of the cap and the height at which the frame is exactly maxW wide. Rounded DOWN to even - 4:2:0 needs an even height, and rounding
+        // up would breach the box. dispWidth is the CODED width (rotation-adjusted), deliberately NOT SAR-corrected, because scale=-2:N derives its
+        // width from coded dimensions too: a display-corrected test would predict a width the filter does not emit. Verified this changes no answer
+        // for the real anamorphic cases (1440x1080 SAR 4:3, 720x576 SAR 64:45 land identically either way). A dispWidth of 0 - no width from either
+        // probe - degrades to the old height-only behaviour rather than refusing, since widthBound then contributes nothing. That ternary is not dead code
+        // to be tidied away: without it the division yields Infinity, which happens to reach the same capHeight today, and nothing would catch a later
+        // edit that stopped it doing so.
+        const evenFloor = (n) => Math.max(2, Math.floor(n / 2) * 2);
+        const widthBound = dispWidth > 0 ? evenFloor(maxW * dispHeight / dispWidth) : dispHeight;
+        const capHeight = Math.min(maxH, widthBound);
+        // capHeight < dispHeight, not dispHeight > maxH: a wide-but-short source is already inside the box (854x480 under a 720 cap bounds at 718,
+        // above its own 480) and must not read as needing work.
+        const willDownscale = action !== 'hdr_cleanup_only' && maxH > 0 && capHeight < dispHeight;
+        const outHeight = willDownscale ? capHeight : dispHeight;
         const qualityForHeight = (h) => ({ sd: qualitySd, p720: quality720, p1080: quality1080, p4k: quality4k }[heightTier(h)]);
         const qNorm = qualityForHeight(outHeight);
 
@@ -1841,7 +1866,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // ================= decide, gated by action =================
         if (action === 'hdr_cleanup_only') {
-            // Only hdr_mode is live; codec / height_cap / bit-depth / deinterlace / encoder inert. Lossless-or-skip.
+            // Only hdr_mode is live; codec / downscale / bit-depth / deinterlace / encoder inert. Lossless-or-skip.
             if (hdrMode === 'preserve') {
                 return skip(`☑${streamTag(primary.index)}[action=hdr_cleanup_only] ${isDynamicHdr
                     ? `${dynLabel} left untouched (preserve)` : 'Nothing to clean up (preserve)'}\n`);
@@ -1855,7 +1880,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         // ---- action = normalize | shrink (real-transcode capable) ---- Resolve the codec trigger + final target codec. depth is a PARAMETER (never a
-        // trigger); height_cap, tonemap and interlace repair are triggers in both actions.
+        // trigger); downscale, tonemap and interlace repair are triggers in both actions.
         const heightTrigger = willDownscale;
         const tonemapTrigger = tonemap;
         const deintTrigger = deinterlaceNeeded;   // a filter, so it forces a real encode exactly as a downscale or a tonemap does
@@ -1899,7 +1924,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             want10Bit = true;
         }
         // guard_shrink_bitrate gates SHRINK's efficiency re-encode only (a CQ re-encode of an already-lean file can grow it). normalize is compatibility-driven
-        // - it must convert regardless of size - and height_cap / tonemap / interlace repair / the lossless strip are exempt in both actions, as transforms
+        // - it must convert regardless of size - and downscale / tonemap / interlace repair / the lossless strip are exempt in both actions, as transforms
         // the user asked for in their own right (the repair is the one that CAN still grow the file: a shot-on-video source comes back at double frame rate).
         let belowFloorKbps = 0;
         if (action === 'shrink' && codecTrigger && guardShrinkKbps > 0) {
@@ -1909,7 +1934,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // A same-codec size pass has ONE stop - the awk_video fence below - and a container that cannot store the tag has nowhere to keep it: the next pass
         // recomputes the identical fingerprint, finds nothing, and re-emits a byte-identical preset, which Tdarr refuses as an infinite transcode loop and
         // ERRORS the file (across separate library scans, where that guard does not apply, it is generational re-encoding instead). Drop the codec trigger
-        // rather than the file: a height_cap, tonemap or deinterlace pass converges on its own evidence and still runs. normalize needs no fence at all - it
+        // rather than the file: a downscale, tonemap or deinterlace pass converges on its own evidence and still runs. normalize needs no fence at all - it
         // fires only on a codec mismatch, which the encode itself removes.
         let fenceUnstorable = false;
         if (action === 'shrink' && codecTrigger && !markerPersists(dstContainer)) {
@@ -2011,7 +2036,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // that was just named instead of comparing two differently-derived figures.
                 const altFloor = (over) => memoryEstimate({ ...common, ...over, floor: true });
                 const trades = [];
-                if (outHeight > 1080) { const m = altFloor({ outH: 1080 }); if (m !== null) trades.push(`height_cap=1080 (~${memMbGb(m)})`); }
+                if (outHeight > 1080) { const m = altFloor({ outH: 1080 }); if (m !== null) trades.push(`downscale=1080 (~${memMbGb(m)})`); }
                 if (want10Bit && targetCodecName !== 'h264') {
                     const m = altFloor({ want10: false });
                     if (m !== null) trades.push(`method_bitdepth=8 (~${memMbGb(m)})`);
@@ -2122,7 +2147,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Predict the re-encoded stream through the shared summariseStream (single source of truth for the [video:...]
             // token) so Expected-results matches the input-summary format; depth is exact via bits_per_raw_sample with
             // pix_fmt/profile cleared, and a tonemapped output is SDR (bt709, detached mediaInfo so no 'hdr' token).
-            const outStream = { ...primary, codec_name: targetCodecName, height: outHeight, bits_per_raw_sample: want10Bit ? 10 : 8, pix_fmt: '', profile: '' };
+            // outWidth is what scale=-2 will actually emit, in the same DISPLAY orientation outHeight is in (ffmpeg autorotates ahead of the filter chain).
+            // Nothing reads it today - summariseStream's video token is height-only - but a source width beside a downscaled height is a wrong number
+            // in a struct named for the output.
+            const outWidth = willDownscale && dispHeight > 0 ? Math.max(2, Math.round(dispWidth * outHeight / dispHeight / 2) * 2) : dispWidth;
+            const outStream = { ...primary, codec_name: targetCodecName, height: outHeight, width: outWidth,
+                bits_per_raw_sample: want10Bit ? 10 : 8, pix_fmt: '', profile: '' };
             if (tonemap) { outStream.color_transfer = 'bt709'; outStream.index = -1; }
             // Unless guard_dv carried it, the re-encode DISCARDS the dynamic HDR layer (DV RPU and HDR10+ SEI alike - no encoder this plugin drives
             // carries either), so the prediction must not still read 'dv' or 'hdr10+'. Clear every carrier summariseStream's dynamic tests read: the
@@ -2145,7 +2175,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return skip(`☒${streamTag(primary.index)}[guard_lossless=true] ${srcCodecName} is a lossless/mastering source - a re-encode would flatten it`
                 + ` to lossy 4:2:0 ${want10Bit ? '10' : '8'}-bit; set guard_lossless=false to convert it anyway\n`);
         }
-        if (!canEncodeTarget && realTranscode()) {   // codec=source resolved to a legacy codec with no encoder, but height_cap/tonemap/deinterlace force one
+        if (!canEncodeTarget && realTranscode()) {   // codec=source resolved to a legacy codec with no encoder, but downscale/tonemap/deinterlace force one
             return skip(`☒${streamTag(primary.index)}[codec=source] Source codec ${srcCodecName || 'unknown'} has no encoder - can't keep it through the `
                 + `${heightTrigger ? 'downscale' : (tonemapTrigger ? 'tonemap' : 'interlace repair')}`
                 + `; set codec=hevc/h264/av1 to convert it\n`);
