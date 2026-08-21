@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.26.0',
+    Version: '4.26.1',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -2217,8 +2217,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Every path that can drop a video stream (method_unmuxable=drop above, cover art in the video branch) records it in removedIndices, so the
         // survivors are read from there. Gated on the file having had video to begin with, so an audio-only file is untouched.
         if(file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'video')
-            && !file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'video' && !removedIndices.has(s.index)))
+            && !file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'video' && !removedIndices.has(s.index))) {
+            // Name the gate when it is the one that took the video, mirroring the audio guard below: its own two escapes are the fix, where the generic
+            // wording sends the user to removal inputs that had nothing to do with it. A prores .mov bound for mp4 is the reachable case - prores is in
+            // MP4_UNMUXABLE and is the file's only video stream, so method_unmuxable=drop empties the file on its own.
+            if(file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'video' && unmuxableDrops.has(s.index)))
+                failFile(`[method_unmuxable=drop] Dropping every video stream ${dstContainer} cannot store would leave the file with no video at all`
+                    + ' - set method_unmuxable=error to stop instead, or mkv_fallback to keep this file in a container that can hold them');
             failFile('Removing the specified streams would leave the file with no video streams - check your removal settings');
+        }
 
         // method_unmuxable=drop is the ONLY path here that removes an audio stream (audio_clean owns every other audio keep/drop), so it needs its own
         // all-gone guard - the video one above does not cover audio. Gated on the file having had audio to begin with, so a genuinely silent file is untouched.
