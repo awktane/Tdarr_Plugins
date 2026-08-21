@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.28.0',
+    Version: '3.28.1',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1545,12 +1545,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!['hdr_cleanup_only', 'normalize', 'shrink'].includes(action)) failFile(`[action=${action}] invalid value, check your settings`);
     if (!['source', 'hevc', 'h264', 'av1'].includes(codec)) failFile(`[codec=${codec}] invalid value, check your settings`);
     if (!['disabled', '2160', '1440', '1080', '720'].includes(downscaleOpt)) failFile(`[downscale=${downscaleOpt}] invalid value, check your settings`);
-    // A RENAME is the one input change that fails SILENTLY. Tdarr keys saved settings by input NAME, so a stored height_cap never reaches the downscale
-    // input and every user of the old spelling would drop to 'disabled' with no error anywhere - a library that quietly stops downscaling. The orphaned
-    // key is still in inputs (loadDefaultValues only ever ADDS defaults, it never prunes), so stop on it exactly as a retired VALUE stops.
-    if (inputs.height_cap !== undefined)
-        failFile(`[height_cap=${inputEcho(inputs.height_cap)}] renamed to downscale, whose off value is "disabled" not "source" - re-save this plugin's `
-            + 'settings; it now fits the output inside the 16:9 frame you name rather than capping height alone, so non-16:9 sources shrink further');
     if (!['slow', 'medium', 'fast'].includes(speed)) failFile(`[method_speed=${speed}] invalid value, check your settings`);
     if (!['source', '8', '10'].includes(bitDepthOpt)) failFile(`[method_bitdepth=${bitDepthOpt}] invalid value, check your settings`);
     if (!['node', 'node_strict', 'auto', 'cpu'].includes(encoderOpt))
