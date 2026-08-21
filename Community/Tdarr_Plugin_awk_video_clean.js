@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.29.0',
+    Version: '3.30.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1225,13 +1225,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // since a hardware encode peaks at 664-1409 MB and can never refuse (no `floor` row), so that figure only ever hardens a warning. `threadScaled` marks the
     // one encoder whose per-frame-thread cost was measured; the rest carry no thread term, which under-states them on a big node - see MEM_FRAME_THREADS.
     const MEM_ENCODER = {
-        libx265:           { base10: 97,  kEnc10: 301, base8: 103, kEnc8: 182, floor: 0.960, threadScaled: true },
-        libx264:           { base10: 89,  kEnc10: 240, base8: 89,  kEnc8: 240, floor: 0.808 },   // H.264 output is always 8-bit; the 10-bit pair never resolves
-        libsvtav1:         { base10: 251, kEnc10: 518, base8: 161, kEnc8: 418, floor: 0.677 },
+        libx265:           { base10: 163, kEnc10: 292, base8: 97,  kEnc8: 186, floor: 0.968, threadScaled: true },
+        libx264:           { base10: 79,  kEnc10: 245, base8: 79,  kEnc8: 245, floor: 0.808 },   // H.264 output is always 8-bit; the 10-bit pair never resolves
+        // SVT-AV1 is the one encoder whose memory does NOT move with preset or thread count - measured 1.006 at
+        // medium, 1.007 at fast and 1.007 single-threaded, i.e. no reduction at all. See presetScaled below.
+        libsvtav1:         { base10: 920, kEnc10: 203, base8: 490, kEnc8: 257, floor: 1.007, presetScaled: false },
         hevc_nvenc:        { base10: 113, kEnc10: 108, base8: 113, kEnc8: 108 },
         hevc_qsv:          { base10: 76,  kEnc10: 51,  base8: 76,  kEnc8: 51 },
         hevc_vaapi:        { base10: 80,  kEnc10: 23,  base8: 80,  kEnc8: 23 },
-        hevc_videotoolbox: { base10: 42,  kEnc10: 41,  base8: 42,  kEnc8: 41 },
+        // Fitted on a Mac, the only platform that has VideoToolbox. Legitimate there despite macOS memory
+        // compression because these rows land at 0.7-0.9 GB, below the regime where it distorts a reading, and
+        // they reproduced across two independent runs (4K 862 then 860 MB; 1080p 690 both times).
+        hevc_videotoolbox: { base10: 252, kEnc10: 27,  base8: 252, kEnc8: 27 },
     };
     // Which measured row stands in for a family's other codecs. Justified by measurement, not convenience: h264_nvenc at 4K 8-bit came within 5% of
     // hevc_nvenc, so the FAMILY dominates the codec. The three CPU encoders are each measured directly and need no stand-in.
@@ -1246,23 +1251,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //     camera-original media is measured, not assumed: real XQ 552 MB vs prores_ks XQ 542 MB at 4K, 1.8% apart.
     //   * def == slice is correct rather than a shortcut - prores is not in MEM_SLICE_CODECS, so -thread_type slice is never emitted for it and the second
     //     figure is never read.
-    // The av1 row's 50.2 was left alone though the same run measured ~47.5: it over-states by 5%, which under-refuses nothing, and re-fitting a row on one
-    // node's clip to chase 5% would trade a cross-platform fit for a local one.
+    // Every other row was re-derived from a full Linux refit on the same date, so they are one consistent set rather than a patchwork of eras. Two of them
+    // moved a long way - mpeg2video -32% and vp9 -21% - which matters less than it looks: both are cheap decoders whose term is small either way.
     const MEM_DECODER = {
-        mpeg2video: { def: 10.4, slice: 10.4 },
-        vp9:        { def: 18.1, slice: 11.5 },
-        h264:       { def: 23.0, slice: 8.8 },
-        hevc8:      { def: 32.1, slice: 18.2 },
-        hevc10:     { def: 47.9, slice: 28.2 },
-        av1:        { def: 50.2, slice: 50.2 },
+        mpeg2video: { def: 7.1,  slice: 7.1 },
+        vp9:        { def: 14.3, slice: 8.2 },
+        h264:       { def: 24.9, slice: 11.9 },
+        hevc8:      { def: 31.8, slice: 15.9 },
+        hevc10:     { def: 46.0, slice: 25.9 },
+        av1:        { def: 46.6, slice: 46.6 },
         prores:     { def: 62.4, slice: 62.4 },
     };
-    // method_speed scales the whole peak by a resolution-independent factor (slow is where the coefficients above were fitted).
+    // method_speed scales the whole peak by a resolution-independent factor (slow is where the coefficients above were fitted). Fitted on libx265, which is
+    // the default encoder and tracks it well (measured 0.920 / 0.817 against the values below). It does NOT hold for every encoder: SVT-AV1 measured 1.006 at
+    // medium and 1.007 at fast, i.e. its memory is flat across presets, which is what MEM_ENCODER's `presetScaled: false` opts it out of. An encoder that has
+    // never been measured across presets keeps scaling by this table, since over-stating a warning is the harmless direction.
     const MEM_PRESET = { slow: 1.000, medium: 0.909, fast: 0.805 };
-    // Filters are NOT additive: tonemapx measured +42 MB at 10-bit and bwdif +55 MB, but tonemap + deinterlace + downscale STACKED came in at +78 MB rather
-    // than 97 - they share frame buffers. So one filter costs its own figure and both cost the measured stacked one. A downscale on its own was never measured
-    // apart from that stack and contributes nothing here, which under-states it slightly. guard_dv's VBV (-maxrate/-bufsize) measured +0 MB and needs no term.
-    const MEM_FILTER_TONEMAP = 42;
+    // Filters are NOT additive, so the stacked case gets its own measured figure rather than a sum. It is no longer additive in the direction it used to be:
+    // when these were first fitted the stack came in BELOW the sum of the singles and the explanation was shared frame buffers. Re-measured 2026-08-21 on
+    // Linux, tonemap collapsed to +7 MB (from +42) while deint held at +45 and the stack at +71 - so the stack now sits ABOVE its parts, and whatever the
+    // filters share is smaller than what a second filter adds. Only the tonemap figure is updated: deint and stacked both landed inside the +-25 MB band, and
+    // moving a row the tolerance says is unchanged would be fitting noise. A downscale on its own was never measured apart from that stack and contributes
+    // nothing here, which under-states it slightly. guard_dv's VBV (-maxrate/-bufsize) measured +0 MB and needs no term.
+    const MEM_FILTER_TONEMAP = 7;
     const MEM_FILTER_DEINT = 55;
     const MEM_FILTER_STACKED = 78;
     const memFilterSurcharge = (tonemapOn, deintOn) => (tonemapOn && deintOn ? MEM_FILTER_STACKED
@@ -1418,10 +1429,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // An unmeasured source codec contributes no decode term rather than a guessed one - it under-states the peak, which under-warns and under-refuses.
         const kDec = dec ? (sliceOn ? dec.slice : dec.def) : 0;
         const mb = (want10 ? row.base10 : row.base8) + kDec * srcMpix + (want10 ? row.kEnc10 : row.kEnc8) * outMpix;
-        if (floor) return mb * (row.floor || 1) * MEM_PRESET.fast * MEM_CONTENT_MARGIN;
+        // presetScaled: false means this encoder's memory does not move with method_speed, so the floor may not claim the fastest preset buys a reduction.
+        // Getting this wrong is not academic: SVT-AV1's coefficients and its floor were BOTH re-fitted together, and applying the new coefficients while
+        // still taking the 0.805 fast-preset discount put the 4K AV1 floor 16% BELOW the measured single-thread peak - a worse under-refusal than the
+        // over-stated coefficients it replaced were hiding.
+        const presetFloorMul = row.presetScaled === false ? 1 : MEM_PRESET.fast;
+        if (floor) return mb * (row.floor || 1) * presetFloorMul * MEM_CONTENT_MARGIN;
         const threadMb = row.threadScaled
             ? Math.max(0, MEM_FRAME_THREADS(memCpuCount(cores)) - MEM_FIT_FRAME_THREADS) * MEM_MB_PER_THREAD_MPIXEL * outMpix : 0;
-        return (mb + threadMb + memFilterSurcharge(tonemapOn, deintOn)) * (MEM_PRESET[speedName] || 1);
+        return (mb + threadMb + memFilterSurcharge(tonemapOn, deintOn)) * (row.presetScaled === false ? 1 : (MEM_PRESET[speedName] || 1));
     };
     const memGb = (bytes) => `${(bytes / (1024 ** 3)).toFixed(1)} GB`;
     const memMbGb = (mb) => memGb(mb * MEM_BYTES_PER_MB);
