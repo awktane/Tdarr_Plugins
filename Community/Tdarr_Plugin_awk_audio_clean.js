@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.26.0',
+    Version: '4.999.0',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1876,9 +1876,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const countSurvivingAudio = () => file.ffProbeData.streams.filter(a => codecTypeOf(a) === 'audio' && !removedIndices.has(a.index)).length;
 
         // ====== TIER DELETES ======
-        // language_unlisted=delete / downmix_secondary=delete. Runs before the layout-drop pre-pass (no double-drop) and before existing*Langs below (a
-        // deleted track must not leave a stale "already exists" entry that suppresses a downmix backfill). The two deletes carry DIFFERENT safety nets,
-        // because they fail differently:
+        // language_unlisted=delete / downmix_secondary=delete. Both run before existing*Langs below (a deleted track must not leave a stale "already exists"
+        // entry that suppresses a downmix backfill), but they sit on OPPOSITE sides of the layout-drop pre-pass - see the ordering note above each. The two
+        // deletes carry DIFFERENT safety nets, because they fail differently:
         //   language_unlisted=delete removes a whole unwanted language, so it must NOT require another track of that language to survive - that rule would
         //     make the option inert (an unwanted dub is normally its language's only track). Safety: dormancy (hasWantedLang) + the never-empty floor.
         //   downmix_secondary=delete removes an EXTRA, so it keeps the fall-back rule: only when a plain track of the SAME language survives - a lone
@@ -1886,7 +1886,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Both are floored by countSurvivingAudio() > 1: no delete may ever leave the file with no audio. The channel clause is dropped when no probe
         // measured a count - enrichStream's fallback lands `undefined` for exactly those streams, and an unguarded interpolation renders "undefinedch".
         const delToken = (s) => `${codecDisplayName(s)}${s.channels > 0 ? ` ${s.channels}ch` : ''} ${langTok(s.awkLangKey)}`;
-        // Language deletes resolve FIRST, so the plain-language fall-back set the role deletes read below reflects what actually survives them.
+        // Language deletes resolve FIRST, BEFORE the layout-drop pre-pass: a track that is both unlisted and opus-hostile is then reported as the language
+        // delete it is, and the pre-pass measures its never-empty floor against the survivors the user actually asked to keep. Reversed, a lone wanted-language
+        // track with a hostile layout is dropped and the floor then spares the unlisted one - leaving the file holding only the language the user deleted.
         for (const s of audioStreams) {
             if (s.awkTier !== 'delete' || s.awkSecondaryTrack || removedIndices.has(s.index)) continue;
             if (countSurvivingAudio() <= 1) {
@@ -1895,21 +1897,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             removedIndices.add(s.index);
             workDone += `☐${streamTag(s.index)}[language_unlisted=delete] Removing ${delToken(s)} - not in language_surround or language_stereo\n`;
-        }
-        const plainLangsSurviving = new Set(audioStreams.filter(s => !s.awkSecondaryTrack && !removedIndices.has(s.index)).map(s => s.awkLangKey));
-        for (const s of audioStreams) {
-            if (s.awkTier !== 'delete' || !s.awkSecondaryTrack || removedIndices.has(s.index)) continue;
-            if (!plainLangsSurviving.has(s.awkLangKey)) {
-                skipDone += `☒${streamTag(s.index)}[downmix_secondary=delete] Not removing ${delToken(s)} - no plain `
-                    + `${langTok(s.awkLangKey)} track survives to fall back on\n`;
-                continue;
-            }
-            if (countSurvivingAudio() <= 1) {
-                skipDone += `☒${streamTag(s.index)}[downmix_secondary=delete] Not removing ${delToken(s)} - it is the last audio track\n`;
-                continue;
-            }
-            removedIndices.add(s.index);
-            workDone += `☐${streamTag(s.index)}[downmix_secondary=delete] Removing secondary ${delToken(s)}\n`;
         }
 
         // A source the layout-drop pre-pass removes may have been the SOLE source a downmix would have derived a track from - dropping it must not
@@ -1956,10 +1943,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
-        // Now that dedup + the layout-drop pre-pass have finalised removedIndices, snapshot which languages still have a primary stereo / 5.1-6ch track among
-        // the SURVIVORS, so downmix_to_stereo/downmix_to_six only create one for a language that genuinely lacks it (a removed track can't leave a stale
-        // entry). Keyed by awkRegionKey - the IDENTITY key dedup grouped on, region-distinct only under method_dedup_region=distinct, never the folded match
-        // key. Channels 2 = stereo; >4 && <=6 = any 5-6ch primary (5.0/5.1, and the rare 4.1, also 5 channels) but not 4.0 (4ch) or 7.1 (8ch).
+        // Role deletes resolve LAST, AFTER the layout-drop pre-pass, because their fall-back rule is a promise about what SURVIVES and plainLangsSurviving is a
+        // one-shot snapshot: the pre-pass can remove the very plain track that authorises a secondary's deletion, so reading it any earlier deletes the
+        // description track on a promise the next block breaks, and the language vanishes from the file entirely. Double-drop safety does NOT rest on this
+        // order - every delete loop and the pre-pass alike skip on removedIndices.has(s.index).
+        const plainLangsSurviving = new Set(audioStreams.filter(s => !s.awkSecondaryTrack && !removedIndices.has(s.index)).map(s => s.awkLangKey));
+        for (const s of audioStreams) {
+            if (s.awkTier !== 'delete' || !s.awkSecondaryTrack || removedIndices.has(s.index)) continue;
+            if (!plainLangsSurviving.has(s.awkLangKey)) {
+                skipDone += `☒${streamTag(s.index)}[downmix_secondary=delete] Not removing ${delToken(s)} - no plain `
+                    + `${langTok(s.awkLangKey)} track survives to fall back on\n`;
+                continue;
+            }
+            if (countSurvivingAudio() <= 1) {
+                skipDone += `☒${streamTag(s.index)}[downmix_secondary=delete] Not removing ${delToken(s)} - it is the last audio track\n`;
+                continue;
+            }
+            removedIndices.add(s.index);
+            workDone += `☐${streamTag(s.index)}[downmix_secondary=delete] Removing secondary ${delToken(s)}\n`;
+        }
+
+        // Now that dedup, the tier deletes and the layout-drop pre-pass have finalised removedIndices, snapshot which languages still have a primary stereo /
+        // 5.1-6ch track among the SURVIVORS, so downmix_to_stereo/downmix_to_six only create one for a language that genuinely lacks it (a removed track can't
+        // leave a stale entry). Keyed by awkRegionKey - the IDENTITY key dedup grouped on, region-distinct only under method_dedup_region=distinct, never the
+        // folded match key. Channels 2 = stereo; >4 && <=6 = any 5-6ch primary (5.0/5.1, and the rare 4.1, also 5 channels) but not 4.0 (4ch) or 7.1 (8ch).
         const survivingPrimaryAudio = audioStreams.filter(s => !removedIndices.has(s.index) && !s.awkSecondaryTrack && s.awkTier === 'surround');
         const existing2chLangs = new Set(survivingPrimaryAudio.filter(s => s.channels === 2).map(s => s.awkRegionKey));
         const existing6chLangs = new Set(survivingPrimaryAudio.filter(s => s.channels > 4 && s.channels <= 6).map(s => s.awkRegionKey));
