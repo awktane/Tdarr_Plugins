@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.26.1',
+    Version: '4.999.0',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1666,8 +1666,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // MARKED 'original' - so when this file carries more than one genuine audio language and marks no original, abort and let the user tag it.
         // Languages fold through langKey; an untagged track counts as the language language_fill would give it, else "und". Commentary/descriptive tracks
         // are excluded - a foreign-language commentary says nothing about which track is the original.
+        // Counts only tracks that WILL REACH THE OUTPUT, the same rule the language_fill_mode check below states in full. It cuts both ways here: a second
+        // language carried only by a track method_unmuxable=drop deletes never reaches audio_clean, so quarantining over it is a stop the user cannot act
+        // on; and an 'original' flag sitting on such a track is no answer either, so counting it would wave through exactly the ambiguity this guard is for.
         if (guardAudioLanguage === 'enabled') {
-            const audioStreams = (file.ffProbeData.streams || []).filter((s) => codecTypeOf(s) === 'audio');
+            const audioStreams = (file.ffProbeData.streams || []).filter((s) => codecTypeOf(s) === 'audio' && !unmuxableDrops.has(s.index));
             const genuineLangs = new Set(audioStreams.filter((s) => !isCommentary(s) && !isDescriptive(s)).map((s) => langKey(resolveWorkLang(s))));
             if (genuineLangs.size > 1 && !audioStreams.some((s) => hasDisposition(s, 'original')))
                 failFile(`[guard_audio_language=${guardAudioLanguage}] ${genuineLangs.size} audio languages (${[...genuineLangs].join(', ')})`
@@ -1724,7 +1727,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // placedSidecars, refusing the drop otherwise exactly as an unsafe path does. The pre-scan repeats the loop's own export test, so the two cannot
         // select different streams.
         let exportRefusedCount = 0;   // image-sub exports that could not be written this run - any at all fails the file, see the check after the stream loop
-        const placedSidecars = new Set(); const failedSidecars = new Map();
+        const placedSidecars = new Set(); const failedSidecars = new Map(); const emptySidecars = new Set();
         // The font attachments a styled-subtitle bundle carries. Read once here: they are the same set for every styled subtitle in the file, and the
         // pre-scan below needs them before the stream loop runs.
         const styledFontIndices = (file.ffProbeData.streams || [])
@@ -1761,8 +1764,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 exportJobs.push({ name, dest, args: mapTokens });
             }
             if (exportJobs.length) {
-                const { placed, failed } = placeSidecars(exportJobs);
+                const { placed, failed, empty } = placeSidecars(exportJobs);
                 for (const n of placed) placedSidecars.add(n);
+                for (const n of empty) emptySidecars.add(n);
                 for (const [n, why] of failed) failedSidecars.set(n, why);
             }
         }
@@ -1926,6 +1930,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         if (placedSidecars.has(sidecarName)) {
                             workDone += `☑${streamTag(ffstream.index)}[remove_imagesubs=export] Exported image subtitle -> ${sidecarName}`
                                 + ' for external OCR (before drop)\n';
+                        } else if (emptySidecars.has(sidecarName)) {
+                            // Nothing came out of the decode, which is an answer about the SOURCE and never changes on a requeue - so it must not be
+                            // counted as a refusal, or the file quarantines forever. A mapped node already resolves it this way (ffmpeg writes a 0-byte
+                            // sidecar as an extra output of the remux and the drop proceeds); this keeps the two routes agreeing on the same file.
+                            workDone += `☑${streamTag(ffstream.index)}[remove_imagesubs=export] Nothing to export to ${sidecarName}`
+                                + ' - the subtitle stream carries no data (dropping it loses nothing)\n';
                         } else {
                             exportRefused = true; exportRefusedCount += 1;
                             response.infoLog += `☒${streamTag(ffstream.index)}[remove_imagesubs=export] Could not place ${sidecarName} in the library`
@@ -2334,9 +2344,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         // remove_imagesubs=export asked for a sidecar that could not be written, so the export did not happen and neither did the drop it protects. Fail
-        // rather than remux around it: every cause is environmental (a quote in the library directory, no path translator, a rejected upload) and so
-        // recurs on every future run, which would leave the export setting quietly doing nothing while each run reported success. Failing costs nothing -
-        // the file is untouched and the image subtitle is still embedded - and the error clears itself once the environment is fixed and the file requeued.
+        // rather than remux around it: every cause counted here is environmental (a quote in the library directory, no path translator, a rejected upload)
+        // and so recurs on every future run, which would leave the export setting quietly doing nothing while each run reported success. Failing costs
+        // nothing - the file is untouched and the image subtitle is still embedded - and the error clears itself once the environment is fixed and the file
+        // requeued. That last clause is why an EMPTY extraction is diverted above rather than counted: nothing about it is fixable, so it would never clear.
         if (exportRefusedCount) {
             failFile(`[remove_imagesubs=export] ${exportRefusedCount} image subtitle${exportRefusedCount === 1 ? '' : 's'} could not be exported,`
                 + ' see the reasons above - nothing was removed from the file');
