@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.1',
+    Version: '3.999.2',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1030,13 +1030,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // on the other: a writer and a reader whose vocabularies drift fail SILENTLY, leaving the captions in the file twice. Deliberately not the awk_sub_worker
     // marker - that is a list of sidecar PATHS whose reader matches entries against paths, so a flag word pushed in there would be read as a filename.
     //   strip    - the captions are out (a sidecar or a subtitle track holds them) but the bitstream copy is still there; drop it on the next re-encode.
+    //   removed  - the captions are out AND the bitstream copy went with them in that same pass, so nothing is left to find, to probe for, or to remove.
+    //              The request/fact pair with `strip`: one asks a later plugin to act, the other tells every later pass there is nothing left to act on.
     //   none     - the caption channel was decoded and carried no caption text at all, so no later pass need pay for that decode again.
     //   imported - the captions are already embedded as a real subtitle track, so sub_worker must not read them out a second time.
     // The value is a COMMA LIST and every reader splits it, because the states genuinely combine: an imported round trip that could not strip in its own pass
-    // records `imported,strip`, and an empty channel on a source the filter refuses records `none,strip`. A writer therefore EXTENDS the tag rather than
-    // replacing it with one token - a whole-value overwrite would erase a pending request instead of deferring it.
+    // records `imported,strip` - and `imported,removed` where it could - while an empty channel on a source the filter refuses records `none,strip`. A writer
+    // therefore EXTENDS the tag rather than replacing it with one token - a whole-value overwrite would erase a pending request instead of deferring it.
     const CC_TAG = 'awk_cc';
-    const CC_TOKENS = { strip: 'strip', none: 'none', imported: 'imported' };
+    const CC_TOKENS = { strip: 'strip', removed: 'removed', none: 'none', imported: 'imported' };
     const ccTokensOf = (tags) => getTagCI(tags || {}, CC_TAG).toLowerCase().split(',').map((t) => t.trim()).filter(Boolean);
     // ===== END SHARED: closed-caption handoff =====
     // #endregion
@@ -2030,7 +2032,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const ccTokens = ccTokensOf(file.ffProbeData.format?.tags);
         const ccExported = ccTokens.includes(CC_TOKENS.strip);    // sub_worker took them out, but could not remove the bitstream copy under its -c copy pass
         const ccChannelEmpty = ccTokens.includes(CC_TOKENS.none); // sub_worker decoded the channel and it carried no caption text at all
-        const dropCaptions = ccExported || ccChannelEmpty;
+        const ccAlreadyGone = ccTokens.includes(CC_TOKENS.removed); // sub_worker read them out AND filtered the bitstream copy away in that same -c copy pass
+        const dropCaptions = ccExported || ccChannelEmpty || ccAlreadyGone;
         // Only `true` is information. Tdarr's optional caption scan reads false both for a file that genuinely has none and for one its bundled CCExtractor
         // could not parse (measured: every mp4, and MPEG-2 inside Matroska), so a false still has to be probed. Memoized to at most one probe per file - that
         // cost is the whole reason the check is skipped wherever the answer could not change the outcome.
@@ -2160,7 +2163,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             if (dropCaptions)
                 response.infoLog += `☐${streamTag(primary.index)} Dropping the embedded closed captions - sub_worker `
-                    + `${ccExported ? 'exported them to a subtitle, and keeping both would show them twice' : 'found the caption channel carries no text'}\n`;
+                    + `${ccExported ? 'exported them to a subtitle, and keeping both would show them twice'
+                        : ccAlreadyGone ? 'already took them out and cleared the bitstream copy, so there is nothing left to carry forward'
+                            : 'found the caption channel carries no text'}\n`;
             sel.notes.forEach((n) => { response.infoLog += n; });
             // Slice decoding is worth emitting only where it saves something and only on a CPU encode: on a hardware route the slower slice decode could in
             // principle starve a 100+ fps encoder, and a hardware encode peaks low enough (664-1409 MB) that it rarely approaches a limit anyway.

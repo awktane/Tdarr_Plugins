@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.6',
+    Version: '3.999.7',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1164,13 +1164,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // on the other: a writer and a reader whose vocabularies drift fail SILENTLY, leaving the captions in the file twice. Deliberately not the awk_sub_worker
     // marker - that is a list of sidecar PATHS whose reader matches entries against paths, so a flag word pushed in there would be read as a filename.
     //   strip    - the captions are out (a sidecar or a subtitle track holds them) but the bitstream copy is still there; drop it on the next re-encode.
+    //   removed  - the captions are out AND the bitstream copy went with them in that same pass, so nothing is left to find, to probe for, or to remove.
+    //              The request/fact pair with `strip`: one asks a later plugin to act, the other tells every later pass there is nothing left to act on.
     //   none     - the caption channel was decoded and carried no caption text at all, so no later pass need pay for that decode again.
     //   imported - the captions are already embedded as a real subtitle track, so sub_worker must not read them out a second time.
     // The value is a COMMA LIST and every reader splits it, because the states genuinely combine: an imported round trip that could not strip in its own pass
-    // records `imported,strip`, and an empty channel on a source the filter refuses records `none,strip`. A writer therefore EXTENDS the tag rather than
-    // replacing it with one token - a whole-value overwrite would erase a pending request instead of deferring it.
+    // records `imported,strip` - and `imported,removed` where it could - while an empty channel on a source the filter refuses records `none,strip`. A writer
+    // therefore EXTENDS the tag rather than replacing it with one token - a whole-value overwrite would erase a pending request instead of deferring it.
     const CC_TAG = 'awk_cc';
-    const CC_TOKENS = { strip: 'strip', none: 'none', imported: 'imported' };
+    const CC_TOKENS = { strip: 'strip', removed: 'removed', none: 'none', imported: 'imported' };
     const ccTokensOf = (tags) => getTagCI(tags || {}, CC_TAG).toLowerCase().split(',').map((t) => t.trim()).filter(Boolean);
     // ===== END SHARED: closed-caption handoff =====
     // #endregion
@@ -1974,6 +1976,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const ccTokens = ccTokensOf(file.ffProbeData.format?.tags);
             if (ccTokens.includes(CC_TOKENS.none))
                 return { job: null, note: '☑[embedded_cc=enabled] The caption channel was read on an earlier pass and carries no caption text\n' };
+            // Nothing is left in the bitstream, so this ends the round trip outright - and it also spares the A53 re-probe the sidecar-exists branch below
+            // would otherwise pay on every later pass while remove_source is on, which is the whole point of writing the memo on the pass that strips.
+            if (ccTokens.includes(CC_TOKENS.removed))
+                return { job: null, note: '☑[embedded_cc=enabled] The captions were extracted and the bitstream copy removed on an earlier pass\n' };
             if (ccTokens.includes(CC_TOKENS.imported))
                 return { job: null, note: '☑[embedded_cc=enabled] Closed captions are already embedded as a subtitle track\n' };
             const hidden = action === 'import';
@@ -2266,7 +2272,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (((ccPlan.job && ccPlaced) || ccPlan.stripOwed) && removeSource && !ccRecord.has(CC_TOKENS.none)) {
                 if (ccStripAllowed()) {
                     ccStrip = ccStripArg(removedIndices);
-                    response.infoLog += `☐${streamTag(ccVideo.index)}[remove_source=true] Removing the closed captions from the video bitstream\n`;
+                    // The one outcome we are CERTAIN about, and it used to be the only one that handed nothing forward: video_clean then paid a caption
+                    // probe to be told what this pass had already proved. Declining the memo costs only a repeated probe, never data, so unlike the
+                    // request below a marker-hostile container needs no warning - it just goes unrecorded.
+                    if (canRecord) ccRecord.add(CC_TOKENS.removed);
+                    response.infoLog += `☐${streamTag(ccVideo.index)}[remove_source=true] Removing the closed captions from the video bitstream${
+                        canRecord ? ' and recording it so no later pass re-checks' : ''}\n`;
                 } else if (canRecord) {
                     ccRecord.add(CC_TOKENS.strip);
                     response.infoLog += `☒${streamTag(ccVideo.index)}[remove_source=true] The captions cannot be removed from this video without re-encoding`
@@ -2753,6 +2764,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (removeSource) {
                     if (ccStripAllowed()) {
                         ccStrip = ccStripArg(removedIndices);
+                        // Same certainty as on extract; `imported` alone would leave video_clean probing a bitstream this pass just cleared.
+                        ccAdd.push(CC_TOKENS.removed);
                         response.infoLog += `☐${streamTag(ccVideo.index)}[remove_source=true] Removing the closed captions from the video bitstream\n`;
                     } else {
                         ccAdd.push(CC_TOKENS.strip);
