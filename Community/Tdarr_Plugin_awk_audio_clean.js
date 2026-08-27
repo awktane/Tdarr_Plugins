@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.6',
+    Version: '4.999.7',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -926,11 +926,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // srt. Audio uses codecDisplayName so a DTS subtype or object-audio layer the container codec_name hides shows in the token. The optional second
     // argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - so NEVER pass this helper straight to .map(): Array.map would
     // supply the element index as that argument.
+    // -=-=-= logTok  [all five] =-=-=-
+    // The one sanitiser for any untrusted string an infoLog line echoes - a container title, handler, language token or free-text input. Control characters
+    // become a space because infoLog is NEWLINE-DELIMITED: a raw newline in a container tag splits the line into a continuation carrying no ☐/☑/☒ symbol,
+    // which is a status line the plugin never wrote. The length cap exists because nothing bounds a container tag and Tdarr persists the whole infoLog.
+    // Quotes and backslashes are deliberately KEPT - this is display-only and never feeds ffmpeg, so unlike escMeta the value should read faithfully.
+    // Shared, and used by every echo site, because the rule is log-integrity relevant and was previously spelled six ways: a hardening applied to one
+    // spelling (also stripping U+2028/U+2029, say, which JSON-embedded logs treat as line terminators) would leave the other five emitting the character.
+    const logTok = (v, max = 64) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, max);
     const summariseStream = (s, out) => {
         // Container-supplied values (language tags, attachment filenames, mimetypes) are unbounded and the whole infoLog is persisted by Tdarr, so every
         // one is clamped: control characters become spaces (a raw newline would split the summary line) and the token caps at 64 chars - the longest
         // registered mimetype subtype is 59, everything else is far shorter.
-        const tok = (v) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 64);
+        const tok = logTok;   // the shared sanitiser at its default 64-char cap
         const type = codecTypeOf(s);
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
         if (codec === 'subrip') codec = 'srt';
@@ -1614,7 +1622,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // The failFile message echoes the offending token capped at 200 chars, with control characters collapsed to a space: free text is unbounded and Tdarr
     // persists the whole error message, and a raw newline in the echo would split the line into a continuation carrying no ☐/☑/☒ status symbol.
-    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)}] not a recognised language`
+    const failLangToken = (name, token) => failFile(`[${name}=${logTok(token, 200)}] not a recognised language`
         + ' - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)');
     // ===== END SHARED: language token failure =====
     // #endregion
@@ -1717,7 +1725,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // continuation carries no ☐/☑/☒, so container text renders as a status line the plugin never wrote, and Tdarr persists the whole infoLog, so an
         // unbounded tag is an unbounded log. Clamp at the echo sites, never in the shared langKey - the key itself is the match/dedup identity and must
         // stay byte-exact. Same expression and same reasoning as summariseStream's tok().
-        const langTok = (v) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 64);
+        const langTok = logTok;
 
         // candidateStreams: the pool for workStreams. A track earns a place when there is genuinely something to do with it - it is a genuine surround track
         // (the only kind eligible for downmix_to_six/downmix_to_stereo), or its tier is 'stereo' (the in-place stereo downmix), or codec_force is set, which

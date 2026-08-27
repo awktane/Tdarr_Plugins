@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.4',
+    Version: '3.999.5',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -649,11 +649,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // srt. Audio uses codecDisplayName so a DTS subtype or object-audio layer the container codec_name hides shows in the token. The optional second
     // argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - so NEVER pass this helper straight to .map(): Array.map would
     // supply the element index as that argument.
+    // -=-=-= logTok  [all five] =-=-=-
+    // The one sanitiser for any untrusted string an infoLog line echoes - a container title, handler, language token or free-text input. Control characters
+    // become a space because infoLog is NEWLINE-DELIMITED: a raw newline in a container tag splits the line into a continuation carrying no ☐/☑/☒ symbol,
+    // which is a status line the plugin never wrote. The length cap exists because nothing bounds a container tag and Tdarr persists the whole infoLog.
+    // Quotes and backslashes are deliberately KEPT - this is display-only and never feeds ffmpeg, so unlike escMeta the value should read faithfully.
+    // Shared, and used by every echo site, because the rule is log-integrity relevant and was previously spelled six ways: a hardening applied to one
+    // spelling (also stripping U+2028/U+2029, say, which JSON-embedded logs treat as line terminators) would leave the other five emitting the character.
+    const logTok = (v, max = 64) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, max);
     const summariseStream = (s, out) => {
         // Container-supplied values (language tags, attachment filenames, mimetypes) are unbounded and the whole infoLog is persisted by Tdarr, so every
         // one is clamped: control characters become spaces (a raw newline would split the summary line) and the token caps at 64 chars - the longest
         // registered mimetype subtype is 59, everything else is far shorter.
-        const tok = (v) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 64);
+        const tok = logTok;   // the shared sanitiser at its default 64-char cap
         const type = codecTypeOf(s);
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
         if (codec === 'subrip') codec = 'srt';
@@ -1584,7 +1592,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // they get the same treatment as every other free-text echo in the suite (clean_and_remux's logSafe, the shared failLangToken): control characters to
     // space, because infoLog is newline-delimited and a raw newline turns the rest of the paste into a status line the plugin never wrote, and a 200-char
     // cap, because loadDefaultValues only trims and Tdarr persists the whole message however large the value was.
-    const inputEcho = (v) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200);
+    const inputEcho = (v) => logTok(v, 200);
     const parseQuality = (v, name) => {
         const n = Number(String(v).trim());
         if (!Number.isFinite(n) || n < 0 || n > 63) failFile(`[${name}=${inputEcho(v)}] must be a number between 0 and 63, check your settings`);

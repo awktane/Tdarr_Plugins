@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.10',
+    Version: '3.999.11',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -542,11 +542,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // srt. Audio uses codecDisplayName so a DTS subtype or object-audio layer the container codec_name hides shows in the token. The optional second
     // argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - so NEVER pass this helper straight to .map(): Array.map would
     // supply the element index as that argument.
+    // -=-=-= logTok  [all five] =-=-=-
+    // The one sanitiser for any untrusted string an infoLog line echoes - a container title, handler, language token or free-text input. Control characters
+    // become a space because infoLog is NEWLINE-DELIMITED: a raw newline in a container tag splits the line into a continuation carrying no ☐/☑/☒ symbol,
+    // which is a status line the plugin never wrote. The length cap exists because nothing bounds a container tag and Tdarr persists the whole infoLog.
+    // Quotes and backslashes are deliberately KEPT - this is display-only and never feeds ffmpeg, so unlike escMeta the value should read faithfully.
+    // Shared, and used by every echo site, because the rule is log-integrity relevant and was previously spelled six ways: a hardening applied to one
+    // spelling (also stripping U+2028/U+2029, say, which JSON-embedded logs treat as line terminators) would leave the other five emitting the character.
+    const logTok = (v, max = 64) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, max);
     const summariseStream = (s, out) => {
         // Container-supplied values (language tags, attachment filenames, mimetypes) are unbounded and the whole infoLog is persisted by Tdarr, so every
         // one is clamped: control characters become spaces (a raw newline would split the summary line) and the token caps at 64 chars - the longest
         // registered mimetype subtype is 59, everything else is far shorter.
-        const tok = (v) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 64);
+        const tok = logTok;   // the shared sanitiser at its default 64-char cap
         const type = codecTypeOf(s);
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
         if (codec === 'subrip') codec = 'srt';
@@ -687,7 +695,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // The failFile message echoes the offending token capped at 200 chars, with control characters collapsed to a space: free text is unbounded and Tdarr
     // persists the whole error message, and a raw newline in the echo would split the line into a continuation carrying no ☐/☑/☒ status symbol.
-    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)}] not a recognised language`
+    const failLangToken = (name, token) => failFile(`[${name}=${logTok(token, 200)}] not a recognised language`
         + ' - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)');
     // ===== END SHARED: language token failure =====
 
@@ -1017,6 +1025,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         clearStaged();
         return { placed, failed, empty };
     };
+    // -=-=-= fileHasBytes  [clean_and_remux, sub_worker] =-=-=-
+    // Is a USABLE sidecar already on disk? One question, asked by both plugins before a destructive step: clean_and_remux drops an embedded subtitle only
+    // because a sidecar is supposed to hold it, and sub_worker skips a re-extract for the same reason. Zero bytes counts as ABSENT, which is the load-bearing
+    // half - an ffmpeg aborted mid-write leaves an empty file, and trusting it then strips the only copy of the subtitle. Any stat failure is absent too, so
+    // a permission error re-extracts rather than silently dropping. Shared so a refinement (treating whitespace-only as absent, or adding an isFile test so a
+    // directory named like a sidecar is not mistaken for one) cannot land on one plugin's copy and leave the other answering differently about the same file.
+    const fileHasBytes = (p) => { try { return fs.statSync(p).size > 0; } catch (e) { return false; } };
     // ===== END SHARED: sidecar placement =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language display name =====
@@ -2205,7 +2220,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // An existing sidecar is preserved (never overwrite the user's edits) - but only if it has content. A 0-byte sidecar is the fingerprint of
                 // an extract ffmpeg aborted mid-write; trusting it and then stripping the embedded source would lose the subtitle, so re-extract it instead.
                 const existsNonEmpty = placeViaApi() ? sidecarExistsRemote(remoteDest)
-                    : (fs.existsSync(full) && (() => { try { return fs.statSync(full).size > 0; } catch { return false; } })());
+                    : fileHasBytes(full);
                 if (existsNonEmpty) { skipped += 1; response.infoLog += `☑${streamTag(s.index)} Sidecar already exists, not overwriting: ${name}\n`; }
                 // Unmapped: the extraction is deferred to placeSidecars after the loop, so this stream's removedIndices entry and its bundled tally wait for
                 // the server's answer - nothing may be stripped until the sidecar is confirmed in the library.
@@ -2462,7 +2477,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (!langFilter || langFilter.has(langKey(f.lang))) return true;
                 // The tag echoes a free-text input, so it gets the same treatment failLangToken gives its token: control characters collapsed (a raw newline
                 // would split the line into a continuation with no ☐/☑/☒ symbol) and capped, since nothing bounds the list and this line is per-sidecar.
-                response.infoLog += `☑[only_languages=${String(inputs.only_languages ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)}] Skipping ${
+                response.infoLog += `☑[only_languages=${logTok(inputs.only_languages, 200)}] Skipping ${
                     f.rel} - ${f.lang} is not in the list\n`;
                 return false;
             })

@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.7',
+    Version: '4.999.8',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -683,11 +683,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // srt. Audio uses codecDisplayName so a DTS subtype or object-audio layer the container codec_name hides shows in the token. The optional second
     // argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - so NEVER pass this helper straight to .map(): Array.map would
     // supply the element index as that argument.
+    // -=-=-= logTok  [all five] =-=-=-
+    // The one sanitiser for any untrusted string an infoLog line echoes - a container title, handler, language token or free-text input. Control characters
+    // become a space because infoLog is NEWLINE-DELIMITED: a raw newline in a container tag splits the line into a continuation carrying no ☐/☑/☒ symbol,
+    // which is a status line the plugin never wrote. The length cap exists because nothing bounds a container tag and Tdarr persists the whole infoLog.
+    // Quotes and backslashes are deliberately KEPT - this is display-only and never feeds ffmpeg, so unlike escMeta the value should read faithfully.
+    // Shared, and used by every echo site, because the rule is log-integrity relevant and was previously spelled six ways: a hardening applied to one
+    // spelling (also stripping U+2028/U+2029, say, which JSON-embedded logs treat as line terminators) would leave the other five emitting the character.
+    const logTok = (v, max = 64) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, max);
     const summariseStream = (s, out) => {
         // Container-supplied values (language tags, attachment filenames, mimetypes) are unbounded and the whole infoLog is persisted by Tdarr, so every
         // one is clamped: control characters become spaces (a raw newline would split the summary line) and the token caps at 64 chars - the longest
         // registered mimetype subtype is 59, everything else is far shorter.
-        const tok = (v) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 64);
+        const tok = logTok;   // the shared sanitiser at its default 64-char cap
         const type = codecTypeOf(s);
         let codec = (s.codec_name || 'unknown').trim().toLowerCase();
         if (codec === 'subrip') codec = 'srt';
@@ -954,7 +962,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // the line into a continuation with no ☐/☑/☒ symbol), quotes/backslashes are preserved so the value reads faithfully (unlike escMeta - this is
     // display-only, never feeds ffmpeg), and it is length-capped: nothing bounds a container title and Tdarr persists the whole infoLog.
     const logSafe = (value, max = 200) => {
-        const s = String(value ?? '').replace(/[\x00-\x1f\x7f]/g, ' ');
+        const s = logTok(value, Infinity);
         return s.length > max ? `${s.slice(0, max)}…` : s;
     };
 
@@ -970,7 +978,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // The failFile message echoes the offending token capped at 200 chars, with control characters collapsed to a space: free text is unbounded and Tdarr
     // persists the whole error message, and a raw newline in the echo would split the line into a continuation carrying no ☐/☑/☒ status symbol.
-    const failLangToken = (name, token) => failFile(`[${name}=${String(token ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, 200)}] not a recognised language`
+    const failLangToken = (name, token) => failFile(`[${name}=${logTok(token, 200)}] not a recognised language`
         + ' - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)');
     // ===== END SHARED: language token failure =====
     // #endregion
@@ -1401,6 +1409,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         clearStaged();
         return { placed, failed, empty };
     };
+    // -=-=-= fileHasBytes  [clean_and_remux, sub_worker] =-=-=-
+    // Is a USABLE sidecar already on disk? One question, asked by both plugins before a destructive step: clean_and_remux drops an embedded subtitle only
+    // because a sidecar is supposed to hold it, and sub_worker skips a re-extract for the same reason. Zero bytes counts as ABSENT, which is the load-bearing
+    // half - an ffmpeg aborted mid-write leaves an empty file, and trusting it then strips the only copy of the subtitle. Any stat failure is absent too, so
+    // a permission error re-extracts rather than silently dropping. Shared so a refinement (treating whitespace-only as absent, or adding an isFile test so a
+    // directory named like a sidecar is not mistaken for one) cannot land on one plugin's copy and leave the other answering differently about the same file.
+    const fileHasBytes = (p) => { try { return fs.statSync(p).size > 0; } catch (e) { return false; } };
     // ===== END SHARED: sidecar placement =====
     // #endregion
 
@@ -2079,7 +2094,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         // whole remux down with it rather than just skipping its own export. An existing sidecar has already served its purpose and may since
                         // have been OCR'd, so the export is simply not repeated and the drop still goes ahead - forcing it (-y) could only destroy that work.
                         let sidecarExists = false;
-                        try { sidecarExists = fs.statSync(sidecarPath).size > 0; } catch (e) { sidecarExists = false; }
+                        sidecarExists = fileHasBytes(sidecarPath);
                         if (sidecarExists) {
                             workDone += `☑${streamTag(ffstream.index)}[remove_imagesubs=export] Sidecar already exists, not overwriting: ${sidecarName}\n`;
                         } else {
@@ -2157,7 +2172,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         // ffmpeg aborts the whole run rather than overwrite an output file, so an existing bundle is left alone and the drop still goes
                         // ahead - it already holds this subtitle, and re-exporting could only destroy a copy the user may have edited.
                         let bundleExists = false;
-                        try { bundleExists = fs.statSync(sidecarPath).size > 0; } catch (e) { bundleExists = false; }
+                        bundleExists = fileHasBytes(sidecarPath);
                         exported = true;
                         if (bundleExists) workDone += `☑${streamTag(ffstream.index)}[container=mp4] Styled-subtitle bundle already exists,`
                             + ` not overwriting: ${sidecarName}\n`;
