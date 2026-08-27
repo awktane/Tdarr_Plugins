@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.30.0',
+    Version: '3.30.1',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1988,9 +1988,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // mismatch and is self-limiting). action is in the core so a normalize-tagged file isn't wrongly fenced under shrink. The plugin version
         // is appended for forensics but is NOT part of the match (like audio_clean's awk_loudnorm), so a version bump never invalidates the fence.
         // EVERY input that can fire a transcode has to appear here, or turning that input on leaves the fingerprint unchanged and the file is skipped
-        // as "already processed at this exact setting" while the work it now asks for never runs. Each optional token keys on the resolved SETTING
-        // (effHdrMode, deinterlaceLive), never on whether this source happens to trigger it - a source property would change once the transform has
-        // been applied, so the fingerprint would stop matching the settings that produced it.
+        // as "already processed at this exact setting" while the work it now asks for never runs. The fingerprint is a FIXED POINT, not a pure function
+        // of the settings: four tokens are SOURCE-derived and are correct only because the transform makes the output re-read as the thing that produced
+        // them - targetCodecName under codec=source, want10Bit under method_bitdepth=source, q from the OUTPUT height, and dv from preserveDv. Do NOT
+        // "correct" one of these to key on its setting instead: keying dv on guardDvLive would stamp the token on EVERY file processed with guard_dv on
+        // (the default), invalidating every awk_video tag in the field and costing every user one full re-encode pass, to prevent a divergence that
+        // cannot occur - a preserved encode carries the RPU through, so pass 2 re-reads dvSignal and recomputes the same token (measured 2026-08-26 on
+        // jellyfin 7.1.4 with a real profile-8.1 RPU: dvhe/p8/L6 in, dvh1/p8/L6 out, record intact; see awk-ffmpeg-test's build-facts.md). The fixed
+        // point is pinned by the scenario assertion video-clean-a-preserved-dv-output-still-matches-its-own-fence, so a detection drift fails there
+        // rather than silently re-encoding a library once per queue pass.
         const videoSigCore = escMeta([action, targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, want10Bit ? '10' : '8', `s${speed}`,
             ...(effHdrMode === 'tonemap_sdr' ? ['sdr'] : []), ...(effHdrMode === 'strip_dynamic' ? ['strip'] : []), ...(preserveDv ? ['dv'] : []),
             ...(deinterlaceLive ? ['deint'] : [])].join('-'));
