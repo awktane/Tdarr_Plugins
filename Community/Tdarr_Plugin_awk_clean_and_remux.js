@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.1',
+    Version: '4.999.2',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1593,6 +1593,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return sdhRemoved(s, wl);
     };
 
+    // Declared outside the try so the catch below can still reach it: workDone is buffered so the log reads as one block, but failFile/failUnexpected build
+    // the quarantine message from response.infoLog ALONE - so a terminal that THROWS has to flush it itself, or the error-queue entry loses the per-stream
+    // lines that say WHICH streams the abort is about. Every throwing terminal inside goes through failWithBuffers or the catch. The header is conditional
+    // because a pre-check that aborts before any stream work has nothing to introduce.
+    let workDone = '';
+    const flushBuffers = () => {
+        if (workDone) response.infoLog += '☒Run stopped here - the decisions it had made up to this point follow\n';
+        response.infoLog += workDone; workDone = '';
+    };
+    const failWithBuffers = (msg) => { flushBuffers(); failFile(msg); };
+
     // One guard around all the per-file work (the input summary, the muxability / guard_audio_language / language_fill_mode pre-checks, the unmapped-node
     // image-sub export, the per-stream loop and the font/metadata/preset build): a deliberate failFile abort (AwkFailFile) rethrows unchanged, and any
     // UNEXPECTED error fails the file too — annotated and carrying the full infoLog — instead of silently skipping. The summary walk is inside it because it
@@ -1715,7 +1726,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                                // Stays empty on an unmapped node, where placeSidecars below uploads the exports instead of riding them on the remux.
         let fflags = '';
         let inputArgs = '';   // recovery args that must precede -i (e.g. -err_detect); placed on the input side of the preset
-        let workDone = '';
         let convert = false;
         // Per-type OUTPUT ordinals, not source indices: they number the streams this run actually emits, and are threaded into -metadata:s:<t>:N, the
         // subtitle format conversion -c:s:N, and the hvc1 -tag:v:N. Start at -1 so the increment in each branch yields 0 for the first stream of that type.
@@ -2235,9 +2245,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // wording sends the user to removal inputs that had nothing to do with it. A prores .mov bound for mp4 is the reachable case - prores is in
             // MP4_UNMUXABLE and is the file's only video stream, so method_unmuxable=drop empties the file on its own.
             if(file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'video' && unmuxableDrops.has(s.index)))
-                failFile(`[method_unmuxable=drop] Dropping every video stream ${dstContainer} cannot store would leave the file with no video at all`
+                failWithBuffers(`[method_unmuxable=drop] Dropping every video stream ${dstContainer} cannot store would leave the file with no video at all`
                     + ' - set method_unmuxable=error to stop instead, or mkv_fallback to keep this file in a container that can hold them');
-            failFile('Removing the specified streams would leave the file with no video streams - check your removal settings');
+            failWithBuffers('Removing the specified streams would leave the file with no video streams - check your removal settings');
         }
 
         // method_unmuxable=drop is the ONLY path here that removes an audio stream (audio_clean owns every other audio keep/drop), so it needs its own
@@ -2245,7 +2255,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if(unmuxableDrops.size > 0
             && file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'audio')
             && !file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'audio' && !removedIndices.has(s.index)))
-            failFile(`[method_unmuxable=drop] Dropping every audio stream ${dstContainer} cannot store would leave the file with no audio at all`
+            failWithBuffers(`[method_unmuxable=drop] Dropping every audio stream ${dstContainer} cannot store would leave the file with no audio at all`
                 + ' - set method_unmuxable=error to stop instead, or mkv_fallback to keep this file in a container that can hold them');
 
         // Case-insensitive read (getTagCI) for the reason spelled out at emitHandlerMeta above: matroska stores this key as COMMENT.
@@ -2352,7 +2362,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // nothing - the file is untouched and the image subtitle is still embedded - and the error clears itself once the environment is fixed and the file
         // requeued. That last clause is why an EMPTY extraction is diverted above rather than counted: nothing about it is fixable, so it would never clear.
         if (exportRefusedCount) {
-            failFile(`[remove_imagesubs=export] ${exportRefusedCount} image subtitle${exportRefusedCount === 1 ? '' : 's'} could not be exported,`
+            failWithBuffers(`[remove_imagesubs=export] ${exportRefusedCount} image subtitle${exportRefusedCount === 1 ? '' : 's'} could not be exported,`
                 + ' see the reasons above - nothing was removed from the file');
         }
 
@@ -2385,6 +2395,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return response;
     } catch (err) {
+        flushBuffers();        // an unexpected bug must not swallow the diagnostics either - see failWithBuffers above
         failUnexpected(err);   // AwkFailFile → rethrow unchanged; anything else → annotate + fail the file with the full infoLog
     }
 };

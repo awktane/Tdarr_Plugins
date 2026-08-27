@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.1',
+    Version: '4.999.2',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1596,6 +1596,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     let workDone = '';       // "this changed" lines (transcode/add/remix/normalize/remove).
     let skipDone = '';       // "this DIDN'T change, and why" lines (guard blocks, ceiling/missing-data skips). Both buffers are always logged.
     let convert = false;
+    // The buffers exist so the log reads in two blocks rather than interleaved per stream, but failFile/failUnexpected build the quarantine message from
+    // response.infoLog ALONE - so a terminal that THROWS has to flush them itself, or the error-queue entry loses the whole record of what the run had
+    // decided, on the one path where the user has least else to go on. Every throwing terminal goes through failWithBuffers or the catch at the end. The
+    // header is conditional because a pre-check that aborts before any stream work has nothing to introduce.
+    const flushBuffers = () => {
+        if (workDone || skipDone) response.infoLog += '☒Run stopped here - the decisions it had made up to this point follow\n';
+        response.infoLog += workDone + skipDone; workDone = ''; skipDone = '';
+    };
+    const failWithBuffers = (msg) => { flushBuffers(); failFile(msg); };
 
     // The one condition three separate features have to give up on - resolveChannels found nothing usable in ffprobe, mediaInfo OR the channel layout. One
     // builder so the diagnosis reads the same whichever setting hit it first; only the [input=value] tag and the consequence clause differ per caller.
@@ -1834,7 +1843,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         continue;
                     }
                     if (methodDeduplicateErrorMode) {
-                        failFile(`${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Duplicate audio track (${codecDisplayName(s)}${rmEx} `
+                        failWithBuffers(`${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Duplicate audio track (${codecDisplayName(s)}${rmEx} `
                             + `${s.channels}ch ${langTok(s.awkRegionKey)}${rmRate}) alongside stream ${kept.index} `
                             + `(${codecDisplayName(kept)}${keptEx}${keptRate})`
                             + ` - aborting; tag/remove tracks manually and requeue, or switch method_deduplicate to a non-error mode`);
@@ -2265,7 +2274,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             loudnormMeasureCount++;
             const analysis = measureLoudness(srcAudioIdx, preFilter, preset);
             if (analysis.error)
-                failFile(`${streamTag(streamIndex)}[method_loudnorm=${methodLoudnorm}] loudnorm analysis pass failed (${analysis.error}) - if this file `
+                failWithBuffers(`${streamTag(streamIndex)}[method_loudnorm=${methodLoudnorm}] loudnorm analysis pass failed (${analysis.error}) - if this file `
                     + `has known corruption, try clean_and_remux's recover_bad_timestamps/recover_bad_data first; if the codec itself is unsupported, `
                     + `that won't help`);
             const { stats } = analysis;
@@ -2827,6 +2836,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return response;
     } catch (err) {
+        flushBuffers();        // an unexpected bug must not swallow the diagnostics either - see failWithBuffers above
         failUnexpected(err);   // AwkFailFile → rethrow unchanged; anything else → annotate + fail the file with the full infoLog
     }
 };
