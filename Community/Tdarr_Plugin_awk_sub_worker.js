@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.5',
+    Version: '3.999.6',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -754,6 +754,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ass:      { ext: 'ass', enc: 'ass' },
         ssa:      { ext: 'ass', enc: 'ass' },
         webvtt:   { ext: 'vtt', enc: 'webvtt' },
+        // Decodable-to-text formats no container we target can store, so a sidecar is the ONLY way they leave the file - the same set clean_and_remux
+        // converts on a remux, kept in step with it so a standalone sub_worker run is not blind to a subtitle the first plugin would have rescued. Every
+        // one has a decoder on the production build. eia_608 is the single row that does not take the srt encoder: it is a real subtitle STREAM (a
+        // QuickTime 608 capture), cc_dec emits ASS internally, and the srt encoder passes unknown override tags THROUGH - measured, an {\an7}-positioned
+        // cue writes the token literally and gains a <font> wrapper, while `text` writes clean SRT. The legacy family carries no overrides, so it takes
+        // srt like the canonical rows above. Listed AFTER them so EXT_TO_CODEC still resolves .srt back to subrip.
+        eia_608:    { ext: 'srt', enc: 'text' },
+        microdvd:   { ext: 'srt', enc: 'srt' },
+        mpl2:       { ext: 'srt', enc: 'srt' },
+        jacosub:    { ext: 'srt', enc: 'srt' },
+        sami:       { ext: 'srt', enc: 'srt' },
+        realtext:   { ext: 'srt', enc: 'srt' },
+        subviewer:  { ext: 'srt', enc: 'srt' },
+        subviewer1: { ext: 'srt', enc: 'srt' },
+        vplayer:    { ext: 'srt', enc: 'srt' },
+        pjs:        { ext: 'srt', enc: 'srt' },
+        stl:        { ext: 'srt', enc: 'srt' },
     };
     const isTextSub = (codec) => Object.prototype.hasOwnProperty.call(TEXT_SUB, String(codec).toLowerCase());
     // Both directions of the table above, derived from it so a new codec row is ONE edit: the loose-text sidecar extensions parseSidecar accepts (a bundle
