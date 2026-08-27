@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.2',
+    Version: '3.999.4',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -634,8 +634,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Normalize any language identifier to a stable comparison key so en / eng / EN / English / en-US - and ISO 639-2/B vs /T (fre vs fra) - all compare
     // equal. Node ships full ICU, so no table or module is needed.
     // -=-=-= shortLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
-    // Short language code: strip any region/variant suffix so 'en-US', 'en_US', 'en.US' all compare as 'en'.
-    const shortLang = (l) => l.replace(/[-_.].*$/, '');
+    // Short language code: strip any region/variant suffix so 'en-US', 'en_US', 'en.US' all compare as 'en'. `[\s\S]*` rather than `.*` because `.` cannot
+    // cross a line terminator and `$` without /m only matches true end-of-input (JS, unlike Perl/Python, will NOT match before a trailing newline) - so on a
+    // run of separators followed by an interior \r, \n, U+2028 or U+2029 the engine retries from every separator, runs the star to the terminator, and gives
+    // a character back at a time against a `$` it can never reach: O(n^2) with no possible match, so no early exit. A container language tag is unbounded
+    // metadata that reaches here uncapped on every language read, and ffprobe hands a 60,000-character Matroska Language element through verbatim - measured
+    // 20.1 s of blocked worker for one such file, 0.9 s -> 0.9 ms with this form. Same defect and reasoning as cleanStreamTitle's quote strip. It also folds
+    // a tag ENDING in a newline ('en-US\n' -> 'en'), which the `.*` form silently left unfolded.
+    const shortLang = (l) => l.replace(/[-_.][\s\S]*$/, '');
     // -=-=-= langNameIndex  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // Reverse map English language NAME -> 2-letter code (english->en), lazily built by probing every aa..zz pair through Intl.DisplayNames, memoised for
     // the run. Null-prototype so a container tag spelling an Object.prototype member ('constructor') misses the map instead of resolving inherited junk.
@@ -869,7 +875,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Keep the sidecar basename under the filesystem's 255-byte cap; if the encoded title pushes it over,
     // trim the RAW title (whole chars, so UTF-8 stays valid) until it fits and flag the lossy truncation.
     let titleTruncated = false;
-    const NAME_BYTE_CAP = 255;   // filesystem basename byte limit (ext4/APFS/NTFS) the encoded sidecar name must fit under
     const encodeTitleCapped = (rawTitle, fixedLen) => {
         let raw = String(rawTitle);
         // Bound the work: the name budget is 255 bytes and encodeTitle emits >= 1 byte per raw char, so any raw title longer
@@ -924,6 +929,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const libDir = path.dirname(libFilePath);
     const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '').replace(/<io>/gi, '');
     const sidecarLangToken = (s) => (resolveLang(s) || 'und').replace(/[^a-z0-9-]/g, '').slice(0, 32) || 'und';
+    // videoBase is the one part NOTHING bounds - it is the user's own filename, legally ~250 bytes on ext4/APFS/NTFS, and the shortest suffix either plugin
+    // appends is ~11 bytes. So each caller must measure the FINISHED name against this cap and refuse that one sidecar, exactly as it refuses an unsafe path.
+    // The refusal has to be at the caller because the two differ in what they do next; trimming videoBase instead is NOT an option, since sub_worker's
+    // parseSidecar anchors on it to read the name back and a trimmed one would extract, strip the track, and then be unrecognisable for reimport.
+    const NAME_BYTE_CAP = 255;
     // ===== END SHARED: sidecar path derivation =====
 
     // ===== SHARED [clean_and_remux, sub_worker]: sidecar placement =====
@@ -1568,7 +1578,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // every cue with the '-->' arrow, and ass marks every line of dialogue with a Dialogue: key, so one token per format settles it.
     const hasNoCues = (text, ext) => {
         if (!String(text).trim()) return true;
-        return ext === 'ass' ? !/^\s*Dialogue\s*:/mi.test(text) : !/-->/.test(text);
+        // The leading class must exclude every character `^` can follow under /m, or the two overlap and the match is quadratic: from each of N line starts
+        // the greedy star runs to the end of the whitespace run and gives a character back at a time testing for `D`, and on text with no Dialogue line
+        // ahead of it none of those N attempts can succeed. JS has FOUR line terminators - \n, \r, U+2028, U+2029 - and `\s` matches all of them, so
+        // `[^\S\r\n]` is NOT enough: it still overlaps on U+2028/U+2029 and stays quadratic (measured 23.7 s on 100k U+2028 versus 12.7 ms on 2M newlines,
+        // so an LF-only test would report it fixed). Shipped form measured 4.14 s on 50k blank lines and 66.9 s on 200k; this one, 424 ms on a 64 MiB
+        // blank-line file - the size the sidecar path actually permits, and one the shipped form never returns from. Behaviour is unchanged: `^` already
+        // anchors at the start of the Dialogue line, so the class only ever needed to skip the indent on the cue's OWN line. The trim() above is no
+        // protection - one non-whitespace byte defeats it, and every real ass has [Script Info].
+        return ext === 'ass' ? !/^[^\S\r\n\u2028\u2029]*Dialogue\s*:/mi.test(text) : !/-->/.test(text);
     };
 
     // Source indices whose text decoded to no cues at all, filled in by embeddedTextHashes on the one pass it already makes. Read through
@@ -1580,7 +1598,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // language+title with different text). One ffmpeg run extracts them all in a SINGLE pass through the same codec->format map the sidecars were written
     // with. The bytes are NOT directly comparable - ffmpeg re-serialises on the way out (CRLF folded, BOM dropped, cue numbers renumbered from 1), which is
     // identical only for a sidecar ffmpeg itself wrote - so both sides hash subTextForHash() instead. Costs one sequential read (0.3s on an 885MB
-    // mkv), so callers only reach it with deduplicate enabled and a real candidate. An empty map means "asked, found nothing"; null means the probe could
+    // mkv), so callers only reach it with a real candidate - but two of the three (the post-processing sidecar-delete confirmation, and the import path) are
+    // gated on remove_source rather than deduplicate, so stock settings DO arrive here. An empty map means "asked, found nothing"; null means the probe could
     // not run, which every caller must read as "cannot prove anything" and import - a redundant track is recoverable, a dropped one is not.
     let embeddedHashCache;
     const embeddedTextHashes = (subs) => {
@@ -1612,6 +1631,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const map = new Map();
             for (const [idx, out] of outs) {
                 try {
+                    // The same ceiling the SIDECAR half of this comparison applies (sidecarSha1, groupHasNoCues) - identical bytes must not be refused as a
+                    // file on disk and accepted as a stream inside a container. Matroska allows per-track zlib compression, so a small mkv legitimately holds
+                    // a very large subtitle: 8.76 MB of container expanded to 314 MB of srt through jellyfin-ffmpeg 7.1.4, and reading that took Tdarr's own
+                    // Node runtime from 43 MB RSS to 629 MB, since the Buffer and its UTF-8 copy are alive together. Past that, Node's own limits take over
+                    // and both throw into this catch as a silent "no hash" - so uncapped the worst case was a ~2.5 GiB peak that then evaporates. Both
+                    // consumers already fail SAFE on a missing hash: dedupeEmbeddedSubs never drops a stream it cannot hash, and contentConfirms never
+                    // authorises an unlink it cannot prove. Real text subtitles are kilobytes and a heavily typeset ASS a few MB, so this refuses no genuine
+                    // one. Reached on an ordinary extract/reimport round trip, not only under deduplicate - contentConfirms arrives here gated only on
+                    // remove_source, which defaults to true.
+                    if (fs.statSync(out).size > SIDECAR_HASH_MAX) continue;
                     const buf = fs.readFileSync(out);
                     // A track that decoded to no cues is EMPTY, not a duplicate. It gets no hash deliberately: every empty track would otherwise hash
                     // alike and be reported as a copy of the others, which describes the wrong problem and leaves one empty track standing.
@@ -2101,6 +2130,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     refused += 1;
                     response.infoLog += `☒${streamTag(s.index)} Library directory has a quote, control char or <io> - cannot write ${name} safely, `
                         + 'keeping the embedded subtitle\n';
+                    continue;
+                }
+                // The byte budget is checked on the FINISHED name, not just on the title encodeTitleCapped trims: an untitled stream skips that call
+                // entirely, and even with a title the fit loop can only trim to empty, so a video whose own basename runs past ~244 bytes overflows on its
+                // own. The sidecar and the strip are outputs of ONE ffmpeg command, so an over-long name does not merely lose the sidecar - ffmpeg answers
+                // "File name too long" (exit 193, verified on jellyfin-ffmpeg 7.1.4) and the whole extract dies, quarantining a file that re-fails on every
+                // requeue while the log line above it claims the extract was queued. Refused per sidecar, exactly as an unsafe path is. NOT fixed by trimming
+                // videoBase: parseSidecar anchors on it (startsWith(`${videoBase}.`), then slices at videoBase.length + 1), so a trimmed name would extract,
+                // strip the embedded track, and then be unrecognisable for reimport - a quiet round-trip break in place of a loud refusal.
+                if (Buffer.byteLength(name, 'utf8') > NAME_BYTE_CAP) {
+                    refused += 1;
+                    response.infoLog += `☒${streamTag(s.index)} Sidecar name would be ${Buffer.byteLength(name, 'utf8')} bytes, over the `
+                        + `${NAME_BYTE_CAP}-byte filesystem limit - rename the video shorter and requeue, keeping the embedded subtitle\n`;
                     continue;
                 }
                 // An unmapped node cannot reach the library to test or write the sidecar locally, so both happen through the server. With no translator

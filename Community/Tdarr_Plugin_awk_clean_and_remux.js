@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.2',
+    Version: '4.999.4',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -775,8 +775,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Normalize any language identifier to a stable comparison key so en / eng / EN / English / en-US - and ISO 639-2/B vs /T (fre vs fra) - all compare
     // equal. Node ships full ICU, so no table or module is needed.
     // -=-=-= shortLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
-    // Short language code: strip any region/variant suffix so 'en-US', 'en_US', 'en.US' all compare as 'en'.
-    const shortLang = (l) => l.replace(/[-_.].*$/, '');
+    // Short language code: strip any region/variant suffix so 'en-US', 'en_US', 'en.US' all compare as 'en'. `[\s\S]*` rather than `.*` because `.` cannot
+    // cross a line terminator and `$` without /m only matches true end-of-input (JS, unlike Perl/Python, will NOT match before a trailing newline) - so on a
+    // run of separators followed by an interior \r, \n, U+2028 or U+2029 the engine retries from every separator, runs the star to the terminator, and gives
+    // a character back at a time against a `$` it can never reach: O(n^2) with no possible match, so no early exit. A container language tag is unbounded
+    // metadata that reaches here uncapped on every language read, and ffprobe hands a 60,000-character Matroska Language element through verbatim - measured
+    // 20.1 s of blocked worker for one such file, 0.9 s -> 0.9 ms with this form. Same defect and reasoning as cleanStreamTitle's quote strip. It also folds
+    // a tag ENDING in a newline ('en-US\n' -> 'en'), which the `.*` form silently left unfolded.
+    const shortLang = (l) => l.replace(/[-_.][\s\S]*$/, '');
     // -=-=-= langNameIndex  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // Reverse map English language NAME -> 2-letter code (english->en), lazily built by probing every aa..zz pair through Intl.DisplayNames, memoised for
     // the run. Null-prototype so a container tag spelling an Object.prototype member ('constructor') misses the map instead of resolving inherited junk.
@@ -1269,6 +1275,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const libDir = path.dirname(libFilePath);
     const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '').replace(/<io>/gi, '');
     const sidecarLangToken = (s) => (resolveLang(s) || 'und').replace(/[^a-z0-9-]/g, '').slice(0, 32) || 'und';
+    // videoBase is the one part NOTHING bounds - it is the user's own filename, legally ~250 bytes on ext4/APFS/NTFS, and the shortest suffix either plugin
+    // appends is ~11 bytes. So each caller must measure the FINISHED name against this cap and refuse that one sidecar, exactly as it refuses an unsafe path.
+    // The refusal has to be at the caller because the two differ in what they do next; trimming videoBase instead is NOT an option, since sub_worker's
+    // parseSidecar anchors on it to read the name back and a trimmed one would extract, strip the track, and then be unrecognisable for reimport.
+    const NAME_BYTE_CAP = 255;
     // ===== END SHARED: sidecar path derivation =====
 
     // ===== SHARED [clean_and_remux, sub_worker]: sidecar placement =====
@@ -1686,8 +1697,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (guardAudioLanguage === 'enabled') {
             const audioStreams = (file.ffProbeData.streams || []).filter((s) => codecTypeOf(s) === 'audio' && !unmuxableDrops.has(s.index));
             const genuineLangs = new Set(audioStreams.filter((s) => !isCommentary(s) && !isDescriptive(s)).map((s) => langKey(resolveWorkLang(s))));
+            // logSafe each token, like every other echo of a container-supplied value: langKey deliberately passes an unrecognised tag through as-is (right for
+            // matching), so this set can hold an arbitrary-length, control-character-bearing string, and THIS message is what Tdarr stores in the error queue.
+            // Uncapped, a 200k tag carrying a newline produced a 200,351-character entry whose abort line was split across rows with no leading symbol - the
+            // infoLog contract break logSafe exists to prevent. summariseStream's tok already caps the same field at 64 on the input-summary line above.
             if (genuineLangs.size > 1 && !audioStreams.some((s) => hasDisposition(s, 'original')))
-                failFile(`[guard_audio_language=${guardAudioLanguage}] ${genuineLangs.size} audio languages (${[...genuineLangs].join(', ')})`
+                failFile(`[guard_audio_language=${guardAudioLanguage}] ${genuineLangs.size} audio languages`
+                    + ` (${[...genuineLangs].map((k) => logSafe(k)).join(', ')})`
                     + ' and none marked original - one of them could be the original language;'
                     + ' mark the original track and requeue, or set guard_audio_language=disabled');
         }
@@ -1954,6 +1970,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             response.infoLog += `☒${streamTag(ffstream.index)}[remove_imagesubs=export] Could not place ${sidecarName} in the library`
                                 + ` - ${failedSidecars.get(sidecarName)}, keeping the subtitle\n`;
                         }
+                    } else if (Buffer.byteLength(sidecarName, 'utf8') > NAME_BYTE_CAP) {
+                        // videoBase is the user's own filename and nothing bounds it, so the finished name can exceed the filesystem's 255-byte basename cap
+                        // on its own. The sidecar and the strip are outputs of ONE ffmpeg command, so an over-long name does not merely lose the sidecar:
+                        // ffmpeg answers "File name too long" and refuses EVERY output of the run, quarantining a file that re-fails on every requeue. Refuse
+                        // it here instead, so the message names the actual fix. Checked BEFORE the write branch, not after the path test - it is a property of
+                        // the name, not of the directory.
+                        exportRefused = true; exportRefusedCount += 1;
+                        response.infoLog += `☒${streamTag(ffstream.index)}[remove_imagesubs=export] Sidecar name would be `
+                            + `${Buffer.byteLength(sidecarName, 'utf8')} bytes, over the ${NAME_BYTE_CAP}-byte filesystem limit`
+                            + ' - rename the video shorter and requeue, keeping the subtitle\n';
                     } else if (pathIsPresetSafe(sidecarPath)) {
                         // ffmpeg refuses to overwrite an existing output file and aborts the ENTIRE run, so a sidecar left by an earlier pass would take the
                         // whole remux down with it rather than just skipping its own export. An existing sidecar has already served its purpose and may since
@@ -2028,6 +2054,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             + ` ${ffstreamCodec} subtitle -> ${sidecarName}${fontNote}\n`; }
                         else response.infoLog += `☒${streamTag(ffstream.index)}[container=mp4] Could not place ${sidecarName} in the library`
                             + ` - ${failedSidecars.get(sidecarName)}; converting to mov_text instead, which loses the styling\n`;
+                    } else if (Buffer.byteLength(sidecarName, 'utf8') > NAME_BYTE_CAP) {
+                        // Same name-length refusal as the image-sub export above; here the fall-through is mov_text rather than a quarantine.
+                        response.infoLog += `☒${streamTag(ffstream.index)}[container=mp4] Sidecar name would be `
+                            + `${Buffer.byteLength(sidecarName, 'utf8')} bytes, over the ${NAME_BYTE_CAP}-byte filesystem limit`
+                            + ' - converting to mov_text instead, which loses the styling; rename the video shorter to keep it\n';
                     } else if (pathIsPresetSafe(sidecarPath)) {
                         // ffmpeg aborts the whole run rather than overwrite an output file, so an existing bundle is left alone and the drop still goes
                         // ahead - it already holds this subtitle, and re-exporting could only destroy a copy the user may have edited.
