@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.46.0',
+    Version: '3.999.0',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -70,7 +70,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['enabled_only_sidecar', 'enabled_checkmedia', 'disabled']
             },
-            tooltip: `What counts as a copy of a subtitle you already have. The TEXT decides, so only byte-for-byte duplicates are ever collapsed - two
+            tooltip: `What counts as a copy of a subtitle you already have. The TEXT decides, and it is compared ignoring the things ffmpeg rewrites on a round trip (line endings, a BOM, cue numbering), so a downloaded subtitle still matches its embedded copy - two
                 commentaries, or a real forced track beside a full one, are different text and both survive.
                 \\n=====
                 \\nActions
@@ -1520,12 +1520,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // because a name that merely parses as a sidecar says nothing about what is behind it - a runaway OCR dump or a mis-renamed file left as
     // <video>.eng.srt would otherwise be pulled into the worker whole for a hash that is not even needed. Real text subtitles are kilobytes and a heavily
     // typeset ASS a few MB, so 64 MiB is orders of magnitude of headroom and never refuses a genuine one. (Node itself already refuses past 2 GiB.)
+    // Sidecar identity is compared against text ffmpeg RE-SERIALISED out of the container, so the two sides are only equal after the same normalisation.
+    // ffmpeg's srt muxer/encoder rewrites on the way through, measured on 7.1.4: CRLF folds to LF, a UTF-8 BOM is dropped, a missing final blank line is
+    // added, and cue numbers are RENUMBERED from 1 (same byte COUNT, different bytes - a size check cannot even hint at it). Hashing raw bytes therefore
+    // said "different subtitle" for every ordinary downloaded .srt, which is CRLF and often gap-numbered. Both hash sites must use THIS function.
+    // Two traps, both deliberate: (1) only a numeric line IMMEDIATELY PRECEDING a "-->" line is dropped, because that is structurally the cue number - a
+    // blanket "drop standalone numeric lines" would delete a cue whose text is literally "7" and make two different subtitles collide; (2) ass is
+    // normalised for line endings ONLY, never reduced to its Dialogue: lines, because that would hash two subtitles differing only in typesetting alike.
+    const subTextForHash = (buf, ext) => {
+        const t = buf.toString('utf8').replace(/^﻿/, '').replace(/\r\n?/g, '\n');
+        const e = String(ext || '').toLowerCase().replace(/^\./, '');
+        if (e !== 'srt' && e !== 'vtt') return t.replace(/\s+$/, '');
+        const lines = t.split('\n');
+        return lines.filter((ln, i) => !(/^\d+$/.test(ln.trim()) && String(lines[i + 1] || '').includes('-->'))).join('\n').replace(/\s+$/, '');
+    };
+
     const SIDECAR_HASH_MAX = 64 * 1024 * 1024;
     const sidecarSha1 = (rel) => {
         const p = path.join(workLibDir(), rel);
         try {
             if (fs.statSync(p).size > SIDECAR_HASH_MAX) return '';
-            return crypto.createHash('sha1').update(fs.readFileSync(p)).digest('hex');
+            return crypto.createHash('sha1').update(subTextForHash(fs.readFileSync(p), path.extname(rel))).digest('hex');
         } catch (e) { return ''; }
     };
 
@@ -1563,7 +1578,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The CONTENT of every embedded text subtitle, as a sha1 keyed by source stream index - the only sound answer to "is this sidecar already in the
     // file": metadata cannot answer it in either direction (retitling changes every visible field while the text stays identical; two tracks can share
     // language+title with different text). One ffmpeg run extracts them all in a SINGLE pass through the same codec->format map the sidecars were written
-    // with, so the bytes are directly comparable (measured identical across a -c copy remux for srt and ass). Costs one sequential read (0.3s on an 885MB
+    // with. The bytes are NOT directly comparable - ffmpeg re-serialises on the way out (CRLF folded, BOM dropped, cue numbers renumbered from 1), which is
+    // identical only for a sidecar ffmpeg itself wrote - so both sides hash subTextForHash() instead. Costs one sequential read (0.3s on an 885MB
     // mkv), so callers only reach it with deduplicate enabled and a real candidate. An empty map means "asked, found nothing"; null means the probe could
     // not run, which every caller must read as "cannot prove anything" and import - a redundant track is recoverable, a dropped one is not.
     let embeddedHashCache;
@@ -1600,7 +1616,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // A track that decoded to no cues is EMPTY, not a duplicate. It gets no hash deliberately: every empty track would otherwise hash
                     // alike and be reported as a copy of the others, which describes the wrong problem and leaves one empty track standing.
                     if (hasNoCues(buf.toString('utf8'), path.extname(out).replace('.', ''))) { embeddedEmptyIdx.add(idx); continue; }
-                    map.set(idx, crypto.createHash('sha1').update(buf).digest('hex'));
+                    map.set(idx, crypto.createHash('sha1').update(subTextForHash(buf, path.extname(out))).digest('hex'));
                 } catch (e) {
                     /* a stream that could not be read simply has no hash, and matches nothing */
                 }
@@ -2513,7 +2529,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (at === null) { toMux.push(f); continue; }
             f.embeddedAt = at;
             alreadyInFile.push(f);
-            response.infoLog += `☑${streamTag(at)}[deduplicate=${dedupeMode}] ${f.rel} is already in the file byte-for-byte - not importing a second copy\n`;
+            response.infoLog += `☑${streamTag(at)}[deduplicate=${dedupeMode}] ${f.rel} is already in the file - not importing a second copy\n`;
             const cur = keptSubs.find((s) => s.index === at);
             const curTitle = isMp4 ? (f.title || '') : (cur?.tags?.title || '');
             const curDisp = new Set(activeDispositions(cur));
