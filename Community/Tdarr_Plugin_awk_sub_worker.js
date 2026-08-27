@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.0',
+    Version: '3.999.1',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1949,7 +1949,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 let text = null;
                 try { text = fs.readFileSync(full, 'utf8'); } catch (e) { text = null; }
                 if (text === null) return { job: null, note: `☒[embedded_cc=enabled] Could not read ${name} to check it - leaving it alone\n` };
-                if (!hasNoCues(text, 'srt')) return { job: null, note: `☑[embedded_cc=enabled] Captions already extracted to ${name}\n` };
+                if (!hasNoCues(text, 'srt')) {
+                    // This sidecar landed on an earlier pass and holds real cue text, so the bitstream copy may NOW be removed - THIS is the pass that owes
+                    // the strip. It is deliberately not done in the pass that WRITES the sidecar: ffmpeg exits 0 having written a cue-less srt whenever the
+                    // caption channel decodes empty (a field-2-only capture with padded field 1 does exactly that), so a same-pass strip deletes captions
+                    // nothing ever captured. Re-probe instead of trusting the library flag - once the strip has landed the captions are gone, and owing a
+                    // SECOND identical strip is what Tdarr refuses as an infinite transcode loop, ERRORING the file. Only paid when remove_source is on,
+                    // the only setting that can owe a strip at all.
+                    let owed = false;
+                    if (removeSource) {
+                        const inj = otherArguments && otherArguments.__awkCap;
+                        owed = probeA53Captions(file.file, deriveFfprobePath(String(otherArguments?.ffmpegPath || 'ffmpeg')),
+                            inj ? inj.captions === true : undefined) === true;
+                    }
+                    return { job: null, stripOwed: owed, note: `☑[embedded_cc=enabled] Captions already extracted to ${name}${owed
+                        ? ' - removing the bitstream copy now that the sidecar is confirmed to hold them' : ''}\n` };
+                }
                 let unlinked = true;
                 try { fs.unlinkSync(full); } catch (e) { unlinked = false; }
                 // Recording the verdict takes a mux of its own, and that is only safe where the tag comes back out. On a marker-hostile container the memo
@@ -2016,7 +2031,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const eligible = streams.filter((s) => codecTypeOf(s) === 'subtitle' && isTextSub(s.codec_name)
                 && !dupes.dropIdx.includes(s.index)
                 && !(langFilter && !langFilter.has(langKey(resolveLang(s) || 'und'))));
-            if (!eligible.length && !dupes.dropIdx.length && !ccPlan.job) return skip('☑No text subtitles to extract\n');
+            // A DEFERRED caption strip is work of its own: the sidecar landed on an earlier pass, so there is no job and nothing to extract, yet the
+            // bitstream copy still has to come out. Bailing here would leave the captions in the video forever, with the sidecar beside it.
+            if (!eligible.length && !dupes.dropIdx.length && !ccPlan.job && !ccPlan.stripOwed) return skip('☑No text subtitles to extract\n');
 
             // method_unmapped=mount on a node where the mount is not actually there. Extract does not need it - the file API still lands every sidecar in the
             // library - so failing here would be gratuitous when the work can be done. But it must not pass in silence: the user asked for a mount, the mount
@@ -2061,7 +2078,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 ccInput = `-f lavfi -i "movie=${escapeMoviePath(file.file)}[out0+subcc]" `;
                 sidecarOut += ` -map 1:s:0 -c:s text -f srt "${ccPlan.job.full}"`;
                 wrote += 1;
-                ccPlaced = true;   // same ffmpeg command as the strip below, so the sidecar and the removal cannot come apart
+                // Deliberately does NOT authorise the strip: ffmpeg exits 0 on an empty caption decode, writing a 0-byte srt while the same command would
+                // delete the SEI - captions gone with nothing holding them. The next pass reads this sidecar, proves it has cues, and owes the strip then.
                 response.infoLog += `☐${streamTag(ccVideo.index)}[embedded_cc=enabled] Reading the embedded closed captions -> ${ccPlan.job.name}`
                     + ' (decodes the video, so this pass is slower than an ordinary extract)\n';
             }
@@ -2180,7 +2198,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // because until then a player shows the captions AND the new subtitle. Gated on ccPlaced, not on a job having been PLANNED: removal may only
             // follow a copy the library is confirmed to hold. A channel proven EMPTY asks for nothing - the `none` memo already stops the decode repeating.
             let ccStrip = '';
-            if (ccPlan.job && ccPlaced && removeSource && !ccRecord.has(CC_TOKENS.none)) {
+            if (((ccPlan.job && ccPlaced) || ccPlan.stripOwed) && removeSource && !ccRecord.has(CC_TOKENS.none)) {
                 if (ccStripAllowed()) {
                     ccStrip = ccStripArg(removedIndices);
                     response.infoLog += `☐${streamTag(ccVideo.index)}[remove_source=true] Removing the closed captions from the video bitstream\n`;
@@ -2336,6 +2354,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const found = scan.rels.map(parseSidecarRel).filter(Boolean)
             .sort(byOriginalPosition)
             .filter((f) => {
+                // The caption staging sidecar is OUR intermediate, not a subtitle the user chose to scope. Captions carry no language of their own so it is
+                // tagged 'und', which is in nobody's only_languages list - and dropping it here strands the round trip: the full-video decode is paid for,
+                // the hidden sidecar is written, and then nothing imports it, so awk_cc=imported is never stamped and every later pass decodes again.
+                // extract already exempts embedded_cc from this filter; this is the import half of the same exemption.
+                if (ccName && f.rel === ccName) return true;
                 if (!langFilter || langFilter.has(langKey(f.lang))) return true;
                 // The tag echoes a free-text input, so it gets the same treatment failLangToken gives its token: control characters collapsed (a raw newline
                 // would split the line into a continuation with no ☐/☑/☒ symbol) and capped, since nothing bounds the list and this line is per-sidecar.
