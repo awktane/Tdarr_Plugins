@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.0',
+    Version: '4.999.1',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1193,15 +1193,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Strip surrounding whitespace/quotes and dedupe repeated segments ("Stereo / Stereo" -> "Stereo"). Busy-title removal (>3 periods) is applied by
     // callers AFTER tagging, not here - roles are captured into flags before an over-dotted title clears.
     function cleanStreamTitle(rawTitle) {
-        // Strip the surrounding quotes by index. /^["']+|["']+$/ is quadratic in an INTERIOR quote run: the ^-anchored branch can only try offset 0, so
-        // once a word character leads, ["']+$ re-scans from every offset inside the run, consumes it greedily and gives back a character at a time against
-        // a failing $ (60k quote characters measured 5.7 s of blocked worker). Same defect, same reasoning and the same output as the whitespace
-        // pre-collapse below - a title is unbounded container metadata, so neither may be left to backtrack.
+        // Strip the surrounding quotes by index, and only a genuine PAIR. An unmatched quote is part of the title, not packaging: 'Commentary by "The
+        // Director"' would otherwise lose its last character AND have the interior " rewritten to ' by escMeta on the way out, so a file needing no other
+        // work is remuxed purely to store damaged metadata. One-sided stripping is therefore refused in both directions, and a title that is ALL quotes has
+        // no pair either, so it survives verbatim rather than collapsing to empty. Index walk rather than /^["']+|["']+$/, which is quadratic in an INTERIOR
+        // quote run: the ^-anchored branch can only try offset 0, so once a word character leads, ["']+$ re-scans from every offset inside the run, consumes
+        // it greedily and gives back a character at a time against a failing $ (60k quote characters measured 5.7 s of blocked worker). Same defect and the
+        // same reasoning as the whitespace pre-collapse below - a title is unbounded container metadata, so neither may be left to backtrack.
         let title = (rawTitle || '').trim();
         let qa = 0; let qb = title.length;
         while (qa < qb && (title[qa] === '"' || title[qa] === "'")) qa += 1;
         while (qb > qa && (title[qb - 1] === '"' || title[qb - 1] === "'")) qb -= 1;
-        title = title.slice(qa, qb);
+        if (qa > 0 && qb < title.length) title = title.slice(qa, qb);
         if (title) {
             // Collapse whitespace runs BEFORE the split: the leading \s* otherwise backtracks a character at a time from every offset inside a long run,
             // which is quadratic in that run's length (an interior 80k-space title measured 20 s of blocked worker). Output is unchanged - every part is
