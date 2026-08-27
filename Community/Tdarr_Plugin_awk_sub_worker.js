@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.11',
+    Version: '3.999.12',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1865,22 +1865,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile('No ffProbe stream data available, cannot process this file');
     }
     const action = String(inputs.action);
-    if (action !== 'extract' && action !== 'import') failFile(`[action=${action}] invalid value, check your settings`);
-    // Deleting the sidecar FILES is remove_source's decision alone in every mode - this setting only ever decides what counts as a duplicate. An
-    // unrecognised value FAILS the file rather than falling through to a default, since the three modes do materially different amounts of work and a typo
-    // must not quietly pick one. The failFile message shows the RAW inputs value.
+    // Deleting the sidecar FILES is remove_source's decision alone in every mode - deduplicate only ever decides what counts as a duplicate. An unrecognised
+    // value FAILS the file rather than falling through to a default, since the three modes do materially different amounts of work and a typo must not
+    // quietly pick one. That is true of every dropdown here, which is why they are validated together below.
     const dedupeMode = String(inputs.deduplicate || 'enabled_only_sidecar').toLowerCase().trim();
-    if (!['disabled', 'enabled_only_sidecar', 'enabled_checkmedia'].includes(dedupeMode))
-        failFile(`[deduplicate=${inputs.deduplicate}] invalid value, check your settings`);
     const dedupeSidecars = dedupeMode !== 'disabled';          // both enabled values collapse byte-identical sidecars and skip one already embedded
     const dedupeStreams = dedupeMode === 'enabled_checkmedia'; // only this one reads the file's own tracks, to find a duplicate or an empty one
     const ccMode = String(inputs.embedded_cc || 'disabled').toLowerCase().trim();
-    if (!['disabled', 'enabled'].includes(ccMode)) failFile(`[embedded_cc=${inputs.embedded_cc}] invalid value, check your settings`);
-    if (!['error', 'mount', 'text_file'].includes(unmappedMode)) failFile(`[method_unmapped=${inputs.method_unmapped}] invalid value, check your settings`);
     const metadataMode = String(inputs.method_import_metadata || 'embedded').toLowerCase();
-    if (!['embedded', 'sidecar'].includes(metadataMode)) {
-        failFile(`[method_import_metadata=${inputs.method_import_metadata}] invalid value, check your settings`);
-    }
+    // Every dropdown's accepted set, as ONE table driving ONE loop. The shape matters beyond the line count: CLAUDE.md's retired-option policy says a value the
+    // dropdown no longer offers must STOP the file, and input_surface_diff.js has to locate each dropdown's validator to report an accepted-but-not-offered
+    // value. A uniform table is an anchor it can find; five scattered `if` statements are not, and one going stale is invisible - that is how video_clean's
+    // method_encoder kept accepting five retired encoder families for seventeen minor versions. The message names the NORMALISED value, as the other four
+    // plugins do; it can differ from what is saved only in case or padding, neither of which is what failed.
+    const dropdownChecks = [
+        ['action',                 action,        ['extract', 'import']],
+        ['deduplicate',            dedupeMode,    ['disabled', 'enabled_only_sidecar', 'enabled_checkmedia']],
+        ['embedded_cc',            ccMode,        ['disabled', 'enabled']],
+        ['method_unmapped',        unmappedMode,  ['error', 'mount', 'text_file']],
+        ['method_import_metadata', metadataMode,  ['embedded', 'sidecar']],
+    ];
+    for (const [name, value, opts] of dropdownChecks)
+        if (!opts.includes(value)) failFile(`[${name}=${value}] invalid value, check your settings`);
     if (file.fileMedium && file.fileMedium !== 'video') return skip('☑Not a video file - skipping\n');
     // A language token that is not a language FAILS the file. only_languages scopes which subtitles are touched at all, so a typo ('eng,fer') silently matches
     // nothing and every subtitle in that language is quietly left out of the extract - the user gets a clean run that did none of the work they asked for, with

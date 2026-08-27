@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.5',
+    Version: '3.999.6',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1609,15 +1609,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return n;
     })();
 
-    if (!['hdr_cleanup_only', 'normalize', 'shrink'].includes(action)) failFile(`[action=${action}] invalid value, check your settings`);
-    if (!['source', 'hevc', 'h264', 'av1'].includes(codec)) failFile(`[codec=${codec}] invalid value, check your settings`);
-    if (!['disabled', '2160', '1440', '1080', '720'].includes(downscaleOpt)) failFile(`[downscale=${downscaleOpt}] invalid value, check your settings`);
-    if (!['slow', 'medium', 'fast'].includes(speed)) failFile(`[method_speed=${speed}] invalid value, check your settings`);
-    if (!['source', '8', '10'].includes(bitDepthOpt)) failFile(`[method_bitdepth=${bitDepthOpt}] invalid value, check your settings`);
-    if (!['node', 'node_strict', 'auto', 'cpu'].includes(encoderOpt))
-        failFile(`[method_encoder=${encoderOpt}] invalid value, check your settings`);
-    if (!['preserve', 'strip_dynamic', 'tonemap_sdr'].includes(hdrMode)) failFile(`[hdr_mode=${hdrMode}] invalid value, check your settings`);
-    if (!['disabled', 'enabled'].includes(deinterlaceOpt)) failFile(`[deinterlace=${deinterlaceOpt}] invalid value, check your settings`);
+    // Every dropdown's accepted set, as ONE table driving ONE loop. The shape matters beyond the line count: CLAUDE.md's retired-option policy says a value the
+    // dropdown no longer offers must STOP the file, and input_surface_diff.js has to locate each dropdown's validator to report an accepted-but-not-offered
+    // value. A uniform table is an anchor it can find; eleven differently-shaped `if` statements are not, and one of them going stale is invisible - that is
+    // how video_clean's method_encoder kept accepting five retired encoder families for seventeen minor versions. Non-dropdown checks stay where they are.
+    const dropdownChecks = [
+        ['action',           action,          ['hdr_cleanup_only', 'normalize', 'shrink']],
+        ['codec',            codec,           ['source', 'hevc', 'h264', 'av1']],
+        ['downscale',        downscaleOpt,    ['disabled', '2160', '1440', '1080', '720']],
+        ['method_speed',     speed,           ['slow', 'medium', 'fast']],
+        ['method_bitdepth',  bitDepthOpt,     ['source', '8', '10']],
+        ['method_encoder',   encoderOpt,      ['node', 'node_strict', 'auto', 'cpu']],
+        ['hdr_mode',         hdrMode,         ['preserve', 'strip_dynamic', 'tonemap_sdr']],
+        ['deinterlace',      deinterlaceOpt,  ['disabled', 'enabled']],
+    ];
+    for (const [name, value, opts] of dropdownChecks)
+        if (!opts.includes(value)) failFile(`[${name}=${value}] invalid value, check your settings`);
     // The one cross-input config error: tonemap_sdr is a pixel-domain re-encode, so it can never satisfy hdr_cleanup_only's lossless-or-skip promise.
     if (hdrMode === 'tonemap_sdr' && action === 'hdr_cleanup_only')
         failFile('[hdr_mode=tonemap_sdr][action=hdr_cleanup_only] tonemapping is always a re-encode (never lossless)'

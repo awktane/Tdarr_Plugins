@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.8',
+    Version: '4.999.9',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1000,28 +1000,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if(fillLanguage && subLanguage.length > 0 && !subLangKeys.includes(langKey(fillLanguage)))
         failFile(`[language_fill=${logSafe(fillLanguage)}] not in language_sub - untagged subtitle streams would be removed;`
             + ' add it to language_sub or clear language_fill');
-    if(!['single-or-error', 'force-any'].includes(fillMode))
-        failFile(`[language_fill_mode=${fillMode}] invalid value, check your settings`);
-    if(!['disabled', 'if_plain_survives', 'all'].includes(removeSubSdh))
-        failFile(`[remove_sub_sdh=${removeSubSdh}] invalid value, check your settings`);
-    if(!['disabled', 'audio', 'subtitle', 'both'].includes(tagDisposition))
-        failFile(`[tag_disposition=${tagDisposition}] invalid value, check your settings`);
-    if(!['disabled', 'audio', 'subtitle', 'both'].includes(tagTitle))
-        failFile(`[tag_title=${tagTitle}] invalid value, check your settings`);
-    if(!['invalid', 'strict', 'disabled'].includes(tagLanguage))
-        failFile(`[tag_language=${tagLanguage}] invalid value, check your settings`);
-    if(!['container', '639-2/t', '639-2/b', 'bcp47'].includes(methodTagLanguage))
-        failFile(`[method_tag_language=${methodTagLanguage}] invalid value, check your settings`);
-    if(!['disabled', 'light', 'aggressive'].includes(recoverData))
-        failFile(`[recover_bad_data=${recoverData}] invalid value, check your settings`);
-    if(!['disabled', 'light', 'aggressive'].includes(recoverTs))
-        failFile(`[recover_bad_timestamps=${recoverTs}] invalid value, check your settings`);
-    if(!['disabled', 'enabled'].includes(guardAudioLanguage))
-        failFile(`[guard_audio_language=${guardAudioLanguage}] invalid value, check your settings`);
-    if(!['unsupported', 'all', 'export'].includes(removeImageSubs))
-        failFile(`[remove_imagesubs=${removeImageSubs}] invalid value, check your settings`);
-    if(!['error', 'drop', 'mkv_fallback'].includes(methodUnmuxable))
-        failFile(`[method_unmuxable=${methodUnmuxable}] invalid value, check your settings`);
+    // Every dropdown's accepted set, as ONE table driving ONE loop. The shape matters beyond the line count: CLAUDE.md's retired-option policy says a value the
+    // dropdown no longer offers must STOP the file, and input_surface_diff.js has to locate each dropdown's validator to report an accepted-but-not-offered
+    // value. A uniform table is an anchor it can find; eleven differently-shaped `if` statements are not, and one of them going stale is invisible - that is
+    // how video_clean's method_encoder kept accepting five retired encoder families for seventeen minor versions. Non-dropdown checks stay where they are.
+    // `container` is NOT here: it is checked far earlier, because response.container is derived from it before this point.
+    const dropdownChecks = [
+        ['language_fill_mode',   fillMode,           ['single-or-error', 'force-any']],
+        ['remove_sub_sdh',       removeSubSdh,       ['disabled', 'if_plain_survives', 'all']],
+        ['tag_disposition',      tagDisposition,     ['disabled', 'audio', 'subtitle', 'both']],
+        ['tag_title',            tagTitle,           ['disabled', 'audio', 'subtitle', 'both']],
+        ['tag_language',         tagLanguage,        ['invalid', 'strict', 'disabled']],
+        ['method_tag_language',  methodTagLanguage,  ['container', '639-2/t', '639-2/b', 'bcp47']],
+        ['recover_bad_data',     recoverData,        ['disabled', 'light', 'aggressive']],
+        ['recover_bad_timestamps', recoverTs,        ['disabled', 'light', 'aggressive']],
+        ['guard_audio_language', guardAudioLanguage, ['disabled', 'enabled']],
+        ['remove_imagesubs',     removeImageSubs,    ['unsupported', 'all', 'export']],
+        ['method_unmuxable',     methodUnmuxable,    ['error', 'drop', 'mkv_fallback']],
+    ];
+    for (const [name, value, opts] of dropdownChecks)
+        if (!opts.includes(value)) failFile(`[${name}=${value}] invalid value, check your settings`);
 
     // ====== LANGUAGE TAG CANONICALIZATION ======
     // Write-side helpers: this is the only plugin that WRITES container language tags via tag_language/language_fill; langKey/langListMatch
