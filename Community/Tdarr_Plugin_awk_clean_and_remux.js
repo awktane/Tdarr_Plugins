@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.5',
+    Version: '4.999.6',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1408,9 +1408,92 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // an exported .mks needs a .embyignore entry there (called out in the remove_imagesubs tooltip). `mark` carries sub_worker's bundle token on a
     // STYLED-subtitle export - what tells its import to read the file back as a font bundle; an image-subtitle export deliberately has none, so importing
     // one can never re-add the picture subtitle this pass just removed.
+    // ===== SHARED [clean_and_remux, sub_worker]: sidecar name tokens =====
+    // -=-=-= DISPOSITIONS / DISP_ALIAS / DISP_IGNORE / DISP_TOKENS / DISP_AMBIGUOUS_LANG  [clean_and_remux, sub_worker] =-=-=-
+    // Dispositions encoded as filename tokens, in fixed order. `ff` is the ffmpeg -disposition name restored on import; `flags` are the ffprobe
+    // disposition keys that, when set on the source, emit this token on extract. They differ only for SDH: hearing_impaired and captions are
+    // the same closed-captions role, but captions has no Matroska flag and does not survive an mp4->mkv round-trip (the muxer silently drops
+    // +captions), so BOTH normalise to the container-portable hearing_impaired - extract emits a single 'sdh' token for either flag and import
+    // restores hearing_impaired. The human-readable role also survives in the encoded title. `default` is deliberately NOT tracked: muxers
+    // auto-manage it (mp4 forces default on the first subtitle), so it is neither identity-stable nor ours. Nothing in the stack normalises a
+    // SUBTITLE default either - stream_ordering's +default/-default pass is audio-only, and only READS the flag for subtitle_first=default_tagged
+    // - so whatever a muxer stamped survives untouched. That is deliberate: "no subtitle is default" and "the first forced subtitle is default"
+    // are both defensible library policies, and silently clearing a user's forced-subtitle default would change what every player auto-enables.
+    const DISPOSITIONS = [
+        { token: 'forced',      ff: 'forced',           flags: ['forced'] },
+        { token: 'sdh',         ff: 'hearing_impaired', flags: ['hearing_impaired', 'captions'] },
+        { token: 'commentary',  ff: 'comment',          flags: ['comment'] },
+        { token: 'descriptive', ff: 'descriptions',     flags: ['descriptions'] },
+    ];
+    // Media-server filename tokens that normalise onto a canonical token above (parse-only; extract never writes them), so a sidecar named by
+    // Plex/Jellyfin/Emby - or by hand from their docs - still imports with its role intact instead of being read as the language and skipped:
+    // 'cc' and 'hi' are the closed-captions/hearing-impaired spellings of SDH, 'foreign' is Jellyfin's and Emby's spelling of forced.
+    const DISP_ALIAS = { cc: 'sdh', hi: 'sdh', foreign: 'forced' };
+    // Parse-only tokens recognised so they aren't mis-read as the language, but carrying
+    // NO disposition: 'default' is muxer-managed, not a role we track or restore.
+    const DISP_IGNORE = new Set(['default']);
+    const DISP_TOKENS = new Set([...DISPOSITIONS.map((d) => d.token), ...Object.keys(DISP_ALIAS), ...DISP_IGNORE]);
+    // Alias tokens that are ALSO a real ISO 639-1 code, so the right-to-left disposition strip must not swallow the language slot: 'hi' is both the
+    // hearing-impaired flag and Hindi. Such a token counts as a disposition only when a real language sits immediately before it (Jellyfin's own rule),
+    // so <name>.en.hi.srt is English+SDH while <name>.hi.srt stays a Hindi track. See the guard in parseSidecar's disposition loop.
+    const DISP_AMBIGUOUS_LANG = new Set(['hi']);
+    // -=-=-= EXTRA_DISPOSITIONS / EXTRA_TOKENS  [clean_and_remux, sub_worker] =-=-=-
+    // Flags that must survive the round trip but that NO media server understands as a filename token. Written BEFORE the language: the servers parse
+    // right-to-left from the extension, so everything ahead of the language is ignored while the trailing <lang>[.disp] they do read stays as it was - an
+    // unknown flag in the trailing run is how a sidecar silently stops being imported at all. Both are raw ffmpeg dispositions, NOT dispositionTypes roles
+    // (that table scopes each to audio), yet mkvtoolnix writes either on a subtitle; reading the raw flag is deliberate, so extract -> import returns the
+    // stream exactly as found regardless of any title keyword or tagging setting. Container limits, measured on jellyfin-ffmpeg: Matroska keeps both
+    // through a -c copy remux; mp4 drops 'original' whatever we do, and cannot tell 'visual_impaired' from 'descriptions' (either reads back as BOTH). The
+    // tokens use ffmpeg's own spelling, and an underscore is something a language token can never be (sidecarLangToken restricts to [a-z0-9-]), so
+    // 'visual_impaired' cannot collide with a language the way 'hi'/Hindi does.
+    const EXTRA_DISPOSITIONS = [
+        { token: 'original',        ff: 'original',        flags: ['original'] },
+        { token: 'visual_impaired', ff: 'visual_impaired', flags: ['visual_impaired'] },
+    ];
+    const EXTRA_TOKENS = new Set(EXTRA_DISPOSITIONS.map((d) => d.token));
+    // -=-=-= SERVER_FLAG_TOKENS / dispTokensOf / extraTokensOf  [clean_and_remux, sub_worker] =-=-=-
+    // The only tokens a media server both documents and acts on, and Plex takes just ONE of them - ".forced.sdh" is not a supported combination, it is one
+    // or the other. So the trailing run carries a single flag and every other role joins 'original' ahead of the language, where servers do not look and
+    // nothing is lost because our own parser reads both regions. forced wins the slot over sdh: it drives AUTOMATIC selection (a forced track that loses
+    // its flag stops appearing by itself), whereas an unlabelled SDH track is still listed and selectable, just not marked.
+    const SERVER_FLAG_TOKENS = ['forced', 'sdh'];
+    // extract: one canonical token per role the stream's real flags carry (sdh covers hearing_impaired OR captions), deduped.
+    const dispTokensOf = (s) => DISPOSITIONS.filter((d) => d.flags.some((f) => s.disposition?.[f] === 1)).map((d) => d.token);
+    const extraTokensOf = (s) => EXTRA_DISPOSITIONS.filter((d) => d.flags.some((f) => s.disposition?.[f] === 1)).map((d) => d.token);
+    // -=-=-= sidecarNameTokens  [clean_and_remux, sub_worker] =-=-=-
+    // The language slot and the two disposition runs that surround it, for any sidecar either plugin writes - the part of a sidecar name that BOTH a media
+    // server and our own parseSidecar read as authoritative. Shared because the writer and the reader live in different files: clean_and_remux exports the
+    // styled .mks bundle, sub_worker imports it, and while these tokens were hand-kept on each side the export could spell only `.forced`. parseSidecar
+    // treats a bundle's filename as the authority and writes an explicit `-disposition 0` when it carries none, so every other role the .mks really held -
+    // sdh, commentary, descriptive, original, visual_impaired - was cleared on the way back in. Assembly stays local, since only sub_worker writes a title
+    // token; the VOCABULARY and the collision escape live here, because those are what drifted.
+    const sidecarNameTokens = (s) => {
+        // lang is the only metadata-derived component read raw (a title is percent-encoded, disp/ext are fixed enums); the shared sidecarLangToken restricts
+        // it to the language-code charset - see its definition for why. parseSidecar round-trips it unchanged, a valid code (en/eng/pt-br) already fitting.
+        const langRaw = sidecarLangToken(s);
+        // A tag that sanitises to a disposition-token word (a crafted tags.language of "forced"/"sdh"/etc.) would be consumed as a trailing disposition by
+        // parseSidecar's right-to-left disp strip, nulling or corrupting the reimport - collapse any such collision to 'und' so the fixed language slot can
+        // never be shaped like a disposition token. A DISP_AMBIGUOUS_LANG token is exempt because it is also a real language code: the disp strip only reads
+        // it as a disposition when a real language sits immediately before it, so a Hindi track keeps 'hi' here rather than losing its language to 'und'.
+        const lang = ((DISP_TOKENS.has(langRaw) && !DISP_AMBIGUOUS_LANG.has(langRaw)) || EXTRA_TOKENS.has(langRaw)) ? 'und' : langRaw;
+        const roles = dispTokensOf(s);
+        const trailing = SERVER_FLAG_TOKENS.find((t) => roles.includes(t));   // at most one, and only a token every server documents
+        // Everything else - a second server flag Plex could not have taken anyway, plus our own roles - rides ahead of the language beside 'original'.
+        const extra = extraTokensOf(s).concat(roles.filter((t) => t !== trailing));
+        return { lang, pre: extra.length ? `.${extra.join('.')}` : '', disp: trailing ? `.${trailing}` : '' };
+    };
+    // ===== END SHARED: sidecar name tokens =====
+
     const exportSidecarName = (ffstream, ext, mark) => {
-        const forced = ffstream.disposition?.forced === 1 ? '.forced' : '';
-        return `.${videoBase}.s${ffstream.index}.${sidecarLangToken(ffstream)}${forced}${mark ? `.${mark}` : ''}.${ext}`;
+        // Every token but the extension comes from the shared sidecarNameTokens, which is what makes this name readable by sub_worker's importer. It used to
+        // spell `.forced` and nothing else, and sub_worker treats a bundle's FILENAME as the authority on disposition - writing an explicit `-disposition 0`
+        // when the name carries no token - so a styled .mks exported from an SDH, commentary, descriptive, original or visual_impaired subtitle came back
+        // with that flag cleared, on the one export path that deletes the source stream because the bundle is supposed to be a complete record. The shared
+        // helper also brings the language-collision escape: a tags.language of "forced" produced a name parseSidecar rejected outright, stranding the only
+        // styled copy beside the video forever. No title token is written here - the .mks carries its title through the -c copy, and import only overwrites
+        // a title the name actually spells.
+        const { lang, pre, disp } = sidecarNameTokens(ffstream);
+        return `.${videoBase}.s${ffstream.index}${pre}.${lang}${disp}${mark ? `.${mark}` : ''}.${ext}`;
     };
     // A subtitle removed regardless of language - by container/format (subFormatDropped), by remove_imagesubs
     // (imageSubDropped), or by the mp4 styled-subtitle bundle export (styledSubExported), which maps the track out of the
