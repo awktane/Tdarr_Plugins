@@ -15,7 +15,7 @@ const details = () => ({
         it's needed).\n\nBecause it runs last it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file
         that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the signature of an out-of-memory-killed or
         unfinalised encode from an earlier stage. A longer output is accepted. This check is always on and has no setting.\n`,
-    Version: '4.22.2',
+    Version: '4.22.3',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -940,6 +940,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // the raw input. The failFile message always shows the RAW inputs[name].
     const junkTagsMode = String(inputs.remove_junk_tags || 'disabled').toLowerCase();
     const methodFaststart = String(inputs.method_mp4_faststart || 'force').toLowerCase().trim();
+    // The container this plugin writes, named once as the other three plugins name it. Neither of these two changes the container, so it is the source's -
+    // but every membership test must see it normalised: a Tdarr container string of 'MKV' misses a bare includes() and silently takes the marker-hostile
+    // branch. The response.container default above deliberately keeps the RAW value: that string becomes the output file's extension, and lowercasing it
+    // there would rename the file rather than answer a question about it.
+    const dstContainer = String(file.container || '').toLowerCase().trim();
     const dropdownChecks = [
         ['audio_first',          inputs.audio_first,                                             ['disabled', 'original_tagged', 'default_tagged', 'descriptive_tagged']],
         ['order_channel',        inputs.order_channel,                                           ['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled']],
@@ -1307,7 +1312,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // method_mp4_faststart: front-load the mp4 moov atom. A plain ride-along isn't enough (we skip when order is already correct), so force a one-time
         // remux when faststart is on, the output is an mp4-family container, and moovBeforeMdat (fail-safe, see its definition above) reports it isn't fronted
         // yet - so this settles after one pass and never loops.
-        const isMp4 = isMp4Family(file.container);
+        const isMp4 = isMp4Family(dstContainer);
         const faststartOn = methodFaststart === 'force';
         const needsFront = faststartOn && isMp4 && !moovBeforeMdat(file.file, otherArguments);
 
@@ -1333,7 +1338,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The -strict level this mp4/mov -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses
         // without it. Pass the RAW ffprobe streams (the local `streams` array above is rebuilt for ordering and lacks codec_tag_string / side_data_list, the
         // DV signals); this plugin only reorders, so every stream is copied and the copied-subset argument stays at its default.
-        const strictArg = mp4StrictArg(file.container, file.ffProbeData.streams);
+        const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams);
         response.preset = `<io>${ffmpegMap} -c copy${dispositionArgs}${junkArgs}${strictArg}${globalOutputOpt}${mp4MovflagsArg}`;
         if (dispositionArgs !== '')
             response.infoLog += '☐Set the first audio track as the sole default\n';

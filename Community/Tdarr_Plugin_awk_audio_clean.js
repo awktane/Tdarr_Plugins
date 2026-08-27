@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.4',
+    Version: '4.999.5',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1526,6 +1526,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const guardObjectAudio = String(inputs.guard_object_audio).trim();
     const guardOriginal = String(inputs.guard_original).trim();
     const guardQuality = String(inputs.guard_quality).trim();
+    // The container this plugin writes, named once as the other three plugins name it. Neither of these two changes the container, so it is the source's -
+    // but every membership test must see it normalised: a Tdarr container string of 'MKV' misses a bare includes() and silently takes the marker-hostile
+    // branch. The response.container default above deliberately keeps the RAW value: that string becomes the output file's extension, and lowercasing it
+    // there would rename the file rather than answer a question about it.
+    const dstContainer = String(file.container || '').toLowerCase().trim();
     // Case-preserving language read for the metadata WRITES on transcoded/appended streams below. resolveLang lowercases (correct for its matching KEYS), but
     // writing that would degrade clean_and_remux's canonical BCP-47 region/script case (pt-BR -> pt-br) and trip a later re-repair remux, so the writes read
     // the stored tag verbatim (ffprobe tag, then mediaInfo), preserving case. audio_clean never NORMALISES a language tag - that is clean_and_remux's job.
@@ -2310,7 +2315,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // is the ONLY change, so it would remux the file on every single pass forever (a non-idempotent loop). So the stamp is emitted only when it
         // will actually survive; on other containers a within-tolerance track is left a true no-op (re-measured next run, but never remuxed). A
         // track that genuinely needs correction still re-encodes once regardless of container, then measures within tolerance next run.
-        const loudnormTagPersists = ['mkv', 'webm', 'mka'].includes(String(file.container).toLowerCase());
+        const loudnormTagPersists = ['mkv', 'webm', 'mka'].includes(dstContainer);
         const loudnormStampArg = (idx) => (loudnormTagPersists ? ` -metadata:s:a:${idx} "awk_loudnorm=${loudnormTagValue()}"` : '');
         // A loudnorm correction that RIDES ALONG on a re-encode some other setting fired (a downmix, a codec_force, a remix) has no line of its own - it is
         // chained into that operation's own filter and command. These two render its share of that line so the eight ride-along sites can't drift: the tag
@@ -2823,13 +2828,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // reassigning default is outside this plugin's scope. mp4/mov muxers drop a custom GLOBAL tag (clean_and_remux's awk_recovered) on a -c copy
             // remux unless told to keep it, which would re-trigger recovery next pass - preserve it. (Per-stream custom tags like awk_loudnorm are NOT
             // rescued by this flag, verified against the real mov muxer - why loudnorm caches on Matroska only; see loudnormTagPersists.)
-            const mp4KeepTags = isMp4Family(file.container) ? ' -movflags use_metadata_tags' : '';
+            const mp4KeepTags = isMp4Family(dstContainer) ? ' -movflags use_metadata_tags' : '';
             // The -strict level this mp4/mov -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses
             // without it. The second list is what this run actually COPIES - a track removedIndices drops, or an in-place transcode replaces (recorded in
             // outputAudioOverride, keyed by output audio index), is left out, so a TrueHD track on its way out never asks for a flag the output cannot need.
             const copiedStreams = file.ffProbeData.streams
                 .filter((s) => !removedIndices.has(s.index) && !outputAudioOverride.has(outputAudioIdxMap.get(s.index)));
-            const strictArg = mp4StrictArg(file.container, file.ffProbeData.streams, copiedStreams);
+            const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams, copiedStreams);
             response.preset += `<io>-map 0 -c copy${extraArguments}${strictArg}${globalOutputOpt}${mp4KeepTags}`;
             response.infoLog += workDone;
             response.infoLog += skipDone;

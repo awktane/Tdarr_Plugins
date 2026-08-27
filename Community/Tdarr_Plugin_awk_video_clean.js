@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.2',
+    Version: '3.999.3',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1573,8 +1573,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const hdrMode = String(inputs.hdr_mode || 'preserve').toLowerCase().trim();
     const deinterlaceOpt = String(inputs.deinterlace || 'disabled').toLowerCase().trim();
     const guardCaptions = String(inputs.guard_captions) === 'true';   // boolean, default FALSE - opt-in, unlike the two guards below (see its tooltip)
-    const guardDv = String(inputs.guard_dv) !== 'false';   // boolean (loadDefaultValues coerces it), default true
-    const guardLossless = String(inputs.guard_lossless) !== 'false';   // boolean, default true
+    const guardDv = String(inputs.guard_dv) === 'true';   // boolean (loadDefaultValues coerces it), default true
+    const guardLossless = String(inputs.guard_lossless) === 'true';   // boolean, default true
 
     // The two free-text NUMERIC inputs are the only user-typed values this plugin echoes back, and failFile's message becomes the file's stored error, so
     // they get the same treatment as every other free-text echo in the suite (clean_and_remux's logSafe, the shared failLangToken): control characters to

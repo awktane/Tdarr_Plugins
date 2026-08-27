@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.8',
+    Version: '3.999.9',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1599,8 +1599,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (ff && Array.isArray(ff.streams)) return { streams: ff.streams, tags: ff.format?.tags || {} };
         const target = String(file._id || file.file || libFilePath || '');
         if (!target) return null;
-        const ffmpegPath = String(otherArguments?.ffmpegPath || 'ffmpeg');
-        const ffprobePath = ffmpegPath.replace(/ffmpeg(\.exe)?$/i, (m) => (m.toLowerCase().endsWith('.exe') ? 'ffprobe.exe' : 'ffprobe'));
+        // The shared deriveFfprobePath, not a second hand-rolled regex: it replaces only the FINAL path component (the production path carries 'ffmpeg' as a
+        // DIRECTORY too), existsSync-checks the result, and returns '' when the binary cannot be located. A local copy silently fell through to the unmodified
+        // ffmpeg path on any unexpected basename, so a wrapper name ran FFMPEG with ffprobe's arguments and the failure was reported as an unreadable file.
+        const ffprobePath = deriveFfprobePath(String(otherArguments?.ffmpegPath || 'ffmpeg'));
+        if (!ffprobePath) return null;
         const { spawnSync } = require('child_process');
         const r = spawnSync(ffprobePath, ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', target],
             { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES });
