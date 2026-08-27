@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.1',
+    Version: '3.999.2',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1751,11 +1751,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
 
-    // Synthetic stream so a not-yet-muxed sidecar renders through summariseStream in the expected-results line.
-    const sidecarToStream = (f) => {
-        // A bundle always carries a styled subtitle. Every other sidecar maps back through EXT_TO_CODEC behind the same TEXT_EXTS gate parseSidecar applies,
-        // so an ext outside the table cannot reach here - the webvtt fallback only guards a future caller that reads a sidecar without going through it.
-        const codec = f.bundle ? 'ass' : (TEXT_EXTS.includes(f.ext) ? EXT_TO_CODEC[f.ext] : 'webvtt');
+    // Synthetic stream so a not-yet-muxed sidecar renders through summariseStream in the expected-results line. It stands in for the RESULT, so `mp4` names the
+    // codec the mux is about to produce, not the one the sidecar arrived as: an mp4-family target transcodes every text sidecar to mov_text, and reporting
+    // the source codec would have the two halves of one run disagree - the same file re-read on the next pass summarises that track as mov_text. The .ass
+    // case is why it is worth more than tidiness: a loose styled sidecar is not filtered out for mp4 (only .mks BUNDLES are), so it is silently flattened
+    // into mov_text and losing its styling while the log says [sub:eng ass].
+    const sidecarToStream = (f, mp4) => {
+        // A bundle always carries a styled subtitle, and can never reach an mp4 target. Every other sidecar maps back through EXT_TO_CODEC behind the same
+        // TEXT_EXTS gate parseSidecar applies, so an ext outside the table cannot reach here - the webvtt fallback only guards a future caller that reads a
+        // sidecar without going through it.
+        const codec = f.bundle ? 'ass' : (mp4 ? 'mov_text' : (TEXT_EXTS.includes(f.ext) ? EXT_TO_CODEC[f.ext] : 'webvtt'));
         const disposition = {};
         for (const d of DISPOSITIONS.concat(EXTRA_DISPOSITIONS)) if ((f.dispTokens.concat(f.extraTokens || [])).includes(d.token)) disposition[d.ff] = 1;
         return { codec_type: 'subtitle', codec_name: codec, index: -1, tags: { language: f.lang, title: f.title }, disposition };
@@ -2705,7 +2710,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             meta += retagArgs((dupes.retag || []).filter((r) => !retunedAt.has(r.index)), keptSubs);
             let out = `${inputSide} -map 0${extraMaps} -c copy${ccStrip}${meta} -metadata "awk_sub_worker=${encodeMarkerList(markList)}"`;
             commitPreset(out);
-            const expected = streams.filter((s) => !removedIndices.has(s.index)).concat(toMux.map(sidecarToStream));
+            // The arrow is required, not stylistic: a bare .map(sidecarToStream) would hand Array.map's INDEX over as the mp4 flag.
+            const expected = streams.filter((s) => !removedIndices.has(s.index)).concat(toMux.map((f) => sidecarToStream(f, isMp4)));
             response.infoLog += `☑Expected results: ${summariseAll(expected)}\n`;
             return response;
         }

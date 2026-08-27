@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.30.1',
+    Version: '3.999.0',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1080,10 +1080,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             : confirmEncode(ffmpegPath, encoderName, inputSide, filter));
         const notes = [];
         const cpuChoice = () => ({ family: 'cpu', encoderName: ENCODER_NAME[codec].cpu, notes });
-        // Emit the ☒ "falling back to CPU" note for a family, but only when the user explicitly pinned that family (auto / node try the rest silently).
-        const pushFallbackNote = (family, reason) => {
-            if (encoderOpt === family) notes.push(`☒[method_encoder=${encoderOpt}] ${reason}; using ${ENCODER_NAME[codec].cpu}\n`);
-        };
         // Data the hardware encoders cannot carry (a Dolby Vision RPU, embedded closed captions) leaves the software encoder as the only option regardless of
         // node or pin. forceCpuWhy names which, so the log says what the slower encode bought.
         if (forceCpu) {
@@ -1103,6 +1099,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const hwList = [...(HW_FAMILIES[platform] || [])];
         const nodeHw = isNodeMode ? String((otherArguments && otherArguments.nodeHardwareType) || '').toLowerCase().trim() : '';
         const nodeIsSpecific = !!nodeHw && nodeHw !== '-';
+        // Emit the ☒ "falling back to CPU" note for a family, but only when THIS NODE'S hardware type is what pinned it - method_encoder=node/node_strict on
+        // a node whose Tdarr hardware type names one family. auto, and node on an "any" node, walk the whole list, so a note for each family they merely tried
+        // would be noise. The pin is the node's hardware type, NOT encoderOpt: the dropdown's per-family values were retired in 3.21.0, so a predicate keyed
+        // on encoderOpt can no longer match anything and silently discards every reason. The four the loop distinguishes - not in this build, hardware not
+        // detected, the probe would not initialise, no encoder for this codec+family - are four different user fixes, and node_strict quarantines the file
+        // with one message for all of them otherwise. Declared here rather than beside `notes` because it reads the node-mode facts just above. node_strict
+        // gets the reason WITHOUT the "using <cpu>" tail, because it is about to refuse that very fallback and quarantine the file instead.
+        const pushFallbackNote = (family, reason) => {
+            if (isNodeMode && nodeIsSpecific && nodeHw === family)
+                notes.push(`☒[method_encoder=${encoderOpt}] ${reason}${strict ? '' : `; using ${ENCODER_NAME[codec].cpu}`}\n`);
+        };
         let families;
         if (encoderOpt === 'auto' || isNodeMode) {
             if (!isGpuWorker) families = ['cpu'];                                          // CPU worker: software regardless of mode
@@ -1151,8 +1158,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return { strictFail: `[method_encoder=${encoderOpt}] ${why}; node_strict forbids the CPU fallback`, notes };
         }
         const cpuName = ENCODER_NAME[codec].cpu;
-        // Every landing-on-CPU note is the same line; only the parenthetical reason differs, so pick the reason and push once. An explicit family pin that
-        // reached here has already been reported by pushFallbackNote in the loop above, so it deliberately yields no reason and emits no second line.
+        // Every landing-on-CPU note is the same line; only the parenthetical reason differs, so pick the reason and push once. It names the encoder actually
+        // used and why the family was left behind in general terms; a node-pinned family also gets pushFallbackNote's ☒ line above, which is the specific
+        // reason. The ladder is exhaustive over the four values encoderOpt can hold, so the trailing '' is a default that no accepted value reaches.
         const cpuWhy = !isGpuWorker && (encoderOpt === 'auto' || isNodeMode) ? 'CPU worker'
             : encoderOpt === 'auto' ? 'no usable GPU encoder on this node'
                 : encoderOpt === 'cpu' ? `${platform}${isGpuWorker ? ' gpu-worker' : ''}`
