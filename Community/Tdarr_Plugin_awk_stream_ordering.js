@@ -15,7 +15,7 @@ const details = () => ({
         it's needed).\n\nBecause it runs last it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file
         that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the signature of an out-of-memory-killed or
         unfinalised encode from an earlier stage. A longer output is accepted. This check is always on and has no setting.\n`,
-    Version: '4.22.1',
+    Version: '4.22.2',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -379,6 +379,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['adpcm',  'adpcm'],
         ['gsm',    'gsm'],      // GSM 06.10 full-rate and the Microsoft variant (gsm_ms) are one speech family - fold to one key
         ['qdm',    'qdm'],      // QDesign Music 1 and 2 (qdmc/qdm2), old QuickTime - fold to one key
+        ['musepack', 'mpc'],   // ffprobe reports musepack7/musepack8 (mpc7/mpc8 are only the DECODER names); fold both to the mpc key
         ['wmavoice', 'wmavoice'],   // WMA Voice: low-bitrate SPEECH codec, not music-grade WMA - keep distinct so the wmav prefix below doesn't score it as full WMA
         ['wmav',   'wma'],
         ['atrac',  'atrac'],

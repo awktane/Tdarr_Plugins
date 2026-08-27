@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.4',
+    Version: '4.999.5',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -499,6 +499,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['adpcm',  'adpcm'],
         ['gsm',    'gsm'],      // GSM 06.10 full-rate and the Microsoft variant (gsm_ms) are one speech family - fold to one key
         ['qdm',    'qdm'],      // QDesign Music 1 and 2 (qdmc/qdm2), old QuickTime - fold to one key
+        ['musepack', 'mpc'],   // ffprobe reports musepack7/musepack8 (mpc7/mpc8 are only the DECODER names); fold both to the mpc key
         ['wmavoice', 'wmavoice'],   // WMA Voice: low-bitrate SPEECH codec, not music-grade WMA - keep distinct so the wmav prefix below doesn't score it as full WMA
         ['wmav',   'wma'],
         ['atrac',  'atrac'],
@@ -1151,23 +1152,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ====== AUDIO / VIDEO CODEC x CONTAINER MUXABILITY ======
     // Which audio/video codecs the destination MUXER refuses on a -c copy. Every row was muxed for real into both containers; the 78-row matrix came out
     // IDENTICAL on Mac/Linux/Windows jellyfin-ffmpeg 7.1.4 (a muxer's codec-tag table is compiled-in, not a build option), so a static table is correct
-    // and no runtime probe is needed. Keyed on the RAW ffprobe codec_name, NEVER resolveCodecName: that helper folds aac_latm->aac and pcm_*->pcm, and
+    // and no runtime probe is needed - and a row measured later on one platform generalizes for that same reason. A codec this build cannot ENCODE is still
+    // measurable: retag an encodable sibling (patch the AVI FOURCC, the WAV wFormatTag or the RealMedia FOURCC), since -c copy never decodes and the muxer's
+    // refusal names the codec, which is also what proves the retag took. Tested and PASSED into mp4, so deliberately absent: vc1, wmv3's successor and the one
+    // WMV-family codec mp4 can tag. Keyed on the RAW ffprobe codec_name, NEVER resolveCodecName: that helper folds aac_latm->aac and pcm_*->pcm, and
     // since plain aac and pcm_s16le mux into mp4 fine, a resolved key would miss the exact rows this table exists for - aac_latm above all, the codec
     // every DVB/broadcast capture carries. Only PROVEN failures are listed, which is what makes it fail-safe: an unlisted codec reaches ffmpeg and fails
     // there exactly as it does today - incompleteness costs a missed diagnosis, never a wrongly-refused file.
     const MP4_UNMUXABLE = [
         // audio - "Could not find tag for codec X in stream #N, codec not currently supported in container"
-        'aac_latm', 'adpcm_ima_wav', 'adpcm_ms', 'adpcm_yamaha', 'mlp', 'pcm_alaw', 'pcm_mulaw', 'pcm_u8', 'wmav1', 'wmav2',
+        'aac_latm', 'adpcm_ima_wav', 'adpcm_ms', 'adpcm_yamaha', 'mlp', 'pcm_alaw', 'pcm_mulaw', 'pcm_u8',
+        'wmalossless', 'wmapro', 'wmav1', 'wmav2', 'wmavoice',
         // video - same error
         'cinepak', 'dnxhd', 'dvvideo', 'ffv1', 'ffvhuff', 'flv1', 'h263', 'huffyuv', 'magicyuv', 'msmpeg4v2', 'msmpeg4v3',
-        'prores', 'qtrle', 'svq1', 'theora', 'utvideo', 'v210', 'vp8', 'wmv1', 'wmv2',
+        'prores', 'qtrle', 'rv40', 'svq1', 'theora', 'utvideo', 'v210', 'vp8', 'wmv1', 'wmv2', 'wmv3',
         // Flash ADPCM: mp4 has no tag for it, but matroska does carry it (its sibling adpcm_ima_qt does not) - so mkv_fallback CAN rescue this one.
         'adpcm_swf',
     ];
-    // Refused by BOTH muxers - matroska answers "No wav codec tag found for codec X". mkv_fallback cannot rescue these, because there is nothing to fall back
-    // TO; the gate degrades them to error/drop and says so. (s302m and pcm_bluray occur naturally only in MPEG-TS and on Blu-ray respectively, which is how a
-    // file can be carrying a codec neither of our two output containers accepts.)
-    const UNMUXABLE_ANYWHERE = ['ac4', 'adpcm_ima_qt', 'nellymoser', 'pcm_bluray', 's302m'];
+    // Refused by BOTH muxers, so mkv_fallback cannot rescue these - there is nothing to fall back TO; the gate degrades them to error/drop and says so. The
+    // wording differs by family: matroska answers "No wav codec tag found for codec X" for the audio rows and "The Matroska muxer does not yet support muxing
+    // X" for RealVideo. (s302m and pcm_bluray occur naturally only in MPEG-TS and on Blu-ray respectively, which is how a file can be carrying a codec neither
+    // of our two output containers accepts. rv40 is deliberately NOT here: it is the one RealVideo generation matroska implements, so it sits in the mp4-only
+    // list above, where mkv_fallback genuinely rescues it.)
+    const UNMUXABLE_ANYWHERE = ['ac4', 'adpcm_ima_qt', 'nellymoser', 'pcm_bluray', 'rv10', 'rv20', 'rv30', 's302m'];
     // Refused by MATROSKA but muxable into mp4 - the mirror of MP4_UNMUXABLE, measured the same way. Deliberately SHORTER than the mp4 half: only a codec
     // this build can encode, or that exists as a real sample, is testable at all, and matroska accepted nearly everything offered (every lossless video
     // codec, wmav1/wmav2, the adpcm family bar the two above, aac_latm, VVC, DTS, TrueHD). rawvideo is the one measured failure deliberately NOT listed:

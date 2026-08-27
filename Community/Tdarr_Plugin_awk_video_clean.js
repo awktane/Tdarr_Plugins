@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.0',
+    Version: '3.999.1',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -270,8 +270,9 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['true', 'false'],
             },
-            tooltip: `Protect a LOSSLESS or mastering-grade video source from being re-encoded: ProRes, DNxHD, CineForm, FFV1, HuffYUV, FFVHuff, MagicYUV,
-                    UtVideo, Lagarith, SheerVideo, QuickTime/Microsoft RLE, and uncompressed video (raw, v210/v410/v408/v308, y41p, r210/r10k).
+            tooltip: `Protect a LOSSLESS or mastering-grade video source from being re-encoded: ProRes, DNxHD, CineForm, JPEG 2000, FFV1, HuffYUV, FFVHuff,
+                    MagicYUV, UtVideo, Lagarith, SheerVideo, QuickTime/Microsoft RLE, the lossless screen-capture codecs (Flash Screen Video, TechSmith
+                    TSCC, ZMBV), and uncompressed video (raw, v210/v410/v408/v308, y41p, r210/r10k).
                 \\n=====
                 \\nActions
                 \\n=====
@@ -453,6 +454,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['adpcm',  'adpcm'],
         ['gsm',    'gsm'],      // GSM 06.10 full-rate and the Microsoft variant (gsm_ms) are one speech family - fold to one key
         ['qdm',    'qdm'],      // QDesign Music 1 and 2 (qdmc/qdm2), old QuickTime - fold to one key
+        ['musepack', 'mpc'],   // ffprobe reports musepack7/musepack8 (mpc7/mpc8 are only the DECODER names); fold both to the mpc key
         ['wmavoice', 'wmavoice'],   // WMA Voice: low-bitrate SPEECH codec, not music-grade WMA - keep distinct so the wmav prefix below doesn't score it as full WMA
         ['wmav',   'wma'],
         ['atrac',  'atrac'],
@@ -848,8 +850,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // spellings; membership is what makes the guard fail-safe - an unrecognised codec is not protected, never wrongly skipped. (Lossless MODES of lossy
     // codecs - x264 -qp 0 - are out of scope: neither probe reports them.) Grouped: compressed lossless intermediates, the RLE/screen-capture family, then
     // uncompressed packed layouts that arrive under their own codec_name. Every name is a decoder on the production build, so none is dead membership.
+    // Two membership calls, stated because each reads as an omission otherwise. jpeg2000 IS here: it is the DCP / IMF / broadcast-mezzanine codec the shared
+    // IMAGE_CODECS comment names, and though the format has a lossy mode neither probe reports which was used, so mastering-grade is the fail-safe reading.
+    // The screen-capture rows stop at the three that reach a real library (Flash screencasts, Camtasia recordings, DOSBox captures): tscc2 is TechSmith's
+    // LOSSY second generation, and the remote-desktop family (rscc, mwsc, rasc, srgc, scpr, vmnc, mss1/mss2/msa1) is recorder-internal rather than a library
+    // file, several of them lossy hybrids in any case.
     const LOSSLESS_VIDEO_CODECS = ['ffv1', 'huffyuv', 'ffvhuff', 'hymt', 'magicyuv', 'utvideo', 'lagarith', 'sheervideo', 'prores', 'dnxhd', 'cfhd',
-        'qtrle', 'msrle', 'rawvideo', 'v210', 'v210x', 'v410', 'v408', 'v308', 'y41p', 'r210', 'r10k'];
+        'jpeg2000', 'qtrle', 'msrle', 'flashsv', 'flashsv2', 'tscc', 'zmbv',
+        'rawvideo', 'v210', 'v210x', 'v410', 'v408', 'v308', 'y41p', 'r210', 'r10k'];
 
     // Efficiency rank for shrink's never-downgrade rule: vp9~hevc and vp8~h264, so an efficient WebM/VP source isn't "upgraded" to a less-efficient
     // codec; a genuinely-legacy codec (mpeg2/vc1/xvid, absent here) ranks below every target via the `|| 0` fallback, so old-codec -> h264 stays a valid
