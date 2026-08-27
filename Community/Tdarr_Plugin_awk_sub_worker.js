@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.9',
+    Version: '3.999.10',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1122,6 +1122,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The value is a COMMA LIST and every reader splits it, because the states genuinely combine: an imported round trip that could not strip in its own pass
     // records `imported,strip` - and `imported,removed` where it could - while an empty channel on a source the filter refuses records `none,strip`. A writer
     // therefore EXTENDS the tag rather than replacing it with one token - a whole-value overwrite would erase a pending request instead of deferring it.
+    // A REQUEST is retired by whoever SERVES it, and only then: video_clean rewrites `strip` to `removed` on the encode that carries the removal out. Without
+    // that the tag only ever grows, and a satisfied request is indistinguishable from a fresh one - a file that later regains captions (a re-muxed capture, an
+    // external tool re-inserting A53 SEI) has them dropped by a request answered encodes ago. `none` and `imported` are never retired: they are memos about
+    // the file rather than requests, and they stay true for its life.
     const CC_TAG = 'awk_cc';
     const CC_TOKENS = { strip: 'strip', removed: 'removed', none: 'none', imported: 'imported' };
     const ccTokensOf = (tags) => getTagCI(tags || {}, CC_TAG).toLowerCase().split(',').map((t) => t.trim()).filter(Boolean);

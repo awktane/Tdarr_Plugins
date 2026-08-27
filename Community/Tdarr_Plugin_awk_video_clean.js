@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.3',
+    Version: '3.999.4',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1037,6 +1037,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The value is a COMMA LIST and every reader splits it, because the states genuinely combine: an imported round trip that could not strip in its own pass
     // records `imported,strip` - and `imported,removed` where it could - while an empty channel on a source the filter refuses records `none,strip`. A writer
     // therefore EXTENDS the tag rather than replacing it with one token - a whole-value overwrite would erase a pending request instead of deferring it.
+    // A REQUEST is retired by whoever SERVES it, and only then: video_clean rewrites `strip` to `removed` on the encode that carries the removal out. Without
+    // that the tag only ever grows, and a satisfied request is indistinguishable from a fresh one - a file that later regains captions (a re-muxed capture, an
+    // external tool re-inserting A53 SEI) has them dropped by a request answered encodes ago. `none` and `imported` are never retired: they are memos about
+    // the file rather than requests, and they stay true for its life.
     const CC_TAG = 'awk_cc';
     const CC_TOKENS = { strip: 'strip', removed: 'removed', none: 'none', imported: 'imported' };
     const ccTokensOf = (tags) => getTagCI(tags || {}, CC_TAG).toLowerCase().split(',').map((t) => t.trim()).filter(Boolean);
@@ -2184,6 +2188,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter: deintFilter(),
                 dropCaptions, sliceDecode });
             let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy${coverArtDrops}${strictArg} -metadata "awk_video=${videoSig}"`;
+            // Retire the request this encode just served. Every route above leaves the output with no captions - `-a53cc 0` on the H.264 pair, and the
+            // absence of `-a53cc 1` everywhere else, including the encoders that have no such option - so `removed` is the accurate successor to `strip`,
+            // and it is the token that stops any later pass paying a caption probe. Only fires when a request was actually present.
+            if (ccExported) {
+                const retired = [...new Set(ccTokens.map((t) => (t === CC_TOKENS.strip ? CC_TOKENS.removed : t)))];
+                out += ` -metadata "${CC_TAG}=${retired.join(',')}"`;
+            }
             if (isMp4Family(dstContainer)) out += ' -movflags use_metadata_tags';   // keep the global tag through an mp4/mov copy
             out += globalOutputOpt;
             response.preset = `${enc.inputSide}<io>${out}`;
