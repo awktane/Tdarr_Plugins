@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.8',
+    Version: '4.999.9',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -2356,6 +2356,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // when the track was already at target), `measured` is "an analysis actually ran" (see buildLoudnormFilter's track cap).
         const loudnormRideTag = (changed) => (changed ? `[method_loudnorm=${methodLoudnorm}]` : '');
         const loudnormRideStamp = (idx, measured) => (measured ? loudnormStampArg(idx) : '');
+        // The within-tolerance no-op: no re-encode is needed, but the measurement is still worth caching. The caller keeps the loudnormTagPersists/measured
+        // gate that decides whether this runs at all - the reasoning for it is at the main-path call site.
+        const stampWithinTolerance = (streamIndex, idx) => {
+            workDone += `☐${streamTag(streamIndex)}[method_loudnorm=${methodLoudnorm}] Stamping awk_loudnorm=${methodLoudnorm} (already within tolerance)`
+                + ` - future runs skip re-measuring while loudnorm stays "${methodLoudnorm}"\n`;
+            extraArguments += loudnormStampArg(idx);
+        };
         const langMetaArg = (idx, lang) => (lang ? ` -metadata:s:a:${idx} "language=${escMeta(lang)}"` : '');
         // ===== END LOUDNORM =====
 
@@ -2383,6 +2390,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const { filter, changed, measured } = buildLoudnormFilter(srcStream.index, inputAudioIdxMap.get(srcStream.index),
                 'aformat=channel_layouts=5.1', LOUDNORM_PRESETS[methodLoudnorm]);
             return { arg: ` -filter:a:${idx} "${filter}"`, measured, changed };
+        };
+
+        // The in-place counterpart of stereoArg/sixArg for a force that keeps the channel count: same { arg, measured, changed } contract, with whatever
+        // pre-filter the caller needs chained ahead of the analysis (an opus relabel, or nothing). With loudnorm disabled the pre-filter is still emitted
+        // on its own - a lossless relabel is the caller's operation, not loudnorm's, and dropping it would leave the layout unfixed.
+        const loudnormFilterArg = (idx, srcAudioIdx, streamIndex, preFilter = '') => {
+            if (methodLoudnorm === 'disabled')
+                return { arg: preFilter ? ` -filter:a:${idx} "${preFilter}"` : '', measured: false, changed: false };
+            const { filter, changed, measured } = buildLoudnormFilter(streamIndex, srcAudioIdx, preFilter, LOUDNORM_PRESETS[methodLoudnorm]);
+            return { arg: filter ? ` -filter:a:${idx} "${filter}"` : '', measured, changed };
         };
 
         // Emit an APPENDED downmix track - a brand-new output stream derived from the ORIGINAL input audio via -map 0:a:N, whether or not that source stream
@@ -2606,16 +2623,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             const { encoder, args, approxRate, label } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true, forceChannels);
                             // No pre-filter (same channel count, no relabel) - measure the source directly. guardBlocks for this force already
                             // passed above (loudnorm rides on that guarantee - see stereoArg).
-                            let aacVbrFilter = '';
-                            let aacVbrLoud = { measured: false, changed: false };
-                            if (methodLoudnorm !== 'disabled') {
-                                const { filter, changed, measured } = buildLoudnormFilter(ffstream.index, srcAudioIdx, '', LOUDNORM_PRESETS[methodLoudnorm]);
-                                if (filter) aacVbrFilter = ` -filter:a:${outputAudioIdx} "${filter}"`;
-                                aacVbrLoud = { measured, changed };
-                            }
+                            const aacVbrLoud = loudnormFilterArg(outputAudioIdx, srcAudioIdx, ffstream.index);
                             workDone += `☐${streamTag(ffstream.index)}[codec_force=${forceCodec}]${loudnormRideTag(aacVbrLoud.changed)} Transcoding `
                                 + `${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → aac ${forceChannels}ch @ ${approxRate} (${label})\n`;
-                            extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${aacVbrFilter}`
+                            extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${aacVbrLoud.arg}`
                                 + `${loudnormRideStamp(outputAudioIdx, aacVbrLoud.measured)}`;
                             modifiedAudioIdx.add(outputAudioIdx);
                             outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: forceChannels, bps: 0, approxRate });
@@ -2626,26 +2637,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // lossless skips the cap; a high-bitrate lossy source is bounded by the codec ceiling.
                             const relabelFilter = relabel ? `channelmap=map=${relabel.map}:channel_layout=${relabel.layout}` : '';
                             const note = relabel ? ` (relabel ${layoutName}→${relabel.layout})` : '';
-                            // guardBlocks for this force already passed above (loudnorm rides on that guarantee - see stereoArg). The relabel filter
-                            // (if any) is the pre-filter loudnorm's measurement must be chained after, so the analysis reflects the actual
-                            // post-relabel signal - though a lossless channelmap relabel doesn't change loudness, keeping the chain order consistent.
-                            let layoutFilter = '';
-                            let layoutLoud = { measured: false, changed: false };
-                            if (methodLoudnorm !== 'disabled') {
-                                const { filter, changed, measured } = buildLoudnormFilter(ffstream.index, srcAudioIdx, relabelFilter,
-                                    LOUDNORM_PRESETS[methodLoudnorm]);
-                                if (filter) layoutFilter = ` -filter:a:${outputAudioIdx} "${filter}"`;
-                                layoutLoud = { measured, changed };
-                            } else if (relabelFilter) {
-                                layoutFilter = ` -filter:a:${outputAudioIdx} "${relabelFilter}"`;
-                            }
+                            // guardBlocks for this force already passed above (loudnorm rides on that guarantee - see stereoArg). The relabel is the
+                            // pre-filter here: a lossless channelmap doesn't change loudness, but chaining it ahead keeps the measurement on the signal
+                            // that is actually encoded.
+                            const layoutLoud = loudnormFilterArg(outputAudioIdx, srcAudioIdx, ffstream.index, relabelFilter);
                             const dstBitArg = encoderArgsIdx(targetCodec, forceChannels, outputAudioIdx, srcBitrate, ffstream.awkLossless,
                                 ffstream.awkQuality);
                             const dstBitStr = resolveBitrate(targetCodec, forceChannels, srcBitrate, ffstream.awkLossless, ffstream.awkQuality);
                             workDone += `☐${streamTag(ffstream.index)}[codec_force=${forceCodec}]${loudnormRideTag(layoutLoud.changed)} Transcoding `
                                 + `${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → ${targetCodec} ${forceChannels}ch @ `
                                 + `${dstBitStr / 1000} kb/s${note}\n`;
-                            extraArguments += ` -c:a:${outputAudioIdx} ${audioEncoder(targetCodec)}${dstBitArg}${layoutFilter}`
+                            extraArguments += ` -c:a:${outputAudioIdx} ${audioEncoder(targetCodec)}${dstBitArg}${layoutLoud.arg}`
                                 + `${loudnormRideStamp(outputAudioIdx, layoutLoud.measured)}`;
                             modifiedAudioIdx.add(outputAudioIdx);
                             outputAudioOverride.set(outputAudioIdx, { codec: targetCodec, channels: forceChannels, bps: dstBitStr });
@@ -2754,9 +2756,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             const two = stereoArg(outputAudioIdx, ffstream);
                             if (!two.changed) {
                                 if (loudnormTagPersists && two.measured) {
-                                    workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Stamping awk_loudnorm=${methodLoudnorm} `
-                                        + `(already within tolerance) - future runs skip re-measuring while loudnorm stays "${methodLoudnorm}"\n`;
-                                    extraArguments += loudnormStampArg(outputAudioIdx);
+                                    stampWithinTolerance(ffstream.index, outputAudioIdx);
                                     convert = true;
                                 }
                                 continue;
@@ -2787,9 +2787,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // changed:false, and must NOT be stamped: the cache would claim a loudness nothing ever read, and every future run would trust it and
                     // skip the track for good. It is simply left at source loudness, as the cap warning says, for a later pass to pick up.
                     if (loudnormTagPersists && measured) {
-                        workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Stamping awk_loudnorm=${methodLoudnorm} (already `
-                            + `within tolerance) - future runs skip re-measuring while loudnorm stays "${methodLoudnorm}"\n`;
-                        extraArguments += loudnormStampArg(outputAudioIdx);
+                        stampWithinTolerance(ffstream.index, outputAudioIdx);
                         convert = true;
                     }
                     continue;
