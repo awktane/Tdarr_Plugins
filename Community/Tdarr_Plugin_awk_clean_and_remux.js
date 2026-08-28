@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.11',
+    Version: '4.999.12',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -2175,7 +2175,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         workDone += `☑${inputTag} Styled-subtitle bundle already exists, not overwriting: ${sidecarName}\n`;
                     } else {
                         // A refusal falls through to the mov_text conversion below with a ☒ naming the loss - a mangled subtitle beats a vanished one. The
-                        // bundle route has no 'empty' answer of its own: an unmapped export that produced nothing reads as the unmapped refusal.
+                        // bundle route has no 'empty' answer of its own and does not need one: placeSidecars files an empty extraction under BOTH
+                        // empty and failed, so the unmapped refusal already names it ('extraction produced no data') rather than reading undefined.
                         const refusal = {
                             unmapped: `Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}; converting to mov_text instead,`
                                 + ' which loses the styling',
