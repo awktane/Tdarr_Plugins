@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.9',
+    Version: '4.999.10',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -428,7 +428,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (WeakMap, per-run closure) because hasDisposition calls it repeatedly per stream.
     // Both description reads go through getTagCI, and neither casing is a guess: matroska UPPER-CASES tag keys on write, so the ffprobe side comes back
     // DESCRIPTION; and MediaInfo defines Comment/Description as GENERAL-only parameters, so a per-TRACK value never appears top-level - it lands in the
-    // track's 'extra' bag under whatever spelling the container used. Both legs were dead before this: a fixed-case top-level read matched neither.
+    // track's 'extra' bag under whatever spelling the container used. A fixed-case top-level read matches neither.
     const roleTextCache = new WeakMap();
     const roleTextLower = (s) => {
         if (roleTextCache.has(s)) return roleTextCache.get(s);
@@ -1219,7 +1219,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const isImageSub = (codec) => Object.prototype.hasOwnProperty.call(IMAGE_SUB, codec);
     // 'all'/'export' drop every image sub; 'unsupported' relies on subFormatDropped (container-forced) alone. imageSubDropped is the
-    // remove_imagesubs-specific drop beyond subFormatDropped, used by subDroppedAnyReason for the language_fill tally + accessibility plain-track guard.
+    // remove_imagesubs-specific drop beyond subFormatDropped, read by subDroppedRegardlessOfLanguage for the language_fill
+    // tally and the accessibility plain-track guard.
     const imageSubDropped = (codec) => isImageSub(codec) && (removeImageSubs === 'all' || removeImageSubs === 'export');
 
     // #region SHARED helpers (1 section: styled subtitle test)
@@ -1322,6 +1323,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // One generous ceiling for every spawn here - a hung ffmpeg or curl is killed rather than holding the worker forever. curl takes seconds and spawnSync
     // milliseconds; deriving one from the other keeps the two spellings from drifting.
     const SIDECAR_SPAWN_TIMEOUT_MS = 1800000;
+    // Ceiling on the extraction's captured stderr. Exceeding it KILLS the child, so the run reports an extraction failure that never happened -
+    // which is why it is named here beside the timeout rather than left as a bare literal at the spawn.
+    const SIDECAR_SPAWN_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
     const SIDECAR_SPAWN_TIMEOUT_S = String(SIDECAR_SPAWN_TIMEOUT_MS / 1000);
     // The server base URL, trailing slashes stripped. '' means the config carries no URL at all - "no route", never a request against an empty host.
     const serverApiUrl = () => String(nodeConfig.serverURL || '').replace(/\/+$/, '');
@@ -1391,7 +1395,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', String(file._id || file.file || '')];
         for (const j of staged) args.push(...j.args, j.tmp);
         const ff = spawnSync(String(otherArguments?.ffmpegPath || 'ffmpeg'), args,
-            { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 });
+            { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES });
         if (ff.error || ff.status !== 0) {
             const why = ff.error ? `extraction failed (${ff.error.code || ff.error.message})`
                 : `extraction failed (ffmpeg exit ${ff.status}: ${String(ff.stderr || '').trim().slice(0, 200)})`;
@@ -1512,7 +1516,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (imageSubDropped), or by the mp4 styled-subtitle bundle export (styledSubExported), which maps the track out of the
     // video. None is ever assigned language_fill, and none counts as a survivor for the language_fill_mode untagged tally or
     // the remove_sub_sdh plain-track guard: a track this run deletes cannot be the plain track another track falls back on.
-    const subDroppedAnyReason = (codec) => subFormatDropped(codec) || imageSubDropped(codec) || styledSubExported(codec);
+    const subDroppedRegardlessOfLanguage = (codec) => subFormatDropped(codec) || imageSubDropped(codec) || styledSubExported(codec);
 
     // #region SHARED helpers (1 section: title canonicalization)
     // ===== SHARED [audio_clean, clean_and_remux]: title canonicalization =====
@@ -1706,7 +1710,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (file.fileMedium !== 'video') return skip('☑File is not a video\n');
 
     // remove_sub_sdh safety guard. A "plain" subtitle carries no commentary/descriptive/SDH/lyrics role. On if_plain_survives an SDH/CC subtitle goes only
-    // when its language still has a plain subtitle that SURVIVES every whole-file drop reason (subDroppedAnyReason), so extras go and the last usable
+    // when its language still has a plain subtitle that SURVIVES every whole-file drop reason
+    // (subDroppedRegardlessOfLanguage), so extras go and the last usable
     // track of that language stays; on `all` it goes regardless, and ending with no subtitles is an accepted outcome there. resolveWorkLang shares
     // canonicalLangMeta's fillApplies rule so the language this guard filters on and the tag that gets written can't drift. Audio has no equivalent:
     // audio_clean's downmix_secondary owns audio-description removal. plainSubLangs is FILLED after the muxability gate below (the format-filter test
@@ -1796,13 +1801,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams,
             (file.ffProbeData.streams || []).filter((s) => !unmuxableDrops.has(s.index)));
 
-        // Fill the remove_sub_sdh plain-track set (declared above). AFTER the muxability gate because subDroppedAnyReason reads dstContainer, which
+        // Fill the remove_sub_sdh plain-track set (declared above). AFTER the muxability gate because subDroppedRegardlessOfLanguage reads dstContainer, which
         // mkv_fallback rewrites - any earlier and a PGS track would count as format-dropped under the abandoned mp4 target. Still ahead of the
         // language_fill_mode pre-check, which subtracts the SDH tracks this guard will drop. Only if_plain_survives consults the set.
         if (removeSubSdh === 'if_plain_survives') {
             for (const s of (file.ffProbeData?.streams || [])) {
                 if (codecTypeOf(s) !== 'subtitle' || !isPlainTrack(s)) continue;
-                if (subDroppedAnyReason((s.codec_name || '').toLowerCase())) continue;
+                if (subDroppedRegardlessOfLanguage((s.codec_name || '').toLowerCase())) continue;
                 const wl = resolveWorkLang(s);
                 if (subLangKeys.length > 0 && !langListMatch(wl, subLangKeys)) continue;
                 plainSubLangs.add(langKey(wl));
@@ -1855,7 +1860,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (untaggedAudio > 1) failUntagged(untaggedAudio, 'audio');
             const untaggedSubs = keptByLangFilter(subLangKeys)
                 ? streams.filter((s) => codecTypeOf(s) === 'subtitle'
-                    && !subDroppedAnyReason((s.codec_name || '').toLowerCase()) && isUntagged(s) && !removedBySdh(s)).length : 0;
+                    && !subDroppedRegardlessOfLanguage((s.codec_name || '').toLowerCase()) && isUntagged(s) && !removedBySdh(s)).length : 0;
             if (untaggedSubs > 1) failUntagged(untaggedSubs, 'subtitle');
         }
 
@@ -2022,8 +2027,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
             // remove_comments (audio/subtitle/video): drop a stream comment tag (players rarely show it). Guard + output mirror the handler_name emitter
             // above, the case-insensitive read (getTagCI) included - matroska stores this key as COMMENT; see there for why the lowercase wipe still clears it.
-            // No mediaInfo fallback: MediaInfo defines Comment as a GENERAL-only parameter, so a per-TRACK comment never appears as track.Comment - the old
-            // second half of this read could not fire, and no container puts a per-track comment in mediaInfo without ffprobe reporting it too.
+            // No mediaInfo fallback: MediaInfo defines Comment as a GENERAL-only parameter, so a per-TRACK comment never appears as track.Comment, and no
+            // container puts a per-track comment in mediaInfo without ffprobe reporting it too.
             const emitCommentRemoval = (typeLetter, idx, typeWord) => {
                 const curComment = getTagCI(ffstream.tags, 'comment');
                 if (removeComments === true && curComment) {
@@ -2455,13 +2460,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // box. The bar is "every real spelling of the family", not Tdarr's defaults; all measured on the production build.
         if (['ts', 'm2ts', 'mts', 'm2t', 'tp', 'trp', 'tod',
             'mpg', 'mpeg', 'vob', 'evo', 'm2p', 'vro', 'mod', 'avi'].includes(srcContainer)) {   // container-forced timestamp fix (always applied)
-            const already = fflags.includes('genpts');
-            if(!already)
+            const genptsAlreadySet = fflags.includes('genpts');
+            if(!genptsAlreadySet)
                 fflags += '+genpts';
             extraArguments = ` -avoid_negative_ts make_zero${extraArguments}`;
             // Independent of the recover_bad_* settings, so it needs saying even when they are disabled - otherwise a user sees a plain remux line and no
             // sign that the timestamps were rewritten. Suppressed when a recover_bad_timestamps line above already said the same thing.
-            if(!already)
+            if(!genptsAlreadySet)
                 workDone += `☐[container=${dstContainer}] Repairing ${srcContainer} timestamps - this source format cannot be remuxed without regenerating `
                     + 'PTS and shifting negative start times to zero\n';
         } else if (runRecover && tsLight)

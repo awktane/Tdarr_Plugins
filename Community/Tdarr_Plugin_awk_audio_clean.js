@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.7',
+    Version: '4.999.8',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -77,6 +77,58 @@ const details = () => ({
                 \\nCommentary, descriptive and M&E tracks are not covered here - they follow downmix_secondary.`,
         },
         {
+            name: 'codec_force',
+            type: 'string',
+            defaultValue: 'disabled',
+            inputUI: {
+                type: 'dropdown',
+                options: ['disabled','2below','6below','all'],
+            },
+            tooltip: `Transcode EXISTING tracks to codec_surround or codec_stereo according to their channel count. With this off, those two settings only
+                ever apply to newly created tracks.
+                \\n=====
+                \\nActions
+                \\n=====
+                \\ndisabled (default) - leave every existing codec as it is.
+                \\n2below - transcode streams of two or fewer channels to codec_stereo. Anything above that keeps its original codec.
+                \\n6below - transcode streams of six or fewer channels to codec_surround, and those of two or fewer to codec_stereo.
+                \\nall - as 6below, but also transcodes surround tracks above six channels, each subject to its codec's own channel ceiling (ac3/eac3 6ch,
+                aac/opus 8ch).
+                \\nA guard-protected track is left in its source codec in every mode, 'all' included. A stream carrying more channels than the target codec
+                can hold is not transcoded.
+                \\nA track already in the target codec is left alone, so switching codec_stereo between aac and aac_vbr changes nothing on its own - that is
+                a rate-control change, not worth a lossy re-encode. It does apply if method_loudnorm re-encodes the track anyway.`,
+        },
+        {
+            name: 'codec_stereo',
+            type: 'string',
+            defaultValue: 'aac',
+            inputUI: {
+                type: 'dropdown',
+                options: ['aac','aac_vbr','ac3','eac3','opus'],
+            },
+            tooltip: `Codec for newly created stereo tracks. AAC and Opus are the most compatible choices for modern media servers and clients, EAC3 is
+                useful for Dolby branding on compatible devices, and AC3 is the most broadly compatible legacy choice.
+                \\naac_vbr uses libfdk_aac in VBR mode (-vbr 5, roughly 192-224 kb/s), better quality than native AAC CBR. It drops to -vbr 4 (roughly
+                128-144 kb/s) when codec_force or method_loudnorm re-encodes an existing stereo track already at or below 144 kb/s, matching the
+                lower-information source.
+                \\nlibfdk_aac ships in the Linux and Windows builds but not the Mac one. On a node whose ffmpeg lacks it, aac_vbr falls back to Apple's
+                aac_at (AudioToolbox) VBR on Mac, or to native aac at 256 kb/s on any other build, so the file still processes either way.
+                \\ncodec_force never re-encodes an existing AAC track just to reach aac_vbr, since that would spend a generation of quality for no gain.
+                method_loudnorm may still re-encode it when a loudness correction is genuinely needed.`,
+        },
+        {
+            name: 'codec_surround',
+            type: 'string',
+            defaultValue: 'aac',
+            inputUI: {
+                type: 'dropdown',
+                options: ['aac','ac3','eac3','opus'],
+            },
+            tooltip: `Codec for newly created surround tracks. AC3 and EAC3 are limited to 6 channels (5.1) by ffmpeg's native encoders, while Opus carries
+                up to 8.`,
+        },
+        {
             name: 'downmix_secondary',
             type: 'string',
             defaultValue: 'surround',
@@ -137,58 +189,6 @@ const details = () => ({
                 downmix_to_six or is protected by a guard, in which case the stereo track is added alongside instead. With the default guards a plain 5.1
                 source usually takes that path, since guard_quality scores a 2 channel target below it.
                 \\nadd - create the stereo track and keep the higher-channel source as well.`,
-        },
-        {
-            name: 'codec_force',
-            type: 'string',
-            defaultValue: 'false',
-            inputUI: {
-                type: 'dropdown',
-                options: ['false','6below','2below','all'],
-            },
-            tooltip: `Transcode EXISTING tracks to codec_surround or codec_stereo according to their channel count. With this off, those two settings only
-                ever apply to newly created tracks.
-                \\n=====
-                \\nActions
-                \\n=====
-                \\nfalse (default) - leave every existing codec as it is.
-                \\n2below - transcode streams of two or fewer channels to codec_stereo. Anything above that keeps its original codec.
-                \\n6below - transcode streams of six or fewer channels to codec_surround, and those of two or fewer to codec_stereo.
-                \\nall - as 6below, but also transcodes surround tracks above six channels, each subject to its codec's own channel ceiling (ac3/eac3 6ch,
-                aac/opus 8ch).
-                \\nA guard-protected track is left in its source codec in every mode, 'all' included. A stream carrying more channels than the target codec
-                can hold is not transcoded.
-                \\nA track already in the target codec is left alone, so switching codec_stereo between aac and aac_vbr changes nothing on its own - that is
-                a rate-control change, not worth a lossy re-encode. It does apply if method_loudnorm re-encodes the track anyway.`,
-        },
-        {
-            name: 'codec_stereo',
-            type: 'string',
-            defaultValue: 'aac',
-            inputUI: {
-                type: 'dropdown',
-                options: ['aac','aac_vbr','ac3','eac3','opus'],
-            },
-            tooltip: `Codec for newly created stereo tracks. AAC and Opus are the most compatible choices for modern media servers and clients, EAC3 is
-                useful for Dolby branding on compatible devices, and AC3 is the most broadly compatible legacy choice.
-                \\naac_vbr uses libfdk_aac in VBR mode (-vbr 5, roughly 192-224 kb/s), better quality than native AAC CBR. It drops to -vbr 4 (roughly
-                128-144 kb/s) when codec_force or method_loudnorm re-encodes an existing stereo track already at or below 144 kb/s, matching the
-                lower-information source.
-                \\nlibfdk_aac ships in the Linux and Windows builds but not the Mac one. On a node whose ffmpeg lacks it, aac_vbr falls back to Apple's
-                aac_at (AudioToolbox) VBR on Mac, or to native aac at 256 kb/s on any other build, so the file still processes either way.
-                \\ncodec_force never re-encodes an existing AAC track just to reach aac_vbr, since that would spend a generation of quality for no gain.
-                method_loudnorm may still re-encode it when a loudness correction is genuinely needed.`,
-        },
-        {
-            name: 'codec_surround',
-            type: 'string',
-            defaultValue: 'aac',
-            inputUI: {
-                type: 'dropdown',
-                options: ['aac','ac3','eac3','opus'],
-            },
-            tooltip: `Codec for newly created surround tracks. AC3 and EAC3 are limited to 6 channels (5.1) by ffmpeg's native encoders, while Opus carries
-                up to 8.`,
         },
         {
             name: 'method_dedup_region',
@@ -509,7 +509,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (WeakMap, per-run closure) because hasDisposition calls it repeatedly per stream.
     // Both description reads go through getTagCI, and neither casing is a guess: matroska UPPER-CASES tag keys on write, so the ffprobe side comes back
     // DESCRIPTION; and MediaInfo defines Comment/Description as GENERAL-only parameters, so a per-TRACK value never appears top-level - it lands in the
-    // track's 'extra' bag under whatever spelling the container used. Both legs were dead before this: a fixed-case top-level read matched neither.
+    // track's 'extra' bag under whatever spelling the container used. A fixed-case top-level read matches neither.
     const roleTextCache = new WeakMap();
     const roleTextLower = (s) => {
         if (roleTextCache.has(s)) return roleTextCache.get(s);
@@ -1439,10 +1439,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Per-codec audio argument string for an ALREADY-RESOLVED rate, scoped to a specific output stream index (e.g. -b:a:2 instead of -b:a). ffmpeg accepts the
     // stream-qualified forms; we use them so each track gets its own settings when a single command touches several.
+    const OPUS_COMPRESSION_LEVEL = 10;
     const encoderArgsBps = (codec, idx, bps) => {
         if (bps <= 0) return '';
+        // libopus is VBR-capable and its complexity knob tops out at 10 - best quality per bit, and pinned rather than left to the build default,
+        // which is not the same on every jellyfin-ffmpeg platform. Both are encode-time cost only; neither changes the container or the bitrate.
         if (codec === 'opus')
-            return ` -vbr:a:${idx} on -compression_level:a:${idx} 10 -b:a:${idx} ${bps / 1000}k`;
+            return ` -vbr:a:${idx} on -compression_level:a:${idx} ${OPUS_COMPRESSION_LEVEL} -b:a:${idx} ${bps / 1000}k`;
         return ` -b:a:${idx} ${bps / 1000}k`;
     };
     // The same string for a codec CHANGE, where the rate comes from the transcode ladder. srcLossless and srcQuality are forwarded to resolveBitrate
@@ -1590,7 +1593,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['downmix_secondary',     downmixSecondary,     ['surround', 'stereo', 'delete']],
         ['downmix_to_six',        downmixToSix,         ['disabled', 'replace', 'add']],
         ['downmix_to_stereo',     downmixToStereo,      ['disabled', 'replace', 'add']],
-        ['codec_force',           forceCodec,           ['false', '6below', '2below', 'all']],
+        ['codec_force',           forceCodec,           ['disabled', '2below', '6below', 'all']],
         ['codec_stereo',          stereoCodec,          ['aac', 'aac_vbr', 'ac3', 'eac3', 'opus']],
         ['codec_surround',        surroundCodec,        ['aac', 'ac3', 'eac3', 'opus']],
         ['method_dedup_region',   methodDedupRegion,    ['fold', 'distinct']],
@@ -1732,7 +1735,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // must be able to standardize the codec of EVERY track including commentary and unlisted-language ones (e.g. codec_force='all' must touch them all).
         // Anything with nothing to do is dropped from the pool. ('delete'-tier tracks may remain here harmlessly - workStreams filters removedIndices below.)
         let candidateStreams = audioStreams;
-        if (forceCodec === 'false')
+        if (forceCodec === 'disabled')
             candidateStreams = candidateStreams.filter(stream => stream.awkTier === 'stereo'
                 || (!stream.awkSecondaryTrack && stream.awkTier === 'surround'));
 
@@ -1847,19 +1850,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     skipDone += noChannelCountSkip(s.index, `method_deduplicate=${methodDeduplicate}`, "can't tell which tracks it would duplicate");
                     continue;
                 }
-                let tier;
+                // The dedup BAND - which tracks are candidates to be duplicates of each other. Deliberately not `tier`: the per-track tier assigned above is
+                // the language/role verdict (surround/stereo/delete) and shares two of its four spellings with this, so one name for both read as one concept.
+                let dedupBand;
                 if (methodDeduplicateGroupBy === 'channel') {
-                    tier = ch;
+                    dedupBand = ch;
                 } else if (downmixToSix !== 'disabled' && ch > 4 && ch <= 6) {
-                    tier = 'six';
+                    dedupBand = 'six';
                 } else if (downmixToStereo !== 'disabled' && ch === 2) {
-                    tier = 'stereo2';
+                    dedupBand = 'stereo2';
                 } else {
-                    tier = ch > 2 ? 'surround' : 'stereo';
+                    dedupBand = ch > 2 ? 'surround' : 'stereo';
                 }
-                // Only MAIN tracks reach here (secondaries skipped above), so the region-grouping key + channel-tier
+                // Only MAIN tracks reach here (secondaries skipped above), so the region-grouping key + channel band
                 // fully identifies a duplicate group (region-distinct only when method_dedup_region=distinct).
-                const key = `${s.awkRegionKey}|${tier}`;
+                const key = `${s.awkRegionKey}|${dedupBand}`;
                 if (seen.has(key)) {
                     const kept = seen.get(key);
                     // Show the removed track's bitrate and the kept track's for contrast - duplicates are decided by quality score (largely bitrate-driven),
@@ -1960,7 +1965,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // libopus-incompatible layout that NO downmix will convert to stereo, and remove it (never the last audio track). keep/remix stay in
         // the loop; this mirrors the loop's surround shouldForce for exactly the drop subset. (The loudnorm-only convergence-to-opus path
         // can't drop here - it only knows a track needs re-encoding after measuring, past this point - so there 'drop' falls back to 'keep'.)
-        if (methodLayoutErr === 'drop' && forceCodec !== 'false' && surroundCodec === 'opus') {
+        if (methodLayoutErr === 'drop' && forceCodec !== 'disabled' && surroundCodec === 'opus') {
             for (const s of audioStreams) {
                 if (removedIndices.has(s.index)) continue;
                 const ch = resolveChannels(s);
@@ -2530,7 +2535,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Also skip when the source has more channels than the target codec supports (ac3/eac3 max 6ch, opus/aac max 8ch) to avoid an ffmpeg encode
             // failure. Channel count is resolved from ffprobe, then mediaInfo, then a channel-layout string (resolveChannels): a track no source can
             // measure is left untouched rather than guessed, since a wrong count could route it to a codec that can't hold its real channels and fail.
-            const forceChannels = (forceCodec !== 'false' && !modifiedAudioIdx.has(outputAudioIdx)) ? ffstreamChannels : -1;
+            const forceChannels = (forceCodec !== 'disabled' && !modifiedAudioIdx.has(outputAudioIdx)) ? ffstreamChannels : -1;
             if (forceChannels === 0)
                 skipDone += noChannelCountSkip(ffstream.index, `codec_force=${forceCodec}`, NO_CHANNEL_COUNT_CODEC);
             if (forceChannels > 0) {
@@ -2704,15 +2709,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // candidate rather than cancelling the pass, so enabling codec_force can never silently switch loudnorm off.
                 const configuredCodec = isStereo ? stereoCodec : surroundCodec;
                 const keepCodec = ENCODABLE_CODECS.includes(ffstreamCodec) ? ffstreamCodec : configuredCodec;
-                const codecMaxChFor = (c) => codecMaxCh(aacFamily(c));
-                const reachable = (c) => channels <= codecMaxChFor(c) && !guardBlocks(ffstream, c, channels, channels);
+                const reachable = (c) => channels <= codecMaxCh(aacFamily(c)) && !guardBlocks(ffstream, c, channels, channels);
                 const wantCodec = forceCovers(isStereo, channels) ? configuredCodec : keepCodec;
                 const targetCodec = reachable(wantCodec) ? wantCodec : (reachable(keepCodec) ? keepCodec : null);
                 if (targetCodec === null) {
                     // Both candidates are out of reach; report against keepCodec, the one the track would otherwise have stayed in.
-                    if (channels > codecMaxChFor(keepCodec))
+                    if (channels > codecMaxCh(aacFamily(keepCodec)))
                         skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Skipping - ${ffstreamCodec} ${channels}ch exceeds the `
-                            + `${codecMaxChFor(keepCodec)}ch limit for ${aacFamily(keepCodec)}\n`;
+                            + `${codecMaxCh(aacFamily(keepCodec))}ch limit for ${aacFamily(keepCodec)}\n`;
                     else
                         skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - would lose detail vs `
                             + `${codecDisplayName(ffstream)} ${channels}ch (guard_lossless=${guardLossless}, guard_quality=${guardQuality}, `
@@ -2745,7 +2749,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // MEASURE FIRST, then decide. The gain correction is the only mandate this loop has - with method_loudnorm=disabled it never runs
                             // at all and the track keeps its source codec and channels - so a track already within LOUDNORM_TOLERANCE_LU (or one the analysis
                             // cap left unmeasured) must not be flattened from surround to stereo for nothing. Every other exit of this loop already bails on
-                            // !changed; this is the one that used to commit before looking. Contrast the codec_force remix, which is correct to fire
+                            // !changed, and so does this one. Contrast the codec_force remix, which is correct to fire
                             // unconditionally: there the codec change IS the requested operation and loudnorm merely rides along.
                             const two = stereoArg(outputAudioIdx, ffstream);
                             if (!two.changed) {

@@ -15,7 +15,7 @@ const details = () => ({
         it's needed).\n\nBecause it runs last it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file
         that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the signature of an out-of-memory-killed or
         unfinalised encode from an earlier stage. A longer output is accepted. This check is always on and has no setting.\n`,
-    Version: '4.22.4',
+    Version: '4.22.5',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -308,7 +308,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (WeakMap, per-run closure) because hasDisposition calls it repeatedly per stream.
     // Both description reads go through getTagCI, and neither casing is a guess: matroska UPPER-CASES tag keys on write, so the ffprobe side comes back
     // DESCRIPTION; and MediaInfo defines Comment/Description as GENERAL-only parameters, so a per-TRACK value never appears top-level - it lands in the
-    // track's 'extra' bag under whatever spelling the container used. Both legs were dead before this: a fixed-case top-level read matched neither.
+    // track's 'extra' bag under whatever spelling the container used. A fixed-case top-level read matches neither.
     const roleTextCache = new WeakMap();
     const roleTextLower = (s) => {
         if (roleTextCache.has(s)) return roleTextCache.get(s);
@@ -1008,11 +1008,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // (Number() -> NaN, so it never matches) while its MENU track reports a bare "0", and without the type test the guard silently compares a
             // menu/chapter track's duration instead of the video's.
             { name: 'the mediaInfo video-track duration',
-                read: (o) => { const v = durVideoStream(o); if (!v) return 0;
-                    return durPositive(((o?.mediaInfo?.track || []).find(t => t['@type'] === 'Video'
+                read: (probed) => { const v = durVideoStream(probed); if (!v) return 0;
+                    return durPositive(((probed?.mediaInfo?.track || []).find(t => t['@type'] === 'Video'
                         && Number(t.StreamOrder) === v.index) || {}).Duration); } },
-            { name: 'the ffprobe video-stream duration', read: (o) => durPositive(durVideoStream(o)?.duration) },
-            { name: 'the container duration', read: (o) => durPositive(o?.ffProbeData?.format?.duration), needsSameAudio: true },
+            { name: 'the ffprobe video-stream duration', read: (probed) => durPositive(durVideoStream(probed)?.duration) },
+            { name: 'the container duration', read: (probed) => durPositive(probed?.ffProbeData?.format?.duration), needsSameAudio: true },
         ];
         // Tolerance is 1% SHORT, fixed, with no input to relax it: a user hitting a false positive would have no recourse but removing the plugin, so the
         // headroom is deliberately double the 0.5% the long-standing community duration-check plugin defaults to. A dead encode is short by far more.
@@ -1034,11 +1034,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let newAny = 0;
             for (const sig of DURATION_SIGNALS) {
                 if (sig.needsSameAudio && !sameAudio) continue;
-                const o = sig.read(originalFile);
-                const n = sig.read(file);
-                if (!oldAny) oldAny = o;
-                if (!newAny) newAny = n;
-                if (!verdict && o && n) verdict = { name: sig.name, old: o, now: n };
+                const oldDur = sig.read(originalFile);
+                const newDur = sig.read(file);
+                if (!oldAny) oldAny = oldDur;
+                if (!newAny) newAny = newDur;
+                if (!verdict && oldDur && newDur) verdict = { name: sig.name, old: oldDur, now: newDur };
             }
             if (verdict) {
                 const pct = (verdict.now / verdict.old) * 100;
@@ -1064,6 +1064,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const UNKNOWN_TYPE_ORDER = 99;   // a codec_type not in streamOrder (video/audio/subtitle/attachment/data) sorts last
         const audioFirst = inputs.audio_first;       // 'disabled' (baseline) | 'original_tagged' | 'default_tagged' | 'descriptive_tagged'
         const subtitleFirst = inputs.subtitle_first; // 'disabled' (baseline) | 'default_tagged' | 'sdh_tagged' | 'descriptive_tagged'
+        // Which stream flag each subtitle_first value lifts. One map instead of three near-identical clauses, so adding a fourth value is a row here rather
+        // than a fourth copy of the same two lines - and so the three cannot drift into asking different questions of the same setting.
+        const SUBTITLE_FIRST_KEY = { default_tagged: 'default', sdh_tagged: 'sdh', descriptive_tagged: 'descriptive' };
+        const subFirstKey = SUBTITLE_FIRST_KEY[subtitleFirst];
+        // Role precedence within a language, lowest first. Defined once per stream type and applied to both comparands: written inline it was the same
+        // ternary chain twice, where a change to one copy silently makes the comparator asymmetric.
+        const subtitleRoleRank = (s) => (s.commentary ? 4 : (s.descriptive ? 3 : (s.sdh ? 2 : (s.lyrics ? 1 : 0))));
+        const audioRoleRank = (s) => (s.commentary ? 2 : (s.descriptive ? 1 : 0));
         const preferredLangKeys = orderLangTokens.map(langKey);   // normalised: en/eng/english/en-US and 639-2/B vs /T all rank together (langKey lowercases)
         const codecFirstList = splitList(inputs.order_codec).map(c => c.toLowerCase());   // canon codec names are lowercase, so the list must be too
 
@@ -1099,8 +1107,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const bRank = b.langRank;
             if (aRank !== bRank) return aRank - bRank;
             //A commentary stream could be descriptive but it would still be a commentary
-            const aRole = a.commentary ? 2 : (a.descriptive ? 1 : 0);
-            const bRole = b.commentary ? 2 : (b.descriptive ? 1 : 0);
+            const aRole = audioRoleRank(a);
+            const bRole = audioRoleRank(b);
             if (aRole !== bRole) return aRole - bRole;
             //order_codec tier — preferred codecs form one group above the rest; this only promotes the group, each still ordered by channel/quality below.
             if (codecFirstList.length > 0 && a.codecMatch !== b.codecMatch) return a.codecMatch ? -1 : 1;
@@ -1132,7 +1140,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             && (JUNK_ENCODER_GLOBAL.has(lowerKey) || (junkTagsMode === 'descriptive' && JUNK_DESCRIPTIVE.has(lowerKey)));
         // Per-stream encoder/encoded_by clears for the stream at OUTPUT index outIdx - the post-sort position -metadata:s:<index> targets, not the source
         // ffprobe index. Present-only, so a clean stream adds nothing and never forces a mux on its own. escMeta guards the probe-derived key.
-        const streamJunkClears = (ffstream, outIdx) => {
+        const junkStreamClears = (ffstream, outIdx) => {
             if (junkTagsMode === 'disabled') return '';
             let meta = '';
             for (const k of Object.keys(ffstream.tags || {}))
@@ -1224,14 +1232,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const bRank = b.langRank;
             if (aRank !== bRank)
                 return aRank - bRank;
-            if (subtitleFirst === 'default_tagged' && a.default !== b.default)
-                return a.default ? -1 : 1;
-            else if (subtitleFirst === 'sdh_tagged' && a.sdh !== b.sdh)
-                return a.sdh ? -1 : 1;
-            else if (subtitleFirst === 'descriptive_tagged' && a.descriptive !== b.descriptive)
-                return a.descriptive ? -1 : 1;
-            const aRole = a.commentary ? 4 : (a.descriptive ? 3 : (a.sdh ? 2 : (a.lyrics ? 1 : 0)));
-            const bRole = b.commentary ? 4 : (b.descriptive ? 3 : (b.sdh ? 2 : (b.lyrics ? 1 : 0)));
+            if (subFirstKey && a[subFirstKey] !== b[subFirstKey])
+                return a[subFirstKey] ? -1 : 1;
+            const aRole = subtitleRoleRank(a);
+            const bRole = subtitleRoleRank(b);
             if (aRole !== bRole)
                 return aRole - bRole;
             return 0;
@@ -1270,8 +1274,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // non-contiguous indices (e.g. 0,1,3 after an upstream drop) isn't remuxed pointlessly. -map still uses the absolute index above.
             if (streams[i].origPos !== i) orderChanged = true;
 
-            // remove_junk_tags (per-stream): clear this stream's encoder tags, keyed on its OUTPUT index i (see streamJunkClears).
-            const streamJunk = streamJunkClears(streams[i].stream, i);
+            // remove_junk_tags (per-stream): clear this stream's encoder tags, keyed on its OUTPUT index i (see junkStreamClears).
+            const streamJunk = junkStreamClears(streams[i].stream, i);
             if (streamJunk) {
                 junkArgs += streamJunk;
                 junkLog += `☐${streamTag(streams[i].index)}[remove_junk_tags=${junkTagsMode}] Remove encoder tag(s) from ${streams[i].type} stream\n`;
@@ -1291,9 +1295,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
-        // Describe the reorder itself. It is this plugin's headline change and the only one that leaves no other trace in the log: a pure reorder emits no
-        // ☐ line at all today, so the log runs straight from the input summary to Expected results and the user has to diff the two token lists to see that
-        // anything happened. The two causes are reported separately because they answer different questions and a user acts on them differently - regrouping
+        // Describe the reorder itself - this plugin's headline change, and the only one that would otherwise leave no trace in the log: without these lines a
+        // pure reorder runs straight from the input summary to Expected results and the user has to diff the two token lists to see that anything happened.
+        // The two causes are reported separately because they answer different questions and a user acts on them differently - regrouping
         // is the fixed video → audio → subtitle → attachment → data precedence that no setting changes, while a within-group sort is what the order_* and
         // audio_first/subtitle_first settings decide. Both lines stay BARE of an [input=value] tag: regrouping has no setting behind it, and a within-group
         // sort is the combined verdict of the whole order_* precedence chain, so naming any one of them would be a guess (see the infoLog contract).

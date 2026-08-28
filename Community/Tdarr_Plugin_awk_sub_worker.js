@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.12',
+    Version: '3.999.13',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -276,7 +276,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (WeakMap, per-run closure) because hasDisposition calls it repeatedly per stream.
     // Both description reads go through getTagCI, and neither casing is a guess: matroska UPPER-CASES tag keys on write, so the ffprobe side comes back
     // DESCRIPTION; and MediaInfo defines Comment/Description as GENERAL-only parameters, so a per-TRACK value never appears top-level - it lands in the
-    // track's 'extra' bag under whatever spelling the container used. Both legs were dead before this: a fixed-case top-level read matched neither.
+    // track's 'extra' bag under whatever spelling the container used. A fixed-case top-level read matches neither.
     const roleTextCache = new WeakMap();
     const roleTextLower = (s) => {
         if (roleTextCache.has(s)) return roleTextCache.get(s);
@@ -940,6 +940,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // One generous ceiling for every spawn here - a hung ffmpeg or curl is killed rather than holding the worker forever. curl takes seconds and spawnSync
     // milliseconds; deriving one from the other keeps the two spellings from drifting.
     const SIDECAR_SPAWN_TIMEOUT_MS = 1800000;
+    // Ceiling on the extraction's captured stderr. Exceeding it KILLS the child, so the run reports an extraction failure that never happened -
+    // which is why it is named here beside the timeout rather than left as a bare literal at the spawn.
+    const SIDECAR_SPAWN_MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
     const SIDECAR_SPAWN_TIMEOUT_S = String(SIDECAR_SPAWN_TIMEOUT_MS / 1000);
     // The server base URL, trailing slashes stripped. '' means the config carries no URL at all - "no route", never a request against an empty host.
     const serverApiUrl = () => String(nodeConfig.serverURL || '').replace(/\/+$/, '');
@@ -1009,7 +1012,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', String(file._id || file.file || '')];
         for (const j of staged) args.push(...j.args, j.tmp);
         const ff = spawnSync(String(otherArguments?.ffmpegPath || 'ffmpeg'), args,
-            { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 });
+            { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES });
         if (ff.error || ff.status !== 0) {
             const why = ff.error ? `extraction failed (${ff.error.code || ff.error.message})`
                 : `extraction failed (ffmpeg exit ${ff.status}: ${String(ff.stderr || '').trim().slice(0, 200)})`;
@@ -1148,7 +1151,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // #endregion
     // Normalise a sidecar language token to a lowercase 3-letter ISO 639-2/T code for an mp4-family import target (mdhd silently drops 2-letter/spelled codes).
     // langKey folds spelled names and 639-2/B onto the 2-letter key, which ISO639_1_TO_2 maps to /T; an already-3-letter code (eng, fil, und) or an unmappable
-    // token is left as-is. Mirrors clean_and_remux's toCanonicalTag three(false); mkv keeps the raw token where it is already a code (see normSidecarLang).
+    // token is left as-is. Mirrors clean_and_remux's toCanonicalTag threeLetter(false); mkv keeps the raw
+    // token where it is already a code (see normSidecarLang).
     const to6392T = (lang) => { const key = langKey(lang); if (!key || key.length !== 2) return lang; return ISO639_1_TO_2[key] || lang; };
     // Plex/Jellyfin/Emby all accept a spelled-out language NAME in a sidecar name (Movie.English.srt), which isRealLanguageToken recognises - but the name
     // itself is not a valid container language tag, so writing it through would stamp "language=English" into the mkv. Fold any non-code token to its code; a
@@ -1294,7 +1298,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (DISP_AMBIGUOUS_LANG.has(toks[toks.length - 1]) && !isRealLanguageToken(toks[toks.length - 2] || '')) break;
             rawDisp.unshift(toks.pop());
         }
-        // drop ignored (default), normalise aliases (cc/hi->sdh, foreign->forced), dedupe
         const dispTokens = [...new Set(rawDisp.filter((t) => !DISP_IGNORE.has(t)).map((t) => DISP_ALIAS[t] || t))];
         if (!toks.length) return null;
         let lang = toks.pop();                                            // language is the next-from-right token
@@ -1327,6 +1330,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             disp: [...new Set(allRoles.concat(extraTokens).map(dispFfOf).filter(Boolean))],
         };
     };
+    // Parse each scanned path as a sidecar, carrying its relative path along as the identity everything downstream keys on.
+    const parseSidecarRel = (rel) => { const p = parseSidecar(path.posix.basename(rel.replace(/\\/g, '/'))); return p ? { ...p, rel } : null; };
 
     // ============= UNMAPPED-NODE LIBRARY ACCESS (method_unmapped) =============
     // An unmapped node is handed a local MIRROR of the library, never the library itself, and Tdarr withholds the user's own path translators from it -
@@ -1338,6 +1343,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //   text_file - no directory access at all; the user lists the filenames and each is fetched by name through the download API.
     const unmappedMode = String(inputs.method_unmapped || 'error').toLowerCase();
     const SUBTITLE_LIST_SUFFIX = '.subtitles.txt';
+    const subtitleListName = `${videoBase}${SUBTITLE_LIST_SUFFIX}`;   // one name for the file, rather than the same join at five sites
     // seedSubtitleList answers '' for success and free prose for a real failure - but two of its outcomes are NOT failures and the caller has to tell them
     // apart to decide whether to warn. Naming them makes that a comparison against a constant rather than against a sentence someone may reasonably reword,
     // which would turn a healthy state into a ☒ on every pass.
@@ -1500,7 +1506,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // discard the OCR'd subtitles they added, which is the one failure that would make the feature untrustworthy. The header explains itself, so opening
     // the file is enough to understand it.
     const seedSubtitleList = (rels) => {
-        const listName = `${videoBase}${SUBTITLE_LIST_SUFFIX}`;
+        const listName = subtitleListName;
         const dest = serverSidePath(path.join(libDir, listName));
         if (!dest) return `no path translator maps ${libDir} back to the server`;
         if (sidecarExistsRemote(dest)) return LIST_SEED_EXISTS;
@@ -1572,8 +1578,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return { rels };
     };
-    // Parse each scanned path as a sidecar, carrying its relative path along as the identity everything downstream keys on.
-    const parseSidecarRel = (rel) => { const p = parseSidecar(path.posix.basename(rel.replace(/\\/g, '/'))); return p ? { ...p, rel } : null; };
     // Import order = the ORIGINAL stream order. Our own names carry the source stream index in their s<index> anchor, and that is the whole point of it:
     // a round trip should hand the tracks back in the order it found them, not in the order their names happen to sort (a plain lexical sort puts s11
     // ahead of s2). A server-native sidecar has no anchor, so it has no original position to restore and goes after the ones that do. The relative path
@@ -1648,8 +1652,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return ext === 'ass' ? !/^[^\S\r\n\u2028\u2029]*Dialogue\s*:/mi.test(text) : !/-->/.test(text);
     };
 
-    // Source indices whose text decoded to no cues at all, filled in by embeddedTextHashes on the one pass it already makes. Read through
-    // embeddedEmptyTextStreams so a caller cannot see a stale empty set from before the probe ran.
+    // Source indices whose text decoded to no cues at all, filled in by embeddedTextHashes on the one pass it already makes. Only meaningful once that
+    // call has returned, and it always has: dedupeEmbeddedSubs forces it first, so an unrun probe can never be mistaken for "no empty tracks".
     const embeddedEmptyIdx = new Set();
 
     // The CONTENT of every embedded text subtitle, as a sha1 keyed by source stream index - the only sound answer to "is this sidecar already in the
@@ -1780,7 +1784,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // method_unmapped: a list written by a text_file run and imported through mount is exactly as spent. Nothing is lost either way - a text_file extract
     // seeds a fresh one when it next needs it.
     const deleteSpentSubtitleList = (delReason, marked) => {
-        const listName = `${videoBase}${SUBTITLE_LIST_SUFFIX}`;
+        const listName = subtitleListName;
         const listPath = path.join(workLibDir(), listName);
         let text;
         try { text = fs.readFileSync(listPath, 'utf8'); } catch (e) { return ''; }   // no list at all is the normal case, and says nothing
@@ -2012,6 +2016,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Hidden on import, visible on extract. On import the sidecar is staging - the next pass muxes it in and remove_source deletes it - so a media server
         // must not offer it in the gap between the two; on extract it IS the deliverable and belongs in plain sight beside the video. Named once, out here,
         // because the import mux needs the same name later to recognise the staging file going in, long after the plan has stopped having anything to say.
+        // The two sentences the caption branches repeat verbatim. Written once because they are a CONTRACT with the user, not incidental wording: the memo
+        // note tells them which containers keep the answer, and the deferral note names the plugin that will finish the job. Three and two sites respectively,
+        // and a wording drift between them reads as two different situations. Declared ahead of ccPlan, which is an IIFE and would otherwise reach them in
+        // their temporal dead zone.
+        const ccMemoTail = () => (canRecord ? ''
+            : `; ${dstContainer} cannot store the awk_cc memo, so a later pass reads it again - remux to mkv or mp4 to stop that`);
+        const ccDeferNote = (idx) => `☒${streamTag(idx)}[remove_source=true] The captions cannot be removed from this video without re-encoding it`
+            + ' - recorded the request, and video_clean will carry it out on its next encode; until then a player shows both copies\n';
         const ccName = (ccMode === 'enabled' && ccVideo)
             ? `${action === 'import' ? '.' : ''}${sidecarBasename(ccPseudoStream(ccVideo.index), false)}` : '';
         const ccPlan = (() => {
@@ -2078,7 +2090,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     record: canRecord ? CC_TOKENS.none : '',
                     note: `☒[embedded_cc=enabled] The caption channel carries no caption text - ${unlinked
                         ? `removed the empty ${name}` : `${name} could not be removed`}${canRecord ? ' and recorded it so no later pass re-reads it'
-                        : `; ${dstContainer} cannot store the awk_cc memo, so a later pass reads it again - remux to mkv or mp4 to stop that`}\n`,
+                        : ccMemoTail()}\n`,
                 };
             }
             // Nothing memoised, so pay for the cheap check. Only `true` from the library scan is information - it reports false both for a file with no
@@ -2262,8 +2274,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             const empty = emptyExtractions.has(j.name);
                             if (empty && canRecord) ccRecord.add(CC_TOKENS.none);
                             response.infoLog += `☒${streamTag(j.index)}[embedded_cc=enabled] ${empty
-                                ? `The caption channel carries no caption text${canRecord ? ''
-                                    : `; ${dstContainer} cannot store the awk_cc memo, so a later pass reads it again - remux to mkv or mp4 to stop that`}`
+                                ? `The caption channel carries no caption text${ccMemoTail()}`
                                 : `Could not place ${j.name} in the library - ${failed.get(j.name)}`
                                     + ' - keeping them in the video so a later pass can retry'}\n`;
                             continue;
@@ -2289,10 +2300,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (unmappedMode === 'text_file') {
                     const placedNames = placeJobs.filter((j) => placed.has(j.name)).map((j) => j.name);
                     const why = placedNames.length ? seedSubtitleList(placedNames) : LIST_SEED_NOTHING;
-                    if (!why) response.infoLog += `☑[method_unmapped=text_file] Created ${videoBase}${SUBTITLE_LIST_SUFFIX} listing ${
+                    if (!why) response.infoLog += `☑[method_unmapped=text_file] Created ${subtitleListName} listing ${
                         placedNames.length} sidecar${placedNames.length === 1 ? '' : 's'} - edit it to add your own\n`;
                     else if (why !== LIST_SEED_EXISTS && why !== LIST_SEED_NOTHING) response.infoLog += `☒[method_unmapped=text_file] Could not create ${
-                        videoBase}${SUBTITLE_LIST_SUFFIX} - ${why}\n`;
+                        subtitleListName} - ${why}\n`;
                 }
             }
             // The fonts leave with the styled subtitles that need them, but only once a bundle actually holds them (bundled) and no styled subtitle is
@@ -2325,8 +2336,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         canRecord ? ' and recording it so no later pass re-checks' : ''}\n`;
                 } else if (canRecord) {
                     ccRecord.add(CC_TOKENS.strip);
-                    response.infoLog += `☒${streamTag(ccVideo.index)}[remove_source=true] The captions cannot be removed from this video without re-encoding`
-                        + ' it - recorded the request, and video_clean will carry it out on its next encode; until then a player shows both copies\n';
+                    response.infoLog += ccDeferNote(ccVideo.index);
                 } else {
                     response.infoLog += `☒${streamTag(ccVideo.index)}[remove_source=true] The captions cannot be removed from this video without re-encoding`
                         + ` it, and ${dstContainer} cannot store the awk_cc request for video_clean to find - they stay in the video and a player shows both`
@@ -2382,7 +2392,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (emptyExtractions.has(ccPlan.job.name)) {
                     response.infoLog += `☒${streamTag(ccVideo.index)}[embedded_cc=enabled] The caption channel carries no caption text${canRecord
                         ? ' - recorded it so no later pass re-reads it'
-                        : `; ${dstContainer} cannot store the awk_cc memo, so a later pass reads it again - remux to mkv or mp4 to stop that`}\n`;
+                        : ccMemoTail()}\n`;
                     if (canRecord) {
                         commitPreset(`-map 0 -c copy${ccTagArg(CC_TOKENS.none)}`);
                         response.infoLog += `☑Expected results: ${summariseAll(streams)}\n`;
@@ -2418,7 +2428,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (unmappedMode === 'text_file') {
                 // No directory access at all here, so the list IS the discovery: each name is fetched from the server by path, and so is the list itself
                 // (see downloadLibraryFile for why it has to sit at a name we can compute).
-                const listName = `${videoBase}${SUBTITLE_LIST_SUFFIX}`;
+                const listName = subtitleListName;
                 const listDest = serverSidePath(path.join(libDir, listName));
                 if (!listDest) failFile(`[method_unmapped=text_file] No path translator maps ${libDir} back to the server, so ${listName} cannot be fetched`);
                 const listLocal = path.join(libDir, listName);
@@ -2631,10 +2641,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // it again. The name says which way it fails; do not "fix" it to match its sibling.
         const contentAllowsSkip = (f) => {
             if (f.bundle || groupHasNoCues(f)) return true;
-            const eh = survivingTextHashes();
-            if (!eh) return true;          // the probe could not run, so nothing is proven either way and the marker's metadata match decides
-            if (!eh.size) return false;    // the probe RAN and no surviving track holds text, so this sidecar is demonstrably not in the file - import it
-            return [...eh.values()].includes(groupHash.get(f.members) || contentKey(f));
+            const surviving = survivingTextHashes();
+            if (!surviving) return true;       // the probe could not run, so nothing is proven either way and the marker's metadata match decides
+            if (!surviving.size) return false; // the probe RAN and no surviving track holds text, so this sidecar is demonstrably not in the file - import it
+            return [...surviving.values()].includes(groupHash.get(f.members) || contentKey(f));
         };
         // The marker skip, now that a group has ONE identity. A group is done only when EVERY member is confirmed embedded AND the group's text is really
         // there: a partly-confirmed group still has something to say (its merged title or flags may not be on the track yet), and processing it is harmless
@@ -2814,9 +2824,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         response.infoLog += `☐${streamTag(ccVideo.index)}[remove_source=true] Removing the closed captions from the video bitstream\n`;
                     } else {
                         ccAdd.push(CC_TOKENS.strip);
-                        response.infoLog += `☒${streamTag(ccVideo.index)}[remove_source=true] The captions cannot be removed from this video without`
-                            + ' re-encoding it - recorded the request, and video_clean will carry it out on its next encode; until then a player shows'
-                            + ' both copies\n';
+                        response.infoLog += ccDeferNote(ccVideo.index);
                     }
                 }
                 meta += ccTagArg(...ccAdd);

@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.6',
+    Version: '3.999.7',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -87,8 +87,8 @@ const details = () => ({
                 missing lines are interpolated and every half-picture becomes a frame of its own: 1080i60 comes out as 60fps, keeping all the motion the
                 file actually holds. Material shot on FILM and padded out for broadcast (nearly every film DVD, much anime) still contains its original
                 frames intact, so those are rebuilt exactly and come back at their own 24fps with nothing invented.
-                \\nSo shot-on-video material comes out at double the frame rate, costing roughly a third more bitrate and half again the encode time.
-                Film-originated and already-progressive video are unaffected, so on a normal mixed library this touches only a small slice of it.`,
+                \\nShot-on-video output therefore costs roughly a third more bitrate and half again the encode time; film-originated and already-progressive
+                video are unaffected, so on a mixed library this touches only a small slice of it.`,
         },
         {
             name: 'downscale',
@@ -383,7 +383,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (WeakMap, per-run closure) because hasDisposition calls it repeatedly per stream.
     // Both description reads go through getTagCI, and neither casing is a guess: matroska UPPER-CASES tag keys on write, so the ffprobe side comes back
     // DESCRIPTION; and MediaInfo defines Comment/Description as GENERAL-only parameters, so a per-TRACK value never appears top-level - it lands in the
-    // track's 'extra' bag under whatever spelling the container used. Both legs were dead before this: a fixed-case top-level read matched neither.
+    // track's 'extra' bag under whatever spelling the container used. A fixed-case top-level read matches neither.
     const roleTextCache = new WeakMap();
     const roleTextLower = (s) => {
         if (roleTextCache.has(s)) return roleTextCache.get(s);
@@ -1469,8 +1469,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             ? Math.max(0, MEM_FRAME_THREADS(memCpuCount(cores)) - MEM_FIT_FRAME_THREADS) * MEM_MB_PER_THREAD_MPIXEL * outMpix : 0;
         return (mb + threadMb + memFilterSurcharge(tonemapOn, deintOn)) * (row.presetScaled === false ? 1 : (MEM_PRESET[speedName] || 1));
     };
-    const memGb = (bytes) => `${(bytes / (1024 ** 3)).toFixed(1)} GB`;
-    const memMbGb = (mb) => memGb(mb * MEM_BYTES_PER_MB);
+    const memGbFromBytes = (bytes) => `${(bytes / (1024 ** 3)).toFixed(1)} GB`;
+    const memGbFromMb = (mb) => memGbFromBytes(mb * MEM_BYTES_PER_MB);
 
     // Build the video-encode arguments for the chosen encoder: decode-side (input) flags + the output -c:v block (encoder, quality, speed, pixel format, the
     // video filter chain, QuickTime fourCC). Returns { inputSide, videoOut }. Source colour metadata carries through automatically - no explicit colour flags
@@ -1585,7 +1585,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const hdrMode = String(inputs.hdr_mode || 'preserve').toLowerCase().trim();
     const deinterlaceOpt = String(inputs.deinterlace || 'disabled').toLowerCase().trim();
     const guardCaptions = String(inputs.guard_captions) === 'true';   // boolean, default FALSE - opt-in, unlike the two guards below (see its tooltip)
-    const guardDv = String(inputs.guard_dv) === 'true';   // boolean (loadDefaultValues coerces it), default true
+    const guardDv = String(inputs.guard_dv) === 'true';   // boolean, default true
     const guardLossless = String(inputs.guard_lossless) === 'true';   // boolean, default true
 
     // The two free-text NUMERIC inputs are the only user-typed values this plugin echoes back, and failFile's message becomes the file's stored error, so
@@ -1830,9 +1830,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // are safe to emit on a file nothing else happens to; the setting costs a decode, so what it found is information the user paid for. Reads the MEMO,
         // never idet(), so asking for the line can never itself provoke the decode: where a guard settled the file without the verdict there is nothing to
         // report, because nothing was paid for. Emitted at the two points where the decision is final - inside emitTranscode, and past the transcode branch.
+        // How idet's counts are shown wherever they are reported: a whole percent, or '?' when nothing was sampled, so the two log sites cannot
+        // disagree about the rounding or about what an empty sample looks like.
+        const idetPct = (n, v) => (v.total ? `${Math.round((n / v.total) * 100)}%` : '?');
         const deintVerdictLine = () => {
             if (!idetMemo || ['disabled', 'interlaced', 'telecine'].includes(idetMemo.kind)) return '';
-            const combedPct = idetMemo.total ? `${Math.round((idetMemo.combed / idetMemo.total) * 100)}%` : '?';
+            const combedPct = idetPct(idetMemo.combed, idetMemo);
             return idetMemo.kind === 'progressive'
                 ? `☑${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] No combing found (${combedPct} combed frames) - nothing to repair\n`
                 : `☒${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Could not read an interlace verdict from this file - left as-is\n`;
@@ -1951,7 +1954,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // trigger); downscale, tonemap and interlace repair are triggers in both actions.
         const heightTrigger = willDownscale;
         const tonemapTrigger = tonemap;
-        const deintTrigger = deinterlaceNeeded;   // a filter, so it forces a real encode exactly as a downscale or a tonemap does
         let codecTrigger = false;
         if (action === 'normalize') {
             // fire on a mismatch either direction; codec=source never mismatches
@@ -2017,7 +2019,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // therefore calls realTranscode() with its own cheap metadata test to the LEFT of it, so a file that guard_lossless / the DV and HDR refusals / the
         // awk_video fence were always going to settle never spawns ffmpeg to be told something it does not use.
         const cheapTranscode = codecTrigger || heightTrigger || tonemapTrigger;
-        const realTranscode = () => cheapTranscode || deintTrigger();
+        // deinterlaceNeeded is a FUNCTION where heightTrigger/tonemapTrigger/codecTrigger are booleans - called here rather than aliased into the
+        // set, so the parentheses stay visible. A filter forces a real encode exactly as a downscale or a tonemap does.
+        const realTranscode = () => cheapTranscode || deinterlaceNeeded();
         const canEncodeTarget = ENCODABLE_CODECS.includes(targetCodecName);
 
         // Idempotency fence: a settings fingerprint stored as a container-global awk_video tag. Essential for shrink (a constant-quality
@@ -2111,21 +2115,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // that was just named instead of comparing two differently-derived figures.
                 const altFloor = (over) => memoryEstimate({ ...common, ...over, floor: true });
                 const trades = [];
-                if (outHeight > 1080) { const m = altFloor({ outH: 1080 }); if (m !== null) trades.push(`downscale=1080 (~${memMbGb(m)})`); }
+                if (outHeight > 1080) { const m = altFloor({ outH: 1080 }); if (m !== null) trades.push(`downscale=1080 (~${memGbFromMb(m)})`); }
                 if (want10Bit && targetCodecName !== 'h264') {
                     const m = altFloor({ want10: false });
-                    if (m !== null) trades.push(`method_bitdepth=8 (~${memMbGb(m)})`);
+                    if (m !== null) trades.push(`method_bitdepth=8 (~${memGbFromMb(m)})`);
                 }
                 if (hwAlt) {
                     const m = altFloor({ family: hwAlt.family, encoderName: hwAlt.encoderName });
                     if (m !== null) trades.push(`${forcedBy.split('=')[0]}=false to allow ${hwAlt.encoderName}`
-                        + ` (~${memMbGb(m)}, at a real bitrate-efficiency cost)`);
+                        + ` (~${memGbFromMb(m)}, at a real bitrate-efficiency cost)`);
                 }
                 const swapNote = budget.swapBytes > 0 && Number.isFinite(budget.swapBytes)
-                    ? ` (a ${memGb(limit)} limit plus ${memGb(budget.swapBytes)} of swap)` : '';
+                    ? ` (a ${memGbFromBytes(limit)} limit plus ${memGbFromBytes(budget.swapBytes)} of swap)` : '';
                 // Round the suggestion up to a whole GB and leave room for the node itself, measured at ~224 MB of anonymous memory beside the encode.
                 const suggestGb = Math.max(1, Math.ceil(((expectMb + 224) * MEM_BYTES_PER_MB) / (1024 ** 3)));
-                let msg = `${tag} ${label} needs at least ~${memMbGb(floorMb)} and this node allows ${memGb(limit + budget.swapBytes)}${swapNote}`
+                let msg = `${tag} ${label} needs at least ~${memGbFromMb(floorMb)} and this node allows ${memGbFromBytes(limit + budget.swapBytes)}${swapNote}`
                     + ` - the encode would be killed with no error at all, so it is being failed here instead`
                     + `\n☒${tag} fix: raise this node's memory limit to about ${suggestGb} GB, or run fewer transcode workers on it`;
                 if (forcedBy) msg += `\n☒${tag}[${forcedBy}] that is what forced this onto the CPU encoder, and the CPU encoders are the expensive ones`;
@@ -2133,11 +2137,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 failFile(msg);
             }
             if (tight)
-                response.infoLog += `☒${tag} this encode needs about ${memMbGb(expectMb)} and only ${memGb(freeBytes)} is free on this node - it should still`
+                response.infoLog += `☒${tag} this encode needs about ${memGbFromMb(expectMb)} and only ${memGbFromBytes(freeBytes)} is free`
+                    + ` on this node - it should still`
                     + ` finish, but by swapping, which is far slower than giving the node more memory\n`;
             if (hwAlt) {
                 const m = memoryEstimate({ ...common, family: hwAlt.family, encoderName: hwAlt.encoderName, tonemapOn: tonemap, deintOn: !!deintFilter() });
-                if (m !== null) response.infoLog += `☒${tag}[${forcedBy}] that forces the CPU encoder - about ${memMbGb(expectMb)} against ${memMbGb(m)} for`
+                if (m !== null) response.infoLog += `☒${tag}[${forcedBy}] that forces the CPU encoder - about ${memGbFromMb(expectMb)}`
+                    + ` against ${memGbFromMb(m)} for`
                     + ` ${hwAlt.encoderName}, which this node could otherwise have used\n`;
             }
             // A RAM-backed transcode cache is invisible to the model above: those pages are anonymous, count against the same cgroup limit, and cannot be
@@ -2220,11 +2226,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // the files it happens to, and its absence legible on the film-originated ones where it never applies.
             if (deinterlaceNeeded()) {
                 const v = idet();
-                const pct = (n) => (v.total ? `${Math.round((n / v.total) * 100)}%` : '?');
                 response.infoLog += v.kind === 'telecine'
-                    ? `☐${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Film-originated video detected (${pct(v.repeats)} repeated fields)`
+                    ? `☐${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Film-originated video detected (${idetPct(v.repeats, v)} repeated fields)`
                         + ' - rebuilding its original frames exactly, at its own frame rate\n'
-                    : `☐${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Interlaced video detected (${pct(v.combed)} combed frames,`
+                    : `☐${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Interlaced video detected (${idetPct(v.combed, v)} combed frames,`
                         + ` ${deintParity()} field order) - keeping every field as its own frame, so the output runs at double the frame rate\n`;
             } else response.infoLog += deintVerdictLine();
             response.infoLog += `☐${streamTag(primary.index)}${encodeTag} Transcoding video @ ${sel.encoderName} q${Math.round(qNorm)}\n`;
