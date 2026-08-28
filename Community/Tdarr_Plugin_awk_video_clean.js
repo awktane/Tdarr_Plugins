@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.7',
+    Version: '3.999.8',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -2087,8 +2087,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!budget || budget.scope === 'unknown') return;
             const common = { family: sel.family, encoderName: sel.encoderName, srcCodec: srcCodecName, srcIs10, srcW: srcWidth, srcH: srcHeight,
                 dispH: dispHeight, outH: outHeight, want10: want10Bit, speedName: speed, cores: budget.cores, sliceOn };
+            const expectOf = (over) => memoryEstimate({ ...common, ...over, tonemapOn: tonemap, deintOn: !!deintFilter() });
             const floorMb = memoryEstimate({ ...common, floor: true });
-            const expectMb = memoryEstimate({ ...common, tonemapOn: tonemap, deintOn: !!deintFilter() });
+            const expectMb = expectOf({});
             if (floorMb === null || expectMb === null) return;   // unreadable source dimensions, or an unmeasured encoder: say nothing rather than guess
             const tag = streamTag(primary.index);
             const limit = budget.limitBytes;
@@ -2141,7 +2142,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     + ` on this node - it should still`
                     + ` finish, but by swapping, which is far slower than giving the node more memory\n`;
             if (hwAlt) {
-                const m = memoryEstimate({ ...common, family: hwAlt.family, encoderName: hwAlt.encoderName, tonemapOn: tonemap, deintOn: !!deintFilter() });
+                const m = expectOf({ family: hwAlt.family, encoderName: hwAlt.encoderName });
                 if (m !== null) response.infoLog += `☒${tag}[${forcedBy}] that forces the CPU encoder - about ${memGbFromMb(expectMb)}`
                     + ` against ${memGbFromMb(m)} for`
                     + ` ${hwAlt.encoderName}, which this node could otherwise have used\n`;
