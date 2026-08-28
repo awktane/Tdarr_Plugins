@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.10',
+    Version: '4.999.11',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1902,6 +1902,33 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     : ['-map', `0:${ffstream.index}`, '-c:s', 'copy', '-f', spec.fmt],
             };
         };
+        // The mechanical half of an export, shared by the image-sub and the styled-bundle branches so the two cannot stage a file differently: the path join,
+        // the unmapped-node lookups, the two refusal tests, the already-exists probe, and the single sidecarOut append that rides the export on the remux.
+        // Returns { status, name, why, bytes } - 'placed' (unmapped, already uploaded), 'empty' (unmapped, the decode produced nothing), 'exists', 'queued'
+        // or 'refused'. A refusal names only the CAUSE ('unmapped', and failedSidecars holds the detail; 'namecap', with `bytes`; 'unsafe'), because the two
+        // callers spell the CONSEQUENCE differently: an image refusal keeps the subtitle and fails the file, a styled one falls through to mov_text.
+        const stageSidecar = (ffstream, styled) => {
+            const { name, mapTokens } = sidecarPlan(ffstream, styled);
+            const sidecarPath = path.join(libDir, name);
+            if (isUnmappedNode) {
+                if (placedSidecars.has(name)) return { status: 'placed', name };
+                if (emptySidecars.has(name)) return { status: 'empty', name };
+                return { status: 'refused', name, why: 'unmapped' };
+            }
+            // videoBase is the user's own filename and nothing bounds it, so the finished name can exceed the filesystem's 255-byte basename cap on its own.
+            // The sidecar and the strip are outputs of ONE ffmpeg command, so an over-long name does not merely lose the sidecar: ffmpeg answers "File name
+            // too long" and refuses EVERY output of the run, quarantining a file that re-fails on every requeue. Tested BEFORE the path, not after - it is a
+            // property of the name, not of the directory.
+            const bytes = Buffer.byteLength(name, 'utf8');
+            if (bytes > NAME_BYTE_CAP) return { status: 'refused', name, why: 'namecap', bytes };
+            if (!pathIsPresetSafe(sidecarPath)) return { status: 'refused', name, why: 'unsafe' };
+            // ffmpeg refuses to overwrite an existing output file and aborts the ENTIRE run, so a sidecar left by an earlier pass would take the whole remux
+            // down with it rather than just skipping its own export. An existing sidecar has already served its purpose and may since have been OCR'd or
+            // edited, so the export is simply not repeated and the drop still goes ahead - forcing it (-y) could only destroy that work.
+            if (fileHasBytes(sidecarPath)) return { status: 'exists', name };
+            sidecarOut += ` ${mapTokens.join(' ')} "${sidecarPath}"`;
+            return { status: 'queued', name };
+        };
         if (isUnmappedNode) {
             const exportJobs = [];
             for (const s of (file.ffProbeData.streams || [])) {
@@ -2063,52 +2090,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const exportSuppressed = removeImageSubs === 'export' && subFilterDrops(ffstream);
                 let exportRefused = false;
                 if (imageSubDrop && removeImageSubs === 'export' && !exportSuppressed) {
-                    const { name: sidecarName, mapTokens } = sidecarPlan(ffstream, false);
-                    const sidecarPath = path.join(libDir, sidecarName);
-                    // Unmapped: the export already ran, above this loop - the drop is allowed only for a sidecar the server confirmed it holds, and the
-                    // line is ☑ rather than ☐ because it reports work already done. A refusal reads like the unsafe-path one below and keeps the subtitle.
-                    if (isUnmappedNode) {
-                        if (placedSidecars.has(sidecarName)) {
-                            workDone += `☑${streamTag(ffstream.index)}[remove_imagesubs=export] Exported image subtitle -> ${sidecarName}`
-                                + ' for external OCR (before drop)\n';
-                        } else if (emptySidecars.has(sidecarName)) {
-                            // Nothing came out of the decode, which is an answer about the SOURCE and never changes on a requeue - so it must not be
-                            // counted as a refusal, or the file quarantines forever. A mapped node already resolves it this way (ffmpeg writes a 0-byte
-                            // sidecar as an extra output of the remux and the drop proceeds); this keeps the two routes agreeing on the same file.
-                            workDone += `☑${streamTag(ffstream.index)}[remove_imagesubs=export] Nothing to export to ${sidecarName}`
-                                + ' - the subtitle stream carries no data (dropping it loses nothing)\n';
-                        } else {
-                            exportRefused = true; exportRefusedCount += 1;
-                            response.infoLog += `☒${streamTag(ffstream.index)}[remove_imagesubs=export] Could not place ${sidecarName} in the library`
-                                + ` - ${failedSidecars.get(sidecarName)}, keeping the subtitle\n`;
-                        }
-                    } else if (Buffer.byteLength(sidecarName, 'utf8') > NAME_BYTE_CAP) {
-                        // videoBase is the user's own filename and nothing bounds it, so the finished name can exceed the filesystem's 255-byte basename cap
-                        // on its own. The sidecar and the strip are outputs of ONE ffmpeg command, so an over-long name does not merely lose the sidecar:
-                        // ffmpeg answers "File name too long" and refuses EVERY output of the run, quarantining a file that re-fails on every requeue. Refuse
-                        // it here instead, so the message names the actual fix. Checked BEFORE the write branch, not after the path test - it is a property of
-                        // the name, not of the directory.
-                        exportRefused = true; exportRefusedCount += 1;
-                        response.infoLog += `☒${streamTag(ffstream.index)}[remove_imagesubs=export] Sidecar name would be `
-                            + `${Buffer.byteLength(sidecarName, 'utf8')} bytes, over the ${NAME_BYTE_CAP}-byte filesystem limit`
-                            + ' - rename the video shorter and requeue, keeping the subtitle\n';
-                    } else if (pathIsPresetSafe(sidecarPath)) {
-                        // ffmpeg refuses to overwrite an existing output file and aborts the ENTIRE run, so a sidecar left by an earlier pass would take the
-                        // whole remux down with it rather than just skipping its own export. An existing sidecar has already served its purpose and may since
-                        // have been OCR'd, so the export is simply not repeated and the drop still goes ahead - forcing it (-y) could only destroy that work.
-                        let sidecarExists = false;
-                        sidecarExists = fileHasBytes(sidecarPath);
-                        if (sidecarExists) {
-                            workDone += `☑${streamTag(ffstream.index)}[remove_imagesubs=export] Sidecar already exists, not overwriting: ${sidecarName}\n`;
-                        } else {
-                            sidecarOut += ` ${mapTokens.join(' ')} "${sidecarPath}"`;
-                            workDone += `☐${streamTag(ffstream.index)}[remove_imagesubs=export] Export image subtitle -> ${sidecarName}`
-                                + ' for external OCR (before drop)\n';
-                        }
+                    const { status, name: sidecarName, why, bytes } = stageSidecar(ffstream, false);
+                    const inputTag = `${streamTag(ffstream.index)}[remove_imagesubs=export]`;
+                    if (status === 'queued') {
+                        workDone += `☐${inputTag} Export image subtitle -> ${sidecarName} for external OCR (before drop)\n`;
+                    } else if (status === 'placed') {
+                        // Unmapped: the export already ran, above this loop - so the line is ☑ rather than ☐, reporting work already done.
+                        workDone += `☑${inputTag} Exported image subtitle -> ${sidecarName} for external OCR (before drop)\n`;
+                    } else if (status === 'exists') {
+                        workDone += `☑${inputTag} Sidecar already exists, not overwriting: ${sidecarName}\n`;
+                    } else if (status === 'empty') {
+                        // Nothing came out of the decode, which is an answer about the SOURCE and never changes on a requeue - so it must not be counted as a
+                        // refusal, or the file quarantines forever. A mapped node already resolves it this way (ffmpeg writes a 0-byte sidecar as an extra
+                        // output of the remux and the drop proceeds); this keeps the two routes agreeing on the same file.
+                        workDone += `☑${inputTag} Nothing to export to ${sidecarName} - the subtitle stream carries no data (dropping it loses nothing)\n`;
                     } else {
+                        // Every refusal keeps the subtitle, and any at all fails the file after the loop: the sidecar would have been its only copy.
+                        const refusal = {
+                            unmapped: `Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}, keeping the subtitle`,
+                            namecap: `Sidecar name would be ${bytes} bytes, over the ${NAME_BYTE_CAP}-byte filesystem limit`
+                                + ' - rename the video shorter and requeue, keeping the subtitle',
+                            unsafe: `Library directory has a quote, control char or <io> - cannot write ${sidecarName} safely, keeping the subtitle`,
+                        };
                         exportRefused = true; exportRefusedCount += 1;
-                        response.infoLog += `☒${streamTag(ffstream.index)}[remove_imagesubs=export] Library directory has a quote, control char or <io>`
-                            + ` - cannot write ${sidecarName} safely, keeping the subtitle\n`;
+                        response.infoLog += `☒${inputTag} ${refusal[why]}\n`;
                     }
                 }
                 if (imageSubDrop && !exportRefused && !exportSuppressed) {
@@ -2156,37 +2161,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // (the bundle then holds the only styled copy); a refusal falls through to the mov_text conversion below with a ☒ naming the loss - a
                 // mangled subtitle beats a vanished one.
                 if (styledSubExported(ffstreamCodec)) {
-                    const { name: sidecarName, mapTokens } = sidecarPlan(ffstream, true);
-                    const sidecarPath = path.join(libDir, sidecarName);
+                    const { status, name: sidecarName, why, bytes } = stageSidecar(ffstream, true);
+                    const inputTag = `${streamTag(ffstream.index)}[container=mp4]`;
                     const fontNote = styledFontIndices.length
                         ? ` with ${styledFontIndices.length} font attachment${styledFontIndices.length === 1 ? '' : 's'}` : ' (no embedded fonts to carry)';
-                    let exported = false;
-                    if (isUnmappedNode) {
-                        if (placedSidecars.has(sidecarName)) { exported = true; workDone += `☑${streamTag(ffstream.index)}[container=mp4] Exported styled`
-                            + ` ${ffstreamCodec} subtitle -> ${sidecarName}${fontNote}\n`; }
-                        else response.infoLog += `☒${streamTag(ffstream.index)}[container=mp4] Could not place ${sidecarName} in the library`
-                            + ` - ${failedSidecars.get(sidecarName)}; converting to mov_text instead, which loses the styling\n`;
-                    } else if (Buffer.byteLength(sidecarName, 'utf8') > NAME_BYTE_CAP) {
-                        // Same name-length refusal as the image-sub export above; here the fall-through is mov_text rather than a quarantine.
-                        response.infoLog += `☒${streamTag(ffstream.index)}[container=mp4] Sidecar name would be `
-                            + `${Buffer.byteLength(sidecarName, 'utf8')} bytes, over the ${NAME_BYTE_CAP}-byte filesystem limit`
-                            + ' - converting to mov_text instead, which loses the styling; rename the video shorter to keep it\n';
-                    } else if (pathIsPresetSafe(sidecarPath)) {
-                        // ffmpeg aborts the whole run rather than overwrite an output file, so an existing bundle is left alone and the drop still goes
-                        // ahead - it already holds this subtitle, and re-exporting could only destroy a copy the user may have edited.
-                        let bundleExists = false;
-                        bundleExists = fileHasBytes(sidecarPath);
-                        exported = true;
-                        if (bundleExists) workDone += `☑${streamTag(ffstream.index)}[container=mp4] Styled-subtitle bundle already exists,`
-                            + ` not overwriting: ${sidecarName}\n`;
-                        else {
-                            sidecarOut += ` ${mapTokens.join(' ')} "${sidecarPath}"`;
-                            workDone += `☐${streamTag(ffstream.index)}[container=mp4] Export styled ${ffstreamCodec} subtitle -> ${sidecarName}${fontNote}`
-                                + ' - mp4 cannot carry it without flattening the styling into on-screen text\n';
-                        }
+                    const exported = ['queued', 'placed', 'exists'].includes(status);
+                    if (status === 'queued') {
+                        workDone += `☐${inputTag} Export styled ${ffstreamCodec} subtitle -> ${sidecarName}${fontNote}`
+                            + ' - mp4 cannot carry it without flattening the styling into on-screen text\n';
+                    } else if (status === 'placed') {
+                        workDone += `☑${inputTag} Exported styled ${ffstreamCodec} subtitle -> ${sidecarName}${fontNote}\n`;
+                    } else if (status === 'exists') {
+                        workDone += `☑${inputTag} Styled-subtitle bundle already exists, not overwriting: ${sidecarName}\n`;
                     } else {
-                        response.infoLog += `☒${streamTag(ffstream.index)}[container=mp4] Library directory has a quote, control char or <io> - cannot`
-                            + ` write ${sidecarName} safely; converting to mov_text instead, which loses the styling\n`;
+                        // A refusal falls through to the mov_text conversion below with a ☒ naming the loss - a mangled subtitle beats a vanished one. The
+                        // bundle route has no 'empty' answer of its own: an unmapped export that produced nothing reads as the unmapped refusal.
+                        const refusal = {
+                            unmapped: `Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}; converting to mov_text instead,`
+                                + ' which loses the styling',
+                            namecap: `Sidecar name would be ${bytes} bytes, over the ${NAME_BYTE_CAP}-byte filesystem limit - converting to mov_text`
+                                + ' instead, which loses the styling; rename the video shorter to keep it',
+                            unsafe: `Library directory has a quote, control char or <io> - cannot write ${sidecarName} safely; converting to mov_text`
+                                + ' instead, which loses the styling',
+                        };
+                        response.infoLog += `☒${inputTag} ${refusal[why || 'unmapped']}\n`;
                     }
                     if (exported) { dropStream(ffstream.index); subtitleStreamIndex--; continue; }
                 }
