@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.12',
+    Version: '4.999.13',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -2039,16 +2039,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
             // Write a changed title, or reconcile ONLY when the ffprobe tag is missing but mediaInfo has a REAL one - REAL meaning what survives laundering,
             // so a Title that was nothing but the handler echo reconciles to nothing and is never promoted into a title tag. The write adds the ffprobe tag so
-            // both probes agree next pass. The reverse (ffprobe has a title mediaInfo never reports) must NOT fire, or a container that never surfaces Title to
-            // mediaInfo would remux every pass.
+            // both probes agree next pass. Two cases must NOT reconcile, both because the write can never make the probes agree so the file would remux every
+            // pass (Tdarr errors an unchanging preset as an infinite transcode loop): the reverse (ffprobe has a title mediaInfo never reports), and an mp4
+            // target - mp4 stores a track title in udta/name, which ffprobe never surfaces, so the written tag stays invisible to the next pass's ffprobe.
             const emitTitleMeta = (typeLetter, idx, typeWord, streamTitle, newStreamTitle, titleCauses) => {
                 if (newStreamTitle !== streamTitle) {
                     workDone += `☐${streamTag(ffstream.index)}${titleCauses.length ? `[${titleCauses.join('][')}]` : ''} Change title (${typeWord})`
                         + ` "${logSafe(streamTitle)}" -> "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "title=${escMeta(newStreamTitle)}"`;
-                } else if (ffmedia && !(ffstream.tags?.title) && mediaTitleClean !== '') {
-                    workDone += `☐${streamTag(ffstream.index)} Change title (${typeWord}) - found "${logSafe(ffstream.tags?.title ?? '')}"`
-                        + ` and "${logSafe(ffmedia?.Title ?? '')}" change to "${logSafe(newStreamTitle)}"\n`;
+                } else if (ffmedia && !(ffstream.tags?.title) && mediaTitleClean !== '' && dstContainer !== 'mp4') {
+                    workDone += `☐${streamTag(ffstream.index)} Set title (${typeWord}) from mediaInfo "${logSafe(newStreamTitle)}" (no ffprobe title tag)\n`;
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "title=${escMeta(newStreamTitle)}"`;
                 }
             };
