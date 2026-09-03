@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.9',
+    Version: '3.999.10',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1624,7 +1624,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['deinterlace',      deinterlaceOpt,  ['disabled', 'enabled']],
     ];
     for (const [name, value, opts] of dropdownChecks)
-        if (!opts.includes(value)) failFile(`[${name}=${value}] invalid value, check your settings`);
+        if (!opts.includes(value)) failFile(`[${name}=${logTok(value, 200)}] invalid value, check your settings`);
     // The one cross-input config error: tonemap_sdr is a pixel-domain re-encode, so it can never satisfy hdr_cleanup_only's lossless-or-skip promise.
     if (hdrMode === 'tonemap_sdr' && action === 'hdr_cleanup_only')
         failFile('[hdr_mode=tonemap_sdr][action=hdr_cleanup_only] tonemapping is always a re-encode (never lossless)'

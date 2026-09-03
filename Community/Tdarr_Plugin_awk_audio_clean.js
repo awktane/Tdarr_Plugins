@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.10',
+    Version: '4.999.11',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1607,7 +1607,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['guard_quality',         guardQuality,         ['enabled', 'strict', 'disabled']],
     ];
     for (const [name, value, opts] of dropdownChecks)
-        if (!opts.includes(value)) failFile(`[${name}=${value}] invalid value, check your settings`);
+        if (!opts.includes(value)) failFile(`[${name}=${logTok(value, 200)}] invalid value, check your settings`);
 
     // Both free-text language lists are checked through this because dormancy is NOT a typo net - it only fires when NOTHING matches EITHER list, so a typo in
     // one list while the other still matches leaves that language "unlisted", where language_unlisted=stereo downmixes it and language_unlisted=delete removes
@@ -1993,8 +1993,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (stereoPath || (surroundPath && (downmixToStereo === 'replace' || (ch > 6 && downmixToSix === 'replace')))) continue;
                 if (countSurvivingAudio() <= 1) continue;                                    // never drop the last audio track
                 removedIndices.add(s.index);
-                // this IS a change (removal)
-                workDone += `☒${streamTag(s.index)}[method_layout_err=${methodLayoutErr}] Dropping - libopus can't encode a `
+                // this IS a queued change (a removal), so it takes the change symbol like every other removal line, not the warning symbol
+                workDone += `☐${streamTag(s.index)}[method_layout_err=${methodLayoutErr}] Dropping - libopus can't encode a `
                     + `${s.channel_layout || `${ch}ch`} layout\n`;
                 // Remember a dropped source a downmix ('add' mode) would derive from, so its stereo/5.1 still gets created even though the source itself is
                 // gone (see the post-loop pass below). 'replace' modes already deferred above (they convert the source in place), so only 'add' reaches here.

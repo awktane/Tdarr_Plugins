@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.15',
+    Version: '4.999.16',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -909,7 +909,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // reachable via a hand-edited/imported config) would silently fall through to a generic remux into an unsupported container - a runtime ffmpeg muxer
     // error instead of a clean quarantine.
     if(!['mkv', 'mp4'].includes(dstContainer))
-        failFile(`[container=${dstContainer}] invalid value, check your settings`);
+        failFile(`[container=${logTok(dstContainer, 200)}] invalid value, check your settings`);
     response.container = `.${dstContainer}`;
 
     // Recovery modes: two symptom dropdowns, each disabled/light/aggressive. light = no-data-loss flags only; aggressive adds the side-effect ones.
@@ -1019,7 +1019,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['method_unmuxable',     methodUnmuxable,    ['error', 'drop', 'mkv_fallback']],
     ];
     for (const [name, value, opts] of dropdownChecks)
-        if (!opts.includes(value)) failFile(`[${name}=${value}] invalid value, check your settings`);
+        if (!opts.includes(value)) failFile(`[${name}=${logTok(value, 200)}] invalid value, check your settings`);
 
     // ====== LANGUAGE TAG CANONICALIZATION ======
     // Write-side helpers: this is the only plugin that WRITES container language tags via tag_language/language_fill; langKey/langListMatch
@@ -1398,7 +1398,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES });
         if (ff.error || ff.status !== 0) {
             const why = ff.error ? `extraction failed (${ff.error.code || ff.error.message})`
-                : `extraction failed (ffmpeg exit ${ff.status}: ${String(ff.stderr || '').trim().slice(0, 200)})`;
+                : `extraction failed (ffmpeg exit ${ff.status}: ${logTok(String(ff.stderr || '').trim(), 200)})`;
             clearStaged();
             return failAll(why);
         }
