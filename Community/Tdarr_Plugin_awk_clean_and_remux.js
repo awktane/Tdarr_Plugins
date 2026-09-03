@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.14',
+    Version: '4.999.15',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1417,6 +1417,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // half - an ffmpeg aborted mid-write leaves an empty file, and trusting it then strips the only copy of the subtitle. Any stat failure is absent too, so
     // a permission error re-extracts rather than silently dropping. Shared so a refinement (treating whitespace-only as absent, or adding an isFile test so a
     // directory named like a sidecar is not mistaken for one) cannot land on one plugin's copy and leave the other answering differently about the same file.
+    // KNOWN GAP, deliberately not closed here: a run killed AFTER the first flush leaves a non-empty TRUNCATED sidecar (an MB-scale image/styled export is
+    // written progressively across the whole remux), which this size>0 test trusts as complete - the next run then drops the embedded stream and keeps only the
+    // partial copy. Cheap structural verification cannot tell the two apart: a byte-truncated raw .sup is indistinguishable from a legitimately shorter subtitle
+    // (ffprobe exits 0 and reads it as valid - measured), and overwriting instead would discard a sidecar the user may have OCR'd or edited. A sound fix needs a
+    // temp-name/finalize protocol across runs; deferred as heavier than the narrow kill-mid-remux+requeue window it guards.
     const fileHasBytes = (p) => { try { return fs.statSync(p).size > 0; } catch (e) { return false; } };
     // ===== END SHARED: sidecar placement =====
     // #endregion

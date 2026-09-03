@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.14',
+    Version: '3.999.15',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1034,6 +1034,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // half - an ffmpeg aborted mid-write leaves an empty file, and trusting it then strips the only copy of the subtitle. Any stat failure is absent too, so
     // a permission error re-extracts rather than silently dropping. Shared so a refinement (treating whitespace-only as absent, or adding an isFile test so a
     // directory named like a sidecar is not mistaken for one) cannot land on one plugin's copy and leave the other answering differently about the same file.
+    // KNOWN GAP, deliberately not closed here: a run killed AFTER the first flush leaves a non-empty TRUNCATED sidecar (an MB-scale image/styled export is
+    // written progressively across the whole remux), which this size>0 test trusts as complete - the next run then drops the embedded stream and keeps only the
+    // partial copy. Cheap structural verification cannot tell the two apart: a byte-truncated raw .sup is indistinguishable from a legitimately shorter subtitle
+    // (ffprobe exits 0 and reads it as valid - measured), and overwriting instead would discard a sidecar the user may have OCR'd or edited. A sound fix needs a
+    // temp-name/finalize protocol across runs; deferred as heavier than the narrow kill-mid-remux+requeue window it guards.
     const fileHasBytes = (p) => { try { return fs.statSync(p).size > 0; } catch (e) { return false; } };
     // ===== END SHARED: sidecar placement =====
 
