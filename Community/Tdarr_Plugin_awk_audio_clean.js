@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.11',
+    Version: '4.999.12',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -2332,6 +2332,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // range [-99 - 0]"). Silence can't be loudness-normalized anyway, so treat any non-finite measured integrated loudness as within-tolerance (skip).
             if (!Number.isFinite(Number(stats.input_i)) || Math.abs(Number(stats.input_i) - preset.I) <= LOUDNORM_TOLERANCE_LU)
                 return { filter: preFilter, changed: false, measured: true };
+            // Past the silent-track skip above, input_i is finite - and a GENUINE loudnorm block's other four fields are finite too (only true silence, which
+            // exits above, carries -inf/inf here). So a non-numeric value in one of them means a malformed or metadata-spoofed block: these land RAW in the
+            // double-quoted -filter:a value that escMeta never sees and string-argv tokenizes quote-aware, so a " would open new ffmpeg argv (a second output
+            // path = arbitrary write) and an <io> would truncate the output side; a missing field bakes a literal 'undefined' the pass-2 transcode rejects with
+            // a cryptic error. Validate so the interpolated values are provably digit/dot/minus only, failing with a targeted diagnostic instead.
+            for (const [field, val] of [['input_lra', stats.input_lra], ['input_tp', stats.input_tp], ['input_thresh', stats.input_thresh], ['target_offset', stats.target_offset]])
+                if (!Number.isFinite(Number(val)))
+                    failWithBuffers(`${streamTag(streamIndex)}[method_loudnorm=${methodLoudnorm}] malformed loudnorm measurement JSON from the analysis pass `
+                        + `(${field}=${logTok(String(val), 40)}) - the file may be corrupt or carry crafted metadata; leave method_loudnorm=disabled for it`);
             const corrected = `loudnorm=I=${preset.I}:LRA=${preset.LRA}:TP=${preset.TP}:measured_I=${stats.input_i}:measured_LRA=${stats.input_lra}`
                 + `:measured_TP=${stats.input_tp}:measured_thresh=${stats.input_thresh}:offset=${stats.target_offset}:linear=true`;
             return { filter: preFilter ? `${preFilter},${corrected}` : corrected, changed: true, measured: true };
