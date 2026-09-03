@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.13',
+    Version: '4.999.14',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1769,6 +1769,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // nothing, or silently dropping a track the user asked to keep, would both be worse than stopping. Two ways to end up there: no container
                 // accepts the codec ('anywhere'), or MATROSKA is the one refusing it ('mkv'), where falling back to mkv is no answer at all.
                 const stuck = offenders.filter((o) => o.cls === 'anywhere' || o.cls === 'mkv');
+                // A codec MATROSKA refuses is stuck under mkv_fallback no matter the CURRENT target: unmuxableClass only reports mkv-refusal when the target
+                // is already non-mp4, so an mkv-unmuxable codec (mpegh_3d_audio) that muxes into the user's mp4 target is NOT an offender above and would
+                // otherwise ride -c copy into the mkv fallback the muxer then rejects with a raw "no tag for codec" error. Fold any such stream into stuck so
+                // the fallback degrades to the same clear diagnostic instead. Guarded by offenders.length (this whole block): a file carrying ONLY such a
+                // codec has no offender, never falls back, and stays mp4 where it muxes fine - failing it pre-emptively would be wrong.
+                if (methodUnmuxable === 'mkv_fallback') {
+                    const seen = new Set(stuck.map((o) => o.s.index));
+                    for (const s of (file.ffProbeData.streams || [])) {
+                        const codec = (s.codec_name || '').toLowerCase().trim();
+                        if (['audio', 'video'].includes(codecTypeOf(s)) && MKV_UNMUXABLE.includes(codec) && !seen.has(s.index)) stuck.push({ s, codec, cls: 'mkv' });
+                    }
+                }
                 if (methodUnmuxable === 'mkv_fallback' && stuck.length) {
                     failFile(`[method_unmuxable=mkv_fallback] ${[...new Set(stuck.map((o) => o.codec))].join(', ')} cannot be stored in mkv either,`
                         + ' so there is no container to fall back to - set method_unmuxable=drop to remove '
