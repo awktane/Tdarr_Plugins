@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.8',
+    Version: '3.999.9',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1878,9 +1878,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // build against a real DV file). A file carrying BOTH needs both: picking one and reporting a completed strip left the other layer in place.
             // Neither filter covers every codec, so each is gated (stripDv / stripHdr10Plus) and tryLosslessStrip refuses or annotates whatever is left over.
             const bsfList = [stripDv ? 'dovi_rpu=strip=1' : '', stripHdr10Plus ? 'hevc_metadata=remove_hdr10plus=1' : ''].filter(Boolean);
-            // A dynamic-HDR file neither flag claims (a bare ffprobe side-data hit naming no format) keeps the HDR10+ filter it has always had - the
-            // fall-back that gives the generic 'dynamic HDR' label something to act on.
-            const bsf = (bsfList.length ? bsfList : ['hevc_metadata=remove_hdr10plus=1']).join(',');
+            const bsf = bsfList.join(',');   // never empty: tryLosslessStrip skips the no-layer-to-strip case before it reaches here
             const stripped = [stripDv ? dvLabel : '', stripHdr10Plus ? 'HDR10+' : ''].filter(Boolean).join(' + ') || dynLabel;
             const leftover = isHdr10Plus && !stripHdr10Plus ? `, but the HDR10+ layer stays - no filter here removes it from ${srcCodecName || 'this codec'}`
                 : '';
@@ -1930,6 +1928,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // HDR10+ layer that stays, rather than abandoning a removal that is genuinely available.
             if (isHdr10Plus && !stripHdr10Plus && !stripDv) {
                 return skip(`${head}HDR10+ in ${srcCodecName || 'this codec'} has no lossless strip path (needs HEVC)`
+                    + ` - left untouched${reencodeAdvice}\n`);
+            }
+            // Neither strip flag is set (per their definitions: dovi_rpu needs a real DV signal on hevc/av1, hevc_metadata needs HDR10+ on hevc), so there is
+            // no bitstream filter to run - reachable only via a record-less dynamic-HDR side-data hit that names no removable layer. Emitting the old
+            // hevc_metadata fallback here strips nothing the bare signal names: on a non-HEVC source it fails bsf init and quarantines the file with a raw
+            // ffmpeg message, and even on HEVC the -c copy re-probes identically so the next pass's byte-identical preset trips Tdarr's infinite-transcode-loop
+            // guard. Skip with the same readable message every sibling case gets - there is genuinely nothing to strip losslessly.
+            if (!stripDv && !stripHdr10Plus) {
+                return skip(`${head}${dynLabel} in ${srcCodecName || 'this codec'} has no lossless strip path`
                     + ` - left untouched${reencodeAdvice}\n`);
             }
             return emitLosslessStrip();
