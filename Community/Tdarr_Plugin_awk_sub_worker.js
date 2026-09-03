@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.16',
+    Version: '3.999.17',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -904,7 +904,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // NOT sanitised - a real path has to stay literal - so callers CHECK the joined path with pathIsPresetSafe and refuse that one sidecar when it fails.
     const libFilePath = otherArguments?.originalLibraryFile?.file || file.file || '';
     const libDir = path.dirname(libFilePath);
-    const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '').replace(/<io>/gi, '');
+    const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '').replace(/<io>/gi, '(io)');
     const sidecarLangToken = (s) => (resolveLang(s) || 'und').replace(/[^a-z0-9-]/g, '').slice(0, 32) || 'und';
     // videoBase is the one part NOTHING bounds - it is the user's own filename, legally ~250 bytes on ext4/APFS/NTFS, and the shortest suffix either plugin
     // appends is ~11 bytes. So each caller must measure the FINISHED name against this cap and refuse that one sidecar, exactly as it refuses an unsafe path.

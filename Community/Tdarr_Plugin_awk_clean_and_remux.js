@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.16',
+    Version: '4.999.17',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1287,7 +1287,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // NOT sanitised - a real path has to stay literal - so callers CHECK the joined path with pathIsPresetSafe and refuse that one sidecar when it fails.
     const libFilePath = otherArguments?.originalLibraryFile?.file || file.file || '';
     const libDir = path.dirname(libFilePath);
-    const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '').replace(/<io>/gi, '');
+    const videoBase = path.basename(libFilePath).replace(/\.[^.]+$/, '').replace(/["\x00-\x1f\x7f]/g, '').replace(/<io>/gi, '(io)');
     const sidecarLangToken = (s) => (resolveLang(s) || 'und').replace(/[^a-z0-9-]/g, '').slice(0, 32) || 'und';
     // videoBase is the one part NOTHING bounds - it is the user's own filename, legally ~250 bytes on ext4/APFS/NTFS, and the shortest suffix either plugin
     // appends is ~11 bytes. So each caller must measure the FINISHED name against this cap and refuse that one sidecar, exactly as it refuses an unsafe path.
