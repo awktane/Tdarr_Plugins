@@ -15,7 +15,7 @@ const details = () => ({
         it's needed).\n\nBecause it runs last it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file
         that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the signature of an out-of-memory-killed or
         unfinalised encode from an earlier stage. A longer output is accepted. This check is always on and has no setting.\n`,
-    Version: '4.22.5',
+    Version: '4.999.0',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -1268,6 +1268,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let orderChanged = false;
         let audioIndex = -1;
 
+        // A default-track flag only round-trips in a container that can STORE it: mkv/webm (Matroska) and the mp4 family persist it; MPEG-TS and AVI silently
+        // drop it (measured on jellyfin-ffmpeg 7.1.4 via set→remux→re-probe). This plugin keeps the source container (dstContainer = file.container), so a
+        // standalone run on a .ts/.avi capture would otherwise write '+default' every pass, read it back missing, and re-emit a byte-identical preset - which
+        // Tdarr's infinite-transcode-loop guard errors, quarantining a healthy file. Normalize the sole-default flag only where it sticks; elsewhere leave the
+        // audio default flags untouched (the same container-unstorable-flag skip clean_and_remux's tag_disposition already applies to captions/original).
+        const canPersistDefault = dstContainer === 'mkv' || dstContainer === 'webm' || isMp4Family(dstContainer);
+        let defaultFlagSkipped = false;
+
         for (let i = 0; i < streams.length; i++) {
             ffmpegMap += ` -map 0:${streams[i].index}`;
             // Compare against each stream's ORIGINAL array position, not its absolute ffprobe index, so a file already in the desired order but with
@@ -1284,14 +1292,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (streams[i].type === 'audio') {
                 audioIndex++;
                 const wantDefault = audioIndex === 0;
-                if (wantDefault && !streams[i].default)
-                    dispositionArgs += ` -disposition:a:${audioIndex} +default`;
-                else if (!wantDefault && streams[i].default)
-                    dispositionArgs += ` -disposition:a:${audioIndex} -default`;
-                // Reflect the normalized flag in the Expected results summary (summariseStream reads disposition.default);
-                // shallow-clone so the source probe object is untouched.
-                if (streams[i].default !== wantDefault)
-                    streams[i].stream = { ...streams[i].stream, disposition: { ...streams[i].stream.disposition, default: wantDefault ? 1 : 0 } };
+                if (!canPersistDefault) {
+                    // Container can't keep the flag - suppress the write (else it loops); remember one skip so the ☑ note below fires exactly once.
+                    if (streams[i].default !== wantDefault) defaultFlagSkipped = true;
+                } else {
+                    if (wantDefault && !streams[i].default)
+                        dispositionArgs += ` -disposition:a:${audioIndex} +default`;
+                    else if (!wantDefault && streams[i].default)
+                        dispositionArgs += ` -disposition:a:${audioIndex} -default`;
+                    // Reflect the normalized flag in the Expected results summary (summariseStream reads disposition.default);
+                    // shallow-clone so the source probe object is untouched.
+                    if (streams[i].default !== wantDefault)
+                        streams[i].stream = { ...streams[i].stream, disposition: { ...streams[i].stream.disposition, default: wantDefault ? 1 : 0 } };
+                }
             }
         }
 
@@ -1327,6 +1340,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const isMp4 = isMp4Family(dstContainer);
         const faststartOn = methodFaststart === 'force';
         const needsFront = faststartOn && isMp4 && !moovBeforeMdat(file.file, otherArguments);
+
+        // Container can't store a default-track flag (ts/avi): the block above left dispositionArgs empty rather than looping. Say so once, whether the pass
+        // otherwise remuxes (a reorder) or skips - so a user never wonders why the sole-default flag was left alone.
+        if (defaultFlagSkipped)
+            response.infoLog += `☑${dstContainer} cannot store a default-track flag, so audio default flags are left as they are\n`;
 
         if (!orderChanged && dispositionArgs === '' && !needsFront && junkArgs === '') return skip('☑Streams already in desired order\n');
 
