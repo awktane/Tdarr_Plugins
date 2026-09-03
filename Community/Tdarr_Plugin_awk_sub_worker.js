@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.13',
+    Version: '3.999.14',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1459,9 +1459,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // buffered back through spawnSync, so a large sidecar cannot silently exceed maxBuffer and report a failure that never happened. curl's EXIT
     // STATUS is part of the success test, not just the HTTP code: a transfer that dies after the response headers - the -m timeout, a dropped
     // connection - still reports %{http_code} 200 and leaves a non-empty file, so testing the code alone would call a truncated download complete.
+    // Returns { ok, serverAnswered, why }. serverAnswered is TRUE only when curl exited 0 and the server sent a definitive non-200 answer (the download
+    // endpoint returns HTTP 400 for a missing file, 501 when unmapped nodes are disabled) - i.e. the file genuinely is not retrievable, which a caller may
+    // treat as "nothing there". It is FALSE for every way the server was NOT reached to a conclusion - no configured URL, a spawn/connection error, or a
+    // transfer that timed out or dropped mid-stream - because then the file may well exist and we simply could not read it, so the two must not be conflated.
     const downloadLibraryFile = (dest, local) => {
         const url = serverApiUrl();
-        if (!url) return 'the node config carries no server URL';
+        if (!url) return { ok: false, serverAnswered: false, why: 'the node config carries no server URL' };
         const { spawnSync } = require('child_process');
         try { fs.mkdirSync(path.dirname(local), { recursive: true }); } catch (e) { /* already there */ }
         const r = spawnSync('curl', ['-sS', '-m', String(LIBRARY_DOWNLOAD_S), '-o', local, '-w', '%{http_code}', ...apiAuthArgs(),
@@ -1469,10 +1473,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             { encoding: 'utf8', timeout: LIBRARY_DOWNLOAD_S * 1000, input: apiAuthInput() });
         const code = String(r.stdout || '').trim();
         let size = 0; try { size = fs.statSync(local).size; } catch (e) { size = 0; }
-        if (!r.error && r.status === 0 && code === '200' && size > 0) return '';
+        if (!r.error && r.status === 0 && code === '200' && size > 0) return { ok: true, serverAnswered: true, why: '' };
         try { fs.unlinkSync(local); } catch (e) { /* nothing landed */ }
-        if (r.error) return `download failed (${r.error.code || r.error.message})`;
-        return r.status === 0 ? `HTTP ${code || 'no response'}` : `the transfer did not complete (curl exit ${r.status === null ? 'signalled' : r.status})`;
+        if (r.error) return { ok: false, serverAnswered: false, why: `download failed (${r.error.code || r.error.message})` };
+        return r.status === 0
+            ? { ok: false, serverAnswered: true, why: `HTTP ${code || 'no response'}` }
+            : { ok: false, serverAnswered: false, why: `the transfer did not complete (curl exit ${r.status === null ? 'signalled' : r.status})` };
     };
 
     // Pull every listed sidecar into this node's mirror at the same relative path - everything downstream (dedup hash, -i inputs, marker) then works on
@@ -1491,13 +1497,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             const dest = serverSidePath(path.join(libDir, rel));
             if (!dest) { response.infoLog += `☒[method_unmapped=text_file] Cannot work out the server path for ${rel}\n`; continue; }
-            const why = downloadLibraryFile(dest, path.join(libDir, rel));
-            if (!why) { got.push(rel); continue; }
+            const dl = downloadLibraryFile(dest, path.join(libDir, rel));
+            if (dl.ok) { got.push(rel); continue; }
             if (embeddedAlready && embeddedAlready.has(rel)) {
                 response.infoLog += `☑[method_unmapped=text_file] ${listName} still lists ${rel}, which an earlier pass already embedded and removed\n`;
                 continue;
             }
-            response.infoLog += `☒[method_unmapped=text_file] ${listName} lists ${rel} but it could not be fetched - ${why}\n`;
+            response.infoLog += `☒[method_unmapped=text_file] ${listName} lists ${rel} but it could not be fetched - ${dl.why}\n`;
         }
         return got;
     };
@@ -2198,10 +2204,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.infoLog += `☐${streamTag(ccVideo.index)}[embedded_cc=enabled] Reading the embedded closed captions -> ${ccPlan.job.name}`
                     + ' (decodes the video, so this pass is slower than an ordinary extract)\n';
             }
+            // deduplicate=enabled_checkmedia folds the removed duplicates' flags/title/language onto the keeper via dupes.retag, and retagArgs restamps the
+            // SURVIVING embedded stream with it. But when the keeper is itself extracted with remove_source=true it leaves keptSubs, so that restamp is silently
+            // dropped (retagArgs: outIdx < 0) - and the sidecar NAME is the sole authority on the reimported identity, so the fold has to reach the name instead
+            // or the round trip loses the folded SDH flag / title / real-language-onto-und keeper. Project the pending retag onto a stand-in stream and name from
+            // THAT (retag.disp already holds ffmpeg flag names, so it rebuilds a disposition object directly). No-op when no fold is pending for this stream.
+            const foldRetag = (st) => {
+                const rt = (dupes.retag || []).find((r) => r.index === st.index);
+                if (!rt) return st;
+                return { ...st, tags: { ...(st.tags || {}), language: rt.lang, title: rt.title }, disposition: Object.fromEntries(rt.disp.map((f) => [f, 1])) };
+            };
             for (const s of eligible) {
                 const { enc } = TEXT_SUB[String(s.codec_name).toLowerCase()];
                 const bundle = fontIndices.length > 0 && isStyledSub(s.codec_name);
-                const name = sidecarBasename(s, bundle);
+                const name = sidecarBasename(foldRetag(s), bundle);
                 const full = path.join(workLibDir(), name);
                 // The path goes into the quoted "${full}" token of the extract preset, so it has to survive Tdarr's quote-aware tokenizer
                 // (pathIsPresetSafe). Only the library directory can fail that - the name we build is already sanitised - and a directory has to stay
@@ -2235,11 +2251,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         + 'keeping the embedded subtitle\n';
                     continue;
                 }
-                // An existing sidecar is preserved (never overwrite the user's edits) - but only if it has content. A 0-byte sidecar is the fingerprint of
-                // an extract ffmpeg aborted mid-write; trusting it and then stripping the embedded source would lose the subtitle, so re-extract it instead.
-                const existsNonEmpty = placeViaApi() ? sidecarExistsRemote(remoteDest)
-                    : fileHasBytes(full);
-                if (existsNonEmpty) { skipped += 1; response.infoLog += `☑${streamTag(s.index)} Sidecar already exists, not overwriting: ${name}\n`; }
+                // An existing sidecar is preserved (never overwrite the user's edits). The 0-byte-means-absent test guards ONE thing: an extract ffmpeg
+                // aborted mid-write leaves a 0-byte file, and trusting it before stripping the embedded source would lose the subtitle - so re-extract. But
+                // that protection only matters when the source WILL be stripped (removeSource). ffmpeg also writes a genuinely 0-byte srt for a cue-less
+                // subtitle stream (measured on jellyfin-ffmpeg 7.1.4), so with removeSource=false the stream is never removed and a cue-less srt would
+                // re-extract the identical 0-byte sidecar every pass - Tdarr errors the second identical preset as an infinite transcode loop. When nothing
+                // will be stripped, plain existence is enough to mean "already handled", which breaks that loop.
+                const alreadyExtracted = placeViaApi() ? sidecarExistsRemote(remoteDest)
+                    : (removeSource ? fileHasBytes(full) : fs.existsSync(full));
+                if (alreadyExtracted) { skipped += 1; response.infoLog += `☑${streamTag(s.index)} Sidecar already exists, not overwriting: ${name}\n`; }
                 // Unmapped: the extraction is deferred to placeSidecars after the loop, so this stream's removedIndices entry and its bundled tally wait for
                 // the server's answer - nothing may be stripped until the sidecar is confirmed in the library.
                 else if (placeViaApi()) {
@@ -2436,8 +2456,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // sidecars, so a video with no text subtitles never has one - and a completed round trip deletes the list once its last entry is embedded.
                 // Failing here would quarantine every such file, turning both "nothing to do" and "finished successfully" into errors. This is the same
                 // outcome a mapped node reaches by scanning the folder and finding no sidecars; only the way it looks is different.
-                const listWhy = downloadLibraryFile(listDest, listLocal);
-                if (listWhy) {
+                const listDl = downloadLibraryFile(listDest, listLocal);
+                // A server-answered miss (curl reached it, HTTP 400/501) genuinely means no list is there - the same "nothing to import" a mapped node reaches
+                // by scanning an empty folder. A transport failure (server unreachable, timed out, dropped, or no server URL) is NOT that: the list may exist and
+                // we simply could not read it, so mapping it to the benign path would file the video under success with a requested import silently skipped -
+                // the exact outcome the contract above says import must fail on. failFile so Tdarr re-queues it, matching the mount route's unreachable failFile.
+                if (!listDl.ok && !listDl.serverAnswered)
+                    failFile(`[method_unmapped=text_file] Could not fetch ${listName} to find what to import - ${listDl.why}`);
+                if (!listDl.ok) {
                     response.infoLog += `☑[method_unmapped=text_file] No ${listName} in the library, so there is nothing listed to import - extract creates `
                         + 'one when it writes sidecars, or add it yourself with one filename per line\n';
                     listedRels = [];   // nothing to import - but the file's own duplicate subtitle streams are still worth collapsing, so fall through
