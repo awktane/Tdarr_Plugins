@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.9',
+    Version: '4.999.10',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1775,6 +1775,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // the user actually has to change instead of listing all three - one definition, so the clause and the message it produces cannot drift.
         const dedupeGuardBlock = (removed, survivor) => {
             if (removed.awkTier !== 'surround') return '';   // a track already headed for stereo/delete is deduped freely (the dedup loop skips secondaries)
+            // A surround-kept track whose survivor is NOT surround can only be a guard_original-pinned 'original' (the sole per-track tier split within a
+            // group - every other tier rule is language-wide, identical for group-mates). The survivor is itself headed for delete/stereo and cannot hold
+            // the kept-at-surround slot, so removing the original loses the very language guard_original promised to keep. Block it, naming guard_original
+            // as the determinate cause (it is the only thing that could have put `removed` above `survivor` in tier).
+            if (survivor.awkTier !== 'surround') return `guard_original=${guardOriginal}`;
             // dropping the last lossless copy
             if (guardLossless === 'enabled' && removed.awkLossless && !survivor.awkLossless) return `guard_lossless=${guardLossless}`;
             // dropping the last object-audio (Atmos/DTS:X) copy
