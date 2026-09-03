@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.17',
+    Version: '4.999.18',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1417,11 +1417,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // half - an ffmpeg aborted mid-write leaves an empty file, and trusting it then strips the only copy of the subtitle. Any stat failure is absent too, so
     // a permission error re-extracts rather than silently dropping. Shared so a refinement (treating whitespace-only as absent, or adding an isFile test so a
     // directory named like a sidecar is not mistaken for one) cannot land on one plugin's copy and leave the other answering differently about the same file.
-    // KNOWN GAP, deliberately not closed here: a run killed AFTER the first flush leaves a non-empty TRUNCATED sidecar (an MB-scale image/styled export is
-    // written progressively across the whole remux), which this size>0 test trusts as complete - the next run then drops the embedded stream and keeps only the
-    // partial copy. Cheap structural verification cannot tell the two apart: a byte-truncated raw .sup is indistinguishable from a legitimately shorter subtitle
-    // (ffprobe exits 0 and reads it as valid - measured), and overwriting instead would discard a sidecar the user may have OCR'd or edited. A sound fix needs a
-    // temp-name/finalize protocol across runs; deferred as heavier than the narrow kill-mid-remux+requeue window it guards.
+    // KNOWN GAP at this level: a run killed AFTER the first flush leaves a non-empty TRUNCATED sidecar (an MB-scale export is written progressively across the
+    // whole remux), which this size>0 test alone would trust as complete. It cannot be closed inside this helper - a byte-truncated raw .sup is indistinguishable
+    // from a legitimately shorter subtitle (ffprobe exits 0 and reads it as valid - measured), and overwriting blindly would discard a sidecar the user may have
+    // OCR'd or edited. A caller that can PROVE the prior export never completed closes it instead: an image-sub export whose source stream is still present cannot
+    // have finished (a completed export always drops that stream), so it re-exports the .sup rather than trusting the partial. Where no such proof exists - a
+    // text/styled sidecar a user may have edited - the size>0 answer stands, a residual narrowed to a kill-mid-write+requeue on an edited round-trip.
     const fileHasBytes = (p) => { try { return fs.statSync(p).size > 0; } catch (e) { return false; } };
     // ===== END SHARED: sidecar placement =====
     // #endregion
@@ -1940,9 +1941,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (bytes > NAME_BYTE_CAP) return { status: 'refused', name, why: 'namecap', bytes };
             if (!pathIsPresetSafe(sidecarPath)) return { status: 'refused', name, why: 'unsafe' };
             // ffmpeg refuses to overwrite an existing output file and aborts the ENTIRE run, so a sidecar left by an earlier pass would take the whole remux
-            // down with it rather than just skipping its own export. An existing sidecar has already served its purpose and may since have been OCR'd or
-            // edited, so the export is simply not repeated and the drop still goes ahead - forcing it (-y) could only destroy that work.
-            if (fileHasBytes(sidecarPath)) return { status: 'exists', name };
+            // down with it. A STYLED bundle's sidecar has already served its purpose and may since have been OCR'd or edited, so it is not re-exported and the
+            // drop still goes ahead - forcing it (-y) could only destroy that work. An IMAGE-sub .sup is different: reaching here means the source stream is
+            // still present, and a completed export always drops it, so an existing .sup can only be a run killed mid-write - whose truncated prefix the drop
+            // would otherwise leave as the subtitle's only copy. A raw bitmap .sup is never user-authored (any OCR happens after a completed run, once the
+            // stream is already gone), so re-export it: delete the partial (ffmpeg would abort rather than overwrite) and queue a fresh copy; on an unlink
+            // failure fall back to trusting it, exactly as for a styled sidecar.
+            if (fileHasBytes(sidecarPath)) {
+                if (styled) return { status: 'exists', name };
+                try { fs.unlinkSync(sidecarPath); } catch (e) { return { status: 'exists', name }; }
+            }
             sidecarOut += ` ${mapTokens.join(' ')} "${sidecarPath}"`;
             return { status: 'queued', name };
         };
