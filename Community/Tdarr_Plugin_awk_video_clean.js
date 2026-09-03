@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.10',
+    Version: '3.999.11',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -553,6 +553,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= mediaInfoFor [all five] =-=-=-
     // The single join point between the two probes: the mediaInfo track whose StreamOrder equals the ffprobe index; undefined when absent. Deliberately
     // NOT memoised (unlike roleTextLower's WeakMap): the scan measures ~20 microseconds per file against a transcode measured in minutes.
+    // Bound to THIS file: it joins against the closure's file.mediaInfo, so it - and every helper that reaches it (roleTextLower, resolveLang, resolveChannels,
+    // ...) - is sound ONLY on streams from the same file.ffProbeData. Never feed it a FOREIGN stream list (e.g. otherArguments.originalLibraryFile's): it would
+    // read THIS file's mediaInfo track at the foreign stream's index and silently answer about the wrong stream.
     // Menu is excluded because it is the one track kind whose StreamOrder is NOT a stream index: MediaInfo numbers an MPEG-TS program's Menu by PROGRAM
     // ordinal ("0") while that program's real tracks carry a two-part "0-0"/"0-1" that Number() turns into NaN - so on a single-program .ts the Menu is the
     // only numeric match and ffprobe stream 0 reads the Menu's fields. Its Language is a concatenated program list (" / en / en / en"), which makes an

@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.18',
+    Version: '4.999.19',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -319,7 +319,10 @@ const details = () => ({
                 \\nlight (risk-free): -fflags +ignidx and -err_detect ignore_err. Ignores a broken or corrupt index (AVI idx1, MOV/MP4 sample tables) and
                 keeps reading past detected errors instead of failing. Drops no frames.
                 \\naggressive: also -fflags +discardcorrupt, which drops packets flagged corrupt. Expect small video or audio blips wherever the damage is.
-                \\nRecovery re-runs only when you change one of the recover_bad_* settings, then settles - it will not reprocess the file on every pass.`,
+                \\nRecovery re-runs only when you change one of the recover_bad_* settings, then settles - it will not reprocess the file on every pass.
+                \\nA repaired file can come out INCOMPLETE (a truncated source is salvaged to its true, shorter length), which stream_ordering accepts with a
+                warning rather than failing it. Review such a file in Tdarr and confirm it plays through before approving - do not auto-approve a recovery queue,
+                or an invisibly short result is kept silently.`,
         },
         {
             name: 'recover_bad_timestamps',
@@ -341,7 +344,10 @@ const details = () => ({
                 \\naggressive: also -fflags +igndts, which ignores the source DTS and rebuilds the timeline outright - this is what fixes "Non-monotonous
                 DTS". It can produce odd results, so only reach for it if light did not help.
                 \\nRe-runs only on a recover_bad_* change, as for recover_bad_data. Container-forced timestamp fixes apply regardless, for the whole
-                MPEG-TS family (ts/m2ts/mts/m2t/tp/trp/tod), the whole MPEG-PS family (mpg/mpeg/vob/evo/m2p/vro/mod), and avi.`,
+                MPEG-TS family (ts/m2ts/mts/m2t/tp/trp/tod), the whole MPEG-PS family (mpg/mpeg/vob/evo/m2p/vro/mod), and avi.
+                \\nA repaired file can come out INCOMPLETE (a truncated source is salvaged to its true, shorter length), which stream_ordering accepts with a
+                warning rather than failing it. Review such a file in Tdarr and confirm it plays through before approving - do not auto-approve a recovery queue,
+                or an invisibly short result is kept silently.`,
         },
     ],
 });
@@ -587,6 +593,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= mediaInfoFor [all five] =-=-=-
     // The single join point between the two probes: the mediaInfo track whose StreamOrder equals the ffprobe index; undefined when absent. Deliberately
     // NOT memoised (unlike roleTextLower's WeakMap): the scan measures ~20 microseconds per file against a transcode measured in minutes.
+    // Bound to THIS file: it joins against the closure's file.mediaInfo, so it - and every helper that reaches it (roleTextLower, resolveLang, resolveChannels,
+    // ...) - is sound ONLY on streams from the same file.ffProbeData. Never feed it a FOREIGN stream list (e.g. otherArguments.originalLibraryFile's): it would
+    // read THIS file's mediaInfo track at the foreign stream's index and silently answer about the wrong stream.
     // Menu is excluded because it is the one track kind whose StreamOrder is NOT a stream index: MediaInfo numbers an MPEG-TS program's Menu by PROGRAM
     // ordinal ("0") while that program's real tracks carry a two-part "0-0"/"0-1" that Number() turns into NaN - so on a single-program .ts the Menu is the
     // only numeric match and ffprobe stream 0 reads the Menu's fields. Its Language is a concatenated program list (" / en / en / en"), which makes an

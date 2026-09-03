@@ -15,7 +15,7 @@ const details = () => ({
         it's needed).\n\nBecause it runs last it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file
         that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the signature of an out-of-memory-killed or
         unfinalised encode from an earlier stage. A longer output is accepted. This check is always on and has no setting.\n`,
-    Version: '4.999.1',
+    Version: '4.999.2',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -619,6 +619,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= mediaInfoFor [all five] =-=-=-
     // The single join point between the two probes: the mediaInfo track whose StreamOrder equals the ffprobe index; undefined when absent. Deliberately
     // NOT memoised (unlike roleTextLower's WeakMap): the scan measures ~20 microseconds per file against a transcode measured in minutes.
+    // Bound to THIS file: it joins against the closure's file.mediaInfo, so it - and every helper that reaches it (roleTextLower, resolveLang, resolveChannels,
+    // ...) - is sound ONLY on streams from the same file.ffProbeData. Never feed it a FOREIGN stream list (e.g. otherArguments.originalLibraryFile's): it would
+    // read THIS file's mediaInfo track at the foreign stream's index and silently answer about the wrong stream.
     // Menu is excluded because it is the one track kind whose StreamOrder is NOT a stream index: MediaInfo numbers an MPEG-TS program's Menu by PROGRAM
     // ordinal ("0") while that program's real tracks carry a two-part "0-0"/"0-1" that Number() turns into NaN - so on a single-program .ts the Menu is the
     // only numeric match and ffprobe stream 0 reads the Menu's fields. Its Language is a concatenated program list (" / en / en / en"), which makes an
@@ -997,7 +1000,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // time survives that operation untouched. Container duration comes last and only when the audio track count is unchanged, since it is the maximum
         // across all streams - audio_clean dropping a commentary track longer than the video legitimately shrinks it - and Matroska frequently stores no
         // per-stream duration on the ffprobe side, which is why mediaInfo leads.
-        const durVideoStream = (obj) => (obj?.ffProbeData?.streams || []).find(s => codecTypeOf(s) === 'video' && !isCoverArt(s));
+        // isCoverArt joins role text through mediaInfoFor, which is bound to THIS file's mediaInfo (see its header) - sound for the current file's streams but NOT
+        // for a foreign list like originalLibraryFile's, where it would read the transcoded file's mediaInfo track at the same index. durVideoStream runs over BOTH
+        // files, so it tests cover art self-contained: an image codec, or a raw cover-art disposition flag. The three cover-art dispositionTypes are streams:['video'],
+        // keywords:[], so for a video stream this resolves to exactly what isCoverArt does today (behaviour-identical) and it stays sound if a keyword is ever added.
+        const foreignCoverArt = (s) => IMAGE_CODECS.includes((s.codec_name || '').trim().toLowerCase())
+            || s.disposition?.attached_pic === 1 || s.disposition?.still_image === 1 || s.disposition?.timed_thumbnails === 1;
+        const durVideoStream = (obj) => (obj?.ffProbeData?.streams || []).find(s => codecTypeOf(s) === 'video' && !foreignCoverArt(s));
         const durAudioCount = (obj) => (obj?.ffProbeData?.streams || []).filter(s => codecTypeOf(s) === 'audio').length;
         // Every DURATION_SIGNALS row must answer with a real duration or 0 - 0 IS the "no signal" sentinel the oldAny/newAny/verdict accumulation below
         // reads by truthiness, and the failFile at the end of that accumulation turns "the old side had one and the new side has none" into a
@@ -1033,27 +1042,49 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let oldAny = 0;
             let newAny = 0;
             for (const sig of DURATION_SIGNALS) {
-                if (sig.needsSameAudio && !sameAudio) continue;
                 const oldDur = sig.read(originalFile);
                 const newDur = sig.read(file);
+                // ANY resolved duration proves that side HAS a duration, so every signal feeds oldAny/newAny - otherwise the no-duration verdict below fires on
+                // a healthy audio-cleaned file whose only resolvable signal is the container's. The needsSameAudio caveat concerns duration SHRINKAGE (a dropped
+                // commentary track longer than the video legitimately shortens the container maximum), a property of the COMPARISON, so it gates only whether this
+                // signal may set the verdict - never the existence test.
                 if (!oldAny) oldAny = oldDur;
                 if (!newAny) newAny = newDur;
+                if (sig.needsSameAudio && !sameAudio) continue;
                 if (!verdict && oldDur && newDur) verdict = { name: sig.name, old: oldDur, now: newDur };
             }
+            // A file clean_and_remux repaired (it stamps a format-level awk_recovered tag on every recover_bad_* remux, kept across containers and untouched by
+            // the junk-tag strip) can legitimately be SHORTER than the library-entry original: recovery salvages a truncated source whose intact header claimed
+            // the full length into a file reporting its true, shorter duration - the mirror of the over-length recover_* case the tolerance comment above already
+            // spares. Erroring it removes the salvaged result the user asked for and loops forever (fixed tolerance, no relaxing input), so soften both verdicts
+            // to a ☒ warning and ACCEPT the file for review. Users should NOT auto-approve a recovery queue - the recover_bad_* tooltips say so.
+            const recovered = getTagCI(file.ffProbeData?.format?.tags || {}, 'awk_recovered').trim() !== '';
             if (verdict) {
                 const pct = (verdict.now / verdict.old) * 100;
-                if (pct < 100 - DURATION_TOLERANCE_PCT)
-                    failFile(`${durTag}output duration ${verdict.now.toFixed(1)} s is ${pct.toFixed(1)}% of the original ${verdict.old.toFixed(1)} s`
-                        + ` - the transcode did not run to completion`
-                        + `\n☒${durTag}the file has been failed rather than accepted; check this node's log for an out-of-memory kill`
-                        + `\n☒${durTag}(compared using ${verdict.name})`);
+                if (pct < 100 - DURATION_TOLERANCE_PCT) {
+                    if (recovered)
+                        response.infoLog += `☒${durTag}output duration ${verdict.now.toFixed(1)} s is ${pct.toFixed(1)}% of the original `
+                            + `${verdict.old.toFixed(1)} s, but this file carries an awk_recovered tag - a recover_bad_* repair of a truncated source `
+                            + `legitimately reports a shorter true duration\n☒${durTag}accepted for review rather than failed; play it through in Tdarr `
+                            + `before approving, and do not auto-approve a recovery queue (compared using ${verdict.name})\n`;
+                    else
+                        failFile(`${durTag}output duration ${verdict.now.toFixed(1)} s is ${pct.toFixed(1)}% of the original ${verdict.old.toFixed(1)} s`
+                            + ` - the transcode did not run to completion`
+                            + `\n☒${durTag}the file has been failed rather than accepted; check this node's log for an out-of-memory kill`
+                            + `\n☒${durTag}(compared using ${verdict.name})`);
+                }
             } else if (oldAny && !newAny) {
                 // A severely truncated or unfinalised output is precisely the file most likely to probe with no duration at all, so treating "no duration" as
                 // "nothing to compare" would silence the guard on exactly what it hunts. Reaching here means NO signal resolved on the new side while at least
                 // one did on the old, so it cannot fire merely because a container stores one signal and not another.
-                failFile(`${durTag}the output reports no duration at all while the original had ${oldAny.toFixed(1)} s - that is what a truncated or`
-                    + ` unfinalised transcode looks like`
-                    + `\n☒${durTag}the file has been failed rather than accepted; check this node's log for an out-of-memory kill`);
+                if (recovered)
+                    response.infoLog += `☒${durTag}the output reports no duration at all while the original had ${oldAny.toFixed(1)} s, but this file `
+                        + `carries an awk_recovered tag - a recover_bad_* repair of a truncated source can legitimately report a shorter or absent duration`
+                        + `\n☒${durTag}accepted for review rather than failed; play it through in Tdarr before approving, and do not auto-approve a recovery queue\n`;
+                else
+                    failFile(`${durTag}the output reports no duration at all while the original had ${oldAny.toFixed(1)} s - that is what a truncated or`
+                        + ` unfinalised transcode looks like`
+                        + `\n☒${durTag}the file has been failed rather than accepted; check this node's log for an out-of-memory kill`);
             }
         }
 
