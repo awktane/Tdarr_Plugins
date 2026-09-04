@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.20',
+    Version: '4.999.21',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -802,15 +802,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // a tag ENDING in a newline ('en-US\n' -> 'en'), which the `.*` form silently left unfolded.
     const shortLang = (l) => l.replace(/[-_.][\s\S]*$/, '');
     // -=-=-= langNameIndex  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
-    // Reverse map English language NAME -> 2-letter code (english->en), lazily built by probing every aa..zz pair through Intl.DisplayNames, memoised for
-    // the run. Null-prototype so a container tag spelling an Object.prototype member ('constructor') misses the map instead of resolving inherited junk.
+    // Reverse map English language NAME -> code, lazily built by probing Intl.DisplayNames and memoised for the run. The 3-letter aaa..zzz codes are probed
+    // first and the 2-letter aa..zz codes second, so a language that HAS a 2-letter code wins its own name (english -> en, never -> eng) and langKey's fold is
+    // unchanged; only a name whose language has no 2-letter code is newly mapped (cantonese -> yue, cebuano -> ceb, hawaiian -> haw), so it validates instead
+    // of failing knownLangToken with the message that had advertised English names. Null-prototype so a tag spelling an Object.prototype member ('constructor')
+    // misses the map instead of resolving inherited junk. The 3-letter pass is a one-time ~197 ms build (17k Intl calls) paid only when a >=4-char token is
+    // first checked - most runs see only 2-3 letter codes and never build the index at all.
     const langNameIndex = (() => {
         let idx = null;
         return () => {
             if (idx) return idx;
             idx = Object.create(null);
             const dn = new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' });
-            for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {   // 97-122 = ASCII a-z: every 2-letter combo
+            for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) for (let c = 97; c <= 122; c++) {   // aaa..zzz: codes with no 2-letter form
+                const code = String.fromCharCode(a, b, c);
+                const name = dn.of(code);
+                if (name) idx[name.toLowerCase()] = code;
+            }
+            for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {   // aa..zz second, so a 2-letter code wins its own name (english -> en)
                 const code = String.fromCharCode(a, b);
                 const name = dn.of(code);
                 if (name) idx[name.toLowerCase()] = code;
