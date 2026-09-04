@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.25',
+    Version: '3.999.26',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1674,8 +1674,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const target = String(file._id || file.file || libFilePath || '');
         if (!target) return null;
         // The shared deriveFfprobePath, not a second hand-rolled regex: it replaces only the FINAL path component (the production path carries 'ffmpeg' as a
-        // DIRECTORY too), existsSync-checks the result, and returns '' when the binary cannot be located. A local copy silently fell through to the unmodified
-        // ffmpeg path on any unexpected basename, so a wrapper name ran FFMPEG with ffprobe's arguments and the failure was reported as an unreadable file.
+        // DIRECTORY too), existsSync-checks the result, and returns '' when the binary cannot be located. A lenient local regex that let an unexpected basename
+        // slip through to the unmodified ffmpeg path would run FFMPEG with ffprobe's arguments and misreport the failure as an unreadable file.
         const ffprobePath = deriveFfprobePath(String(otherArguments?.ffmpegPath || 'ffmpeg'));
         if (!ffprobePath) return null;
         const { spawnSync } = require('child_process');
@@ -2063,6 +2063,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return codecNameOf(ccVideo) === 'h264'
                 && !isDolbyVisionVideo(ccVideo, mi) && !HDR_TRANSFERS.includes(xfer) && !hdrFmt;
         };
+        // The A53 caption probe as ccPlan's two strip/plan sites both spell it - the __awkCap test-injection contract plus the ffprobe-path derivation, defined
+        // once so a future hardening of either can't land at one site and not the other. Declared ahead of ccPlan's IIFE, like the notes below.
+        const ccProbeVerdict = () => {
+            const inj = otherArguments && otherArguments.__awkCap;
+            return probeA53Captions(file.file, deriveFfprobePath(String(otherArguments?.ffmpegPath || 'ffmpeg')), inj ? inj.captions === true : undefined);
+        };
 
         // Hidden on import, visible on extract. On import the sidecar is staging - the next pass muxes it in and remove_source deletes it - so a media server
         // must not offer it in the gap between the two; on extract it IS the deliverable and belongs in plain sight beside the video. Named once, out here,
@@ -2129,11 +2135,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // SECOND identical strip is what Tdarr refuses as an infinite transcode loop, ERRORING the file. Only paid when remove_source is on,
                     // the only setting that can owe a strip at all.
                     let owed = false;
-                    if (removeSource) {
-                        const inj = otherArguments && otherArguments.__awkCap;
-                        owed = probeA53Captions(file.file, deriveFfprobePath(String(otherArguments?.ffmpegPath || 'ffmpeg')),
-                            inj ? inj.captions === true : undefined) === true;
-                    }
+                    if (removeSource) owed = ccProbeVerdict() === true;
                     return { job: null, stripOwed: owed, note: `☑[embedded_cc=enabled] Captions already extracted to ${name}${owed
                         ? ' - removing the bitstream copy now that the sidecar is confirmed to hold them' : ''}\n` };
                 }
@@ -2153,9 +2155,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Nothing memoised, so pay for the cheap check. Only `true` from the library scan is information - it reports false both for a file with no
             // captions and for one its scanner could not parse - so a false still goes to the probe, and an 'unknown' probe leaves the file alone.
             if (file.hasClosedCaptions !== true) {
-                const inj = otherArguments && otherArguments.__awkCap;
-                const seen = probeA53Captions(file.file, deriveFfprobePath(String(otherArguments?.ffmpegPath || 'ffmpeg')),
-                    inj ? inj.captions === true : undefined);
+                const seen = ccProbeVerdict();
                 if (seen === 'unknown')
                     return { job: null, note: '☒[embedded_cc=enabled] Could not check this file for closed captions on this node - leaving it alone\n' };
                 if (seen === false) return { job: null, note: '☑[embedded_cc=enabled] No embedded closed captions in this file\n' };
@@ -2235,7 +2235,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // silently shift every existing -map 0. ccRecord is a SET because the awk_cc states combine and only one value is written: an empty channel on
             // a strip-refused source records BOTH `none` and `strip`, and a single-token overwrite would erase whichever came first. ccPlaced earns the
             // removal: on the unmapped route the caption srt is uploaded BEFORE the preset returns (a rejected upload must not be followed by a strip that
-            // leaves the captions nowhere); on the mapped route sidecar and strip are outputs of the SAME command, so it is true by construction.
+            // leaves the captions nowhere). On the mapped route ccPlaced deliberately stays false, so the fresh-extract pass never strips - the strip is owed
+            // on a later pass via stripOwed, once the sidecar is proven to hold cues (see the empty-decode deferral note in the mapped branch below).
             let ccInput = ''; const ccRecord = new Set(); let ccPlaced = false;
             if (ccPlan.job && placeViaApi()) {
                 placeJobs.push({
@@ -2399,9 +2400,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (((ccPlan.job && ccPlaced) || ccPlan.stripOwed) && removeSource && !ccRecord.has(CC_TOKENS.none)) {
                 if (ccStripAllowed()) {
                     ccStrip = ccStripArg(removedIndices);
-                    // The one outcome we are CERTAIN about, and it used to be the only one that handed nothing forward: video_clean then paid a caption
-                    // probe to be told what this pass had already proved. Declining the memo costs only a repeated probe, never data, so unlike the
-                    // request below a marker-hostile container needs no warning - it just goes unrecorded.
+                    // The one outcome we are CERTAIN about: recording `removed` spares video_clean a caption probe for a fact this pass has already
+                    // proved. Declining the memo costs only a repeated probe, never data, so unlike the request below a marker-hostile container needs
+                    // no warning - it just goes unrecorded.
                     if (canRecord) ccRecord.add(CC_TOKENS.removed);
                     response.infoLog += `☐${streamTag(ccVideo.index)}[remove_source=true] Removing the closed captions from the video bitstream${
                         canRecord ? ' and recording it so no later pass re-checks' : ''}\n`;
