@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.13',
+    Version: '4.999.14',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1066,6 +1066,48 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         try { return String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase(); } catch (e) { return s; }
     };
     // ===== END SHARED: language matching =====
+
+    // ===== SHARED [audio_clean, clean_and_remux, sub_worker]: iso639-1 to iso639-2 map =====
+    // -=-=-= ISO639_1_TO_2  [audio_clean, clean_and_remux, sub_worker] =-=-=-
+    // ISO 639-1 (2-letter) -> ISO 639-2/T (terminologic 3-letter), complete for every current 639-1 code; each row
+    // verified to name the same language via ICU. Both writers map to /T for an mp4 target (its mdhd stores only a
+    // 3-letter code): clean_and_remux via toCanonicalTag/method_tag_language, sub_worker via to6392T on subtitle import.
+    const ISO639_1_TO_2 = {
+        aa:'aar',ab:'abk',ae:'ave',af:'afr',ak:'aka',am:'amh',an:'arg',ar:'ara',as:'asm',av:'ava',ay:'aym',az:'aze',ba:'bak',be:'bel',bg:'bul',
+        bh:'bih',bi:'bis',bm:'bam',bn:'ben',bo:'bod',br:'bre',bs:'bos',ca:'cat',ce:'che',ch:'cha',co:'cos',cr:'cre',cs:'ces',cu:'chu',cv:'chv',
+        cy:'cym',da:'dan',de:'deu',dv:'div',dz:'dzo',ee:'ewe',el:'ell',en:'eng',eo:'epo',es:'spa',et:'est',eu:'eus',fa:'fas',ff:'ful',fi:'fin',
+        fj:'fij',fo:'fao',fr:'fra',fy:'fry',ga:'gle',gd:'gla',gl:'glg',gn:'grn',gu:'guj',gv:'glv',ha:'hau',he:'heb',hi:'hin',ho:'hmo',hr:'hrv',
+        ht:'hat',hu:'hun',hy:'hye',hz:'her',ia:'ina',id:'ind',ie:'ile',ig:'ibo',ii:'iii',ik:'ipk',io:'ido',is:'isl',it:'ita',iu:'iku',ja:'jpn',
+        jv:'jav',ka:'kat',kg:'kon',ki:'kik',kj:'kua',kk:'kaz',kl:'kal',km:'khm',kn:'kan',ko:'kor',kr:'kau',ks:'kas',ku:'kur',kv:'kom',kw:'cor',
+        ky:'kir',la:'lat',lb:'ltz',lg:'lug',li:'lim',ln:'lin',lo:'lao',lt:'lit',lu:'lub',lv:'lav',mg:'mlg',mh:'mah',mi:'mri',mk:'mkd',ml:'mal',
+        mn:'mon',mr:'mar',ms:'msa',mt:'mlt',my:'mya',na:'nau',nb:'nob',nd:'nde',ne:'nep',ng:'ndo',nl:'nld',nn:'nno',no:'nor',nr:'nbl',nv:'nav',
+        ny:'nya',oc:'oci',oj:'oji',om:'orm',or:'ori',os:'oss',pa:'pan',pi:'pli',pl:'pol',ps:'pus',pt:'por',qu:'que',rm:'roh',rn:'run',ro:'ron',
+        ru:'rus',rw:'kin',sa:'san',sc:'srd',sd:'snd',se:'sme',sg:'sag',si:'sin',sk:'slk',sl:'slv',sm:'smo',sn:'sna',so:'som',sq:'sqi',sr:'srp',
+        ss:'ssw',st:'sot',su:'sun',sv:'swe',sw:'swa',ta:'tam',te:'tel',tg:'tgk',th:'tha',ti:'tir',tk:'tuk',tl:'tgl',tn:'tsn',to:'ton',tr:'tur',
+        ts:'tso',tt:'tat',tw:'twi',ty:'tah',ug:'uig',uk:'ukr',ur:'urd',uz:'uzb',ve:'ven',vi:'vie',vo:'vol',wa:'wln',wo:'wol',xh:'xho',yi:'yid',
+        yo:'yor',za:'zha',zh:'zho',zu:'zul',
+    };
+    // ===== END SHARED: iso639-1 to iso639-2 map =====
+
+    // ===== SHARED [audio_clean, sub_worker]: mov language remap =====
+    // -=-=-= to6392T  [audio_clean, sub_worker] =-=-=-
+    // Fold a language token to a lowercase 3-letter ISO 639-2/T code: langKey folds spelled names and 639-2/B onto the 2-letter key, which ISO639_1_TO_2 maps to
+    // /T; an already-3-letter code (eng, fil, und) or an unmappable token is left as-is. Used where a 3-letter code is required - sub_worker's mp4-family sidecar
+    // import (mdhd stores only /T) and the mov remap below - and it is the fold MOV_LANG expects. Mirrors clean_and_remux's toCanonicalTag threeLetter(false).
+    const to6392T = (lang) => { const key = langKey(lang); if (!key || key.length !== 2) return lang; return ISO639_1_TO_2[key] || lang; };
+    // -=-=-= MOV_LANG  [audio_clean, sub_worker] =-=-=-
+    // mov is the exception to writing a language into the output container (mp4 stores only lowercase 3-letter /T, mkv keeps the raw spelling). The QuickTime
+    // muxer does not store the letters: mov_write_mdhd_tag looks the code up in ffmpeg's legacy Macintosh language table and writes 0x7fff ("unspecified") on a
+    // miss, which the demuxer then excludes - so the track reads back with NO language at all, exit 0 and no warning from either side. That table predates ISO
+    // 639-2/T and spells 15 of the 20 dual-spelling languages the /B way, so to6392T's /T output is precisely the spelling mov throws away (measured on
+    // jellyfin-ffmpeg 7.1.4: nld/deu/zho land 0x7fff, dut/ger/chi land a real code; 106 of the 184 codes to6392T can emit are dropped). ces/ron/slk/fra are
+    // deliberately ABSENT - QuickTime spells those four the /T way and remapping them would break what works - and mri is absent because the table has no Maori
+    // under any code. Anyone extending this must re-measure against the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a safe source.
+    // mp4/m4v/m4a pack the letters directly and keep either spelling, which is why this is mov-only. Both writers fold to /T then remap: audio_clean on an audio
+    // language write, sub_worker on a subtitle language write.
+    const MOV_LANG = { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
+        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel' };
+    // ===== END SHARED: mov language remap =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: free-text list split =====
     // -=-=-= splitList  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
@@ -2380,7 +2422,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 + ` - future runs skip re-measuring while loudnorm stays "${methodLoudnorm}"\n`;
             extraArguments += loudnormStampArg(idx);
         };
-        const langMetaArg = (idx, lang) => (lang ? ` -metadata:s:a:${idx} "language=${escMeta(lang)}"` : '');
+        // On a mov output the QuickTime muxer silently drops any language spelling outside its legacy Mac table (deu/nld/de all read back with NO language), so
+        // fold to /T and remap through MOV_LANG - the shared 'mov language remap' section has the why. mkv/mp4 keep the resolved value verbatim (audio_clean never
+        // normalises a language tag - that is clean_and_remux's job), so escMeta is the only transform there.
+        const langMetaArg = (idx, lang) => {
+            if (!lang) return '';
+            const v = dstContainer === 'mov' ? (MOV_LANG[to6392T(lang)] || to6392T(lang)) : lang;
+            return ` -metadata:s:a:${idx} "language=${escMeta(v)}"`;
+        };
         // ===== END LOUDNORM =====
 
         // Channel/filter snippet for a new or replaced stereo track. No guard check here: every call site either already passed guardBlocks or is a

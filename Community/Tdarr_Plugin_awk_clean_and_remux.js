@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.19',
+    Version: '4.999.20',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1036,8 +1036,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // mdhd stores only a lowercase 3-letter ISO 639-2 code (2-letter / uppercase / region are silently dropped, so a plain mkv->mp4 remux
     // of an "en"-tagged stream loses its language), mkv stores any recognised code; und/mul/zxx/mis are never rewritten.
     // #region SHARED helpers (1 section: iso639-1 to iso639-2 map)
-    // ===== SHARED [clean_and_remux, sub_worker]: iso639-1 to iso639-2 map =====
-    // -=-=-= ISO639_1_TO_2  [clean_and_remux, sub_worker] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, sub_worker]: iso639-1 to iso639-2 map =====
+    // -=-=-= ISO639_1_TO_2  [audio_clean, clean_and_remux, sub_worker] =-=-=-
     // ISO 639-1 (2-letter) -> ISO 639-2/T (terminologic 3-letter), complete for every current 639-1 code; each row
     // verified to name the same language via ICU. Both writers map to /T for an mp4 target (its mdhd stores only a
     // 3-letter code): clean_and_remux via toCanonicalTag/method_tag_language, sub_worker via to6392T on subtitle import.

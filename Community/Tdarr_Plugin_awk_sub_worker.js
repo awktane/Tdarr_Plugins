@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.19',
+    Version: '3.999.20',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1068,8 +1068,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const isRealLanguageToken = (token) => { const k = langKey(token); if (!k) return false; return !!langDisplayName(k); };
 
     // #region SHARED helpers (3 sections: iso639-1 to iso639-2 map … closed-caption handoff)
-    // ===== SHARED [clean_and_remux, sub_worker]: iso639-1 to iso639-2 map =====
-    // -=-=-= ISO639_1_TO_2  [clean_and_remux, sub_worker] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, sub_worker]: iso639-1 to iso639-2 map =====
+    // -=-=-= ISO639_1_TO_2  [audio_clean, clean_and_remux, sub_worker] =-=-=-
     // ISO 639-1 (2-letter) -> ISO 639-2/T (terminologic 3-letter), complete for every current 639-1 code; each row
     // verified to name the same language via ICU. Both writers map to /T for an mp4 target (its mdhd stores only a
     // 3-letter code): clean_and_remux via toCanonicalTag/method_tag_language, sub_worker via to6392T on subtitle import.
@@ -1158,11 +1158,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const ccTokensOf = (tags) => getTagCI(tags || {}, CC_TAG).toLowerCase().split(',').map((t) => t.trim()).filter(Boolean);
     // ===== END SHARED: closed-caption handoff =====
     // #endregion
-    // Normalise a sidecar language token to a lowercase 3-letter ISO 639-2/T code for an mp4-family import target (mdhd silently drops 2-letter/spelled codes).
-    // langKey folds spelled names and 639-2/B onto the 2-letter key, which ISO639_1_TO_2 maps to /T; an already-3-letter code (eng, fil, und) or an unmappable
-    // token is left as-is. Mirrors clean_and_remux's toCanonicalTag threeLetter(false); mkv keeps the raw
-    // token where it is already a code (see normSidecarLang).
+    // ===== SHARED [audio_clean, sub_worker]: mov language remap =====
+    // -=-=-= to6392T  [audio_clean, sub_worker] =-=-=-
+    // Fold a language token to a lowercase 3-letter ISO 639-2/T code: langKey folds spelled names and 639-2/B onto the 2-letter key, which ISO639_1_TO_2 maps to
+    // /T; an already-3-letter code (eng, fil, und) or an unmappable token is left as-is. Used where a 3-letter code is required - sub_worker's mp4-family sidecar
+    // import (mdhd stores only /T) and the mov remap below - and it is the fold MOV_LANG expects. Mirrors clean_and_remux's toCanonicalTag threeLetter(false).
     const to6392T = (lang) => { const key = langKey(lang); if (!key || key.length !== 2) return lang; return ISO639_1_TO_2[key] || lang; };
+    // -=-=-= MOV_LANG  [audio_clean, sub_worker] =-=-=-
+    // mov is the exception to writing a language into the output container (mp4 stores only lowercase 3-letter /T, mkv keeps the raw spelling). The QuickTime
+    // muxer does not store the letters: mov_write_mdhd_tag looks the code up in ffmpeg's legacy Macintosh language table and writes 0x7fff ("unspecified") on a
+    // miss, which the demuxer then excludes - so the track reads back with NO language at all, exit 0 and no warning from either side. That table predates ISO
+    // 639-2/T and spells 15 of the 20 dual-spelling languages the /B way, so to6392T's /T output is precisely the spelling mov throws away (measured on
+    // jellyfin-ffmpeg 7.1.4: nld/deu/zho land 0x7fff, dut/ger/chi land a real code; 106 of the 184 codes to6392T can emit are dropped). ces/ron/slk/fra are
+    // deliberately ABSENT - QuickTime spells those four the /T way and remapping them would break what works - and mri is absent because the table has no Maori
+    // under any code. Anyone extending this must re-measure against the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a safe source.
+    // mp4/m4v/m4a pack the letters directly and keep either spelling, which is why this is mov-only. Both writers fold to /T then remap: audio_clean on an audio
+    // language write, sub_worker on a subtitle language write.
+    const MOV_LANG = { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
+        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel' };
+    // ===== END SHARED: mov language remap =====
     // Plex/Jellyfin/Emby all accept a spelled-out language NAME in a sidecar name (Movie.English.srt), which isRealLanguageToken recognises - but the name
     // itself is not a valid container language tag, so writing it through would stamp "language=English" into the mkv. Fold any non-code token to its code; a
     // token already shaped like a code is passed through untouched so a region tag (pt-BR) survives - the whole point of keeping the raw token on mkv.
@@ -1939,16 +1953,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // costs depends on the operation, so each site decides for itself rather than the whole plugin declining: an extract memoises through the SIDECAR ON DISK
     // and needs no tag, while an import has nothing else to tell an already-embedded sidecar from a new one.
     const canRecord = markerPersists(dstContainer);
-    // The one rule for writing a language into the output container: mp4 stores only lowercase 3-letter ISO 639-2/T, while mkv keeps the sidecar spelling.
-    // mov is the exception. The QuickTime muxer does not store the letters: mov_write_mdhd_tag looks the code up in ffmpeg's legacy Macintosh language table
-    // and writes 0x7fff ("unspecified") on a miss, which the demuxer then excludes - so the track reads back with NO language at all, exit 0 and no warning
-    // from either side. That table predates ISO 639-2/T and spells 15 of the 20 dual-spelling languages the /B way, so to6392T's /T output is precisely the
-    // spelling mov throws away (measured on jellyfin-ffmpeg 7.1.4: nld/deu/zho land 0x7fff, dut/ger/chi land a real code; 106 of the 184 codes to6392T can
-    // emit are dropped). ces/ron/slk/fra are deliberately ABSENT - QuickTime spells those four the /T way and remapping them would break what works - and mri
-    // is absent because the table has no Maori under any code. Anyone extending this must re-measure against the muxer: the table is a MIXTURE of /T and /B,
-    // so the ISO 639-2/B list is not a safe source. mp4/m4v/m4a pack the letters directly and keep either spelling, which is why this is mov-only.
-    const MOV_LANG = { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
-        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel' };
+    // The one rule for writing a subtitle language into the output container: mp4 folds to /T (to6392T), mkv keeps the sidecar spelling (normSidecarLang), and mov
+    // folds to /T then remaps through MOV_LANG - the shared 'mov language remap' section has the why. escMeta guards the value either way.
     const langMetaValue = (l) => { const v = isMp4 ? to6392T(l) : normSidecarLang(l); return escMeta(dstContainer === 'mov' ? (MOV_LANG[v] || v) : v); };
     // Everything this plugin writes onto a subtitle stream, for ONE stream. Two callers reach it - the duplicate fold below and the sidecar-metadata retune -
     // and they must agree on both load-bearing rules: outIdx is the position among the SURVIVING subtitle streams, which is what -map 0 minus the drops
