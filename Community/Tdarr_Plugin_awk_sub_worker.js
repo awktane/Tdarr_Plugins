@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.27',
+    Version: '3.999.28',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -2105,6 +2105,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return { job: null, note: '☑[embedded_cc=enabled] The captions were extracted and the bitstream copy removed on an earlier pass\n' };
             if (ccTokens.includes(CC_TOKENS.imported))
                 return { job: null, note: '☑[embedded_cc=enabled] Closed captions are already embedded as a subtitle track\n' };
+            // A `strip` already recorded but not yet served - this node cannot remove it (the source is not h264 SDR) - is video_clean's to retire on its next
+            // encode. Re-deriving it here re-emits a byte-identical tag-only mux every pass, which Tdarr refuses as an infinite transcode loop and ERRORS an
+            // undamaged file: the sidecar and the bitstream are both unchanged, so the probe keeps answering the same. Wait for the retire. When the source IS
+            // strippable this early-return is skipped, the strip lands, and the `removed` memo above ends the round trip.
+            if (ccTokens.includes(CC_TOKENS.strip) && !ccStripAllowed())
+                return { job: null, note: '☑[embedded_cc=enabled] Caption removal already recorded - waiting for video_clean to re-encode\n' };
             const hidden = action === 'import';
             const name = ccName;
             const full = path.join(workLibDir(), name);
@@ -2139,7 +2145,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // the only setting that can owe a strip at all.
                     let owed = false;
                     if (removeSource) owed = ccProbeVerdict() === true;
-                    return { job: null, stripOwed: owed, note: `☑[embedded_cc=enabled] Captions already extracted to ${name}${owed
+                    return { job: null, stripOwed: owed, note: `☑[embedded_cc=enabled] Captions already extracted to ${name}${owed && ccStripAllowed()
                         ? ' - removing the bitstream copy now that the sidecar is confirmed to hold them' : ''}\n` };
                 }
                 let unlinked = true;
