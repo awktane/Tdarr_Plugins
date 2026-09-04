@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.24',
+    Version: '3.999.25',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -2478,6 +2478,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The global marker VALUE lists the sidecar paths (relative to the video's directory) an earlier pass consumed, so a later pass deletes exactly what
         // it embedded (never a pre-existing collision) and never re-adds them. Tdarr only re-runs after a SUCCESSFUL mux, so a listed sidecar is safely in.
         const importedSet = new Set(decodeMarkerList(getTagCI(file.ffProbeData.format?.tags || {}, 'awk_sub_worker')));
+        // Import scope decided from a sidecar's NAME alone (no content, no download): the caption staging file is always ours; otherwise the language must be in
+        // only_languages (or the filter is off); and a styled bundle cannot go into an mp4-family target that has no font attachments. Pulled out so the
+        // marker-hostile refusal can be decided from the listed names BEFORE the text_file route downloads them, and so that refusal and the found-filter below
+        // can never drift on what counts as importable.
+        const subLangInScope = (f) => (ccName && f.rel === ccName) || !langFilter || langFilter.has(langKey(f.lang));
+        const subBundleFits = (f) => !(f.bundle && isMp4);
+        // The marker-hostile refusal message, shared by the pre-fetch check (text_file route) and the post-scan check (mapped route) so they read identically.
+        const markerHostileMsg = (n) => `[action=import][container=${dstContainer}] ${n} sidecar${n === 1 ? '' : 's'} to import, but ${dstContainer}`
+            + ' cannot store the awk_sub_worker marker that records them, so every later pass would import them again - remux to mkv or mp4 first'
+            + ' (clean_and_remux does that), then run import';
 
         // Import discovers sidecars by SCANNING the library directory, and an unmapped node has no view of it - libDir there is the node-local
         // mirror Tdarr downloads into, so the scan would read back only the video it was given. The file API cannot stand in: it addresses one
@@ -2533,6 +2543,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             + 'add one filename per line\n';
                         listedRels = [];
                     } else {
+                        // A marker-hostile target refuses this import anyway (the canRecord check below), and on this route that refusal would otherwise come
+                        // only AFTER downloading every listed sidecar. Decide it from the NAMES here so a doomed import never pays the fetch (re-paid on every
+                        // requeue); nothing importable falls through to the file's own duplicate cleanup, exactly as the canRecord check does.
+                        if (!canRecord) {
+                            const wouldImport = parsed.ok.map(parseSidecarRel).filter(Boolean).filter((f) => subLangInScope(f) && subBundleFits(f));
+                            if (wouldImport.length) failFile(markerHostileMsg(wouldImport.length));
+                        }
                         listedRels = fetchListedSidecars(parsed.ok, listName, importedSet);
                         // Names an earlier pass already embedded and removed are not a shortfall, so they count out of the total rather than as failures.
                         const spent = parsed.ok.filter((rel) => importedSet.has(rel) && !listedRels.includes(rel)).length;
@@ -2563,8 +2580,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // tagged 'und', which is in nobody's only_languages list - and dropping it here strands the round trip: the full-video decode is paid for,
                 // the hidden sidecar is written, and then nothing imports it, so awk_cc=imported is never stamped and every later pass decodes again.
                 // extract already exempts embedded_cc from this filter; this is the import half of the same exemption.
-                if (ccName && f.rel === ccName) return true;
-                if (!langFilter || langFilter.has(langKey(f.lang))) return true;
+                if (subLangInScope(f)) return true;
                 // The tag echoes a free-text input, so it gets the same treatment failLangToken gives its token: control characters collapsed (a raw newline
                 // would split the line into a continuation with no ☐/☑/☒ symbol) and capped, since nothing bounds the list and this line is per-sidecar.
                 response.infoLog += `☑[only_languages=${logTok(inputs.only_languages, 200)}] Skipping ${
@@ -2575,7 +2591,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // its fonts - and remove_source would then delete the only copy that has them. Leave the bundle untouched on disk instead
             // (dropping it from `found` also keeps it out of the deletion pass below); remux the file to mkv and run import again to restore it.
             .filter((f) => {
-                if (!f.bundle || !isMp4) return true;
+                if (subBundleFits(f)) return true;
                 response.infoLog += `☒Cannot import ${f.rel} - an ${dstContainer} target carries no font attachments, `
                     + 'keeping the styled-subtitle bundle on disk\n';
                 return false;
@@ -2626,11 +2642,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // a marker-hostile container one import becomes an unbounded one, adding another copy of every sidecar on every pass until Tdarr happens to see two
         // identical presets and errors the file anyway. Stopping HERE, past the no-sidecars branch above, keeps the file's own duplicate-subtitle cleanup
         // working and only ever fires when there is real import work to refuse - and it stops rather than skips, because sidecars are sitting in the library
-        // for this video and processFile:false would file that under success, leaving a silently un-imported library nobody has reason to look at.
+        // for this video and processFile:false would file that under success, leaving a silently un-imported library nobody has reason to look at. The
+        // text_file route reaches the same refusal earlier, from the listed NAMES before the fetch (see there), so a doomed import there never pays the download.
         if (!canRecord) {
-            failFile(`[action=import][container=${dstContainer}] ${found.length} sidecar${found.length === 1 ? '' : 's'} to import, but ${dstContainer}`
-                + ' cannot store the awk_sub_worker marker that records them, so every later pass would import them again - remux to mkv or mp4 first'
-                + ' (clean_and_remux does that), then run import');
+            failFile(markerHostileMsg(found.length));
         }
 
         // Import is NON-DESTRUCTIVE: every recognized sidecar not already handled by our own prior pass (marker) is muxed in. A sidecar is never suppressed
