@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.17',
+    Version: '3.999.18',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -2233,7 +2233,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // and it is the token that stops any later pass paying a caption probe. Only fires when a request was actually present.
             if (ccExported) {
                 const retired = [...new Set(ccTokens.map((t) => (t === CC_TOKENS.strip ? CC_TOKENS.removed : t)))];
-                out += ` -metadata "${CC_TAG}=${retired.join(',')}"`;
+                out += ` -metadata "${CC_TAG}=${escMeta(retired.join(','))}"`;
             }
             if (isMp4Family(dstContainer)) out += ' -movflags use_metadata_tags';   // keep the global tag through an mp4/mov copy
             out += globalOutputOpt;
