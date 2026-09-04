@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.23',
+    Version: '4.999.24',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1271,7 +1271,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Matroska is the only container that can hold a subtitle and its fonts together (mp4 carries no attachments at all), and .mks is its subtitle-only
     // extension, so a media server that does not skip dotfiles still does not read the bundle as a video. The 'styled' mark is sub_worker's bundle token:
     // with it the file reimports as a bundle, fonts and all - which is what makes the export a round trip rather than a one-way archive.
+    // ===== SHARED [clean_and_remux, sub_worker]: styled bundle vocabulary =====
+    // -=-=-= STYLED_BUNDLE  [clean_and_remux, sub_worker] =-=-=-
+    // The styled-subtitle .mks bundle vocabulary, one definition for the two-plugin round trip: ext (extension), mark (the fixed name token before the
+    // extension), fmt (the ffmpeg muxer format). clean_and_remux EXPORTS the bundle - its mp4 styled export deletes the source stream on the promise the .mks
+    // is a complete record - and sub_worker RECOGNISES and RE-IMPORTS it (parseSidecar returns null, a silent skip, on a mark/ext mismatch). Shared because a
+    // one-sided drift would strand the only copy of a styled subtitle on disk, unimportable and undiagnosed, and the shared-block check cannot see it while the
+    // two sides spell the vocabulary in different shapes.
     const STYLED_BUNDLE = { ext: 'mks', fmt: 'matroska', mark: 'styled' };
+    // ===== END SHARED: styled bundle vocabulary =====
 
     // #region SHARED helpers (2 sections: preset path safety … font attachment test)
     // ===== SHARED [clean_and_remux, sub_worker]: preset path safety =====
@@ -1537,20 +1545,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: sidecar name tokens =====
 
     const exportSidecarName = (ffstream, ext, mark) => {
-        // Every token but the extension comes from the shared sidecarNameTokens, which is what makes this name readable by sub_worker's importer. It used to
-        // spell `.forced` and nothing else, and sub_worker treats a bundle's FILENAME as the authority on disposition - writing an explicit `-disposition 0`
-        // when the name carries no token - so a styled .mks exported from an SDH, commentary, descriptive, original or visual_impaired subtitle came back
-        // with that flag cleared, on the one export path that deletes the source stream because the bundle is supposed to be a complete record. The shared
-        // helper also brings the language-collision escape: a tags.language of "forced" produced a name parseSidecar rejected outright, stranding the only
-        // styled copy beside the video forever. No title token is written here - the .mks carries its title through the -c copy, and import only overwrites
-        // a title the name actually spells.
+        // Every token but the extension comes from the shared sidecarNameTokens: that vocabulary is what makes the name readable by sub_worker's importer,
+        // which treats a bundle's FILENAME as the disposition authority (it writes an explicit `-disposition 0` when the name carries no token). A wrong token
+        // therefore clears the wrong disposition on reimport - and this is the one export path that DELETES the source stream (the bundle is meant to be a
+        // complete record), so the loss would be permanent; that, and the language-collision escape the shared helper carries, are why the vocabulary lives in
+        // one shared place. No title token is written here: the .mks carries its title through the -c copy, and import only overwrites a title the name spells.
         const { lang, pre, disp } = sidecarNameTokens(ffstream);
         return `.${videoBase}.s${ffstream.index}${pre}.${lang}${disp}${mark ? `.${mark}` : ''}.${ext}`;
     };
-    // A subtitle removed regardless of language - by container/format (subFormatDropped), by remove_imagesubs
-    // (imageSubDropped), or by the mp4 styled-subtitle bundle export (styledSubExported), which maps the track out of the
-    // video. None is ever assigned language_fill, and none counts as a survivor for the language_fill_mode untagged tally or
-    // the remove_sub_sdh plain-track guard: a track this run deletes cannot be the plain track another track falls back on.
+    // A subtitle removed regardless of language - by container/format (subFormatDropped), by remove_imagesubs (imageSubDropped), or by the mp4
+    // styled-subtitle bundle export (styledSubExported), which maps the track out of the video WHEN THE EXPORT SUCCEEDS. Such a track is not assigned
+    // language_fill and does not count as a survivor for the language_fill_mode untagged tally or the remove_sub_sdh plain-track guard: a track this run
+    // deletes cannot be the plain track another falls back on. One exception on the styled path - a REFUSED export (unmapped node / name over the byte cap /
+    // unsafe path) survives as a mov_text conversion and DOES receive language_fill (see the emitLangMeta reorder note in the subtitle branch), so the tally
+    // exclusion is slightly conservative there.
     const subDroppedRegardlessOfLanguage = (codec) => subFormatDropped(codec) || imageSubDropped(codec) || styledSubExported(codec);
 
     // #region SHARED helpers (1 section: title canonicalization)

@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.22',
+    Version: '3.999.23',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -800,7 +800,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const isTextSub = (codec) => Object.prototype.hasOwnProperty.call(TEXT_SUB, String(codec).toLowerCase());
     // Both directions of the table above, derived from it so a new codec row is ONE edit: the loose-text sidecar extensions parseSidecar accepts (a bundle
-    // is admitted by BUNDLE_EXT instead, so 'mks' must never be a TEXT_SUB ext - extract would write one no import could read back), and the reverse ext ->
+    // is admitted by STYLED_BUNDLE.ext instead, so 'mks' must never be a TEXT_SUB ext - extract would write one no import could read back), and the reverse ext ->
     // codec name for a sidecar not muxed in yet. Several codecs share an ext, so the reverse keeps the FIRST row declaring it - the canonical spelling
     // ffprobe reports back for a sidecar that row's encoder wrote (subrip for .srt, ass for .ass, webvtt for .vtt). Keep the canonical codec first.
     const TEXT_EXTS = [...new Set(Object.values(TEXT_SUB).map((t) => t.ext))];
@@ -813,8 +813,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // what makes a bundle name unambiguous: clean_and_remux's remove_imagesubs=export writes dot-prefixed .mks IMAGE-subtitle sidecars in the same name
     // shape, and importing one of those as a bundle would silently re-add the image subtitle that pass had just removed. clean_and_remux writes the token
     // on its OWN styled bundles, so those DO come back through the import as bundles - the whole point of exporting them in that form.
-    const BUNDLE_EXT = 'mks';
-    const BUNDLE_TOKEN = 'styled';
+    // ===== SHARED [clean_and_remux, sub_worker]: styled bundle vocabulary =====
+    // -=-=-= STYLED_BUNDLE  [clean_and_remux, sub_worker] =-=-=-
+    // The styled-subtitle .mks bundle vocabulary, one definition for the two-plugin round trip: ext (extension), mark (the fixed name token before the
+    // extension), fmt (the ffmpeg muxer format). clean_and_remux EXPORTS the bundle - its mp4 styled export deletes the source stream on the promise the .mks
+    // is a complete record - and sub_worker RECOGNISES and RE-IMPORTS it (parseSidecar returns null, a silent skip, on a mark/ext mismatch). Shared because a
+    // one-sided drift would strand the only copy of a styled subtitle on disk, unimportable and undiagnosed, and the shared-block check cannot see it while the
+    // two sides spell the vocabulary in different shapes.
+    const STYLED_BUNDLE = { ext: 'mks', fmt: 'matroska', mark: 'styled' };
+    // ===== END SHARED: styled bundle vocabulary =====
 
     // #region SHARED helpers (1 section: styled subtitle test)
     // ===== SHARED [clean_and_remux, sub_worker]: styled subtitle test =====
@@ -1286,9 +1293,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // differently. Only the TITLE token is assembled locally - sub_worker is the one that writes one. The `collides` escape below keeps the slot
         // immediately ahead of the language free of anything parseSidecar's strip would mistake for a language.
         const { lang, pre, disp } = sidecarNameTokens(s);
-        const ext = bundle ? BUNDLE_EXT : TEXT_SUB[String(s.codec_name).toLowerCase()].ext;
+        const ext = bundle ? STYLED_BUNDLE.ext : TEXT_SUB[String(s.codec_name).toLowerCase()].ext;
         const dot = bundle ? '.' : '';
-        const mark = bundle ? `.${BUNDLE_TOKEN}` : '';
+        const mark = bundle ? `.${STYLED_BUNDLE.mark}` : '';
         const rawTitle = s.tags?.title || '';
         // The same collision one field to the left: TITLE_SAFE passes letters and '_' straight through, so a title that IS a token ("forced", "original")
         // would encode to that exact word and be eaten by parseSidecar's token strip - losing the title and inventing a flag. Encoding only ever expands, so
@@ -1306,7 +1313,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const extMatch = name.match(/\.([A-Za-z0-9]+)$/);
         if (!extMatch) return null;
         const ext = extMatch[1].toLowerCase();
-        const bundle = ext === BUNDLE_EXT;
+        const bundle = ext === STYLED_BUNDLE.ext;
         if (!bundle && !TEXT_EXTS.includes(ext)) return null;
         // A bundle is written only by us, always dot-prefixed and always with the s<index> anchor (required below), so an unrelated .mks dropped
         // beside the video is left alone rather than muxed in blind.
@@ -1321,8 +1328,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const toks = mid.split('.');
         if (!toks.length) return null;
         // Require (and consume) the bundle marker before anything else reads the trailing tokens, so a clean_and_remux image-subtitle export sharing the
-        // .mks extension and the same name shape is rejected here rather than re-imported as a styled bundle. See BUNDLE_TOKEN.
-        if (bundle) { if (toks[toks.length - 1] !== BUNDLE_TOKEN) return null; toks.pop(); }
+        // .mks extension and the same name shape is rejected here rather than re-imported as a styled bundle. See STYLED_BUNDLE.mark.
+        if (bundle) { if (toks[toks.length - 1] !== STYLED_BUNDLE.mark) return null; toks.pop(); }
         // Our own sidecars lead with an s<index> order marker; a fresh server-native sidecar (Movie.en.forced.srt) has none. Consume the marker if
         // present (index only keeps our names unique); otherwise index is null and the language token below MUST be a recognized language, so an
         // unrelated .srt (Movie.backup.srt) is not mis-read as lang="backup" and imported as junk.
@@ -2207,7 +2214,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
 
             // A styled subtitle is exported as a .mks BUNDLE carrying the subtitle plus every font attachment, because those fonts exist nowhere else
-            // (see BUNDLE_EXT). Loose text sidecars stay the default for everything else: a plain srt, and an ass/ssa in a file with no fonts, have
+            // (see STYLED_BUNDLE.ext). Loose text sidecars stay the default for everything else: a plain srt, and an ass/ssa in a file with no fonts, have
             // nothing to carry and are far more useful as editable text on disk.
             const fontIndices = streams.filter((s) => codecTypeOf(s) === 'attachment' && isFontAttachment(s)).map((s) => s.index);
             const fontMaps = fontIndices.map((i) => ` -map 0:${i}`).join('');
@@ -2301,14 +2308,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // Unmapped: the extraction is deferred to placeSidecars after the loop, so this stream's removedIndices entry and its bundled tally wait for
                 // the server's answer - nothing may be stripped until the sidecar is confirmed in the library.
                 else if (placeViaApi()) {
-                    const ffArgs = bundle ? ['-map', `0:${s.index}`, ...fontIndices.flatMap((i) => ['-map', `0:${i}`]), '-c', 'copy', '-f', 'matroska']
+                    const ffArgs = bundle ? ['-map', `0:${s.index}`, ...fontIndices.flatMap((i) => ['-map', `0:${i}`]), '-c', 'copy', '-f', STYLED_BUNDLE.fmt]
                         : ['-map', `0:${s.index}`, '-c:s', enc];
                     placeJobs.push({ name, dest: remoteDest, args: ffArgs, index: s.index, bundle });
                     continue;
                 }
                 // A bundle is muxed with -c copy so the subtitle and every font stay byte-exact; matroska auto-detects .mkv but NOT .mks, so -f is required.
                 else if (bundle) {
-                    sidecarOut += ` -map 0:${s.index}${fontMaps} -c copy -f matroska "${full}"`; wrote += 1;
+                    sidecarOut += ` -map 0:${s.index}${fontMaps} -c copy -f ${STYLED_BUNDLE.fmt} "${full}"`; wrote += 1;
                     response.infoLog += `☐${streamTag(s.index)} Extract -> ${name} (styled subtitle bundled with ${fontIndices.length} font${
                         fontIndices.length === 1 ? '' : 's'})\n`;
                 }
@@ -2583,7 +2590,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // A hidden TEXT sidecar named after THIS video is the exception: that is the OCR coming back, it is importable now, so a name that still fails to
             // parse is a genuine mistake (a bad language token, a lost s<index>) and saying nothing would strand the work the user just did.
             if (relBase.startsWith('.') && !(TEXT_EXTS.includes(relExt) && relBase.slice(1).startsWith(`${videoBase}.`))) continue;
-            if (TEXT_EXTS.includes(relExt) || relExt === BUNDLE_EXT) response.infoLog += `☒Not a recognised sidecar name, skipping: ${logTok(rel, 200)}\n`;
+            if (TEXT_EXTS.includes(relExt) || relExt === STYLED_BUNDLE.ext) response.infoLog += `☒Not a recognised sidecar name, skipping: ${logTok(rel, 200)}\n`;
         }
         // This pass only ever ADDS subtitles - it never deletes a sidecar. remove_source acts in the post-processing branch above, after acceptance.
         const embeddedSubs = streams.filter((s) => codecTypeOf(s) === 'subtitle');
