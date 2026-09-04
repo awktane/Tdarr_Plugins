@@ -15,7 +15,7 @@ const details = () => ({
         it's needed).\n\nBecause it runs last it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file
         that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the signature of an out-of-memory-killed or
         unfinalised encode from an earlier stage. A longer output is accepted. This check is always on and has no setting.\n`,
-    Version: '4.999.4',
+    Version: '4.999.5',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -961,26 +961,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile('No ffProbe stream data available for this file - the plugin cannot process it');
 
     // Value checks. The two free-text inputs (order_language/order_codec) have no fixed option set; the six dropdowns each do, and are checked here as
-    // [inputName, valueToTest, validOptions], top-down, failing on the first bad value. remove_junk_tags and method_mp4_faststart are case-normalized ONCE
-    // here and the use sites below read those same constants, so the value that gets validated is provably the value that gets executed; the other four test
-    // the raw input. The failFile message always shows the RAW inputs[name].
+    // [inputName, valueToTest, validOptions], top-down, failing on the first bad value. Every dropdown value is case/whitespace-normalised ONCE above and the
+    // use sites below read those same constants, so the value that gets validated is provably the value that gets executed, and the failFile message shows that
+    // normalised value - the same discipline the other four plugins follow.
     const junkTagsMode = String(inputs.remove_junk_tags || 'disabled').toLowerCase();
     const methodFaststart = String(inputs.method_mp4_faststart || 'force').toLowerCase().trim();
+    // The four order/promotion selectors, case/whitespace-normalised ONCE (like the two above) so validation, the sort reads and the echo all see one value.
+    // Defaults: audio_first/subtitle_first 'disabled', order_channel/order_quality 'descending'.
+    const audioFirst = String(inputs.audio_first || 'disabled').toLowerCase().trim();
+    const subtitleFirst = String(inputs.subtitle_first || 'disabled').toLowerCase().trim();
+    const orderChannel = String(inputs.order_channel || 'descending').toLowerCase().trim();
+    const orderQuality = String(inputs.order_quality || 'descending').toLowerCase().trim();
     // The container this plugin writes, named once as the other three plugins name it. Neither of these two changes the container, so it is the source's -
     // but every membership test must see it normalised: a Tdarr container string of 'MKV' misses a bare includes() and silently takes the marker-hostile
     // branch. The response.container default above deliberately keeps the RAW value: that string becomes the output file's extension, and lowercasing it
     // there would rename the file rather than answer a question about it.
     const dstContainer = String(file.container || '').toLowerCase().trim();
     const dropdownChecks = [
-        ['audio_first',          inputs.audio_first,                                             ['disabled', 'original_tagged', 'default_tagged', 'descriptive_tagged']],
-        ['order_channel',        inputs.order_channel,                                           ['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled']],
-        ['order_quality',        inputs.order_quality,                                           ['descending', 'descending <=1024k', 'ascending', 'disabled']],
-        ['subtitle_first',       inputs.subtitle_first,                                          ['disabled', 'default_tagged', 'sdh_tagged', 'descriptive_tagged']],
-        ['remove_junk_tags',     junkTagsMode,                                                    ['disabled', 'encoder', 'descriptive']],
-        ['method_mp4_faststart', methodFaststart,                                                ['force', 'strip']],
+        ['audio_first',          audioFirst,      ['disabled', 'original_tagged', 'default_tagged', 'descriptive_tagged']],
+        ['order_channel',        orderChannel,    ['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled']],
+        ['order_quality',        orderQuality,    ['descending', 'descending <=1024k', 'ascending', 'disabled']],
+        ['subtitle_first',       subtitleFirst,   ['disabled', 'default_tagged', 'sdh_tagged', 'descriptive_tagged']],
+        ['remove_junk_tags',     junkTagsMode,    ['disabled', 'encoder', 'descriptive']],
+        ['method_mp4_faststart', methodFaststart, ['force', 'strip']],
     ];
     for (const [name, value, opts] of dropdownChecks)
-        if (!opts.includes(value)) failFile(`[${name}=${logTok(inputs[name], 200)}] invalid value, check your settings`);
+        if (!opts.includes(value)) failFile(`[${name}=${logTok(value, 200)}] invalid value, check your settings`);
     // order_language has no option set, but it still holds LANGUAGES, so a token that is not one FAILS the file. A typo does not announce itself here: an
     // unmatched entry simply scores as "not listed" and the tracks the user meant to promote stay wherever they were, which reads exactly like the ordering
     // rules not working. order_codec is genuinely open (codec names come and go, and an unknown one is inert rather than misleading), so it stays unchecked.
@@ -1116,8 +1122,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         const streamOrder = { video: 0, audio: 1, subtitle: 2 , attachment: 3, data: 4};
         const UNKNOWN_TYPE_ORDER = 99;   // a codec_type not in streamOrder (video/audio/subtitle/attachment/data) sorts last
-        const audioFirst = inputs.audio_first;       // 'disabled' (baseline) | 'original_tagged' | 'default_tagged' | 'descriptive_tagged'
-        const subtitleFirst = inputs.subtitle_first; // 'disabled' (baseline) | 'default_tagged' | 'sdh_tagged' | 'descriptive_tagged'
         // Which stream flag each subtitle_first value lifts. One map instead of three near-identical clauses, so adding a fourth value is a row here rather
         // than a fourth copy of the same two lines - and so the three cannot drift into asking different questions of the same setting.
         const SUBTITLE_FIRST_KEY = { default_tagged: 'default', sdh_tagged: 'sdh', descriptive_tagged: 'descriptive' };
@@ -1138,8 +1142,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (m) return { enabled: true, dir: 'descending', cap: Number(m[1]) * (m[2] === 'k' ? 1000 : 1) };
             return { enabled: true, dir: mode === 'ascending' ? 'ascending' : 'descending', cap: Infinity };
         };
-        const channelOrder = parseOrderMode(inputs.order_channel);
-        const qualityOrder = parseOrderMode(inputs.order_quality);
+        const channelOrder = parseOrderMode(orderChannel);
+        const qualityOrder = parseOrderMode(orderQuality);
         // Union-of-caps demotion: a track over EITHER the channel cap OR the quality cap sorts below the under-all-caps tracks in its own language/role/codec
         // tier, so the fully-serveable track leads - e.g. a 5.1 under the <=6 channel cap but over the <=1024k quality cap is still demoted, not kept above a
         // stereo. Only a 'descending <=N' mode caps (plain descending/ascending/disabled -> Infinity). Channel caps by channel count, quality by capBitrate.
