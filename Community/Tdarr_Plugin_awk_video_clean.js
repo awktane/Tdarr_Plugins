@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.12',
+    Version: '3.999.13',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -354,6 +354,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // a fixed lowercase enum, so trim+lowercase are pure defensiveness - but one definition keeps every site defensive the SAME way, where per-site
     // spellings could classify the same stream differently. Optional-chained, so a nullish stream reads as "no type" rather than throwing.
     const codecTypeOf = (s) => (s?.codec_type || '').trim().toLowerCase();
+    // -=-=-= codecNameOf [all five] =-=-=-
+    // The stream's codec NAME, normalised the one way - jellyfin-ffprobe emits a fixed lowercase token, so trim+lowercase are pure defensiveness, but one
+    // definition keeps every site defensive the SAME way (a padded 'prores ' can't classify differently at two sites). Mirrors codecTypeOf; optional-chained.
+    const codecNameOf = (s) => (s?.codec_name || '').trim().toLowerCase();
     // ===== END SHARED: stream codec type =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: role/disposition classifiers =====
@@ -438,7 +442,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // and mkv carries it as an ATTACHMENT, not a video stream - so a dispositionless mjpeg/jpeg2000 video stream reads as real video, the
     // fail-safe direction. nb_frames cannot substitute for the disposition test: in mkv it is N/A for real MJPEG video AND for cover art.
     const IMAGE_CODECS = ['png', 'apng', 'gif', 'bmp', 'webp', 'tiff', 'qoi'];
-    const isCoverArt = (s) => IMAGE_CODECS.includes((s.codec_name || '').trim().toLowerCase())
+    const isCoverArt = (s) => IMAGE_CODECS.includes(codecNameOf(s))
         || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails');
     // ===== END SHARED: image / cover-art codecs =====
 
@@ -470,7 +474,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // undocumented format, so a real DTS:X track may still classify as the plain subtype - never the reverse, since detection only fires on an actual
     // reported value, never on the absence of one.
     const resolveCodecName = (stream) => {
-        let codec = (stream?.codec_name || '').toLowerCase().trim();
+        let codec = codecNameOf(stream);
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
 
         for (const [prefix, replacement] of codecAliases) {
@@ -540,11 +544,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: marker persistence =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: case-insensitive tag lookup =====
     // -=-=-= getTagCI  [all five] =-=-=-
-    // Look up a tag value case-insensitively - matroska UPPER-CASES tag keys on write, so a plugin reading its
-    // sibling's awk_* marker gets an uppercased key back. Returns the raw value (or '' if absent); callers trim/decode
-    // as needed. One source so the five plugins that read each other's markers can't drift on the lookup convention.
+    // Look up a tag value case-insensitively on BOTH sides - matroska UPPER-CASES tag keys on write, so a plugin reading
+    // its sibling's awk_* marker gets an uppercased key back, and the lookup name is folded too so a mixed-case name
+    // still matches. Returns the raw value (or '' if absent); callers trim/decode as needed. One source so the five
+    // plugins that read each other's markers can't drift on the lookup convention.
     const getTagCI = (tags, name) => {
-        const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === name);
+        const want = String(name).toLowerCase();
+        const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === want);
         return hit === undefined ? '' : String(tags[hit] ?? '');
     };
     // ===== END SHARED: case-insensitive tag lookup =====
@@ -817,7 +823,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!isMp4Family(container)) return '';
         const list = Array.isArray(streams) ? streams : [];
         const kept = Array.isArray(copied) ? copied : list;
-        if (kept.some((s) => codecTypeOf(s) === 'audio' && (s?.codec_name || '').toLowerCase().trim() === 'truehd')) return ' -strict experimental';
+        if (kept.some((s) => codecTypeOf(s) === 'audio' && codecNameOf(s) === 'truehd')) return ' -strict experimental';
         return list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s))) ? ' -strict unofficial' : '';
     };
     // ===== END SHARED: mp4 strict compliance arg =====
@@ -1653,7 +1659,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const mi = mediaInfoFor(primary);
         const srcWidth = Number(primary.width || mi?.Width || 0);
         const srcHeight = Number(primary.height || mi?.Height || 0);   // CODED height - what the decoder and the encoder see
-        const srcCodecName = (primary.codec_name || '').toLowerCase().trim();
+        const srcCodecName = codecNameOf(primary);
         // DISPLAY orientation: a phone clip is routinely CODED 1920x1080 with a 90-degree rotation, so it DISPLAYS 1080x1920 - downscale must judge what a
         // viewer sees, or a portrait 4K reads as "already within 1080". The emitted command needs no help (ffmpeg autorotates before the filter chain, so
         // scale=-2:N sets the DISPLAYED height); only the fire/skip decision and the tier were reading the wrong number. Both probes, since neither is

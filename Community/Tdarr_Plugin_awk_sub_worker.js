@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.21',
+    Version: '3.999.22',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -247,6 +247,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // a fixed lowercase enum, so trim+lowercase are pure defensiveness - but one definition keeps every site defensive the SAME way, where per-site
     // spellings could classify the same stream differently. Optional-chained, so a nullish stream reads as "no type" rather than throwing.
     const codecTypeOf = (s) => (s?.codec_type || '').trim().toLowerCase();
+    // -=-=-= codecNameOf [all five] =-=-=-
+    // The stream's codec NAME, normalised the one way - jellyfin-ffprobe emits a fixed lowercase token, so trim+lowercase are pure defensiveness, but one
+    // definition keeps every site defensive the SAME way (a padded 'prores ' can't classify differently at two sites). Mirrors codecTypeOf; optional-chained.
+    const codecNameOf = (s) => (s?.codec_name || '').trim().toLowerCase();
     // ===== END SHARED: stream codec type =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: role/disposition classifiers =====
@@ -331,7 +335,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // and mkv carries it as an ATTACHMENT, not a video stream - so a dispositionless mjpeg/jpeg2000 video stream reads as real video, the
     // fail-safe direction. nb_frames cannot substitute for the disposition test: in mkv it is N/A for real MJPEG video AND for cover art.
     const IMAGE_CODECS = ['png', 'apng', 'gif', 'bmp', 'webp', 'tiff', 'qoi'];
-    const isCoverArt = (s) => IMAGE_CODECS.includes((s.codec_name || '').trim().toLowerCase())
+    const isCoverArt = (s) => IMAGE_CODECS.includes(codecNameOf(s))
         || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails');
     // ===== END SHARED: image / cover-art codecs =====
 
@@ -363,7 +367,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // undocumented format, so a real DTS:X track may still classify as the plain subtype - never the reverse, since detection only fires on an actual
     // reported value, never on the absence of one.
     const resolveCodecName = (stream) => {
-        let codec = (stream?.codec_name || '').toLowerCase().trim();
+        let codec = codecNameOf(stream);
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
 
         for (const [prefix, replacement] of codecAliases) {
@@ -433,11 +437,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: marker persistence =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: case-insensitive tag lookup =====
     // -=-=-= getTagCI  [all five] =-=-=-
-    // Look up a tag value case-insensitively - matroska UPPER-CASES tag keys on write, so a plugin reading its
-    // sibling's awk_* marker gets an uppercased key back. Returns the raw value (or '' if absent); callers trim/decode
-    // as needed. One source so the five plugins that read each other's markers can't drift on the lookup convention.
+    // Look up a tag value case-insensitively on BOTH sides - matroska UPPER-CASES tag keys on write, so a plugin reading
+    // its sibling's awk_* marker gets an uppercased key back, and the lookup name is folded too so a mixed-case name
+    // still matches. Returns the raw value (or '' if absent); callers trim/decode as needed. One source so the five
+    // plugins that read each other's markers can't drift on the lookup convention.
     const getTagCI = (tags, name) => {
-        const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === name);
+        const want = String(name).toLowerCase();
+        const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === want);
         return hit === undefined ? '' : String(tags[hit] ?? '');
     };
     // ===== END SHARED: case-insensitive tag lookup =====
@@ -743,7 +749,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!isMp4Family(container)) return '';
         const list = Array.isArray(streams) ? streams : [];
         const kept = Array.isArray(copied) ? copied : list;
-        if (kept.some((s) => codecTypeOf(s) === 'audio' && (s?.codec_name || '').toLowerCase().trim() === 'truehd')) return ' -strict experimental';
+        if (kept.some((s) => codecTypeOf(s) === 'audio' && codecNameOf(s) === 'truehd')) return ' -strict experimental';
         return list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s))) ? ' -strict unofficial' : '';
     };
     // ===== END SHARED: mp4 strict compliance arg =====
@@ -898,7 +904,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const mime  = (s.tags?.mimetype || '').trim().toLowerCase();
         const fname = (s.tags?.filename || '').trim().toLowerCase();
         const ext   = fname.includes('.') ? fname.slice(fname.lastIndexOf('.') + 1) : '';
-        return ['ttf', 'otf'].includes((s.codec_name || '').trim().toLowerCase()) || isFontMime(mime) || FONT_EXTS.includes(ext);
+        return ['ttf', 'otf'].includes(codecNameOf(s)) || isFontMime(mime) || FONT_EXTS.includes(ext);
     };
     // ===== END SHARED: font attachment test =====
 
@@ -1935,13 +1941,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // no way to tell it apart from a file that genuinely had no such subtitle. Stopping is the far cheaper failure. The und/mul/zxx/mis/qaa-qtz allowance is
     // load-bearing, NOT laxness: the filter is compared against langKey(resolveLang(s) || 'und'), so scoping on 'und' is how untagged subtitles are selected.
     // #region SHARED helpers (1 section: language token recognition)
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: special language code =====
+    // -=-=-= isNonLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // The special / non-language ISO 639-2 codes plus the qaa-qtz private-use range: und (undetermined), mul (multiple), zxx (no linguistic content),
+    // mis (uncoded). One predicate so every consumer agrees on the set - knownLangToken ACCEPTS these in the free-text language lists, and clean_and_remux
+    // accepts them in language_sub, refuses them in language_fill, and passes them unrewritten through tag canonicalisation. Drift the set in one spelling
+    // and one settings string would mean different things at different pipeline stages.
+    const isNonLang = (k) => k === 'und' || k === 'mul' || k === 'zxx' || k === 'mis' || /^q[a-t][a-z]$/.test(k);
+    // ===== END SHARED: special language code =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker]: language token recognition =====
     // -=-=-= knownLangToken  [audio_clean, stream_ordering, sub_worker] =-=-=-
     // Is an already-folded langKey a recognised language token: any real language in any form (langKey folds en/eng/English/en-US/pt-BR to one base code), or
-    // a valid special/private code - und (undetermined), mul (multiple), zxx (no linguistic content), mis (uncoded) and the qaa-qtz private-use range. Those
-    // specials are load-bearing rather than laxness: stream language tags carry them, so a list has to be able to name them. Why an unrecognised token STOPS
-    // the file is per-plugin and stays above this section, since it depends on what that plugin's input scopes; the message itself is failLangToken.
-    const knownLangToken = (key) => key === 'und' || key === 'mul' || key === 'zxx' || key === 'mis' || /^q[a-t][a-z]$/.test(key) || !!langDisplayName(key);
+    // one of the special/private codes isNonLang accepts (load-bearing rather than laxness: stream language tags carry them, so a list has to be able to name
+    // them). Why an unrecognised token STOPS the file is per-plugin and stays above this section, since it depends on what that plugin's input scopes; the
+    // message itself is failLangToken.
+    const knownLangToken = (key) => isNonLang(key) || !!langDisplayName(key);
     // ===== END SHARED: language token recognition =====
     // #endregion
     const onlyLangRaw = splitList(inputs.only_languages);
@@ -2039,7 +2053,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const mi = mediaInfoFor(ccVideo) || {};
             const xfer = String(ccVideo.color_transfer || mi.transfer_characteristics || '').toLowerCase().trim();
             const hdrFmt = String(mi.HDR_Format || mi.HDR_Format_Compatibility || '').trim();
-            return String(ccVideo.codec_name || '').toLowerCase().trim() === 'h264'
+            return codecNameOf(ccVideo) === 'h264'
                 && !isDolbyVisionVideo(ccVideo, mi) && !HDR_TRANSFERS.includes(xfer) && !hdrFmt;
         };
 

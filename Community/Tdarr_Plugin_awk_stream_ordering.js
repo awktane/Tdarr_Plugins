@@ -15,7 +15,7 @@ const details = () => ({
         it's needed).\n\nBecause it runs last it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file
         that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the signature of an out-of-memory-killed or
         unfinalised encode from an earlier stage. A longer output is accepted. This check is always on and has no setting.\n`,
-    Version: '4.999.3',
+    Version: '4.999.4',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -268,15 +268,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // a fixed lowercase enum, so trim+lowercase are pure defensiveness - but one definition keeps every site defensive the SAME way, where per-site
     // spellings could classify the same stream differently. Optional-chained, so a nullish stream reads as "no type" rather than throwing.
     const codecTypeOf = (s) => (s?.codec_type || '').trim().toLowerCase();
+    // -=-=-= codecNameOf [all five] =-=-=-
+    // The stream's codec NAME, normalised the one way - jellyfin-ffprobe emits a fixed lowercase token, so trim+lowercase are pure defensiveness, but one
+    // definition keeps every site defensive the SAME way (a padded 'prores ' can't classify differently at two sites). Mirrors codecTypeOf; optional-chained.
+    const codecNameOf = (s) => (s?.codec_name || '').trim().toLowerCase();
     // ===== END SHARED: stream codec type =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: case-insensitive tag lookup =====
     // -=-=-= getTagCI  [all five] =-=-=-
-    // Look up a tag value case-insensitively - matroska UPPER-CASES tag keys on write, so a plugin reading its
-    // sibling's awk_* marker gets an uppercased key back. Returns the raw value (or '' if absent); callers trim/decode
-    // as needed. One source so the five plugins that read each other's markers can't drift on the lookup convention.
+    // Look up a tag value case-insensitively on BOTH sides - matroska UPPER-CASES tag keys on write, so a plugin reading
+    // its sibling's awk_* marker gets an uppercased key back, and the lookup name is folded too so a mixed-case name
+    // still matches. Returns the raw value (or '' if absent); callers trim/decode as needed. One source so the five
+    // plugins that read each other's markers can't drift on the lookup convention.
     const getTagCI = (tags, name) => {
-        const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === name);
+        const want = String(name).toLowerCase();
+        const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === want);
         return hit === undefined ? '' : String(tags[hit] ?? '');
     };
     // ===== END SHARED: case-insensitive tag lookup =====
@@ -363,7 +369,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // and mkv carries it as an ATTACHMENT, not a video stream - so a dispositionless mjpeg/jpeg2000 video stream reads as real video, the
     // fail-safe direction. nb_frames cannot substitute for the disposition test: in mkv it is N/A for real MJPEG video AND for cover art.
     const IMAGE_CODECS = ['png', 'apng', 'gif', 'bmp', 'webp', 'tiff', 'qoi'];
-    const isCoverArt = (s) => IMAGE_CODECS.includes((s.codec_name || '').trim().toLowerCase())
+    const isCoverArt = (s) => IMAGE_CODECS.includes(codecNameOf(s))
         || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails');
     // ===== END SHARED: image / cover-art codecs =====
 
@@ -395,7 +401,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // undocumented format, so a real DTS:X track may still classify as the plain subtype - never the reverse, since detection only fires on an actual
     // reported value, never on the absence of one.
     const resolveCodecName = (stream) => {
-        let codec = (stream?.codec_name || '').toLowerCase().trim();
+        let codec = codecNameOf(stream);
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
 
         for (const [prefix, replacement] of codecAliases) {
@@ -944,7 +950,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!isMp4Family(container)) return '';
         const list = Array.isArray(streams) ? streams : [];
         const kept = Array.isArray(copied) ? copied : list;
-        if (kept.some((s) => codecTypeOf(s) === 'audio' && (s?.codec_name || '').toLowerCase().trim() === 'truehd')) return ' -strict experimental';
+        if (kept.some((s) => codecTypeOf(s) === 'audio' && codecNameOf(s) === 'truehd')) return ' -strict experimental';
         return list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s))) ? ' -strict unofficial' : '';
     };
     // ===== END SHARED: mp4 strict compliance arg =====
@@ -980,13 +986,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // rules not working. order_codec is genuinely open (codec names come and go, and an unknown one is inert rather than misleading), so it stays unchecked.
     // The und/mul/zxx/mis/qaa-qtz allowance matches every other language input - 'und' is a real ordering target, since untagged tracks sort somewhere too.
     // #region SHARED helpers (1 section: language token recognition)
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: special language code =====
+    // -=-=-= isNonLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // The special / non-language ISO 639-2 codes plus the qaa-qtz private-use range: und (undetermined), mul (multiple), zxx (no linguistic content),
+    // mis (uncoded). One predicate so every consumer agrees on the set - knownLangToken ACCEPTS these in the free-text language lists, and clean_and_remux
+    // accepts them in language_sub, refuses them in language_fill, and passes them unrewritten through tag canonicalisation. Drift the set in one spelling
+    // and one settings string would mean different things at different pipeline stages.
+    const isNonLang = (k) => k === 'und' || k === 'mul' || k === 'zxx' || k === 'mis' || /^q[a-t][a-z]$/.test(k);
+    // ===== END SHARED: special language code =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker]: language token recognition =====
     // -=-=-= knownLangToken  [audio_clean, stream_ordering, sub_worker] =-=-=-
     // Is an already-folded langKey a recognised language token: any real language in any form (langKey folds en/eng/English/en-US/pt-BR to one base code), or
-    // a valid special/private code - und (undetermined), mul (multiple), zxx (no linguistic content), mis (uncoded) and the qaa-qtz private-use range. Those
-    // specials are load-bearing rather than laxness: stream language tags carry them, so a list has to be able to name them. Why an unrecognised token STOPS
-    // the file is per-plugin and stays above this section, since it depends on what that plugin's input scopes; the message itself is failLangToken.
-    const knownLangToken = (key) => key === 'und' || key === 'mul' || key === 'zxx' || key === 'mis' || /^q[a-t][a-z]$/.test(key) || !!langDisplayName(key);
+    // one of the special/private codes isNonLang accepts (load-bearing rather than laxness: stream language tags carry them, so a list has to be able to name
+    // them). Why an unrecognised token STOPS the file is per-plugin and stays above this section, since it depends on what that plugin's input scopes; the
+    // message itself is failLangToken.
+    const knownLangToken = (key) => isNonLang(key) || !!langDisplayName(key);
     // ===== END SHARED: language token recognition =====
     // #endregion
     const orderLangTokens = splitList(inputs.order_language);
@@ -1013,7 +1027,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // for a foreign list like originalLibraryFile's, where it would read the transcoded file's mediaInfo track at the same index. durVideoStream runs over BOTH
         // files, so it tests cover art self-contained: an image codec, or a raw cover-art disposition flag. The three cover-art dispositionTypes are streams:['video'],
         // keywords:[], so for a video stream this resolves to exactly what isCoverArt does today (behaviour-identical) and it stays sound if a keyword is ever added.
-        const foreignCoverArt = (s) => IMAGE_CODECS.includes((s.codec_name || '').trim().toLowerCase())
+        const foreignCoverArt = (s) => IMAGE_CODECS.includes(codecNameOf(s))
             || s.disposition?.attached_pic === 1 || s.disposition?.still_image === 1 || s.disposition?.timed_thumbnails === 1;
         const durVideoStream = (obj) => (obj?.ffProbeData?.streams || []).find(s => codecTypeOf(s) === 'video' && !foreignCoverArt(s));
         const durAudioCount = (obj) => (obj?.ffProbeData?.streams || []).filter(s => codecTypeOf(s) === 'audio').length;
