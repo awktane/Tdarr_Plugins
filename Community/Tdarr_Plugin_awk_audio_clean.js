@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.17',
+    Version: '4.999.18',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1560,7 +1560,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const lowInfo = isStereoSrc && Number(srcBps) > 0 && Number(srcBps) <= AAC_VBR_LOWINFO_BPS;
         if (hasEncoder('libfdk_aac')) {
             const vbrLevel = lowInfo ? 4 : 5;
-            return { encoder: 'libfdk_aac', args: ` -vbr:a:${idx} ${vbrLevel}`, approxRate: lowInfo ? '~128k' : '~192k', label: `libfdk VBR q${vbrLevel}` };
+            const approxRate = `~${aacVbrPredictedBps(lowInfo ? AAC_VBR_LOWINFO_BPS : Infinity) / 1000}k`;   // one source with guardBlocks' prediction
+            return { encoder: 'libfdk_aac', args: ` -vbr:a:${idx} ${vbrLevel}`, approxRate, label: `libfdk VBR q${vbrLevel}` };
         }
         if (hasEncoder('aac_at')) {
             if (!_aacVbrFallbackWarned) {
@@ -1601,12 +1602,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const langSurround = splitList(inputs.language_surround).map(lang => lang.toLowerCase());
     const langSurroundKeys = langSurround.map(langKey);
     const langUnlisted = String(inputs.language_unlisted).trim();
-    const downmixSecondary = String(inputs.downmix_secondary).trim();
-    const downmixToSix = String(inputs.downmix_to_six).trim();
-    const downmixToStereo = String(inputs.downmix_to_stereo).trim();
     const forceCodec = String(inputs.codec_force).trim();
     const stereoCodec = String(inputs.codec_stereo).trim();
     const surroundCodec = String(inputs.codec_surround).trim();
+    const downmixSecondary = String(inputs.downmix_secondary).trim();
+    const downmixToSix = String(inputs.downmix_to_six).trim();
+    const downmixToStereo = String(inputs.downmix_to_stereo).trim();
     const methodDedupRegion = String(inputs.method_dedup_region).trim();
     const methodDeduplicate = String(inputs.method_deduplicate).trim();
     const methodLayoutErr = String(inputs.method_layout_err).trim();
@@ -1650,12 +1651,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // [inputName, parsedValue, validOptions] - checked top-down, failing on the first bad value, and the message always echoes the value that was tested.
     const dropdownChecks = [
         ['language_unlisted',     langUnlisted,         ['surround', 'stereo', 'delete']],
-        ['downmix_secondary',     downmixSecondary,     ['surround', 'stereo', 'delete']],
-        ['downmix_to_six',        downmixToSix,         ['disabled', 'replace', 'add']],
-        ['downmix_to_stereo',     downmixToStereo,      ['disabled', 'replace', 'add']],
         ['codec_force',           forceCodec,           ['disabled', '2below', '6below', 'all']],
         ['codec_stereo',          stereoCodec,          ['aac', 'aac_vbr', 'ac3', 'eac3', 'opus']],
         ['codec_surround',        surroundCodec,        ['aac', 'ac3', 'eac3', 'opus']],
+        ['downmix_secondary',     downmixSecondary,     ['surround', 'stereo', 'delete']],
+        ['downmix_to_six',        downmixToSix,         ['disabled', 'replace', 'add']],
+        ['downmix_to_stereo',     downmixToStereo,      ['disabled', 'replace', 'add']],
         ['method_dedup_region',   methodDedupRegion,    ['fold', 'distinct']],
         ['method_deduplicate',    methodDeduplicate,    ['disabled', 'multi-stereo', 'multi-stereo-error', 'channel', 'channel-error']],
         ['method_layout_err',     methodLayoutErr,      ['keep', 'drop', 'remix']],
@@ -1816,6 +1817,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // (Atmos -> ac3 = 8pt, DTS-HD -> ac3 = 10pt). QUALITY_MARGIN = 7 is the DTS(91)-vs-ac3(84) base-score gap, so DTS core -> ac3 sits exactly at the
         // margin on the pass side (a drop must STRICTLY exceed it to protect) - preserving the force-DTS-to-ac3 behaviour.
         const QUALITY_MARGIN = 7;
+        // The three-guard parenthetical shared by the codec_force and loudnorm "would lose detail" skip lines, defined once so the two cannot word-drift.
+        const guardTriple = () => `guard_lossless=${guardLossless}, guard_quality=${guardQuality}, guard_object_audio=${guardObjectAudio}`;
         const guardBlocks = (stream, targetCodec, targetChannels, srcChannels) => {
             if (stream.awkSecondaryTrack || stream.awkTier !== 'surround') return false;
             if (guardLossless === 'enabled' && stream.awkLossless) return true;         // lossless detail can't survive any lossy re-encode
@@ -2001,6 +2004,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             '6.1(back)': { layout: '6.1', map: 'FL-FL|FR-FR|FC-FC|LFE-LFE|BL-SL|BR-SR|BC-BC' },
             'quad(side)': { layout: 'quad', map: 'FL-FL|FR-FR|SL-BL|SR-BR' },
         };
+        // One place that answers "what does opus make of this layout?": the normalised layout string, whether libopus accepts it, and its lossless relabel
+        // (null if none). The layout-drop pre-pass, the codec_force opus branch and the loudnorm convergence-to-opus path each ask a different downstream
+        // question of the same verdict, so a new OPUS_RELABEL entry or a normalisation change lands in one spot instead of three.
+        const opusLayoutFor = (stream, channels) => {
+            const lay = (stream.channel_layout || '').toLowerCase().trim();
+            return { lay, ok: opusAcceptsLayout(channels, lay), relabel: OPUS_RELABEL[lay] || null };
+        };
         // Surviving audio COUNT (streams not in removedIndices), read at call time so it reflects dedup + pre-pass removals - backs the never-drop-last guard.
         const countSurvivingAudio = () => file.ffProbeData.streams.filter(a => codecTypeOf(a) === 'audio' && !removedIndices.has(a.index)).length;
 
@@ -2042,14 +2052,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             for (const s of audioStreams) {
                 if (removedIndices.has(s.index)) continue;
                 const ch = resolveChannels(s);
-                const lay = (s.channel_layout || '').toLowerCase().trim();
                 if (ch <= 2 || ch > 8) continue;                                             // stereo→codec_stereo; >8 blocked (targetMaxCh)
                 if (codecNameOf(s) === 'opus') continue;                 // already opus
                 // guard_lossless/guard_quality/guard_object_audio — mirrors the force-site guard (surroundCodec is opus)
                 if (guardBlocks(s, surroundCodec, ch, ch)) continue;
                 if (!forceCovers(false, ch)) continue;   // is this surround track (never stereo here: ch is 3-8) in codec_force's scope?
-                if (opusAcceptsLayout(ch, lay)) continue;
-                if (OPUS_RELABEL[lay]) continue;                                             // losslessly relabelable → the loop transcodes it, never drop
+                const opusLayout = opusLayoutFor(s, ch);
+                if (opusLayout.ok) continue;
+                if (opusLayout.relabel) continue;                                            // losslessly relabelable → the loop transcodes it, never drop
                 // A downmix that will process this track keeps it out of the drop pile — whether it converts in place (replace, unguarded) or
                 // flips to 'add' (guarded: source kept + a derivative added), the track SURVIVES, so defer the drop to the loop; only a track NO
                 // downmix touches is truly dropped. Must NOT gate this on guardBlocks: a guarded replace flips to 'add', which keeps the source
@@ -2666,14 +2676,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     } else if (shouldForce && guardBlocks(ffstream, targetCodec, forceChannels, forceChannels)) {
                         // Guarded: forcing this codec would irreversibly lose detail the target can't hold - see the FORCE CODEC note above.
                         skipDone += `☒${streamTag(ffstream.index)}[codec_force=${forceCodec}] Not forcing ${targetCodecFamily} - would lose detail vs `
-                            + `${codecDisplayName(ffstream)} ${forceChannels}ch @ ${srcRateStr} (guard_lossless=${guardLossless}, `
-                            + `guard_quality=${guardQuality}, guard_object_audio=${guardObjectAudio}); left as ${ffstreamCodec}\n`;
+                            + `${codecDisplayName(ffstream)} ${forceChannels}ch @ ${srcRateStr} (${guardTriple()}); left as ${ffstreamCodec}\n`;
                     } else if (shouldForce) {
                         // Guard the force-to-opus path against libopus-incompatible layouts (method_layout_err). Only opus is affected - AC3/EAC3/AAC
                         // take any layout. `forced` gates the run's convert flag so a keep/defer makes no change (and doesn't cause a needless re-run).
-                        const srcLayout = (ffstream.channel_layout || '').toLowerCase().trim();
-                        const opusBad = targetCodec === 'opus' && forceChannels > 2 && !opusAcceptsLayout(forceChannels, srcLayout);
-                        const relabel = opusBad ? OPUS_RELABEL[srcLayout] : null;
+                        const opusLayout = opusLayoutFor(ffstream, forceChannels);
+                        const srcLayout = opusLayout.lay;
+                        const opusBad = targetCodec === 'opus' && forceChannels > 2 && !opusLayout.ok;
+                        const relabel = opusBad ? opusLayout.relabel : null;
                         const layoutName = srcLayout || `${forceChannels}ch`;
                         // remix→stereo defers when the language already has a stereo (hasStereoForLang, which is where the duplicate rule is explained);
                         // fall back to keep.
@@ -2810,8 +2820,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             + `${codecMaxCh(aacFamily(keepCodec))}ch limit for ${aacFamily(keepCodec)}\n`;
                     else
                         skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - would lose detail vs `
-                            + `${codecDisplayName(ffstream)} ${channels}ch (guard_lossless=${guardLossless}, guard_quality=${guardQuality}, `
-                            + `guard_object_audio=${guardObjectAudio}); left as ${ffstreamCodec}\n`;
+                            + `${codecDisplayName(ffstream)} ${channels}ch (${guardTriple()}); left as ${ffstreamCodec}\n`;
                     continue;
                 }
                 const targetFamily = aacFamily(targetCodec);
@@ -2828,9 +2837,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // once the audio index maps are built (the codec_force path drops such a track in the pre-pass) - leave it in its source codec, un-normalized.
                 let loudnormRelabel = '';
                 if (targetFamily === 'opus' && channels > 2 && ffstreamCodec !== 'opus') {
-                    const lay = (ffstream.channel_layout || '').toLowerCase().trim();
-                    if (!opusAcceptsLayout(channels, lay)) {
-                        const relabel = OPUS_RELABEL[lay];
+                    const { lay, ok, relabel } = opusLayoutFor(ffstream, channels);
+                    if (!ok) {
                         const remixDefer = !relabel && methodLayoutErr === 'remix'
                             && hasStereoForLang(ffstream.awkRegionKey);
                         if (relabel) {
