@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.16',
+    Version: '4.999.17',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1626,7 +1626,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // the stored tag verbatim (ffprobe tag, then mediaInfo), preserving case. audio_clean never NORMALISES a language tag - that is clean_and_remux's job.
     const langForWrite = (s) => (s.tags?.language || '').trim() || (mediaInfoFor(s)?.Language ?? '').trim();
     // Does codec_force's scope cover a track of this shape? ('6below' takes every stereo track plus any surround track up to 6ch; 'all' drops that 6ch bound.)
-    // ONE predicate for the two places that consult the setting, because they ask DIFFERENT questions of it: the FORCE CODEC block asks "is a re-encode worth
+    // ONE predicate for every place that consults the setting, because they ask DIFFERENT questions of it: the FORCE CODEC block asks "is a re-encode worth
     // spending on this track?", while loudnorm's leftovers loop - which only runs once a re-encode is already happening for the gain correction - asks "since
     // we are encoding anyway, whose codec applies?". A second hand-copied scope test is exactly how those two would drift apart.
     const forceCovers = (isStereo, channels) => forceCodec === 'all'
@@ -2047,7 +2047,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (codecNameOf(s) === 'opus') continue;                 // already opus
                 // guard_lossless/guard_quality/guard_object_audio — mirrors the force-site guard (surroundCodec is opus)
                 if (guardBlocks(s, surroundCodec, ch, ch)) continue;
-                if (!(forceCodec === 'all' || (forceCodec === '6below' && ch <= 6))) continue;   // surround shouldForce (mirrors the loop)
+                if (!forceCovers(false, ch)) continue;   // is this surround track (never stereo here: ch is 3-8) in codec_force's scope?
                 if (opusAcceptsLayout(ch, lay)) continue;
                 if (OPUS_RELABEL[lay]) continue;                                             // losslessly relabelable → the loop transcodes it, never drop
                 // A downmix that will process this track keeps it out of the drop pile — whether it converts in place (replace, unguarded) or
@@ -2126,12 +2126,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // workStreams to reach that downmix regardless of downmix_to_* / codec.
         const noCodecWorkNeeded = (stream) => {
             if(stream.channels > 6 && stream.awkTier === 'surround' && (downmixToSix === 'disabled') && (downmixToStereo === 'disabled')
-                    && (forceCodec === 'all' && (codecFamilyOf(stream) === surroundCodec)))
+                    && (forceCovers(stream.channels <= 2, stream.channels) && (codecFamilyOf(stream) === surroundCodec)))
                 return true;
             else if(stream.channels > 2 && stream.channels <= 6 && stream.awkTier === 'surround' && (downmixToStereo === 'disabled')
-                    && (['all','6below'].includes(forceCodec) && (codecFamilyOf(stream) === surroundCodec)))
+                    && (forceCovers(stream.channels <= 2, stream.channels) && (codecFamilyOf(stream) === surroundCodec)))
                 return true;
-            if((stream.channels <= 2) && ['all','6below','2below'].includes(forceCodec) && (codecFamilyOf(stream) === stereoCodecFamily))
+            if((stream.channels <= 2) && forceCovers(stream.channels <= 2, stream.channels) && (codecFamilyOf(stream) === stereoCodecFamily))
                 return true;
             return false;
         };

@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.22',
+    Version: '4.999.23',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -925,7 +925,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!inputs.container || inputs.container === '')
         failFile(`[container=${inputs.container || ''}] not configured, check your settings`);
 
-    const srcContainer = file.container.toLowerCase().trim();
+    const srcContainer = String(file.container || '').toLowerCase().trim();
     // let, not const: method_unmuxable=mkv_fallback rewrites this (and response.container) for THIS file when the target container cannot store one of its
     // codecs. The rewrite happens before any consumer runs - see the muxability gate at the top of the per-file work below.
     let dstContainer = inputs.container.toLowerCase().trim();

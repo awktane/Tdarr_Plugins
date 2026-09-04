@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.13',
+    Version: '3.999.14',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1665,8 +1665,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // scale=-2:N sets the DISPLAYED height); only the fire/skip decision and the tier were reading the wrong number. Both probes, since neither is
         // complete (ffprobe: numeric side_data rotation on mp4 AND mkv; MediaInfo: string Rotation, mp4 only), and they disagree on sign and wrap (ffprobe
         // -90 is MediaInfo "270.000") - so only the PARITY is read: an odd quarter-turn swaps displayed width/height, a test no sign convention can flip.
-        const displayMatrix = (Array.isArray(primary.side_data_list) ? primary.side_data_list : [])
-            .find((sd) => /display matrix/i.test(String(sd?.side_data_type || '')));
+        // primary's ffprobe side-data list, normalised once for the rotation-parity read here and the DV/HDR reads further down
+        const sideDataList = Array.isArray(primary.side_data_list) ? primary.side_data_list : [];
+        const displayMatrix = sideDataList.find((sd) => /display matrix/i.test(String(sd?.side_data_type || '')));
         const rotationDeg = Number(displayMatrix?.rotation ?? mi?.Rotation ?? 0);
         const quarterTurned = Number.isFinite(rotationDeg) && Math.abs(Math.round(rotationDeg / 90)) % 2 === 1;
         const dispHeight = quarterTurned && srcWidth > 0 ? srcWidth : srcHeight;   // the height the downscale and the quality tier both judge
@@ -1687,13 +1688,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // - detected from BOTH probes (mediaInfo HDR_Format + ffprobe DOVI/HDR10+ side_data or a DV codec tag); a single-probe false
         // negative is destructive. isHdr (any HDR incl. static) gates tonemapping; dvSignal is DV specifically (excludes HDR10+).
         const hdrFmt = String(mi?.HDR_Format || mi?.HDR_Format_Compatibility || '').toLowerCase();
-        const dvSideData = Array.isArray(primary.side_data_list) ? primary.side_data_list : [];
         const dvCodecTag = DV_FOURCC_RE.test(String(primary.codec_tag_string || '').toLowerCase().trim());
-        const ffprobeDynamicHdr = dvSideData
+        const ffprobeDynamicHdr = sideDataList
             .some((sd) => /dovi|dolby vision|smpte ?2094|hdr dynamic metadata/.test(String(sd?.side_data_type || '').toLowerCase())) || dvCodecTag;
         const isDynamicHdr = hdrFmt.includes('dolby vision') || DYNAMIC_HDR_RE.test(hdrFmt) || ffprobeDynamicHdr;
         // DOVI configuration record (ffprobe side_data) -> profile-aware logging: dvLabel names the profile, and 8.x carries a compat id (8.1 HDR10 / 8.4 HLG).
-        const doviRec = dvSideData.find((sd) => /dovi configuration record/i.test(String(sd?.side_data_type || '')));
+        const doviRec = sideDataList.find((sd) => /dovi configuration record/i.test(String(sd?.side_data_type || '')));
         const dovi = doviRec
             ? { profile: Number(doviRec.dv_profile), compatId: Number(doviRec.dv_bl_signal_compatibility_id), elPresent: doviRec.el_present_flag === 1 }
             : null;
@@ -1712,7 +1712,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // the DV fourcc: reusing that would make every Dolby Vision file claim an HDR10+ layer it does not carry. And the flag deliberately does
         // NOT exclude dvSignal, because a real release can carry both at once and the two are stripped by different filters - a DV-excluded flag
         // hid the HDR10+ half entirely, so the strip removed only the RPU while the log reported the file done with dynamic HDR.
-        const ffprobeHdr10Plus = dvSideData.some((sd) => {
+        const ffprobeHdr10Plus = sideDataList.some((sd) => {
             const t = String(sd?.side_data_type || '').toLowerCase();
             return /smpte ?2094|hdr dynamic metadata/.test(t) && !/dovi|dolby vision/.test(t);
         });
