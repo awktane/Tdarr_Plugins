@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.11',
+    Version: '3.999.12',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1792,10 +1792,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // action's business. The detection decode is the one real cost of turning this on, so it runs ONLY when the setting is live - never on the default.
         // Tests inject otherArguments.__awkCap.idet to pin a verdict without spawning ffmpeg, exactly as they do for the encoder and tonemap probes.
         const deinterlaceLive = deinterlaceOpt !== 'disabled' && action !== 'hdr_cleanup_only';
-        // LAZY and memoised: this is a real ffmpeg decode (measured 5.4 s wall / 35 s CPU at 4K on an idle Mac - and idle is ~3x optimistic vs a loaded
-        // node), and Tdarr re-cycles the stack until every plugin skips, so an eager probe is paid again on every cycle. realTranscode() tries the three
-        // metadata triggers first and reaches for this only when interlace repair would be the sole reason to encode - the case where the verdict is
-        // genuinely load-bearing. Nothing may read idetMemo's value except through idet().
+        // LAZY and memoised for this invocation only: this is a real ffmpeg decode (measured 5.4 s wall / 35 s CPU at 4K on an idle Mac - and idle is ~3x
+        // optimistic vs a loaded node), and Tdarr re-cycles the stack until every plugin skips, so an eager probe is paid again on every cycle. realTranscode()
+        // tries the three metadata triggers first and reaches for this only when interlace repair would be the sole reason to encode - the case where the
+        // verdict is genuinely load-bearing. The verdict is deliberately NOT persisted across passes (no awk_idet tag, no one-time tag-only mux the way
+        // sub_worker records awk_cc=none): tags have proven unreliable to carry across muxes and other plugins, and the only cost of re-deciding is that one
+        // decode - paid only when a progressive file with deinterlace=enabled re-cycles and nothing cheaper triggers an encode - too low to justify cross-pass
+        // persistence machinery or the whole-file remux write it would force on files that never transcode. Nothing may read idetMemo's value except through
+        // idet() - and deintVerdictLine, which reads the memo raw by design so emitting the verdict can never itself provoke the decode (see its comment).
         let idetMemo = null;
         const idet = () => {
             if (idetMemo) return idetMemo;
