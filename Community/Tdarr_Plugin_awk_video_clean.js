@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.14',
+    Version: '3.999.15',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1598,13 +1598,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const guardLossless = String(inputs.guard_lossless) === 'true';   // boolean, default true
 
     // The two free-text NUMERIC inputs are the only user-typed values this plugin echoes back, and failFile's message becomes the file's stored error, so
-    // they get the same treatment as every other free-text echo in the suite (clean_and_remux's logSafe, the shared failLangToken): control characters to
-    // space, because infoLog is newline-delimited and a raw newline turns the rest of the paste into a status line the plugin never wrote, and a 200-char
-    // cap, because loadDefaultValues only trims and Tdarr persists the whole message however large the value was.
-    const inputEcho = (v) => logTok(v, 200);
+    // they get the same treatment as every other free-text echo in the suite - the shared logTok(v, 200): control characters to space, because infoLog is
+    // newline-delimited and a raw newline turns the rest of the paste into a status line the plugin never wrote, and a 200-char cap, because loadDefaultValues
+    // only trims and Tdarr persists the whole message however large the value was.
     const parseQuality = (v, name) => {
         const n = Number(String(v).trim());
-        if (!Number.isFinite(n) || n < 0 || n > 63) failFile(`[${name}=${inputEcho(v)}] must be a number between 0 and 63, check your settings`);
+        if (!Number.isFinite(n) || n < 0 || n > 63) failFile(`[${name}=${logTok(v, 200)}] must be a number between 0 and 63, check your settings`);
         return n;
     };
     const qualitySd = parseQuality(inputs.quality_sd, 'quality_sd');
@@ -1614,13 +1613,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const guardShrinkKbps = (() => {
         const n = Number(String(inputs.guard_shrink_bitrate).trim());
         if (!Number.isFinite(n) || n < 0)
-            failFile(`[guard_shrink_bitrate=${inputEcho(inputs.guard_shrink_bitrate)}] must be a non-negative number (kbps), check your settings`);
+            failFile(`[guard_shrink_bitrate=${logTok(inputs.guard_shrink_bitrate, 200)}] must be a non-negative number (kbps), check your settings`);
         return n;
     })();
 
     // Every dropdown's accepted set, as ONE table driving ONE loop. The shape matters beyond the line count: CLAUDE.md's retired-option policy says a value the
     // dropdown no longer offers must STOP the file, and input_surface_diff.js has to locate each dropdown's validator to report an accepted-but-not-offered
-    // value. A uniform table is an anchor it can find; eleven differently-shaped `if` statements are not, and one of them going stale is invisible - that is
+    // value. A uniform table is an anchor it can find; eight differently-shaped `if` statements are not, and one of them going stale is invisible - that is
     // how video_clean's method_encoder kept accepting five retired encoder families for seventeen minor versions. Non-dropdown checks stay where they are.
     const dropdownChecks = [
         ['action',           action,          ['hdr_cleanup_only', 'normalize', 'shrink']],
