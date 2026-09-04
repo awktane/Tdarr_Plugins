@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.15',
+    Version: '3.999.16',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -905,19 +905,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Synthetic 256x256 lavfi test source for the confirming HW probes below (each reads a single frame); only the fill colour varies.
     const testColorSource = (color) => `color=c=${color}:s=256x256:d=1:r=5`;
 
+    // Run one probe command and report only whether it exited 0 - the shared spawn+verdict skeleton for the confirm* probes below, so a future hardening
+    // (a maxBuffer cap, stderr capture) lands once instead of per probe. Each caller builds its own args; that is pure string work and cannot throw.
+    const probeOk = (ffmpegPath, args) => {
+        try { return childProcess.spawnSync(ffmpegPath || 'ffmpeg', args, { encoding: 'utf8', timeout: CONFIRM_PROBE_TIMEOUT_MS }).status === 0; }
+        catch (e) { return false; }
+    };
+
     // Single confirming probe (one 256x256 frame) of ONE candidate encoder - used only for ambiguous families/cases, never as a blind per-codec ladder.
     const confirmEncode = (ffmpegPath, encoderName, inputSide, filter) => {
-        let ok = false;
-        try {
-            const args = ['-hide_banner'];
-            if (inputSide) args.push(...inputSide.split(' ').filter(Boolean));
-            args.push('-f', 'lavfi', '-i', testColorSource('black'));
-            if (filter) args.push('-vf', filter);
-            args.push('-frames:v', '1', '-c:v', encoderName, '-f', 'null', '-');
-            const r = childProcess.spawnSync(ffmpegPath || 'ffmpeg', args, { encoding: 'utf8', timeout: CONFIRM_PROBE_TIMEOUT_MS });
-            ok = r.status === 0;
-        } catch (e) { ok = false; }
-        return ok;
+        const args = ['-hide_banner'];
+        if (inputSide) args.push(...inputSide.split(' ').filter(Boolean));
+        args.push('-f', 'lavfi', '-i', testColorSource('black'));
+        if (filter) args.push('-vf', filter);
+        args.push('-frames:v', '1', '-c:v', encoderName, '-f', 'null', '-');
+        return probeOk(ffmpegPath, args);
     };
 
     // The GPU tonemap curve, shared by the probe below and both emit sites in buildVideoArgs. The probe's verdict is only meaningful because it runs THE SAME
@@ -929,16 +931,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // input ("unsupported transfer function"), so a plain test pattern false-negatives - the probe stamps a synthetic HDR transfer (smpte2084/bt2020) onto
     // one frame and runs the real island. Cheap; the encoder-side re-upload (vaapi) is not probed here (that device is already proven by the encoder probe).
     const confirmTonemap = (ffmpegPath, backend) => {
-        let ok = false;
-        try {
-            const island = 'format=p010le,setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc,hwupload,'
-                + `tonemap_${backend}=${GPU_TONEMAP_OPTS}nv12,hwdownload,format=nv12`;
-            const args = ['-hide_banner', '-init_hw_device', `${backend}=tm`, '-filter_hw_device', 'tm',
-                '-f', 'lavfi', '-i', testColorSource('gray'), '-vf', island, '-frames:v', '1', '-f', 'null', '-'];
-            const r = childProcess.spawnSync(ffmpegPath || 'ffmpeg', args, { encoding: 'utf8', timeout: CONFIRM_PROBE_TIMEOUT_MS });
-            ok = r.status === 0;
-        } catch (e) { ok = false; }
-        return ok;
+        const island = 'format=p010le,setparams=color_trc=smpte2084:color_primaries=bt2020:colorspace=bt2020nc,hwupload,'
+            + `tonemap_${backend}=${GPU_TONEMAP_OPTS}nv12,hwdownload,format=nv12`;
+        const args = ['-hide_banner', '-init_hw_device', `${backend}=tm`, '-filter_hw_device', 'tm',
+            '-f', 'lavfi', '-i', testColorSource('gray'), '-vf', island, '-frames:v', '1', '-f', 'null', '-'];
+        return probeOk(ffmpegPath, args);
     };
 
     // ====== INTERLACE DETECTION ======
@@ -1132,8 +1129,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const nodeIsSpecific = !!nodeHw && nodeHw !== '-';
         // Emit the ☒ "falling back to CPU" note for a family, but only when THIS NODE'S hardware type is what pinned it - method_encoder=node/node_strict on
         // a node whose Tdarr hardware type names one family. auto, and node on an "any" node, walk the whole list, so a note for each family they merely tried
-        // would be noise. The pin is the node's hardware type, NOT encoderOpt: the dropdown's per-family values were retired in 3.21.0, so a predicate keyed
-        // on encoderOpt can no longer match anything and silently discards every reason. The four the loop distinguishes - not in this build, hardware not
+        // would be noise. The pin is the node's hardware type, NOT encoderOpt: encoderOpt only ever holds node/node_strict/auto/cpu, never a family name, so a
+        // predicate keyed on it can never match a family and would discard every reason. The four the loop distinguishes - not in this build, hardware not
         // detected, the probe would not initialise, no encoder for this codec+family - are four different user fixes, and node_strict quarantines the file
         // with one message for all of them otherwise. Declared here rather than beside `notes` because it reads the node-mode facts just above. node_strict
         // gets the reason WITHOUT the "using <cpu>" tail, because it is about to refuse that very fallback and quarantine the file instead.
@@ -1306,12 +1303,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // medium and 1.007 at fast, i.e. its memory is flat across presets, which is what MEM_ENCODER's `presetScaled: false` opts it out of. An encoder that has
     // never been measured across presets keeps scaling by this table, since over-stating a warning is the harmless direction.
     const MEM_PRESET = { slow: 1.000, medium: 0.909, fast: 0.805 };
-    // Filters are NOT additive, so the stacked case gets its own measured figure rather than a sum. It is no longer additive in the direction it used to be:
-    // when these were first fitted the stack came in BELOW the sum of the singles and the explanation was shared frame buffers. Re-measured 2026-08-21 on
-    // Linux, tonemap collapsed to +7 MB (from +42) while deint held at +45 and the stack at +71 - so the stack now sits ABOVE its parts, and whatever the
-    // filters share is smaller than what a second filter adds. Only the tonemap figure is updated: deint and stacked both landed inside the +-25 MB band, and
-    // moving a row the tolerance says is unchanged would be fitting noise. A downscale on its own was never measured apart from that stack and contributes
-    // nothing here, which under-states it slightly. guard_dv's VBV (-maxrate/-bufsize) measured +0 MB and needs no term.
+    // Filters are NOT additive - the stacked case gets its own measured figure rather than a sum, and it sits ABOVE the sum of its parts, so whatever the
+    // filters share is smaller than what a second filter adds. Measured 2026-08-21 on Linux: tonemap +7 MB, deint +45, stack +71. Only the tonemap figure is
+    // updated here; deint and stacked both landed inside the +-25 MB band, and moving a row the tolerance says is unchanged would be fitting noise. A downscale
+    // on its own was never measured apart from that stack and contributes nothing here, which under-states it slightly. guard_dv's VBV (-maxrate/-bufsize)
+    // measured +0 MB and needs no term.
     const MEM_FILTER_TONEMAP = 7;
     const MEM_FILTER_DEINT = 55;
     const MEM_FILTER_STACKED = 78;
