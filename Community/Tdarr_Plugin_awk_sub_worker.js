@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.28',
+    Version: '3.999.29',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1172,7 +1172,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //   none     - the caption channel was decoded and carried no caption text at all, so no later pass need pay for that decode again.
     //   imported - the captions are already embedded as a real subtitle track, so sub_worker must not read them out a second time.
     // The value is a COMMA LIST and every reader splits it, because the states genuinely combine: an imported round trip that could not strip in its own pass
-    // records `imported,strip` - and `imported,removed` where it could - while an empty channel on a source the filter refuses records `none,strip`. A writer
+    // records `imported,strip` - and `imported,removed` where it could. An empty channel records `none` ALONE - it never owes a strip. A writer
     // therefore EXTENDS the tag rather than replacing it with one token - a whole-value overwrite would erase a pending request instead of deferring it.
     // A REQUEST is retired by whoever SERVES it, and only then: video_clean rewrites `strip` to `removed` on the encode that carries the removal out. Without
     // that the tag only ever grows, and a satisfied request is indistinguishable from a fresh one - a file that later regains captions (a re-muxed capture, an
