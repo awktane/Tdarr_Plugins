@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.23',
+    Version: '3.999.24',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -2077,6 +2077,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             + ' - recorded the request, and video_clean will carry it out on its next encode; until then a player shows both copies\n';
         const ccName = (ccMode === 'enabled' && ccVideo)
             ? `${action === 'import' ? '.' : ''}${sidecarBasename(ccPseudoStream(ccVideo.index), false)}` : '';
+        // An unmapped node with method_unmapped=error cannot import at all - there is no way to discover sidecars. Fail HERE, before ccPlan's IIFE pays the
+        // A53 caption probe and a remote existence round-trip it would only discard, since every requeue would otherwise re-pay them before quarantining.
+        if (action === 'import' && isUnmappedNode && unmappedMode === 'error') {
+            failFile('[method_unmapped=error] This node is unmapped and cannot see the library to find sidecars - '
+                + 'set method_unmapped to mount or text_file, or run import on a node that shares the library filesystem');
+        }
         const ccPlan = (() => {
             if (ccMode !== 'enabled') return { job: null, note: '' };
             if (!ccVideo) return { job: null, note: '☑[embedded_cc=enabled] No video stream to read captions from\n' };
@@ -2481,10 +2487,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // signal, so returning it would file the video under success and leave a silently un-imported library nobody has reason to look at.
         let listedRels = null;   // non-null once method_unmapped=text_file has supplied the names, since there is no directory to scan
         if (isUnmappedNode) {
-            if (unmappedMode === 'error') {
-                failFile('[method_unmapped=error] This node is unmapped and cannot see the library to find sidecars - '
-                    + 'set method_unmapped to mount or text_file, or run import on a node that shares the library filesystem');
-            }
+            // method_unmapped=error is refused earlier, before ccPlan, so only mount/text_file reach here.
             if (unmappedMode === 'mount' && !mountedLib().dir) {
                 failFile(`[method_unmapped=mount] Could not reach the library from this node - ${mountedLib().why}`);
             }
