@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.29',
+    Version: '3.999.30',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -179,7 +179,8 @@ const details = () => ({
                 (e.g. /media) needs nothing more. Otherwise set this node's Node Tag field, on the server's node options page, to a "key=value" entry - key
                 being the FIRST folder of the server's path, value being where THIS node sees that same folder. Windows and macOS nodes need one, because the
                 server's path cannot exist locally. Tdarr keeps its own tags in that field too, so add yours alongside them rather than replacing them.
-                Extract writes directly in this mode as well, skipping the upload API.
+                Extract writes directly in this mode as well, skipping the upload API. A mount that is READ-ONLY from this node still works: everything is
+                read through it, while sidecars are placed through the upload API and deletion waits for the server, as if there were no mount.
                 \\nExample: server library /media/Shows, mounted on this Windows node as M:\\Shows
                 \\nmedia=M:
                 \\ntext_file - read "<video>.subtitles.txt" beside the video: one filename per line, lines starting with # ignored. Extract seeds the list
@@ -187,10 +188,10 @@ const details = () => ({
                 must still follow the sidecar naming convention, since that is where its language, title and flags come from.
                 \\nDELETING a sidecar (remove_source on import) is separate again: an unmapped node cannot delete a library file at all, since Tdarr's API
                 offers upload and download but not delete. The post-processing pass does it server-side instead, which is why that stack entry is required.
-                \\nOne case costs an extra pass: on an unmapped node with no mount, when every sidecar is ALREADY embedded there is nothing to mux - so no
-                transcode, no acceptance, and no post-processing run in which to delete anything. remove_source then forces a lossless -c copy of the video
-                purely to reach that stage. It is a full read and write to remove a few kB of text, but it is the only route and it happens at most ONCE per
-                file.`,
+                \\nOne case costs an extra pass: on an unmapped node with no mount it can write to, when every sidecar is ALREADY embedded there is nothing
+                to mux - so no transcode, no acceptance, and no post-processing run in which to delete anything. remove_source then forces a lossless -c
+                copy of the video purely to reach that stage. It is a full read and write to remove a few kB of text, but it is the only route and it
+                happens at most ONCE per file.`,
         },
     ],
 });
@@ -1471,6 +1472,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The library directory as THIS node can actually open it, or '' with the reason it could not. Candidates are tried in order and each is PROBED - a
     // path is only accepted once a real readdir succeeds, never because its shape looked right. ENOENT and EACCES are reported apart because they send you
     // to different places: a wrong value versus a path that exists but this node has no credentials for (typically Tdarr running as a service).
+    // `writable` carries the access(W_OK) verdict, and it steers ROUTING, never acceptance: a read-only mount is still the best possible view for reads
+    // (scans, dedup, feeding ffmpeg inputs), while every write falls back to the file API exactly as if no mount had resolved. A writable candidate is
+    // preferred over an earlier read-only one - both name the same library, and taking the writable view spares the API round-trips. The probe is
+    // advisory by design: on Windows fs.access ignores directory ACLs (only FILE_ATTRIBUTE_READONLY is honoured), so a false "writable" can slip through
+    // - and then the direct write fails exactly as it did before the probe existed, so a wrong verdict never makes anything worse. A dotfile write-probe
+    // would be airtight but plants artifacts in a library every media server watches, and a crash strands them - rejected on those grounds.
     const resolveMountedLibDir = () => {
         const serverDir = serverSidePath(libDir);
         if (!serverDir) return { dir: '', why: `no path translator maps ${libDir} back to the server, so this node cannot name the library at all` };
@@ -1481,14 +1488,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!norm.startsWith(root)) continue;
             candidates.push([`Node Tag "${k}=${v}"`, path.normalize(String(v).replace(/[\\/]+$/, '') + norm.slice(root.length))]);
         }
-        const tried = [];
+        const tried = []; let readOnly = null;
         for (const [label, dir] of candidates) {
-            try { fs.readdirSync(dir); return { dir, via: label }; } catch (e) {
+            try { fs.readdirSync(dir); } catch (e) {
                 const code = (e && e.code) || '';
                 tried.push(`${label} (${dir}) - ${code === 'ENOENT' ? 'not there'
                     : (code === 'EACCES' || code === 'EPERM' ? 'exists but unreadable from this node, check credentials' : code || e.message)}`);
+                continue;
             }
+            try { fs.accessSync(dir, fs.constants.W_OK); return { dir, via: label, writable: true }; }
+            catch (e) { if (!readOnly) readOnly = { dir, via: label, writable: false }; }
         }
+        if (readOnly) return readOnly;
         return { dir: '',
             why: `nothing reachable. Tried: ${tried.join('; ')}${nodeTagPairs().length ? '' : '. No "key=value" Node Tag is set for this node'}` };
     };
@@ -1497,10 +1508,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return () => { if (!c) c = (isUnmappedNode && unmappedMode === 'mount') ? resolveMountedLibDir() : { dir: '' }; return c; };
     })();
 
-    // Every path below goes through these two rather than libDir/isUnmappedNode directly: with a resolved mount the node behaves exactly like a mapped one,
-    // reading and writing the real library, and the API routes are only for a node that genuinely cannot reach it.
+    // Every path below goes through these rather than libDir/isUnmappedNode directly, and READS and WRITES route independently: any resolved mount serves
+    // reads (workLibDir), but only a WRITABLE one serves writes - a read-only mount reads like a mapped node while placing every write through the file
+    // API. readViaApi is "no library view at all" (existence checks must ask the server); placeViaApi is "no writable view" (sidecars go up by upload, and
+    // deletion can only happen in the server's own post-processing pass). serverDestFor names a sidecar's upload destination in SERVER space, and it must
+    // derive from libDir, never workLibDir(): the translators map the node MIRROR back to the server, a mount tree matches no translator prefix, and a
+    // mount-joined path would therefore translate to '' and refuse an upload the mirror path can name.
     const workLibDir = () => mountedLib().dir || libDir;
-    const placeViaApi = () => isUnmappedNode && !mountedLib().dir;
+    const readViaApi = () => isUnmappedNode && !mountedLib().dir;
+    const placeViaApi = () => isUnmappedNode && !(mountedLib().dir && mountedLib().writable);
+    const serverDestFor = (name) => serverSidePath(path.join(libDir, name));
 
     // Fetch one library file to a local path, through the only read an unmapped node has. It addresses a single KNOWN path, which is exactly why
     // the list has to live at a name we can compute rather than one we would have to go looking for. Written straight to disk by curl, never
@@ -2119,17 +2136,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // The caption SOURCE path needs the same test, and the joined path above cannot stand in for it: videoBase strips a quote out of the NAME, so one
             // living in the video's own filename is invisible there while surviving verbatim in file.file - which is what the two mapped branches interpolate
             // into their quoted "movie=..." token. escapeMoviePath answers the filtergraph's parsers, not Tdarr's tokeniser, so a " there closes the token and
-            // turns the rest into fresh argv entries, and an <io> truncates the whole command. Only the preset route is exposed: the unmapped route hands the
+            // turns the rest into fresh argv entries, and an <io> truncates the whole command. Only the preset route is exposed: the API route hands the
             // same string to spawnSync as one argv element, so it is gated on !placeViaApi() and keeps working.
             if (!placeViaApi() && !pathIsPresetSafe(String(file.file || '')))
                 return { job: null, note: '☒[embedded_cc=enabled] The video path has a quote, control char or <io> - cannot read the captions safely\n' };
-            const remoteDest = placeViaApi() ? serverSidePath(full) : '';
+            const remoteDest = placeViaApi() ? serverDestFor(name) : '';
             if (placeViaApi() && !remoteDest)
                 return { job: null, note: `☒[embedded_cc=enabled] No path translator maps this library directory back to the server - cannot write ${name}\n` };
-            // An existing caption sidecar is the memo that the decode already happened. On a MAPPED node it can also be read, which is the only way to tell
-            // a channel that carried no text from one that was never read: A53 side data is present whether or not anyone was speaking, so an empty channel
-            // looks exactly like a full one to the probe. A cue-less sidecar is deleted and the finding recorded, so no later pass repeats the decode.
-            const existing = placeViaApi() ? (sidecarExistsRemote(remoteDest) ? 'remote' : '')
+            // An existing caption sidecar is the memo that the decode already happened. Wherever the library can be READ - a mapped node, or any resolved
+            // mount, read-only included - it can also be opened, which is the only way to tell a channel that carried no text from one that was never read:
+            // A53 side data is present whether or not anyone was speaking, so an empty channel looks exactly like a full one to the probe. A cue-less
+            // sidecar is deleted and the finding recorded, so no later pass repeats the decode.
+            const existing = readViaApi() ? (sidecarExistsRemote(remoteDest) ? 'remote' : '')
                 : ((() => { try { return fs.existsSync(full) ? 'local' : ''; } catch (e) { return ''; } })());
             if (existing === 'remote') return { job: null, note: `☑[embedded_cc=enabled] Caption sidecar already in the library: ${name}\n` };
             if (existing === 'local') {
@@ -2224,6 +2242,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.infoLog += `☒[method_unmapped=mount] Could not reach the library from this node - ${mountedLib().why}\n`;
                 response.infoLog += '☒[method_unmapped=mount] Placing sidecars through the file API instead; '
                     + 'import will FAIL on this node until the mount works\n';
+            } else if (isUnmappedNode && unmappedMode === 'mount' && !mountedLib().writable) {
+                response.infoLog += `☒[method_unmapped=mount] The library at ${mountedLib().dir} (via ${mountedLib().via}) is read-only from this node - `
+                    + 'reading through the mount, placing sidecars through the file API\n';
             } else if (isUnmappedNode && unmappedMode === 'mount') {
                 response.infoLog += `☑[method_unmapped=mount] Writing to the library at ${mountedLib().dir} (via ${mountedLib().via})\n`;
             }
@@ -2234,18 +2255,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const fontIndices = streams.filter((s) => codecTypeOf(s) === 'attachment' && isFontAttachment(s)).map((s) => s.index);
             const fontMaps = fontIndices.map((i) => ` -map 0:${i}`).join('');
 
-            // sidecarOut carries the extra ffmpeg outputs that write the sidecars on a MAPPED node. On an unmapped node it stays empty and the same
-            // extractions are collected in placeJobs instead, to be run and uploaded by placeSidecars once the loop has seen every stream.
+            // sidecarOut carries the extra ffmpeg outputs that write the sidecars on a node with a WRITABLE library view (mapped, or a writable mount).
+            // Without one the same extractions are collected in placeJobs instead, to be run and uploaded by placeSidecars once the loop has seen every
+            // stream - which is why the placement decision is made HERE: Tdarr runs the preset only after the plugin returns, so a preset output that
+            // fails against a read-only mount cannot be caught and rerouted, only quarantined.
             let sidecarOut = ''; const removedIndices = new Set(dupes.dropIdx); let wrote = 0; let skipped = 0; let refused = 0; let bundled = 0;
             const placeJobs = [];
-            // The caption extraction leads on both routes; on the unmapped one that is a hard requirement - placeSidecars concatenates every job's args
-            // after a single -i, so the caption job's '-f lavfi -i' only precedes all outputs if its job is first. On the mapped route the same input is
-            // emitted at the head of the OUTPUT side, where Tdarr's own -i is already spliced in ahead - on the input side it would become input 0 and
+            // The caption extraction leads on both routes; on the API one that is a hard requirement - placeSidecars concatenates every job's args
+            // after a single -i, so the caption job's '-f lavfi -i' only precedes all outputs if its job is first. On the direct-write route the same input
+            // is emitted at the head of the OUTPUT side, where Tdarr's own -i is already spliced in ahead - on the input side it would become input 0 and
             // silently shift every existing -map 0. ccRecord is a SET because the awk_cc states combine and only one value is written: an empty channel on
             // a strip-refused source records BOTH `none` and `strip`, and a single-token overwrite would erase whichever came first. ccPlaced earns the
-            // removal: on the unmapped route the caption srt is uploaded BEFORE the preset returns (a rejected upload must not be followed by a strip that
-            // leaves the captions nowhere). On the mapped route ccPlaced deliberately stays false, so the fresh-extract pass never strips - the strip is owed
-            // on a later pass via stripOwed, once the sidecar is proven to hold cues (see the empty-decode deferral note in the mapped branch below).
+            // removal: on the API route the caption srt is uploaded BEFORE the preset returns (a rejected upload must not be followed by a strip that
+            // leaves the captions nowhere). On the direct-write route ccPlaced deliberately stays false, so the fresh-extract pass never strips - the strip
+            // is owed on a later pass via stripOwed, once the sidecar is proven to hold cues (see the empty-decode deferral note in that branch below).
             let ccInput = ''; const ccRecord = new Set(); let ccPlaced = false;
             if (ccPlan.job && placeViaApi()) {
                 placeJobs.push({
@@ -2303,9 +2326,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         + `${NAME_BYTE_CAP}-byte filesystem limit - rename the video shorter and requeue, keeping the embedded subtitle\n`;
                     continue;
                 }
-                // An unmapped node cannot reach the library to test or write the sidecar locally, so both happen through the server. With no translator
-                // claiming the path there is no server-side destination at all, and the extract is refused exactly as an unsafe path is.
-                const remoteDest = placeViaApi() ? serverSidePath(full) : '';
+                // A node placing through the API needs a server-side destination; with no translator claiming the path there is none at all, and the
+                // extract is refused exactly as an unsafe path is. The existence test below is independent of that: it reads locally through any resolved
+                // mount, and only asks the server when there is no library view to read.
+                const remoteDest = placeViaApi() ? serverDestFor(name) : '';
                 if (placeViaApi() && !remoteDest) {
                     refused += 1;
                     response.infoLog += `☒${streamTag(s.index)} No path translator maps this library directory back to the server - cannot write ${name}, `
@@ -2318,11 +2342,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // subtitle stream (measured on jellyfin-ffmpeg 7.1.4), so with removeSource=false the stream is never removed and a cue-less srt would
                 // re-extract the identical 0-byte sidecar every pass - Tdarr errors the second identical preset as an infinite transcode loop. When nothing
                 // will be stripped, plain existence is enough to mean "already handled", which breaks that loop.
-                const alreadyExtracted = placeViaApi() ? sidecarExistsRemote(remoteDest)
+                const alreadyExtracted = readViaApi() ? sidecarExistsRemote(remoteDest)
                     : (removeSource ? fileHasBytes(full) : fs.existsSync(full));
                 if (alreadyExtracted) { skipped += 1; response.infoLog += `☑${streamTag(s.index)} Sidecar already exists, not overwriting: ${name}\n`; }
-                // Unmapped: the extraction is deferred to placeSidecars after the loop, so this stream's removedIndices entry and its bundled tally wait for
-                // the server's answer - nothing may be stripped until the sidecar is confirmed in the library.
+                // API placement: the extraction is deferred to placeSidecars after the loop, so this stream's removedIndices entry and its bundled tally
+                // wait for the server's answer - nothing may be stripped until the sidecar is confirmed in the library.
                 else if (placeViaApi()) {
                     const ffArgs = bundle ? ['-map', `0:${s.index}`, ...fontIndices.flatMap((i) => ['-map', `0:${i}`]), '-c', 'copy', '-f', STYLED_BUNDLE.fmt]
                         : ['-map', `0:${s.index}`, '-c:s', enc];
@@ -2341,7 +2365,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (bundle) bundled += 1;
                 if (removeSource) removedIndices.add(s.index);
             }
-            // Unmapped node: the deferred extractions run HERE, in one ffmpeg pass, and each result is uploaded to the library. Only a sidecar the server
+            // API placement: the deferred extractions run HERE, in one ffmpeg pass, and each result is uploaded to the library. Only a sidecar the server
             // confirms in place counts as written and earns its stream a removal - a failure logs ☒ and keeps that subtitle embedded, so the worst case
             // is an unextracted subtitle rather than a lost one.
             if (placeJobs.length) {
@@ -2397,7 +2421,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     fontIndices.length === 1 ? '' : 's'} - now archived in the styled-subtitle bundle\n`;
             }
             if (titleTruncated) response.infoLog += '☒A subtitle title was too long for the filename and was truncated\n';
-            // sidecarOut rather than wrote: on an unmapped node the sidecars are already written, and with remove_source off there is genuinely nothing
+            // sidecarOut rather than wrote: on the API route the sidecars are already written, and with remove_source off there is genuinely nothing
             // left for ffmpeg to do. Three endings, only one a failure: extraction ASKED FOR that left NOTHING in the library (every eligible subtitle
             // refused) - processFile:false there would file the video under success with the subtitles never extracted. A run where some sidecars landed
             // keeps going and carries its ☒ lines into a successful log (a partial result, not a failed one); a sidecar an earlier pass placed is landed
@@ -2426,7 +2450,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             const ccMeta = ccRecord.size ? ccTagArg(...ccRecord) : '';
 
-            // ccStrip and ccMeta count as work in their own right: on an unmapped node the sidecars are already placed, so a caption-only run has an empty
+            // ccStrip and ccMeta count as work in their own right: on the API route the sidecars are already placed, so a caption-only run has an empty
             // sidecarOut and no removedIndices, and testing those alone would skip the pass that removes the captions from the bitstream.
             if (!sidecarOut && !removedIndices.size && !ccMeta && !ccStrip) {
                 if (refused && !wrote && !skipped) failFile('No subtitle could be extracted - every eligible subtitle was refused, see the reasons above');
@@ -2457,7 +2481,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += `☑Expected results: ${summariseAll(streams)}\n`;
             return response;
         }
-        // An unmapped node has no library to write an extra ffmpeg output into, so the same extraction runs in-plugin and uploads through the file API - and
+        // With no writable library view to aim an extra ffmpeg output at, the same extraction runs in-plugin and uploads through the file API - and
         // then falls THROUGH into the import below rather than returning, because the sidecar is in the library now and this pass can still mux it.
         if (ccPlan.job) {
             const { placed, failed, empty: emptyExtractions } = placeSidecars([{ name: ccPlan.job.name, dest: ccPlan.job.remoteDest, args: ccLavfiArgs() }]);
@@ -2465,9 +2489,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.infoLog += ccReadLine(ccVideo.index, ccPlan.job.name);
                 if (unmappedMode === 'text_file') seedSubtitleList([ccPlan.job.name]);
             } else {
-                // An empty channel is a VERDICT and has to be memoised, exactly as the mapped route memoises it through ccPlan.record: the tag is the only
-                // thing that stops the next pass paying for the same full-video decode, and it takes a mux of its own to write. Returning here defers any
-                // other import work by one pass, which is what the mapped route does too - and cheaply, since that pass no longer decodes. The two outcomes
+                // An empty channel is a VERDICT and has to be memoised, exactly as the direct-write route memoises it through ccPlan.record: the tag is the
+                // only thing that stops the next pass paying for the same full-video decode, and it takes a mux of its own to write. Returning here defers
+                // any other import work by one pass, as the direct-write route does too - and cheaply, since that pass no longer decodes. The two outcomes
                 // are EXCLUSIVE, as they are on the extract route: a channel that carried no text is not a placement that failed, and reporting both leaves
                 // the user reading a library/upload fault under a line that just said there was nothing to upload.
                 if (emptyExtractions.has(ccPlan.job.name)) {
@@ -2511,7 +2535,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (unmappedMode === 'mount' && !mountedLib().dir) {
                 failFile(`[method_unmapped=mount] Could not reach the library from this node - ${mountedLib().why}`);
             }
-            if (unmappedMode === 'mount') response.infoLog += `☑[method_unmapped=mount] Reading the library at ${mountedLib().dir} (via ${mountedLib().via})\n`;
+            if (unmappedMode === 'mount') {
+                response.infoLog += `☑[method_unmapped=mount] Reading the library at ${mountedLib().dir} (via ${mountedLib().via}${
+                    mountedLib().writable ? '' : ', read-only'})\n`;
+            }
             // Every route says WHERE it read from, this one included - see the mapped-route note below for why that line matters.
             if (unmappedMode === 'text_file') {
                 // No directory access at all here, so the list IS the discovery: each name is fetched from the server by path, and so is the list itself
@@ -2810,12 +2837,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Sidecars that were only ever redundant, with nothing to mux alongside them: no transcode to wait on, so the deletion happens now rather than in
         // post-processing - safe precisely because these never entered the marker (anything reaching here had its content in the file BEFORE this flow
-        // started, so it is in the accepted library copy however the flow ends). Requires REACHING the library, which placeViaApi() is the negation of:
-        // without that, workLibDir() is the node-local mirror, and under text_file the sidecars there are this run's own downloaded scratch copies -
-        // unlinking them reports a deletion that never touched the library. Nor can any other route stand in (the file API has no delete; with nothing to
-        // mux there is no acceptance and no server-side pass), so it says so and leaves them alone rather than claim a deletion it did not perform. Both
-        // cleanup shortcuts below must be the EXACT negation of the mux branch's trigger (toMux || retuneMeta || removedIndices) - a queued embedded-dedup
-        // drop is work on the FILE, and returning here would discard it silently.
+        // started, so it is in the accepted library copy however the flow ends). Requires a WRITABLE library view, which placeViaApi() is the negation
+        // of: a read-only mount refuses the unlink, and without any mount workLibDir() is the node-local mirror - under text_file the sidecars there are
+        // this run's own downloaded scratch copies, so unlinking them reports a deletion that never touched the library. Nor can any other route delete
+        // directly (the file API has no delete; with nothing to mux there is no acceptance and no server-side pass), so the placeViaApi() branch buys the
+        // server pass instead of claiming a deletion it did not perform. Both cleanup shortcuts below must be the EXACT negation of the mux branch's
+        // trigger (toMux || retuneMeta || removedIndices) - a queued embedded-dedup drop is work on the FILE, and returning here would discard it silently.
         if (!toMux.length && !retuneMeta && !removedIndices.size && alreadyInFile.length && removeSource && placeViaApi()) {
             const stranded = alreadyInFile.flatMap((f) => f.members.map((m) => m.rel));
             // Forcing twice for the same sidecar is worse than not forcing at all: Tdarr ERRORS a file whose consecutive passes emit identical arguments
@@ -2837,7 +2864,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // above. Making this a setting would only work for someone who already knew the trap existed, and by then they have been caught by it: asking for
             // the sidecars to be deleted IS asking for whatever it takes. It cannot repeat - one extra pass per file, ever - because the marker stamped here
             // lists them, so the next pass filters them out through alreadyEmbedded, whether or not the deletion that follows actually succeeded.
-            response.infoLog += '☒[remove_source=true] Every sidecar is already in the file and this node cannot reach the library to delete them - '
+            response.infoLog += '☒[remove_source=true] Every sidecar is already in the file and this node cannot delete them from the library - '
                 + 'remuxing losslessly, since only an accepted transcode gives the server a pass in which to do it\n';
             for (const rel of stranded) response.infoLog += `☐[remove_source=true] Queued for removal once accepted: ${rel}\n`;
             commitPreset(` -map 0 -c copy -metadata "awk_sub_worker=${encodeMarkerList(markList)}"`);
