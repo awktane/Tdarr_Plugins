@@ -15,7 +15,7 @@ const details = () => ({
         it's needed).\n\nBecause it runs last it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file
         that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the signature of an out-of-memory-killed or
         unfinalised encode from an earlier stage. A longer output is accepted. This check is always on and has no setting.\n`,
-    Version: '4.999.6',
+    Version: '4.999.7',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -188,37 +188,6 @@ const details = () => ({
 const plugin = (file, librarySettings, inputs, otherArguments) => {
     const lib = require('../methods/lib')();
     const fs = require('fs');
-    // True if the mp4 already has moov before mdat (front-loaded), so method_mp4_faststart needn't remux it. Reads only top-level box headers (a few
-    // 16-byte reads, seeking by box size) - no ffmpeg spawn, no full-file read. otherArguments.__awkMoovFront overrides for the harness (which has
-    // no real file on disk). Fail-safe: any read/parse anomaly returns true (treat as fronted -> skip) so we never loop on a file we can't inspect.
-    const moovBeforeMdat = (filePath, otherArgs) => {
-        const inj = otherArgs?.__awkMoovFront;
-        if (inj !== undefined) return inj === true;
-        let fd;
-        try {
-            fd = fs.openSync(filePath, 'r');
-            // A top-level box header is 4-byte size + 4-byte FourCC; when size === 1 the real size follows as a 64-bit largesize at offset 8. So every read
-            // must cover the largesize too: BOX_READ_BYTES must stay >= BOX_HEADER_BYTES + 8 or the readBigUInt64BE below runs off the buffer on a >4GB mdat.
-            const BOX_HEADER_BYTES = 8;
-            const BOX_READ_BYTES = 16;
-            const head = Buffer.alloc(BOX_READ_BYTES);
-            let pos = 0;
-            // Safety bound against a pathological/corrupt box chain - exceeding it is treated as already-fronted (fail-safe).
-            const MAX_MP4_TOP_LEVEL_BOXES = 100;
-            for (let i = 0; i < MAX_MP4_TOP_LEVEL_BOXES; i++) {
-                const n = fs.readSync(fd, head, 0, BOX_READ_BYTES, pos);
-                if (n < BOX_HEADER_BYTES) return true;
-                let size = head.readUInt32BE(0);
-                const type = head.toString('latin1', 4, 8);
-                if (size === 1) size = Number(head.readBigUInt64BE(BOX_HEADER_BYTES));   // 64-bit largesize
-                if (type === 'moov') return true;
-                if (type === 'mdat') return false;
-                if (size < BOX_HEADER_BYTES) return true;                 // malformed / size-0 (extends to EOF)
-                pos += size;
-            }
-            return true;
-        } catch { return true; } finally { if (fd !== undefined) fs.closeSync(fd); }
-    };
     // eslint-disable-next-line @typescript-eslint/no-unused-vars,no-param-reassign
     inputs = lib.loadDefaultValues(inputs, details);
 
@@ -1187,28 +1156,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return 0;
         };
 
-        // remove_junk_tags: strip encoder/muxer-provenance (+ optional descriptive) tags on the reorder remux. 'encoder' = pure provenance (global encoded_by;
-        // per-stream encoder/encoded_by); 'descriptive' (superset) also drops iTunes/movie-TV container tags. Always kept: title/comment, awk_* markers
-        // (idempotency), creation_time, the mkv BPS/statistics family (mediaInfo's per-track bitrate source), the functional per-stream tags, and the GLOBAL
-        // 'encoder' tag (muxer-managed: every mux re-stamps it, so stripping would loop). Per-stream 'encoder' - including the Lavc tag an upstream re-encode
-        // stamps - is NOT re-added on a -c copy, so running last clears it in the SAME remux (a first-in-stack plugin could only catch it a pass later).
-        const JUNK_ENCODER_GLOBAL = new Set(['encoded_by']);
-        const JUNK_DESCRIPTIVE = new Set(['compilation', 'gapless_playback', 'hd_video', 'purchase_date', 'sort_name', 'sort_album', 'sort_album_artist',
-            'sort_artist', 'sort_composer', 'sort_show', 'genre', 'date', 'description', 'synopsis', 'show', 'episode_id', 'network', 'episode_sort',
-            'season_number', 'media_type', 'artist', 'album', 'album_artist', 'composer', 'grouping', 'lyrics', 'copyright', 'keywords']);
-        const JUNK_PERSTREAM = new Set(['encoded_by', 'encoder']);   // only encoder-tier keys are safe per-stream (descriptive ones are functional, kept)
-        const junkGlobalStrip = (lowerKey) => junkTagsMode !== 'disabled'
-            && (JUNK_ENCODER_GLOBAL.has(lowerKey) || (junkTagsMode === 'descriptive' && JUNK_DESCRIPTIVE.has(lowerKey)));
-        // Per-stream encoder/encoded_by clears for the stream at OUTPUT index outIdx - the post-sort position -metadata:s:<index> targets, not the source
-        // ffprobe index. Present-only, so a clean stream adds nothing and never forces a mux on its own. escMeta guards the probe-derived key.
-        const junkStreamClears = (ffstream, outIdx) => {
-            if (junkTagsMode === 'disabled') return '';
-            let meta = '';
-            for (const k of Object.keys(ffstream.tags || {}))
-                if (JUNK_PERSTREAM.has(k.toLowerCase())) meta += ` -metadata:s:${outIdx} "${escMeta(k)}="`;
-            return meta;
-        };
-
         const streams = [];
         for (let i = 0; i < file.ffProbeData.streams.length; i++) {
             const ffstream = file.ffProbeData.streams[i];
@@ -1320,6 +1267,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return a.index - b.index;
         });
 
+        // remove_junk_tags: strip encoder/muxer-provenance (+ optional descriptive) tags on the reorder remux. 'encoder' = pure provenance (global encoded_by;
+        // per-stream encoder/encoded_by); 'descriptive' (superset) also drops iTunes/movie-TV container tags. Always kept: title/comment, awk_* markers
+        // (idempotency), creation_time, the mkv BPS/statistics family (mediaInfo's per-track bitrate source), the functional per-stream tags, and the GLOBAL
+        // 'encoder' tag (muxer-managed: every mux re-stamps it, so stripping would loop). Per-stream 'encoder' - including the Lavc tag an upstream re-encode
+        // stamps - is NOT re-added on a -c copy, so running last clears it in the SAME remux (a first-in-stack plugin could only catch it a pass later).
+        const JUNK_ENCODER_GLOBAL = new Set(['encoded_by']);
+        const JUNK_DESCRIPTIVE = new Set(['compilation', 'gapless_playback', 'hd_video', 'purchase_date', 'sort_name', 'sort_album', 'sort_album_artist',
+            'sort_artist', 'sort_composer', 'sort_show', 'genre', 'date', 'description', 'synopsis', 'show', 'episode_id', 'network', 'episode_sort',
+            'season_number', 'media_type', 'artist', 'album', 'album_artist', 'composer', 'grouping', 'lyrics', 'copyright', 'keywords']);
+        const JUNK_PERSTREAM = new Set(['encoded_by', 'encoder']);   // only encoder-tier keys are safe per-stream (descriptive ones are functional, kept)
+        const junkGlobalStrip = (lowerKey) => junkTagsMode !== 'disabled'
+            && (JUNK_ENCODER_GLOBAL.has(lowerKey) || (junkTagsMode === 'descriptive' && JUNK_DESCRIPTIVE.has(lowerKey)));
+        // Per-stream encoder/encoded_by clears for the stream at OUTPUT index outIdx - the post-sort position -metadata:s:<index> targets, not the source
+        // ffprobe index. Present-only, so a clean stream adds nothing and never forces a mux on its own. escMeta guards the probe-derived key.
+        const junkStreamClears = (ffstream, outIdx) => {
+            if (junkTagsMode === 'disabled') return '';
+            let meta = '';
+            for (const k of Object.keys(ffstream.tags || {}))
+                if (JUNK_PERSTREAM.has(k.toLowerCase())) meta += ` -metadata:s:${outIdx} "${escMeta(k)}="`;
+            return meta;
+        };
+
         //Set orderChanged if the sort moved a stream, and build the map; also normalise the audio default flag so exactly one audio track — the first in sorted
         //order — is default, matching what the ordering rules chose. Additive +default/-default preserves forced/commentary/etc; subtitle/video untouched.
         let ffmpegMap = '';
@@ -1369,21 +1338,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
-        // Describe the reorder itself - this plugin's headline change, and the only one that would otherwise leave no trace in the log: without these lines a
-        // pure reorder runs straight from the input summary to Expected results and the user has to diff the two token lists to see that anything happened.
-        // The two causes are reported separately because they answer different questions and a user acts on them differently - regrouping
-        // is the fixed video → audio → subtitle → attachment → data precedence that no setting changes, while a within-group sort is what the order_* and
-        // audio_first/subtitle_first settings decide. Both lines stay BARE of an [input=value] tag: regrouping has no setting behind it, and a within-group
-        // sort is the combined verdict of the whole order_* precedence chain, so naming any one of them would be a guess (see the infoLog contract).
-        const originalOrder = streams.slice().sort((a, b) => a.origPos - b.origPos);
-        const typeSeq = (arr) => arr.map((s) => s.type).join(',');
-        const regrouped = typeSeq(originalOrder) !== typeSeq(streams);
-        const sortedWithin = [];   // "<n> <type>" per type group whose members changed order among themselves
-        for (const t of new Set(streams.map((s) => s.type))) {
-            const positions = streams.filter((s) => s.type === t).map((s) => s.origPos);
-            if (!positions.every((p, i) => i === 0 || positions[i - 1] < p)) sortedWithin.push(`${positions.length} ${t}`);
-        }
-
         // remove_junk_tags (global): clear the provenance / descriptive container tags present, matched case-insensitively. escMeta guards the key.
         if (junkTagsMode !== 'disabled')
             for (const k of Object.keys(file.ffProbeData.format?.tags || {})) {
@@ -1395,8 +1349,39 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
             }
 
+        // True if the mp4 already has moov before mdat (front-loaded), so method_mp4_faststart needn't remux it. Reads only top-level box headers (a few
+        // 16-byte reads, seeking by box size) - no ffmpeg spawn, no full-file read. otherArguments.__awkMoovFront overrides for the harness (which has
+        // no real file on disk). Fail-safe: any read/parse anomaly returns true (treat as fronted -> skip) so we never loop on a file we can't inspect.
+        const moovBeforeMdat = (filePath, otherArgs) => {
+            const inj = otherArgs?.__awkMoovFront;
+            if (inj !== undefined) return inj === true;
+            let fd;
+            try {
+                fd = fs.openSync(filePath, 'r');
+                // A top-level box header is 4-byte size + 4-byte FourCC; when size === 1 the real size follows as a 64-bit largesize at offset 8. So every read
+                // must cover the largesize too: BOX_READ_BYTES must stay >= BOX_HEADER_BYTES + 8 or the readBigUInt64BE below runs off the buffer on a >4GB mdat.
+                const BOX_HEADER_BYTES = 8;
+                const BOX_READ_BYTES = 16;
+                const head = Buffer.alloc(BOX_READ_BYTES);
+                let pos = 0;
+                // Safety bound against a pathological/corrupt box chain - exceeding it is treated as already-fronted (fail-safe).
+                const MAX_MP4_TOP_LEVEL_BOXES = 100;
+                for (let i = 0; i < MAX_MP4_TOP_LEVEL_BOXES; i++) {
+                    const n = fs.readSync(fd, head, 0, BOX_READ_BYTES, pos);
+                    if (n < BOX_HEADER_BYTES) return true;
+                    let size = head.readUInt32BE(0);
+                    const type = head.toString('latin1', 4, 8);
+                    if (size === 1) size = Number(head.readBigUInt64BE(BOX_HEADER_BYTES));   // 64-bit largesize
+                    if (type === 'moov') return true;
+                    if (type === 'mdat') return false;
+                    if (size < BOX_HEADER_BYTES) return true;                 // malformed / size-0 (extends to EOF)
+                    pos += size;
+                }
+                return true;
+            } catch { return true; } finally { if (fd !== undefined) fs.closeSync(fd); }
+        };
         // method_mp4_faststart: front-load the mp4 moov atom. A plain ride-along isn't enough (we skip when order is already correct), so force a one-time
-        // remux when faststart is on, the output is an mp4-family container, and moovBeforeMdat (fail-safe, see its definition above) reports it isn't fronted
+        // remux when faststart is on, the output is an mp4-family container, and moovBeforeMdat (fail-safe, defined just above) reports it isn't fronted
         // yet - so this settles after one pass and never loops.
         const isMp4 = isMp4Family(dstContainer);
         const faststartOn = methodFaststart === 'force';
@@ -1411,6 +1396,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         response.processFile = true;
         response.reQueueAfter = true;
+        // Describe the reorder itself - this plugin's headline change, and the only one that would otherwise leave no trace in the log: without these lines a
+        // pure reorder runs straight from the input summary to Expected results and the user has to diff the two token lists to see that anything happened.
+        // The two causes are reported separately because they answer different questions and a user acts on them differently - regrouping
+        // is the fixed video → audio → subtitle → attachment → data precedence that no setting changes, while a within-group sort is what the order_* and
+        // audio_first/subtitle_first settings decide. Both lines stay BARE of an [input=value] tag: regrouping has no setting behind it, and a within-group
+        // sort is the combined verdict of the whole order_* precedence chain, so naming any one of them would be a guess (see the infoLog contract).
+        const originalOrder = streams.slice().sort((a, b) => a.origPos - b.origPos);
+        const typeSeq = (arr) => arr.map((s) => s.type).join(',');
+        const regrouped = typeSeq(originalOrder) !== typeSeq(streams);
+        const sortedWithin = [];   // "<n> <type>" per type group whose members changed order among themselves
+        for (const t of new Set(streams.map((s) => s.type))) {
+            const positions = streams.filter((s) => s.type === t).map((s) => s.origPos);
+            if (!positions.every((p, i) => i === 0 || positions[i - 1] < p)) sortedWithin.push(`${positions.length} ${t}`);
+        }
         if (regrouped)
             response.infoLog += '☐Regrouping streams into video → audio → subtitle → attachment → data order\n';
         if (sortedWithin.length) {

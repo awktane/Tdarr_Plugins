@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.20',
+    Version: '3.999.21',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -954,129 +954,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return probeOk(ffmpegPath, args);
     };
 
-    // ====== INTERLACE DETECTION ======
-    // Decided from the PIXELS, never the container: real files lie routinely (genuinely combed material tagged field_order=unknown in the corpus), so a
-    // metadata test would miss exactly the files needing repair. One idet decode answers both questions. WHICH kind of combing matters because the repairs
-    // are opposite: shot-on-VIDEO has no original full frame, so bwdif interpolates; shot-on-FILM telecined for broadcast still contains its frames, so
-    // fieldmatch+decimate rebuilds them EXACTLY (measured SSIM 1.000000 vs the true 24p, against 0.9606 for deinterlacing the same file). The discriminator
-    // is idet's REPEATED-FIELD counter, not its combed ratio: 3:2 pulldown structurally repeats one field in five (measured 27% on the telecine sample vs
-    // 0-8% on four true-interlace ones), while the combed ratio reads 97.8% vs 100% - far too narrow to key on.
-    const IDET_PROBE_TIMEOUT_MS = 180000;
-    const IDET_PROBE_MAX_BYTES = 8 * 1024 * 1024;
-    const IDET_SAMPLE_FRAMES = 400;      // enough for a stable ratio; a few seconds of decode even at 4K
-    const IDET_COMBED_MIN = 0.20;        // below this the sample is progressive (measured: 0% progressive vs ~100% interlaced - a wide margin either side)
-    const IDET_REPEAT_MIN = 0.15;        // at or above this the combing is 3:2 pulldown (measured 27%), below it genuine interlace (measured 0-8%)
-    const IDET_SEEK_MIN_DURATION_SEC = 90;   // shorter than this and there is nothing to seek past, so sample from the start
-    const IDET_SEEK_FRACTION = 3;            // sample from a third of the way in, clear of opening titles
-    const IDET_SEEK_MAX_SEC = 600;           // ceiling, so a feature-length programme is not sampled from an hour in
-    // Pull the LAST populated match out of idet's stderr: ffmpeg emits the counters more than once (an all-zero block from a discarded init leads, and the
-    // muxer summary trails), so anchoring to the first block reads zeros and anchoring to the end matches nothing - either way no file gets a verdict.
-    const lastIdetCounts = (text, re) => {
-        const rx = new RegExp(re, 'g');
-        let best = null; let hit;
-        while ((hit = rx.exec(text)) !== null) if (hit.slice(1).some((n) => Number(n) > 0)) best = hit;
-        // The CAPTURE GROUPS as numbers - index 0, the whole match, is dropped, so the caller's [0] is group 1. Both consumers index on that: the four-name
-        // destructure below, and rep[1] + rep[2] meaning Top + Bottom.
-        return best ? best.slice(1).map(Number) : null;
-    };
-    const detectInterlace = (ffmpegPath, inputPath, startSec) => {
-        try {
-            // Sampled from a way into the file, not the head: logos, black and title cards are commonly progressive even in an interlaced programme, so a
-            // head sample under-reports. -ss ahead of -i is safe here because this DECODES; it is only a stream COPY that -ss corrupts.
-            const args = ['-nostats', '-hide_banner', ...(startSec > 0 ? ['-ss', String(startSec)] : []), '-i', inputPath,
-                '-frames:v', String(IDET_SAMPLE_FRAMES), '-vf', 'idet', '-an', '-sn', '-f', 'null', '-'];
-            const r = childProcess.spawnSync(ffmpegPath || 'ffmpeg', args,
-                { encoding: 'utf8', timeout: IDET_PROBE_TIMEOUT_MS, maxBuffer: IDET_PROBE_MAX_BYTES });
-            const text = String((r && r.stderr) || '');
-            const multi = lastIdetCounts(text,
-                'Multi frame detection:\\s*TFF:\\s*(\\d+)\\s*BFF:\\s*(\\d+)\\s*Progressive:\\s*(\\d+)\\s*Undetermined:\\s*(\\d+)');
-            if (!multi) return { kind: 'unknown' };
-            const [tff, bff, prog, undet] = multi;
-            const total = tff + bff + prog + undet;
-            if (total === 0) return { kind: 'unknown' };
-            const combed = tff + bff;
-            if (combed / total < IDET_COMBED_MIN) return { kind: 'progressive', combed, total };
-            const rep = lastIdetCounts(text, 'Repeated Fields:\\s*Neither:\\s*(\\d+)\\s*Top:\\s*(\\d+)\\s*Bottom:\\s*(\\d+)');
-            const repeats = rep ? rep[1] + rep[2] : 0;
-            // Parity from idet's own TFF/BFF split. Consulted whenever the container states no UNAMBIGUOUS field order - that is, no order at all or one of
-            // the producer-dependent crossed values (see the deintParity note) - because bwdif's parity=auto reads the frame flags and guesses top-first when
-            // there are none, which on a flagless bottom-field-first source is simply wrong (measured 0.9345 SSIM against 0.9668).
-            const parity = tff > bff ? 'tff' : (bff > tff ? 'bff' : 'auto');
-            return { kind: repeats / total >= IDET_REPEAT_MIN ? 'telecine' : 'interlaced', combed, total, repeats, parity };
-        } catch (e) { return { kind: 'unknown' }; }
-    };
-    // ====== END INTERLACE DETECTION ======
-
-    // #region SHARED helpers (2 sections: closed-caption probe … closed-caption handoff)
-    // ===== SHARED [sub_worker, video_clean]: closed-caption probe =====
-    // -=-=-= A53 probe constants / deriveFfprobePath / probeA53Captions  [sub_worker, video_clean] =-=-=-
-    // Closed captions are not a stream. They ride INSIDE the video bitstream as A53/EIA-608 SEI, so no stream list mentions them and nothing short of a
-    // decode-side probe can see them - which is also why a re-encode is the one operation that can destroy them. ffprobe reports them as per-frame side data,
-    // and reading a BOUNDED window of frames answers the question at a cost independent of duration (measured 0.2-17s across the sample corpus, a clip and a
-    // feature alike) because -read_intervals stops the read instead of scanning to EOF. Do NOT reach for the movie=...[out0+subcc] filter to detect: it has no
-    // working bound - on a caption-FREE file the subtitle output never ends, so ffmpeg decodes the whole file hunting packets that never arrive.
-    const A53_PROBE_TIMEOUT_MS = 120000;
-    const A53_PROBE_MAX_BYTES = 8 * 1024 * 1024;
-    const A53_PROBE_FRAMES = 400;                         // captions are sparse, and a programme's opening is often silent; 400 frames spans enough to decide
-    const A53_SIDE_DATA = 'A53 Part 4 Closed Captions';   // ffprobe's spelling of the side-data type, and the only positive signal there is
-
-    // Tdarr hands a plugin otherArguments.ffmpegPath and nothing else; ffprobe sits beside it under the same name. Replace only the FINAL path component: the
-    // production path carries 'ffmpeg' as a DIRECTORY as well as the basename (.../assets/app/ffmpeg/darwin_arm64/ffmpeg), so a plain string replace rewrites
-    // the directory and yields a path to nothing. Returns '' when the binary can't be located, which every caller must read as "unknown", never as "no".
-    const deriveFfprobePath = (ffmpegPath) => {
-        const p = String(ffmpegPath || '').trim();
-        if (!p) return '';
-        const cut = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
-        const base = p.slice(cut + 1);
-        if (!/^ffmpeg(\.exe)?$/i.test(base)) return '';   // an unexpected basename (a wrapper script, say): no safe derivation
-        const probe = p.slice(0, cut + 1) + base.replace(/^ffmpeg/i, 'ffprobe');
-        if (cut < 0) return probe;                        // a bare 'ffmpeg' means a PATH lookup, and 'ffprobe' resolves the same way
-        try { return fs.existsSync(probe) ? probe : ''; } catch (e) { return ''; }
-    };
-
-    // Does the primary video stream carry A53 caption side data? Returns true / false / 'unknown' - and 'unknown' is NOT 'no': it means the probe could not
-    // run, so a caller stays fail-safe rather than concluding the file is caption-free. `cap` is the test-injected verdict (__awkCap.captions): supplying it
-    // short-circuits the spawn entirely, which is how the harness stays free of real binaries.
-    const probeA53Captions = (filePath, ffprobePath, cap) => {
-        if (cap === true || cap === false) return cap;
-        if (!filePath || !ffprobePath) return 'unknown';
-        try {
-            const { spawnSync } = require('child_process');
-            const args = ['-v', 'error', '-select_streams', 'v:0', '-read_intervals', `%+#${A53_PROBE_FRAMES}`,
-                '-show_frames', '-show_entries', 'frame=side_data_list', '-of', 'default=nw=1', filePath];
-            const r = spawnSync(ffprobePath, args, { encoding: 'utf8', timeout: A53_PROBE_TIMEOUT_MS, maxBuffer: A53_PROBE_MAX_BYTES });
-            if (!r || r.status !== 0) return 'unknown';
-            return String(r.stdout || '').includes(A53_SIDE_DATA);
-        } catch (e) { return 'unknown'; }
-    };
-    // ===== END SHARED: closed-caption probe =====
-
-    // ===== SHARED [sub_worker, video_clean]: closed-caption handoff =====
-    // -=-=-= CC_TAG / CC_TOKENS / ccTokensOf  [sub_worker, video_clean] =-=-=-
-    // The cross-plugin channel for embedded closed captions. They live in the video BITSTREAM rather than in a stream list, so sub_worker can read them out
-    // to a sidecar or a subtitle track but can only DELETE them where its own -c copy pass may filter the bitstream (H.264, not HDR, not Dolby Vision);
-    // video_clean is the only plugin that re-encodes video, so it is the only one that can be rid of them on anything else. The request therefore travels in
-    // a global CC_TAG tag on the file, written by sub_worker and read by video_clean. It is SHARED so a token added or renamed on one side cannot go missing
-    // on the other: a writer and a reader whose vocabularies drift fail SILENTLY, leaving the captions in the file twice. Deliberately not the awk_sub_worker
-    // marker - that is a list of sidecar PATHS whose reader matches entries against paths, so a flag word pushed in there would be read as a filename.
-    //   strip    - the captions are out (a sidecar or a subtitle track holds them) but the bitstream copy is still there; drop it on the next re-encode.
-    //   removed  - the captions are out AND the bitstream copy went with them in that same pass, so nothing is left to find, to probe for, or to remove.
-    //              The request/fact pair with `strip`: one asks a later plugin to act, the other tells every later pass there is nothing left to act on.
-    //   none     - the caption channel was decoded and carried no caption text at all, so no later pass need pay for that decode again.
-    //   imported - the captions are already embedded as a real subtitle track, so sub_worker must not read them out a second time.
-    // The value is a COMMA LIST and every reader splits it, because the states genuinely combine: an imported round trip that could not strip in its own pass
-    // records `imported,strip` - and `imported,removed` where it could. An empty channel records `none` ALONE - it never owes a strip. A writer
-    // therefore EXTENDS the tag rather than replacing it with one token - a whole-value overwrite would erase a pending request instead of deferring it.
-    // A REQUEST is retired by whoever SERVES it, and only then: video_clean rewrites `strip` to `removed` on the encode that carries the removal out. Without
-    // that the tag only ever grows, and a satisfied request is indistinguishable from a fresh one - a file that later regains captions (a re-muxed capture, an
-    // external tool re-inserting A53 SEI) has them dropped by a request answered encodes ago. `none` and `imported` are never retired: they are memos about
-    // the file rather than requests, and they stay true for its life.
-    const CC_TAG = 'awk_cc';
-    const CC_TOKENS = { strip: 'strip', removed: 'removed', none: 'none', imported: 'imported' };
-    const ccTokensOf = (tags) => getTagCI(tags || {}, CC_TAG).toLowerCase().split(',').map((t) => t.trim()).filter(Boolean);
-    // ===== END SHARED: closed-caption handoff =====
-    // #endregion
-
     // Route the HDR->SDR tonemap to the GPU filter that rides the chosen encoder's device stack, keeping every node's output in the ONE
     // consistent tonemap_* family (cuda ~= opencl ~= videotoolbox, SSIM ~0.9997 - validated on real NVIDIA/Intel/Mac hardware). CPU 'tonemapx'
     // is the ~0.79-different outlier, used only as a fallback when no GPU tonemap initialises or the encoder is software. nvenc->cuda (native,
@@ -1215,6 +1092,129 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (cpuWhy) notes.push(`☐[method_encoder=${encoderOpt}] Encoder: ${cpuName} (${cpuWhy})\n`);
         return cpuChoice();
     };
+
+    // ====== INTERLACE DETECTION ======
+    // Decided from the PIXELS, never the container: real files lie routinely (genuinely combed material tagged field_order=unknown in the corpus), so a
+    // metadata test would miss exactly the files needing repair. One idet decode answers both questions. WHICH kind of combing matters because the repairs
+    // are opposite: shot-on-VIDEO has no original full frame, so bwdif interpolates; shot-on-FILM telecined for broadcast still contains its frames, so
+    // fieldmatch+decimate rebuilds them EXACTLY (measured SSIM 1.000000 vs the true 24p, against 0.9606 for deinterlacing the same file). The discriminator
+    // is idet's REPEATED-FIELD counter, not its combed ratio: 3:2 pulldown structurally repeats one field in five (measured 27% on the telecine sample vs
+    // 0-8% on four true-interlace ones), while the combed ratio reads 97.8% vs 100% - far too narrow to key on.
+    const IDET_PROBE_TIMEOUT_MS = 180000;
+    const IDET_PROBE_MAX_BYTES = 8 * 1024 * 1024;
+    const IDET_SAMPLE_FRAMES = 400;      // enough for a stable ratio; a few seconds of decode even at 4K
+    const IDET_COMBED_MIN = 0.20;        // below this the sample is progressive (measured: 0% progressive vs ~100% interlaced - a wide margin either side)
+    const IDET_REPEAT_MIN = 0.15;        // at or above this the combing is 3:2 pulldown (measured 27%), below it genuine interlace (measured 0-8%)
+    const IDET_SEEK_MIN_DURATION_SEC = 90;   // shorter than this and there is nothing to seek past, so sample from the start
+    const IDET_SEEK_FRACTION = 3;            // sample from a third of the way in, clear of opening titles
+    const IDET_SEEK_MAX_SEC = 600;           // ceiling, so a feature-length programme is not sampled from an hour in
+    // Pull the LAST populated match out of idet's stderr: ffmpeg emits the counters more than once (an all-zero block from a discarded init leads, and the
+    // muxer summary trails), so anchoring to the first block reads zeros and anchoring to the end matches nothing - either way no file gets a verdict.
+    const lastIdetCounts = (text, re) => {
+        const rx = new RegExp(re, 'g');
+        let best = null; let hit;
+        while ((hit = rx.exec(text)) !== null) if (hit.slice(1).some((n) => Number(n) > 0)) best = hit;
+        // The CAPTURE GROUPS as numbers - index 0, the whole match, is dropped, so the caller's [0] is group 1. Both consumers index on that: the four-name
+        // destructure below, and rep[1] + rep[2] meaning Top + Bottom.
+        return best ? best.slice(1).map(Number) : null;
+    };
+    const detectInterlace = (ffmpegPath, inputPath, startSec) => {
+        try {
+            // Sampled from a way into the file, not the head: logos, black and title cards are commonly progressive even in an interlaced programme, so a
+            // head sample under-reports. -ss ahead of -i is safe here because this DECODES; it is only a stream COPY that -ss corrupts.
+            const args = ['-nostats', '-hide_banner', ...(startSec > 0 ? ['-ss', String(startSec)] : []), '-i', inputPath,
+                '-frames:v', String(IDET_SAMPLE_FRAMES), '-vf', 'idet', '-an', '-sn', '-f', 'null', '-'];
+            const r = childProcess.spawnSync(ffmpegPath || 'ffmpeg', args,
+                { encoding: 'utf8', timeout: IDET_PROBE_TIMEOUT_MS, maxBuffer: IDET_PROBE_MAX_BYTES });
+            const text = String((r && r.stderr) || '');
+            const multi = lastIdetCounts(text,
+                'Multi frame detection:\\s*TFF:\\s*(\\d+)\\s*BFF:\\s*(\\d+)\\s*Progressive:\\s*(\\d+)\\s*Undetermined:\\s*(\\d+)');
+            if (!multi) return { kind: 'unknown' };
+            const [tff, bff, prog, undet] = multi;
+            const total = tff + bff + prog + undet;
+            if (total === 0) return { kind: 'unknown' };
+            const combed = tff + bff;
+            if (combed / total < IDET_COMBED_MIN) return { kind: 'progressive', combed, total };
+            const rep = lastIdetCounts(text, 'Repeated Fields:\\s*Neither:\\s*(\\d+)\\s*Top:\\s*(\\d+)\\s*Bottom:\\s*(\\d+)');
+            const repeats = rep ? rep[1] + rep[2] : 0;
+            // Parity from idet's own TFF/BFF split. Consulted whenever the container states no UNAMBIGUOUS field order - that is, no order at all or one of
+            // the producer-dependent crossed values (see the deintParity note) - because bwdif's parity=auto reads the frame flags and guesses top-first when
+            // there are none, which on a flagless bottom-field-first source is simply wrong (measured 0.9345 SSIM against 0.9668).
+            const parity = tff > bff ? 'tff' : (bff > tff ? 'bff' : 'auto');
+            return { kind: repeats / total >= IDET_REPEAT_MIN ? 'telecine' : 'interlaced', combed, total, repeats, parity };
+        } catch (e) { return { kind: 'unknown' }; }
+    };
+    // ====== END INTERLACE DETECTION ======
+
+    // #region SHARED helpers (2 sections: closed-caption probe … closed-caption handoff)
+    // ===== SHARED [sub_worker, video_clean]: closed-caption probe =====
+    // -=-=-= A53 probe constants / deriveFfprobePath / probeA53Captions  [sub_worker, video_clean] =-=-=-
+    // Closed captions are not a stream. They ride INSIDE the video bitstream as A53/EIA-608 SEI, so no stream list mentions them and nothing short of a
+    // decode-side probe can see them - which is also why a re-encode is the one operation that can destroy them. ffprobe reports them as per-frame side data,
+    // and reading a BOUNDED window of frames answers the question at a cost independent of duration (measured 0.2-17s across the sample corpus, a clip and a
+    // feature alike) because -read_intervals stops the read instead of scanning to EOF. Do NOT reach for the movie=...[out0+subcc] filter to detect: it has no
+    // working bound - on a caption-FREE file the subtitle output never ends, so ffmpeg decodes the whole file hunting packets that never arrive.
+    const A53_PROBE_TIMEOUT_MS = 120000;
+    const A53_PROBE_MAX_BYTES = 8 * 1024 * 1024;
+    const A53_PROBE_FRAMES = 400;                         // captions are sparse, and a programme's opening is often silent; 400 frames spans enough to decide
+    const A53_SIDE_DATA = 'A53 Part 4 Closed Captions';   // ffprobe's spelling of the side-data type, and the only positive signal there is
+
+    // Tdarr hands a plugin otherArguments.ffmpegPath and nothing else; ffprobe sits beside it under the same name. Replace only the FINAL path component: the
+    // production path carries 'ffmpeg' as a DIRECTORY as well as the basename (.../assets/app/ffmpeg/darwin_arm64/ffmpeg), so a plain string replace rewrites
+    // the directory and yields a path to nothing. Returns '' when the binary can't be located, which every caller must read as "unknown", never as "no".
+    const deriveFfprobePath = (ffmpegPath) => {
+        const p = String(ffmpegPath || '').trim();
+        if (!p) return '';
+        const cut = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+        const base = p.slice(cut + 1);
+        if (!/^ffmpeg(\.exe)?$/i.test(base)) return '';   // an unexpected basename (a wrapper script, say): no safe derivation
+        const probe = p.slice(0, cut + 1) + base.replace(/^ffmpeg/i, 'ffprobe');
+        if (cut < 0) return probe;                        // a bare 'ffmpeg' means a PATH lookup, and 'ffprobe' resolves the same way
+        try { return fs.existsSync(probe) ? probe : ''; } catch (e) { return ''; }
+    };
+
+    // Does the primary video stream carry A53 caption side data? Returns true / false / 'unknown' - and 'unknown' is NOT 'no': it means the probe could not
+    // run, so a caller stays fail-safe rather than concluding the file is caption-free. `cap` is the test-injected verdict (__awkCap.captions): supplying it
+    // short-circuits the spawn entirely, which is how the harness stays free of real binaries.
+    const probeA53Captions = (filePath, ffprobePath, cap) => {
+        if (cap === true || cap === false) return cap;
+        if (!filePath || !ffprobePath) return 'unknown';
+        try {
+            const { spawnSync } = require('child_process');
+            const args = ['-v', 'error', '-select_streams', 'v:0', '-read_intervals', `%+#${A53_PROBE_FRAMES}`,
+                '-show_frames', '-show_entries', 'frame=side_data_list', '-of', 'default=nw=1', filePath];
+            const r = spawnSync(ffprobePath, args, { encoding: 'utf8', timeout: A53_PROBE_TIMEOUT_MS, maxBuffer: A53_PROBE_MAX_BYTES });
+            if (!r || r.status !== 0) return 'unknown';
+            return String(r.stdout || '').includes(A53_SIDE_DATA);
+        } catch (e) { return 'unknown'; }
+    };
+    // ===== END SHARED: closed-caption probe =====
+
+    // ===== SHARED [sub_worker, video_clean]: closed-caption handoff =====
+    // -=-=-= CC_TAG / CC_TOKENS / ccTokensOf  [sub_worker, video_clean] =-=-=-
+    // The cross-plugin channel for embedded closed captions. They live in the video BITSTREAM rather than in a stream list, so sub_worker can read them out
+    // to a sidecar or a subtitle track but can only DELETE them where its own -c copy pass may filter the bitstream (H.264, not HDR, not Dolby Vision);
+    // video_clean is the only plugin that re-encodes video, so it is the only one that can be rid of them on anything else. The request therefore travels in
+    // a global CC_TAG tag on the file, written by sub_worker and read by video_clean. It is SHARED so a token added or renamed on one side cannot go missing
+    // on the other: a writer and a reader whose vocabularies drift fail SILENTLY, leaving the captions in the file twice. Deliberately not the awk_sub_worker
+    // marker - that is a list of sidecar PATHS whose reader matches entries against paths, so a flag word pushed in there would be read as a filename.
+    //   strip    - the captions are out (a sidecar or a subtitle track holds them) but the bitstream copy is still there; drop it on the next re-encode.
+    //   removed  - the captions are out AND the bitstream copy went with them in that same pass, so nothing is left to find, to probe for, or to remove.
+    //              The request/fact pair with `strip`: one asks a later plugin to act, the other tells every later pass there is nothing left to act on.
+    //   none     - the caption channel was decoded and carried no caption text at all, so no later pass need pay for that decode again.
+    //   imported - the captions are already embedded as a real subtitle track, so sub_worker must not read them out a second time.
+    // The value is a COMMA LIST and every reader splits it, because the states genuinely combine: an imported round trip that could not strip in its own pass
+    // records `imported,strip` - and `imported,removed` where it could. An empty channel records `none` ALONE - it never owes a strip. A writer
+    // therefore EXTENDS the tag rather than replacing it with one token - a whole-value overwrite would erase a pending request instead of deferring it.
+    // A REQUEST is retired by whoever SERVES it, and only then: video_clean rewrites `strip` to `removed` on the encode that carries the removal out. Without
+    // that the tag only ever grows, and a satisfied request is indistinguishable from a fresh one - a file that later regains captions (a re-muxed capture, an
+    // external tool re-inserting A53 SEI) has them dropped by a request answered encodes ago. `none` and `imported` are never retired: they are memos about
+    // the file rather than requests, and they stay true for its life.
+    const CC_TAG = 'awk_cc';
+    const CC_TOKENS = { strip: 'strip', removed: 'removed', none: 'none', imported: 'imported' };
+    const ccTokensOf = (tags) => getTagCI(tags || {}, CC_TAG).toLowerCase().split(',').map((t) => t.trim()).filter(Boolean);
+    // ===== END SHARED: closed-caption handoff =====
+    // #endregion
 
     // ====== PER-ENCODER QUALITY / SPEED / PIXEL-FORMAT TRANSLATION ======
     // One normalized quality target (HEVC-CRF scale, lower = better) mapped to each encoder's native flag so the same setting yields comparable

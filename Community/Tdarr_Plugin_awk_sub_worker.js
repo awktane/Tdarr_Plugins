@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.30',
+    Version: '3.999.31',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1382,7 +1382,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Parse each scanned path as a sidecar, carrying its relative path along as the identity everything downstream keys on.
     const parseSidecarRel = (rel) => { const p = parseSidecar(path.posix.basename(rel.replace(/\\/g, '/'))); return p ? { ...p, rel } : null; };
 
-    // ============= UNMAPPED-NODE LIBRARY ACCESS (method_unmapped) =============
+    // ====== UNMAPPED-NODE LIBRARY ACCESS (method_unmapped) ======
     // An unmapped node is handed a local MIRROR of the library, never the library itself, and Tdarr withholds the user's own path translators from it -
     // so the node can work out that the server calls this folder /media/Show and reach nothing at that path. Two ways out, both measured on a real
     // Windows node:
@@ -1411,37 +1411,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // extraction's stderr - not for the smallest that usually suffices. Named once for the same reason the durations are: an unlabelled ceiling gives nobody
     // raising it a way to tell whether the number was chosen or copied.
     const SPAWN_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
-
-    // ====== EMBEDDED CLOSED CAPTIONS ======
-    // Captions are read out through the lavfi `movie` source with its subcc output, which decodes the video and surfaces the A53 caption channel as a
-    // subtitle stream. It is the only route ffmpeg offers, and it is a DECODE - so it is reached only after the cheap bounded probe (the shared
-    // closed-caption probe section) says the file has captions at all. Intent is recorded in the shared awk_cc tag (the closed-caption handoff section),
-    // which is how a removal request survives the one thing this plugin cannot always do: taking the captions out of a bitstream it may not filter.
-
-    // The movie= filename runs TWO parsers - the filtergraph, then the filter's own key=value splitter - and each character is special at a different
-    // level. Measured on the production binary: ':' '=' are option-level (depth 2), '[' ']' ',' ';' filtergraph-level (1), '\' and '\'' special at BOTH
-    // (3); everything else, spaces included, passes untouched. The backslash pass must run FIRST or it re-escapes what the later passes add. ESCAPES
-    // rather than refuses, because a Windows path always contains ':' - refusing would disable the feature on every Windows node. Absolute paths only: a
-    // RELATIVE path whose first component precedes a ':' is read by ffmpeg as a protocol name, which no escaping fixes.
-    const escapeMoviePath = (p) => String(p)
-        .replace(/[\\']/g, (c) => `\\\\\\${c}`)
-        .replace(/[:=]/g, (c) => `\\\\${c}`)
-        .replace(/[[\],;]/g, (c) => `\\${c}`);
-
-    // The caption sidecar is named through sidecarBasename like any other, from a stand-in stream describing what the captions ARE: they belong to the video
-    // stream (so its index anchors the name and can never collide with a real subtitle's), they carry no language of their own, and closed captions are the
-    // SDH role in this plugin's vocabulary. Going through sidecarBasename is what keeps parseSidecar its exact inverse, so the import side needs no special
-    // case - and the s<index> anchor is load-bearing: without it parseSidecar requires the language token to be a REAL language, and 'und' is not one.
-    const CC_LANG = 'und';
-    const ccPseudoStream = (videoIdx) => ({ index: videoIdx, codec_name: 'subrip', tags: { language: CC_LANG }, disposition: { hearing_impaired: 1 } });
-    // The IN-PLUGIN caption extraction, as argv. Both unmapped routes run it - extract defers it into placeSidecars' batch, import runs it alone before
-    // falling through to the mux - and a correction applied to one array only (making the map tolerant, say) would leave the two behaving differently on the
-    // SAME file and the SAME node, in the one route no mapped test run ever exercises. The MAPPED route's preset forms stay written out at their call sites:
-    // they name file.file because Tdarr runs that command against the working file, where this spawn needs the real path the node holds now.
-    const ccLavfiArgs = () => ['-f', 'lavfi', '-i', `movie=${escapeMoviePath(String(file._id || file.file || ''))}[out0+subcc]`,
-        '-map', '1:s:0', '-c:s', 'text', '-f', 'srt'];
-    // The one wording for "the caption channel was read out to this sidecar", shared by the same two routes.
-    const ccReadLine = (videoIdx, name) => `☑${streamTag(videoIdx)}[embedded_cc=enabled] Read the embedded closed captions -> ${name}\n`;
 
     // This node's Node Tags, as [key, value] pairs. One request, memoised, and only ever made when something actually needs it. Tdarr maintains entries in
     // the SAME field - a node restart rewrites it to e.g. "unmapped,media=M:\" - so the field is shared, not ours: split on commas and keep only the
@@ -1626,6 +1595,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { ok, bad };
     };
 
+    // ====== SIDECAR SCAN / HASH / DEDUP (both node types) ======
     // Where a sidecar can legitimately live. Plex is the only one of the three servers that reads a SUBFOLDER: it accepts `subs` or `subtitles` beside the
     // video (the season directory for a show), with the files inside named exactly as they would be beside the video. Jellyfin reads only the video's own
     // directory - subfolder support is an open feature request there, not behaviour - and Emby documents no subfolder either. So IMPORT reads all of them,
@@ -1677,12 +1647,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     const SIDECAR_HASH_MAX = 64 * 1024 * 1024;
-    const sidecarSha1 = (rel) => {
-        const p = path.join(workLibDir(), rel);
+    // One read per sidecar answers BOTH content questions - hash identity (contentKey) and cue emptiness (groupHasNoCues) - mirroring embeddedTextHashes,
+    // whose one ffmpeg pass answers the same pair for the embedded side. Memoised per rel. null = unreadable or over the cap; each caller keeps its own
+    // failure direction (contentKey -> a unique never-merged key, groupHasNoCues -> false = not provably empty).
+    const sidecarContentMemo = new Map();
+    const sidecarContent = (f) => {
+        if (sidecarContentMemo.has(f.rel)) return sidecarContentMemo.get(f.rel);
+        let out = null;
         try {
-            if (fs.statSync(p).size > SIDECAR_HASH_MAX) return '';
-            return crypto.createHash('sha1').update(subTextForHash(fs.readFileSync(p), path.extname(rel))).digest('hex');
-        } catch (e) { return ''; }
+            const p = path.join(workLibDir(), f.rel);
+            if (fs.statSync(p).size <= SIDECAR_HASH_MAX) {
+                const buf = fs.readFileSync(p);
+                out = {
+                    sha1: crypto.createHash('sha1').update(subTextForHash(buf, path.extname(f.rel))).digest('hex'),
+                    noCues: hasNoCues(buf.toString('utf8'), f.ext),
+                };
+            }
+        } catch (e) { out = null; }
+        sidecarContentMemo.set(f.rel, out);
+        return out;
     };
 
     // The streams and global tags of the file as it stands NOW. Pre-processing is always handed ffProbeData; the post-processing stage may not be, so fall
@@ -1765,7 +1748,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const map = new Map();
             for (const [idx, out] of outs) {
                 try {
-                    // The same ceiling the SIDECAR half of this comparison applies (sidecarSha1, groupHasNoCues) - identical bytes must not be refused as a
+                    // The same ceiling the SIDECAR half of this comparison applies (sidecarContent) - identical bytes must not be refused as a
                     // file on disk and accepted as a stream inside a container. Matroska allows per-track zlib compression, so a small mkv legitimately holds
                     // a very large subtitle: 8.76 MB of container expanded to 314 MB of srt through jellyfin-ffmpeg 7.1.4, and reading that took Tdarr's own
                     // Node runtime from 43 MB RSS to 629 MB, since the Buffer and its UTF-8 copy are alive together. Past that, Node's own limits take over
@@ -1892,7 +1875,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (f.bundle) return false;
             if (hashes === undefined) hashes = embeddedTextHashes(embedded);
             if (!hashes || !hashes.size) return false;
-            const h = sidecarSha1(f.rel);
+            const h = sidecarContent(f)?.sha1;
             return !!h && [...hashes.values()].includes(h);
         };
         const confirmed = (f) => {
@@ -1929,7 +1912,38 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { codec_type: 'subtitle', codec_name: codec, index: -1, tags: { language: f.lang, title: f.title }, disposition };
     };
 
-    // ============= guards + input validation (before the try, per the suite's failFile convention) =============
+    // ====== EMBEDDED CLOSED CAPTIONS ======
+    // Captions are read out through the lavfi `movie` source with its subcc output, which decodes the video and surfaces the A53 caption channel as a
+    // subtitle stream. It is the only route ffmpeg offers, and it is a DECODE - so it is reached only after the cheap bounded probe (the shared
+    // closed-caption probe section) says the file has captions at all. Intent is recorded in the shared awk_cc tag (the closed-caption handoff section),
+    // which is how a removal request survives the one thing this plugin cannot always do: taking the captions out of a bitstream it may not filter.
+
+    // The movie= filename runs TWO parsers - the filtergraph, then the filter's own key=value splitter - and each character is special at a different
+    // level. Measured on the production binary: ':' '=' are option-level (depth 2), '[' ']' ',' ';' filtergraph-level (1), '\' and '\'' special at BOTH
+    // (3); everything else, spaces included, passes untouched. The backslash pass must run FIRST or it re-escapes what the later passes add. ESCAPES
+    // rather than refuses, because a Windows path always contains ':' - refusing would disable the feature on every Windows node. Absolute paths only: a
+    // RELATIVE path whose first component precedes a ':' is read by ffmpeg as a protocol name, which no escaping fixes.
+    const escapeMoviePath = (p) => String(p)
+        .replace(/[\\']/g, (c) => `\\\\\\${c}`)
+        .replace(/[:=]/g, (c) => `\\\\${c}`)
+        .replace(/[[\],;]/g, (c) => `\\${c}`);
+
+    // The caption sidecar is named through sidecarBasename like any other, from a stand-in stream describing what the captions ARE: they belong to the video
+    // stream (so its index anchors the name and can never collide with a real subtitle's), they carry no language of their own, and closed captions are the
+    // SDH role in this plugin's vocabulary. Going through sidecarBasename is what keeps parseSidecar its exact inverse, so the import side needs no special
+    // case - and the s<index> anchor is load-bearing: without it parseSidecar requires the language token to be a REAL language, and 'und' is not one.
+    const CC_LANG = 'und';
+    const ccPseudoStream = (videoIdx) => ({ index: videoIdx, codec_name: 'subrip', tags: { language: CC_LANG }, disposition: { hearing_impaired: 1 } });
+    // The IN-PLUGIN caption extraction, as argv. Both unmapped routes run it - extract defers it into placeSidecars' batch, import runs it alone before
+    // falling through to the mux - and a correction applied to one array only (making the map tolerant, say) would leave the two behaving differently on the
+    // SAME file and the SAME node, in the one route no mapped test run ever exercises. The MAPPED route's preset forms stay written out at their call sites:
+    // they name file.file because Tdarr runs that command against the working file, where this spawn needs the real path the node holds now.
+    const ccLavfiArgs = () => ['-f', 'lavfi', '-i', `movie=${escapeMoviePath(String(file._id || file.file || ''))}[out0+subcc]`,
+        '-map', '1:s:0', '-c:s', 'text', '-f', 'srt'];
+    // The one wording for "the caption channel was read out to this sidecar", shared by the same two routes.
+    const ccReadLine = (videoIdx, name) => `☑${streamTag(videoIdx)}[embedded_cc=enabled] Read the embedded closed captions -> ${name}\n`;
+
+    // ====== GUARDS + INPUT VALIDATION (before the try, per the suite's failFile convention) ======
     // WHICH STAGE this is. The plugin declares no Stage, so Tdarr runs it in both stacks; post-processing is handed exactly {homePath, handbrakePath,
     // ffmpegPath, mkvpropeditPath, originalLibraryFile}, and homePath is the discriminator because it is POSITIVE evidence - it appears nowhere else.
     // Testing for the ABSENCE of configVars/job would misread any caller that simply passes less (the flow shim passes no configVars at all, and would
@@ -2159,10 +2173,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // the strip. It is deliberately not done in the pass that WRITES the sidecar: ffmpeg exits 0 having written a cue-less srt whenever the
                     // caption channel decodes empty (a field-2-only capture with padded field 1 does exactly that), so a same-pass strip deletes captions
                     // nothing ever captured. Re-probe instead of trusting the library flag - once the strip has landed the captions are gone, and owing a
-                    // SECOND identical strip is what Tdarr refuses as an infinite transcode loop, ERRORING the file. Only paid when remove_source is on,
-                    // the only setting that can owe a strip at all.
+                    // SECOND identical strip is what Tdarr refuses as an infinite transcode loop, ERRORING the file. Only paid when remove_source is on
+                    // (the only setting that can owe a strip at all) AND this is an extract pass: stripOwed is read only by the extract branch - import
+                    // strips through its own consumed-sidecar path and never consults it, so the probe would be spent on an answer nobody reads.
                     let owed = false;
-                    if (removeSource) owed = ccProbeVerdict() === true;
+                    if (removeSource && action === 'extract') owed = ccProbeVerdict() === true;
                     return { job: null, stripOwed: owed, note: `☑[embedded_cc=enabled] Captions already extracted to ${name}${owed && ccStripAllowed()
                         ? ' - removing the bitstream copy now that the sidecar is confirmed to hold them' : ''}\n` };
                 }
@@ -2518,6 +2533,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // can never drift on what counts as importable.
         const subLangInScope = (f) => (ccName && f.rel === ccName) || !langFilter || langFilter.has(langKey(f.lang));
         const subBundleFits = (f) => !(f.bundle && isMp4);
+        // The shared scope verdict WITH its user-facing line, used by the found-filter below and by the text_file route's pre-fetch filter, so the two
+        // routes can never log different reasons. Every drop says so: a sidecar that is on disk and never mentioned again is indistinguishable from one
+        // the plugin never saw, and that is precisely the report a user cannot debug. Idempotent by construction (pure predicates), so a rel the
+        // pre-fetch filter already passed logs nothing when the found-filter re-tests it. Two scope rules:
+        // - only_languages: the caption staging sidecar is OUR intermediate, not a subtitle the user chose to scope - captions carry no language of
+        //   their own so it is tagged 'und', in nobody's list, and dropping it would strand the caption round trip (the full-video decode is paid, the
+        //   hidden sidecar written, nothing imports it, awk_cc=imported is never stamped, every later pass decodes again). subLangInScope carries the
+        //   import half of that exemption; extract exempts embedded_cc from its own filter.
+        // - bundle-vs-mp4: an mp4-family target carries no font attachments at all, so importing a styled-subtitle bundle there would embed the subtitle
+        //   and strand its fonts - and remove_source would then delete the only copy that has them. Leave the bundle untouched on disk (a drop here also
+        //   keeps it out of the deletion pass below); remux the file to mkv and run import again to restore it.
+        const subInScopeLogged = (f) => {
+            if (!subLangInScope(f)) {
+                // The tag echoes a free-text input, so it gets the same treatment failLangToken gives its token: control characters collapsed (a raw
+                // newline would split the line into a continuation with no ☐/☑/☒ symbol) and capped, since nothing bounds the list and this line is
+                // per-sidecar.
+                response.infoLog += `☑[only_languages=${logTok(inputs.only_languages, 200)}] Skipping ${f.rel} - ${f.lang} is not in the list\n`;
+                return false;
+            }
+            if (!subBundleFits(f)) {
+                response.infoLog += `☒Cannot import ${f.rel} - an ${dstContainer} target carries no font attachments, `
+                    + 'keeping the styled-subtitle bundle on disk\n';
+                return false;
+            }
+            return true;
+        };
         // The marker-hostile refusal message, shared by the pre-fetch check (text_file route) and the post-scan check (mapped route) so they read identically.
         const markerHostileMsg = (n) => `[action=import][container=${dstContainer}] ${n} sidecar${n === 1 ? '' : 's'} to import, but ${dstContainer}`
             + ' cannot store the awk_sub_worker marker that records them, so every later pass would import them again - remux to mkv or mp4 first'
@@ -2583,17 +2624,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         // A marker-hostile target refuses this import anyway (the canRecord check below), and on this route that refusal would otherwise come
                         // only AFTER downloading every listed sidecar. Decide it from the NAMES here so a doomed import never pays the fetch (re-paid on every
                         // requeue); nothing importable falls through to the file's own duplicate cleanup, exactly as the canRecord check does.
+                        const listedPairs = parsed.ok.map((rel) => [rel, parseSidecarRel(rel)]);
+                        const listedParsed = listedPairs.map(([, f]) => f).filter(Boolean);
                         if (!canRecord) {
-                            const wouldImport = parsed.ok.map(parseSidecarRel).filter(Boolean).filter((f) => subLangInScope(f) && subBundleFits(f));
+                            const wouldImport = listedParsed.filter((f) => subLangInScope(f) && subBundleFits(f));
                             if (wouldImport.length) failFile(markerHostileMsg(wouldImport.length));
                         }
-                        listedRels = fetchListedSidecars(parsed.ok, listName, importedSet);
-                        // Names an earlier pass already embedded and removed are not a shortfall, so they count out of the total rather than as failures.
-                        const spent = parsed.ok.filter((rel) => importedSet.has(rel) && !listedRels.includes(rel)).length;
-                        const wanted = parsed.ok.length - spent;
+                        // Scope is likewise decided from the NAMES, before any transfer: an out-of-scope entry (only_languages, or a styled bundle an
+                        // mp4-family target cannot carry) gets its subInScopeLogged skip line and is never downloaded. Unfiltered, it re-downloaded on
+                        // EVERY pass - a sidecar that is never imported never leaves the list. Unparseable names still go through, so fetchListedSidecars
+                        // keeps warning about them by name.
+                        const inScope = new Set(listedParsed.filter(subInScopeLogged).map((f) => f.rel));
+                        listedRels = fetchListedSidecars(listedPairs.filter(([rel, f]) => !f || inScope.has(rel)).map(([rel]) => rel), listName, importedSet);
+                        // Names an earlier pass already embedded and removed are not a shortfall, so they count out of the total rather than as failures;
+                        // the same goes for the out-of-scope names skipped above, which never entered the fetch.
+                        const skippedScope = listedParsed.length - inScope.size;
+                        const spent = parsed.ok.filter((rel) => inScope.has(rel) && importedSet.has(rel) && !listedRels.includes(rel)).length;
+                        const wanted = inScope.size - spent;
                         response.infoLog += `☑[method_unmapped=text_file] Read ${parsed.ok.length} filename${parsed.ok.length === 1 ? '' : 's'} from ${
                             listName}, fetched ${listedRels.length} of the ${wanted} still to import${
-                            spent ? ` (${spent} already embedded and removed)` : ''}\n`;
+                            spent ? ` (${spent} already embedded and removed)` : ''}${
+                            skippedScope ? ` (${skippedScope} out of scope, skipped above)` : ''}\n`;
                     }
                 }
             }
@@ -2608,36 +2659,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             otherArguments?.configVars ? '' : ' (node type unknown - Tdarr passed no node configuration for this run)'}\n`;
         const scan = listedRels ? { rels: listedRels } : scanSidecarDirs();
         if (scan.err) failFile(`Cannot read the library directory to find sidecars: ${scan.err.message || scan.err}`);
-        // Every drop from here down says so. A sidecar that is on disk and never mentioned again is indistinguishable from one the plugin never saw, and
-        // that is precisely the report a user cannot debug - so each filter names the file and the setting that excluded it.
-        const found = scan.rels.map(parseSidecarRel).filter(Boolean)
+        // Parse every scanned name once - the found-filter and the unparseable-name warning below read the same parse. The scope filter (with its skip
+        // lines) is subInScopeLogged above; on the text_file route it already ran against the listed names, and re-testing the fetched survivors here
+        // passes silently.
+        const scanParsed = scan.rels.map((rel) => [rel, parseSidecarRel(rel)]);
+        const found = scanParsed.map(([, f]) => f).filter(Boolean)
             .sort(byOriginalPosition)
-            .filter((f) => {
-                // The caption staging sidecar is OUR intermediate, not a subtitle the user chose to scope. Captions carry no language of their own so it is
-                // tagged 'und', which is in nobody's only_languages list - and dropping it here strands the round trip: the full-video decode is paid for,
-                // the hidden sidecar is written, and then nothing imports it, so awk_cc=imported is never stamped and every later pass decodes again.
-                // extract already exempts embedded_cc from this filter; this is the import half of the same exemption.
-                if (subLangInScope(f)) return true;
-                // The tag echoes a free-text input, so it gets the same treatment failLangToken gives its token: control characters collapsed (a raw newline
-                // would split the line into a continuation with no ☐/☑/☒ symbol) and capped, since nothing bounds the list and this line is per-sidecar.
-                response.infoLog += `☑[only_languages=${logTok(inputs.only_languages, 200)}] Skipping ${
-                    f.rel} - ${f.lang} is not in the list\n`;
-                return false;
-            })
-            // An mp4-family target carries no font attachments at all, so importing a styled-subtitle bundle there would embed the subtitle and strand
-            // its fonts - and remove_source would then delete the only copy that has them. Leave the bundle untouched on disk instead
-            // (dropping it from `found` also keeps it out of the deletion pass below); remux the file to mkv and run import again to restore it.
-            .filter((f) => {
-                if (subBundleFits(f)) return true;
-                response.infoLog += `☒Cannot import ${f.rel} - an ${dstContainer} target carries no font attachments, `
-                    + 'keeping the styled-subtitle bundle on disk\n';
-                return false;
-            });
+            .filter(subInScopeLogged);
         // A file that LOOKS like a subtitle but does not parse as a sidecar is almost always a hand-named one, and saying nothing about it turns a typo into
         // a long hunt for why "nothing happened". Only subtitle EXTENSIONS are named: the library folder holds plenty of unrelated files, and reporting
         // every one of them would be noise. This runs before the empty check, because a run that imports nothing is exactly when the user needs the reason.
-        for (const rel of scan.rels) {
-            if (parseSidecarRel(rel)) continue;
+        for (const [rel, relParsed] of scanParsed) {
+            if (relParsed) continue;
             const relBase = path.posix.basename(rel.replace(/\\/g, '/'));
             const relExt = (relBase.match(/\.([A-Za-z0-9]+)$/) || ['', ''])[1].toLowerCase();
             // A DOT-PREFIXED file is hidden from media servers, and an unparseable one is usually a file the user meant to leave alone: clean_and_remux's
@@ -2713,7 +2746,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Group candidates by byte-identical file content (disabled => every file is its own group). A file whose bytes cannot be read - gone since the
         // readdir, or too large to be a subtitle at all - gets a unique key, so it is imported on its own, never silently dropped or merged.
-        const contentKey = (f) => sidecarSha1(f.rel) || `unreadable:${f.rel}`;
+        const contentKey = (f) => sidecarContent(f)?.sha1 || `unreadable:${f.rel}`;
         const groups = []; const groupHash = new Map();
         if (!dedupeSidecars) { for (const f of candidates) groups.push([f]); }
         else {
@@ -2753,13 +2786,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // content - importing it produces a track that decodes to nothing and gets no hash, so the marker skip could never fire and the same empty
         // subtitle would be muxed in again every cycle, one more dead track each time; the marker's metadata match decides there too. An unreadable or
         // oversized sidecar answers false and takes the ordinary content route, which imports - the recoverable direction.
-        const groupHasNoCues = (f) => {
-            try {
-                const p = path.join(workLibDir(), f.rel);
-                if (fs.statSync(p).size > SIDECAR_HASH_MAX) return false;
-                return hasNoCues(fs.readFileSync(p, 'utf8'), f.ext);
-            } catch (e) { return false; }
-        };
+        const groupHasNoCues = (f) => sidecarContent(f)?.noCues === true;
         // The counterpart of contentConfirms above, and DELIBERATELY the opposite polarity - hence the different verb. contentConfirms guards an UNLINK, so
         // "cannot prove it" must mean "do not delete on content grounds" and it fails CLOSED. This one guards a SKIP, so "cannot prove it" must mean "defer to
         // the marker", which alreadyEmbedded has already confirmed against the live streams - it fails OPEN. Returning false for a bundle here would re-import

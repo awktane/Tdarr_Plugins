@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.25',
+    Version: '4.999.26',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1053,6 +1053,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     for (const [name, value, opts] of dropdownChecks)
         if (!opts.includes(value)) failFile(`[${name}=${logTok(value, 200)}] invalid value, check your settings`);
 
+    // This benign skip (processFile:false) sits BETWEEN config validation (above) and the per-file CONTENT checks (below), and both edges are load-bearing:
+    // a bad setting must still fail loudly on a non-video file, while the language_fill_mode / guard_audio_language pre-checks can failFile (quarantine),
+    // and a non-video file the plugin only means to skip must never be routed to the error queue.
+    if (file.fileMedium !== 'video') return skip('☑File is not a video\n');
+
     // ====== LANGUAGE TAG CANONICALIZATION ======
     // Write-side helpers: this is the only plugin that WRITES container language tags via tag_language/language_fill; langKey/langListMatch
     // (matching) are shared, the ISO639_2_B/toCanonicalTag write-side logic below is clean_and_remux-only. Verified on this build: mp4's
@@ -1751,10 +1756,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return out;
     };
 
-    // This benign skip (processFile:false) must precede the per-file CONTENT checks below - the language_fill_mode / guard_audio_language pre-checks can
-    // failFile (quarantine), and a non-video file the plugin only means to skip must never be routed to the error queue.
-    if (file.fileMedium !== 'video') return skip('☑File is not a video\n');
-
     // remove_sub_sdh safety guard. A "plain" subtitle carries no commentary/descriptive/SDH/lyrics role. On if_plain_survives an SDH/CC subtitle goes only
     // when its language still has a plain subtitle that SURVIVES every whole-file drop reason
     // (subDroppedRegardlessOfLanguage), so extras go and the last usable
@@ -1853,12 +1854,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
-        // The ' -strict <level>' this remux needs, or '' (see mp4StrictArg). Computed HERE, right after the muxability gate, because it reads the FINAL
-        // target container (mkv_fallback rewrites it) and the survivor set that gate leaves behind - a -strict describing a stream this run no longer
-        // keeps would contradict MP4_STRICT_GATED's refusal rationale. Only unmuxableDrops can remove an AUDIO stream, so the survivor set is already complete.
-        const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams,
-            (file.ffProbeData.streams || []).filter((s) => !unmuxableDrops.has(s.index)));
-
         // Fill the remove_sub_sdh plain-track set (declared above). AFTER the muxability gate because subDroppedRegardlessOfLanguage reads dstContainer, which
         // mkv_fallback rewrites - any earlier and a PGS track would count as format-dropped under the abandoned mp4 target. Still ahead of the
         // language_fill_mode pre-check, which subtracts the SDH tracks this guard will drop. Only if_plain_survives consults the set.
@@ -1935,6 +1930,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let subtitleStreamIndex = -1;
         let audioStreamIndex = -1;
         let videoStreamIndex = -1;
+        // Predicted-output tracking for the closing summary line (does not affect the ffmpeg preset). removedIndices: input stream positions
+        // dropped via -map -0:ffstream.index. subCodecOverride: input stream position -> converted subtitle codec ('srt' / 'mov_text').
+        const removedIndices = new Set();
+        const subCodecOverride = new Map();
+        // Drop one input stream. The three writes are NOT independent: removedIndices is the sole input to the "Expected results" summary filter and to the
+        // orphaned-font survivor test, so a drop site that maps a stream out without recording it makes the summary advertise a stream the command deletes.
+        // Per-branch extras (a stream-index decrement, the continue) stay at the call site.
+        const dropStream = (index) => {
+            extraArguments += ` -map -0:${index}`;
+            removedIndices.add(index);
+            convert = true;
+        };
+        // Font attachments whose removal is deferred until after the main loop, when we know which subtitle streams survive. Decided here (not inline)
+        // because an attachment can appear before its subtitles in the file, so we cannot know whether a styled subtitle survives at the moment we reach
+        // the attachment.
+        const deferredFontIndices = [];
 
         // remove_imagesubs=export on an UNMAPPED node: the sidecars cannot ride along as extra outputs of the remux (see the sidecar-placement section), so
         // they are extracted and uploaded HERE, before the stream loop decides anything - the loop then drops an image sub only when its export is in
@@ -2019,28 +2030,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
-        // Predicted-output tracking for the closing summary line (does not affect the ffmpeg preset). removedIndices: input stream positions
-        // dropped via -map -0:ffstream.index. subCodecOverride: input stream position -> converted subtitle codec ('srt' / 'mov_text').
-        const removedIndices = new Set();
-        const subCodecOverride = new Map();
-        // Drop one input stream. The three writes are NOT independent: removedIndices is the sole input to the "Expected results" summary filter and to the
-        // orphaned-font survivor test, so a drop site that maps a stream out without recording it makes the summary advertise a stream the command deletes.
-        // Per-branch extras (a stream-index decrement, the continue) stay at the call site.
-        const dropStream = (index) => {
-            extraArguments += ` -map -0:${index}`;
-            removedIndices.add(index);
-            convert = true;
-        };
-        // The -strict level settled at the muxability gate: TrueHD already living in an mp4-family file and re-muxed back into one would see the very remux
-        // that gate allowed FAIL without it, and a Dolby Vision stream would lose its dvcC/dvvC boxes to a plain mp4 copy. Emitted here rather than at the
-        // gate because extraArguments is built inside this block. Not a `convert = true` trigger - it is inert unless some other work emits a command, and
-        // forcing a remux just to add a flag would be a loop (an untouched file keeps its boxes).
-        extraArguments += strictArg;
-
-        // Font attachments whose removal is deferred until after the main loop, when we know which subtitle streams survive. Decided here (not inline)
-        // because an attachment can appear before its subtitles in the file, so we cannot know whether a styled subtitle survives at the moment we reach
-        // the attachment.
-        const deferredFontIndices = [];
+        // The ' -strict <level>' this remux needs, or '' (see mp4StrictArg): TrueHD already living in an mp4-family file and re-muxed back into one would see
+        // the very remux the muxability gate allowed FAIL without it, and a Dolby Vision stream would lose its dvcC/dvvC boxes to a plain mp4 copy. Reads the
+        // FINAL target container (mkv_fallback rewrites it) and the survivor set that gate leaves behind - a -strict describing a stream this run no longer
+        // keeps would contradict MP4_STRICT_GATED's refusal rationale; only unmuxableDrops can remove an AUDIO stream, so the survivor set is already
+        // complete. Not a `convert = true` trigger - it is inert unless some other work emits a command, and forcing a remux just to add a flag would be a
+        // loop (an untouched file keeps its boxes).
+        extraArguments += mp4StrictArg(dstContainer, file.ffProbeData.streams,
+            (file.ffProbeData.streams || []).filter((s) => !unmuxableDrops.has(s.index)));
 
         for (let i = 0; i < file.ffProbeData.streams.length; i++) {
             const ffstream = file.ffProbeData?.streams[i];
@@ -2060,8 +2057,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // The stream's own title, handler laundered out - see the shared mediaTitleFor.
             const mediaTitleClean = mediaTitleFor(ffstream);
             const streamTitle = (ffstream.tags?.title || mediaTitleClean || '');
-            const streamLang = resolveLang(ffstream);
-            let workLang = streamLang || 'und';
 
             //Metadata edits for this stream, accumulated by the emitters below and flushed onto the command at the end of the iteration.
             let metadataCommand = '';
@@ -2129,12 +2124,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
             };
             // language_fill / tag_language: write the canonical language tag for a kept stream. canonicalLangMeta decides it; this records the decision the
-            // same way for all three stream types, so the "log it AND emit it" pair can never be applied to one branch and forgotten in another. Returns
-            // canonicalLangMeta's workLang; the subtitle branch instead resolves its own earlier (resolveWorkLang), since it must decide keep/drop first.
+            // same way for all three stream types, so the "log it AND emit it" pair can never be applied to one branch and forgotten in another. (The
+            // subtitle branch resolves its own working language first - resolveWorkLang - since it must decide keep/drop before writing a tag.)
             const emitLangMeta = (typeLetter, idx, typeWord, allowFill) => {
                 const langMeta = canonicalLangMeta(typeLetter, idx, ffstream, typeWord, allowFill);
                 if (langMeta.meta) { workDone += langMeta.log; metadataCommand += langMeta.meta; }
-                return langMeta.workLang;
             };
 
             if(ffstreamType === 'subtitle') {
@@ -2199,7 +2193,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // Decide removal BEFORE standardising the tag, so a subtitle dropped by language_sub / remove_sub_sdh / the styled-bundle export never
                     // logs a language correction it won't keep. workLang here equals canonicalLangMeta's own workLang (same fillApplies rule), so the
                     // keep/drop decision is unchanged - the tag write is just skipped for a stream about to be mapped out.
-                    workLang = resolveWorkLang(ffstream);
+                    const workLang = resolveWorkLang(ffstream);
 
                     //language_sub: drop a subtitle whose (possibly filled) language is not on the keep list. A blank list keeps every language.
                     if(subLanguage.length > 0 && !langListMatch(workLang, subLangKeys)) {
@@ -2311,8 +2305,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             } else if(ffstreamType === 'audio') {
                 audioStreamIndex++;
 
-                // Fill a blank language and/or standardise the tag (tag_language) before deciding whether to remove it.
-                workLang = emitLangMeta('a', audioStreamIndex, 'audio', true);
+                // Fill a blank language and/or standardise the tag (tag_language).
+                emitLangMeta('a', audioStreamIndex, 'audio', true);
 
                 // Past the muxability gate above, nothing here removes an audio stream - audio_clean owns every audio keep/drop decision (language via
                 // language_surround/language_stereo/language_unlisted, role via downmix_secondary), so audio only ever gets metadata work in this branch.
