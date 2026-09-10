@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.20',
+    Version: '4.999.21',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1416,7 +1416,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const srcRateToken = (s) => {
         const b = Number(s.bit_rate || 0);
         if (b > 0) return kbpsToken(b);
-        const tb = targetTable(codecNameOf(s), resolveChannels(s));
+        // codecFamilyOf, not the raw codec_name: the ladder is keyed by family, so a container spelling (aac_latm in a broadcast .ts) would miss it and
+        // print 'unknown bitrate' for a track whose family the ladder covers perfectly well. The displayed CODEC name stays raw at the call sites.
+        const tb = targetTable(codecFamilyOf(s), resolveChannels(s));
         return tb > 0 ? `~${tb / 1000} kb/s` : 'unknown bitrate';
     };
 
@@ -2208,6 +2210,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // later in the loop is visible to every later caller.
         const hasSixForLang = (k) => existing6chLangs.has(k) || created6chLangs.has(k);
         const hasStereoForLang = (k) => existing2chLangs.has(k) || created2chLangs.has(k);
+        // "This remix must stand down" - ONE spelling of the deferral both remix sites ask about (codec_force, and the loudnorm convergence): no lossless
+        // relabel exists, method_layout_err=remix, and the language already has a GENUINE-track stereo, so remixing would only mint a duplicate. Secondary
+        // tracks are excluded on the same rule replace2ch's registerLang states from the other side: the language's stereo slot belongs to main tracks, so a
+        // commentary neither claims it nor is blocked by it. Without that exclusion a secondary is deferred forever - secondaries are never deduplicated, so
+        // the duplicate this rule avoids can never be collapsed, and downmix_secondary=stereo already makes one stereo per secondary beside the main one.
+        // Takes the ffstream rather than a key so both sites read the same fields off the same object.
+        const remixDefersToExistingStereo = (s, relabel) => !relabel && methodLayoutErr === 'remix' && !s.awkSecondaryTrack && hasStereoForLang(s.awkRegionKey);
 
         // Tracks which OUTPUT audio indices have already received a -c:a:N assignment so we don't emit conflicting codec directives for the same stream.
         const modifiedAudioIdx = new Set();
@@ -2690,10 +2699,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         const opusBad = targetCodec === 'opus' && forceChannels > 2 && !opusLayout.ok;
                         const relabel = opusBad ? opusLayout.relabel : null;
                         const layoutName = srcLayout || `${forceChannels}ch`;
-                        // remix→stereo defers when the language already has a stereo (hasStereoForLang, which is where the duplicate rule is explained);
-                        // fall back to keep.
-                        const remixDefer = opusBad && !relabel && methodLayoutErr === 'remix'
-                            && hasStereoForLang(ffstreamRegionKey);
+                        // remix→stereo defers when the language already has a stereo (see remixDefersToExistingStereo); fall back to keep.
+                        const remixDefer = opusBad && remixDefersToExistingStereo(ffstream, relabel);
                         let forced = false;
 
                         if (opusBad && !relabel && (methodLayoutErr === 'keep' || methodLayoutErr === 'drop' || remixDefer)) {
@@ -2836,15 +2843,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 // Converging a non-opus source to opus (ffstreamCodec isn't opus-encodable, so targetCodec fell through to codec_surround=opus): if libopus
                 // encode this track's layout, a bare -c:a opus would abort the whole ffmpeg job. Relabel losslessly when possible (chained before loudnorm);
-                // otherwise defer to method_layout_err. 'remix' downmixes to codec_stereo (+ loudnorm) in place, unless a stereo already exists for this
-                // language (remixDefer, through the same hasStereoForLang predicate the codec_force path uses); 'keep' - and 'drop', which can't remove a track
-                // once the audio index maps are built (the codec_force path drops such a track in the pre-pass) - leave it in its source codec, un-normalized.
+                // otherwise defer to method_layout_err. 'remix' downmixes to codec_stereo (+ loudnorm) in place, unless a GENUINE track already holds this
+                // language's stereo (remixDefer, the shared remixDefersToExistingStereo the codec_force path asks too, which never defers a secondary - a
+                // commentary's stereo is not the language's); 'keep' - and 'drop', which can't remove a track once the audio index maps are built (the
+                // codec_force path drops such a track in the pre-pass) - leave it in its source codec, un-normalized.
                 let loudnormRelabel = '';
                 if (targetFamily === 'opus' && channels > 2 && ffstreamCodec !== 'opus') {
                     const { lay, ok, relabel } = opusLayoutFor(ffstream, channels);
                     if (!ok) {
-                        const remixDefer = !relabel && methodLayoutErr === 'remix'
-                            && hasStereoForLang(ffstream.awkRegionKey);
+                        const remixDefer = remixDefersToExistingStereo(ffstream, relabel);
                         if (relabel) {
                             // lossless relabel to an opus-safe layout, chained ahead of loudnorm
                             loudnormRelabel = `channelmap=map=${relabel.map}:channel_layout=${relabel.layout}`;
@@ -2854,12 +2861,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // cap left unmeasured) must not be flattened from surround to stereo for nothing. Every other exit of this loop already bails on
                             // !changed, and so does this one. Contrast the codec_force remix, which is correct to fire
                             // unconditionally: there the codec change IS the requested operation and loudnorm merely rides along.
+                            // And NO stamp on the way out, unlike every other within-tolerance exit: stereoArg measured the stereo FOLD, a signal this track
+                            // never becomes here, and the tag records only the preset - so caching it against the source would claim the surround content is
+                            // at target when nothing measured it. Measured on this build, a fold reads 0.95-3.0 LU quieter than the same track natively
+                            // (0.12 LU only on pure dialogue), i.e. past LOUDNORM_TOLERANCE_LU, so the false claim would land exactly on the loud tracks
+                            // loudnorm exists to tame - and this loop's cache check trusts the tag before any codec/layout reasoning, so it would suppress the
+                            // correction for good once the settings stop routing this track through the remix. The cost is one analysis spawn per pass, the
+                            // same price a container that cannot persist the tag already pays.
                             const two = stereoArg(outputAudioIdx, ffstream);
                             if (!two.changed) {
-                                if (loudnormTagPersists && two.measured) {
-                                    stampWithinTolerance(ffstream.index, outputAudioIdx);
-                                    convert = true;
-                                }
+                                skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Remix not needed - the stereo fold is already `
+                                    + `within tolerance; left as ${ffstreamCodec} ${channels}ch un-normalized\n`;
                                 continue;
                             }
                             const enc = stereoEnc(outputAudioIdx);
