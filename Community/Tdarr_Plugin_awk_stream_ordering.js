@@ -15,7 +15,7 @@ const details = () => ({
         it's needed).\n\nBecause it runs last it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file
         that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the signature of an out-of-memory-killed or
         unfinalised encode from an earlier stage. A longer output is accepted. This check is always on and has no setting.\n`,
-    Version: '4.999.8',
+    Version: '4.999.9',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -985,6 +985,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     for (const tok of orderLangTokens)
         if (!knownLangToken(langKey(tok))) failLangToken('order_language', tok);
 
+    // The only plugin in the suite with real work to do on an audio-only file: after audio_clean force-codecs a track this is the one that strips the
+    // per-stream encoder tag it leaves, and a multi-track .mka still wants order_language/order_codec and the sole-default normalisation.
+    // mka ONLY, and the reason is cover art. Matroska carries it as an ATTACHMENT, so an .mka has no video-typed stream and the rank table below already
+    // orders it correctly - nothing needs changing to support it. Every other audio container carries cover art as an attached_pic VIDEO stream, which
+    // streamOrder ranks 0: it would be hoisted above the music to become track 0, and a music file whose first track is a JPEG reads as a video to taggers
+    // and media servers. Excluding them is what lets the comparator stay untouched, so none of this can reach a video file.
+    // Accepted residual: a contrived .mka carrying a genuine video-typed stream at avg_frame_rate 0/0 classifies as 'audio' and would be sorted to track 0.
+    // Guarding it means editing the comparator every video file traverses - a certain risk to the common case to protect a file that does not occur.
+    if (file.fileMedium !== 'video' && !(file.fileMedium === 'audio' && dstContainer === 'mka')) {
+        if (file.fileMedium === 'audio')
+            return skip(`☑[${dstContainer || 'none'}] Audio-only file - only mka is reordered, since every other audio container carries cover art as a `
+                + 'video stream that would be ordered ahead of the audio\n');
+        return skip('☑File is not a video\n');
+    }
+
     // One guard around all the reordering work below: a deliberate failFile abort (AwkFailFile) rethrows unchanged, and any UNEXPECTED error fails the
     // file too — annotated and carrying the full infoLog — instead of silently skipping. (Input validation runs above this, failing via failFile too.)
     try {
@@ -1298,12 +1313,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let orderChanged = false;
         let audioIndex = -1;
 
-        // A default-track flag only round-trips in a container that can STORE it: mkv/webm (Matroska) and the mp4 family persist it; MPEG-TS and AVI silently
+        // A default-track flag only round-trips in a container that can STORE it: Matroska (mkv/mka/webm) and mp4-family persist it; MPEG-TS and AVI silently
         // drop it (measured on jellyfin-ffmpeg 7.1.4 via set→remux→re-probe). This plugin keeps the source container (dstContainer = file.container), so a
         // standalone run on a .ts/.avi capture would otherwise write '+default' every pass, read it back missing, and re-emit a byte-identical preset - which
         // Tdarr's infinite-transcode-loop guard errors, quarantining a healthy file. Normalize the sole-default flag only where it sticks; elsewhere leave the
         // audio default flags untouched (the same container-unstorable-flag skip clean_and_remux's tag_disposition already applies to captions/original).
-        const canPersistDefault = dstContainer === 'mkv' || dstContainer === 'webm' || isMp4Family(dstContainer);
+        const canPersistDefault = ['mkv', 'mka', 'webm'].includes(dstContainer) || isMp4Family(dstContainer);
         let defaultFlagSkipped = false;
 
         for (let i = 0; i < streams.length; i++) {
