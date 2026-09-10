@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.21',
+    Version: '4.999.22',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1122,9 +1122,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // deliberately ABSENT - QuickTime spells those four the /T way and remapping them would break what works - and mri is absent because the table has no Maori
     // under any code. Anyone extending this must re-measure against the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a safe source.
     // mp4/m4v/m4a pack the letters directly and keep either spelling, which is why this is mov-only. Both writers fold to /T then remap: audio_clean on an audio
-    // language write, sub_worker on a subtitle language write.
-    const MOV_LANG = { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
-        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel' };
+    // language write, sub_worker on a subtitle language write. Null-prototype so a container tag spelling an Object.prototype member ('constructor',
+    // '__proto__') misses the table and falls through to the pass-through instead of resolving an inherited function.
+    const MOV_LANG = Object.assign(Object.create(null), { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
+        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel' });
     // ===== END SHARED: mov language remap =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: free-text list split =====
@@ -2345,6 +2346,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             quiet_room: { I: -16, LRA: 6,  TP: -1.5 },
         };
         const LOUDNORM_TOLERANCE_LU = 1;
+        // Shape of a measured value: minus/digits/dot only, the %.2f form the real binary emits ('-21.75', '0.00', '-70.00'). Tested on String(val).
+        const LOUDNORM_MEASURED_SHAPE = /^-?\d+(?:\.\d+)?$/;
 
         // Synchronous analysis-only ffmpeg spawn measuring one stream's EBU R128 loudness. Returns { stats } (input_i/input_tp/input_lra/input_thresh/
         // target_offset) or { error } - every failure is reported, never thrown, so the caller decides how to fail the file. The loudnorm JSON logs at
@@ -2426,9 +2429,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // exits above, carries -inf/inf here). So a non-numeric value in one of them means a malformed or metadata-spoofed block: these land RAW in the
             // double-quoted -filter:a value that escMeta never sees and string-argv tokenizes quote-aware, so a " would open new ffmpeg argv (a second output
             // path = arbitrary write) and an <io> would truncate the output side; a missing field bakes a literal 'undefined' the pass-2 transcode rejects with
-            // a cryptic error. Validate so the interpolated values are provably digit/dot/minus only, failing with a targeted diagnostic instead.
-            for (const [field, val] of [['input_lra', stats.input_lra], ['input_tp', stats.input_tp], ['input_thresh', stats.input_thresh], ['target_offset', stats.target_offset]])
-                if (!Number.isFinite(Number(val)))
+            // a cryptic error. Validate the SHAPE, not just the coercion: Number() alone calls '', ' ', null, true, [], '0x1f' and '1e1' finite while the RAW
+            // value is what gets spliced, so only a digit/dot/minus regex proves the claim; the finite test stays beside it to keep rejecting a digit string
+            // too large to be a real measurement. input_i is validated here too - its own non-finite case already returned above as silence.
+            for (const [field, val] of [['input_i', stats.input_i], ['input_lra', stats.input_lra], ['input_tp', stats.input_tp],
+                ['input_thresh', stats.input_thresh], ['target_offset', stats.target_offset]])
+                if (!LOUDNORM_MEASURED_SHAPE.test(String(val)) || !Number.isFinite(Number(val)))
                     failWithBuffers(`${streamTag(streamIndex)}[method_loudnorm=${methodLoudnorm}] malformed loudnorm measurement JSON from the analysis pass `
                         + `(${field}=${logTok(String(val), 40)}) - the file may be corrupt or carry crafted metadata; leave method_loudnorm=disabled for it`);
             const corrected = `loudnorm=I=${preset.I}:LRA=${preset.LRA}:TP=${preset.TP}:measured_I=${stats.input_i}:measured_LRA=${stats.input_lra}`

@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.32',
+    Version: '3.999.33',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1201,9 +1201,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // deliberately ABSENT - QuickTime spells those four the /T way and remapping them would break what works - and mri is absent because the table has no Maori
     // under any code. Anyone extending this must re-measure against the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a safe source.
     // mp4/m4v/m4a pack the letters directly and keep either spelling, which is why this is mov-only. Both writers fold to /T then remap: audio_clean on an audio
-    // language write, sub_worker on a subtitle language write.
-    const MOV_LANG = { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
-        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel' };
+    // language write, sub_worker on a subtitle language write. Null-prototype so a container tag spelling an Object.prototype member ('constructor',
+    // '__proto__') misses the table and falls through to the pass-through instead of resolving an inherited function.
+    const MOV_LANG = Object.assign(Object.create(null), { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
+        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel' });
     // ===== END SHARED: mov language remap =====
     // Plex/Jellyfin/Emby all accept a spelled-out language NAME in a sidecar name (Movie.English.srt), which isRealLanguageToken recognises - but the name
     // itself is not a valid container language tag, so writing it through would stamp "language=English" into the mkv. Fold any non-code token to its code; a
@@ -1643,12 +1644,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Two traps, both deliberate: (1) only a numeric line IMMEDIATELY PRECEDING a "-->" line is dropped, because that is structurally the cue number - a
     // blanket "drop standalone numeric lines" would delete a cue whose text is literally "7" and make two different subtitles collide; (2) ass is
     // normalised for line endings ONLY, never reduced to its Dialogue: lines, because that would hash two subtitles differing only in typesetting alike.
+    // trimEnd, never /\s+$/: that pattern is start-unanchored, so V8 retries from every offset inside a whitespace run and backtracks against a $ it can
+    // never reach while the run is interior - O(n^2) on the 64 MiB these buffers are capped at (measured 12.7 s at an 80 KB run; trimEnd does 4 MiB in
+    // 5.6 ms). trimEnd strips exactly the JS \s set - verified over every code point U+0000-U+10FFFF, BOM and U+2028/2029 included - so hashes are unchanged.
     const subTextForHash = (buf, ext) => {
         const t = buf.toString('utf8').replace(/^﻿/, '').replace(/\r\n?/g, '\n');
         const e = String(ext || '').toLowerCase().replace(/^\./, '');
-        if (e !== 'srt' && e !== 'vtt') return t.replace(/\s+$/, '');
+        if (e !== 'srt' && e !== 'vtt') return t.trimEnd();
         const lines = t.split('\n');
-        return lines.filter((ln, i) => !(/^\d+$/.test(ln.trim()) && String(lines[i + 1] || '').includes('-->'))).join('\n').replace(/\s+$/, '');
+        return lines.filter((ln, i) => !(/^\d+$/.test(ln.trim()) && String(lines[i + 1] || '').includes('-->'))).join('\n').trimEnd();
     };
 
     const SIDECAR_HASH_MAX = 64 * 1024 * 1024;
@@ -1743,7 +1747,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         for (const s of wanted) {
             const enc = TEXT_SUB[String(s.codec_name).toLowerCase()];
             const out = path.join(dir, `s${s.index}.${enc.ext}`);
-            args.push('-map', `0:${s.index}`, '-c:s', enc.enc, out);
+            // -fs is a per-OUTPUT byte cap, so it bounds this staging directory at write time rather than after the fact - see the SIDECAR_HASH_MAX
+            // comment below for what it buys and why the ceiling sits one byte above the cap.
+            args.push('-map', `0:${s.index}`, '-c:s', enc.enc, '-fs', String(SIDECAR_HASH_MAX + 1), out);
             outs.set(s.index, out);
         }
         const { spawnSync } = require('child_process');
@@ -1761,7 +1767,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // consumers already fail SAFE on a missing hash: dedupeEmbeddedSubs never drops a stream it cannot hash, and contentConfirms never
                     // authorises an unlink it cannot prove. Real text subtitles are kilobytes and a heavily typeset ASS a few MB, so this refuses no genuine
                     // one. Reached on an ordinary extract/reimport round trip, not only under deduplicate - contentConfirms arrives here gated only on
-                    // remove_source, which defaults to true.
+                    // remove_source, which defaults to true. Enforced at WRITE time too, by the per-output -fs above: an oversized track truncates its own
+                    // file at the first chunk past the limit - so strictly ABOVE the cap, and this test still rejects it unchanged - while the other outputs
+                    // complete and the run still exits 0, and ffmpeg stops reading once every output has capped. Without that bound this test governs
+                    // only what is READ, leaving the pass free to stage N x (whatever the container decodes to) in os.tmpdir() first.
                     if (fs.statSync(out).size > SIDECAR_HASH_MAX) continue;
                     const buf = fs.readFileSync(out);
                     // A track that decoded to no cues is EMPTY, not a duplicate. It gets no hash deliberately: every empty track would otherwise hash
