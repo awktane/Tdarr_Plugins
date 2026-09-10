@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.22',
+    Version: '4.999.23',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1724,9 +1724,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         `☒${streamTag(index)}[${tag}] Skipping - no channel count in ffprobe, mediaInfo, or channel layout; ${tail}\n`;
     const NO_CHANNEL_COUNT_CODEC = "can't safely choose a target codec or verify its channel limit";
 
-    // Ordered before the no-audio check so a non-video reports "not a video", not "no audio streams".
-    if (file.fileMedium !== 'video') return skip('☑File is not a video\n');
+    // Which audio-medium containers this plugin will work in. mka is Matroska and m4a is mp4-family - the two muxers it already writes on every video file, so
+    // neither needs a muxability model of its own - and both hold several audio streams of an arbitrary codec, which downmix add and method_deduplicate need.
+    // Every other audio container is effectively single-stream (mp3/flac/wav/ogg), where a downmix add or a force-codec has nowhere to land.
+    const AUDIO_MEDIUM_CONTAINERS = ['mka', 'm4a'];
 
+    // Ordered before the no-audio check so a file this plugin will not touch reports WHY in the most specific terms available - "not a video" or the container
+    // it cannot work in, never "no audio streams", which would read as a property of the file rather than of this plugin's reach. 'other' (subtitle-only,
+    // stills, and anything ffprobe failed to read) and the unscanned '' both take the not-a-video skip: neither promises an audio stream worth managing.
+    if (file.fileMedium !== 'video' && !(file.fileMedium === 'audio' && AUDIO_MEDIUM_CONTAINERS.includes(dstContainer))) {
+        if (file.fileMedium === 'audio')
+            return skip(`☑[${dstContainer || 'none'}] Audio-only file in a container this plugin cannot work in - only `
+                + `${AUDIO_MEDIUM_CONTAINERS.join('/')} hold several audio streams of any codec\n`);
+        return skip('☑File is not a video\n');
+    }
+
+    // Only a VIDEO file can reach this: fileMedium 'audio' is assigned on the presence of an audio stream, so an audio-medium file always has one.
     let audioStreams = file.ffProbeData.streams.filter(stream => codecTypeOf(stream) === 'audio');
     if (audioStreams.length === 0) return skip('☑Video file has no audio streams to manage\n');
 
