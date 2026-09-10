@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.31',
+    Version: '3.999.32',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1086,11 +1086,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     })();
     // ===== END SHARED: language display name =====
     // #endregion
-    // Recognise a filename token as a real language, so a server-native sidecar can be anchored on it without mis-reading an arbitrary token. NOT
-    // interchangeable with the shared knownLangToken - they differ in both directions: this one takes a RAW token and folds it itself, so it recognises
-    // 'English' (the Emby paren split and the server-native anchor depend on that), while knownLangToken takes an ALREADY-FOLDED key and answers false for
-    // a spelled-out name; and knownLangToken accepts und/mis and qaa-qtz because a language INPUT must be able to name them, while here they are not
-    // languages at all - reading 'und' as one turns '<video>.und.hi.srt' from Hindi into an SDH flag on an undetermined track.
+    // Recognise a filename token as a real language, so a server-native sidecar can be anchored on it without mis-reading an arbitrary token. The test is
+    // purely "does ICU name this string" - it says nothing about our own sidecar-name vocabulary, so a caller that needs that (parseSidecar's disposition
+    // strip, where ICU names 'sdh' as Southern Kurdish) must test DISP_TOKENS/EXTRA_TOKENS itself. und and mis have no ICU name and are rejected, which is
+    // what stops '<video>.und.hi.srt' reading as an SDH flag on an undetermined track instead of Hindi; mul and zxx DO have names and are accepted on
+    // purpose - a container can legitimately hold either. NOT interchangeable with the shared knownLangToken, which takes an ALREADY-FOLDED key (so it
+    // answers false for a spelled-out 'English', which the Emby paren split and the server-native anchor both depend on here) and accepts und/mis and
+    // qaa-qtz because a language INPUT must be able to name them.
     const isRealLanguageToken = (token) => { const k = langKey(token); if (!k) return false; return !!langDisplayName(k); };
 
     // #region SHARED helpers (3 sections: iso639-1 to iso639-2 map … closed-caption handoff)
@@ -1340,11 +1342,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const ours = /^s\d+$/.test(toks[0]);
         if (bundle && !ours) return null;
         const index = ours ? parseInt(toks.shift().slice(1), 10) : null;
-        // Trailing dispositions, right-to-left. A DISP_AMBIGUOUS_LANG token only counts as a disposition when the token it would expose is itself a real
-        // language, so Movie.en.hi.srt reads as English+SDH while Movie.hi.srt - and our own Movie.s3.Title.hi.srt - keeps Hindi as its language.
+        // Trailing dispositions, right-to-left. A DISP_AMBIGUOUS_LANG token only counts as a disposition when the token it would expose is a real language
+        // AND is not one of our own name tokens: ICU names 'sdh' (Southern Kurdish), so on the language test alone our own '<video>.sN.sdh.hi.forced.srt'
+        // would eat 'hi' as an SDH flag and then 'sdh' behind it, emptying toks and rejecting a name we wrote ourselves. With both halves Movie.en.hi.srt
+        // still reads as English+SDH, while Movie.hi.srt, our own Movie.s3.Title.hi.srt and Movie.s3.sdh.hi.forced.srt all keep Hindi as the language.
         const rawDisp = [];
         while (toks.length && DISP_TOKENS.has(toks[toks.length - 1])) {
-            if (DISP_AMBIGUOUS_LANG.has(toks[toks.length - 1]) && !isRealLanguageToken(toks[toks.length - 2] || '')) break;
+            const prev = toks[toks.length - 2] || '';
+            if (DISP_AMBIGUOUS_LANG.has(toks[toks.length - 1]) && (DISP_TOKENS.has(prev) || EXTRA_TOKENS.has(prev) || !isRealLanguageToken(prev))) break;
             rawDisp.unshift(toks.pop());
         }
         const dispTokens = [...new Set(rawDisp.filter((t) => !DISP_IGNORE.has(t)).map((t) => DISP_ALIAS[t] || t))];
@@ -2163,7 +2168,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // sidecar is deleted and the finding recorded, so no later pass repeats the decode.
             const existing = readViaApi() ? (sidecarExistsRemote(remoteDest) ? 'remote' : '')
                 : ((() => { try { return fs.existsSync(full) ? 'local' : ''; } catch (e) { return ''; } })());
-            if (existing === 'remote') return { job: null, note: `☑[embedded_cc=enabled] Caption sidecar already in the library: ${name}\n` };
+            if (existing === 'remote') return { job: null, staged: true, note: `☑[embedded_cc=enabled] Caption sidecar already in the library: ${name}\n` };
             if (existing === 'local') {
                 let text = null;
                 try { text = fs.readFileSync(full, 'utf8'); } catch (e) { text = null; }
@@ -2205,6 +2210,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return { job: { name, full, remoteDest, hidden, stream: ccPseudoStream(ccVideo.index) }, note: '' };
         })();
         response.infoLog += ccPlan.note;
+        // Whether the caption staging sidecar is in the library RIGHT NOW - either ccPlan's existence probe found it there, or this pass uploads it below.
+        // Only the text_file import route reads it, because that route has no directory to scan and cannot put the name into the user's list.
+        let ccStaged = ccPlan.staged === true;
 
         // Captions are removed from the VIDEO BITSTREAM, not from a stream list, so the removal is a bitstream filter rather than a -map exclusion. It is
         // picture-lossless on H.264 only: remove_types takes NAL unit types and the numbering is CODEC-SPECIFIC, so 6 is SEI on H.264 but a VCL slice type
@@ -2469,7 +2477,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // sidecarOut and no removedIndices, and testing those alone would skip the pass that removes the captions from the bitstream.
             if (!sidecarOut && !removedIndices.size && !ccMeta && !ccStrip) {
                 if (refused && !wrote && !skipped) failFile('No subtitle could be extracted - every eligible subtitle was refused, see the reasons above');
-                return skip(wrote ? '☑[remove_source=false] Sidecars placed in the library - nothing left to remux\n'
+                // The tag reports the value IN EFFECT, which is not always false here: a caption job never enters removedIndices, so a run that placed only
+                // captions and could neither strip them nor record the request reaches this line with removal ON - one line under the ☒ that says why.
+                return skip(wrote ? `☑[remove_source=${removeSource}] Sidecars placed in the library - nothing left to remux\n`
                     : '☑All eligible subtitles already extracted\n');
             }
 
@@ -2502,7 +2512,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const { placed, failed, empty: emptyExtractions } = placeSidecars([{ name: ccPlan.job.name, dest: ccPlan.job.remoteDest, args: ccLavfiArgs() }]);
             if (placed.has(ccPlan.job.name)) {
                 response.infoLog += ccReadLine(ccVideo.index, ccPlan.job.name);
-                if (unmappedMode === 'text_file') seedSubtitleList([ccPlan.job.name]);
+                ccStaged = true;
+                // The list is seeded here only when there ISN'T one yet; an existing list is the user's file and is never rewritten (seedSubtitleList).
+                // A real failure to create one is reported exactly as the extract route reports it - swallowed, the user is never told the list is missing.
+                if (unmappedMode === 'text_file') {
+                    const why = seedSubtitleList([ccPlan.job.name]);
+                    if (why && why !== LIST_SEED_EXISTS)
+                        response.infoLog += `☒[method_unmapped=text_file] Could not create ${subtitleListName} - ${why}\n`;
+                }
             } else {
                 // An empty channel is a VERDICT and has to be memoised, exactly as the direct-write route memoises it through ccPlan.record: the tag is the
                 // only thing that stops the next pass paying for the same full-video decode, and it takes a mux of its own to write. Returning here defers
@@ -2647,6 +2664,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             skippedScope ? ` (${skippedScope} out of scope, skipped above)` : ''}\n`;
                     }
                 }
+                // The caption staging sidecar is the plugin's OWN intermediate, but on this route the user's list is the only discovery channel - and a list
+                // seeded before embedded_cc was enabled, or written by hand, will never name it, while an existing list is never rewritten (seedSubtitleList).
+                // So fetch it by name, on an answer this pass has already paid for: it was uploaded above, or ccPlan's probe found it in the library. Without
+                // this the round trip stalls for good - uploaded, never fetched, never muxed, and awk_cc=imported, which the run needs to converge, never
+                // written, while every later pass reports the sidecar is already there and does nothing.
+                if (listedRels && ccStaged && ccName && !listedRels.includes(ccName))
+                    listedRels = listedRels.concat(fetchListedSidecars([ccName], listName, importedSet));
             }
         }
 
