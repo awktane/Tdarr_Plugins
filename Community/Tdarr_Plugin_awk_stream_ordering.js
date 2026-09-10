@@ -15,7 +15,7 @@ const details = () => ({
         it's needed).\n\nBecause it runs last it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file
         that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the signature of an out-of-memory-killed or
         unfinalised encode from an earlier stage. A longer output is accepted. This check is always on and has no setting.\n`,
-    Version: '4.999.7',
+    Version: '4.999.8',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -1323,7 +1323,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 audioIndex++;
                 const wantDefault = audioIndex === 0;
                 if (!canPersistDefault) {
-                    // Container can't keep the flag - suppress the write (else it loops); remember one skip so the ☑ note below fires exactly once.
+                    // Container can't keep the flag - suppress the write (else it loops); remember one skip so the ☒ note below fires exactly once.
                     if (streams[i].default !== wantDefault) defaultFlagSkipped = true;
                 } else {
                     if (wantDefault && !streams[i].default)
@@ -1389,8 +1389,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Container can't store a default-track flag (ts/avi): the block above left dispositionArgs empty rather than looping. Say so once, whether the pass
         // otherwise remuxes (a reorder) or skips - so a user never wonders why the sole-default flag was left alone.
+        // ☒, not ☑: a normalisation WAS wanted here and was declined, which is the warning case, and it is the only way a user learns it did not happen -
+        // nothing configures this behaviour, so there is no setting to inspect instead. Same symbol the sibling plugins use for the same class of message
+        // (video_clean declining a shrink, sub_worker declining the awk_cc request and the marker) whenever the destination container cannot store what
+        // this pass wanted to write. On ts/avi ffprobe always reads default=0, so this fires on every pass over such a file that has audio.
         if (defaultFlagSkipped)
-            response.infoLog += `☑${dstContainer} cannot store a default-track flag, so audio default flags are left as they are\n`;
+            response.infoLog += `☒${dstContainer} cannot store a default-track flag, so audio default flags are left as they are\n`;
 
         if (!orderChanged && dispositionArgs === '' && !needsFront && junkArgs === '') return skip('☑Streams already in desired order\n');
 
