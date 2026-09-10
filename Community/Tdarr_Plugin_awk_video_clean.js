@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.21',
+    Version: '3.999.22',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1844,13 +1844,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // 0.9377 vs 0.9816, so the crossed values are ignored and idet decides from the pixels (exact both ways); parity=auto is the last resort.
         const srcFieldOrder = String(primary.field_order || '').toLowerCase().trim();
         const deintParity = () => (srcFieldOrder === 'tt' ? 'tff' : (srcFieldOrder === 'bb' ? 'bff' : (idet().parity || 'auto')));
-        // send_field, not send_frame: a shot-on-video source genuinely holds one distinct moment per FIELD, so emitting one frame per field (1080i60 -> 60p)
-        // keeps what the file contains, while the half-rate alternative would discard every second moment purely to save space. It costs ~31% bitrate and ~58%
-        // encode time (measured, libx265 CRF 23 on real 1080i broadcast). A telecined source is unaffected either way - its original frames come back at their
-        // own rate, so there is no second field to keep and the question does not arise.
+        // Both arms state a mode, because bwdif's own default is send_field (unlike yadif's send_frame) and the two arms want opposite things. Shot-on-video
+        // wants send_field: such a source genuinely holds one distinct moment per FIELD, so emitting one frame per field (1080i60 -> 60p) keeps what the file
+        // contains, while the half-rate alternative would discard every second moment purely to save space. It costs ~31% bitrate and ~58% encode time
+        // (measured, libx265 CRF 23 on real 1080i broadcast). Telecine wants send_frame, and must SAY so: send_field doubles the link's declared rate on setup
+        // whatever deint= passes through, and decimate derives its CFR output from that doubled rate - measured on the same 240 rebuilt frames, the default
+        // emits 48/1 across 5.000 s where send_frame emits 24/1 across 10.000 s, so the picture would finish at half the length of the copied audio.
         const deintFilter = () => (!deinterlaceNeeded() ? ''
             : (idet().kind === 'telecine'
-                ? 'fieldmatch,bwdif=deint=interlaced,decimate'   // rebuild the original frames; bwdif only touches what fieldmatch could not pair
+                ? 'fieldmatch,bwdif=mode=send_frame:deint=interlaced,decimate'   // rebuild the original frames; bwdif only touches what fieldmatch left combed
                 : `bwdif=mode=send_field:parity=${deintParity()}:deint=all`));
         // The two verdict REPORTS - "I looked and there was no combing", "I could not read one at all". They claim no work, so unlike the ☐ repair lines they
         // are safe to emit on a file nothing else happens to; the setting costs a decode, so what it found is information the user paid for. Reads the MEMO,
@@ -2222,11 +2224,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     response.infoLog += `☒${streamTag(primary.index)}[codec=${codec}][guard_captions=true] Closed captions found by ${cc.via}, and no AV1`
                         + ` encoder on this node can carry them - they will be lost; extract them with sub_worker's embedded_cc first to keep them\n`;
             }
-            if (dropCaptions)
+            // `removed` is a memo, not a request - sub_worker took the captions out AND filtered the bitstream copy away in its own pass - so it gets a ☑
+            // no-op line rather than the ☐ one, which would announce a queued removal against a file that has carried no captions since. The line is still
+            // worth emitting: it is what says why the caption probe was skipped, a decode this run did not have to pay for. dropCaptions keeps including
+            // ccAlreadyGone either way, because the -a53cc 0 it drives is the right command - a harmless no-op against a bitstream holding no A53.
+            if (ccExported || ccChannelEmpty)
                 response.infoLog += `☐${streamTag(primary.index)} Dropping the embedded closed captions - sub_worker `
                     + `${ccExported ? 'exported them to a subtitle, and keeping both would show them twice'
-                        : ccAlreadyGone ? 'already took them out and cleared the bitstream copy, so there is nothing left to carry forward'
-                            : 'found the caption channel carries no text'}\n`;
+                        : 'found the caption channel carries no text'}\n`;
+            else if (ccAlreadyGone)
+                response.infoLog += `☑${streamTag(primary.index)} No embedded closed captions to carry - sub_worker already took them out and cleared the `
+                    + 'bitstream copy\n';
             sel.notes.forEach((n) => { response.infoLog += n; });
             // Slice decoding is worth emitting only where it saves something and only on a CPU encode: on a hardware route the slower slice decode could in
             // principle starve a 100+ fps encoder, and a hardware encode peaks low enough (664-1409 MB) that it rarely approaches a limit anyway.
