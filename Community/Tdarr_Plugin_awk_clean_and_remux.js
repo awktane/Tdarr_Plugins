@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.26',
+    Version: '4.999.27',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1134,8 +1134,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // canonicalLangMeta writes derive from the SAME rule.
     const fillApplies = (sl, allowFill) => allowFill && fillLanguage && (!sl || sl === 'und');
     // Language tag to WRITE for a kept video/audio/subtitle stream. Blank container tag + language_fill (audio/subtitle only): fill it, always in a canonical
-    // form (see the fill branch below). Non-blank: canonicalise per tag_language (invalid = only tags storesCleanly rejects; strict = every tag).
-    // und/non-language is never written. Returns { workLang, meta, log }.
+    // form (see the fill branch below). Non-blank: canonicalise per tag_language (invalid = only tags storesCleanly rejects; strict = every tag), which
+    // includes PROMOTING a language only mediaInfo reports into a real tag. und/non-language is never written. Returns { workLang, meta, log }.
     const canonicalLangMeta = (typeLetter, idx, ffstream, typeWord, allowFill) => {
         const rawTag = (ffstream.tags?.language || '').trim();
         const sl = resolveLang(ffstream);
@@ -1149,9 +1149,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             desired = (tagLanguage !== 'disabled' || dstContainer === 'mp4')
                 ? toCanonicalTag(fillLanguage)
                 : (canonicalRegionTag(fillLanguage) || toCanonicalTag(fillLanguage));
-        } else if (!blank && tagLanguage !== 'disabled' && (tagLanguage === 'strict' || !storesCleanly(rawTag))) {
+        } else if (!blank && tagLanguage !== 'disabled' && (tagLanguage === 'strict' || (!rawTag && langName(sl)) || !storesCleanly(rawTag))) {
             // strict enforces the method form (folds region under container/639-2); invalid only repairs syntax, so a recognised region/script tag keeps
             // its region (canonicalised: en_us -> en-US, pt-br -> pt-BR) on mkv. mp4 can't store a region, so it still folds to 639-2/T via toCanonicalTag.
+            // The !rawTag arm is the both-probe promotion: a language resolved with NO ffprobe tag behind it lives only where mediaInfo can see it (an mkv
+            // carrying LanguageIETF beside an explicit und), and ffmpeg demuxes the same dict ffprobe printed - so with no write the remux drops the very
+            // language this run used to decide keep/drop, and the summary promises one the file will not carry. langName(sl) is mandatory, not defensive:
+            // toCanonicalTag hands an unrecognised key back unchanged, and mediaInfo can report a string that is no language at all (the MPEG-TS Menu join),
+            // which must never reach the container. tag_language=disabled still means "never change an existing tag", so it declines the promotion too.
             const repairRegion = tagLanguage === 'invalid' && dstContainer !== 'mp4' ? canonicalRegionTag(sl) : '';
             desired = repairRegion || toCanonicalTag(sl);
         }
@@ -1159,9 +1164,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!desired || desired === compareTo) return { workLang, meta: '', log: '' };
         // Both echoed tags go through logSafe: the raw one is unbounded container metadata, and an UNRECOGNISED tag passes through the canonicaliser
         // unchanged, so `desired` inherits whatever the file supplied. escMeta already makes the -metadata value below safe; this is the log's own guard.
+        const st = streamTag(ffstream.index);
         const log = blank
-            ? `☐${streamTag(ffstream.index)}[language_fill=${logSafe(fillLanguage)}] Language blank on ${typeWord} stream - setting to "${logSafe(desired)}"\n`
-            : `☐${streamTag(ffstream.index)}[tag_language=${tagLanguage}] Standardise ${typeWord} language - "${logSafe(rawTag)}" to "${logSafe(desired)}"\n`;
+            ? `☐${st}[language_fill=${logSafe(fillLanguage)}] Language blank on ${typeWord} stream - setting to "${logSafe(desired)}"\n`
+            : (rawTag
+                ? `☐${st}[tag_language=${tagLanguage}] Standardise ${typeWord} language - "${logSafe(rawTag)}" to "${logSafe(desired)}"\n`
+                : `☐${st}[tag_language=${tagLanguage}] Set language (${typeWord}) from mediaInfo "${logSafe(sl)}" to "${logSafe(desired)}"`
+                    + ' (no ffprobe language tag)\n');
         return { workLang, meta: ` -metadata:s:${typeLetter}:${idx} "language=${escMeta(desired)}"`, log };
     };
     // ====== END LANGUAGE TAG CANONICALIZATION ======
