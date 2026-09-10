@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.27',
+    Version: '4.999.28',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -2448,7 +2448,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         // Every path that can drop a video stream (method_unmuxable=drop above, cover art in the video branch) records it in removedIndices, so the
-        // survivors are read from there. Gated on the file having had video to begin with, so an audio-only file is untouched.
+        // survivors are read from there. The first clause exists to stop the second being VACUOUSLY true: with no video stream at all, "no video stream
+        // survives" holds trivially and would fail a file nothing was taken from. It is structural, not a policy about audio-only files - the not-a-video
+        // skip far above means only a file the scanner classified as video reaches here, so an audio-only file never arrives to be protected.
         if(file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'video')
             && !file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'video' && !removedIndices.has(s.index))) {
             // Name the gate when it is the one that took the video, mirroring the audio guard below: its own two escapes are the fix, where the generic
