@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.40',
+    Version: '3.999.41',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -790,7 +790,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: ffmpeg metadata escaping =====
     // #endregion
 
-    // ============= SUBTITLE SIDECAR HELPERS (non-shared) =============
+    // ====== SUBTITLE SIDECAR HELPERS (non-shared) ======
     // Text subtitle codecs we can round-trip, mapped to the sidecar's native extension + ffmpeg encoder. Bitmap
     // codecs (hdmv_pgs_subtitle/dvd_subtitle/dvb_subtitle/xsub) have no text form: never extracted, never removed.
     const TEXT_SUB = {
@@ -1690,6 +1690,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return lines.filter((ln, i) => !(/^\d+$/.test(ln.trim()) && String(lines[i + 1] || '').includes('-->'))).join('\n').trimEnd();
     };
 
+    // Does decoded subtitle text contain any actual CUES? Only srt writes a genuinely 0-byte file when it has nothing to say - webvtt still writes its WEBVTT
+    // header and ass its whole [Script Info]/[V4+ Styles] preamble - so a size test alone would call an empty ass track populated. Both timed formats mark
+    // every cue with the '-->' arrow, and ass marks every line of dialogue with a Dialogue: key, so one token per format settles it.
+    const hasNoCues = (text, ext) => {
+        if (!String(text).trim()) return true;
+        // The leading class must exclude every character `^` can follow under /m, or the two overlap and the match is quadratic: from each of N line starts
+        // the greedy star runs to the end of the whitespace run and gives a character back at a time testing for `D`, and on text with no Dialogue line
+        // ahead of it none of those N attempts can succeed. JS has FOUR line terminators - \n, \r, U+2028, U+2029 - and `\s` matches all of them, so
+        // `[^\S\r\n]` is NOT enough: it still overlaps on U+2028/U+2029 and stays quadratic (measured 23.7 s on 100k U+2028 versus 12.7 ms on 2M newlines,
+        // so an LF-only test would report it fixed). Shipped form measured 4.14 s on 50k blank lines and 66.9 s on 200k; this one, 424 ms on a 64 MiB
+        // blank-line file - the size the sidecar path actually permits, and one the shipped form never returns from. Behaviour is unchanged: `^` already
+        // anchors at the start of the Dialogue line, so the class only ever needed to skip the indent on the cue's OWN line. The trim() above is no
+        // protection - one non-whitespace byte defeats it, and every real ass has [Script Info].
+        return ext === 'ass' ? !/^[^\S\r\n\u2028\u2029]*Dialogue\s*:/mi.test(text) : !/-->/.test(text);
+    };
+
     const SIDECAR_HASH_MAX = 64 * 1024 * 1024;
     // One read per sidecar answers BOTH content questions - hash identity (contentKey) and cue emptiness (groupHasNoCues) - mirroring embeddedTextHashes,
     // whose one ffmpeg pass answers the same pair for the embedded side. Memoised per rel. null = unreadable or over the cap; each caller keeps its own
@@ -1710,44 +1726,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         } catch (e) { out = null; }
         sidecarContentMemo.set(f.rel, out);
         return out;
-    };
-
-    // The streams and global tags of the file as it stands NOW. Pre-processing is always handed ffProbeData; the post-processing stage may not be, so fall
-    // back to running ffprobe here - otherArguments supplies ffmpegPath and ffprobe sits beside it under the matching name. null means neither route
-    // worked, which the caller must read as "cannot confirm what is embedded" and therefore delete nothing.
-    const probeCurrentFile = () => {
-        const ff = file.ffProbeData;
-        if (ff && Array.isArray(ff.streams)) return { streams: ff.streams, tags: ff.format?.tags || {} };
-        const target = String(file._id || file.file || libFilePath || '');
-        if (!target) return null;
-        // The shared deriveFfprobePath, not a second hand-rolled regex: it replaces only the FINAL path component (the production path carries 'ffmpeg' as a
-        // DIRECTORY too), existsSync-checks the result, and returns '' when the binary cannot be located. A lenient local regex that let an unexpected basename
-        // slip through to the unmodified ffmpeg path would run FFMPEG with ffprobe's arguments and misreport the failure as an unreadable file.
-        const ffprobePath = deriveFfprobePath(String(otherArguments?.ffmpegPath || 'ffmpeg'));
-        if (!ffprobePath) return null;
-        const { spawnSync } = require('child_process');
-        const r = spawnSync(ffprobePath, ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', target],
-            { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES });
-        if (r.error || r.status !== 0) return null;
-        try {
-            const j = JSON.parse(r.stdout); return Array.isArray(j.streams) ? { streams: j.streams, tags: j.format?.tags || {} } : null;
-        } catch (e) { return null; }
-    };
-
-    // Does decoded subtitle text contain any actual CUES? Only srt writes a genuinely 0-byte file when it has nothing to say - webvtt still writes its WEBVTT
-    // header and ass its whole [Script Info]/[V4+ Styles] preamble - so a size test alone would call an empty ass track populated. Both timed formats mark
-    // every cue with the '-->' arrow, and ass marks every line of dialogue with a Dialogue: key, so one token per format settles it.
-    const hasNoCues = (text, ext) => {
-        if (!String(text).trim()) return true;
-        // The leading class must exclude every character `^` can follow under /m, or the two overlap and the match is quadratic: from each of N line starts
-        // the greedy star runs to the end of the whitespace run and gives a character back at a time testing for `D`, and on text with no Dialogue line
-        // ahead of it none of those N attempts can succeed. JS has FOUR line terminators - \n, \r, U+2028, U+2029 - and `\s` matches all of them, so
-        // `[^\S\r\n]` is NOT enough: it still overlaps on U+2028/U+2029 and stays quadratic (measured 23.7 s on 100k U+2028 versus 12.7 ms on 2M newlines,
-        // so an LF-only test would report it fixed). Shipped form measured 4.14 s on 50k blank lines and 66.9 s on 200k; this one, 424 ms on a 64 MiB
-        // blank-line file - the size the sidecar path actually permits, and one the shipped form never returns from. Behaviour is unchanged: `^` already
-        // anchors at the start of the Dialogue line, so the class only ever needed to skip the indent on the cue's OWN line. The trim() above is no
-        // protection - one non-whitespace byte defeats it, and every real ass has [Script Info].
-        return ext === 'ass' ? !/^[^\S\r\n\u2028\u2029]*Dialogue\s*:/mi.test(text) : !/-->/.test(text);
     };
 
     // Source indices whose text decoded to no cues at all, filled in by embeddedTextHashes on the one pass it already makes. Only meaningful once that
@@ -1898,69 +1876,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         catch (e) { return `☒[${delReason}] Could not delete ${listName}: ${e && e.message ? e.message : e}\n`; }
     };
 
-    // remove_source's actual deletion. Called ONLY from the post-processing pass, once Tdarr has accepted the transcode and moved it into the
-    // library, so the embedded copy is the one that survives. This unlink is the one irreversible thing the plugin does, so each marker-listed sidecar has to
-    // be proved against the accepted file's own text before it goes; the marker VALUE still scopes deletion to names we listed, so no file outside this
-    // video's sidecars is ever a candidate. A false negative merely keeps the sidecar (a later pass, or the user, removes it) and never loses subtitle
-    // content, so this fails safe.
-    const deleteImportedSidecars = (streamList, globalTags, mp4Target) => {
-        const delReason = 'remove_source=true';   // this pass only runs when removal is on
-        const marked = new Set(decodeMarkerList(getTagCI(globalTags || {}, 'awk_sub_worker')));
-        if (!marked.size) return { deleted: 0, log: '' };
-        const scan = scanSidecarDirs();
-        if (scan.err) {
-            return { deleted: 0, log: `☒[${delReason}] Cannot read the library directory to remove imported sidecars: ${scan.err.message || scan.err}\n` };
-        }
-        const embedded = streamList.filter((s) => codecTypeOf(s) === 'subtitle');
-        const anyFont = streamList.some((s) => codecTypeOf(s) === 'attachment' && isFontAttachment(s));
-        // Language + title is a proxy for "this is in the file"; the TEXT is the fact itself, and only the fact may authorise an unlink. So the content test
-        // is the PRIMARY one for every ordinary sidecar, and the metadata match is only the fallback for what content cannot cover: a bundle (an .mks is an
-        // archive, and its fonts are what the metadata path checks for) and a probe that could not run at all. That is also what lets a copy the user named
-        // themselves be cleaned up: its title matches no track by construction, yet its content is provably one of them. The hashes cost one pass over the
-        // accepted library file on every successful round trip - the price of never unlinking a sidecar on a resemblance. `confirmed` returns the REASON it
-        // may go, so the deletion line reports what was actually proved.
-        let hashes;
-        const contentConfirms = (f) => {
-            if (f.bundle) return false;
-            if (hashes === undefined) hashes = embeddedTextHashes(embedded);
-            if (!hashes || !hashes.size) return false;
-            const h = sidecarContent(f)?.sha1;
-            return !!h && [...hashes.values()].includes(h);
-        };
-        const confirmed = (f) => {
-            if (!f.bundle && contentConfirms(f)) return 'its text is in the file';
-            // An EMPTY map is not a failed probe - it is the probe saying the accepted file holds no text for this sidecar to be, which is the strongest
-            // possible answer against deleting it. Only a null map (nothing could be read at all) hands the decision back to the metadata resemblance.
-            const metaOnly = f.bundle || !hashes;   // an archive, or a probe that could not run - the two cases the text cannot settle
-            return (metaOnly && markerConfirmsEmbedded(f, embedded, anyFont, mp4Target)) ? 'the file carries a matching subtitle' : '';
-        };
-        let deleted = 0; let log = '';
-        for (const f of scan.rels.map(parseSidecarRel).filter(Boolean).filter((x) => marked.has(x.rel))) {
-            const why = confirmed(f);
-            if (!why) { log += `☒[${delReason}] Marker lists ${f.rel} but nothing in the file is confirmed to be it - not deleting (unverified)\n`; continue; }
-            try { fs.unlinkSync(path.join(workLibDir(), f.rel)); deleted += 1; log += `☑[${delReason}] Deleted sidecar (${why}): ${f.rel}\n`; }
-            catch (e) { log += `☒[${delReason}] Could not delete sidecar ${f.rel}: ${e && e.message ? e.message : e}\n`; }
-        }
-        log += deleteSpentSubtitleList(delReason, marked);
-        return { deleted, log };
-    };
-
-
-    // Synthetic stream so a not-yet-muxed sidecar renders through summariseStream in the expected-results line. It stands in for the RESULT, so `mp4` names the
-    // codec the mux is about to produce, not the one the sidecar arrived as: an mp4-family target transcodes every text sidecar to mov_text, and reporting
-    // the source codec would have the two halves of one run disagree - the same file re-read on the next pass summarises that track as mov_text. The .ass
-    // case is why it is worth more than tidiness: a loose styled sidecar is not filtered out for mp4 (only .mks BUNDLES are), so it is silently flattened
-    // into mov_text and losing its styling while the log says [sub:eng ass].
-    const sidecarToStream = (f, mp4) => {
-        // A bundle always carries a styled subtitle, and can never reach an mp4 target. Every other sidecar maps back through EXT_TO_CODEC behind the same
-        // TEXT_EXTS gate parseSidecar applies, so an ext outside the table cannot reach here - the webvtt fallback only guards a future caller that reads a
-        // sidecar without going through it.
-        const codec = f.bundle ? 'ass' : (mp4 ? 'mov_text' : (TEXT_EXTS.includes(f.ext) ? EXT_TO_CODEC[f.ext] : 'webvtt'));
-        const disposition = {};
-        for (const d of DISPOSITIONS.concat(EXTRA_DISPOSITIONS)) if ((f.dispTokens.concat(f.extraTokens || [])).includes(d.token)) disposition[d.ff] = 1;
-        return { codec_type: 'subtitle', codec_name: codec, index: -1, tags: { language: f.lang, title: f.title }, disposition };
-    };
-
     // ====== EMBEDDED CLOSED CAPTIONS ======
     // Captions are read out through the lavfi `movie` source with its subcc output, which decodes the video and surfaces the A53 caption channel as a
     // subtitle stream. It is the only route ffmpeg offers, and it is a DECODE - so it is reached only after the cheap bounded probe (the shared
@@ -2066,6 +1981,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // costs depends on the operation, so each site decides for itself rather than the whole plugin declining: an extract memoises through the SIDECAR ON DISK
     // and needs no tag, while an import has nothing else to tell an already-embedded sidecar from a new one.
     const canRecord = markerPersists(dstContainer);
+    // ====== SUBTITLE METADATA / RETAG ARGS ======
     // The one rule for writing a subtitle language into the output container: mp4 folds to /T (to6392T), mkv keeps the sidecar spelling (normSidecarLang), and mov
     // folds to /T then remaps through MOV_LANG - the shared 'mov language remap' section has the why. escMeta guards the value either way.
     const langMetaValue = (l) => { const v = isMp4 ? to6392T(l) : normSidecarLang(l); return escMeta(dstContainer === 'mov' ? (MOV_LANG[v] || v) : v); };
@@ -2087,13 +2003,83 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return args;
     };
 
-    // ============= POST-PROCESSING: remove sidecars now that the import is ACCEPTED =============
+    // ====== POST-PROCESSING: remove sidecars now that the import is ACCEPTED ======
     // The only hook that runs after Tdarr's accept gate, and so the only place remove_source may act. Deleting during pre-processing would
     // destroy the sidecars of a transcode the user then REJECTS: the muxed copy goes with the work directory and the library file never had
     // those subtitles, so they would exist nowhere. This stage also runs SERVER-side, which is what lets it clean up on behalf of an
     // UNMAPPED node - the file API offers upload and download but nothing that removes a path, while the server simply has the library on
     // disk. Nothing here may throw: the post-processing runner swallows exceptions, so a throw would be invisible. Nothing here needs to
     // either - a delete that fails leaves a sidecar the marker already excludes from re-import, and the next pass over this file retries it.
+
+    // The streams and global tags of the file as it stands NOW. Pre-processing is always handed ffProbeData; the post-processing stage may not be, so fall
+    // back to running ffprobe here - otherArguments supplies ffmpegPath and ffprobe sits beside it under the matching name. null means neither route
+    // worked, which the caller must read as "cannot confirm what is embedded" and therefore delete nothing.
+    const probeCurrentFile = () => {
+        const ff = file.ffProbeData;
+        if (ff && Array.isArray(ff.streams)) return { streams: ff.streams, tags: ff.format?.tags || {} };
+        const target = String(file._id || file.file || libFilePath || '');
+        if (!target) return null;
+        // The shared deriveFfprobePath, not a second hand-rolled regex: it replaces only the FINAL path component (the production path carries 'ffmpeg' as a
+        // DIRECTORY too), existsSync-checks the result, and returns '' when the binary cannot be located. A lenient local regex that let an unexpected basename
+        // slip through to the unmodified ffmpeg path would run FFMPEG with ffprobe's arguments and misreport the failure as an unreadable file.
+        const ffprobePath = deriveFfprobePath(String(otherArguments?.ffmpegPath || 'ffmpeg'));
+        if (!ffprobePath) return null;
+        const { spawnSync } = require('child_process');
+        const r = spawnSync(ffprobePath, ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', target],
+            { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES });
+        if (r.error || r.status !== 0) return null;
+        try {
+            const j = JSON.parse(r.stdout); return Array.isArray(j.streams) ? { streams: j.streams, tags: j.format?.tags || {} } : null;
+        } catch (e) { return null; }
+    };
+
+    // remove_source's actual deletion. Called ONLY from the post-processing pass, once Tdarr has accepted the transcode and moved it into the
+    // library, so the embedded copy is the one that survives. This unlink is the one irreversible thing the plugin does, so each marker-listed sidecar has to
+    // be proved against the accepted file's own text before it goes; the marker VALUE still scopes deletion to names we listed, so no file outside this
+    // video's sidecars is ever a candidate. A false negative merely keeps the sidecar (a later pass, or the user, removes it) and never loses subtitle
+    // content, so this fails safe.
+    const deleteImportedSidecars = (streamList, globalTags, mp4Target) => {
+        const delReason = 'remove_source=true';   // this pass only runs when removal is on
+        const marked = new Set(decodeMarkerList(getTagCI(globalTags || {}, 'awk_sub_worker')));
+        if (!marked.size) return { deleted: 0, log: '' };
+        const scan = scanSidecarDirs();
+        if (scan.err) {
+            return { deleted: 0, log: `☒[${delReason}] Cannot read the library directory to remove imported sidecars: ${scan.err.message || scan.err}\n` };
+        }
+        const embedded = streamList.filter((s) => codecTypeOf(s) === 'subtitle');
+        const anyFont = streamList.some((s) => codecTypeOf(s) === 'attachment' && isFontAttachment(s));
+        // Language + title is a proxy for "this is in the file"; the TEXT is the fact itself, and only the fact may authorise an unlink. So the content test
+        // is the PRIMARY one for every ordinary sidecar, and the metadata match is only the fallback for what content cannot cover: a bundle (an .mks is an
+        // archive, and its fonts are what the metadata path checks for) and a probe that could not run at all. That is also what lets a copy the user named
+        // themselves be cleaned up: its title matches no track by construction, yet its content is provably one of them. The hashes cost one pass over the
+        // accepted library file on every successful round trip - the price of never unlinking a sidecar on a resemblance. `confirmedWhy` returns the REASON it
+        // may go, so the deletion line reports what was actually proved.
+        let hashes;
+        const contentConfirms = (f) => {
+            if (f.bundle) return false;
+            if (hashes === undefined) hashes = embeddedTextHashes(embedded);
+            if (!hashes || !hashes.size) return false;
+            const h = sidecarContent(f)?.sha1;
+            return !!h && [...hashes.values()].includes(h);
+        };
+        const confirmedWhy = (f) => {
+            if (!f.bundle && contentConfirms(f)) return 'its text is in the file';
+            // An EMPTY map is not a failed probe - it is the probe saying the accepted file holds no text for this sidecar to be, which is the strongest
+            // possible answer against deleting it. Only a null map (nothing could be read at all) hands the decision back to the metadata resemblance.
+            const metaOnly = f.bundle || !hashes;   // an archive, or a probe that could not run - the two cases the text cannot settle
+            return (metaOnly && markerConfirmsEmbedded(f, embedded, anyFont, mp4Target)) ? 'the file carries a matching subtitle' : '';
+        };
+        let deleted = 0; let log = '';
+        for (const f of scan.rels.map(parseSidecarRel).filter(Boolean).filter((x) => marked.has(x.rel))) {
+            const why = confirmedWhy(f);
+            if (!why) { log += `☒[${delReason}] Marker lists ${f.rel} but nothing in the file is confirmed to be it - not deleting (unverified)\n`; continue; }
+            try { fs.unlinkSync(path.join(workLibDir(), f.rel)); deleted += 1; log += `☑[${delReason}] Deleted sidecar (${why}): ${f.rel}\n`; }
+            catch (e) { log += `☒[${delReason}] Could not delete sidecar ${f.rel}: ${e && e.message ? e.message : e}\n`; }
+        }
+        log += deleteSpentSubtitleList(delReason, marked);
+        return { deleted, log };
+    };
+
     if (isPostProcessing) {
         // Only the import workflow ends in a deletion. In extract mode this pass must do nothing at all: extract WRITES the sidecars, and with
         // remove_source off the embedded subtitles stay too - so a stale marker from an earlier import would confirm against those still-embedded
@@ -2106,9 +2092,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return skip(log ? `☑[remove_source=true] Working in ${workLibDir()}\n${log}`
             : `☑[remove_source=true] No imported sidecar is waiting to be removed\n`);
     }
-    // The -strict level either -c copy remux below needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses without
-    // it. Only subtitle streams are ever added or dropped here, so every audio/video stream is copied and the copied-subset argument stays at its default.
-    const strictArg = mp4StrictArg(dstContainer, streams);
+    // ====== END POST-PROCESSING ======
+
+    // ====== PRESET ASSEMBLY + SUMMARY ======
     // The stream-summary token line. The input summary and every "Expected results" line are meant to be the SAME view of the stream set before and after,
     // and those result lines sit in mutually exclusive branches - so hand-typed copies could drift in a way only one run type ever shows.
     const summariseAll = (list) => list.map((s) => summariseStream(enrichStream(s))).join('');
@@ -2118,17 +2104,37 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // so it both keeps sibling plugins' global awk_* tags (awk_video/awk_recovered) through a -c copy and lands this plugin's own awk_sub_worker marker at
     // all - without it an mp4 marker silently vanishes and the next pass re-imports every sidecar it should have skipped.
     const commitPreset = (out) => {
-        let full = out + strictArg;
+        // The -strict level either -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses without it.
+        // Only subtitle streams are ever added or dropped here, so every audio/video stream is copied and the copied-subset argument stays at its default.
+        let full = out + mp4StrictArg(dstContainer, streams);
         if (isMp4) full += ' -movflags use_metadata_tags';
         full += globalOutputOpt;
         response.preset = `<io>${full}`;
         response.processFile = true;
     };
 
+    // Synthetic stream so a not-yet-muxed sidecar renders through summariseStream in the expected-results line. It stands in for the RESULT, so `mp4` names the
+    // codec the mux is about to produce, not the one the sidecar arrived as: an mp4-family target transcodes every text sidecar to mov_text, and reporting
+    // the source codec would have the two halves of one run disagree - the same file re-read on the next pass summarises that track as mov_text. The .ass
+    // case is why it is worth more than tidiness: a loose styled sidecar is not filtered out for mp4 (only .mks BUNDLES are), so it is silently flattened
+    // into mov_text and losing its styling while the log says [sub:eng ass].
+    const sidecarToStream = (f, mp4) => {
+        // A bundle always carries a styled subtitle, and can never reach an mp4 target. Every other sidecar maps back through EXT_TO_CODEC behind the same
+        // TEXT_EXTS gate parseSidecar applies, so an ext outside the table cannot reach here - the webvtt fallback only guards a future caller that reads a
+        // sidecar without going through it.
+        const codec = f.bundle ? 'ass' : (mp4 ? 'mov_text' : (TEXT_EXTS.includes(f.ext) ? EXT_TO_CODEC[f.ext] : 'webvtt'));
+        const disposition = {};
+        for (const d of DISPOSITIONS.concat(EXTRA_DISPOSITIONS)) if ((f.dispTokens.concat(f.extraTokens || [])).includes(d.token)) disposition[d.ff] = 1;
+        return { codec_type: 'subtitle', codec_name: codec, index: -1, tags: { language: f.lang, title: f.title }, disposition };
+    };
+
+    // ====== END PRESET ASSEMBLY + SUMMARY ======
+
     try {
         response.infoLog += `☐Input streams: ${summariseAll(streams)}\n`;
 
-        // ---- embedded closed captions ---- Answered once, ahead of both action branches, because both ask the same two questions: is there caption data
+        // ====== EMBEDDED CLOSED CAPTIONS: PER-FILE PLAN ======
+        // Answered once, ahead of both action branches, because both ask the same two questions: is there caption data
         // worth the decode, and where would it land? Everything that can end the question cheaply is checked before the probe, and the probe before the
         // decode. Returns a job only when there is real work; otherwise a note saying why not, so an enabled setting never passes in silence.
         const ccVideo = streams.find((s) => codecTypeOf(s) === 'video' && !isCoverArt(s));
@@ -2289,7 +2295,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
 
         if (action === 'extract') {
-            // ============= EXTRACT: embedded text subs -> sidecars (+ optional removal) =============
+            // ====== EXTRACT: embedded text subs -> sidecars (+ optional removal) ======
             // Duplicate tracks the file already carries go before anything else: a dropped stream must not also be written to a sidecar, or the copy we just
             // decided was redundant comes straight back on the next import under a name of its own.
             const dupes = dedupeStreams ? dedupeEmbeddedSubs(streams.filter((s) => codecTypeOf(s) === 'subtitle')) : { dropIdx: [], retag: null, log: '' };
@@ -2538,7 +2544,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return response;
         }
 
-        // ============= IMPORT: sidecars -> embedded (+ safe deletion) =============
+        // ====== IMPORT: sidecars -> embedded (+ safe deletion) ======
         // Captions reach a subtitle TRACK over two passes, and that is a reuse decision rather than a compromise: this pass only reads them out to a hidden
         // staging sidecar, and the next runs that file through the ordinary import path, which already verifies content, collapses duplicates against what
         // is embedded, converts to mov_text for an mp4 target, restores metadata from the name and deletes the file afterwards. Muxing the captions straight
