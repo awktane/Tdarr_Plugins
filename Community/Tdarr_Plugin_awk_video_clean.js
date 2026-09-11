@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.22',
+    Version: '3.999.23',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1655,11 +1655,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Everything from here is per-FILE work, so it runs inside the failUnexpected wrapper: the summary walk reads both probes for every stream, and an
     // unforeseen throw in there must still reach the error queue carrying this plugin's own infoLog rather than as a bare Error with none of it.
     try {
-        response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
-
+        // Ahead of the input summary, which walks BOTH probes for every stream: a file this plugin will not touch should cost one log line, not a full
+        // enrich pass whose output is then thrown away. Keep it FIRST INSIDE the try rather than above it - the guard reads one scalar and cannot throw,
+        // so nothing the failUnexpected wrapper exists to protect moves out from under it.
         if (file.fileMedium !== 'video') {
             return skip('☑File is not a video\n');
         }
+
+        response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
 
         // Primary (non-cover-art) video stream - the one we actually encode.
         const videoStreams = file.ffProbeData.streams.filter((s) => codecTypeOf(s) === 'video');
