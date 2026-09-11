@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.30',
+    Version: '4.999.31',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -2627,7 +2627,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         for (let i = 0; i < workStreams.length; i++) {
             const ffstream = workStreams[i];
-            const ffstreamCodec = codecNameOf(ffstream);
+            const ffstreamCodec = codecNameOf(ffstream) || 'unknown';
             const ffstreamChannels = ffstream.awkChannels;
             const writeLang = langForWrite(ffstream);
             const outputAudioIdx = outputAudioIdxMap.get(ffstream.index);
@@ -2851,7 +2851,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const srcAudioIdx = inputAudioIdxMap.get(s.index);
             if (srcAudioIdx === undefined) continue;
             const srcRateStr = srcRateToken(s);
-            const srcCodec = (s.codec_name || 'unknown').trim().toLowerCase();
+            const srcCodec = codecNameOf(s) || 'unknown';
             // 5.1 derivative from a >6ch source (downmix_to_six), when the language still lacks one.
             if (s.channels > 6 && downmixToSix !== 'disabled' && !hasSixForLang(regionKey)) {
                 append6ch(s, srcAudioIdx, srcCodec, srcRateStr, regionKey, " (source dropped - libopus can't encode its layout)");
@@ -2882,7 +2882,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     skipDone += noChannelCountSkip(ffstream.index, `method_loudnorm=${methodLoudnorm}`, NO_CHANNEL_COUNT_CODEC);
                     continue;
                 }
-                const ffstreamCodec = codecNameOf(ffstream);
+                const ffstreamCodec = codecNameOf(ffstream) || 'unknown';
                 const isStereo = channels <= 2;
                 // WHICH codec this re-encode lands on. Two candidates, in preference order: keepCodec - the codec the track already has, whenever this
                 // plugin can encode it (what codec_force=false means, and the only option for a source outside our encodable domain: a kept DTS core,
