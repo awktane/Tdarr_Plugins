@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.34',
+    Version: '3.999.35',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -203,13 +203,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // eslint-disable-next-line no-param-reassign
     inputs = lib.loadDefaultValues(inputs, details);
 
+    // Tdarr's classic-plugin consumer (Tdarr_Node/srcug/node/workers/transcodeSettings/settingsPlugin.js) reads only processFile, preset, container,
+    // ffmpegMode, handbrakeMode, infoLog, error and reason - reQueueAfter is NOT among them, in any of the five plugins. It is plugin-creator TEMPLATE
+    // residue: its one occurrence in the whole install is inside the scaffold string pluginCreatorMethods.js writes out, so setting it does nothing at all.
+    // Don't re-add it. Re-running the stack until every plugin skips is the flow's own loop, not something a plugin requests - which is why this plugin's
+    // confirm-and-delete second pass arrives without it.
     const response = {
         processFile: false,
         preset: '',
         handBrakeMode: false,
         container: `.${file.container}`,
         FFmpegMode: true,
-        reQueueAfter: false,
         infoLog: '',
     };
 

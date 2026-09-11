@@ -15,7 +15,7 @@ const details = () => ({
         it's needed).\n\nBecause it runs last it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file
         that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the signature of an out-of-memory-killed or
         unfinalised encode from an earlier stage. A longer output is accepted. This check is always on and has no setting.\n`,
-    Version: '4.999.9',
+    Version: '4.999.10',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -1414,7 +1414,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!orderChanged && dispositionArgs === '' && !needsFront && junkArgs === '') return skip('☑Streams already in desired order\n');
 
         response.processFile = true;
-        response.reQueueAfter = true;
         // Describe the reorder itself - this plugin's headline change, and the only one that would otherwise leave no trace in the log: without these lines a
         // pure reorder runs straight from the input summary to Expected results and the user has to diff the two token lists to see that anything happened.
         // The two causes are reported separately because they answer different questions and a user acts on them differently - regrouping
