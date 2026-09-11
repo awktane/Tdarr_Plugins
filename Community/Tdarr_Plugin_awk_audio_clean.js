@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.29',
+    Version: '4.999.30',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1579,21 +1579,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const approxRate = `~${aacVbrPredictedBps(lowInfo ? AAC_VBR_LOWINFO_BPS : Infinity) / 1000}k`;   // one source with guardBlocks' prediction
             return { encoder: 'libfdk_aac', args: ` -vbr:a:${idx} ${vbrLevel}`, approxRate, label: `libfdk VBR q${vbrLevel}` };
         }
+        // Both fallbacks warn at most once per file: the encoder is a node fact, so a per-track line would repeat it for every stereo track on the run.
+        const warnFallbackOnce = (msg) => {
+            if (_aacVbrFallbackWarned) return;
+            _aacVbrFallbackWarned = true;
+            response.infoLog += `☒[codec_stereo=aac_vbr] ${msg}\n`;
+        };
         if (hasEncoder('aac_at')) {
-            if (!_aacVbrFallbackWarned) {
-                _aacVbrFallbackWarned = true;
-                response.infoLog += `☒[codec_stereo=aac_vbr] no libfdk_aac on this node - using aac_at (AudioToolbox) VBR instead\n`;
-            }
+            warnFallbackOnce('no libfdk_aac on this node - using aac_at (AudioToolbox) VBR instead');
             const q = lowInfo ? 1 : 0;
             return {
                 encoder: 'aac_at', args: ` -aac_at_mode:a:${idx} vbr -q:a:${idx} ${q}`, approxRate: lowInfo ? '~150k' : '~190k', label: `aac_at VBR q${q}`,
             };
         }
         const bps = resolveBitrate('aac', channels);
-        if (!_aacVbrFallbackWarned) {
-            _aacVbrFallbackWarned = true;
-            response.infoLog += `☒[codec_stereo=aac_vbr] no libfdk_aac or aac_at on this node - using native aac ${bps / 1000}k instead\n`;
-        }
+        warnFallbackOnce(`no libfdk_aac or aac_at on this node - using native aac ${bps / 1000}k instead`);
         return { encoder: 'aac', args: encoderArgsBps('aac', idx, bps), approxRate: `${bps / 1000}k`, label: 'native aac' };
     };
 
@@ -1815,8 +1815,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 awkTier: tier,
                 awkLangKey: cleanLang,
                 awkRegionKey: regionKey,
-                // Channel count as a testable NUMBER, 0 = no probe measured one. The enriched .channels deliberately stays undefined on an unmeasurable
-                // stream (see enrichStream), so every numeric channel guard below reads THIS field instead of re-deriving it per phase.
+                // Channel count as a testable NUMBER, 0 = no probe measured one. Read by the per-stream guards that must tell UNMEASURABLE from small -
+                // dedup, codec_force, loudnorm - which is what the 0 sentinel is for. The ambient `.channels` comparisons elsewhere (existing2ch/6chLangs,
+                // noCodecWorkNeeded, the dedup guard block) read the enriched field instead, which stays undefined on an unmeasurable stream and so fails
+                // closed: do NOT swap them to awkChannels, whose 0 compares true against `<= 2` and would silently drop the no-channel-count diagnostic.
                 awkChannels: resolveChannels(enrichedItem),
                 awkQuality: audioQuality(enrichedItem),
                 // Used by codec_force to suppress the source-bitrate floor in resolveBitrate for lossless sources. A lossless bitrate (e.g. 4 Mbps TrueHD)
@@ -2865,7 +2867,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Tracks none of the downmix/force/remix sites above touched at all (the common case - already the right codec/channels, nothing else needed). Runs
         // over EVERY kept audio stream directly (not workStreams/candidateStreams, which exist for codec_force/the stereo tier's own narrower eligibility and
         // would silently exclude secondary/commentary tracks under default settings) - guard_lossless/guard_quality/guard_object_audio are the only scope gate.
-        // A track ALSO being modified by one of the sites above rides on that same re-encode instead (each site's own stereoArg/layoutFilter/inline block calls
+        // A track ALSO being modified by one of the sites above rides on that same re-encode instead (each site's own stereoArg/sixArg/loudnormFilterArg calls
         // buildLoudnormFilter at its own emit point); this loop only handles the leftovers.
         if (methodLoudnorm !== 'disabled') {
             const preset = LOUDNORM_PRESETS[methodLoudnorm];
@@ -2910,12 +2912,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // subprocess entirely. A stale tag from a DIFFERENT preset (or no tag at all) falls through to a fresh measurement below.
                 if (loudnormTagMatchesPreset(ffstream)) continue;
 
-                // Converging a non-opus source to opus (ffstreamCodec isn't opus-encodable, so targetCodec fell through to codec_surround=opus): if libopus
-                // encode this track's layout, a bare -c:a opus would abort the whole ffmpeg job. Relabel losslessly when possible (chained before loudnorm);
-                // otherwise defer to method_layout_err. 'remix' downmixes to codec_stereo (+ loudnorm) in place, unless a GENUINE track already holds this
-                // language's stereo (remixDefer, the shared remixDefersToExistingStereo the codec_force path asks too, which never defers a secondary - a
-                // commentary's stereo is not the language's); 'keep' - and 'drop', which can't remove a track once the audio index maps are built (the
-                // codec_force path drops such a track in the pre-pass) - leave it in its source codec, un-normalized.
+                // Any opus target on a non-opus source - whether codec_force's scope put codec_surround=opus here, or an unencodable source fell through to it:
+                // if libopus CAN'T encode this track's layout, a bare -c:a libopus would abort the whole ffmpeg job. Relabel losslessly when possible (chained
+                // before loudnorm); otherwise defer to method_layout_err. 'remix' downmixes to codec_stereo (+ loudnorm) in place, unless a GENUINE track
+                // already holds this language's stereo (remixDefer, the shared remixDefersToExistingStereo the codec_force path asks too, which never defers a
+                // secondary - a commentary's stereo is not the language's); 'keep' - and 'drop', which can't remove a track once the audio index maps are built
+                // (the codec_force path drops such a track in the pre-pass) - leave it in its source codec, un-normalized.
                 let loudnormRelabel = '';
                 if (targetFamily === 'opus' && channels > 2 && ffstreamCodec !== 'opus') {
                     const { lay, ok, relabel } = opusLayoutFor(ffstream, channels);
