@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.26',
+    Version: '4.999.27',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -530,7 +530,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (15 sections: stream codec type … language list match)
+    // #region SHARED helpers (15 sections: stream codec type … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -1153,6 +1153,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const splitList = (v) => String(v || '').split(',').map(t => t.trim()).filter(Boolean);
     // ===== END SHARED: free-text list split =====
 
+    // ===== SHARED [audio_clean, clean_and_remux]: language list match =====
+    // -=-=-= langListMatch  [audio_clean, clean_and_remux] =-=-=-
+    // True when a stream's language matches any entry in a pre-normalised key list (keys = userList.map(langKey), computed once per run). Only these two
+    // plugins match a stream language against a user list; stream_ordering/sub_worker use langKey directly (indexOf / Set), so they carry langKey, not this.
+    const langListMatch = (streamLang, keys) => keys.includes(langKey(streamLang));
+    // ===== END SHARED: language list match =====
+
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language display name =====
     // -=-=-= langDisplayName  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // Memoised ICU DisplayNames (built once, reused): the recognised English name for an ALREADY-normalised language code, or '' for a non-language/unknown
@@ -1204,12 +1211,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ===== END SHARED: mp4 strict compliance arg =====
 
-    // ===== SHARED [audio_clean, clean_and_remux]: language list match =====
-    // -=-=-= langListMatch  [audio_clean, clean_and_remux] =-=-=-
-    // True when a stream's language matches any entry in a pre-normalised key list (keys = userList.map(langKey), computed once per run). Only these two
-    // plugins match a stream language against a user list; stream_ordering/sub_worker use langKey directly (indexOf / Set), so they carry langKey, not this.
-    const langListMatch = (streamLang, keys) => keys.includes(langKey(streamLang));
-    // ===== END SHARED: language list match =====
     // #endregion
 
     // audio_clean-local IDENTITY key: like langKey but KEEPS the region/script subtag, so pt-BR and pt-PT are DISTINCT identities

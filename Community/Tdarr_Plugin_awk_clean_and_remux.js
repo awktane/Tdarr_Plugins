@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.32',
+    Version: '4.999.33',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -872,6 +872,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const splitList = (v) => String(v || '').split(',').map(t => t.trim()).filter(Boolean);
     // ===== END SHARED: free-text list split =====
 
+    // ===== SHARED [audio_clean, clean_and_remux]: language list match =====
+    // -=-=-= langListMatch  [audio_clean, clean_and_remux] =-=-=-
+    // True when a stream's language matches any entry in a pre-normalised key list (keys = userList.map(langKey), computed once per run). Only these two
+    // plugins match a stream language against a user list; stream_ordering/sub_worker use langKey directly (indexOf / Set), so they carry langKey, not this.
+    const langListMatch = (streamLang, keys) => keys.includes(langKey(streamLang));
+    // ===== END SHARED: language list match =====
+
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: dolby vision detection =====
     // -=-=-= DV_FOURCC_RE [all five] =-=-=-
     // The DV fourccs: HEVC dvhe/dvh1, AVC dvav/dva1, AV1 dav1. Named so the set has ONE definition (video_clean's dvCodecTag tests the same constant).
@@ -908,13 +915,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s))) ? ' -strict unofficial' : '';
     };
     // ===== END SHARED: mp4 strict compliance arg =====
-
-    // ===== SHARED [audio_clean, clean_and_remux]: language list match =====
-    // -=-=-= langListMatch  [audio_clean, clean_and_remux] =-=-=-
-    // True when a stream's language matches any entry in a pre-normalised key list (keys = userList.map(langKey), computed once per run). Only these two
-    // plugins match a stream language against a user list; stream_ordering/sub_worker use langKey directly (indexOf / Set), so they carry langKey, not this.
-    const langListMatch = (streamLang, keys) => keys.includes(langKey(streamLang));
-    // ===== END SHARED: language list match =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
     // -=-=-= escMeta [all five] =-=-=-
@@ -1307,6 +1307,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: styled bundle vocabulary =====
     // #endregion
 
+    // A subtitle removed regardless of language - by container/format (subFormatDropped), by remove_imagesubs (imageSubDropped), or by the mp4
+    // styled-subtitle bundle export (styledSubExported), which maps the track out of the video WHEN THE EXPORT SUCCEEDS. Such a track is not assigned
+    // language_fill and does not count as a survivor for the language_fill_mode untagged tally or the remove_sub_sdh plain-track guard: a track this run
+    // deletes cannot be the plain track another falls back on. One exception on the styled path - a REFUSED export (unmapped node / name over the byte cap /
+    // unsafe path) survives as a mov_text conversion and DOES receive language_fill (see the emitLangMeta reorder note in the subtitle branch), so the tally
+    // exclusion is slightly conservative there.
+    const subDroppedRegardlessOfLanguage = (codec) => subFormatDropped(codec) || imageSubDropped(codec) || styledSubExported(codec);
+
     // #region SHARED helpers (2 sections: preset path safety … font attachment test)
     // ===== SHARED [clean_and_remux, sub_worker]: preset path safety =====
     // -=-=-= pathIsPresetSafe  [clean_and_remux, sub_worker] =-=-=-
@@ -1581,14 +1589,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const { lang, pre, disp } = sidecarNameTokens(ffstream);
         return `.${videoBase}.s${ffstream.index}${pre}.${lang}${disp}${mark ? `.${mark}` : ''}.${ext}`;
     };
-    // A subtitle removed regardless of language - by container/format (subFormatDropped), by remove_imagesubs (imageSubDropped), or by the mp4
-    // styled-subtitle bundle export (styledSubExported), which maps the track out of the video WHEN THE EXPORT SUCCEEDS. Such a track is not assigned
-    // language_fill and does not count as a survivor for the language_fill_mode untagged tally or the remove_sub_sdh plain-track guard: a track this run
-    // deletes cannot be the plain track another falls back on. One exception on the styled path - a REFUSED export (unmapped node / name over the byte cap /
-    // unsafe path) survives as a mov_text conversion and DOES receive language_fill (see the emitLangMeta reorder note in the subtitle branch), so the tally
-    // exclusion is slightly conservative there.
-    const subDroppedRegardlessOfLanguage = (codec) => subFormatDropped(codec) || imageSubDropped(codec) || styledSubExported(codec);
-
     // #region SHARED helpers (1 section: title canonicalization)
     // ===== SHARED [audio_clean, clean_and_remux]: title canonicalization =====
     // Canonical audio-title machinery, shared so audio_clean's downmix titles come out already in clean_and_remux's tag_title form (no wasted remux).
@@ -1738,6 +1738,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // form. Only channelLabel's 3ch (2.1 vs 3.0) and 4ch (3.1 vs 4.0) cases read hasLfe, so 6/8-ch labels are unaffected.
     const layoutHasLfe = (ffstream) => { const s = channelLayoutStr(ffstream); return /lfe/.test(s) || /^\d+\.[1-9]/.test(s.trim()); };
 
+    // >3-period 'busy'/scene-release title test (>4 dot-segments). Callers apply it AFTER role tagging, per the cleanStreamTitle note.
+    const tooManyPeriods = (s) => (s || '').trim().split('.').length > 4;
+
     // Image filename extensions, for an attachment whose codec_name is absent or reads 'none'/'unknown'. COMPOSED from IMAGE_CODECS - every name there is
     // also its own file extension - so a codec added to that shared list is recognised by extension too, plus the extensions IMAGE_CODECS deliberately omits:
     // a filename extension is unambiguous where a codec name is not, so the JPEG family, JPEG 2000, AVIF and HEIC are safe here even though mjpeg/jpeg2000/
@@ -1759,9 +1762,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (isFontAttachment(s)) return 'font';
         return 'other';
     };
-
-    // >3-period 'busy'/scene-release title test (>4 dot-segments). Callers apply it AFTER role tagging, per the cleanStreamTitle note.
-    const tooManyPeriods = (s) => (s || '').trim().split('.').length > 4;
 
     // tag_disposition: the title keywords to promote into real +flags (audio and subtitle share the predicate). A promotion must PERSIST in the
     // destination container, or the flag never "takes" and the plugin re-promotes every pass - an infinite remux loop. Empirically (jellyfin-ffmpeg):
