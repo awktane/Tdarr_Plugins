@@ -7,13 +7,13 @@ const details = () => ({
     Type: 'Audio',
     Operation: 'Transcode',
     Description: `This plugin curates a file's audio tracks: it decides which to KEEP and at what quality - and which to DROP - by language (keep at
-                  surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, and M&E tracks follow
-                  their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove
+                  surround, keep downmixed to stereo, or delete an unlisted language) and by role (commentary, audio-description, M&E and karaoke tracks
+                  follow their own keep / stereo / delete setting). It can also downmix surround to 5.1 or stereo, force tracks to a chosen codec, remove
                   duplicate tracks, and apply two-pass EBU R128 loudness normalization. Guard options protect lossless, object-audio (Atmos/DTS:X/AC-4),
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.23',
+    Version: '4.999.24',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -42,11 +42,11 @@ const details = () => ({
                 counts as "und".
                 \\nA language in neither this list nor language_stereo is "unlisted" and follows language_unlisted. A language in BOTH lists is treated as
                 surround, so this list wins.
-                \\nCommentary, descriptive and M&E tracks are secondary whatever their language - they follow downmix_secondary, not these lists.
+                \\nCommentary, descriptive, M&E and karaoke tracks are secondary whatever their language - they follow downmix_secondary, not these lists.
                 \\nWhich tracks a guard can protect: only a genuine track kept at surround. A secondary track never is, and neither is one you have already
                 sent to stereo or delete through language_stereo, language_unlisted or downmix_secondary - protecting a track from the very downmix you
                 asked for would be nonsense.
-                \\nException - dormancy: if NO genuine (non-commentary, non-descriptive) track matches this list or language_stereo, the language settings
+                \\nException - dormancy: if NO genuine (non-secondary) track matches this list or language_stereo, the language settings
                 go dormant, every genuine track is kept at surround, and language_unlisted=delete is suppressed. So a foreign-language-only file, Japanese
                 only when the lists say English, keeps all its audio instead of losing it.
                 \\nException - guard_original, when enabled, keeps an 'original'-disposition track at surround even in an unlisted language, and vetoes
@@ -74,7 +74,7 @@ const details = () => ({
                 \\ndelete - remove an unlisted language from the file. There is no same-language safety net here: a plain track of that language is NOT
                 required to survive, that rule belonging to downmix_secondary=delete. The only protections are dormancy, and the never-empty floor that
                 keeps the last audio track; guard_original additionally vetoes the delete for an 'original'-flagged track.
-                \\nCommentary, descriptive and M&E tracks are not covered here - they follow downmix_secondary.`,
+                \\nCommentary, descriptive, M&E and karaoke tracks are not covered here - they follow downmix_secondary.`,
         },
         {
             name: 'codec_force',
@@ -136,8 +136,8 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['surround', 'stereo', 'delete'],
             },
-            tooltip: `What to do with SECONDARY tracks - commentary, visually impaired (audio description) and M&E. This is a role, not a language: a
-                secondary track follows this setting whatever its language, and never language_surround, language_stereo or language_unlisted.
+            tooltip: `What to do with SECONDARY tracks - commentary, visually impaired (audio description), M&E and karaoke. This is a role, not a language:
+                a secondary track follows this setting whatever its language, and never language_surround, language_stereo or language_unlisted.
                 \\n=====
                 \\nActions
                 \\n=====
@@ -145,9 +145,9 @@ const details = () => ({
                 still apply.
                 \\nstereo - transcode each secondary track of more than 2 channels in place to a stereo codec_stereo track, using the method_stereo_downmix
                 matrix.
-                \\ndelete - remove secondary tracks, but only where a plain (non-commentary, non-descriptive, non-M&E) track of the SAME language survives,
-                and never if it would leave the file with no audio at all. So a file's only track, or a lone audio-description track with no plain track
-                in its language, is always kept.
+                \\ndelete - remove secondary tracks, but only where a plain (non-commentary, non-descriptive, non-M&E, non-karaoke) track of the SAME
+                language survives, and never if it would leave the file with no audio at all. So a file's only track, or a lone audio-description track
+                with no plain track in its language, is always kept.
                 \\nUnlike the language downmix paths, each surround secondary track is handled in place and independently - one stereo per secondary track,
                 preserving all of them. Secondary tracks are never protected by the guards, so stereo always transcodes them.`,
         },
@@ -160,7 +160,7 @@ const details = () => ({
                 options: ['disabled', 'replace', 'add'],
             },
             tooltip: `Create a 5.1 track for a language that has none, built from the best higher-channel track it does have - restricted to
-                language_surround's languages if you set that list, and never taken from a secondary (commentary, descriptive) track.
+                language_surround's languages if you set that list, and never taken from a secondary (commentary, descriptive, M&E, karaoke) track.
                 \\nNothing is created when the language already has a 5.1 track, or has no higher-channel track to build one from.
                 \\n=====
                 \\nActions
@@ -179,7 +179,7 @@ const details = () => ({
                 options: ['disabled', 'replace', 'add'],
             },
             tooltip: `Create a stereo track for a language that has none, built from the best higher-channel track it does have, never from a secondary
-                (commentary, descriptive) track.
+                (commentary, descriptive, M&E, karaoke) track.
                 \\nNothing is created when the language already has a stereo track, or has no higher-channel track to build one from.
                 \\n=====
                 \\nActions
@@ -236,8 +236,9 @@ const details = () => ({
                 \\nmulti-stereo keeps the 5.1 truehd, better quality than the 7.1 aac and both counting as "surround", plus the 2.0 ac3. The 7.1 aac
                 survives too under the default guard_quality=enabled, which blocks a removal that would drop channels the survivor lacks; with
                 guard_quality=disabled it is removed.
-                \\nNever treated as duplicates: commentary and descriptive tracks, since two different commentaries - cast and crew versus directors - are
-                distinct content even when both are titled "Commentary"; and any track whose language folds to "und", because every untagged track shares
+                \\nNever treated as duplicates: secondary tracks - commentary, descriptive, M&E and karaoke - since two different commentaries, cast and
+                crew versus directors, are distinct content even when both are titled "Commentary", and an M&E or karaoke mix is not a copy of the main
+                track either; and any track whose language folds to "und", because every untagged track shares
                 that one key and two untagged tracks of genuinely different languages would otherwise look alike. An und track can neither be removed nor
                 be the survivor that removes another.
                 \\nA stream newly created by downmix_to_six or downmix_to_stereo is always kept. While downmix_to_six is enabled the 5.1/5.0 band (5-6
@@ -396,8 +397,8 @@ const details = () => ({
                 \\nIt only bites on an unlisted-language original while a wanted language is also present, such as a Japanese 5.1 original beside an English
                 dub with language_surround=eng. An original already in a listed language, or a foreign-only file whose language settings are dormant, is
                 kept at surround anyway and is unchanged by this.
-                \\nCommentary, descriptive and M&E tracks are unaffected: this clears only the LANGUAGE decision, never the role one, so an 'original'
-                commentary still follows downmix_secondary.`,
+                \\nCommentary, descriptive, M&E and karaoke tracks are unaffected: this clears only the LANGUAGE decision, never the role one, so an
+                'original' commentary still follows downmix_secondary.`,
         },
         {
             name: 'guard_quality',
@@ -1756,6 +1757,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // mix. Lyrics/songs are subtitle-only, so they never apply to an audio stream. Secondary is a ROLE: it follows downmix_secondary whatever its language.
         const isSecondaryTrack = (stream) => isCommentary(stream) || isDescriptive(stream)
             || hasDisposition(stream, 'clean_effects') || hasDisposition(stream, 'karaoke');
+        // Which of the four roles made a track secondary, for the removal log: a line saying only "secondary" leaves the user unable to tell WHY a track
+        // counted as one, and since the role is never a language the settings pages give them nowhere else to look. Called only where isSecondaryTrack has
+        // already matched, so the last branch is karaoke by elimination; first match wins, because a track can carry more than one role.
+        const secondaryRole = (stream) => (isCommentary(stream) ? 'commentary'
+            : isDescriptive(stream) ? 'audio description'
+                : hasDisposition(stream, 'clean_effects') ? 'M&E' : 'karaoke');
 
         // Dormancy - see the language_surround tooltip for the full rationale. This boolean is the gate: true only when a genuine (non-secondary) track sits
         // in a language the user asked for (language_surround or language_stereo). Secondary tracks never count toward presence - they follow
@@ -2118,7 +2125,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 continue;
             }
             removedIndices.add(s.index);
-            workDone += `☐${streamTag(s.index)}[downmix_secondary=delete] Removing secondary ${delToken(s)}\n`;
+            workDone += `☐${streamTag(s.index)}[downmix_secondary=delete] Removing secondary ${delToken(s)} (${secondaryRole(s)})\n`;
         }
 
         // Now that dedup, the tier deletes and the layout-drop pre-pass have finalised removedIndices, snapshot which languages still have a primary stereo /
