@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.30',
+    Version: '4.999.31',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -354,6 +354,62 @@ const details = () => ({
 // #endregion
 
 // eslint-disable-next-line @typescript-eslint/no-unused-vars
+// #region SHARED helpers (1 section: language matching)
+// ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language matching =====
+// Normalize any language identifier to a stable comparison key so en / eng / EN / English / en-US - and ISO 639-2/B vs /T (fre vs fra) - all compare
+// equal. Node ships full ICU, so no table or module is needed. This section sits at MODULE scope rather than inside plugin(): every symbol in it is a
+// pure const closure, which is what the top-level rule allows, and langNameIndex's memo is only worth keeping if it outlives a single plugin() call.
+// -=-=-= shortLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+// Short language code: strip any region/variant suffix so 'en-US', 'en_US', 'en.US' all compare as 'en'. `[\s\S]*` rather than `.*` because `.` cannot
+// cross a line terminator and `$` without /m only matches true end-of-input (JS, unlike Perl/Python, will NOT match before a trailing newline) - so on a
+// run of separators followed by an interior \r, \n, U+2028 or U+2029 the engine retries from every separator, runs the star to the terminator, and gives
+// a character back at a time against a `$` it can never reach: O(n^2) with no possible match, so no early exit. A container language tag is unbounded
+// metadata that reaches here uncapped on every language read, and ffprobe hands a 60,000-character Matroska Language element through verbatim - measured
+// 20.1 s of blocked worker for one such file, 0.9 s -> 0.9 ms with this form. Same defect and reasoning as cleanStreamTitle's quote strip. It also folds
+// a tag ENDING in a newline ('en-US\n' -> 'en'), which the `.*` form silently left unfolded.
+const shortLang = (l) => l.replace(/[-_.][\s\S]*$/, '');
+// -=-=-= langNameIndex  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+// Reverse map English language NAME -> code, probed out of Intl.DisplayNames and memoised. Consulted ONLY for a token of 4+ characters, so an ordinary
+// 2- or 3-letter code (en, eng) never touches it and pays nothing. Built in TWO TIERS because the tiers cost wildly different amounts: the 676 two-letter
+// codes take ~1.6 ms and already answer almost every spelled-out name a user types, while the 17,576 three-letter codes take ~170-190 ms - roughly 100x
+// more - and are needed only for a language with NO two-letter form (cantonese -> yue, cebuano -> ceb, hawaiian -> haw). So the cheap tier is built first
+// and the expensive one only when a name misses it. The two-letter entries are then overlaid ON TOP of the three-letter ones, which is what keeps a
+// language that HAS a two-letter code winning its own name (english -> en, never eng) and langKey's fold unchanged. Measured on Tdarr's own bundled
+// runtime and proven exhaustively rather than sampled: both build orders yield 636 keys with 0 differing values across every key, junk tokens included.
+// Null-prototype so a tag spelling an Object.prototype member ('constructor') misses the map instead of resolving inherited junk. Do NOT collapse this
+// back to a single pass: the whole point is that a file whose language tag is spelled out pays ~1.6 ms rather than ~180.
+const langNameIndex = (() => {
+    let two = null; let all = null;
+    const probe = (three) => {
+        const idx = Object.create(null);
+        const dn = new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' });
+        const add = (code) => { const name = dn.of(code); if (name) idx[name.toLowerCase()] = code; };
+        for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {
+            if (!three) { add(String.fromCharCode(a, b)); continue; }
+            for (let c = 97; c <= 122; c++) add(String.fromCharCode(a, b, c));
+        }
+        return idx;
+    };
+    return (name) => {
+        if (!two) two = probe(false);
+        if (two[name] !== undefined) return two[name];
+        if (!all) all = Object.assign(probe(true), two);   // two-letter overlaid LAST, so english -> en rather than eng
+        return all[name];
+    };
+})();
+// -=-=-= langKey  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+// Comparison key for a language token: lowercase/trim, strip any region/variant via shortLang, map a spelled-out English name to its code, then fold
+// code variants with Intl.getCanonicalLocales (eng->en, fre/fra->fr). Undetermined / non-language tokens (und, mul, zxx, mis, reserved qaa-qtz) and
+// anything unrecognised pass through unchanged, so they only ever match themselves.
+const langKey = (x) => {
+    let s = shortLang(String(x || '').trim().toLowerCase());
+    if (!s) return '';
+    if (s.length >= 4) { const code = langNameIndex(s); if (code) s = code; }   // spelled-out English name -> its code
+    try { return String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase(); } catch (e) { return s; }
+};
+// ===== END SHARED: language matching =====
+// #endregion
+
 const plugin = (file, librarySettings, inputs, otherArguments) => {
     const lib = require('../methods/lib')();
     // eslint-disable-next-line @typescript-eslint/no-unused-vars,no-param-reassign
@@ -398,7 +454,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (13 sections: stream codec type … ffmpeg metadata escaping)
+    // #region SHARED helpers (12 sections: stream codec type … ffmpeg metadata escaping)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -804,55 +860,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const streamTag = (index) => `[s${String(index).padStart(2, ' ')}]`;
     // ===== END SHARED: stream / language / preset helpers =====
 
-    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language matching =====
-    // Normalize any language identifier to a stable comparison key so en / eng / EN / English / en-US - and ISO 639-2/B vs /T (fre vs fra) - all compare
-    // equal. Node ships full ICU, so no table or module is needed.
-    // -=-=-= shortLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
-    // Short language code: strip any region/variant suffix so 'en-US', 'en_US', 'en.US' all compare as 'en'. `[\s\S]*` rather than `.*` because `.` cannot
-    // cross a line terminator and `$` without /m only matches true end-of-input (JS, unlike Perl/Python, will NOT match before a trailing newline) - so on a
-    // run of separators followed by an interior \r, \n, U+2028 or U+2029 the engine retries from every separator, runs the star to the terminator, and gives
-    // a character back at a time against a `$` it can never reach: O(n^2) with no possible match, so no early exit. A container language tag is unbounded
-    // metadata that reaches here uncapped on every language read, and ffprobe hands a 60,000-character Matroska Language element through verbatim - measured
-    // 20.1 s of blocked worker for one such file, 0.9 s -> 0.9 ms with this form. Same defect and reasoning as cleanStreamTitle's quote strip. It also folds
-    // a tag ENDING in a newline ('en-US\n' -> 'en'), which the `.*` form silently left unfolded.
-    const shortLang = (l) => l.replace(/[-_.][\s\S]*$/, '');
-    // -=-=-= langNameIndex  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
-    // Reverse map English language NAME -> code, lazily built by probing Intl.DisplayNames and memoised for the run. The 3-letter aaa..zzz codes are probed
-    // first and the 2-letter aa..zz codes second, so a language that HAS a 2-letter code wins its own name (english -> en, never -> eng) and langKey's fold is
-    // unchanged; only a name whose language has no 2-letter code is newly mapped (cantonese -> yue, cebuano -> ceb, hawaiian -> haw), so it validates instead
-    // of failing knownLangToken with the message that had advertised English names. Null-prototype so a tag spelling an Object.prototype member ('constructor')
-    // misses the map instead of resolving inherited junk. The 3-letter pass is a one-time ~197 ms build (17k Intl calls) paid only when a >=4-char token is
-    // first checked - most runs see only 2-3 letter codes and never build the index at all.
-    const langNameIndex = (() => {
-        let idx = null;
-        return () => {
-            if (idx) return idx;
-            idx = Object.create(null);
-            const dn = new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' });
-            for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) for (let c = 97; c <= 122; c++) {   // aaa..zzz: codes with no 2-letter form
-                const code = String.fromCharCode(a, b, c);
-                const name = dn.of(code);
-                if (name) idx[name.toLowerCase()] = code;
-            }
-            for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {   // aa..zz second, so a 2-letter code wins its own name (english -> en)
-                const code = String.fromCharCode(a, b);
-                const name = dn.of(code);
-                if (name) idx[name.toLowerCase()] = code;
-            }
-            return idx;
-        };
-    })();
-    // -=-=-= langKey  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
-    // Comparison key for a language token: lowercase/trim, strip any region/variant via shortLang, map a spelled-out English name to its code, then fold
-    // code variants with Intl.getCanonicalLocales (eng->en, fre/fra->fr). Undetermined / non-language tokens (und, mul, zxx, mis, reserved qaa-qtz) and
-    // anything unrecognised pass through unchanged, so they only ever match themselves.
-    const langKey = (x) => {
-        let s = shortLang(String(x || '').trim().toLowerCase());
-        if (!s) return '';
-        if (s.length >= 4 && langNameIndex()[s]) s = langNameIndex()[s];   // spelled-out English name -> its 2-letter code
-        try { return String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase(); } catch (e) { return s; }
-    };
-    // ===== END SHARED: language matching =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: free-text list split =====
     // -=-=-= splitList  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
