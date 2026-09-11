@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.25',
+    Version: '3.999.26',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1259,9 +1259,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // `floor` is the fraction of that peak the encoder still reaches squeezed to a single frame thread (measured via frame-threads=1 / -x264-params threads=1 /
     // -svtav1-params lp=1). The plugin emits NONE of those knobs - the floor exists only to give the refusal a bound no node's core count or preset choice can
     // undercut. Each depth is measured rather than derived: the 10-bit/8-bit ratio differs per encoder (borrowing libx265's mis-predicts libsvtav1 by 24%).
-    // The four hardware rows carry their 10-bit measurement only and reuse it at 8 bits, over-stating an 8-bit hardware encode by roughly a fifth - harmless,
-    // since a hardware encode peaks at 664-1409 MB and can never refuse (no `floor` row), so that figure only ever hardens a warning. `threadScaled` marks the
-    // one encoder whose per-frame-thread cost was measured; the rest carry no thread term, which under-states them on a big node - see MEM_FRAME_THREADS.
+    // The four hardware rows carry their 10-bit measurement only and reuse it at 8 bits, over-stating an 8-bit hardware encode by roughly a fifth - harmless in
+    // practice, since a hardware encode peaks at 664-1409 MB, far below any realistic node limit, so the over-stated figure normally only hardens a warning. It
+    // is NOT structurally exempt from the refusal: with no `floor` row the multiplier is 1, so the floor equals the FULL estimate times the preset and content
+    // terms - a stricter bound than any CPU row's, and a small enough cgroup still refuses. `threadScaled` marks the one encoder whose per-frame-thread
+    // cost was measured; the rest carry no thread term, which under-states them on a big node - see MEM_FRAME_THREADS.
     const MEM_ENCODER = {
         libx265:           { base10: 163, kEnc10: 292, base8: 97,  kEnc8: 186, floor: 0.968, threadScaled: true },
         libx264:           { base10: 79,  kEnc10: 245, base8: 79,  kEnc8: 245, floor: 0.808 },   // H.264 output is always 8-bit; the 10-bit pair never resolves
@@ -1721,9 +1723,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const dvCodecTag = DV_FOURCC_RE.test(String(primary.codec_tag_string || '').toLowerCase().trim());
         const ffprobeDynamicHdr = sideDataList
             .some((sd) => /dovi|dolby vision|smpte ?2094|hdr dynamic metadata/.test(String(sd?.side_data_type || '').toLowerCase())) || dvCodecTag;
-        // "Carries dynamic HDR of any kind", COMPOSED from the two per-format recognisers above so a spelling added to one list can never be missed by the union.
-        // isDynamicHdr is the only question in the suite that genuinely spans both formats - a re-encode flattens either to static HDR10 - so this is a local, not
-        // a shared helper: every other consumer wants ONE format (HDR10+ has a lossless strip path, HDR Vivid has none) and must reach for the narrower test.
+        // "Carries dynamic HDR of any kind", COMPOSED from the two per-format recognisers above so a spelling added to one list can never be missed by the
+        // union. isDynamicHdr is the only question in the suite that genuinely spans both formats - a re-encode flattens either to static HDR10 - so this is
+        // a local, not a shared helper: every other consumer wants ONE format (HDR10+ has a lossless strip path, HDR Vivid has none) and must reach for the
+        // narrower test.
         const DYNAMIC_HDR_RE = new RegExp(`${HDR10P_RE.source}|${VIVID_HDR_RE.source}`);
         const isDynamicHdr = hdrFmt.includes('dolby vision') || DYNAMIC_HDR_RE.test(hdrFmt) || ffprobeDynamicHdr;
         // DOVI configuration record (ffprobe side_data) -> profile-aware logging: dvLabel names the profile, and 8.x carries a compat id (8.1 HDR10 / 8.4 HLG).
@@ -1980,8 +1983,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     + ` - left untouched${reencodeAdvice}\n`);
             }
             // Neither strip flag is set (per their definitions: dovi_rpu needs a real DV signal on hevc/av1, hevc_metadata needs HDR10+ on hevc), so there is
-            // no bitstream filter to run - reachable only via a record-less dynamic-HDR side-data hit that names no removable layer. Emitting the old
-            // hevc_metadata fallback here strips nothing the bare signal names: on a non-HEVC source it fails bsf init and quarantines the file with a raw
+            // no bitstream filter to run - reachable only via a record-less dynamic-HDR side-data hit that names no removable layer. A bare hevc_metadata
+            // fallback here would strip nothing the signal names: on a non-HEVC source it fails bsf init and quarantines the file with a raw
             // ffmpeg message, and even on HEVC the -c copy re-probes identically so the next pass's byte-identical preset trips Tdarr's infinite-transcode-loop
             // guard. Skip with the same readable message every sibling case gets - there is genuinely nothing to strip losslessly.
             if (!stripDv && !stripHdr10Plus) {
@@ -2072,8 +2075,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         // Three of the four triggers are pure stream metadata; the fourth is the idet DECODE. Split so the cheap ones are tried first and the decode is
         // reached only when interlace repair would be the sole reason to encode - the case where the verdict really is load-bearing. Every consumer below
-        // therefore calls realTranscode() with its own cheap metadata test to the LEFT of it, so a file that guard_lossless / the DV and HDR refusals / the
-        // awk_video fence were always going to settle never spawns ffmpeg to be told something it does not use.
+        // therefore calls realTranscode() with its own cheap metadata test to the LEFT of it, so a file that guard_lossless or the DV and HDR refusals were
+        // always going to settle never spawns ffmpeg to be told something it does not use. The awk_video fence is the deliberate exception: it is tested
+        // INSIDE the realTranscode() branch, so a fenced file whose only live trigger is deinterlace does pay one idet decode per re-cycle. Hoisting it left
+        // would pre-empt the strip_dynamic lossless path below and re-label every fenced no-trigger skip with the fence line instead of its accurate reason.
         const cheapTranscode = codecTrigger || heightTrigger || tonemapTrigger;
         // deinterlaceNeeded is a FUNCTION where heightTrigger/tonemapTrigger/codecTrigger are booleans - called here rather than aliased into the
         // set, so the parentheses stay visible. A filter forces a real encode exactly as a downscale or a tonemap does.
