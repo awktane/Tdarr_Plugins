@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.27',
+    Version: '4.999.28',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1633,10 +1633,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const guardObjectAudio = String(inputs.guard_object_audio).trim();
     const guardOriginal = String(inputs.guard_original).trim();
     const guardQuality = String(inputs.guard_quality).trim();
-    // The container this plugin writes, named once as the other three plugins name it. Neither of these two changes the container, so it is the source's -
-    // but every membership test must see it normalised: a Tdarr container string of 'MKV' misses a bare includes() and silently takes the marker-hostile
-    // branch. The response.container default above deliberately keeps the RAW value: that string becomes the output file's extension, and lowercasing it
-    // there would rename the file rather than answer a question about it.
+    // The container this plugin writes, derived the same way in every other plugin that needs it. This plugin never changes the container, so it is always
+    // the source's - but every membership test must see it normalised: a Tdarr container string of 'MKV' misses a bare includes() and silently takes the
+    // marker-hostile branch. The response.container default above deliberately keeps the RAW value: that string becomes the output file's extension, and
+    // lowercasing it there would rename the file rather than answer a question about it.
     const dstContainer = String(file.container || '').toLowerCase().trim();
     // Case-preserving language read for the metadata WRITES on transcoded/appended streams below. resolveLang lowercases (correct for its matching KEYS), but
     // writing that would degrade clean_and_remux's canonical BCP-47 region/script case (pt-BR -> pt-br) and trip a later re-repair remux, so the writes read

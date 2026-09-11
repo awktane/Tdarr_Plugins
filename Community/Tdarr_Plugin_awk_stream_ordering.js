@@ -17,7 +17,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file carrying clean_and_remux's awk_recovered tag: a
         repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. This check
         is always on and has no setting.\n`,
-    Version: '4.999.14',
+    Version: '4.999.15',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -871,7 +871,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .replace(/<io>/gi, '(io)');        // preset split marker → inert text (a value may never carry a second marker)
     // ===== END SHARED: ffmpeg metadata escaping =====
 
-
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: free-text list split =====
     // -=-=-= splitList  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // Tokenise a free-text comma list exactly one way across the suite: split on commas, trim each token, drop the empties - so ' eng , , jpn ' and 'eng,jpn'
@@ -959,11 +958,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const subtitleFirst = String(inputs.subtitle_first || 'disabled').toLowerCase().trim();
     const orderChannel = String(inputs.order_channel || 'descending').toLowerCase().trim();
     const orderQuality = String(inputs.order_quality || 'descending').toLowerCase().trim();
-    // The container this plugin writes, named once as the other three plugins name it. Neither of these two changes the container, so it is the source's -
-    // but every membership test must see it normalised: a Tdarr container string of 'MKV' misses a bare includes() and silently takes the marker-hostile
-    // branch. The response.container default above deliberately keeps the RAW value: that string becomes the output file's extension, and lowercasing it
-    // there would rename the file rather than answer a question about it.
-    const dstContainer = String(file.container || '').toLowerCase().trim();
+
     const dropdownChecks = [
         ['audio_first',          audioFirst,      ['disabled', 'original_tagged', 'default_tagged', 'descriptive_tagged']],
         ['order_channel',        orderChannel,    ['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled']],
@@ -1017,6 +1012,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // The only plugin in the suite with real work to do on an audio-only file: after audio_clean force-codecs a track this is the one that strips the
     // per-stream encoder tag it leaves, and a multi-track .mka still wants order_language/order_codec and the sole-default normalisation.
+    // The container this plugin writes, derived the same way in every other plugin that needs it. This plugin never changes the container, so it is always
+    // the source's - but every membership test must see it normalised: a Tdarr container string of 'MKV' misses a bare includes() and silently takes the
+    // marker-hostile branch. The response.container default above deliberately keeps the RAW value: that string becomes the output file's extension, and
+    // lowercasing it there would rename the file rather than answer a question about it.
+    const dstContainer = String(file.container || '').toLowerCase().trim();
+
     // mka ONLY, and the reason is cover art. Matroska carries it as an ATTACHMENT, so an .mka has no video-typed stream and the rank table below already
     // orders it correctly - nothing needs changing to support it. Every other audio container carries cover art as an attached_pic VIDEO stream, which
     // streamOrder ranks 0: it would be hoisted above the music to become track 0, and a music file whose first track is a JPEG reads as a video to taggers
