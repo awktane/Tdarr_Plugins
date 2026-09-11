@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.24',
+    Version: '3.999.25',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -764,10 +764,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const streamTag = (index) => `[s${String(index).padStart(2, ' ')}]`;
     // ===== END SHARED: stream / language / preset helpers =====
     // #endregion
-    // "Carries dynamic HDR of any kind", COMPOSED from the two per-format recognisers above so a spelling added to one list can never be missed by the union.
-    // isDynamicHdr is the only question in the suite that genuinely spans both formats - a re-encode flattens either to static HDR10 - so this is a local, not
-    // a shared helper: every other consumer wants ONE format (HDR10+ has a lossless strip path, HDR Vivid has none) and must reach for the narrower test.
-    const DYNAMIC_HDR_RE = new RegExp(`${HDR10P_RE.source}|${VIVID_HDR_RE.source}`);
 
     // #region SHARED helpers (4 sections: ffmpeg metadata escaping … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
@@ -885,26 +881,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         hevc: { cpu: 'optin', videotoolbox: 'drop', nvenc: 'keep', qsv: 'drop', vaapi: 'keep', amf: 'drop' },
         av1: { cpu: 'drop', videotoolbox: 'drop', nvenc: 'keep', qsv: 'drop', vaapi: 'drop', amf: 'drop' },
     };
-    // Lossless / mastering-grade video codecs, read only by guard_lossless (NOT shared: no other plugin re-encodes video). Raw ffprobe codec_name
-    // spellings; membership is what makes the guard fail-safe - an unrecognised codec is not protected, never wrongly skipped. (Lossless MODES of lossy
-    // codecs - x264 -qp 0 - are out of scope: neither probe reports them.) Grouped: compressed lossless intermediates, the RLE/screen-capture family, then
-    // uncompressed packed layouts that arrive under their own codec_name. Every name is a decoder on the production build, so none is dead membership.
-    // Two membership calls, stated because each reads as an omission otherwise. jpeg2000 IS here: it is the DCP / IMF / broadcast-mezzanine codec the shared
-    // IMAGE_CODECS comment names, and though the format has a lossy mode neither probe reports which was used, so mastering-grade is the fail-safe reading.
-    // The screen-capture rows stop at the three that reach a real library (Flash screencasts, Camtasia recordings, DOSBox captures): tscc2 is TechSmith's
-    // LOSSY second generation, and the remote-desktop family (rscc, mwsc, rasc, srgc, scpr, vmnc, mss1/mss2/msa1) is recorder-internal rather than a library
-    // file, several of them lossy hybrids in any case.
-    const LOSSLESS_VIDEO_CODECS = ['ffv1', 'huffyuv', 'ffvhuff', 'hymt', 'magicyuv', 'utvideo', 'lagarith', 'sheervideo', 'prores', 'dnxhd', 'cfhd',
-        'jpeg2000', 'qtrle', 'msrle', 'flashsv', 'flashsv2', 'tscc', 'zmbv',
-        'rawvideo', 'v210', 'v210x', 'v410', 'v408', 'v308', 'y41p', 'r210', 'r10k'];
-
-    // Efficiency rank for shrink's never-downgrade rule: vp9~hevc and vp8~h264, so an efficient WebM/VP source isn't "upgraded" to a less-efficient
-    // codec; a genuinely-legacy codec (mpeg2/vc1/xvid, absent here) ranks below every target via the `|| 0` fallback, so old-codec -> h264 stays a valid
-    // shrink upgrade. vvc (H.266) outranks av1 and is DECODE-only in this build: a rank does NOT make a codec encodable (ENCODABLE_CODECS derives from
-    // ENCODER_NAME, which has no vvc row), so the entry does exactly one job - stop shrink re-encoding a VVC source down to HEVC/AV1, the very downgrade
-    // this rule exists to prevent. codec=source on a VVC file still skips with the no-encoder warning.
-    const CODEC_EFFICIENCY = { vvc: 4, av1: 3, hevc: 2, vp9: 2, h264: 1, vp8: 1 };
-
     // Query the ffmpeg build's encoder list + hardware presence for this node: encoders from `-encoders`, NVIDIA from nvidia-smi,
     // VAAPI/QSV from a /dev/dri check. Tdarr reloads each classic plugin fresh per file, and selectEncoder may call this up to twice per file - the
     // guard_captions CPU re-pick and guard_dv's memory counterfactual each make their own call, and the probe runs even on a forced-CPU pick because
@@ -1098,6 +1074,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (cpuWhy) notes.push(`☐[method_encoder=${encoderOpt}] Encoder: ${cpuName} (${cpuWhy})\n`);
         return cpuChoice();
     };
+    // ====== END ENCODER CAPABILITY + SELECTION ======
 
     // ====== INTERLACE DETECTION ======
     // Decided from the PIXELS, never the container: real files lie routinely (genuinely combed material tagged field_order=unknown in the corpus), so a
@@ -1258,6 +1235,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (family === 'amf') return `-quality ${{ slow: 'quality', medium: 'balanced', fast: 'speed' }[speed]}`;
         return '';   // vaapi / videotoolbox: no equivalent preset knob
     };
+    // ====== END PER-ENCODER QUALITY / SPEED / PIXEL-FORMAT TRANSLATION ======
+
+    // ====== OUTPUT TIER + CONTAINER ======
 
     // Map an output height to its resolution tier (SD/720p/1080p/4K, boundaries 576/720/1080), so the CRF ladder
     // (qualityForHeight) and the Dolby-Vision VBV ladder share one set of breakpoints instead of repeating them.
@@ -1498,6 +1478,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const memGbFromBytes = (bytes) => `${(bytes / (1024 ** 3)).toFixed(1)} GB`;
     const memGbFromMb = (mb) => memGbFromBytes(mb * MEM_BYTES_PER_MB);
+    // ====== END ENCODE MEMORY MODEL ======
+
+    // ====== VIDEO ARGUMENT ASSEMBLY ======
 
     // Build the video-encode arguments for the chosen encoder: decode-side (input) flags + the output -c:v block (encoder, quality, speed, pixel format, the
     // video filter chain, QuickTime fourCC). Returns { inputSide, videoOut }. Source colour metadata carries through automatically - no explicit colour flags
@@ -1595,9 +1578,34 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { inputSide, videoOut: `${parts.filter(Boolean).join(' ')}${vfArg}` };
     };
 
-    // --------------------------------------------------------------------- awk_video_clean: validate -> classify source video
-    // -> decide -> select encoder per node -> build preset. Video-only by design (audio and subtitles are always copied) so it
-    // composes with the other awk plugins. ---------------------------------------------------------------------
+    // ====== END VIDEO ARGUMENT ASSEMBLY ======
+
+    // ====== SOURCE-CODEC POLICY (guard_lossless, shrink never-downgrade) ======
+    // Lossless / mastering-grade video codecs, read only by guard_lossless (NOT shared: no other plugin re-encodes video). Raw ffprobe codec_name
+    // spellings; membership is what makes the guard fail-safe - an unrecognised codec is not protected, never wrongly skipped. (Lossless MODES of lossy
+    // codecs - x264 -qp 0 - are out of scope: neither probe reports them.) Grouped: compressed lossless intermediates, the RLE/screen-capture family, then
+    // uncompressed packed layouts that arrive under their own codec_name. Every name is a decoder on the production build, so none is dead membership.
+    // Two membership calls, stated because each reads as an omission otherwise. jpeg2000 IS here: it is the DCP / IMF / broadcast-mezzanine codec the shared
+    // IMAGE_CODECS comment names, and though the format has a lossy mode neither probe reports which was used, so mastering-grade is the fail-safe reading.
+    // The screen-capture rows stop at the three that reach a real library (Flash screencasts, Camtasia recordings, DOSBox captures): tscc2 is TechSmith's
+    // LOSSY second generation, and the remote-desktop family (rscc, mwsc, rasc, srgc, scpr, vmnc, mss1/mss2/msa1) is recorder-internal rather than a library
+    // file, several of them lossy hybrids in any case.
+    const LOSSLESS_VIDEO_CODECS = ['ffv1', 'huffyuv', 'ffvhuff', 'hymt', 'magicyuv', 'utvideo', 'lagarith', 'sheervideo', 'prores', 'dnxhd', 'cfhd',
+        'jpeg2000', 'qtrle', 'msrle', 'flashsv', 'flashsv2', 'tscc', 'zmbv',
+        'rawvideo', 'v210', 'v210x', 'v410', 'v408', 'v308', 'y41p', 'r210', 'r10k'];
+
+    // Efficiency rank for shrink's never-downgrade rule: vp9~hevc and vp8~h264, so an efficient WebM/VP source isn't "upgraded" to a less-efficient
+    // codec; a genuinely-legacy codec (mpeg2/vc1/xvid, absent here) ranks below every target via the `|| 0` fallback, so old-codec -> h264 stays a valid
+    // shrink upgrade. vvc (H.266) outranks av1 and is DECODE-only in this build: a rank does NOT make a codec encodable (ENCODABLE_CODECS derives from
+    // ENCODER_NAME, which has no vvc row), so the entry does exactly one job - stop shrink re-encoding a VVC source down to HEVC/AV1, the very downgrade
+    // this rule exists to prevent. codec=source on a VVC file still skips with the no-encoder warning.
+    const CODEC_EFFICIENCY = { vvc: 4, av1: 3, hevc: 2, vp9: 2, h264: 1, vp8: 1 };
+
+    // ====== END SOURCE-CODEC POLICY ======
+
+    // ====== PER-FILE FLOW ======
+    // validate -> classify source video -> decide -> select encoder per node -> build preset. Video-only by design (audio and subtitles are always
+    // copied) so it composes with the other awk plugins.
 
     // Missing/partial probe data fails the file with the infoLog attached, rather than throwing a TypeError on the first streams access.
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
@@ -1713,6 +1721,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const dvCodecTag = DV_FOURCC_RE.test(String(primary.codec_tag_string || '').toLowerCase().trim());
         const ffprobeDynamicHdr = sideDataList
             .some((sd) => /dovi|dolby vision|smpte ?2094|hdr dynamic metadata/.test(String(sd?.side_data_type || '').toLowerCase())) || dvCodecTag;
+        // "Carries dynamic HDR of any kind", COMPOSED from the two per-format recognisers above so a spelling added to one list can never be missed by the union.
+        // isDynamicHdr is the only question in the suite that genuinely spans both formats - a re-encode flattens either to static HDR10 - so this is a local, not
+        // a shared helper: every other consumer wants ONE format (HDR10+ has a lossless strip path, HDR Vivid has none) and must reach for the narrower test.
+        const DYNAMIC_HDR_RE = new RegExp(`${HDR10P_RE.source}|${VIVID_HDR_RE.source}`);
         const isDynamicHdr = hdrFmt.includes('dolby vision') || DYNAMIC_HDR_RE.test(hdrFmt) || ffprobeDynamicHdr;
         // DOVI configuration record (ffprobe side_data) -> profile-aware logging: dvLabel names the profile, and 8.x carries a compat id (8.1 HDR10 / 8.4 HLG).
         const doviRec = sideDataList.find((sd) => /dovi configuration record/i.test(String(sd?.side_data_type || '')));
@@ -1979,7 +1991,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return emitLosslessStrip();
         };
 
-        // ================= decide, gated by action =================
+        // ====== DECIDE, GATED BY ACTION ======
         if (action === 'hdr_cleanup_only') {
             // Only hdr_mode is live; codec / downscale / bit-depth / deinterlace / encoder inert. Lossless-or-skip.
             if (hdrMode === 'preserve') {
