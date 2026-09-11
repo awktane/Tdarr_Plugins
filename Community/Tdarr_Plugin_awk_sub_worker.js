@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.39',
+    Version: '3.999.40',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1301,10 +1301,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= sidecarNameTokens  [clean_and_remux, sub_worker] =-=-=-
     // The language slot and the two disposition runs that surround it, for any sidecar either plugin writes - the part of a sidecar name that BOTH a media
     // server and our own parseSidecar read as authoritative. Shared because the writer and the reader live in different files: clean_and_remux exports the
-    // styled .mks bundle, sub_worker imports it, and while these tokens were hand-kept on each side the export could spell only `.forced`. parseSidecar
-    // treats a bundle's filename as the authority and writes an explicit `-disposition 0` when it carries none, so every other role the .mks really held -
-    // sdh, commentary, descriptive, original, visual_impaired - was cleared on the way back in. Assembly stays local, since only sub_worker writes a title
-    // token; the VOCABULARY and the collision escape live here, because those are what drifted.
+    // styled .mks bundle and sub_worker imports it. parseSidecar treats a bundle's filename as the disposition authority and writes an explicit
+    // `-disposition 0` when the name carries no token, so a vocabulary that drifts on either side silently clears every role the .mks really holds - sdh,
+    // commentary, descriptive, original, visual_impaired - on the way back in, and the styled export has already deleted the source stream. Assembly stays
+    // local, since only sub_worker writes a title token; the VOCABULARY and the collision escape live here, where both sides read one copy.
     const sidecarNameTokens = (s) => {
         // lang is the only metadata-derived component read raw (a title is percent-encoded, disp/ext are fixed enums); the shared sidecarLangToken restricts
         // it to the language-code charset - see its definition for why. parseSidecar round-trips it unchanged, a valid code (en/eng/pt-br) already fitting.

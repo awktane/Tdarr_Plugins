@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.33',
+    Version: '4.999.34',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1558,10 +1558,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= sidecarNameTokens  [clean_and_remux, sub_worker] =-=-=-
     // The language slot and the two disposition runs that surround it, for any sidecar either plugin writes - the part of a sidecar name that BOTH a media
     // server and our own parseSidecar read as authoritative. Shared because the writer and the reader live in different files: clean_and_remux exports the
-    // styled .mks bundle, sub_worker imports it, and while these tokens were hand-kept on each side the export could spell only `.forced`. parseSidecar
-    // treats a bundle's filename as the authority and writes an explicit `-disposition 0` when it carries none, so every other role the .mks really held -
-    // sdh, commentary, descriptive, original, visual_impaired - was cleared on the way back in. Assembly stays local, since only sub_worker writes a title
-    // token; the VOCABULARY and the collision escape live here, because those are what drifted.
+    // styled .mks bundle and sub_worker imports it. parseSidecar treats a bundle's filename as the disposition authority and writes an explicit
+    // `-disposition 0` when the name carries no token, so a vocabulary that drifts on either side silently clears every role the .mks really holds - sdh,
+    // commentary, descriptive, original, visual_impaired - on the way back in, and the styled export has already deleted the source stream. Assembly stays
+    // local, since only sub_worker writes a title token; the VOCABULARY and the collision escape live here, where both sides read one copy.
     const sidecarNameTokens = (s) => {
         // lang is the only metadata-derived component read raw (a title is percent-encoded, disp/ext are fixed enums); the shared sidecarLangToken restricts
         // it to the language-code charset - see its definition for why. parseSidecar round-trips it unchanged, a valid code (en/eng/pt-br) already fitting.
@@ -1992,11 +1992,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // pre-scan below needs them before the stream loop runs.
         const styledFontIndices = (file.ffProbeData.streams || [])
             .filter((s) => codecTypeOf(s) === 'attachment' && isFontAttachment(s)).map((s) => s.index);
-        // WHAT a sidecar export is called and WHICH ffmpeg selection produces it, for the three sites that need it: the unmapped pre-scan below (which hands
-        // the tokens to placeSidecars as argv) and the two in-loop preset builders (which join them into sidecarOut). A divergence between those two forms is
-        // invisible to every check here - one is an array and the other a template literal - and the unmapped copy is UPLOADED into the user's library rather
-        // than being a discardable extra output, so the two must not be able to disagree. The REFUSAL paths stay at their call sites: they differ deliberately
-        // (an image refusal fails the file, a styled one falls through to mov_text, the pre-scan's just records into failedSidecars).
+        // WHAT a sidecar export is called and WHICH ffmpeg selection produces it, for the two sites that need it: the unmapped pre-scan below (which hands the
+        // tokens to placeSidecars as argv) and stageSidecar, which serves both in-loop branches and owns the single sidecarOut append. A divergence between
+        // those two forms is invisible to every check here - one is an array and the other a template literal - and the unmapped copy is UPLOADED into the
+        // user's library rather than being a discardable extra output, so the two must not be able to disagree. The REFUSAL paths stay at their call sites:
+        // they differ deliberately (an image refusal fails the file, a styled one falls through to mov_text, the pre-scan's just records into failedSidecars).
         const sidecarPlan = (ffstream, styled) => {
             const spec = styled ? STYLED_BUNDLE : IMAGE_SUB[codecNameOf(ffstream)];
             return {
@@ -2174,8 +2174,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // be safe (the sidecar is the only surviving copy): when the joined path can't be embedded in the quoted preset token (pathIsPresetSafe -
                 // the library directory has to stay literal) the export AND the drop are refused with a ☒, and the stream falls through to the container
                 // test, which still drops it on mp4 and keeps it on mkv. That ☒ goes straight to the infoLog rather than workDone: it warns about the
-                // ENVIRONMENT, not a queued change, and workDone is flushed only on a real remux - a file whose only pending change WAS the refused export
-                // would otherwise report "nothing requiring removal or conversion" and swallow the warning entirely.
+                // ENVIRONMENT, not a queued change, so it belongs outside the decision block rather than buffered with it. workDone itself always reaches
+                // the log - on the convert path at the remux, and through flushBuffers on any quarantine - and a refused image export always quarantines.
                 const imageSubDrop = imageSubDropped(ffstreamCodec);
                 // language_sub / remove_sub_sdh discard this track on its own merits, so it must not be exported first: the sidecar is permanent (nothing
                 // here ever deletes one, and on an unmapped node it is uploaded into the library over the file API), it hands the user an OCR job for a
