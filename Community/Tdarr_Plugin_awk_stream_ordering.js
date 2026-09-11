@@ -14,8 +14,10 @@ const details = () => ({
         playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time
         it's needed).\n\nBecause it runs last it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file
         that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the signature of an out-of-memory-killed or
-        unfinalised encode from an earlier stage. A longer output is accepted. This check is always on and has no setting.\n`,
-    Version: '4.999.13',
+        unfinalised encode from an earlier stage. A longer output is accepted, and so is a file carrying clean_and_remux's awk_recovered tag: a
+        repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. This check
+        is always on and has no setting.\n`,
+    Version: '4.999.14',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -1055,17 +1057,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Every DURATION_SIGNALS row must answer with a real duration or 0 - 0 IS the "no signal" sentinel the oldAny/newAny/verdict accumulation below
         // reads by truthiness, and the failFile at the end of that accumulation turns "the old side had one and the new side has none" into a
         // quarantine. A row that returns something else (a NaN, a negative, an already-coerced value) breaks the guard silently.
-        const durPositive = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
+        const durOrZero = (v) => { const n = Number(v); return Number.isFinite(n) && n > 0 ? n : 0; };
         const DURATION_SIGNALS = [
             // The join must require @type 'Video' as well as the StreamOrder match: MPEG-TS gives its video track the two-part StreamOrder "0-0"
             // (Number() -> NaN, so it never matches) while its MENU track reports a bare "0", and without the type test the guard silently compares a
             // menu/chapter track's duration instead of the video's.
             { name: 'the mediaInfo video-track duration',
                 read: (probed) => { const v = durVideoStream(probed); if (!v) return 0;
-                    return durPositive(((probed?.mediaInfo?.track || []).find(t => t['@type'] === 'Video'
+                    return durOrZero(((probed?.mediaInfo?.track || []).find(t => t['@type'] === 'Video'
                         && Number(t.StreamOrder) === v.index) || {}).Duration); } },
-            { name: 'the ffprobe video-stream duration', read: (probed) => durPositive(durVideoStream(probed)?.duration) },
-            { name: 'the container duration', read: (probed) => durPositive(probed?.ffProbeData?.format?.duration), needsSameAudio: true },
+            { name: 'the ffprobe video-stream duration', read: (probed) => durOrZero(durVideoStream(probed)?.duration) },
+            { name: 'the container duration', read: (probed) => durOrZero(probed?.ffProbeData?.format?.duration), needsSameAudio: true },
         ];
         // Tolerance is 1% SHORT, fixed, with no input to relax it: a user hitting a false positive would have no recourse but removing the plugin, so the
         // headroom is deliberately double the 0.5% the long-standing community duration-check plugin defaults to. A dead encode is short by far more.
@@ -1075,6 +1077,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // last, so it is the stage that sees that pair. Failing it would quarantine a correctly repaired file and send the user hunting an OOM kill that
         // never happened. An over-length alarm, if ever wanted, needs its own branch and its own wording - none of the text below is true of it.
         const DURATION_TOLERANCE_PCT = 1;
+        // The two sentences the verdicts hand the operator, declared once because each is written by both a short-duration and a no-duration branch
+        // and they are a CONTRACT with the user, not incidental wording: one tells them where to look for the cause, the other what not to do with a
+        // recovery queue. A drift between the two copies of either reads as two different situations. The ` (compared using ...)` suffix is not part
+        // of them - only the short-duration verdict can name a signal.
+        const OOM_HINT = 'the file has been failed rather than accepted; check this node\'s log for an out-of-memory kill';
+        const REVIEW_HINT = 'accepted for review rather than failed; play it through in Tdarr before approving, and do not auto-approve a recovery queue';
         const originalFile = otherArguments?.originalLibraryFile;
         if (originalFile?.ffProbeData) {
             const sameAudio = durAudioCount(originalFile) === durAudioCount(file);
@@ -1109,12 +1117,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (recovered)
                         response.infoLog += `☒${durTag}output duration ${verdict.now.toFixed(1)} s is ${pct.toFixed(1)}% of the original `
                             + `${verdict.old.toFixed(1)} s, but this file carries an ${RECOVERED_TAG} tag - a recover_bad_* repair of a truncated source `
-                            + `legitimately reports a shorter true duration\n☒${durTag}accepted for review rather than failed; play it through in Tdarr `
-                            + `before approving, and do not auto-approve a recovery queue (compared using ${verdict.name})\n`;
+                            + `legitimately reports a shorter true duration\n☒${durTag}${REVIEW_HINT} (compared using ${verdict.name})\n`;
                     else
                         failFile(`${durTag}output duration ${verdict.now.toFixed(1)} s is ${pct.toFixed(1)}% of the original ${verdict.old.toFixed(1)} s`
                             + ` - the transcode did not run to completion`
-                            + `\n☒${durTag}the file has been failed rather than accepted; check this node's log for an out-of-memory kill`
+                            + `\n☒${durTag}${OOM_HINT}`
                             + `\n☒${durTag}(compared using ${verdict.name})`);
                 }
             } else if (oldAny && !newAny) {
@@ -1124,16 +1131,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (recovered)
                     response.infoLog += `☒${durTag}the output reports no duration at all while the original had ${oldAny.toFixed(1)} s, but this file `
                         + `carries an ${RECOVERED_TAG} tag - a recover_bad_* repair of a truncated source can legitimately report a shorter or absent duration`
-                        + `\n☒${durTag}accepted for review rather than failed; play it through in Tdarr before approving, and do not auto-approve a recovery queue\n`;
+                        + `\n☒${durTag}${REVIEW_HINT}\n`;
                 else
                     failFile(`${durTag}the output reports no duration at all while the original had ${oldAny.toFixed(1)} s - that is what a truncated or`
                         + ` unfinalised transcode looks like`
-                        + `\n☒${durTag}the file has been failed rather than accepted; check this node's log for an out-of-memory kill`);
+                        + `\n☒${durTag}${OOM_HINT}`);
             }
         }
+        // ====== END TRUNCATION CHECK ======
 
         // Input summary — the streams exactly as they arrived, before re-ordering.
         response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
+
+        // ====== ORDERING KEYS ======
 
         const streamOrder = { video: 0, audio: 1, subtitle: 2 , attachment: 3, data: 4};
         const UNKNOWN_TYPE_ORDER = 99;   // a codec_type not in streamOrder (video/audio/subtitle/attachment/data) sorts last
@@ -1198,6 +1208,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return qualityOrder.dir === 'ascending' ? a.audioQuality - b.audioQuality : b.audioQuality - a.audioQuality;
             return 0;
         };
+
+        // ====== STREAM TABLE + SORT ======
 
         const streams = [];
         for (let i = 0; i < file.ffProbeData.streams.length; i++) {
@@ -1310,6 +1322,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return a.index - b.index;
         });
 
+        // ====== JUNK TAG STRIP ======
+
         // remove_junk_tags: strip encoder/muxer-provenance (+ optional descriptive) tags on the reorder remux. 'encoder' = pure provenance (global encoded_by;
         // per-stream encoder/encoded_by); 'descriptive' (superset) also drops iTunes/movie-TV container tags. Always kept: title/comment, awk_* markers
         // (idempotency), creation_time, the mkv BPS/statistics family (mediaInfo's per-track bitrate source), the functional per-stream tags, and the GLOBAL
@@ -1392,6 +1406,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
             }
 
+        // ====== MOOV / FASTSTART PROBE ======
+
         // True if the mp4 already has moov before mdat (front-loaded), so method_mp4_faststart needn't remux it. Reads only top-level box headers (a few
         // 16-byte reads, seeking by box size) - no ffmpeg spawn, no full-file read. otherArguments.__awkMoovFront overrides for the harness (which has
         // no real file on disk). Fail-safe: any read/parse anomaly returns true (treat as fronted -> skip) so we never loop on a file we can't inspect.
@@ -1429,6 +1445,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const isMp4 = isMp4Family(dstContainer);
         const faststartOn = methodFaststart === 'force';
         const needsFront = faststartOn && isMp4 && !moovBeforeMdat(file.file, otherArguments);
+
+        // ====== DECIDE + REPORT ======
 
         // Container can't store a default-track flag (ts/avi): the block above left dispositionArgs empty rather than looping. Say so once, whether the pass
         // otherwise remuxes (a reorder) or skips - so a user never wonders why the sole-default flag was left alone.
@@ -1468,6 +1486,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // (see mp4MovflagsArg below), so a reorder or a disposition fix front-loads the file just as surely, and a ☐ line marks a change about to be made.
         if (needsFront)
             response.infoLog += `☐[method_mp4_faststart=${methodFaststart}] Front-load the mp4 moov atom on this remux\n`;
+        // ====== PRESET ASSEMBLY ======
+
         // mp4/mov muxers drop a custom GLOBAL metadata tag (e.g. clean_and_remux's awk_recovered, set upstream) on a -c copy remux unless told to keep it,
         // which would re-trigger recovery on the next pass. Preserve it on the mov family, and append +faststart when method_mp4_faststart is on.
         const mp4MovflagsArg = isMp4 ? ` -movflags use_metadata_tags${faststartOn ? '+faststart' : ''}` : '';
