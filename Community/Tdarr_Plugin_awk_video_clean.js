@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.27',
+    Version: '3.999.28',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -635,6 +635,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Embedded-font file extensions + a font-mimetype test. Read by summariseStream's [attach:...] token and isFontAttachment (clean_and_remux/sub_worker).
     const FONT_EXTS = ['ttf', 'otf', 'ttc', 'otc', 'pfb', 'pfa', 'woff', 'woff2', 'eot'];
     const isFontMime = (mime) => /font|truetype|opentype|sfnt/.test(mime);
+    // -=-=-= attachmentNameParts [all five] =-=-=-
+    // The three name-derived facts an attachment is classified by - its mimetype, its filename, and the extension taken off that filename - resolved once.
+    // Three sites ask for them (summariseStream's [attach:...] token, isFontAttachment, and clean_and_remux's attachmentKind), and the extension rule is the
+    // fragile part: a filename with NO dot must yield '' rather than the whole name, or every dotless attachment classifies as an extension of itself.
+    const attachmentNameParts = (s) => {
+        const mime = (s?.tags?.mimetype || '').trim().toLowerCase();
+        const fname = (s?.tags?.filename || '').trim().toLowerCase();
+        return { mime, fname, ext: fname.includes('.') ? fname.slice(fname.lastIndexOf('.') + 1) : '' };
+    };
     // -=-=-= HDR_TRANSFERS [all five] =-=-=-
     // The HDR transfer curves - ffmpeg's two HDR color_trc enums (smpte2084 = PQ, arib-std-b67 = HLG) plus the MediaInfo spellings (pq, hlg). The single
     // source for every HDR-curve test.
@@ -732,10 +741,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // 'font', everything else the mimetype SUBTYPE (image/png -> png) - so a removed attachment is legible by what it actually is.
             let label = codec;
             if (label === 'unknown' || label === 'none') {
-                const mime  = (s.tags?.mimetype || '').trim().toLowerCase();
-                const fname = (s.tags?.filename || '').trim().toLowerCase();
-                const ext   = fname.includes('.') ? fname.slice(fname.lastIndexOf('.') + 1) : '';
-                const sub   = mimeSubtype(mime);
+                const { mime, ext } = attachmentNameParts(s);
+                const sub = mimeSubtype(mime);
                 if (FONT_EXTS.includes(ext)) label = ext;
                 else if (isFontMime(mime)) label = 'font';
                 else if (ext) label = ext;

@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.34',
+    Version: '4.999.35',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -731,6 +731,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Embedded-font file extensions + a font-mimetype test. Read by summariseStream's [attach:...] token and isFontAttachment (clean_and_remux/sub_worker).
     const FONT_EXTS = ['ttf', 'otf', 'ttc', 'otc', 'pfb', 'pfa', 'woff', 'woff2', 'eot'];
     const isFontMime = (mime) => /font|truetype|opentype|sfnt/.test(mime);
+    // -=-=-= attachmentNameParts [all five] =-=-=-
+    // The three name-derived facts an attachment is classified by - its mimetype, its filename, and the extension taken off that filename - resolved once.
+    // Three sites ask for them (summariseStream's [attach:...] token, isFontAttachment, and clean_and_remux's attachmentKind), and the extension rule is the
+    // fragile part: a filename with NO dot must yield '' rather than the whole name, or every dotless attachment classifies as an extension of itself.
+    const attachmentNameParts = (s) => {
+        const mime = (s?.tags?.mimetype || '').trim().toLowerCase();
+        const fname = (s?.tags?.filename || '').trim().toLowerCase();
+        return { mime, fname, ext: fname.includes('.') ? fname.slice(fname.lastIndexOf('.') + 1) : '' };
+    };
     // -=-=-= HDR_TRANSFERS [all five] =-=-=-
     // The HDR transfer curves - ffmpeg's two HDR color_trc enums (smpte2084 = PQ, arib-std-b67 = HLG) plus the MediaInfo spellings (pq, hlg). The single
     // source for every HDR-curve test.
@@ -828,10 +837,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // 'font', everything else the mimetype SUBTYPE (image/png -> png) - so a removed attachment is legible by what it actually is.
             let label = codec;
             if (label === 'unknown' || label === 'none') {
-                const mime  = (s.tags?.mimetype || '').trim().toLowerCase();
-                const fname = (s.tags?.filename || '').trim().toLowerCase();
-                const ext   = fname.includes('.') ? fname.slice(fname.lastIndexOf('.') + 1) : '';
-                const sub   = mimeSubtype(mime);
+                const { mime, ext } = attachmentNameParts(s);
+                const sub = mimeSubtype(mime);
                 if (FONT_EXTS.includes(ext)) label = ext;
                 else if (isFontMime(mime)) label = 'font';
                 else if (ext) label = ext;
@@ -1332,10 +1339,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // True when an attachment stream is an embedded font. Identified three ways because older builds report codec_name 'none'/'unknown' for a font:
     // the ttf/otf codec name, a font mimetype, or a font filename extension. Read by clean_and_remux's attachmentKind (orphaned-font removal) and
     // sub_worker's styled-subtitle .mks bundle (the fonts that must travel with an extracted ASS/SSA so its styling survives the round-trip).
-    const isFontAttachment = (s) => {
-        const mime  = (s.tags?.mimetype || '').trim().toLowerCase();
-        const fname = (s.tags?.filename || '').trim().toLowerCase();
-        const ext   = fname.includes('.') ? fname.slice(fname.lastIndexOf('.') + 1) : '';
+    const isFontAttachment = (s, parts) => {
+        const { mime, ext } = parts || attachmentNameParts(s);
         return ['ttf', 'otf'].includes(codecNameOf(s)) || isFontMime(mime) || FONT_EXTS.includes(ext);
     };
     // ===== END SHARED: font attachment test =====
@@ -1755,11 +1760,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //   'other' - anything unidentifiable (a bare 'none'/'unknown', no font/image signal). Left untouched - could be anything, never safe to remove.
     const attachmentKind = (s) => {
         const codec = codecNameOf(s);
-        const mime  = (s.tags?.mimetype || '').trim().toLowerCase();
-        const fname = (s.tags?.filename || '').trim().toLowerCase();
-        const ext   = fname.includes('.') ? fname.slice(fname.lastIndexOf('.') + 1) : '';
-        if (IMAGE_CODECS.includes(codec) || mime.startsWith('image/') || IMAGE_EXTS.includes(ext)) return 'image';
-        if (isFontAttachment(s)) return 'font';
+        const parts = attachmentNameParts(s);
+        if (IMAGE_CODECS.includes(codec) || parts.mime.startsWith('image/') || IMAGE_EXTS.includes(parts.ext)) return 'image';
+        if (isFontAttachment(s, parts)) return 'font';
         return 'other';
     };
 
