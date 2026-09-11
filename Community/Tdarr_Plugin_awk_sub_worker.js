@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.33',
+    Version: '3.999.34',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1208,9 +1208,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: mov language remap =====
     // Plex/Jellyfin/Emby all accept a spelled-out language NAME in a sidecar name (Movie.English.srt), which isRealLanguageToken recognises - but the name
     // itself is not a valid container language tag, so writing it through would stamp "language=English" into the mkv. Fold any non-code token to its code; a
-    // token already shaped like a code is passed through untouched so a region tag (pt-BR) survives - the whole point of keeping the raw token on mkv.
+    // token already shaped like a code keeps its region subtag (pt-BR), which is the whole point of keeping the raw token on mkv.
     const LANG_CODE_SHAPE = /^[A-Za-z]{2,3}(-[A-Za-z0-9]{2,8})?$/;
-    const normSidecarLang = (lang) => (LANG_CODE_SHAPE.test(String(lang)) ? lang : to6392T(lang));
+    // A region-bearing token is CASED to canonical rather than written as it arrived. Our own extract can only produce a lowercase one - sidecarLangToken
+    // lowercases and strips to [a-z0-9-] - while clean_and_remux's tag_language judges a region tag clean only at canonicalRegionTag's fixed point, so writing
+    // 'pt-br' costs one whole extra remux per import purely to re-case it to 'pt-BR', and the extract/reimport round trip is not case-identity. Emitting the
+    // form that canonicaliser converges on is the same fixed-point rule canonicalAudioTitle follows between audio_clean and clean_and_remux. Guarded by
+    // isRealLanguageToken because getCanonicalLocales happily cases a structurally-valid nonsense tag (xx-YY), and wrapped because it throws on malformed input.
+    // A BARE code must never reach the result - getCanonicalLocales('eng') is 'en', which would rewrite the language of every ordinary sidecar - and it is held
+    // out twice on purpose: the subtag test returns before Intl is called at all (the common path, so no sidecar pays for an Intl call it cannot use), and the
+    // result is taken only while it still carries a subtag. Either alone would do; keep both, and do not collapse them into one.
+    const canonSidecarRegion = (lang) => {
+        if (!lang.includes('-') || !isRealLanguageToken(lang)) return lang;
+        try { const c = Intl.getCanonicalLocales(lang)[0] || ''; return c.includes('-') ? c : lang; } catch (e) { return lang; }
+    };
+    const normSidecarLang = (lang) => (LANG_CODE_SHAPE.test(String(lang)) ? canonSidecarRegion(String(lang)) : to6392T(lang));
 
     // ===== SHARED [clean_and_remux, sub_worker]: sidecar name tokens =====
     // -=-=-= DISPOSITIONS / DISP_ALIAS / DISP_IGNORE / DISP_TOKENS / DISP_AMBIGUOUS_LANG  [clean_and_remux, sub_worker] =-=-=-
