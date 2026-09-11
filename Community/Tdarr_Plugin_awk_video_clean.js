@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.26',
+    Version: '3.999.27',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -838,6 +838,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const fs = require('fs');
     const childProcess = require('child_process');
 
+    // The node's ffmpeg, or the bare name when Tdarr did not supply one. Read at four sites (the encoder + tonemap probes, the idet decode, the A53 probe).
+    const ffmpegPathOf = (oa) => (oa && oa.ffmpegPath) || 'ffmpeg';
+
+    // Read a table by a key that came from a PROBE or a user string, never from a validated dropdown. `TABLE[key] || fallback` cannot tell an ABSENT key from
+    // one inherited off Object.prototype, and every prototype member is truthy, so the fallback never fires for it - a stream whose codec_name is 'constructor'
+    // would read as a real row. Every probe-keyed lookup in this file goes through here; a dropdown-keyed one does not need it.
+    const tableGet = (table, key, dflt) => (Object.prototype.hasOwnProperty.call(table, key) ? table[key] : dflt);
+
     // ====== ENCODER CAPABILITY + SELECTION ======
     // Inputs are set once per LIBRARY and shipped identically to every node, so a video encoder can't be a stored setting on a mixed fleet - it is
     // resolved at runtime, per node, with a CAPABILITY QUERY (not a trial-encode ladder): ask ffmpeg what the build supports, intersect with a cheap
@@ -947,7 +955,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (base === 'cpu') return 'cpu';
         const inj = otherArguments && otherArguments.__awkCap;
         if (inj) return (inj.tonemap && inj.tonemap[base] === false) ? 'cpu' : base;
-        const ffmpegPath = (otherArguments && otherArguments.ffmpegPath) || 'ffmpeg';
+        const ffmpegPath = ffmpegPathOf(otherArguments);
         return confirmTonemap(ffmpegPath, base) ? base : 'cpu';
     };
 
@@ -974,7 +982,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const platform = (inj && inj.platform) || os.platform();
         const workerType = String((otherArguments && otherArguments.workerType) || '').toLowerCase();
         const isGpuWorker = workerType.includes('gpu');
-        const ffmpegPath = (otherArguments && otherArguments.ffmpegPath) || 'ffmpeg';
+        const ffmpegPath = ffmpegPathOf(otherArguments);
         const cap = inj
             ? { encoders: new Set(inj.encoders || []), nvidia: !!inj.nvidia, dri: !!inj.dri }
             : queryCapabilities(ffmpegPath);
@@ -1205,13 +1213,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // visual quality sits at a higher number there. HW flag syntax mirrors the proven community plugins (Migz nvenc -cq:v, Boosh qsv
     // -global_quality, vaapi -qp, amf -qp_i/-qp_p). VideoToolbox's -q:v is an inverted 1-100 scale (higher = better), opposite the
     // low-is-better HEVC-CRF q; this linear fit maps CRF onto it (intercept = -q:v at CRF 0, pre-clamp; slope = -q:v units dropped per +1 CRF).
+    const QUALITY_MAX = 63;   // the widest scale any emit uses (libsvtav1 CQ); every other encoder clamps to 51 below, and parseQuality bounds input by it
     const VT_Q_INTERCEPT = 118;
     const VT_Q_SLOPE = 2.6;
-    const nativeQuality = (codec, family, qNorm) => {
+    const nativeQuality = (targetCodec, family, qNorm) => {
         let q = Math.round(qNorm);
         // Clamp to each scale's real range so an out-of-range quality input can't emit a CRF/QP ffmpeg rejects (e.g. libx265 -crf 52 errors). AV1 (libsvtav1
         // CQ) goes 0-63; every other emit - libx264/libx265 -crf, nvenc -cq, qsv -global_quality, vaapi/amf -qp - caps at ~0-51. videotoolbox remaps q anyway.
-        if (codec === 'av1') q = Math.max(0, Math.min(63, q + 8));
+        if (targetCodec === 'av1') q = Math.max(0, Math.min(QUALITY_MAX, q + 8));
         else q = Math.max(0, Math.min(51, q));
         switch (family) {
             case 'cpu': return `-crf ${q}`;                                   // libx264 / libx265 / libsvtav1 all take -crf
@@ -1225,9 +1234,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // Normalized speed -> each family's native knob: libsvtav1's -preset is numeric (-2 to 13), the x26x pair and qsv named, nvenc p1-p7, amf -quality;
     // vaapi/videotoolbox have no comparable preset (omitted). Slower = better/smaller.
-    const nativeSpeed = (codec, family, speed) => {
+    const nativeSpeed = (targetCodec, family, speed) => {
         if (family === 'cpu') {
-            if (codec === 'av1') return `-preset ${{ slow: '4', medium: '6', fast: '8' }[speed]}`;
+            if (targetCodec === 'av1') return `-preset ${{ slow: '4', medium: '6', fast: '8' }[speed]}`;
             return `-preset ${{ slow: 'slow', medium: 'medium', fast: 'fast' }[speed]}`;
         }
         if (family === 'nvenc') return `-preset ${{ slow: 'p7', medium: 'p5', fast: 'p3' }[speed]}`;
@@ -1444,17 +1453,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     const memCpuCount = (pinned) => { if (Number(pinned) > 0) return Number(pinned); try { return (os.cpus() || []).length || 1; } catch (e) { return 1; } };
-    const memEncoderRow = (encoderName, family) => (Object.prototype.hasOwnProperty.call(MEM_ENCODER, encoderName) ? MEM_ENCODER[encoderName]
-        : (Object.prototype.hasOwnProperty.call(MEM_ENCODER_BY_FAMILY, family) ? MEM_ENCODER[MEM_ENCODER_BY_FAMILY[family]] : null));
+    const memEncoderRow = (encoderName, family) => {
+        const byName = tableGet(MEM_ENCODER, encoderName, null);
+        return byName || tableGet(MEM_ENCODER, tableGet(MEM_ENCODER_BY_FAMILY, family, ''), null);
+    };
     const memDecoderRow = (codecName, is10) => {
         const key = codecName === 'hevc' ? (is10 ? 'hevc10' : 'hevc8') : codecName;
-        return Object.prototype.hasOwnProperty.call(MEM_DECODER, key) ? MEM_DECODER[key] : null;
+        return tableGet(MEM_DECODER, key, null);
     };
     // Predicted peak resident MB for one encode. `floor: true` returns the LOWER BOUND instead - a single frame thread, the fastest preset, no filters - and
     // that is the only figure the refusal may read: it says "even under the most favourable threading and preset this cannot fit", so it cannot false-positive
     // from a node's core count or the user's speed setting. Returns null rather than a guess when the source dimensions are unreadable or the encoder has no
     // measured row: a fabricated number could refuse a file that would have encoded perfectly well, and there is no input a user could set to override it.
-    // The membership gates above are why a crafted codec or encoder name cannot resolve to an inherited Object.prototype member and read as a real row.
+    // Both row lookups above go through tableGet, which is why a crafted codec or encoder name cannot resolve to an inherited Object.prototype member.
     const memoryEstimate = ({ family, encoderName, srcCodec, srcIs10, srcW, srcH, dispH, outH, want10, speedName, cores,
         sliceOn, tonemapOn, deintOn, floor }) => {
         const row = memEncoderRow(encoderName, family);
@@ -1488,11 +1499,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // video filter chain, QuickTime fourCC). Returns { inputSide, videoOut }. Source colour metadata carries through automatically - no explicit colour flags
     // (see the HDR-detection block below). Decode stays on software frames (nvenc via the shared nvdecPreset helper) so one CPU scale filter and -pix_fmt path
     // work uniformly across families; VAAPI is the exception - it needs its frames uploaded, so it carries an explicit device + format,hwupload filter.
-    const buildVideoArgs = ({ family, encoderName, codec, qNorm, speed, want10Bit, willDownscale, outHeight, dstContainer, file, tonemap,
+    const buildVideoArgs = ({ family, encoderName, targetCodec, qNorm, speed, want10Bit, willDownscale, outHeight, dstContainer, file, tonemap,
         tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter, dropCaptions, sliceDecode }) => {
         const { getNvdecHwaccelPreset, getNvenc10BitFormatArg } = require('../methods/nvdecPreset');
-        const q = nativeQuality(codec, family, qNorm);
-        const spd = nativeSpeed(codec, family, speed);
+        const q = nativeQuality(targetCodec, family, qNorm);
+        const spd = nativeSpeed(targetCodec, family, speed);
         let inputSide = '';
         const parts = [`-c:v:0 ${encoderName}`, q, spd];   // :v:0 = encode primary video only; any genuine secondary video stream stays copied
         const vf = [];
@@ -1528,7 +1539,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         } else if (family === 'qsv') {
             if (useGpuTm) inputSide = tmDevice;
             pushTonemap();
-            if (want10Bit) { parts.push('-pix_fmt p010le'); if (codec === 'hevc') parts.push('-profile:v main10'); } else parts.push('-pix_fmt nv12');
+            if (want10Bit) { parts.push('-pix_fmt p010le'); if (targetCodec === 'hevc') parts.push('-profile:v main10'); } else parts.push('-pix_fmt nv12');
         } else if (family === 'vaapi') {
             if (useGpuTm) {   // two devices: opencl tonemaps, frames download to software, then re-upload to vaapi for the encoder (proven on Intel)
                 inputSide = '-init_hw_device opencl=ocl -init_hw_device vaapi=va:/dev/dri/renderD128';
@@ -1547,7 +1558,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (useGpuTm) inputSide = tmDevice;
             pushTonemap();
             parts.push(want10Bit ? '-pix_fmt p010le' : '-pix_fmt yuv420p');
-            if (want10Bit && codec === 'hevc') parts.push('-profile:v main10');
+            if (want10Bit && targetCodec === 'hevc') parts.push('-profile:v main10');
         } else {   // cpu
             pushTonemap();
             parts.push(`-pix_fmt ${want10Bit ? 'yuv420p10le' : 'yuv420p'}`);
@@ -1563,13 +1574,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // empty, so the bitstream copy must go or a player shows them twice. So: on a keep-by-default encoder, suppress when dropping (vaapi loses a53_cc from
         // its sei set, everyone else takes -a53cc 0); on libx265, enable when keeping; and h264_videotoolbox always gets -a53cc 0 because inserting A53 crashes
         // it - it cannot keep captions at all, which is why guard_captions force-picks libx264 when a caption-bearing file targets H.264 on a Mac.
-        const a53cap = (A53_CAP[codec] || {})[family];
+        const a53cap = (A53_CAP[targetCodec] || {})[family];
         if (a53cap === 'error') parts.push('-a53cc 0');
         else if (a53cap === 'keep' && dropCaptions) parts.push(family === 'vaapi' ? '-sei -a53_cc' : '-a53cc 0');
         else if (a53cap === 'optin' && !dropCaptions) parts.push('-a53cc 1');
         // hvc1 = Apple/QuickTime HEVC-in-mp4 (primary only); a no-base DV (e.g. profile 5) needs dvh1 or the DV box is dropped. The encode path tags hevc
         // ONLY - see qtVideoTag for why it and the copy path differ
-        if (codec === 'hevc' && isQtVideoContainer(dstContainer)) parts.push(preserveDvNoBase ? '-tag:v:0 dvh1' : '-tag:v:0 hvc1');
+        if (targetCodec === 'hevc' && isQtVideoContainer(dstContainer)) parts.push(preserveDvNoBase ? '-tag:v:0 dvh1' : '-tag:v:0 hvc1');
         // Slice-threaded DECODING, which costs 55-163 MB less at 4K than the default frame threading (see MEM_SLICE_CODECS for the per-codec figures). It rides
         // the INPUT side and must never move across the <io> marker: before -i the flag configures the DECODER, and decoding is normative, so it cannot alter
         // the output - proven bit-exact on Linux, Windows and macOS across five decoder settings and all three CPU encoders. AFTER the marker the identical
@@ -1633,7 +1644,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ellipsis, because loadDefaultValues only trims, Tdarr persists the whole message however large the value was, and a user has to be able to see it was cut.
     const parseQuality = (v, name) => {
         const n = Number(String(v).trim());
-        if (!Number.isFinite(n) || n < 0 || n > 63) failFile(`[${name}=${logSafe(v)}] must be a number between 0 and 63, check your settings`);
+        if (!Number.isFinite(n) || n < 0 || n > QUALITY_MAX)
+            failFile(`[${name}=${logSafe(v)}] must be a number between 0 and ${QUALITY_MAX}, check your settings`);
         return n;
     };
     const qualitySd = parseQuality(inputs.quality_sd, 'quality_sd');
@@ -1855,7 +1867,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // starts at 0. Duration comes from the format header; an absent one simply samples from the start.
             const durSec = Number(file.ffProbeData.format?.duration) || 0;
             const startSec = durSec > IDET_SEEK_MIN_DURATION_SEC ? Math.min(Math.floor(durSec / IDET_SEEK_FRACTION), IDET_SEEK_MAX_SEC) : 0;
-            idetMemo = detectInterlace((otherArguments && otherArguments.ffmpegPath) || 'ffmpeg', file.file, startSec);
+            idetMemo = detectInterlace(ffmpegPathOf(otherArguments), file.file, startSec);
             return idetMemo;
         };
         // A repaired file re-detects as progressive on any later pass, so this converges by itself and needs no reprocess fence of its own.
@@ -1906,11 +1918,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Apple/QuickTime fourCC for a COPIED stream, gated on isQtVideoContainer rather than isMp4Family (see its definition). The CODEC COVERAGE difference
         // against the encode path above is intentional and must stay: this path copies an arbitrary source codec (so it maps all three), while the encode path
         // only ever emits a fourCC for hevc and picks dvh1-vs-hvc1 from whether the DV RPU survives - a choice a copy cannot make. Do not merge the two.
-        // The key is an ffprobe codec_name, so the read is gated the same way the memory tables gate theirs: TABLE[key] || fallback cannot tell an absent
-        // key from one inherited off Object.prototype, and every prototype member is truthy, so the fallback would never fire for it.
+        // The key is an ffprobe codec_name, so the read goes through tableGet (see its definition for why a bare TABLE[key] || fallback is unsafe here).
         const QT_VIDEO_TAG = { hevc: ' -tag:v:0 hvc1', av1: ' -tag:v:0 av01', h264: ' -tag:v:0 avc1' };
         const qtVideoTag = (cn) => (isQtVideoContainer(dstContainer)
-            ? (Object.prototype.hasOwnProperty.call(QT_VIDEO_TAG, cn) ? QT_VIDEO_TAG[cn] : '') : '');
+            ? tableGet(QT_VIDEO_TAG, cn, '') : '');
         // input streams minus dropped cover-art video
         const keptStreams = () => file.ffProbeData.streams.filter((s) => !(isCoverArt(s) && codecTypeOf(s) === 'video'));
         // The output summary, built once for both exits (the lossless strip and the transcode). Only the primary video's token differs between them, so it is
@@ -2018,9 +2029,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // fire on a mismatch either direction; codec=source never mismatches
             codecTrigger = ENCODABLE_CODECS.includes(targetCodecName) && srcCodecName !== targetCodecName;
         } else {   // shrink: upgrade to a more efficient codec, else a same-codec size pass; never downgrade efficiency
-            // Same membership gate as qtVideoTag, for the same reason - srcCodecName is probe-sourced. The two sibling reads below key on `codec`, which is
-            // validated against the dropdown's own option set, so only this one needs it.
-            const srcEff = Object.prototype.hasOwnProperty.call(CODEC_EFFICIENCY, srcCodecName) ? CODEC_EFFICIENCY[srcCodecName] : 0;
+            // tableGet because srcCodecName is probe-sourced. The two sibling reads below key on `codec`, which is validated against the dropdown's own
+            // option set, so only this one needs the gate.
+            const srcEff = tableGet(CODEC_EFFICIENCY, srcCodecName, 0);
             if (codec !== 'source' && (CODEC_EFFICIENCY[codec] || 0) > srcEff && !preserveDv) {
                 codecTrigger = true;   // upgrade (targetCodecName already = codec)
             } else {
@@ -2079,10 +2090,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // always going to settle never spawns ffmpeg to be told something it does not use. The awk_video fence is the deliberate exception: it is tested
         // INSIDE the realTranscode() branch, so a fenced file whose only live trigger is deinterlace does pay one idet decode per re-cycle. Hoisting it left
         // would pre-empt the strip_dynamic lossless path below and re-label every fenced no-trigger skip with the fence line instead of its accurate reason.
-        const cheapTranscode = codecTrigger || heightTrigger || tonemapTrigger;
+        const cheapTrigger = codecTrigger || heightTrigger || tonemapTrigger;
         // deinterlaceNeeded is a FUNCTION where heightTrigger/tonemapTrigger/codecTrigger are booleans - called here rather than aliased into the
         // set, so the parentheses stay visible. A filter forces a real encode exactly as a downscale or a tonemap does.
-        const realTranscode = () => cheapTranscode || deinterlaceNeeded();
+        const realTranscode = () => cheapTrigger || deinterlaceNeeded();
         const canEncodeTarget = ENCODABLE_CODECS.includes(targetCodecName);
 
         // Idempotency fence: a settings fingerprint stored as a container-global awk_video tag. Essential for shrink (a constant-quality
@@ -2128,7 +2139,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // An injected capability object means a synthetic node, so never spawn past it: a missing key reads as "no captions" rather than falling through
             // to a real probe. Mirrors the idet and tonemap probes.
             const inj = otherArguments && otherArguments.__awkCap;
-            const r = probeA53Captions(file.file, deriveFfprobePath((otherArguments && otherArguments.ffmpegPath) || 'ffmpeg'),
+            const r = probeA53Captions(file.file, deriveFfprobePath(ffmpegPathOf(otherArguments)),
                 inj ? inj.captions === true : undefined);
             ccVerdict = { present: r === true, unknown: r === 'unknown', via: 'a bitstream scan' };
             return ccVerdict;
@@ -2275,7 +2286,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // No cross-compatible base (compat id 0 / no surviving HDR transfer, e.g. profile 5): the mp4
             // output needs the dvh1 tag - hvc1 drops the DV box entirely; a stream WITH a base keeps hvc1.
             const preserveDvNoBase = preserveDv && (dvNoBaseLayer || (!!dovi && dovi.compatId === 0));
-            const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, codec: targetCodecName, qNorm, speed, want10Bit, willDownscale,
+            const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, targetCodec: targetCodecName, qNorm, speed, want10Bit, willDownscale,
                 outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter: deintFilter(),
                 dropCaptions, sliceDecode });
             let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy${coverArtDrops}${strictArg} -metadata "awk_video=${videoSig}"`;
