@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.31',
+    Version: '4.999.32',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -998,6 +998,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // any region/variant subtag first, so en-US is judged as en. Used by knownLangToken (both free-text language inputs), canonicalRegionTag and storesCleanly.
     const langName = (tag) => langDisplayName(shortLang(String(tag).toLowerCase()));
 
+    // #region SHARED helpers (1 section: special language code)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: special language code =====
     // -=-=-= isNonLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // The special / non-language ISO 639-2 codes plus the qaa-qtz private-use range: und (undetermined), mul (multiple), zxx (no linguistic content),
@@ -1006,6 +1007,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // and one settings string would mean different things at different pipeline stages.
     const isNonLang = (k) => k === 'und' || k === 'mul' || k === 'zxx' || k === 'mis' || /^q[a-t][a-z]$/.test(k);
     // ===== END SHARED: special language code =====
+    // #endregion
     // A recognised language token, given its already-folded langKey: any real language in any form (langKey folds en/eng/English/en-US/pt-BR to a base
     // code) or one of the isNonLang special/private codes. Both free-text language inputs are checked through this, so an unrecognised token (typo/garbage)
     // fails the file rather than silently changing which streams survive.
@@ -1293,6 +1295,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Matroska is the only container that can hold a subtitle and its fonts together (mp4 carries no attachments at all), and .mks is its subtitle-only
     // extension, so a media server that does not skip dotfiles still does not read the bundle as a video. The 'styled' mark is sub_worker's bundle token:
     // with it the file reimports as a bundle, fonts and all - which is what makes the export a round trip rather than a one-way archive.
+    // #region SHARED helpers (1 section: styled bundle vocabulary)
     // ===== SHARED [clean_and_remux, sub_worker]: styled bundle vocabulary =====
     // -=-=-= STYLED_BUNDLE  [clean_and_remux, sub_worker] =-=-=-
     // The styled-subtitle .mks bundle vocabulary, one definition for the two-plugin round trip: ext (extension), mark (the fixed name token before the
@@ -1302,6 +1305,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // two sides spell the vocabulary in different shapes.
     const STYLED_BUNDLE = { ext: 'mks', fmt: 'matroska', mark: 'styled' };
     // ===== END SHARED: styled bundle vocabulary =====
+    // #endregion
 
     // #region SHARED helpers (2 sections: preset path safety … font attachment test)
     // ===== SHARED [clean_and_remux, sub_worker]: preset path safety =====
@@ -1490,6 +1494,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // an exported .mks needs a .embyignore entry there (called out in the remove_imagesubs tooltip). `mark` carries sub_worker's bundle token on a
     // STYLED-subtitle export - what tells its import to read the file back as a font bundle; an image-subtitle export deliberately has none, so importing
     // one can never re-add the picture subtitle this pass just removed.
+    // #region SHARED helpers (1 section: sidecar name tokens)
     // ===== SHARED [clean_and_remux, sub_worker]: sidecar name tokens =====
     // -=-=-= DISPOSITIONS / DISP_ALIAS / DISP_IGNORE / DISP_TOKENS / DISP_AMBIGUOUS_LANG  [clean_and_remux, sub_worker] =-=-=-
     // Dispositions encoded as filename tokens, in fixed order. `ff` is the ffmpeg -disposition name restored on import; `flags` are the ffprobe
@@ -1565,6 +1570,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { lang, pre: extra.length ? `.${extra.join('.')}` : '', disp: trailing ? `.${trailing}` : '' };
     };
     // ===== END SHARED: sidecar name tokens =====
+    // #endregion
 
     const exportSidecarName = (ffstream, ext, mark) => {
         // Every token but the extension comes from the shared sidecarNameTokens: that vocabulary is what makes the name readable by sub_worker's importer,

@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.38',
+    Version: '3.999.39',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -834,6 +834,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // what makes a bundle name unambiguous: clean_and_remux's remove_imagesubs=export writes dot-prefixed .mks IMAGE-subtitle sidecars in the same name
     // shape, and importing one of those as a bundle would silently re-add the image subtitle that pass had just removed. clean_and_remux writes the token
     // on its OWN styled bundles, so those DO come back through the import as bundles - the whole point of exporting them in that form.
+    // #region SHARED helpers (1 section: styled bundle vocabulary)
     // ===== SHARED [clean_and_remux, sub_worker]: styled bundle vocabulary =====
     // -=-=-= STYLED_BUNDLE  [clean_and_remux, sub_worker] =-=-=-
     // The styled-subtitle .mks bundle vocabulary, one definition for the two-plugin round trip: ext (extension), mark (the fixed name token before the
@@ -843,6 +844,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // two sides spell the vocabulary in different shapes.
     const STYLED_BUNDLE = { ext: 'mks', fmt: 'matroska', mark: 'styled' };
     // ===== END SHARED: styled bundle vocabulary =====
+    // #endregion
 
     // #region SHARED helpers (1 section: styled subtitle test)
     // ===== SHARED [clean_and_remux, sub_worker]: styled subtitle test =====
@@ -1203,6 +1205,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const ccTokensOf = (tags) => getTagCI(tags || {}, CC_TAG).toLowerCase().split(',').map((t) => t.trim()).filter(Boolean);
     // ===== END SHARED: closed-caption handoff =====
     // #endregion
+    // #region SHARED helpers (1 section: mov language remap)
     // ===== SHARED [audio_clean, sub_worker]: mov language remap =====
     // -=-=-= to6392T  [audio_clean, sub_worker] =-=-=-
     // Fold a language token to a lowercase 3-letter ISO 639-2/T code: langKey folds spelled names and 639-2/B onto the 2-letter key, which ISO639_1_TO_2 maps to
@@ -1223,6 +1226,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const MOV_LANG = Object.assign(Object.create(null), { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
         deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel' });
     // ===== END SHARED: mov language remap =====
+    // #endregion
     // Plex/Jellyfin/Emby all accept a spelled-out language NAME in a sidecar name (Movie.English.srt), which isRealLanguageToken recognises - but the name
     // itself is not a valid container language tag, so writing it through would stamp "language=English" into the mkv. Fold any non-code token to its code; a
     // token already shaped like a code keeps its region subtag (pt-BR), which is the whole point of keeping the raw token on mkv.
@@ -1241,6 +1245,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const normSidecarLang = (lang) => (LANG_CODE_SHAPE.test(String(lang)) ? canonSidecarRegion(String(lang)) : to6392T(lang));
 
+    // #region SHARED helpers (1 section: sidecar name tokens)
     // ===== SHARED [clean_and_remux, sub_worker]: sidecar name tokens =====
     // -=-=-= DISPOSITIONS / DISP_ALIAS / DISP_IGNORE / DISP_TOKENS / DISP_AMBIGUOUS_LANG  [clean_and_remux, sub_worker] =-=-=-
     // Dispositions encoded as filename tokens, in fixed order. `ff` is the ffmpeg -disposition name restored on import; `flags` are the ffprobe
@@ -1316,6 +1321,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { lang, pre: extra.length ? `.${extra.join('.')}` : '', disp: trailing ? `.${trailing}` : '' };
     };
     // ===== END SHARED: sidecar name tokens =====
+    // #endregion
     // The ffmpeg -disposition name a filename token restores on import. Import-only, so it stays out of the section above.
     const dispFfOf = (token) => (DISPOSITIONS.concat(EXTRA_DISPOSITIONS).find((d) => d.token === token) || {}).ff;
 
