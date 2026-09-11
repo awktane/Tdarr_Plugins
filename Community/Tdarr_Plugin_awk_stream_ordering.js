@@ -17,7 +17,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file carrying clean_and_remux's awk_recovered tag: a
         repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. This check
         is always on and has no setting.\n`,
-    Version: '4.999.15',
+    Version: '4.999.16',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -35,12 +35,12 @@ const details = () => ({
                 \\n=====
                 \\ndisabled (default): promote nothing - the normal ordering stands, so order_language decides.
                 \\noriginal_tagged: promote the original-language track (the ffmpeg 'original' disposition, or an 'original' title) above language, so a
-                foreign film leads with its original audio rather than a dub. Falls back to normal ordering when no track is flagged original.
+                foreign film leads with its original audio rather than a dub.
                 \\ndefault_tagged: promote the track already flagged default (the ffmpeg 'default' disposition), so the source's chosen audio stays first.
                 Where several tracks carry the flag - a source track and a downmix that inherited it, say - the highest-priority one by normal ordering
-                leads. Falls back to normal ordering when no track is flagged default.
-                \\ndescriptive_tagged: promote the descriptive (audio-description) track above language. Falls back to normal ordering when there is no
-                descriptive track.
+                leads.
+                \\ndescriptive_tagged: promote the descriptive (audio-description) track above language.
+                \\nAny option falls back to normal ordering when no track carries the flag it names.
                 \\nWhichever you pick, the first sorted track becomes the sole default - so descriptive_tagged makes the audio description your default
                 audio.`,
         },
@@ -1271,7 +1271,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Per-type comparators (pure: read only a/b and the closed-over read-only audioFirst/subtitleFirst/winningDefault/compareAudioKeys). Each
         // returns 0 on a full tie, so the sort dispatcher below falls through to source-index order. Video: cover art / posters / thumbnails sort last.
         const compareVideoStreams = (a, b) => (a.coverArt !== b.coverArt) ? (a.coverArt ? 1 : -1) : 0;
-        // Audio: audio_first promotes ONE track above every audio key (including language). Only one value is active, so at most one
+        // Audio: audio_first promotes the tracks the setting NAMES above every audio key (including language) - the whole flagged class for
+        // original_tagged and descriptive_tagged, the single winningDefault for default_tagged. Only one value is active, so at most one
         // clause fires; each is a no-op when no track qualifies, falling through to the normal ordering. original_tagged: keeps a foreign
         // film's original audio first (and default), not a dub. default_tagged: keeps the source's flagged-default audio first - promoting
         // only the WINNING default (winningDefault) so the result is idempotent. descriptive_tagged: lifts the audio-description track first
