@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.36',
+    Version: '3.999.37',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -550,13 +550,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // as plain 5.1. mediaInfo's Format_Settings_Mode is the flag's only home (ffprobe does not expose it). One definition so summariseStream's dd-ex token
     // and audio_clean's dedup tie-break can never disagree about what counts as EX.
     const isDdEx = (s) => /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '');
-    // -=-=-= summariseStream [all five] =-=-=-
-    // The [type:details] summary token. Audio & subtitle append /default then EVERY role marker that applies. /default reads the REAL disposition flag
-    // alone - a title keyword must not flip a selection flag; every other marker uses the same flag-OR-title-keyword test the sort keys use, so every
-    // plugin's summary lines up. Exception: the subtitle /original is a raw flag, display only - no classifier scopes it to subtitles. subrip shows as
-    // srt. Audio uses codecDisplayName so a DTS subtype or object-audio layer the container codec_name hides shows in the token. The optional second
-    // argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - so NEVER pass this helper straight to .map(): Array.map would
-    // supply the element index as that argument.
     // -=-=-= logTok  [all five] =-=-=-
     // The one sanitiser for any untrusted string an infoLog line echoes - a container title, handler, language token or free-text input. Control characters
     // become a space because infoLog is NEWLINE-DELIMITED: a raw newline in a container tag splits the line into a continuation carrying no ☐/☑/☒ symbol,
@@ -565,6 +558,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Shared, and used by every echo site, because the rule is log-integrity relevant: a per-site spelling would let a hardening (also stripping
     // U+2028/U+2029, say, which JSON-embedded logs treat as line terminators) land at one echo site while the others keep emitting the character.
     const logTok = (v, max = 64) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, max);
+    // -=-=-= logSafe  [all five] =-=-=-
+    // logTok with the truncation made VISIBLE: the same sanitising (see above), but a value that was actually cut ends in an ellipsis, so a reader can tell a
+    // clipped echo from a value that genuinely ends there. EVERY echo of an unbounded value goes through this - a free-text input, a container tag, a sidecar
+    // path - so the marker means one thing in every plugin rather than appearing in whichever one happened to wrap it. summariseStream's tokens deliberately
+    // do NOT: they call logTok directly at its 64 cap, where an ellipsis would render inside an [attach:...] token for any ordinary long mimetype or filename.
+    const logSafe = (value, max = 200) => { const s = logTok(value, Infinity); return s.length > max ? `${s.slice(0, max)}…` : s; };
+    // -=-=-= summariseStream [all five] =-=-=-
+    // The [type:details] summary token. Audio & subtitle append /default then EVERY role marker that applies. /default reads the REAL disposition flag
+    // alone - a title keyword must not flip a selection flag; every other marker uses the same flag-OR-title-keyword test the sort keys use, so every
+    // plugin's summary lines up. Exception: the subtitle /original is a raw flag, display only - no classifier scopes it to subtitles. subrip shows as
+    // srt. Audio uses codecDisplayName so a DTS subtype or object-audio layer the container codec_name hides shows in the token. The optional second
+    // argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - so NEVER pass this helper straight to .map(): Array.map would
+    // supply the element index as that argument.
     const summariseStream = (s, out) => {
         // Every container-supplied value here (language tags, attachment filenames, mimetypes) is clamped via logTok - see its header for why; 64 covers the
         // longest registered mimetype subtype (59), everything else is far shorter.
@@ -721,7 +727,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // The failFile message echoes the offending token capped at 200 chars, with control characters collapsed to a space: free text is unbounded and Tdarr
     // persists the whole error message, and a raw newline in the echo would split the line into a continuation carrying no ☐/☑/☒ status symbol.
-    const failLangToken = (name, token) => failFile(`[${name}=${logTok(token, 200)}] not a recognised language`
+    const failLangToken = (name, token) => failFile(`[${name}=${logSafe(token)}] not a recognised language`
         + ' - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)');
     // ===== END SHARED: language token failure =====
 
@@ -1048,7 +1054,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES });
         if (ff.error || ff.status !== 0) {
             const why = ff.error ? `extraction failed (${ff.error.code || ff.error.message})`
-                : `extraction failed (ffmpeg exit ${ff.status}: ${logTok(String(ff.stderr || '').trim(), 200)})`;
+                : `extraction failed (ffmpeg exit ${ff.status}: ${logSafe(String(ff.stderr || '').trim())})`;
             clearStaged();
             return failAll(why);
         }
@@ -1548,18 +1554,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const got = [];
         for (const rel of rels) {
             if (!parseSidecarRel(rel)) {
-                response.infoLog += `☒[method_unmapped=text_file] ${listName} lists ${logTok(rel, 200)}, which is not a recognised sidecar name - skipping\n`;
+                response.infoLog += `☒[method_unmapped=text_file] ${listName} lists ${logSafe(rel)}, which is not a recognised sidecar name - skipping\n`;
                 continue;
             }
             const dest = serverSidePath(path.join(libDir, rel));
-            if (!dest) { response.infoLog += `☒[method_unmapped=text_file] Cannot work out the server path for ${logTok(rel, 200)}\n`; continue; }
+            if (!dest) { response.infoLog += `☒[method_unmapped=text_file] Cannot work out the server path for ${logSafe(rel)}\n`; continue; }
             const dl = downloadLibraryFile(dest, path.join(libDir, rel));
             if (dl.ok) { got.push(rel); continue; }
             if (embeddedAlready && embeddedAlready.has(rel)) {
-                response.infoLog += `☑[method_unmapped=text_file] ${listName} still lists ${logTok(rel, 200)}, which an earlier pass already embedded and removed\n`;
+                response.infoLog += `☑[method_unmapped=text_file] ${listName} still lists ${logSafe(rel)}, which an earlier pass already embedded and removed\n`;
                 continue;
             }
-            response.infoLog += `☒[method_unmapped=text_file] ${listName} lists ${logTok(rel, 200)} but it could not be fetched - ${dl.why}\n`;
+            response.infoLog += `☒[method_unmapped=text_file] ${listName} lists ${logSafe(rel)} but it could not be fetched - ${dl.why}\n`;
         }
         return got;
     };
@@ -2005,7 +2011,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['method_import_metadata', metadataMode,  ['embedded', 'sidecar']],
     ];
     for (const [name, value, opts] of dropdownChecks)
-        if (!opts.includes(value)) failFile(`[${name}=${logTok(value, 200)}] invalid value, check your settings`);
+        if (!opts.includes(value)) failFile(`[${name}=${logSafe(value)}] invalid value, check your settings`);
     if (file.fileMedium && file.fileMedium !== 'video') return skip('☑File is not a video\n');
     // A language token that is not a language FAILS the file. only_languages scopes which subtitles are touched at all, so a typo ('eng,fer') silently matches
     // nothing and every subtitle in that language is quietly left out of the extract - the user gets a clean run that did none of the work they asked for, with
@@ -2591,7 +2597,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // The tag echoes a free-text input, so it gets the same treatment failLangToken gives its token: control characters collapsed (a raw
                 // newline would split the line into a continuation with no ☐/☑/☒ symbol) and capped, since nothing bounds the list and this line is
                 // per-sidecar.
-                response.infoLog += `☑[only_languages=${logTok(inputs.only_languages, 200)}] Skipping ${f.rel} - ${f.lang} is not in the list\n`;
+                response.infoLog += `☑[only_languages=${logSafe(inputs.only_languages)}] Skipping ${f.rel} - ${f.lang} is not in the list\n`;
                 return false;
             }
             if (!subBundleFits(f)) {
@@ -2652,7 +2658,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         failFile(`[method_unmapped=text_file] Fetched ${listName} but could not read it back: ${e && e.message ? e.message : e}`);
                     }
                     const parsed = readSubtitleList(listText);
-                    for (const [entry, why] of parsed.bad) response.infoLog += `☒[method_unmapped=text_file] Ignoring "${logTok(entry, 200)}" in ${listName} - ${why}\n`;
+                    for (const [entry, why] of parsed.bad) response.infoLog += `☒[method_unmapped=text_file] Ignoring "${logSafe(entry)}" in ${listName} - ${why}\n`;
                     // An empty list is the same "nothing to import" as no list at all - a user who emptied it, or left only comments, has said so. A list whose
                     // every line was REJECTED is different: those were written with intent and not one can be used, which is a mistake worth stopping on.
                     if (!parsed.ok.length && parsed.bad.length) {
@@ -2728,7 +2734,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // A hidden TEXT sidecar named after THIS video is the exception: that is the OCR coming back, it is importable now, so a name that still fails to
             // parse is a genuine mistake (a bad language token, a lost s<index>) and saying nothing would strand the work the user just did.
             if (relBase.startsWith('.') && !(TEXT_EXTS.includes(relExt) && relBase.slice(1).startsWith(`${videoBase}.`))) continue;
-            if (TEXT_EXTS.includes(relExt) || relExt === STYLED_BUNDLE.ext) response.infoLog += `☒Not a recognised sidecar name, skipping: ${logTok(rel, 200)}\n`;
+            if (TEXT_EXTS.includes(relExt) || relExt === STYLED_BUNDLE.ext) response.infoLog += `☒Not a recognised sidecar name, skipping: ${logSafe(rel)}\n`;
         }
         // This pass only ever ADDS subtitles - it never deletes a sidecar. remove_source acts in the post-processing branch above, after acceptance.
         const embeddedSubs = streams.filter((s) => codecTypeOf(s) === 'subtitle');

@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.23',
+    Version: '3.999.24',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -652,13 +652,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // as plain 5.1. mediaInfo's Format_Settings_Mode is the flag's only home (ffprobe does not expose it). One definition so summariseStream's dd-ex token
     // and audio_clean's dedup tie-break can never disagree about what counts as EX.
     const isDdEx = (s) => /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '');
-    // -=-=-= summariseStream [all five] =-=-=-
-    // The [type:details] summary token. Audio & subtitle append /default then EVERY role marker that applies. /default reads the REAL disposition flag
-    // alone - a title keyword must not flip a selection flag; every other marker uses the same flag-OR-title-keyword test the sort keys use, so every
-    // plugin's summary lines up. Exception: the subtitle /original is a raw flag, display only - no classifier scopes it to subtitles. subrip shows as
-    // srt. Audio uses codecDisplayName so a DTS subtype or object-audio layer the container codec_name hides shows in the token. The optional second
-    // argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - so NEVER pass this helper straight to .map(): Array.map would
-    // supply the element index as that argument.
     // -=-=-= logTok  [all five] =-=-=-
     // The one sanitiser for any untrusted string an infoLog line echoes - a container title, handler, language token or free-text input. Control characters
     // become a space because infoLog is NEWLINE-DELIMITED: a raw newline in a container tag splits the line into a continuation carrying no ☐/☑/☒ symbol,
@@ -667,6 +660,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Shared, and used by every echo site, because the rule is log-integrity relevant: a per-site spelling would let a hardening (also stripping
     // U+2028/U+2029, say, which JSON-embedded logs treat as line terminators) land at one echo site while the others keep emitting the character.
     const logTok = (v, max = 64) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, max);
+    // -=-=-= logSafe  [all five] =-=-=-
+    // logTok with the truncation made VISIBLE: the same sanitising (see above), but a value that was actually cut ends in an ellipsis, so a reader can tell a
+    // clipped echo from a value that genuinely ends there. EVERY echo of an unbounded value goes through this - a free-text input, a container tag, a sidecar
+    // path - so the marker means one thing in every plugin rather than appearing in whichever one happened to wrap it. summariseStream's tokens deliberately
+    // do NOT: they call logTok directly at its 64 cap, where an ellipsis would render inside an [attach:...] token for any ordinary long mimetype or filename.
+    const logSafe = (value, max = 200) => { const s = logTok(value, Infinity); return s.length > max ? `${s.slice(0, max)}…` : s; };
+    // -=-=-= summariseStream [all five] =-=-=-
+    // The [type:details] summary token. Audio & subtitle append /default then EVERY role marker that applies. /default reads the REAL disposition flag
+    // alone - a title keyword must not flip a selection flag; every other marker uses the same flag-OR-title-keyword test the sort keys use, so every
+    // plugin's summary lines up. Exception: the subtitle /original is a raw flag, display only - no classifier scopes it to subtitles. subrip shows as
+    // srt. Audio uses codecDisplayName so a DTS subtype or object-audio layer the container codec_name hides shows in the token. The optional second
+    // argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - so NEVER pass this helper straight to .map(): Array.map would
+    // supply the element index as that argument.
     const summariseStream = (s, out) => {
         // Every container-supplied value here (language tags, attachment filenames, mimetypes) is clamped via logTok - see its header for why; 64 covers the
         // longest registered mimetype subtype (59), everything else is far shorter.
@@ -1612,12 +1618,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const guardLossless = String(inputs.guard_lossless) === 'true';   // boolean, default true
 
     // The two free-text NUMERIC inputs are the only user-typed values this plugin echoes back, and failFile's message becomes the file's stored error, so
-    // they get the same treatment as every other free-text echo in the suite - the shared logTok(v, 200): control characters to space, because infoLog is
-    // newline-delimited and a raw newline turns the rest of the paste into a status line the plugin never wrote, and a 200-char cap, because loadDefaultValues
-    // only trims and Tdarr persists the whole message however large the value was.
+    // they get the same treatment as every other free-text echo in the suite - the shared logSafe(v): control characters to space, because infoLog is
+    // newline-delimited and a raw newline turns the rest of the paste into a status line the plugin never wrote, and a 200-char cap ending in a visible
+    // ellipsis, because loadDefaultValues only trims, Tdarr persists the whole message however large the value was, and a user has to be able to see it was cut.
     const parseQuality = (v, name) => {
         const n = Number(String(v).trim());
-        if (!Number.isFinite(n) || n < 0 || n > 63) failFile(`[${name}=${logTok(v, 200)}] must be a number between 0 and 63, check your settings`);
+        if (!Number.isFinite(n) || n < 0 || n > 63) failFile(`[${name}=${logSafe(v)}] must be a number between 0 and 63, check your settings`);
         return n;
     };
     const qualitySd = parseQuality(inputs.quality_sd, 'quality_sd');
@@ -1627,7 +1633,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const guardShrinkKbps = (() => {
         const n = Number(String(inputs.guard_shrink_bitrate).trim());
         if (!Number.isFinite(n) || n < 0)
-            failFile(`[guard_shrink_bitrate=${logTok(inputs.guard_shrink_bitrate, 200)}] must be a non-negative number (kbps), check your settings`);
+            failFile(`[guard_shrink_bitrate=${logSafe(inputs.guard_shrink_bitrate)}] must be a non-negative number (kbps), check your settings`);
         return n;
     })();
 
@@ -1646,7 +1652,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['deinterlace',      deinterlaceOpt,  ['disabled', 'enabled']],
     ];
     for (const [name, value, opts] of dropdownChecks)
-        if (!opts.includes(value)) failFile(`[${name}=${logTok(value, 200)}] invalid value, check your settings`);
+        if (!opts.includes(value)) failFile(`[${name}=${logSafe(value)}] invalid value, check your settings`);
     // The one cross-input config error: tonemap_sdr is a pixel-domain re-encode, so it can never satisfy hdr_cleanup_only's lossless-or-skip promise.
     if (hdrMode === 'tonemap_sdr' && action === 'hdr_cleanup_only')
         failFile('[hdr_mode=tonemap_sdr][action=hdr_cleanup_only] tonemapping is always a re-encode (never lossless)'

@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.29',
+    Version: '4.999.30',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -692,13 +692,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // as plain 5.1. mediaInfo's Format_Settings_Mode is the flag's only home (ffprobe does not expose it). One definition so summariseStream's dd-ex token
     // and audio_clean's dedup tie-break can never disagree about what counts as EX.
     const isDdEx = (s) => /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '');
-    // -=-=-= summariseStream [all five] =-=-=-
-    // The [type:details] summary token. Audio & subtitle append /default then EVERY role marker that applies. /default reads the REAL disposition flag
-    // alone - a title keyword must not flip a selection flag; every other marker uses the same flag-OR-title-keyword test the sort keys use, so every
-    // plugin's summary lines up. Exception: the subtitle /original is a raw flag, display only - no classifier scopes it to subtitles. subrip shows as
-    // srt. Audio uses codecDisplayName so a DTS subtype or object-audio layer the container codec_name hides shows in the token. The optional second
-    // argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - so NEVER pass this helper straight to .map(): Array.map would
-    // supply the element index as that argument.
     // -=-=-= logTok  [all five] =-=-=-
     // The one sanitiser for any untrusted string an infoLog line echoes - a container title, handler, language token or free-text input. Control characters
     // become a space because infoLog is NEWLINE-DELIMITED: a raw newline in a container tag splits the line into a continuation carrying no ☐/☑/☒ symbol,
@@ -707,6 +700,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Shared, and used by every echo site, because the rule is log-integrity relevant: a per-site spelling would let a hardening (also stripping
     // U+2028/U+2029, say, which JSON-embedded logs treat as line terminators) land at one echo site while the others keep emitting the character.
     const logTok = (v, max = 64) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, max);
+    // -=-=-= logSafe  [all five] =-=-=-
+    // logTok with the truncation made VISIBLE: the same sanitising (see above), but a value that was actually cut ends in an ellipsis, so a reader can tell a
+    // clipped echo from a value that genuinely ends there. EVERY echo of an unbounded value goes through this - a free-text input, a container tag, a sidecar
+    // path - so the marker means one thing in every plugin rather than appearing in whichever one happened to wrap it. summariseStream's tokens deliberately
+    // do NOT: they call logTok directly at its 64 cap, where an ellipsis would render inside an [attach:...] token for any ordinary long mimetype or filename.
+    const logSafe = (value, max = 200) => { const s = logTok(value, Infinity); return s.length > max ? `${s.slice(0, max)}…` : s; };
+    // -=-=-= summariseStream [all five] =-=-=-
+    // The [type:details] summary token. Audio & subtitle append /default then EVERY role marker that applies. /default reads the REAL disposition flag
+    // alone - a title keyword must not flip a selection flag; every other marker uses the same flag-OR-title-keyword test the sort keys use, so every
+    // plugin's summary lines up. Exception: the subtitle /original is a raw flag, display only - no classifier scopes it to subtitles. subrip shows as
+    // srt. Audio uses codecDisplayName so a DTS subtype or object-audio layer the container codec_name hides shows in the token. The optional second
+    // argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - so NEVER pass this helper straight to .map(): Array.map would
+    // supply the element index as that argument.
     const summariseStream = (s, out) => {
         // Every container-supplied value here (language tags, attachment filenames, mimetypes) is clamped via logTok - see its header for why; 64 covers the
         // longest registered mimetype subtype (59), everything else is far shorter.
@@ -936,7 +942,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // reachable via a hand-edited/imported config) would silently fall through to a generic remux into an unsupported container - a runtime ffmpeg muxer
     // error instead of a clean quarantine.
     if(!['mkv', 'mp4'].includes(dstContainer))
-        failFile(`[container=${logTok(dstContainer, 200)}] invalid value, check your settings`);
+        failFile(`[container=${logSafe(dstContainer)}] invalid value, check your settings`);
     response.container = `.${dstContainer}`;
 
     // Recovery modes: two symptom dropdowns, each disabled/light/aggressive. light = no-data-loss flags only; aggressive adds the side-effect ones.
@@ -985,14 +991,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // any region/variant subtag first, so en-US is judged as en. Used by knownLangToken (both free-text language inputs), canonicalRegionTag and storesCleanly.
     const langName = (tag) => langDisplayName(shortLang(String(tag).toLowerCase()));
 
-    // Sanitize a file-supplied string (title/comment/handler/filename) for one infoLog line: control characters become a space (a raw newline would split
-    // the line into a continuation with no ☐/☑/☒ symbol), quotes/backslashes are preserved so the value reads faithfully (unlike escMeta - this is
-    // display-only, never feeds ffmpeg), and it is length-capped: nothing bounds a container title and Tdarr persists the whole infoLog.
-    const logSafe = (value, max = 200) => {
-        const s = logTok(value, Infinity);
-        return s.length > max ? `${s.slice(0, max)}…` : s;
-    };
-
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: special language code =====
     // -=-=-= isNonLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // The special / non-language ISO 639-2 codes plus the qaa-qtz private-use range: und (undetermined), mul (multiple), zxx (no linguistic content),
@@ -1010,7 +1008,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // The failFile message echoes the offending token capped at 200 chars, with control characters collapsed to a space: free text is unbounded and Tdarr
     // persists the whole error message, and a raw newline in the echo would split the line into a continuation carrying no ☐/☑/☒ status symbol.
-    const failLangToken = (name, token) => failFile(`[${name}=${logTok(token, 200)}] not a recognised language`
+    const failLangToken = (name, token) => failFile(`[${name}=${logSafe(token)}] not a recognised language`
         + ' - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)');
     // ===== END SHARED: language token failure =====
     // #endregion
@@ -1051,7 +1049,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['method_unmuxable',     methodUnmuxable,    ['error', 'drop', 'mkv_fallback']],
     ];
     for (const [name, value, opts] of dropdownChecks)
-        if (!opts.includes(value)) failFile(`[${name}=${logTok(value, 200)}] invalid value, check your settings`);
+        if (!opts.includes(value)) failFile(`[${name}=${logSafe(value)}] invalid value, check your settings`);
 
     // This benign skip (processFile:false) sits BETWEEN config validation (above) and the per-file CONTENT checks (below), and both edges are load-bearing:
     // a bad setting must still fail loudly on a non-video file, while the language_fill_mode / guard_audio_language pre-checks can failFile (quarantine),
@@ -1452,7 +1450,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES });
         if (ff.error || ff.status !== 0) {
             const why = ff.error ? `extraction failed (${ff.error.code || ff.error.message})`
-                : `extraction failed (ffmpeg exit ${ff.status}: ${logTok(String(ff.stderr || '').trim(), 200)})`;
+                : `extraction failed (ffmpeg exit ${ff.status}: ${logSafe(String(ff.stderr || '').trim())})`;
             clearStaged();
             return failAll(why);
         }

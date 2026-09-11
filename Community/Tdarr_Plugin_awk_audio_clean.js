@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.24',
+    Version: '4.999.25',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -930,13 +930,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // as plain 5.1. mediaInfo's Format_Settings_Mode is the flag's only home (ffprobe does not expose it). One definition so summariseStream's dd-ex token
     // and audio_clean's dedup tie-break can never disagree about what counts as EX.
     const isDdEx = (s) => /surround ex/i.test(mediaInfoFor(s)?.Format_Settings_Mode || '');
-    // -=-=-= summariseStream [all five] =-=-=-
-    // The [type:details] summary token. Audio & subtitle append /default then EVERY role marker that applies. /default reads the REAL disposition flag
-    // alone - a title keyword must not flip a selection flag; every other marker uses the same flag-OR-title-keyword test the sort keys use, so every
-    // plugin's summary lines up. Exception: the subtitle /original is a raw flag, display only - no classifier scopes it to subtitles. subrip shows as
-    // srt. Audio uses codecDisplayName so a DTS subtype or object-audio layer the container codec_name hides shows in the token. The optional second
-    // argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - so NEVER pass this helper straight to .map(): Array.map would
-    // supply the element index as that argument.
     // -=-=-= logTok  [all five] =-=-=-
     // The one sanitiser for any untrusted string an infoLog line echoes - a container title, handler, language token or free-text input. Control characters
     // become a space because infoLog is NEWLINE-DELIMITED: a raw newline in a container tag splits the line into a continuation carrying no ☐/☑/☒ symbol,
@@ -945,6 +938,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Shared, and used by every echo site, because the rule is log-integrity relevant: a per-site spelling would let a hardening (also stripping
     // U+2028/U+2029, say, which JSON-embedded logs treat as line terminators) land at one echo site while the others keep emitting the character.
     const logTok = (v, max = 64) => String(v ?? '').replace(/[\x00-\x1f\x7f]/g, ' ').slice(0, max);
+    // -=-=-= logSafe  [all five] =-=-=-
+    // logTok with the truncation made VISIBLE: the same sanitising (see above), but a value that was actually cut ends in an ellipsis, so a reader can tell a
+    // clipped echo from a value that genuinely ends there. EVERY echo of an unbounded value goes through this - a free-text input, a container tag, a sidecar
+    // path - so the marker means one thing in every plugin rather than appearing in whichever one happened to wrap it. summariseStream's tokens deliberately
+    // do NOT: they call logTok directly at its 64 cap, where an ellipsis would render inside an [attach:...] token for any ordinary long mimetype or filename.
+    const logSafe = (value, max = 200) => { const s = logTok(value, Infinity); return s.length > max ? `${s.slice(0, max)}…` : s; };
+    // -=-=-= summariseStream [all five] =-=-=-
+    // The [type:details] summary token. Audio & subtitle append /default then EVERY role marker that applies. /default reads the REAL disposition flag
+    // alone - a title keyword must not flip a selection flag; every other marker uses the same flag-OR-title-keyword test the sort keys use, so every
+    // plugin's summary lines up. Exception: the subtitle /original is a raw flag, display only - no classifier scopes it to subtitles. subrip shows as
+    // srt. Audio uses codecDisplayName so a DTS subtype or object-audio layer the container codec_name hides shows in the token. The optional second
+    // argument describes a RE-ENCODED output track as { codec, channels, bps, rate } - so NEVER pass this helper straight to .map(): Array.map would
+    // supply the element index as that argument.
     const summariseStream = (s, out) => {
         // Every container-supplied value here (language tags, attachment filenames, mimetypes) is clamped via logTok - see its header for why; 64 covers the
         // longest registered mimetype subtype (59), everything else is far shorter.
@@ -1670,7 +1676,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['guard_quality',         guardQuality,         ['enabled', 'strict', 'disabled']],
     ];
     for (const [name, value, opts] of dropdownChecks)
-        if (!opts.includes(value)) failFile(`[${name}=${logTok(value, 200)}] invalid value, check your settings`);
+        if (!opts.includes(value)) failFile(`[${name}=${logSafe(value)}] invalid value, check your settings`);
 
     // Both free-text language lists are checked through this because dormancy is NOT a typo net - it only fires when NOTHING matches EITHER list, so a typo in
     // one list while the other still matches leaves that language "unlisted", where language_unlisted=stereo downmixes it and language_unlisted=delete removes
@@ -1696,7 +1702,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= failLangToken  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
     // The failFile message echoes the offending token capped at 200 chars, with control characters collapsed to a space: free text is unbounded and Tdarr
     // persists the whole error message, and a raw newline in the echo would split the line into a continuation carrying no ☐/☑/☒ status symbol.
-    const failLangToken = (name, token) => failFile(`[${name}=${logTok(token, 200)}] not a recognised language`
+    const failLangToken = (name, token) => failFile(`[${name}=${logSafe(token)}] not a recognised language`
         + ' - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)');
     // ===== END SHARED: language token failure =====
     // #endregion
@@ -2456,7 +2462,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 ['input_thresh', stats.input_thresh], ['target_offset', stats.target_offset]])
                 if (!LOUDNORM_MEASURED_SHAPE.test(String(val)) || !Number.isFinite(Number(val)))
                     failWithBuffers(`${streamTag(streamIndex)}[method_loudnorm=${methodLoudnorm}] malformed loudnorm measurement JSON from the analysis pass `
-                        + `(${field}=${logTok(String(val), 40)}) - the file may be corrupt or carry crafted metadata; leave method_loudnorm=disabled for it`);
+                        + `(${field}=${logSafe(String(val), 40)}) - the file may be corrupt or carry crafted metadata; leave method_loudnorm=disabled for it`);
             const corrected = `loudnorm=I=${preset.I}:LRA=${preset.LRA}:TP=${preset.TP}:measured_I=${stats.input_i}:measured_LRA=${stats.input_lra}`
                 + `:measured_TP=${stats.input_tp}:measured_thresh=${stats.input_thresh}:offset=${stats.target_offset}:linear=true`;
             return { filter: preFilter ? `${preFilter},${corrected}` : corrected, changed: true, measured: true };
