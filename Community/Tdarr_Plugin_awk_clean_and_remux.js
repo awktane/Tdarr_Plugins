@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.28',
+    Version: '4.999.29',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1700,6 +1700,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: title canonicalization =====
     // #endregion
 
+    // #region SHARED helpers (1 section: recovered marker vocabulary)
+    // ===== SHARED [clean_and_remux, stream_ordering]: recovered marker vocabulary =====
+    // -=-=-= RECOVERED_TAG  [clean_and_remux, stream_ordering] =-=-=-
+    // The format-level tag clean_and_remux stamps on every recover_bad_* remux, and the ONE cross-plugin marker whose spelling is executable code in two
+    // files (awk_cc is already shared; awk_video, awk_loudnorm and awk_sub_worker are each single-plugin). clean_and_remux reads it back to stay idempotent;
+    // stream_ordering reads it to soften BOTH truncation verdicts from a failFile quarantine to a warning that accepts the file for review, because a
+    // recover_bad_* repair of a truncated source legitimately reports a shorter or absent duration - so a reader that stopped matching would quarantine
+    // every salvaged file in a loop the user cannot break (fixed tolerance, no relaxing input). SHARED for the reason the closed-caption handoff gives: a
+    // writer and a reader whose vocabularies drift fail SILENTLY. Only the KEY needs guarding - the read is getTagCI (case-insensitive) and tests
+    // non-emptiness only, so no VALUE format can drift. Interpolate it into the log lines that NAME the tag too, or a rename here leaves user-facing text
+    // pointing at a key nothing writes any more.
+    const RECOVERED_TAG = 'awk_recovered';
+    // ===== END SHARED: recovered marker vocabulary =====
+    // #endregion
+
     // Channel layout string from ffprobe, falling back to mediaInfo (ChannelLayout/ChannelPositions) - lets us spot the LFE that separates 3.1 from 4.0 and
     // 2.1 from 3.0 even when ffprobe omits channel_layout. Feeds channelLabel's hasLfe argument at the tag_title call site.
     const channelLayoutStr = (ffstream) => {
@@ -2500,7 +2515,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // but keeps the compared value byte-identical to what gets written to awk_recovered below.
         const recoverSig = [recoverTs !== 'disabled' && `ts-${recoverTs}`, recoverData !== 'disabled' && `data-${recoverData}`].filter(Boolean).join('+');
         const recoverIntent = escMeta(recoverSig);
-        const recoveredTag = getTagCI(file.ffProbeData.format?.tags || {}, 'awk_recovered').trim();
+        const recoveredTag = getTagCI(file.ffProbeData.format?.tags || {}, RECOVERED_TAG).trim();
         const intentMatches = recoveredTag !== '' && recoveredTag === recoverIntent;
         // A real container change (e.g. mkv->mp4) already remuxes and is a one-shot (a fixed config makes
         // srcContainer==dstContainer afterward), so recovery can ride along regardless of the tag without looping.
@@ -2564,8 +2579,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // (The mp4 use_metadata_tags that makes any global tag persist is added for all mp4 remuxes below.)
         if (convert === true && recoverRequested) {
             if (runRecover)
-                workDone += `☐Stamp awk_recovered=${recoverIntent} - recovery re-runs only if a recover_bad_* mode changes\n`;
-            extraArguments += ` -metadata "awk_recovered=${recoverIntent}"`;
+                workDone += `☐Stamp ${RECOVERED_TAG}=${recoverIntent} - recovery re-runs only if a recover_bad_* mode changes\n`;
+            extraArguments += ` -metadata "${RECOVERED_TAG}=${recoverIntent}"`;
         }
 
         // remove_imagesubs=export asked for a sidecar that could not be written, so the export did not happen and neither did the drop it protects. Fail
@@ -2600,7 +2615,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.processFile = true;
         } else {
             if (recoverRequested && intentMatches)
-                response.infoLog += `☑Already recovered with these options (awk_recovered=${recoveredTag}) - skipping to avoid reprocessing;`
+                response.infoLog += `☑Already recovered with these options (${RECOVERED_TAG}=${recoveredTag}) - skipping to avoid reprocessing;`
                     + ' change a recover_bad_* mode to run again\n';
             response.infoLog += `☑File is already ${dstContainer} and contains no streams requiring removal or conversion\n`;
             response.processFile = false;

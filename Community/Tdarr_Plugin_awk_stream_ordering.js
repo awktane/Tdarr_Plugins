@@ -15,7 +15,7 @@ const details = () => ({
         it's needed).\n\nBecause it runs last it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file
         that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the signature of an out-of-memory-killed or
         unfinalised encode from an earlier stage. A longer output is accepted. This check is always on and has no setting.\n`,
-    Version: '4.999.10',
+    Version: '4.999.11',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -981,6 +981,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const knownLangToken = (key) => isNonLang(key) || !!langDisplayName(key);
     // ===== END SHARED: language token recognition =====
     // #endregion
+
+    // #region SHARED helpers (1 section: recovered marker vocabulary)
+    // ===== SHARED [clean_and_remux, stream_ordering]: recovered marker vocabulary =====
+    // -=-=-= RECOVERED_TAG  [clean_and_remux, stream_ordering] =-=-=-
+    // The format-level tag clean_and_remux stamps on every recover_bad_* remux, and the ONE cross-plugin marker whose spelling is executable code in two
+    // files (awk_cc is already shared; awk_video, awk_loudnorm and awk_sub_worker are each single-plugin). clean_and_remux reads it back to stay idempotent;
+    // stream_ordering reads it to soften BOTH truncation verdicts from a failFile quarantine to a warning that accepts the file for review, because a
+    // recover_bad_* repair of a truncated source legitimately reports a shorter or absent duration - so a reader that stopped matching would quarantine
+    // every salvaged file in a loop the user cannot break (fixed tolerance, no relaxing input). SHARED for the reason the closed-caption handoff gives: a
+    // writer and a reader whose vocabularies drift fail SILENTLY. Only the KEY needs guarding - the read is getTagCI (case-insensitive) and tests
+    // non-emptiness only, so no VALUE format can drift. Interpolate it into the log lines that NAME the tag too, or a rename here leaves user-facing text
+    // pointing at a key nothing writes any more.
+    const RECOVERED_TAG = 'awk_recovered';
+    // ===== END SHARED: recovered marker vocabulary =====
+    // #endregion
     const orderLangTokens = splitList(inputs.order_language);
     for (const tok of orderLangTokens)
         if (!knownLangToken(langKey(tok))) failLangToken('order_language', tok);
@@ -1074,13 +1089,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // the full length into a file reporting its true, shorter duration - the mirror of the over-length recover_* case the tolerance comment above already
             // spares. Erroring it removes the salvaged result the user asked for and loops forever (fixed tolerance, no relaxing input), so soften both verdicts
             // to a ☒ warning and ACCEPT the file for review. Users should NOT auto-approve a recovery queue - the recover_bad_* tooltips say so.
-            const recovered = getTagCI(file.ffProbeData?.format?.tags || {}, 'awk_recovered').trim() !== '';
+            const recovered = getTagCI(file.ffProbeData?.format?.tags || {}, RECOVERED_TAG).trim() !== '';
             if (verdict) {
                 const pct = (verdict.now / verdict.old) * 100;
                 if (pct < 100 - DURATION_TOLERANCE_PCT) {
                     if (recovered)
                         response.infoLog += `☒${durTag}output duration ${verdict.now.toFixed(1)} s is ${pct.toFixed(1)}% of the original `
-                            + `${verdict.old.toFixed(1)} s, but this file carries an awk_recovered tag - a recover_bad_* repair of a truncated source `
+                            + `${verdict.old.toFixed(1)} s, but this file carries an ${RECOVERED_TAG} tag - a recover_bad_* repair of a truncated source `
                             + `legitimately reports a shorter true duration\n☒${durTag}accepted for review rather than failed; play it through in Tdarr `
                             + `before approving, and do not auto-approve a recovery queue (compared using ${verdict.name})\n`;
                     else
@@ -1095,7 +1110,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // one did on the old, so it cannot fire merely because a container stores one signal and not another.
                 if (recovered)
                     response.infoLog += `☒${durTag}the output reports no duration at all while the original had ${oldAny.toFixed(1)} s, but this file `
-                        + `carries an awk_recovered tag - a recover_bad_* repair of a truncated source can legitimately report a shorter or absent duration`
+                        + `carries an ${RECOVERED_TAG} tag - a recover_bad_* repair of a truncated source can legitimately report a shorter or absent duration`
                         + `\n☒${durTag}accepted for review rather than failed; play it through in Tdarr before approving, and do not auto-approve a recovery queue\n`;
                 else
                     failFile(`${durTag}the output reports no duration at all while the original had ${oldAny.toFixed(1)} s - that is what a truncated or`
