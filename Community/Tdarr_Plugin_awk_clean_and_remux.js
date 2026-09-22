@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.35',
+    Version: '4.999.36',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -399,13 +399,14 @@ const langNameIndex = (() => {
 })();
 // -=-=-= langKey  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
 // Comparison key for a language token: lowercase/trim, strip any region/variant via shortLang, map a spelled-out English name to its code, then fold
-// code variants with Intl.getCanonicalLocales (eng->en, fre/fra->fr). Undetermined / non-language tokens (und, mul, zxx, mis, reserved qaa-qtz) and
-// anything unrecognised pass through unchanged, so they only ever match themselves.
+// code variants with Intl.getCanonicalLocales (eng->en, fre/fra->fr) and strip again: ICU's legacy aliases ADD a subtag to a few codes (sh/hbs -> sr-Latn,
+// cnr -> sr-ME, prs -> fa-AF), which would otherwise key apart from every other spelling of the language. Undetermined / non-language tokens (und, mul,
+// zxx, mis, reserved qaa-qtz) and anything unrecognised pass through unchanged, so they only ever match themselves.
 const langKey = (x) => {
     let s = shortLang(String(x || '').trim().toLowerCase());
     if (!s) return '';
     if (s.length >= 4) { const code = langNameIndex(s); if (code) s = code; }   // spelled-out English name -> its code
-    try { return String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase(); } catch (e) { return s; }
+    try { return shortLang(String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase()); } catch (e) { return s; }
 };
 // ===== END SHARED: language matching =====
 // #endregion
@@ -1417,15 +1418,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // Is a non-empty sidecar already at this server path? Download is the only read the API offers, so the test IS a fetch - discarded to the null device
     // and measured with curl's own counters, never buffered through spawnSync (a large body silently exceeds maxBuffer and fakes a failure).
+    // Three answers, not two, because a caller's next step on 'absent' is an upload, and the upload endpoint REPLACES whatever is there - possibly a
+    // sidecar the user has OCR'd or edited. So 'absent' needs a completed request the server answered definitively: its File-not-found (HTTP 400), or a
+    // 200 with no body, which holds nothing to lose. Everything else - no URL, a spawn error, a non-zero curl exit (connection refused, the -m timeout,
+    // a dropped transfer), a 5xx, a 501 - is 'unknown': the sidecar may well be there, so the caller leaves it alone this pass instead of writing over it.
+    // Returns { state: 'present' | 'absent' | 'unknown', why }; `why` is for the user's log line and is '' unless the state is 'unknown'.
     const sidecarExistsRemote = (dest) => {
         const { spawnSync } = require('child_process');
         const url = serverApiUrl();
-        if (!url) return false;
+        if (!url) return { state: 'unknown', why: 'the node config carries no server URL' };
         const r = spawnSync('curl', ['-sS', '-m', SIDECAR_SPAWN_TIMEOUT_S, '-o', nullDevice, '-w', '%{http_code} %{size_download}', ...apiAuthArgs(),
             '-X', 'POST', '-H', 'Content-Type: application/json', '-d', JSON.stringify({ filePath: dest }), `${url}/api/v2/file/download`],
             { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, input: apiAuthInput() });
+        if (r.error) return { state: 'unknown', why: `the existence check failed (${r.error.code || r.error.message})` };
+        if (r.status !== 0) return { state: 'unknown', why: `the existence check did not complete (curl exit ${r.status === null ? 'signalled' : r.status})` };
         const [code, got] = String(r.stdout || '').trim().split(/\s+/);
-        return code === '200' && Number(got) > 0;
+        if (code === '200') return { state: Number(got) > 0 ? 'present' : 'absent', why: '' };
+        if (code === '400') return { state: 'absent', why: '' };
+        return { state: 'unknown', why: `the server answered HTTP ${code || 'nothing'}` };
     };
     // -=-=-= uploadLibraryFile  [clean_and_remux, sub_worker] =-=-=-
     // The multipart POST to /api/v2/file/upload, in ONE place because the field ORDER is load-bearing: the server parses the stream as it arrives, so
@@ -2057,7 +2067,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const dest = serverSidePath(path.join(libDir, name));
                 if (!dest) { failedSidecars.set(name, 'no path translator maps this library directory back to the server'); continue; }
                 // Already on the server (a re-run, or a prior export the drop never followed): count it placed rather than re-extracting and re-uploading it.
-                if (sidecarExistsRemote(dest)) { placedSidecars.add(name); continue; }
+                // An unconfirmed answer is a failed placement - an upload could replace a sidecar that is there - so the stream is kept, as for any other.
+                const there = sidecarExistsRemote(dest);
+                if (there.state === 'present') { placedSidecars.add(name); continue; }
+                if (there.state === 'unknown') {
+                    failedSidecars.set(name, `could not confirm whether it is already there (${there.why}), so it was not exported over it`);
+                    continue;
+                }
                 exportJobs.push({ name, dest, args: mapTokens });
             }
             if (exportJobs.length) {

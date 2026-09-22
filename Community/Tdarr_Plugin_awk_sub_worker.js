@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.43',
+    Version: '3.999.44',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -243,13 +243,14 @@ const langNameIndex = (() => {
 })();
 // -=-=-= langKey  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
 // Comparison key for a language token: lowercase/trim, strip any region/variant via shortLang, map a spelled-out English name to its code, then fold
-// code variants with Intl.getCanonicalLocales (eng->en, fre/fra->fr). Undetermined / non-language tokens (und, mul, zxx, mis, reserved qaa-qtz) and
-// anything unrecognised pass through unchanged, so they only ever match themselves.
+// code variants with Intl.getCanonicalLocales (eng->en, fre/fra->fr) and strip again: ICU's legacy aliases ADD a subtag to a few codes (sh/hbs -> sr-Latn,
+// cnr -> sr-ME, prs -> fa-AF), which would otherwise key apart from every other spelling of the language. Undetermined / non-language tokens (und, mul,
+// zxx, mis, reserved qaa-qtz) and anything unrecognised pass through unchanged, so they only ever match themselves.
 const langKey = (x) => {
     let s = shortLang(String(x || '').trim().toLowerCase());
     if (!s) return '';
     if (s.length >= 4) { const code = langNameIndex(s); if (code) s = code; }   // spelled-out English name -> its code
-    try { return String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase(); } catch (e) { return s; }
+    try { return shortLang(String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase()); } catch (e) { return s; }
 };
 // ===== END SHARED: language matching =====
 // #endregion
@@ -996,15 +997,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // Is a non-empty sidecar already at this server path? Download is the only read the API offers, so the test IS a fetch - discarded to the null device
     // and measured with curl's own counters, never buffered through spawnSync (a large body silently exceeds maxBuffer and fakes a failure).
+    // Three answers, not two, because a caller's next step on 'absent' is an upload, and the upload endpoint REPLACES whatever is there - possibly a
+    // sidecar the user has OCR'd or edited. So 'absent' needs a completed request the server answered definitively: its File-not-found (HTTP 400), or a
+    // 200 with no body, which holds nothing to lose. Everything else - no URL, a spawn error, a non-zero curl exit (connection refused, the -m timeout,
+    // a dropped transfer), a 5xx, a 501 - is 'unknown': the sidecar may well be there, so the caller leaves it alone this pass instead of writing over it.
+    // Returns { state: 'present' | 'absent' | 'unknown', why }; `why` is for the user's log line and is '' unless the state is 'unknown'.
     const sidecarExistsRemote = (dest) => {
         const { spawnSync } = require('child_process');
         const url = serverApiUrl();
-        if (!url) return false;
+        if (!url) return { state: 'unknown', why: 'the node config carries no server URL' };
         const r = spawnSync('curl', ['-sS', '-m', SIDECAR_SPAWN_TIMEOUT_S, '-o', nullDevice, '-w', '%{http_code} %{size_download}', ...apiAuthArgs(),
             '-X', 'POST', '-H', 'Content-Type: application/json', '-d', JSON.stringify({ filePath: dest }), `${url}/api/v2/file/download`],
             { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, input: apiAuthInput() });
+        if (r.error) return { state: 'unknown', why: `the existence check failed (${r.error.code || r.error.message})` };
+        if (r.status !== 0) return { state: 'unknown', why: `the existence check did not complete (curl exit ${r.status === null ? 'signalled' : r.status})` };
         const [code, got] = String(r.stdout || '').trim().split(/\s+/);
-        return code === '200' && Number(got) > 0;
+        if (code === '200') return { state: Number(got) > 0 ? 'present' : 'absent', why: '' };
+        if (code === '400') return { state: 'absent', why: '' };
+        return { state: 'unknown', why: `the server answered HTTP ${code || 'nothing'}` };
     };
     // -=-=-= uploadLibraryFile  [clean_and_remux, sub_worker] =-=-=-
     // The multipart POST to /api/v2/file/upload, in ONE place because the field ORDER is load-bearing: the server parses the stream as it arrives, so
@@ -1507,8 +1517,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         for (const [k, v] of nodeTagPairs()) {
             const root = `/${String(k).replace(/^\/+/, '')}`;
             const norm = serverDir.replace(/\\/g, '/');
-            if (!norm.startsWith(root)) continue;
-            candidates.push([`Node Tag "${k}=${v}"`, path.normalize(String(v).replace(/[\\/]+$/, '') + norm.slice(root.length))]);
+            // The tag must name a whole leading folder: "media" claims /media/TV, never /mediastore/TV or /media2. The remainder always starts with a
+            // separator, so a drive-letter value ("M:" or "M:\") joins to the absolute M:\TV rather than the drive-relative M:TV.
+            const rest = norm.startsWith(root) ? norm.slice(root.length) : null;
+            if (rest === null || (rest && !rest.startsWith('/'))) continue;
+            candidates.push([`Node Tag "${k}=${v}"`, path.normalize(String(v).replace(/[\\/]+$/, '') + (rest || '/'))]);
         }
         const tried = []; let readOnly = null;
         for (const [label, dir] of candidates) {
@@ -1602,7 +1615,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const listName = subtitleListName;
         const dest = serverSidePath(path.join(libDir, listName));
         if (!dest) return `no path translator maps ${libDir} back to the server`;
-        if (sidecarExistsRemote(dest)) return LIST_SEED_EXISTS;
+        const there = sidecarExistsRemote(dest);
+        if (there.state === 'present') return LIST_SEED_EXISTS;
+        if (there.state === 'unknown') return `could not confirm whether one is already in the library (${there.why}), so it was left alone`;
         const body = [
             `# Subtitles to import for ${path.basename(libFilePath)} - one filename per line.`,
             '# Lines starting with # are ignored. This file was created once, automatically; it is yours to edit now.',
@@ -2211,6 +2226,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return { job: null, note: '☑[embedded_cc=enabled] Caption removal already recorded - waiting for video_clean to re-encode\n' };
             const hidden = action === 'import';
             const name = ccName;
+            // The same finished-name refusal the extract loop applies (see the NAME_BYTE_CAP check there): the caption srt has no title to trim, so only
+            // videoBase can overflow it, and both direct-write routes put this name into one ffmpeg command whose exit 193 would quarantine the file.
+            // Checked before the existence probe and the A53 decode, which a name that can never be written would only waste.
+            const nameBytes = Buffer.byteLength(name, 'utf8');
+            if (nameBytes > NAME_BYTE_CAP) {
+                return { job: null, note: `☒[embedded_cc=enabled] Caption sidecar name would be ${nameBytes} bytes, over the ${NAME_BYTE_CAP}-byte filesystem `
+                    + 'limit - rename the video shorter and requeue, keeping the captions in the video\n' };
+            }
             const full = path.join(workLibDir(), name);
             if (!pathIsPresetSafe(full))
                 return { job: null, note: `☒[embedded_cc=enabled] Library directory has a quote, control char or <io> - cannot write ${name} safely\n` };
@@ -2228,7 +2251,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // mount, read-only included - it can also be opened, which is the only way to tell a channel that carried no text from one that was never read:
             // A53 side data is present whether or not anyone was speaking, so an empty channel looks exactly like a full one to the probe. A cue-less
             // sidecar is deleted and the finding recorded, so no later pass repeats the decode.
-            const existing = readViaApi() ? (sidecarExistsRemote(remoteDest) ? 'remote' : '')
+            // On the API route an unconfirmed answer stops here: a job would upload over whatever is there, and the captions stay put for a later pass.
+            const remote = readViaApi() ? sidecarExistsRemote(remoteDest) : null;
+            if (remote && remote.state === 'unknown') {
+                return { job: null, note: `☒[embedded_cc=enabled] Could not confirm whether ${name} is already in the library (${remote.why}) - `
+                    + 'not overwriting it; the captions stay in the video for a later pass\n' };
+            }
+            const existing = remote ? (remote.state === 'present' ? 'remote' : '')
                 : ((() => { try { return fs.existsSync(full) ? 'local' : ''; } catch (e) { return ''; } })());
             if (existing === 'remote') return { job: null, staged: true, note: `☑[embedded_cc=enabled] Caption sidecar already in the library: ${name}\n` };
             if (existing === 'local') {
@@ -2345,6 +2374,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // stream - which is why the placement decision is made HERE: Tdarr runs the preset only after the plugin returns, so a preset output that
             // fails against a read-only mount cannot be caught and rerouted, only quarantined.
             let sidecarOut = ''; const removedIndices = new Set(dupes.dropIdx); let wrote = 0; let skipped = 0; let refused = 0; let bundled = 0;
+            let deferred = 0;
             const placeJobs = [];
             // The caption extraction leads on both routes; on the API one that is a hard requirement - placeSidecars concatenates every job's args
             // after a single -i, so the caption job's '-f lavfi -i' only precedes all outputs if its job is first. On the direct-write route the same input
@@ -2428,8 +2458,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // that protection only matters when the source WILL be stripped (removeSource). ffmpeg also writes a genuinely 0-byte srt for a cue-less
                 // subtitle stream (measured on jellyfin-ffmpeg 7.1.4), so with removeSource=false the stream is never removed and a cue-less srt would
                 // re-extract the identical 0-byte sidecar every pass - Tdarr errors the second identical preset as an infinite transcode loop. When nothing
-                // will be stripped, plain existence is enough to mean "already handled", which breaks that loop.
-                const alreadyExtracted = readViaApi() ? sidecarExistsRemote(remoteDest)
+                // will be stripped, plain existence is enough to mean "already handled", which breaks that loop. On the API route an UNCONFIRMED answer
+                // is neither: extracting would upload over a sidecar that may be there, so the stream waits for a later pass - not counted in `refused`,
+                // since a transient server condition must not fail an undamaged video (see the placement-failure note below).
+                const remote = readViaApi() ? sidecarExistsRemote(remoteDest) : null;
+                if (remote && remote.state === 'unknown') {
+                    deferred += 1;
+                    response.infoLog += `☒${streamTag(s.index)} Could not confirm whether ${name} is already in the library (${remote.why}) - `
+                        + 'not overwriting it, keeping the embedded subtitle for a later pass\n';
+                    continue;
+                }
+                const alreadyExtracted = remote ? remote.state === 'present'
                     : (removeSource ? fileHasBytes(full) : fs.existsSync(full));
                 if (alreadyExtracted) { skipped += 1; response.infoLog += `☑${streamTag(s.index)} Sidecar already exists, not overwriting: ${name}\n`; }
                 // API placement: the extraction is deferred to placeSidecars after the loop, so this stream's removedIndices entry and its bundled tally
@@ -2540,10 +2579,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // ccStrip and ccMeta count as work in their own right: on the API route the sidecars are already placed, so a caption-only run has an empty
             // sidecarOut and no removedIndices, and testing those alone would skip the pass that removes the captions from the bitstream.
             if (!sidecarOut && !removedIndices.size && !ccMeta && !ccStrip) {
-                if (refused && !wrote && !skipped) failFile('No subtitle could be extracted - every eligible subtitle was refused, see the reasons above');
+                if (refused && !wrote && !skipped && !deferred) {
+                    failFile('No subtitle could be extracted - every eligible subtitle was refused, see the reasons above');
+                }
                 // The tag reports the value IN EFFECT, which is not always false here: a caption job never enters removedIndices, so a run that placed only
                 // captions and could neither strip them nor record the request reaches this line with removal ON - one line under the ☒ that says why.
-                return skip(wrote ? `☑[remove_source=${removeSource}] Sidecars placed in the library - nothing left to remux\n`
+                if (wrote) return skip(`☑[remove_source=${removeSource}] Sidecars placed in the library - nothing left to remux\n`);
+                return skip(deferred ? '☒Nothing extracted this pass - the library could not be checked, see the reasons above\n'
                     : '☑All eligible subtitles already extracted\n');
             }
 

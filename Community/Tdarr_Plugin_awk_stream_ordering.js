@@ -17,7 +17,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file carrying clean_and_remux's awk_recovered tag: a
         repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. This check
         is always on and has no setting.\n`,
-    Version: '4.999.17',
+    Version: '4.999.18',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -232,13 +232,14 @@ const langNameIndex = (() => {
 })();
 // -=-=-= langKey  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
 // Comparison key for a language token: lowercase/trim, strip any region/variant via shortLang, map a spelled-out English name to its code, then fold
-// code variants with Intl.getCanonicalLocales (eng->en, fre/fra->fr). Undetermined / non-language tokens (und, mul, zxx, mis, reserved qaa-qtz) and
-// anything unrecognised pass through unchanged, so they only ever match themselves.
+// code variants with Intl.getCanonicalLocales (eng->en, fre/fra->fr) and strip again: ICU's legacy aliases ADD a subtag to a few codes (sh/hbs -> sr-Latn,
+// cnr -> sr-ME, prs -> fa-AF), which would otherwise key apart from every other spelling of the language. Undetermined / non-language tokens (und, mul,
+// zxx, mis, reserved qaa-qtz) and anything unrecognised pass through unchanged, so they only ever match themselves.
 const langKey = (x) => {
     let s = shortLang(String(x || '').trim().toLowerCase());
     if (!s) return '';
     if (s.length >= 4) { const code = langNameIndex(s); if (code) s = code; }   // spelled-out English name -> its code
-    try { return String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase(); } catch (e) { return s; }
+    try { return shortLang(String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase()); } catch (e) { return s; }
 };
 // ===== END SHARED: language matching =====
 // #endregion

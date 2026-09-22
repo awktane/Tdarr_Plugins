@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.32',
+    Version: '4.999.33',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -475,13 +475,14 @@ const langNameIndex = (() => {
 })();
 // -=-=-= langKey  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
 // Comparison key for a language token: lowercase/trim, strip any region/variant via shortLang, map a spelled-out English name to its code, then fold
-// code variants with Intl.getCanonicalLocales (eng->en, fre/fra->fr). Undetermined / non-language tokens (und, mul, zxx, mis, reserved qaa-qtz) and
-// anything unrecognised pass through unchanged, so they only ever match themselves.
+// code variants with Intl.getCanonicalLocales (eng->en, fre/fra->fr) and strip again: ICU's legacy aliases ADD a subtag to a few codes (sh/hbs -> sr-Latn,
+// cnr -> sr-ME, prs -> fa-AF), which would otherwise key apart from every other spelling of the language. Undetermined / non-language tokens (und, mul,
+// zxx, mis, reserved qaa-qtz) and anything unrecognised pass through unchanged, so they only ever match themselves.
 const langKey = (x) => {
     let s = shortLang(String(x || '').trim().toLowerCase());
     if (!s) return '';
     if (s.length >= 4) { const code = langNameIndex(s); if (code) s = code; }   // spelled-out English name -> its code
-    try { return String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase(); } catch (e) { return s; }
+    try { return shortLang(String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase()); } catch (e) { return s; }
 };
 // ===== END SHARED: language matching =====
 // #endregion
@@ -2662,13 +2663,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // secondary track left at downmix_secondary=surround falls through untouched here (codec_force/method_loudnorm may still act on it further
                 // down). guard_lossless/guard_quality/guard_object_audio never protect a secondary or a non-surround-tier track (guardBlocks short-circuits
                 // false for them), so there is no guarded-source case here: the stereo tier always transcodes in place.
-                if (ffstream.awkTier === 'stereo' && ffstreamChannels > 2 && !modifiedAudioIdx.has(outputAudioIdx)) {
+                // Thread the setting that actually put this track on the stereo tier, so the log names the input the user would go change.
+                const tierTag = ffstream.awkSecondaryTrack ? `downmix_secondary=${downmixSecondary}`
+                    : (langStereoKeys.includes(ffstream.awkLangKey) ? 'language_stereo' : `language_unlisted=${langUnlisted}`);
+                if (ffstream.awkTier === 'stereo' && !(ffstreamChannels > 0) && !modifiedAudioIdx.has(outputAudioIdx)) {
+                    skipDone += noChannelCountSkip(ffstream.index, tierTag, "can't tell whether it needs the stereo downmix");
+                } else if (ffstream.awkTier === 'stereo' && ffstreamChannels > 2 && !modifiedAudioIdx.has(outputAudioIdx)) {
                     // Downmix changes channel count, so the source bitrate isn't a comparable floor - stereoEnc uses the 2ch target (aac_vbr: no low-info
                     // tier).
                     const enc = stereoEnc(outputAudioIdx);
-                    // Thread the setting that actually put this track on the stereo tier, so the log names the input the user would go change.
-                    const tierTag = ffstream.awkSecondaryTrack ? `downmix_secondary=${downmixSecondary}`
-                        : (langStereoKeys.includes(ffstream.awkLangKey) ? 'language_stereo' : `language_unlisted=${langUnlisted}`);
                     const two = stereoArg(outputAudioIdx, ffstream);
                     workDone += `☐${streamTag(ffstream.index)}[${tierTag}]${loudnormRideTag(two.changed)} Transcoding ${ffstreamCodec} ${ffstreamChannels}ch `
                         + `@ ${srcRateStr} → ${enc.logCodec} stereo @ ${enc.rate} (${enc.label ? `${enc.label}, ` : ''}`
@@ -2898,7 +2901,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // what makes codec_stereo=aac_vbr reach a track already aac). A guard-protected or over-channel-limit target falls back to the other
                 // candidate rather than cancelling the pass, so enabling codec_force can never silently switch loudnorm off.
                 const configuredCodec = isStereo ? stereoCodec : surroundCodec;
-                const keepCodec = ENCODABLE_CODECS.includes(ffstreamCodec) ? ffstreamCodec : configuredCodec;
+                // Folded like every other identity check (codecFamilyOf), so an aac_latm track keeps AAC; folding the RESOLVED name keeps the mediaInfo
+                // fallback codecNameOf supplies when ffprobe carries none.
+                const srcFamily = codecFamilyOf({ codec_name: ffstreamCodec });
+                const keepCodec = ENCODABLE_CODECS.includes(srcFamily) ? srcFamily : configuredCodec;
                 const reachable = (c) => channels <= codecMaxCh(aacFamily(c)) && !guardBlocks(ffstream, c, channels, channels);
                 const wantCodec = forceCovers(isStereo, channels) ? configuredCodec : keepCodec;
                 const targetCodec = reachable(wantCodec) ? wantCodec : (reachable(keepCodec) ? keepCodec : null);
@@ -2948,8 +2954,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // same price a container that cannot persist the tag already pays.
                             const two = stereoArg(outputAudioIdx, ffstream);
                             if (!two.changed) {
-                                skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Remix not needed - the stereo fold is already `
-                                    + `within tolerance; left as ${ffstreamCodec} ${channels}ch un-normalized\n`;
+                                skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] ${two.measured
+                                    ? 'Remix not needed - the stereo fold is already within tolerance'
+                                    : 'Remix skipped - the per-file analysis cap left the stereo fold unmeasured (a later pass can normalize it)'}; left as `
+                                    + `${ffstreamCodec} ${channels}ch un-normalized\n`;
                                 continue;
                             }
                             const enc = stereoEnc(outputAudioIdx);

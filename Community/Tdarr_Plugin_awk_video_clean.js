@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.29',
+    Version: '3.999.30',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -2043,19 +2043,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 codecTrigger = true;   // upgrade (targetCodecName already = codec)
             } else {
                 // Never-downgrade governs codec CHOICE at a FIXED resolution; it has to yield when another transform already forces a real encode and the
-                // source codec has no encoder to fall back on. A 2160p->1080p downscale saves far more than an h264-vs-vp9 codec penalty costs, and a tonemap
-                // is a compatibility transform with no size rationale at all - refusing both to protect the codec choice abandons the transform the user
-                // actually asked for. A pure codec-swap with no forced transform still refuses; codec=source is untouched (it skips with the warning below).
-                const forcedTransform = heightTrigger || tonemapTrigger;
-                const yieldToTransform = !preserveDv && forcedTransform && codec !== 'source'
-                    && ENCODABLE_CODECS.includes(codec) && !ENCODABLE_CODECS.includes(srcCodecName);
+                // source codec has no encoder to fall back on. A 2160p->1080p downscale saves far more than an h264-vs-vp9 codec penalty costs, a tonemap
+                // is a compatibility transform with no size rationale at all, and interlace repair is asked for in its own right - declining to shrink
+                // must never decline the repair too. Refusing any of them to protect the codec choice abandons the transform the user actually asked for.
+                // A pure codec-swap with no forced transform still refuses; codec=source is untouched (it skips with the warning below). The interlace
+                // verdict is a real decode, so it is tested LAST, behind the metadata tests: it runs only where the !canEncodeTarget skip below would
+                // otherwise pay for the same decode.
+                const canYield = !preserveDv && codec !== 'source' && ENCODABLE_CODECS.includes(codec) && !ENCODABLE_CODECS.includes(srcCodecName);
+                const forcedTransform = heightTrigger ? 'downscale' : (tonemapTrigger ? 'tonemap' : (canYield && deinterlaceNeeded() ? 'interlace repair' : ''));
+                const yieldToTransform = canYield && forcedTransform !== '';
                 if (yieldToTransform)
                     response.infoLog += `☒${streamTag(primary.index)}[action=shrink][codec=${codec}] ${codec} is no more efficient than the source `
-                        + `${srcCodecName}, but the forced ${heightTrigger ? 'downscale' : 'tonemap'} saves more than the codec costs`
-                        + ` - encoding as ${codec}\n`;
+                        + `${srcCodecName}, but ${forcedTransform === 'interlace repair'
+                            ? `${srcCodecName} has no encoder here and the interlace repair needs a re-encode`
+                            : `the forced ${forcedTransform} saves more than the codec costs`} - encoding as ${codec}\n`;
                 else if (codec !== 'source' && (CODEC_EFFICIENCY[codec] || 0) < srcEff && !preserveDv)
                     response.infoLog += `☒${streamTag(primary.index)}[action=shrink][codec=${codec}] ${codec} is less efficient than the source `
-                        + `${srcCodecName} - never downgrading; re-encoding as ${srcCodecName} to shrink instead\n`;
+                        + `${srcCodecName} - never downgrading${ENCODABLE_CODECS.includes(srcCodecName)
+                            ? `; re-encoding as ${srcCodecName} to shrink instead`
+                            : `, and ${srcCodecName} has no encoder here, so it is left as-is (action=normalize converts it)`}\n`;
                 targetCodecName = preserveDv ? 'hevc' : (yieldToTransform ? codec : srcCodecName);   // same-codec size pass (guard_dv still forces hevc for DV)
                 // a legacy same-codec pass can't encode - caught by the !canEncodeTarget skip below
                 codecTrigger = ENCODABLE_CODECS.includes(targetCodecName);
@@ -2236,6 +2242,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Build the transcode preset (encoder resolved per node) + the predicted output summary.
         const emitTranscode = (encodeTag) => {
             if (preserveDv) response.infoLog += `☐${streamTag(primary.index)}[guard_dv=true] ${dvLabel} - keeping the DV RPU through the re-encode (libx265)\n`;
+            // libx265 carries only the RPU through a re-encode; any other dynamic layer on the same file is lost, and every other path that loses one says so.
+            const lostWithDv = preserveDv ? [isHdr10Plus ? 'HDR10+' : '', isHdrVivid ? 'HDR Vivid' : ''].filter(Boolean).join(' and ') : '';
+            if (lostWithDv) response.infoLog += `☒${streamTag(primary.index)}[guard_dv=true] The ${lostWithDv} layer is dropped - no encoder here carries it`
+                + ' through a re-encode\n';
             let sel = selectEncoder({ codec: targetCodecName, encoderOpt, otherArguments, forceCpu: preserveDv,
                 forceCpuWhy: 'for Dolby Vision - hardware encoders drop the RPU' });
             // What this node would have chosen before guard_captions could force it onto the CPU. Free here and nowhere else: the memory check below needs the
@@ -2361,7 +2371,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 + ` to lossy 4:2:0 ${want10Bit ? '10' : '8'}-bit; set guard_lossless=false to convert it anyway\n`);
         }
         if (!canEncodeTarget && realTranscode()) {   // codec=source resolved to a legacy codec with no encoder, but downscale/tonemap/deinterlace force one
-            return skip(`☒${streamTag(primary.index)}[codec=source] Source codec ${srcCodecName || 'unknown'} has no encoder - can't keep it through the `
+            return skip(`☒${streamTag(primary.index)}[codec=${codec}] Source codec ${srcCodecName || 'unknown'} has no encoder - can't keep it through the `
                 + `${heightTrigger ? 'downscale' : (tonemapTrigger ? 'tonemap' : 'interlace repair')}`
                 + `; set codec=hevc/h264/av1 to convert it\n`);
         }
@@ -2417,7 +2427,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (action === 'shrink') {
             return skip(`☑${streamTag(primary.index)}[action=shrink] Nothing to shrink - ${canEncodeTarget
                 ? `already ${srcCodecName}${dispHeight ? ` ${dispHeight}p` : ''} at the target and no more-efficient codec selected`
-                : `source codec ${srcCodecName || 'unknown'} has no encoder (set codec=hevc/h264/av1 to convert it)`}\n`);
+                : `source codec ${srcCodecName || 'unknown'} has no encoder ${codec === 'source' ? '(set codec=hevc/h264/av1 to convert it)'
+                    : `and ${codec} is no more efficient (action=normalize converts it)`}`}\n`);
         }
         return skip(`☑${streamTag(primary.index)}[action=normalize] Video is already ${targetCodecName}${dispHeight ? ` ${dispHeight}p` : ''}`
             + `${srcIs10 ? ' 10-bit' : ''} and within limits\n`);
