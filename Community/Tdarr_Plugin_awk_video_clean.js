@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.28',
+    Version: '3.999.29',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -2286,10 +2286,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Before resolveTonemapBackend, which spawns a real ffmpeg probe: a refusal here must not first pay for a probe whose answer it will never use.
             memoryVerdict(sel, selUnforced, sliceDecode);
             const tonemapBackend = tonemap ? resolveTonemapBackend({ family: sel.family, otherArguments }) : null;
-            if (tonemap) response.infoLog += tonemapBackend === 'cpu'
-                ? `☒${streamTag(primary.index)}[hdr_mode=tonemap_sdr] Tonemapping HDR -> SDR on CPU (tonemapx) - no GPU tonemap available on this node;`
-                    + ` result may differ slightly from GPU-tonemapped nodes\n`
-                : `☐${streamTag(primary.index)}[hdr_mode=tonemap_sdr] Tonemapping HDR -> SDR via ${tonemapBackend} (GPU-accelerated)\n`;
+            if (tonemap && tonemapBackend === 'cpu') {
+                // A CPU encode never asks for the node's GPU tonemap (the backend follows the encoder family), so only a hardware encode whose tonemap probe
+                // failed may blame the node; otherwise name what put the encode on the CPU. guard_dv needs no arm: it suppresses tonemap_sdr outright.
+                const [why, tag] = sel.family !== 'cpu' ? ['no GPU tonemap available on this node', '']
+                    : sel !== selUnforced ? ['the encode was forced onto the CPU to keep the closed captions', '[guard_captions=true]']
+                        : encoderOpt === 'cpu' ? ['the encode is pinned to the CPU encoder', '[method_encoder=cpu]']
+                            : ['the encode landed on the CPU encoder (see the Encoder line)', ''];
+                const tail = sel.family === 'cpu' ? ', and a GPU tonemap runs only beside a hardware encoder' : '';
+                response.infoLog += `☒${streamTag(primary.index)}[hdr_mode=tonemap_sdr]${tag} Tonemapping HDR -> SDR on CPU (tonemapx) - ${why}${tail};`
+                    + ` result may differ slightly from GPU-tonemapped nodes\n`;
+            } else if (tonemap)
+                response.infoLog += `☐${streamTag(primary.index)}[hdr_mode=tonemap_sdr] Tonemapping HDR -> SDR via ${tonemapBackend} (GPU-accelerated)\n`;
             // No cross-compatible base (compat id 0 / no surviving HDR transfer, e.g. profile 5): the mp4
             // output needs the dvh1 tag - hvc1 drops the DV box entirely; a stream WITH a base keeps hvc1.
             const preserveDvNoBase = preserveDv && (dvNoBaseLayer || (!!dovi && dovi.compatId === 0));
