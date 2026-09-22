@@ -17,7 +17,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file carrying clean_and_remux's awk_recovered tag: a
         repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. This check
         is always on and has no setting.\n`,
-    Version: '4.999.20',
+    Version: '4.999.21',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -186,7 +186,6 @@ const details = () => ({
 });
 // #endregion
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 // #region SHARED helpers (1 section: language matching)
 // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language matching =====
 // Normalize any language identifier to a stable comparison key so en / eng / EN / English / en-US - and ISO 639-2/B vs /T (fre vs fra) - all compare
@@ -247,7 +246,7 @@ const langKey = (x) => {
 const plugin = (file, librarySettings, inputs, otherArguments) => {
     const lib = require('../methods/lib')();
     const fs = require('fs');
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars,no-param-reassign
+    // eslint-disable-next-line no-param-reassign
     inputs = lib.loadDefaultValues(inputs, details);
 
     const response = {
@@ -304,10 +303,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: case-insensitive tag lookup =====
     // -=-=-= getTagCI  [all five] =-=-=-
-    // Look up a tag value case-insensitively on BOTH sides - matroska UPPER-CASES tag keys on write, so a plugin reading
-    // its sibling's awk_* marker gets an uppercased key back, and the lookup name is folded too so a mixed-case name
-    // still matches. Returns the raw value (or '' if absent); callers trim/decode as needed. One source so the five
-    // plugins that read each other's markers can't drift on the lookup convention.
+    // Look up a tag value case-insensitively on BOTH sides - matroska UPPER-CASES tag keys on write, so a plugin reading its sibling's awk_*
+    // marker gets an uppercased key back, and the lookup name is folded too so a mixed-case name still matches. Returns the raw value (or '' if
+    // absent); callers trim/decode as needed. One source so the five plugins that read each other's markers can't drift on the lookup convention.
     const getTagCI = (tags, name) => {
         const want = String(name).toLowerCase();
         const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === want);
@@ -339,11 +337,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         timed_thumbnails: { streams:['video'],                    keywords: [],                                                        tag: null          },
     };
     // -=-=-= roleTextLower [all five] =-=-=-
-    // Role-signal text unioned from BOTH probes - a title/description/handler can live in ffprobe OR mediaInfo but not both. Memoized by stream object
-    // (WeakMap, per-run closure) because hasDisposition calls it repeatedly per stream.
-    // Both description reads go through getTagCI, and neither casing is a guess: matroska UPPER-CASES tag keys on write, so the ffprobe side comes back
-    // DESCRIPTION; and MediaInfo defines Comment/Description as GENERAL-only parameters, so a per-TRACK value never appears top-level - it lands in the
-    // track's 'extra' bag under whatever spelling the container used. A fixed-case top-level read matches neither.
+    // Role-signal text unioned from BOTH probes - a title/description/handler can live in ffprobe OR mediaInfo but not both. Memoized
+    // by stream object (WeakMap, per-run closure) because hasDisposition calls it repeatedly per stream. Both description reads go
+    // through getTagCI, and neither casing is a guess: matroska UPPER-CASES tag keys on write, so the ffprobe side comes back
+    // DESCRIPTION; and MediaInfo defines Comment/Description as GENERAL-only parameters, so a per-TRACK value never appears top-level
+    // - it lands in the track's 'extra' bag under whatever spelling the container used. A fixed-case top-level read matches neither.
     const roleTextCache = new WeakMap();
     const roleTextLower = (s) => {
         if (roleTextCache.has(s)) return roleTextCache.get(s);
@@ -653,16 +651,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream / language / preset helpers =====
     // -=-=-= mediaInfoFor [all five] =-=-=-
     // The single join point between the two probes: the mediaInfo track whose StreamOrder equals the ffprobe index; undefined when absent. Deliberately
-    // NOT memoised (unlike roleTextLower's WeakMap): the scan measures ~20 microseconds per file against a transcode measured in minutes.
-    // Bound to THIS file: it joins against the closure's file.mediaInfo, so it - and every helper that reaches it (roleTextLower, resolveLang, resolveChannels,
-    // ...) - is sound ONLY on streams from the same file.ffProbeData. Never feed it a FOREIGN stream list (e.g. otherArguments.originalLibraryFile's): it would
-    // read THIS file's mediaInfo track at the foreign stream's index and silently answer about the wrong stream.
-    // Menu is excluded because it is the one track kind whose StreamOrder is NOT a stream index: MediaInfo numbers an MPEG-TS program's Menu by PROGRAM
-    // ordinal ("0") while that program's real tracks carry a two-part "0-0"/"0-1" that Number() turns into NaN - so on a single-program .ts the Menu is the
-    // only numeric match and ffprobe stream 0 reads the Menu's fields. Its Language is a concatenated program list (" / en / en / en"), which makes an
-    // untagged track look tagged and silences language_fill, and tag_language=strict then writes that string into the container where nothing can repair it
-    // (toCanonicalTag passes it through unchanged). Measured on 6 of the corpus's MPEG-TS files; stream_ordering's DURATION_SIGNALS already guards the same
-    // way. Do NOT "fix" this by joining on the last component of the two-part form - measured wrong on both a teletext capture and a multi-program mux.
+    // NOT memoised (unlike roleTextLower's WeakMap): the scan measures ~20 microseconds per file against a transcode measured in minutes. Bound to THIS
+    // file: it joins against the closure's file.mediaInfo, so it - and every helper that reaches it (roleTextLower, resolveLang, resolveChannels, ...)
+    // - is sound ONLY on streams from the same file.ffProbeData. Never feed it a FOREIGN stream list (e.g. otherArguments.originalLibraryFile's): it
+    // would read THIS file's mediaInfo track at the foreign stream's index and silently answer about the wrong stream. Menu is excluded because it is
+    // the one track kind whose StreamOrder is NOT a stream index: MediaInfo numbers an MPEG-TS program's Menu by PROGRAM ordinal ("0") while that
+    // program's real tracks carry a two-part "0-0"/"0-1" that Number() turns into NaN - so on a single-program .ts the Menu is the only numeric match
+    // and ffprobe stream 0 reads the Menu's fields. Its Language is a concatenated program list (" / en / en / en"), which makes an untagged track look
+    // tagged and silences language_fill, and tag_language=strict then writes that string into the container where nothing can repair it (toCanonicalTag
+    // passes it through unchanged). Measured on 6 of the corpus's MPEG-TS files; stream_ordering's DURATION_SIGNALS already guards the same way. Do NOT
+    // "fix" this by joining on the last component of the two-part form - measured wrong on both a teletext capture and a multi-program mux.
     const mediaInfoFor = (s) => (file?.mediaInfo?.track || []).find(t => t['@type'] !== 'Menu' && Number(t.StreamOrder) === s.index);
     // -=-=-= resolveLang [all five] =-=-=-
     // ffprobe tags.language, else mediaInfo Language (files often tag one probe but not the other); '' when neither reports it - callers wanting a
@@ -959,10 +957,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         failFile('No ffProbe stream data available for this file - the plugin cannot process it');
 
     // Value checks. The two free-text inputs (order_language/order_codec) have no fixed option set; the six dropdowns each do, and are checked here as
-    // [inputName, valueToTest, validOptions], top-down, failing on the first bad value. Every dropdown value is case/whitespace-normalised ONCE above and the
+    // [inputName, valueToTest, validOptions], top-down, failing on the first bad value. Every dropdown value is case/whitespace-normalised ONCE here and the
     // use sites below read those same constants, so the value that gets validated is provably the value that gets executed, and the failFile message shows that
     // normalised value - the same discipline the other four plugins follow.
-    const junkTagsMode = String(inputs.remove_junk_tags || 'disabled').toLowerCase();
+    const junkTagsMode = String(inputs.remove_junk_tags || 'disabled').toLowerCase().trim();
     const methodFaststart = String(inputs.method_mp4_faststart || 'force').toLowerCase().trim();
     // The four order/promotion selectors, case/whitespace-normalised ONCE (like the two above) so validation, the sort reads and the echo all see one value.
     // Defaults: audio_first/subtitle_first 'disabled', order_channel/order_quality 'descending'.
@@ -1004,20 +1002,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: language token recognition =====
     // #endregion
 
-    // #region SHARED helpers (1 section: recovered marker vocabulary)
-    // ===== SHARED [clean_and_remux, stream_ordering]: recovered marker vocabulary =====
-    // -=-=-= RECOVERED_TAG  [clean_and_remux, stream_ordering] =-=-=-
-    // The format-level tag clean_and_remux stamps on every recover_bad_* remux, and the ONE cross-plugin marker whose spelling is executable code in two
-    // files (awk_cc is already shared; awk_video, awk_loudnorm and awk_sub_worker are each single-plugin). clean_and_remux reads it back to stay idempotent;
-    // stream_ordering reads it to soften BOTH truncation verdicts from a failFile quarantine to a warning that accepts the file for review, because a
-    // recover_bad_* repair of a truncated source legitimately reports a shorter or absent duration - so a reader that stopped matching would quarantine
-    // every salvaged file in a loop the user cannot break (fixed tolerance, no relaxing input). SHARED for the reason the closed-caption handoff gives: a
-    // writer and a reader whose vocabularies drift fail SILENTLY. Only the KEY needs guarding - the read is getTagCI (case-insensitive) and tests
-    // non-emptiness only, so no VALUE format can drift. Interpolate it into the log lines that NAME the tag too, or a rename here leaves user-facing text
-    // pointing at a key nothing writes any more.
-    const RECOVERED_TAG = 'awk_recovered';
-    // ===== END SHARED: recovered marker vocabulary =====
-    // #endregion
     const orderLangTokens = splitList(inputs.order_language);
     for (const tok of orderLangTokens)
         if (!knownLangToken(langKey(tok))) failLangToken('order_language', tok);
@@ -1043,6 +1027,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return skip('☑File is not a video\n');
     }
 
+    // #region SHARED helpers (1 section: recovered marker vocabulary)
+    // ===== SHARED [clean_and_remux, stream_ordering]: recovered marker vocabulary =====
+    // -=-=-= RECOVERED_TAG  [clean_and_remux, stream_ordering] =-=-=-
+    // The format-level tag clean_and_remux stamps on every recover_bad_* remux, and the ONE cross-plugin marker whose spelling is executable code in two
+    // files (awk_cc is already shared; awk_video, awk_loudnorm and awk_sub_worker are each single-plugin). clean_and_remux reads it back to stay idempotent;
+    // stream_ordering reads it to soften BOTH truncation verdicts from a failFile quarantine to a warning that accepts the file for review, because a
+    // recover_bad_* repair of a truncated source legitimately reports a shorter or absent duration - so a reader that stopped matching would quarantine
+    // every salvaged file in a loop the user cannot break (fixed tolerance, no relaxing input). SHARED for the reason the closed-caption handoff gives: a
+    // writer and a reader whose vocabularies drift fail SILENTLY. Only the KEY needs guarding - the read is getTagCI (case-insensitive) and tests
+    // non-emptiness only, so no VALUE format can drift. Interpolate it into the log lines that NAME the tag too, or a rename here leaves user-facing text
+    // pointing at a key nothing writes any more.
+    const RECOVERED_TAG = 'awk_recovered';
+    // ===== END SHARED: recovered marker vocabulary =====
+    // #endregion
+
     // One guard around all the reordering work below: a deliberate failFile abort (AwkFailFile) rethrows unchanged, and any UNEXPECTED error fails the
     // file too — annotated and carrying the full infoLog — instead of silently skipping. (Input validation runs above this, failing via failFile too.)
     try {
@@ -1052,17 +1051,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // and the check sits ahead of everything else here BECAUSE the ordinary outcome is `skip` a few hundred lines down: on the final cycle the streams are
         // usually already in order, and a check placed beside the reordering work would be dead in exactly the case it exists for.
         //
-        // Compared against otherArguments.originalLibraryFile, which is the file as it entered the library rather than the previous stage's output, and which
-        // Tdarr scans in full - ffProbeData and mediaInfo alike. Signals are tried in order and the first that resolves on BOTH sides decides, so a container
-        // that stores one but not the other cannot make a healthy file look broken. FRAME COUNT is deliberately not among them: video_clean's interlace repair
-        // emits bwdif=mode=send_field, which DOUBLES the frame count at field rate, so a frame comparison reports a 2x change on a perfectly good file. Wall
-        // time survives that operation untouched. Container duration comes last and only when the audio track count is unchanged, since it is the maximum
-        // across all streams - audio_clean dropping a commentary track longer than the video legitimately shrinks it - and Matroska frequently stores no
-        // per-stream duration on the ffprobe side, which is why mediaInfo leads.
-        // isCoverArt joins role text through mediaInfoFor, which is bound to THIS file's mediaInfo (see its header) - sound for the current file's streams but NOT
-        // for a foreign list like originalLibraryFile's, where it would read the transcoded file's mediaInfo track at the same index. durVideoStream runs over BOTH
-        // files, so it tests cover art self-contained: an image codec, or a raw cover-art disposition flag. The three cover-art dispositionTypes are streams:['video'],
-        // keywords:[], so for a video stream this resolves to exactly what isCoverArt does today (behaviour-identical) and it stays sound if a keyword is ever added.
+        // Compared against otherArguments.originalLibraryFile, which is the file as it entered the library rather than the previous stage's output, and
+        // which Tdarr scans in full - ffProbeData and mediaInfo alike. Signals are tried in order and the first that resolves on BOTH sides decides, so a
+        // container that stores one but not the other cannot make a healthy file look broken. FRAME COUNT is deliberately not among them: video_clean's
+        // interlace repair emits bwdif=mode=send_field, which DOUBLES the frame count at field rate, so a frame comparison reports a 2x change on a
+        // perfectly good file. Wall time survives that operation untouched. Container duration comes last and only when the audio track count is unchanged,
+        // since it is the maximum across all streams - audio_clean dropping a commentary track longer than the video legitimately shrinks it - and Matroska
+        // frequently stores no per-stream duration on the ffprobe side, which is why mediaInfo leads. isCoverArt joins role text through mediaInfoFor, which
+        // is bound to THIS file's mediaInfo (see its header) - sound for the current file's streams but NOT for a foreign list like originalLibraryFile's,
+        // where it would read the transcoded file's mediaInfo track at the same index. durVideoStream runs over BOTH files, so it tests cover art
+        // self-contained: an image codec, or a raw cover-art disposition flag. The three cover-art dispositionTypes are streams:['video'], keywords:[], so
+        // for a video stream this resolves to exactly what isCoverArt does today (behaviour-identical) and it stays sound if a keyword is ever added.
         const foreignCoverArt = (s) => IMAGE_CODECS.includes(codecNameOf(s))
             || s.disposition?.attached_pic === 1 || s.disposition?.still_image === 1 || s.disposition?.timed_thumbnails === 1;
         const durVideoStream = (obj) => (obj?.ffProbeData?.streams || []).find(s => codecTypeOf(s) === 'video' && !foreignCoverArt(s));
@@ -1109,10 +1108,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             for (const sig of DURATION_SIGNALS) {
                 const oldDur = sig.read(originalFile);
                 const newDur = sig.read(file);
-                // ANY resolved duration proves that side HAS a duration, so every signal feeds oldAny/newAny - otherwise the no-duration verdict below fires on
-                // a healthy audio-cleaned file whose only resolvable signal is the container's. The needsSameAudio caveat concerns duration SHRINKAGE (a dropped
-                // commentary track longer than the video legitimately shortens the container maximum), a property of the COMPARISON, so it gates only whether this
-                // signal may set the verdict - never the existence test.
+                // ANY resolved duration proves that side HAS a duration, so every signal feeds oldAny/newAny - otherwise the no-duration
+                // verdict below fires on a healthy audio-cleaned file whose only resolvable signal is the container's. The needsSameAudio
+                // caveat concerns duration SHRINKAGE (a dropped commentary track longer than the video legitimately shortens the container
+                // maximum), a property of the COMPARISON, so it gates only whether this signal may set the verdict - never the existence test.
                 if (!oldAny) oldAny = oldDur;
                 if (!newAny) newAny = newDur;
                 if (sig.needsSameAudio && !sameAudio) continue;
@@ -1120,9 +1119,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             // A file clean_and_remux repaired (it stamps a format-level awk_recovered tag on every recover_bad_* remux, kept across containers and untouched by
             // the junk-tag strip) can legitimately be SHORTER than the library-entry original: recovery salvages a truncated source whose intact header claimed
-            // the full length into a file reporting its true, shorter duration - the mirror of the over-length recover_* case the tolerance comment above already
-            // spares. Erroring it removes the salvaged result the user asked for and loops forever (fixed tolerance, no relaxing input), so soften both verdicts
-            // to a ☒ warning and ACCEPT the file for review. Users should NOT auto-approve a recovery queue - the recover_bad_* tooltips say so.
+            // the full length into a file reporting its true, shorter duration - the mirror of the over-length recover_* case the tolerance comment above
+            // already spares. Erroring it removes the salvaged result the user asked for and loops forever (fixed tolerance, no relaxing input), so soften both
+            // verdicts to a ☒ warning and ACCEPT the file for review. Users should NOT auto-approve a recovery queue - the recover_bad_* tooltips say so.
             const recovered = getTagCI(file.ffProbeData?.format?.tags || {}, RECOVERED_TAG).trim() !== '';
             if (verdict) {
                 const pct = (verdict.now / verdict.old) * 100;
@@ -1180,13 +1179,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (m) return { enabled: true, dir: 'descending', cap: Number(m[1]) * (m[2] === 'k' ? 1000 : 1) };
             return { enabled: true, dir: mode === 'ascending' ? 'ascending' : 'descending', cap: Infinity };
         };
-        const channelOrder = parseOrderMode(orderChannel);
-        const qualityOrder = parseOrderMode(orderQuality);
+        const channelMode = parseOrderMode(orderChannel);
+        const qualityMode = parseOrderMode(orderQuality);
         // Union-of-caps demotion: a track over EITHER the channel cap OR the quality cap sorts below the under-all-caps tracks in its own language/role/codec
         // tier, so the fully-serveable track leads - e.g. a 5.1 under the <=6 channel cap but over the <=1024k quality cap is still demoted, not kept above a
         // stereo. Only a 'descending <=N' mode caps (plain descending/ascending/disabled -> Infinity). Channel caps by channel count, quality by capBitrate.
-        const chanCap = (channelOrder.enabled && channelOrder.dir === 'descending') ? channelOrder.cap : Infinity;
-        const qualCap = (qualityOrder.enabled && qualityOrder.dir === 'descending') ? qualityOrder.cap : Infinity;
+        const chanCap = (channelMode.enabled && channelMode.dir === 'descending') ? channelMode.cap : Infinity;
+        const qualCap = (qualityMode.enabled && qualityMode.dir === 'descending') ? qualityMode.cap : Infinity;
         const overCap = (s) => s.channels > chanCap || s.capBitrate > qualCap;
 
         const getLangRank = (lang) => {
@@ -1214,11 +1213,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (aOver !== bOver) return aOver ? 1 : -1;
             }
             //Channel (skipped when disabled): the cap already partitioned above, so this is a plain direction sort by channel count.
-            if (channelOrder.enabled && a.channels !== b.channels)
-                return channelOrder.dir === 'ascending' ? a.channels - b.channels : b.channels - a.channels;
+            if (channelMode.enabled && a.channels !== b.channels)
+                return channelMode.dir === 'ascending' ? a.channels - b.channels : b.channels - a.channels;
             //Quality (skipped when disabled): orders by the audioQuality score in the requested direction.
-            if (qualityOrder.enabled && a.audioQuality !== b.audioQuality)
-                return qualityOrder.dir === 'ascending' ? a.audioQuality - b.audioQuality : b.audioQuality - a.audioQuality;
+            if (qualityMode.enabled && a.audioQuality !== b.audioQuality)
+                return qualityMode.dir === 'ascending' ? a.audioQuality - b.audioQuality : b.audioQuality - a.audioQuality;
             return 0;
         };
         // ====== END ORDERING KEYS ======
@@ -1255,7 +1254,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 forced: hasDisposition(ffstream, 'forced'),   // flag OR title keyword - a "Forced"/"Foreign Parts Only" title counts where the flag isn't set
                 // Only score audio, and only when order_quality actually reads the score: scoring video/subtitle/data would spam bogus "unknown audio codec" /
                 // "no bitrate reported" notices, and with order_quality=disabled the score is dead - scoring anyway warns about values the sort ignores.
-                audioQuality: (streamType === 'audio' && qualityOrder.enabled) ? audioQuality(enrichedStream) : 0,
+                audioQuality: (streamType === 'audio' && qualityMode.enabled) ? audioQuality(enrichedStream) : 0,
                 // Does this audio stream's canonical codec match order_codec? Family-prefix: "dts" catches dtsma/dtshr/dtsexpress, "eac3" catches eac3atmos.
                 codecMatch: canon !== '' && codecFirstList.some(c => canon.startsWith(c)),
                 default: ffstream?.disposition?.default === 1,
@@ -1362,7 +1361,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (JUNK_PERSTREAM.has(k.toLowerCase())) meta += ` -metadata:s:${outIdx} "${escMeta(k)}="`;
             return meta;
         };
+        // ====== END JUNK TAG STRIP ======
 
+        // ====== OUTPUT MAP + SOLE-DEFAULT FLAG ======
         //Set orderChanged if the sort moved a stream, and build the map; also normalise the audio default flag so exactly one audio track — the first in sorted
         //order — is default, matching what the ordering rules chose. Additive +default/-default preserves forced/commentary/etc; subtitle/video untouched.
         let ffmpegMap = '';
@@ -1411,7 +1412,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
             }
         }
+        // ====== END OUTPUT MAP + SOLE-DEFAULT FLAG ======
 
+        // ====== JUNK TAG STRIP: GLOBAL ======
         // remove_junk_tags (global): clear the provenance / descriptive container tags present, matched case-insensitively. escMeta guards the key.
         if (junkTagsMode !== 'disabled')
             for (const k of Object.keys(file.ffProbeData.format?.tags || {})) {
@@ -1422,7 +1425,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     junkLog += `☐[remove_junk_tags=${junkTagsMode}] Remove ${k} tag from file\n`;
                 }
             }
-        // ====== END JUNK TAG STRIP ======
+        // ====== END JUNK TAG STRIP: GLOBAL ======
 
         // ====== MOOV / FASTSTART PROBE ======
 
@@ -1435,8 +1438,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let fd;
             try {
                 fd = fs.openSync(filePath, 'r');
-                // A top-level box header is 4-byte size + 4-byte FourCC; when size === 1 the real size follows as a 64-bit largesize at offset 8. So every read
-                // must cover the largesize too: BOX_READ_BYTES must stay >= BOX_HEADER_BYTES + 8 or the readBigUInt64BE below runs off the buffer on a >4GB mdat.
+                // A top-level box header is 4-byte size + 4-byte FourCC; when size === 1 the real size follows as
+                // a 64-bit largesize at offset 8. So every read must cover the largesize too: BOX_READ_BYTES must
+                // stay >= BOX_HEADER_BYTES + 8 or the readBigUInt64BE below runs off the buffer on a >4GB mdat.
                 const BOX_HEADER_BYTES = 8;
                 const BOX_READ_BYTES = 16;
                 const head = Buffer.alloc(BOX_READ_BYTES);
@@ -1467,12 +1471,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // ====== DECIDE + REPORT ======
 
-        // Container can't store a default-track flag (ts/avi): the block above left dispositionArgs empty rather than looping. Say so once, whether the pass
-        // otherwise remuxes (a reorder) or skips - so a user never wonders why the sole-default flag was left alone.
-        // ☒, not ☑: a normalisation WAS wanted here and was declined, which is the warning case, and it is the only way a user learns it did not happen -
-        // nothing configures this behaviour, so there is no setting to inspect instead. Same symbol the sibling plugins use for the same class of message
-        // (video_clean declining a shrink, sub_worker declining the awk_cc request and the marker) whenever the destination container cannot store what
-        // this pass wanted to write. On ts/avi ffprobe always reads default=0, so this fires on every pass over such a file that has audio.
+        // Container can't store a default-track flag (ts/avi): the block above left dispositionArgs empty rather than looping. Say so once, whether
+        // the pass otherwise remuxes (a reorder) or skips - so a user never wonders why the sole-default flag was left alone. ☒, not ☑: a
+        // normalisation WAS wanted here and was declined, which is the warning case, and it is the only way a user learns it did not happen - nothing
+        // configures this behaviour, so there is no setting to inspect instead. Same symbol the sibling plugins use for the same class of message
+        // (video_clean declining a shrink, sub_worker declining the awk_cc request and the marker) whenever the destination container cannot store
+        // what this pass wanted to write. On ts/avi ffprobe always reads default=0, so this fires on every pass over such a file that has audio.
         if (defaultFlagSkipped)
             response.infoLog += `☒${dstContainer} cannot store a default-track flag, so audio default flags are left as they are\n`;
 

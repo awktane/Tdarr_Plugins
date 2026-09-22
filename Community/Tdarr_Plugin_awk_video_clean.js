@@ -1,4 +1,3 @@
-/* eslint no-plusplus: ["error", { "allowForLoopAfterthoughts": true }] */
 // #region details() — input form + tooltips
 const details = () => ({
     id: 'Tdarr_Plugin_awk_video_clean',
@@ -14,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.33',
+    Version: '3.999.34',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -32,7 +31,7 @@ const details = () => ({
                 \\n=====
                 \\nhdr_cleanup_only (default, harmless): only hdr_mode is live, and only where it can act losslessly - strip_dynamic drops the Dolby
                 Vision / HDR10+ dynamic layer with a plain -c:v copy, keeping the base HDR10, and anything that cannot be done losslessly is skipped.
-                codec, downscale, bit depth, quality and encoder are all inert. A safe do-nothing default.
+                codec, downscale, deinterlace, bit depth, quality and encoder are all inert. A safe do-nothing default.
                 \\nnormalize: compatibility conversion. Re-encodes whenever the source does not match your codec, downscale or hdr_mode target, in
                 EITHER direction - AV1 to HEVC for an old TV, or 4K down to 1080p. method_bitdepth rides along on whatever else fires but never triggers
                 a re-encode by itself.
@@ -103,7 +102,8 @@ const details = () => ({
                 \\ndisabled (default): keep the source resolution.
                 \\n1080 fits anything larger into 1920x1080 - the classic "shrink 4K to 1080p to save space". 720 does the same at 1280x720, while 2160
                 and 1440 only shrink sources larger than their own frame. Cinema geometry is fitted by WIDTH too, so a 4096x1716 scope master lands
-                1920x804 instead of staying 2578 wide, and a 2048x858 DCI 2K master is no longer waved through a 1080 setting untouched.`,
+                1920x804 instead of staying 2578 wide, and a 2048x858 DCI 2K master is fitted too - it overflows the 1920x1080 box by width, though
+                858 <= 1080.`,
         },
         {
             name: 'hdr_mode',
@@ -296,17 +296,17 @@ const details = () => ({
                 resolution.
                 \\nWhy: shrink works at constant quality, which cannot predict the output size, so re-encoding an already-lean source can GROW it. This
                 floor prevents that.
-                \\nnormalize ignores this entirely, a compatibility conversion having to run whatever the size. Three things are exempt even under shrink,
-                none of which can grow a file: a downscale, tonemap_sdr, and the lossless strip_dynamic copy.`,
+                \\nnormalize ignores this entirely, a compatibility conversion having to run whatever the size. Four things are exempt even under shrink:
+                a downscale, tonemap_sdr, the lossless strip_dynamic copy and interlace repair. The first three cannot grow a file; the repair can, since a
+                shot-on-video source comes back at double the frame rate.`,
         },
     ],
 });
 // #endregion
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 const plugin = (file, librarySettings, inputs, otherArguments) => {
     const lib = require('../methods/lib')();
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars,no-param-reassign
+    // eslint-disable-next-line no-param-reassign
     inputs = lib.loadDefaultValues(inputs, details);
 
     const response = {
@@ -384,11 +384,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         timed_thumbnails: { streams:['video'],                    keywords: [],                                                        tag: null          },
     };
     // -=-=-= roleTextLower [all five] =-=-=-
-    // Role-signal text unioned from BOTH probes - a title/description/handler can live in ffprobe OR mediaInfo but not both. Memoized by stream object
-    // (WeakMap, per-run closure) because hasDisposition calls it repeatedly per stream.
-    // Both description reads go through getTagCI, and neither casing is a guess: matroska UPPER-CASES tag keys on write, so the ffprobe side comes back
-    // DESCRIPTION; and MediaInfo defines Comment/Description as GENERAL-only parameters, so a per-TRACK value never appears top-level - it lands in the
-    // track's 'extra' bag under whatever spelling the container used. A fixed-case top-level read matches neither.
+    // Role-signal text unioned from BOTH probes - a title/description/handler can live in ffprobe OR mediaInfo but not both. Memoized
+    // by stream object (WeakMap, per-run closure) because hasDisposition calls it repeatedly per stream. Both description reads go
+    // through getTagCI, and neither casing is a guess: matroska UPPER-CASES tag keys on write, so the ffprobe side comes back
+    // DESCRIPTION; and MediaInfo defines Comment/Description as GENERAL-only parameters, so a per-TRACK value never appears top-level
+    // - it lands in the track's 'extra' bag under whatever spelling the container used. A fixed-case top-level read matches neither.
     const roleTextCache = new WeakMap();
     const roleTextLower = (s) => {
         if (roleTextCache.has(s)) return roleTextCache.get(s);
@@ -545,10 +545,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: marker persistence =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: case-insensitive tag lookup =====
     // -=-=-= getTagCI  [all five] =-=-=-
-    // Look up a tag value case-insensitively on BOTH sides - matroska UPPER-CASES tag keys on write, so a plugin reading
-    // its sibling's awk_* marker gets an uppercased key back, and the lookup name is folded too so a mixed-case name
-    // still matches. Returns the raw value (or '' if absent); callers trim/decode as needed. One source so the five
-    // plugins that read each other's markers can't drift on the lookup convention.
+    // Look up a tag value case-insensitively on BOTH sides - matroska UPPER-CASES tag keys on write, so a plugin reading its sibling's awk_*
+    // marker gets an uppercased key back, and the lookup name is folded too so a mixed-case name still matches. Returns the raw value (or '' if
+    // absent); callers trim/decode as needed. One source so the five plugins that read each other's markers can't drift on the lookup convention.
     const getTagCI = (tags, name) => {
         const want = String(name).toLowerCase();
         const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === want);
@@ -559,16 +558,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream / language / preset helpers =====
     // -=-=-= mediaInfoFor [all five] =-=-=-
     // The single join point between the two probes: the mediaInfo track whose StreamOrder equals the ffprobe index; undefined when absent. Deliberately
-    // NOT memoised (unlike roleTextLower's WeakMap): the scan measures ~20 microseconds per file against a transcode measured in minutes.
-    // Bound to THIS file: it joins against the closure's file.mediaInfo, so it - and every helper that reaches it (roleTextLower, resolveLang, resolveChannels,
-    // ...) - is sound ONLY on streams from the same file.ffProbeData. Never feed it a FOREIGN stream list (e.g. otherArguments.originalLibraryFile's): it would
-    // read THIS file's mediaInfo track at the foreign stream's index and silently answer about the wrong stream.
-    // Menu is excluded because it is the one track kind whose StreamOrder is NOT a stream index: MediaInfo numbers an MPEG-TS program's Menu by PROGRAM
-    // ordinal ("0") while that program's real tracks carry a two-part "0-0"/"0-1" that Number() turns into NaN - so on a single-program .ts the Menu is the
-    // only numeric match and ffprobe stream 0 reads the Menu's fields. Its Language is a concatenated program list (" / en / en / en"), which makes an
-    // untagged track look tagged and silences language_fill, and tag_language=strict then writes that string into the container where nothing can repair it
-    // (toCanonicalTag passes it through unchanged). Measured on 6 of the corpus's MPEG-TS files; stream_ordering's DURATION_SIGNALS already guards the same
-    // way. Do NOT "fix" this by joining on the last component of the two-part form - measured wrong on both a teletext capture and a multi-program mux.
+    // NOT memoised (unlike roleTextLower's WeakMap): the scan measures ~20 microseconds per file against a transcode measured in minutes. Bound to THIS
+    // file: it joins against the closure's file.mediaInfo, so it - and every helper that reaches it (roleTextLower, resolveLang, resolveChannels, ...)
+    // - is sound ONLY on streams from the same file.ffProbeData. Never feed it a FOREIGN stream list (e.g. otherArguments.originalLibraryFile's): it
+    // would read THIS file's mediaInfo track at the foreign stream's index and silently answer about the wrong stream. Menu is excluded because it is
+    // the one track kind whose StreamOrder is NOT a stream index: MediaInfo numbers an MPEG-TS program's Menu by PROGRAM ordinal ("0") while that
+    // program's real tracks carry a two-part "0-0"/"0-1" that Number() turns into NaN - so on a single-program .ts the Menu is the only numeric match
+    // and ffprobe stream 0 reads the Menu's fields. Its Language is a concatenated program list (" / en / en / en"), which makes an untagged track look
+    // tagged and silences language_fill, and tag_language=strict then writes that string into the container where nothing can repair it (toCanonicalTag
+    // passes it through unchanged). Measured on 6 of the corpus's MPEG-TS files; stream_ordering's DURATION_SIGNALS already guards the same way. Do NOT
+    // "fix" this by joining on the last component of the two-part form - measured wrong on both a teletext capture and a multi-program mux.
     const mediaInfoFor = (s) => (file?.mediaInfo?.track || []).find(t => t['@type'] !== 'Menu' && Number(t.StreamOrder) === s.index);
     // -=-=-= resolveLang [all five] =-=-=-
     // ffprobe tags.language, else mediaInfo Language (files often tag one probe but not the other); '' when neither reports it - callers wanting a
@@ -1313,9 +1312,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         hevc_nvenc:        { base10: 113, kEnc10: 108, base8: 113, kEnc8: 108 },
         hevc_qsv:          { base10: 76,  kEnc10: 51,  base8: 76,  kEnc8: 51 },
         hevc_vaapi:        { base10: 80,  kEnc10: 23,  base8: 80,  kEnc8: 23 },
-        // Fitted on a Mac, the only platform that has VideoToolbox. Legitimate there despite macOS memory
-        // compression because these rows land at 0.7-0.9 GB, below the regime where it distorts a reading, and
-        // they reproduced across two independent runs (4K 862 then 860 MB; 1080p 690 both times).
+        // Fitted on a Mac, the only platform that has VideoToolbox. Legitimate there despite macOS memory compression because these rows land at 0.7-0.9
+        // GB, below the regime where it distorts a reading, and they reproduced across two independent runs (4K 862 then 860 MB; 1080p 690 both times).
         hevc_videotoolbox: { base10: 252, kEnc10: 27,  base8: 252, kEnc8: 27 },
     };
     // Which measured row stands in for a family's other codecs. Justified by measurement, not convenience: h264_nvenc at 4K 8-bit came within 5% of
@@ -1669,10 +1667,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const guardDv = String(inputs.guard_dv) === 'true';   // boolean, default true
     const guardLossless = String(inputs.guard_lossless) === 'true';   // boolean, default true
 
-    // The two free-text NUMERIC inputs are the only user-typed values this plugin echoes back, and failFile's message becomes the file's stored error, so
-    // they get the same treatment as every other free-text echo in the suite - the shared logSafe(v): control characters to space, because infoLog is
-    // newline-delimited and a raw newline turns the rest of the paste into a status line the plugin never wrote, and a 200-char cap ending in a visible
-    // ellipsis, because loadDefaultValues only trims, Tdarr persists the whole message however large the value was, and a user has to be able to see it was cut.
+    // The two free-text NUMERIC inputs are the only user-typed values this plugin echoes back, and failFile's message becomes the
+    // file's stored error, so they get the same treatment as every other free-text echo in the suite - the shared logSafe(v):
+    // control characters to space, because infoLog is newline-delimited and a raw newline turns the rest of the paste into a
+    // status line the plugin never wrote, and a 200-char cap ending in a visible ellipsis, because loadDefaultValues only trims,
+    // Tdarr persists the whole message however large the value was, and a user has to be able to see it was cut.
     const parseQuality = (v, name) => {
         const n = Number(String(v).trim());
         if (!Number.isFinite(n) || n < 0 || n > QUALITY_MAX)
@@ -1840,40 +1839,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 + `${hdrMode === 'tonemap_sdr' ? 'tonemap' : 'strip'} it\n`;
         const dvIptC2 = preserveDv && srcIsIptC2;   // skip below rather than emit a command libx265 would reject
 
-        // Resolution / downscale (only ever downscales) + the quality tier for the OUTPUT height. Inert under hdr_cleanup_only.
-        // The setting names a 16:9 FRAME, not a height: 1080 means "fit inside 1920x1080". Capping height alone under-shrinks everything wider than
-        // 16:9 by exactly (source AR / 16:9) - a 4096x1716 scope master answered a 1080 cap with 2578x1080, 34% MORE pixels than 1080p, and a
-        // 2048x858 DCI 2K master sailed through untouched because 858 <= 1080. Both measured on the production binary.
-        const maxH = downscaleOpt === 'disabled' ? 0 : Number(downscaleOpt);
-        const maxW = Math.round(maxH * 16 / 9);
-        // Only a HEIGHT is ever needed to express the box: scale=-2:N derives the width from the coded aspect, so fitting the frame collapses to the
-        // smaller of the cap and the height at which the frame is exactly maxW wide. Rounded DOWN to even - 4:2:0 needs an even height, and rounding
-        // up would breach the box. dispWidth is the CODED width (rotation-adjusted), deliberately NOT SAR-corrected, because scale=-2:N derives its
-        // width from coded dimensions too: a display-corrected test would predict a width the filter does not emit. Verified this changes no answer
-        // for the real anamorphic cases (1440x1080 SAR 4:3, 720x576 SAR 64:45 land identically either way). A dispWidth of 0 - no width from either
-        // probe - degrades to the old height-only behaviour rather than refusing, since widthBound then contributes nothing. That ternary is not dead code
-        // to be tidied away: without it the division yields Infinity, which happens to reach the same capHeight today, and nothing would catch a later
-        // edit that stopped it doing so.
-        const evenFloor = (n) => Math.max(2, Math.floor(n / 2) * 2);
-        const widthBound = dispWidth > 0 ? evenFloor(maxW * dispHeight / dispWidth) : dispHeight;
-        const capHeight = Math.min(maxH, widthBound);
-        // capHeight < dispHeight, not dispHeight > maxH: a wide-but-short source is already inside the box (854x480 under a 720 cap bounds at 718,
-        // above its own 480) and must not read as needing work.
-        const willDownscale = action !== 'hdr_cleanup_only' && maxH > 0 && capHeight < dispHeight;
-        const outHeight = willDownscale ? capHeight : dispHeight;
-        const qualityForHeight = (h) => ({ sd: qualitySd, p720: quality720, p1080: quality1080, p4k: quality4k }[heightTier(h)]);
-        const qNorm = qualityForHeight(outHeight);
-
-        // tonemap_sdr flattens ALL HDR -> SDR (a real re-encode). effHdrMode is never tonemap_sdr under hdr_cleanup_only (hard-errored) or for a
-        // guard-protected DV file. The tonemap_* filters self-tag bt709 (verified), so no explicit colour flags; where it runs: see resolveTonemapBackend.
-        const tonemap = effHdrMode === 'tonemap_sdr' && isHdr;
-        // A tonemap_* filter REJECTS a frame whose decoded transfer isn't a known HDR curve, and the island carries no explicit tags. When HDR
-        // is known (mediaInfo / dynamic metadata) but the stream's own transfer is NOT a recognised HDR curve - absent (a stripped VUI) OR
-        // present-but-non-HDR (a mislabelled bt2020-10) - stamp the inferred HDR curve onto the island so the filter has a valid HDR input.
-        const tonemapSetparams = (tonemap && !HDR_TRANSFERS.includes(srcXfer))
-            ? `setparams=color_trc=${inferredHdrCurve}:color_primaries=bt2020:colorspace=bt2020nc,`
-            : '';
-
         // ---- interlace repair ---- Inert under hdr_cleanup_only for the same reason tonemap_sdr is: it changes pixels, so it can never be the lossless-only
         // action's business. The detection decode is the one real cost of turning this on, so it runs ONLY when the setting is live - never on the default.
         // Tests inject otherArguments.__awkCap.idet to pin a verdict without spawning ffmpeg, exactly as they do for the encoder and tonemap probes.
@@ -1960,6 +1925,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // the one argument; every other stream is summarised from its own enriched form, exactly as the input summary does.
         const expectedResultsLine = (primaryToken) => `☑Expected results: ${keptStreams()
             .map((s) => (s === primary ? primaryToken : summariseStream(enrichStream(s)))).join('')}\n`;
+        // A predicted output stream that has lost its dynamic HDR layer must not still read 'dv' or 'hdr10+', so both predictions (the lossless strip and the
+        // transcode) clear every carrier summariseStream's dynamic tests read: the dvhe/dvh1 fourcc, the DOVI side-data record, and the mediaInfo HDR_Format
+        // (detached by dropping the joined index). The HDR10/HLG base keeps its own transfer. A carrier the shared DV/HDR10+ detection gains belongs here too.
+        const clearDynamicHdrCarriers = (s) => Object.assign(s, { codec_tag_string: '', side_data_list: [], index: -1 });
         // Both presets below copy the audio and subtitles into the SAME container they came from, so an mp4-family output still carrying TrueHD needs the mov
         // muxer's -strict level or the mux is refused outright (see mp4StrictArg). Every stream this plugin does not re-encode is copied, so the default
         // survivor set is right. On the transcode path it must sit AFTER buildVideoArgs' own -strict: the last one on the command wins, so appending keeps the
@@ -1985,10 +1954,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.preset = `<io>${out}`;   // no input-side args
             response.processFile = true;
             response.infoLog += coverArtLog;
-            // The strip removes exactly the layer the 'dv'/'hdr10+' token names, so the prediction clears the same carriers the transcode prediction does -
-            // the dvhe/dvh1 fourcc, the DOVI record, and the mediaInfo join (via the index) - leaving the HDR10/HLG base's own transfer, inferred off
-            // HDR_Format when neither probe reported one. Everything else about the stream is untouched, since this path is a -c:v copy.
-            const strippedVideo = { ...primary, codec_tag_string: '', side_data_list: [], index: -1 };
+            // The strip removes exactly the layer the 'dv'/'hdr10+' token names (see clearDynamicHdrCarriers), leaving the HDR10/HLG base's own transfer,
+            // inferred off HDR_Format when neither probe reported one. Everything else about the stream is untouched, since this path is a -c:v copy.
+            const strippedVideo = clearDynamicHdrCarriers({ ...primary });
             if (!HDR_TRANSFERS.includes(srcXfer)) strippedVideo.color_transfer = inferredHdrCurve;
             response.infoLog += expectedResultsLine(summariseStream(strippedVideo));
             return response;
@@ -2052,8 +2020,42 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 '; use action=normalize/shrink to re-encode it away');
         }
 
-        // ---- action = normalize | shrink (real-transcode capable) ---- Resolve the codec trigger + final target codec. depth is a PARAMETER (never a
-        // trigger); downscale, tonemap and interlace repair are triggers in both actions.
+        // ---- action = normalize | shrink (real-transcode capable) ---- Resolution / downscale (only ever downscales) + the quality tier for
+        // the OUTPUT height. The setting names a 16:9 FRAME, not a height: 1080 means "fit inside 1920x1080". Capping height alone under-shrinks
+        // everything wider than 16:9 by exactly (source AR / 16:9) - a 4096x1716 scope master answered a 1080 cap with 2578x1080, 34% MORE
+        // pixels than 1080p, and a 2048x858 DCI 2K master sailed through untouched because 858 <= 1080. Both measured on the production binary.
+        const maxH = downscaleOpt === 'disabled' ? 0 : Number(downscaleOpt);
+        const maxW = Math.round(maxH * 16 / 9);
+        // Only a HEIGHT is ever needed to express the box: scale=-2:N derives the width from the coded aspect, so fitting the frame collapses to the
+        // smaller of the cap and the height at which the frame is exactly maxW wide. Rounded DOWN to even - 4:2:0 needs an even height, and rounding
+        // up would breach the box. dispWidth is the CODED width (rotation-adjusted), deliberately NOT SAR-corrected, because scale=-2:N derives its
+        // width from coded dimensions too: a display-corrected test would predict a width the filter does not emit. Verified this changes no answer
+        // for the real anamorphic cases (1440x1080 SAR 4:3, 720x576 SAR 64:45 land identically either way). A dispWidth of 0 - no width from either
+        // probe - degrades to height-only fitting rather than refusing, since widthBound then contributes nothing. That ternary is not dead code
+        // to be tidied away: without it the division yields Infinity, which happens to reach the same capHeight today, and nothing would catch a later
+        // edit that stopped it doing so.
+        const evenFloor = (n) => Math.max(2, Math.floor(n / 2) * 2);
+        const widthBound = dispWidth > 0 ? evenFloor(maxW * dispHeight / dispWidth) : dispHeight;
+        const capHeight = Math.min(maxH, widthBound);
+        // capHeight < dispHeight, not dispHeight > maxH: a wide-but-short source is already inside the box (854x480 under a 720 cap bounds at 718,
+        // above its own 480) and must not read as needing work.
+        const willDownscale = maxH > 0 && capHeight < dispHeight;
+        const outHeight = willDownscale ? capHeight : dispHeight;
+        const qualityForHeight = (h) => ({ sd: qualitySd, p720: quality720, p1080: quality1080, p4k: quality4k }[heightTier(h)]);
+        const qNorm = qualityForHeight(outHeight);
+
+        // tonemap_sdr flattens ALL HDR -> SDR (a real re-encode). effHdrMode is never tonemap_sdr for a guard-protected DV file. The tonemap_* filters
+        // self-tag bt709 (verified), so no explicit colour flags; where it runs: see resolveTonemapBackend.
+        const tonemap = effHdrMode === 'tonemap_sdr' && isHdr;
+        // A tonemap_* filter REJECTS a frame whose decoded transfer isn't a known HDR curve, and the island carries no explicit tags. When HDR
+        // is known (mediaInfo / dynamic metadata) but the stream's own transfer is NOT a recognised HDR curve - absent (a stripped VUI) OR
+        // present-but-non-HDR (a mislabelled bt2020-10) - stamp the inferred HDR curve onto the island so the filter has a valid HDR input.
+        const tonemapSetparams = (tonemap && !HDR_TRANSFERS.includes(srcXfer))
+            ? `setparams=color_trc=${inferredHdrCurve}:color_primaries=bt2020:colorspace=bt2020nc,`
+            : '';
+
+        // Resolve the codec trigger + final target codec. depth is a PARAMETER (never a trigger); downscale, tonemap and interlace repair are triggers in
+        // both actions.
         const heightTrigger = willDownscale;
         const tonemapTrigger = tonemap;
         let codecTrigger = false;
@@ -2284,10 +2286,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // node_strict would silently take a multi-hour software encode for the sole reason that it carries captions. Checking first also skips the
             // bounded caption probe (0.2-17 s) on a file that was already decided to fail.
             if (sel.strictFail) { sel.notes.forEach((n) => { response.infoLog += n; }); failFile(sel.strictFail); }
-            // Probe for captions only where the SELECTED encoder would drop them (A53_CAP 'drop'/'error'). A keep-by-default encoder - any H.264, or HEVC on
-            // nvenc/vaapi, or av1 on nvenc - and libx265 (kept via the -a53cc 1 above) all carry them unaided, so a probe would change nothing there. Of the
-            // droppers, an H.264 or HEVC target has a caption-keeping CPU encoder to fall back to (libx264 / libx265), so force it; an AV1 target that landed on
-            // a dropper has none (libsvtav1 has no option, and an av1_nvenc would already have been picked), so it can only warn and continue - hence they differ.
+            // Probe for captions only where the SELECTED encoder would drop them (A53_CAP 'drop'/'error'). A keep-by-default encoder
+            // - any H.264, or HEVC on nvenc/vaapi, or av1 on nvenc - and libx265 (kept via the -a53cc 1 above) all carry them
+            // unaided, so a probe would change nothing there. Of the droppers, an H.264 or HEVC target has a caption-keeping CPU
+            // encoder to fall back to (libx264 / libx265), so force it; an AV1 target that landed on a dropper has none (libsvtav1
+            // has no option, and an av1_nvenc would already have been picked), so it can only warn and continue - hence they differ.
             const selDropsCaptions = ['drop', 'error'].includes((A53_CAP[targetCodecName] || {})[sel.family]);
             if (guardCaptions && !dropCaptions && selDropsCaptions) {
                 const cc = detectCaptions();
@@ -2364,23 +2367,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         + ` ${deintParity()} field order) - keeping every field as its own frame, so the output runs at double the frame rate\n`;
             } else response.infoLog += deintVerdictLine();
             response.infoLog += `☐${streamTag(primary.index)}${encodeTag} Transcoding video @ ${sel.encoderName} q${Math.round(qNorm)}\n`;
-            // Predict the re-encoded stream through the shared summariseStream (single source of truth for the [video:...]
-            // token) so Expected-results matches the input-summary format; depth is exact via bits_per_raw_sample with
-            // pix_fmt/profile cleared, and a tonemapped output is SDR (bt709, detached mediaInfo so no 'hdr' token).
-            // outWidth is what scale=-2 will actually emit, in the same DISPLAY orientation outHeight is in (ffmpeg autorotates ahead of the filter chain).
-            // Nothing reads it today - summariseStream's video token is height-only - but a source width beside a downscaled height is a wrong number
-            // in a struct named for the output.
+            // Predict the re-encoded stream through the shared summariseStream (single source of truth for the [video:...] token) so
+            // Expected-results matches the input-summary format; depth is exact via bits_per_raw_sample with pix_fmt/profile cleared, and a
+            // tonemapped output is SDR (bt709, detached mediaInfo so no 'hdr' token). outWidth is what scale=-2 will actually emit, in the same
+            // DISPLAY orientation outHeight is in (ffmpeg autorotates ahead of the filter chain). Nothing reads it today - summariseStream's
+            // video token is height-only - but a source width beside a downscaled height is a wrong number in a struct named for the output.
             const outWidth = willDownscale && dispHeight > 0 ? Math.max(2, Math.round(dispWidth * outHeight / dispHeight / 2) * 2) : dispWidth;
             const outStream = { ...primary, codec_name: targetCodecName, height: outHeight, width: outWidth,
                 bits_per_raw_sample: want10Bit ? 10 : 8, pix_fmt: '', profile: '' };
             if (tonemap) { outStream.color_transfer = 'bt709'; outStream.index = -1; }
             // Unless guard_dv carried it, the re-encode DISCARDS the dynamic HDR layer (DV RPU and HDR10+ SEI alike - no encoder this plugin drives
-            // carries either), so the prediction must not still read 'dv' or 'hdr10+'. Clear every carrier summariseStream's dynamic tests read: the
-            // fourcc, the DOVI side-data record, and the mediaInfo HDR_Format (detached by dropping the joined index). The surviving HDR10/HLG base still
-            // shows 'hdr' from the stream's own transfer - or, when neither probe reported one, from the curve inferred off HDR_Format and stamped here
-            // (same reason tonemapSetparams stamps the island). A tonemap already landed bt709 above and must keep it, so the stamp skips that case.
+            // carries either), so the prediction clears its carriers (see clearDynamicHdrCarriers). The surviving HDR10/HLG base still shows 'hdr' from the
+            // stream's own transfer - or, when neither probe reported one, from the curve inferred off HDR_Format and stamped here (same reason
+            // tonemapSetparams stamps the island). A tonemap already landed bt709 above and must keep it, so the stamp skips that case.
             if (isDynamicHdr && !preserveDv) {
-                outStream.codec_tag_string = ''; outStream.side_data_list = []; outStream.index = -1;
+                clearDynamicHdrCarriers(outStream);
                 if (!tonemap && !HDR_TRANSFERS.includes(srcXfer)) outStream.color_transfer = inferredHdrCurve;
             }
             const outVideoToken = summariseStream(outStream);
@@ -2441,19 +2442,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (effHdrMode === 'strip_dynamic' && isDynamicHdr) {   // strip_dynamic is the sole reason - do it losslessly (or skip when it can't be lossless)
             return tryLosslessStrip('set hdr_mode=tonemap_sdr to flatten it to SDR', '');
         }
-        // The declined size pass already logged WHY above; say only that nothing else was left, so the run does not end on the "already at the target"
-        // line, which would contradict it.
+        // The declined size pass already logged WHY above; say only that nothing else was left, rather than falling to the shrink line below, which speaks
+        // for a target with no encoder.
         if (fenceUnstorable)
             return skip(`☑${streamTag(primary.index)}[action=shrink] Nothing else to do for this file\n`);
         if (belowFloorKbps > 0) {
             return skip(`☑${streamTag(primary.index)}[guard_shrink_bitrate=${guardShrinkKbps}] Source video bitrate ${belowFloorKbps}k is below the `
                 + `${guardShrinkKbps}k floor - already efficient, left untouched\n`);
         }
+        // Only a target with no encoder gets here under shrink: an encodable one always fires a size pass above (an upgrade, or a fenced same-codec pass),
+        // and the two things that decline it - the bitrate floor and an unstorable fence - have each returned with their own line already.
         if (action === 'shrink') {
-            return skip(`☑${streamTag(primary.index)}[action=shrink] Nothing to shrink - ${canEncodeTarget
-                ? `already ${srcCodecName}${dispHeight ? ` ${dispHeight}p` : ''} at the target and no more-efficient codec selected`
-                : `source codec ${srcCodecName || 'unknown'} has no encoder ${codec === 'source' ? '(set codec=hevc/h264/av1 to convert it)'
-                    : `and ${codec} is no more efficient (action=normalize converts it)`}`}\n`);
+            return skip(`☑${streamTag(primary.index)}[action=shrink] Nothing to shrink - source codec ${srcCodecName || 'unknown'} has no encoder `
+                + `${codec === 'source' ? '(set codec=hevc/h264/av1 to convert it)' : `and ${codec} is no more efficient (action=normalize converts it)`}\n`);
         }
         return skip(`☑${streamTag(primary.index)}[action=normalize] Video is already ${targetCodecName}${dispHeight ? ` ${dispHeight}p` : ''}`
             + `${srcIs10 ? ' 10-bit' : ''} and within limits\n`);

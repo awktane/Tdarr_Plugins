@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.34',
+    Version: '4.999.35',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -429,7 +429,6 @@ const details = () => ({
 });
 // #endregion
 
-// eslint-disable-next-line @typescript-eslint/no-unused-vars
 // #region SHARED helpers (1 section: language matching)
 // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language matching =====
 // Normalize any language identifier to a stable comparison key so en / eng / EN / English / en-US - and ISO 639-2/B vs /T (fre vs fra) - all compare
@@ -489,7 +488,7 @@ const langKey = (x) => {
 
 const plugin = (file, librarySettings, inputs, otherArguments) => {
     const lib = require('../methods/lib')();
-    // eslint-disable-next-line @typescript-eslint/no-unused-vars,no-param-reassign
+    // eslint-disable-next-line no-param-reassign
     inputs = lib.loadDefaultValues(inputs, details);
 
     const response = {
@@ -568,11 +567,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         timed_thumbnails: { streams:['video'],                    keywords: [],                                                        tag: null          },
     };
     // -=-=-= roleTextLower [all five] =-=-=-
-    // Role-signal text unioned from BOTH probes - a title/description/handler can live in ffprobe OR mediaInfo but not both. Memoized by stream object
-    // (WeakMap, per-run closure) because hasDisposition calls it repeatedly per stream.
-    // Both description reads go through getTagCI, and neither casing is a guess: matroska UPPER-CASES tag keys on write, so the ffprobe side comes back
-    // DESCRIPTION; and MediaInfo defines Comment/Description as GENERAL-only parameters, so a per-TRACK value never appears top-level - it lands in the
-    // track's 'extra' bag under whatever spelling the container used. A fixed-case top-level read matches neither.
+    // Role-signal text unioned from BOTH probes - a title/description/handler can live in ffprobe OR mediaInfo but not both. Memoized
+    // by stream object (WeakMap, per-run closure) because hasDisposition calls it repeatedly per stream. Both description reads go
+    // through getTagCI, and neither casing is a guess: matroska UPPER-CASES tag keys on write, so the ffprobe side comes back
+    // DESCRIPTION; and MediaInfo defines Comment/Description as GENERAL-only parameters, so a per-TRACK value never appears top-level
+    // - it lands in the track's 'extra' bag under whatever spelling the container used. A fixed-case top-level read matches neither.
     const roleTextCache = new WeakMap();
     const roleTextLower = (s) => {
         if (roleTextCache.has(s)) return roleTextCache.get(s);
@@ -718,10 +717,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: mp4-family container =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: case-insensitive tag lookup =====
     // -=-=-= getTagCI  [all five] =-=-=-
-    // Look up a tag value case-insensitively on BOTH sides - matroska UPPER-CASES tag keys on write, so a plugin reading
-    // its sibling's awk_* marker gets an uppercased key back, and the lookup name is folded too so a mixed-case name
-    // still matches. Returns the raw value (or '' if absent); callers trim/decode as needed. One source so the five
-    // plugins that read each other's markers can't drift on the lookup convention.
+    // Look up a tag value case-insensitively on BOTH sides - matroska UPPER-CASES tag keys on write, so a plugin reading its sibling's awk_*
+    // marker gets an uppercased key back, and the lookup name is folded too so a mixed-case name still matches. Returns the raw value (or '' if
+    // absent); callers trim/decode as needed. One source so the five plugins that read each other's markers can't drift on the lookup convention.
     const getTagCI = (tags, name) => {
         const want = String(name).toLowerCase();
         const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === want);
@@ -894,16 +892,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream / language / preset helpers =====
     // -=-=-= mediaInfoFor [all five] =-=-=-
     // The single join point between the two probes: the mediaInfo track whose StreamOrder equals the ffprobe index; undefined when absent. Deliberately
-    // NOT memoised (unlike roleTextLower's WeakMap): the scan measures ~20 microseconds per file against a transcode measured in minutes.
-    // Bound to THIS file: it joins against the closure's file.mediaInfo, so it - and every helper that reaches it (roleTextLower, resolveLang, resolveChannels,
-    // ...) - is sound ONLY on streams from the same file.ffProbeData. Never feed it a FOREIGN stream list (e.g. otherArguments.originalLibraryFile's): it would
-    // read THIS file's mediaInfo track at the foreign stream's index and silently answer about the wrong stream.
-    // Menu is excluded because it is the one track kind whose StreamOrder is NOT a stream index: MediaInfo numbers an MPEG-TS program's Menu by PROGRAM
-    // ordinal ("0") while that program's real tracks carry a two-part "0-0"/"0-1" that Number() turns into NaN - so on a single-program .ts the Menu is the
-    // only numeric match and ffprobe stream 0 reads the Menu's fields. Its Language is a concatenated program list (" / en / en / en"), which makes an
-    // untagged track look tagged and silences language_fill, and tag_language=strict then writes that string into the container where nothing can repair it
-    // (toCanonicalTag passes it through unchanged). Measured on 6 of the corpus's MPEG-TS files; stream_ordering's DURATION_SIGNALS already guards the same
-    // way. Do NOT "fix" this by joining on the last component of the two-part form - measured wrong on both a teletext capture and a multi-program mux.
+    // NOT memoised (unlike roleTextLower's WeakMap): the scan measures ~20 microseconds per file against a transcode measured in minutes. Bound to THIS
+    // file: it joins against the closure's file.mediaInfo, so it - and every helper that reaches it (roleTextLower, resolveLang, resolveChannels, ...)
+    // - is sound ONLY on streams from the same file.ffProbeData. Never feed it a FOREIGN stream list (e.g. otherArguments.originalLibraryFile's): it
+    // would read THIS file's mediaInfo track at the foreign stream's index and silently answer about the wrong stream. Menu is excluded because it is
+    // the one track kind whose StreamOrder is NOT a stream index: MediaInfo numbers an MPEG-TS program's Menu by PROGRAM ordinal ("0") while that
+    // program's real tracks carry a two-part "0-0"/"0-1" that Number() turns into NaN - so on a single-program .ts the Menu is the only numeric match
+    // and ffprobe stream 0 reads the Menu's fields. Its Language is a concatenated program list (" / en / en / en"), which makes an untagged track look
+    // tagged and silences language_fill, and tag_language=strict then writes that string into the container where nothing can repair it (toCanonicalTag
+    // passes it through unchanged). Measured on 6 of the corpus's MPEG-TS files; stream_ordering's DURATION_SIGNALS already guards the same way. Do NOT
+    // "fix" this by joining on the last component of the two-part form - measured wrong on both a teletext capture and a multi-program mux.
     const mediaInfoFor = (s) => (file?.mediaInfo?.track || []).find(t => t['@type'] !== 'Menu' && Number(t.StreamOrder) === s.index);
     // -=-=-= resolveLang [all five] =-=-=-
     // ffprobe tags.language, else mediaInfo Language (files often tag one probe but not the other); '' when neither reports it - callers wanting a
@@ -1135,21 +1133,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ===== SHARED [audio_clean, sub_worker]: mov language remap =====
     // -=-=-= to6392T  [audio_clean, sub_worker] =-=-=-
-    // Fold a language token to a lowercase 3-letter ISO 639-2/T code: langKey folds spelled names and 639-2/B onto the 2-letter key, which ISO639_1_TO_2 maps to
-    // /T; an already-3-letter code (eng, fil, und) or an unmappable token is left as-is. Used where a 3-letter code is required - sub_worker's mp4-family sidecar
-    // import (mdhd stores only /T) and the mov remap below - and it is the fold MOV_LANG expects. Mirrors clean_and_remux's toCanonicalTag threeLetter(false).
+    // Fold a language token to a lowercase 3-letter ISO 639-2/T code: langKey folds spelled names and 639-2/B onto the
+    // 2-letter key, which ISO639_1_TO_2 maps to /T; an already-3-letter code (eng, fil, und) or an unmappable token is left
+    // as-is. Used where a 3-letter code is required - sub_worker's mp4-family sidecar import (mdhd stores only /T) and the
+    // mov remap below - and it is the fold MOV_LANG expects. Mirrors clean_and_remux's toCanonicalTag threeLetter(false).
     const to6392T = (lang) => { const key = langKey(lang); if (!key || key.length !== 2) return lang; return ISO639_1_TO_2[key] || lang; };
     // -=-=-= MOV_LANG  [audio_clean, sub_worker] =-=-=-
     // mov is the exception to writing a language into the output container (mp4 stores only lowercase 3-letter /T, mkv keeps the raw spelling). The QuickTime
-    // muxer does not store the letters: mov_write_mdhd_tag looks the code up in ffmpeg's legacy Macintosh language table and writes 0x7fff ("unspecified") on a
-    // miss, which the demuxer then excludes - so the track reads back with NO language at all, exit 0 and no warning from either side. That table predates ISO
-    // 639-2/T and spells 15 of the 20 dual-spelling languages the /B way, so to6392T's /T output is precisely the spelling mov throws away (measured on
+    // muxer does not store the letters: mov_write_mdhd_tag looks the code up in ffmpeg's legacy Macintosh language table and writes 0x7fff ("unspecified") on
+    // a miss, which the demuxer then excludes - so the track reads back with NO language at all, exit 0 and no warning from either side. That table predates
+    // ISO 639-2/T and spells 15 of the 20 dual-spelling languages the /B way, so to6392T's /T output is precisely the spelling mov throws away (measured on
     // jellyfin-ffmpeg 7.1.4: nld/deu/zho land 0x7fff, dut/ger/chi land a real code; 106 of the 184 codes to6392T can emit are dropped). ces/ron/slk/fra are
-    // deliberately ABSENT - QuickTime spells those four the /T way and remapping them would break what works - and mri is absent because the table has no Maori
-    // under any code. Anyone extending this must re-measure against the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a safe source.
-    // mp4/m4v/m4a pack the letters directly and keep either spelling, which is why this is mov-only. Both writers fold to /T then remap: audio_clean on an audio
-    // language write, sub_worker on a subtitle language write. Null-prototype so a container tag spelling an Object.prototype member ('constructor',
-    // '__proto__') misses the table and falls through to the pass-through instead of resolving an inherited function.
+    // deliberately ABSENT - QuickTime spells those four the /T way and remapping them would break what works - and mri is absent because the table has no
+    // Maori under any code. Anyone extending this must re-measure against the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a
+    // safe source. mp4/m4v/m4a pack the letters directly and keep either spelling, which is why this is mov-only. Both writers fold to /T then remap:
+    // audio_clean on an audio language write, sub_worker on a subtitle language write. Null-prototype so a container tag spelling an Object.prototype member
+    // ('constructor', '__proto__') misses the table and falls through to the pass-through instead of resolving an inherited function.
     const MOV_LANG = Object.assign(Object.create(null), { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
         deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel' });
     // ===== END SHARED: mov language remap =====
@@ -1233,17 +1232,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const ffmpegPathOf = (otherArgs) => String(otherArgs?.ffmpegPath || 'ffmpeg');
     // ===== END SHARED: ffmpeg path =====
     // #endregion
-
-    // audio_clean-local IDENTITY key: like langKey but KEEPS the region/script subtag, so pt-BR and pt-PT are DISTINCT identities
-    // (both survive dedup, each gets its own downmix) while eng/en/English/en-US still fold their BASE (eng==en, but en !=
-    // en-US). Used ONLY for dedup grouping and the one-downmix-per-language sets; all matching/filtering stays on the folded
-    // langKey. Non-language/untagged/malformed tokens fall back to langKey, so 'und' stays 'und' and the dedup exemption holds.
-    const langIdentityKey = (x) => {
-        let s = String(x || '').trim().toLowerCase().replace(/[_.]/g, '-');
-        if (!s) return '';
-        if (s.length >= 4) { const code = langNameIndex(s); if (code) s = code; }   // spelled-out English name -> its code (no region on a spelled-out name)
-        try { return String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase(); } catch (e) { return langKey(x); }
-    };
 
     // #region SHARED helpers (3 sections: ffmpeg metadata escaping … title canonicalization)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
@@ -1376,16 +1364,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return suffix ? `${base} - ${suffix}` : base;
     };
     // -=-=-= mediaTitleFor  [audio_clean, clean_and_remux] =-=-=-
-    // A stream's OWN title: ffprobe's tag where there is one, else mediaInfo's Title with the container HANDLER laundered out. Shared because both carriers
-    // WRITE what it returns, and taking the raw join welds the handler into the title - "Core Media Audio -> 2.0" on an Apple mp4 track, which then becomes a
-    // real ffprobe tag no later pass will repair, because it is indistinguishable from a title the user chose.
-    // mediaInfo does not report a track's title on its own: it JOINS the handler to it with " / ", and the ORDER is per-container - measured on the bundled
-    // MediaInfoLib 23.07, mp4 puts the handler first ("Main Feature / Movie.2020.x264-GRP") and mkv puts the title first. So filter by PART, never by prefix,
-    // and never compare the whole string: an exact-equality test sees nothing and a dot count over the join charges the handler's periods to the title. What
-    // is left is the track's own title, empty when the handler was all of it. This is needed at all because ffprobe does not surface an mp4 track's udta/name
-    // box, so on mp4 the joined mediaInfo Title is the ONLY place a per-track title appears. Read the handler case-insensitively - matroska stores the key
-    // uppercase. MediaInfoLib drops the Title entirely when the handler contains "Handler" (capital H) or " handler", so that boilerplate never reaches here;
-    // what does is the naming that escapes the filter, Apple's "Core Media Audio"/"Core Media Video" above all.
+    // A stream's OWN title: ffprobe's tag where there is one, else mediaInfo's Title with the container HANDLER laundered out. Shared because both
+    // carriers WRITE what it returns, and taking the raw join welds the handler into the title - "Core Media Audio -> 2.0" on an Apple mp4 track,
+    // which then becomes a real ffprobe tag no later pass will repair, because it is indistinguishable from a title the user chose. mediaInfo does not
+    // report a track's title on its own: it JOINS the handler to it with " / ", and the ORDER is per-container - measured on the bundled MediaInfoLib
+    // 23.07, mp4 puts the handler first ("Main Feature / Movie.2020.x264-GRP") and mkv puts the title first. So filter by PART, never by prefix, and
+    // never compare the whole string: an exact-equality test sees nothing and a dot count over the join charges the handler's periods to the title.
+    // What is left is the track's own title, empty when the handler was all of it. This is needed at all because ffprobe does not surface an mp4
+    // track's udta/name box, so on mp4 the joined mediaInfo Title is the ONLY place a per-track title appears. Read the handler case-insensitively -
+    // matroska stores the key uppercase. MediaInfoLib drops the Title entirely when the handler contains "Handler" (capital H) or " handler", so that
+    // boilerplate never reaches here; what does is the naming that escapes the filter, Apple's "Core Media Audio"/"Core Media Video" above all.
     const mediaTitleFor = (s) => {
         const ownTagTitle = (s?.tags?.title || '').trim();
         if (ownTagTitle) return ownTagTitle;
@@ -1400,6 +1388,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Bail out gracefully on missing/partial probe data, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
         failFile('No ffProbe stream data available for this file - the plugin cannot process it');
+
+    // audio_clean-local IDENTITY key: like langKey but KEEPS the region/script subtag, so pt-BR and pt-PT are DISTINCT identities
+    // (both survive dedup, each gets its own downmix) while eng/en/English/en-US still fold their BASE (eng==en, but en !=
+    // en-US). Used ONLY for dedup grouping and the one-downmix-per-language sets; all matching/filtering stays on the folded
+    // langKey. Non-language/untagged/malformed tokens fall back to langKey, so 'und' stays 'und' and the dedup exemption holds.
+    const langIdentityKey = (x) => {
+        let s = String(x || '').trim().toLowerCase().replace(/[_.]/g, '-');
+        if (!s) return '';
+        if (s.length >= 4) { const code = langNameIndex(s); if (code) s = code; }   // spelled-out English name -> its code (no region on a spelled-out name)
+        try { return String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase(); } catch (e) { return langKey(x); }
+    };
 
     // AC3 valid CBR presets in bps. ffmpeg rounds an AC3 request to the NEAREST of these (can round DOWN); resolveBitrate snaps UP to a preset itself so the
     // emitted rate is never below target and the log matches what ffmpeg produces. EAC3/AAC/Opus honour arbitrary rates (verified) and are NOT snapped.
@@ -1693,21 +1692,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     for (const [name, value, opts] of dropdownChecks)
         if (!opts.includes(value)) failFile(`[${name}=${logSafe(value)}] invalid value, check your settings`);
 
-    // Stereo (2ch) encode tokens for the configured stereoCodec, folding the aac_vbr (per-node VBR via aacVbrArgsIdx) vs fixed-bitrate branch otherwise
-    // duplicated at every 2ch downmix/remix emit site. Returns the -c:a fragment (encoder + bitrate/quality args), the codec name + rate string + label for the
-    // log line, and the output-summary record; each caller keeps its own -map prefix, log verb/suffix and outputAudioOverride/appendedAudio target inline.
-    const stereoEnc = (idx) => {
-        if (stereoCodec === 'aac_vbr') {
-            const { encoder, args, approxRate, label } = aacVbrArgsIdx(idx);
-            return { frag: `${encoder}${args}`, logCodec: 'aac', rate: approxRate, label, record: { codec: 'aac', channels: 2, bps: 0, approxRate } };
-        }
-        const bps = resolveBitrate(stereoCodec, 2);
-        return {
-            frag: `${audioEncoder(stereoCodec)}${encoderArgsBps(stereoCodec, idx, bps)}`, logCodec: stereoCodec, rate: `${bps / 1000} kb/s`, label: '',
-            record: { codec: stereoCodec, channels: 2, bps },
-        };
-    };
-
     // Both free-text language lists are checked through this because dormancy is NOT a typo net - it only fires when NOTHING matches EITHER list, so a typo in
     // one list while the other still matches leaves that language "unlisted", where language_unlisted=stereo downmixes it and language_unlisted=delete removes
     // it. A rejected token fails the file. clean_and_remux runs the same check on its own lists, through its langName wrapper rather than this predicate.
@@ -1899,6 +1883,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return predQuality < stream.awkQuality - margin;                 // target scores below the source by more than the tier's margin → detail lost
         };
 
+        // ====== DEDUPLICATE ======
         // Duplicate removal keeps `survivor` and drops `removed`. Block only when the drop loses detail the survivor can't hold. Separate from
         // guardBlocks: dedupe compares against an existing survivor (not a predicted transcode) and must check the survivor's losslessness. No
         // quality clause on purpose — the dedupe sort is measured-bitrate-first, so a survivor can carry a LOWER awkQuality than the removed track;
@@ -2000,8 +1985,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 } else {
                     dedupBand = ch > 2 ? 'surround' : 'stereo';
                 }
-                // Only MAIN tracks reach here (secondaries skipped above), so the region-grouping key + channel band
-                // fully identifies a duplicate group (region-distinct only when method_dedup_region=distinct).
+                // Only MAIN tracks reach here (secondaries skipped above), so the region-grouping key + channel
+                // band fully identifies a duplicate group (region-distinct only when method_dedup_region=distinct).
                 const key = `${s.awkRegionKey}|${dedupBand}`;
                 if (seen.has(key)) {
                     const kept = seen.get(key);
@@ -2048,6 +2033,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     seen.set(key, s);
             }
         }
+        // ====== END DEDUPLICATE ======
 
         // libopus only accepts its RFC-mapping layouts and HARD-ERRORS on the rest, failing the whole job; ffmpeg's DEFAULT layout for 3ch
         // (2.1) and 4ch (4.0) is also rejected. AC3/EAC3/AAC accept every layout, so this only guards the force-to-opus path. OK set + relabels
@@ -2169,14 +2155,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             removedIndices.add(s.index);
             workDone += `☐${streamTag(s.index)}[downmix_secondary=delete] Removing secondary ${delToken(s)} (${secondaryRole(s)})\n`;
         }
-
-        // Now that dedup, the tier deletes and the layout-drop pre-pass have finalised removedIndices, snapshot which languages still have a primary stereo /
-        // 5.1-6ch track among the SURVIVORS, so downmix_to_stereo/downmix_to_six only create one for a language that genuinely lacks it (a removed track can't
-        // leave a stale entry). Keyed by awkRegionKey - the IDENTITY key dedup grouped on, region-distinct only under method_dedup_region=distinct, never the
-        // folded match key. Channels 2 = stereo; >4 && <=6 = any 5-6ch primary (5.0/5.1, and the rare 4.1, also 5 channels) but not 4.0 (4ch) or 7.1 (8ch).
-        const survivingPrimaryAudio = audioStreams.filter(s => !removedIndices.has(s.index) && !s.awkSecondaryTrack && s.awkTier === 'surround');
-        const existing2chLangs = new Set(survivingPrimaryAudio.filter(s => s.channels === 2).map(s => s.awkRegionKey));
-        const existing6chLangs = new Set(survivingPrimaryAudio.filter(s => s.channels > 4 && s.channels <= 6).map(s => s.awkRegionKey));
         // ====== END TIER DELETES 2/2: SECONDARY ROLE ======
 
 
@@ -2220,7 +2198,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
 
         // workStreams: surviving candidates that still need codec work (downmix or force codec).
-        let workStreams = candidateStreams
+        const workStreams = candidateStreams
             .filter(s => !removedIndices.has(s.index))
             .filter(s => !noCodecWorkNeeded(s));
 
@@ -2254,14 +2232,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (workStreams.length === 0 && removedIndices.size === 0 && methodLoudnorm === 'disabled') {
             // Flush both buffers like every other exit - skipDone is routinely non-empty here (a guard that blocked the only candidate is exactly the
             // "why did nothing happen" diagnostic), and throwing it away leaves the user with a bare "no changes" line and no reason.
-            response.infoLog += workDone;
-            response.infoLog += skipDone;
+            response.infoLog += workDone + skipDone;
             return skip('☑No audio tracks require changes\n');
         }
         // ====== END WORK STREAM SELECTION ======
 
 
         // ====== DOWNMIX BOOKKEEPING ======
+        // Now that dedup, the tier deletes and the layout-drop pre-pass have finalised removedIndices, snapshot which languages still have a primary stereo /
+        // 5.1-6ch track among the SURVIVORS, so downmix_to_stereo/downmix_to_six only create one for a language that genuinely lacks it (a removed track can't
+        // leave a stale entry). Keyed by awkRegionKey - the IDENTITY key dedup grouped on, region-distinct only under method_dedup_region=distinct, never the
+        // folded match key. Channels 2 = stereo; >4 && <=6 = any 5-6ch primary (5.0/5.1, and the rare 4.1, also 5 channels) but not 4.0 (4ch) or 7.1 (8ch).
+        const survivingPrimaryAudio = audioStreams.filter(s => !removedIndices.has(s.index) && !s.awkSecondaryTrack && s.awkTier === 'surround');
+        const existing2chLangs = new Set(survivingPrimaryAudio.filter(s => s.channels === 2).map(s => s.awkRegionKey));
+        const existing6chLangs = new Set(survivingPrimaryAudio.filter(s => s.channels > 4 && s.channels <= 6).map(s => s.awkRegionKey));
+
         // Seed extraArguments with removal exclusions before any codec args.
         if (removedIndices.size > 0) {
             for (const idx of removedIndices)
@@ -2549,13 +2534,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // ====== END LOUDNORM ======
 
         // ====== ENCODE ARG BUILDERS ======
-        // On a mov output the QuickTime muxer silently drops any language spelling outside its legacy Mac table (deu/nld/de all read back with NO language), so
-        // fold to /T and remap through MOV_LANG - the shared 'mov language remap' section has the why. mkv/mp4 keep the resolved value verbatim (audio_clean never
-        // normalises a language tag - that is clean_and_remux's job), so escMeta is the only transform there.
+        // On a mov output the QuickTime muxer silently drops any language spelling outside its legacy Mac table (deu/nld/de all read back with NO
+        // language), so fold to /T and remap through MOV_LANG - the shared 'mov language remap' section has the why. mkv/mp4 keep the resolved
+        // value verbatim (audio_clean never normalises a language tag - that is clean_and_remux's job), so escMeta is the only transform there.
         const langMetaArg = (idx, lang) => {
             if (!lang) return '';
             const v = dstContainer === 'mov' ? (MOV_LANG[to6392T(lang)] || to6392T(lang)) : lang;
             return ` -metadata:s:a:${idx} "language=${escMeta(v)}"`;
+        };
+
+        // Stereo (2ch) encode tokens for the configured stereoCodec, folding the aac_vbr (per-node VBR via aacVbrArgsIdx) vs
+        // fixed-bitrate branch otherwise duplicated at every 2ch downmix/remix emit site. Returns the -c:a fragment (encoder
+        // + bitrate/quality args), the codec name + rate string + label for the log line, and the output-summary record;
+        // each caller keeps its own -map prefix, log verb/suffix and outputAudioOverride/appendedAudio target inline.
+        const stereoEnc = (idx) => {
+            if (stereoCodec === 'aac_vbr') {
+                const { encoder, args, approxRate, label } = aacVbrArgsIdx(idx);
+                return { frag: `${encoder}${args}`, logCodec: 'aac', rate: approxRate, label, record: { codec: 'aac', channels: 2, bps: 0, approxRate } };
+            }
+            const bps = resolveBitrate(stereoCodec, 2);
+            return {
+                frag: `${audioEncoder(stereoCodec)}${encoderArgsBps(stereoCodec, idx, bps)}`, logCodec: stereoCodec, rate: `${bps / 1000} kb/s`, label: '',
+                record: { codec: stereoCodec, channels: 2, bps },
+            };
         };
 
         // Channel/filter snippet for a new or replaced stereo track. No guard check here: every call site either already passed guardBlocks or is a
@@ -2906,12 +2907,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 const ffstreamCodec = codecNameOf(ffstream) || 'unknown';
                 const isStereo = channels <= 2;
-                // WHICH codec this re-encode lands on. Two candidates, in preference order: keepCodec - the codec the track already has, whenever this
-                // plugin can encode it (what codec_force=false means, and the only option for a source outside our encodable domain: a kept DTS core,
-                // an MP3); configuredCodec - codec_stereo/codec_surround, when codec_force's scope covers this track (the FORCE CODEC block may have
-                // declined it as not worth a lossy generation on its own, but the generation is already being spent on the gain correction - this is
-                // what makes codec_stereo=aac_vbr reach a track already aac). A guard-protected or over-channel-limit target falls back to the other
-                // candidate rather than cancelling the pass, so enabling codec_force can never silently switch loudnorm off.
+                // WHICH codec this re-encode lands on. Two candidates, in preference order: keepCodec - the codec the track already has, whenever this plugin
+                // can encode it (what a track outside codec_force's scope gets - forceCovers false, e.g. codec_force=disabled - and the only option for a
+                // source outside our encodable domain: a kept DTS core, an MP3); configuredCodec - codec_stereo/codec_surround, when codec_force's scope covers
+                // this track (the FORCE CODEC block may have declined it as not worth a lossy generation on its own, but the generation is already being spent
+                // on the gain correction - this is what makes codec_stereo=aac_vbr reach a track already aac). A guard-protected or over-channel-limit target
+                // falls back to the other candidate rather than cancelling the pass, so enabling codec_force can never silently switch loudnorm off.
                 const configuredCodec = isStereo ? stereoCodec : surroundCodec;
                 // Folded like every other identity check (codecFamilyOf), so an aac_latm track keeps AAC; folding the RESOLVED name keeps the mediaInfo
                 // fallback codecNameOf supplies when ffprobe carries none.
@@ -2930,7 +2931,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             + `${codecDisplayName(ffstream)} ${channels}ch (${guardTriple()}); left as ${ffstreamCodec}\n`;
                     continue;
                 }
-                const targetFamily = aacFamily(targetCodec);
+                const targetCodecFamily = aacFamily(targetCodec);
 
                 // Cache check: this stream isn't being touched by anything else this run, so if it already carries a tag matching the CURRENT preset,
                 // its content hasn't changed since we last measured/corrected it against this exact target - trust it and skip the measurement
@@ -2944,7 +2945,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // secondary - a commentary's stereo is not the language's); 'keep' - and 'drop', which can't remove a track once the audio index maps are built
                 // (the codec_force path drops such a track in the pre-pass) - leave it in its source codec, un-normalized.
                 let loudnormRelabel = '';
-                if (targetFamily === 'opus' && channels > 2 && ffstreamCodec !== 'opus') {
+                if (targetCodecFamily === 'opus' && channels > 2 && ffstreamCodec !== 'opus') {
                     const { lay, ok, relabel } = opusLayoutFor(ffstream, channels);
                     if (!ok) {
                         const remixDefer = remixDefersToExistingStereo(ffstream, relabel);
@@ -2955,15 +2956,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // MEASURE FIRST, then decide. The gain correction is the only mandate this loop has - with method_loudnorm=disabled it never runs
                             // at all and the track keeps its source codec and channels - so a track already within LOUDNORM_TOLERANCE_LU (or one the analysis
                             // cap left unmeasured) must not be flattened from surround to stereo for nothing. Every other exit of this loop already bails on
-                            // !changed, and so does this one. Contrast the codec_force remix, which is correct to fire
-                            // unconditionally: there the codec change IS the requested operation and loudnorm merely rides along.
-                            // And NO stamp on the way out, unlike every other within-tolerance exit: stereoArg measured the stereo FOLD, a signal this track
-                            // never becomes here, and the tag records only the preset - so caching it against the source would claim the surround content is
-                            // at target when nothing measured it. Measured on this build, a fold reads 0.95-3.0 LU quieter than the same track natively
-                            // (0.12 LU only on pure dialogue), i.e. past LOUDNORM_TOLERANCE_LU, so the false claim would land exactly on the loud tracks
-                            // loudnorm exists to tame - and this loop's cache check trusts the tag before any codec/layout reasoning, so it would suppress the
-                            // correction for good once the settings stop routing this track through the remix. The cost is one analysis spawn per pass, the
-                            // same price a container that cannot persist the tag already pays.
+                            // !changed, and so does this one. Contrast the codec_force remix, which is correct to fire unconditionally: there the codec change
+                            // IS the requested operation and loudnorm merely rides along. And NO stamp on the way out, unlike every other within-tolerance
+                            // exit: stereoArg measured the stereo FOLD, a signal this track never becomes here, and the tag records only the preset - so
+                            // caching it against the source would claim the surround content is at target when nothing measured it. Measured on this build, a
+                            // fold reads 0.95-3.0 LU quieter than the same track natively (0.12 LU only on pure dialogue), i.e. past LOUDNORM_TOLERANCE_LU, so
+                            // the false claim would land exactly on the loud tracks loudnorm exists to tame - and this loop's cache check trusts the tag
+                            // before any codec/layout reasoning, so it would suppress the correction for good once the settings stop routing this track
+                            // through the remix. The cost is one analysis spawn per pass, the same price a container that cannot persist the tag already pays.
                             const two = stereoArg(outputAudioIdx, ffstream);
                             if (!two.changed) {
                                 skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] ${two.measured
@@ -3015,8 +3015,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // Format in == format out (the plain loudnorm case, and codec_force aimed at the codec the track already uses): match the source rate
                     // rather than re-deriving a ladder target, which would re-encode a 192k mono aac at the 160k aac ceiling and build in a loss nobody
                     // asked for. Only a genuine codec change takes resolveBitrate's transcode target. An unmeasurable source rate falls back to it too.
-                    const sameFormat = targetFamily === codecFamilyOf(ffstream);
-                    const matchedBps = sameFormat ? sameFormatBitrate(targetFamily, channels, srcBitrate) : 0;
+                    const sameFormat = targetCodecFamily === codecFamilyOf(ffstream);
+                    const matchedBps = sameFormat ? sameFormatBitrate(targetCodecFamily, channels, srcBitrate) : 0;
                     const dstBps = matchedBps || resolveBitrate(targetCodec, channels, srcBitrate, ffstream.awkLossless, ffstream.awkQuality);
                     const dstBitArg = encoderArgsBps(targetCodec, outputAudioIdx, dstBps);
                     const srcRateStr = srcRateToken(ffstream);
@@ -3062,6 +3062,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return tokens.join('');
         };
 
+        response.infoLog += workDone + skipDone;
         if (convert === true) {
             // Dispositions (default flag) are intentionally untouched: ffmpeg copies the source disposition onto mapped/transcoded outputs, so a
             // downmix from a default-flagged source also carries default - two default tracks, acceptable (near-identical content, players cope);
@@ -3076,13 +3077,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 .filter((s) => !removedIndices.has(s.index) && !outputAudioOverride.has(outputAudioIdxMap.get(s.index)));
             const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams, copiedStreams);
             response.preset += `<io>-map 0 -c copy${extraArguments}${strictArg}${globalOutputOpt}${mp4KeepTags}`;
-            response.infoLog += workDone;
-            response.infoLog += skipDone;
             response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;
             response.processFile = true;
         } else {
-            response.infoLog += workDone;
-            response.infoLog += skipDone;
             response.infoLog += `☑Audio already has the correct formats available\n`;
             response.processFile = false;
         }
