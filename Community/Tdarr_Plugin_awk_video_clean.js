@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.30',
+    Version: '3.999.31',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1106,10 +1106,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const IDET_SEEK_MIN_DURATION_SEC = 90;   // shorter than this and there is nothing to seek past, so sample from the start
     const IDET_SEEK_FRACTION = 3;            // sample from a third of the way in, clear of opening titles
     const IDET_SEEK_MAX_SEC = 600;           // ceiling, so a feature-length programme is not sampled from an hour in
+    // Only the filter's OWN lines are counters. The input dump prints container tag values to the same stderr and starts a new line at every newline inside
+    // one, so a crafted title can spell out a whole counter line; every dump line is indented, so requiring idet's log prefix at the START of the line shuts
+    // all of them out. The pointer after '@' is matched loosely - 0x-prefixed on Mac/Linux, bare hex on Windows.
+    const IDET_LINE_PREFIX = '^\\[Parsed_idet_\\d+ @ [^\\]\\n]+\\] ';
     // Pull the LAST populated match out of idet's stderr: ffmpeg emits the counters more than once (an all-zero block from a discarded init leads, and the
     // muxer summary trails), so anchoring to the first block reads zeros and anchoring to the end matches nothing - either way no file gets a verdict.
     const lastIdetCounts = (text, re) => {
-        const rx = new RegExp(re, 'g');
+        const rx = new RegExp(IDET_LINE_PREFIX + re, 'gm');
         let best = null; let hit;
         while ((hit = rx.exec(text)) !== null) if (hit.slice(1).some((n) => Number(n) > 0)) best = hit;
         // The CAPTURE GROUPS as numbers - index 0, the whole match, is dropped, so the caller's [0] is group 1. Both consumers index on that: the four-name
@@ -1124,7 +1128,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 '-frames:v', String(IDET_SAMPLE_FRAMES), '-vf', 'idet', '-an', '-sn', '-f', 'null', '-'];
             const r = childProcess.spawnSync(ffmpegPath || 'ffmpeg', args,
                 { encoding: 'utf8', timeout: IDET_PROBE_TIMEOUT_MS, maxBuffer: IDET_PROBE_MAX_BYTES });
-            const text = String((r && r.stderr) || '');
+            // A probe that did not finish gives no verdict. A timeout or the maxBuffer cap still hands back the stderr read SO FAR, and the genuine summary
+            // prints last - so a cut-off read holds at best the init block, and at worst whatever the input dump put there.
+            if (!r || r.error || r.signal || r.status !== 0) {
+                return { kind: 'unknown', why: r && r.error ? (r.error.code || r.error.message) : `ffmpeg exit ${r && r.status !== null ? r.status : 'signalled'}` };
+            }
+            const text = String(r.stderr || '');
             const multi = lastIdetCounts(text,
                 'Multi frame detection:\\s*TFF:\\s*(\\d+)\\s*BFF:\\s*(\\d+)\\s*Progressive:\\s*(\\d+)\\s*Undetermined:\\s*(\\d+)');
             if (!multi) return { kind: 'unknown' };
@@ -1909,7 +1918,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const combedPct = idetPct(idetMemo.combed, idetMemo);
             return idetMemo.kind === 'progressive'
                 ? `☑${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] No combing found (${combedPct} combed frames) - nothing to repair\n`
-                : `☒${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Could not read an interlace verdict from this file - left as-is\n`;
+                : `☒${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Could not read an interlace verdict from this file${
+                    idetMemo.why ? ` (the probe did not finish: ${idetMemo.why})` : ''} - left as-is\n`;
         };
 
         // ---- shared emit helpers ----

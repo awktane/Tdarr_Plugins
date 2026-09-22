@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.44',
+    Version: '3.999.45',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1456,6 +1456,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const unmappedMode = String(inputs.method_unmapped || 'error').toLowerCase();
     const SUBTITLE_LIST_SUFFIX = '.subtitles.txt';
     const subtitleListName = `${videoBase}${SUBTITLE_LIST_SUFFIX}`;   // one name for the file, rather than the same join at five sites
+    const SUBTITLE_LIST_MAX = 1024 * 1024;   // one filename per line is a few KB; a file this size at the list's name is something else
     // seedSubtitleList answers '' for success and free prose for a real failure - but two of its outcomes are NOT failures and the caller has to tell them
     // apart to decide whether to warn. Naming them makes that a comparison against a constant rather than against a sentence someone may reasonably reword,
     // which would turn a healthy state into a ☒ on every pass.
@@ -1554,6 +1555,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const placeViaApi = () => isUnmappedNode && !(mountedLib().dir && mountedLib().writable);
     const serverDestFor = (name) => serverSidePath(path.join(libDir, name));
 
+    const CURL_FILESIZE_EXCEEDED = 63;   // curl's exit status when --max-filesize refuses a transfer
+
     // Fetch one library file to a local path, through the only read an unmapped node has. It addresses a single KNOWN path, which is exactly why
     // the list has to live at a name we can compute rather than one we would have to go looking for. Written straight to disk by curl, never
     // buffered back through spawnSync, so a large sidecar cannot silently exceed maxBuffer and report a failure that never happened. curl's EXIT
@@ -1563,12 +1566,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // endpoint returns HTTP 400 for a missing file, 501 when unmapped nodes are disabled) - i.e. the file genuinely is not retrievable, which a caller may
     // treat as "nothing there". It is FALSE for every way the server was NOT reached to a conclusion - no configured URL, a spawn/connection error, or a
     // transfer that timed out or dropped mid-stream - because then the file may well exist and we simply could not read it, so the two must not be conflated.
-    const downloadLibraryFile = (dest, local) => {
+    // `maxBytes`, when given, has curl refuse a larger file before writing any of it (the server sends its length). That file EXISTS, so the answer is
+    // serverAnswered FALSE - a caller must never read it as "nothing there".
+    const downloadLibraryFile = (dest, local, maxBytes) => {
         const url = serverApiUrl();
         if (!url) return { ok: false, serverAnswered: false, why: 'the node config carries no server URL' };
         const { spawnSync } = require('child_process');
         try { fs.mkdirSync(path.dirname(local), { recursive: true }); } catch (e) { /* already there */ }
-        const r = spawnSync('curl', ['-sS', '-m', String(LIBRARY_DOWNLOAD_S), '-o', local, '-w', '%{http_code}', ...apiAuthArgs(),
+        const r = spawnSync('curl', ['-sS', '-m', String(LIBRARY_DOWNLOAD_S), ...(maxBytes ? ['--max-filesize', String(maxBytes)] : []),
+            '-o', local, '-w', '%{http_code}', ...apiAuthArgs(),
             '-X', 'POST', '-H', 'Content-Type: application/json', '-d', JSON.stringify({ filePath: dest }), `${url}/api/v2/file/download`],
             { encoding: 'utf8', timeout: LIBRARY_DOWNLOAD_S * 1000, input: apiAuthInput() });
         const code = String(r.stdout || '').trim();
@@ -1576,6 +1582,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!r.error && r.status === 0 && code === '200' && size > 0) return { ok: true, serverAnswered: true, why: '' };
         try { fs.unlinkSync(local); } catch (e) { /* nothing landed */ }
         if (r.error) return { ok: false, serverAnswered: false, why: `download failed (${r.error.code || r.error.message})` };
+        if (maxBytes && r.status === CURL_FILESIZE_EXCEEDED) return { ok: false, serverAnswered: false, why: `it is over the ${maxBytes}-byte limit` };
         return r.status === 0
             ? { ok: false, serverAnswered: true, why: `HTTP ${code || 'no response'}` }
             : { ok: false, serverAnswered: false, why: `the transfer did not complete (curl exit ${r.status === null ? 'signalled' : r.status})` };
@@ -1734,6 +1741,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     const SIDECAR_HASH_MAX = 64 * 1024 * 1024;
+    // The same stat-first rule for the other library files read whole as TEXT - the caption sidecar and the subtitle list sit at names anyone can put a
+    // file at. Over the cap it throws like an unreadable file, so each caller's catch keeps its own failure direction; `overCap` lets one say why.
+    const readTextCapped = (p, cap) => {
+        const size = fs.statSync(p).size;
+        if (size > cap) throw Object.assign(new Error(`it is ${size} bytes, over the ${cap}-byte limit`), { overCap: true });
+        return fs.readFileSync(p, 'utf8');
+    };
     // One read per sidecar answers BOTH content questions - hash identity (contentKey) and cue emptiness (groupHasNoCues) - mirroring embeddedTextHashes,
     // whose one ffmpeg pass answers the same pair for the embedded side. Memoised per rel. null = unreadable or over the cap; each caller keeps its own
     // failure direction (contentKey -> a unique never-merged key, groupHasNoCues -> false = not provably empty).
@@ -1869,7 +1883,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (sameDisp && (keep.tags?.title || '') === title && langKey(resolveLang(keep) || 'und') === langKey(lang)) continue;
             out.retag = (out.retag || []).concat([{ index: keep.index, lang, title, disp: [...disp] }]);
             out.log += `☐${streamTag(keep.index)}[deduplicate=enabled_checkmedia] Folding the removed streams' tags onto it (${
-                [lang, title, ...disp].filter(Boolean).join(' ')})\n`;
+                [logSafe(lang), logSafe(title), ...disp].filter(Boolean).join(' ')})\n`;
         }
         return out;
     };
@@ -1879,9 +1893,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // confirm it against the streams as they stand rather than trusting it. This is the METADATA half: match on language + title, the identity our import
     // writes - except on an mp4/mov target, which DROPS per-stream subtitle titles on the mux, so there language alone decides (else a titled sidecar we
     // DID embed never matches its now-title-less stream). A bundle additionally has to see a font attachment - carrying fonts is its reason to exist.
-    // Metadata can only say "something like this is here", never "this one is here" (an edited sidecar keeps its name and matches just as well), so it
-    // decides alone only for a bundle (an archive is not comparable text) or when the text cannot be read; otherwise the sidecar's own bytes must be one
-    // of the tracks. Only a TEXT subtitle can stand in for a loose sidecar - a PGS/VobSub track holds pictures, however well its metadata matches.
+    // Metadata can only say "something like this is here", never "this one is here" (an edited sidecar keeps its name and matches just as well), so a
+    // DELETION trusts it alone only for a bundle (an archive is not comparable text); the import skip also leans on it when the text cannot be read, since
+    // a wrong skip loses nothing. Otherwise the sidecar's own bytes must be one of the tracks. Only a TEXT subtitle can stand in for a loose sidecar - a
+    // PGS/VobSub track holds pictures, however well its metadata matches.
     const markerConfirmsEmbedded = (f, subs, anyFont, mp4Target) => (!f.bundle || anyFont)
         && subs.filter((s) => f.bundle || isTextSub(s.codec_name)).some((s) =>
             langKey(resolveLang(s) || 'und') === langKey(f.lang || 'und') && (mp4Target || (s.tags?.title || '') === (f.title || '')));
@@ -1895,7 +1910,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const listName = subtitleListName;
         const listPath = path.join(workLibDir(), listName);
         let text;
-        try { text = fs.readFileSync(listPath, 'utf8'); } catch (e) { return ''; }   // no list at all is the normal case, and says nothing
+        try { text = readTextCapped(listPath, SUBTITLE_LIST_MAX); } catch (e) {   // no list at all is the normal case, and says nothing
+            return e && e.overCap ? `☒[${delReason}] Leaving ${listName} in place - ${e.message}\n` : '';
+        }
         const entries = readSubtitleList(text).ok;
         if (!entries.length || !entries.some((n) => marked.has(n))) return '';
         if (entries.some((n) => fs.existsSync(path.join(workLibDir(), n)))) return '';
@@ -2076,11 +2093,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const embedded = streamList.filter((s) => codecTypeOf(s) === 'subtitle');
         const anyFont = streamList.some((s) => codecTypeOf(s) === 'attachment' && isFontAttachment(s));
         // Language + title is a proxy for "this is in the file"; the TEXT is the fact itself, and only the fact may authorise an unlink. So the content test
-        // is the PRIMARY one for every ordinary sidecar, and the metadata match is only the fallback for what content cannot cover: a bundle (an .mks is an
-        // archive, and its fonts are what the metadata path checks for) and a probe that could not run at all. That is also what lets a copy the user named
-        // themselves be cleaned up: its title matches no track by construction, yet its content is provably one of them. The hashes cost one pass over the
-        // accepted library file on every successful round trip - the price of never unlinking a sidecar on a resemblance. `confirmedWhy` returns the REASON it
-        // may go, so the deletion line reports what was actually proved.
+        // is the ONLY one for an ordinary sidecar, and the metadata match serves just what content cannot cover: a bundle (an .mks is an archive, and its
+        // fonts are what the metadata path checks for). That is also what lets a copy the user named themselves be cleaned up: its title matches no track by
+        // construction, yet its content is provably one of them. The hashes cost one pass over the accepted library file on every successful round trip - the
+        // price of never unlinking a sidecar on a resemblance. `confirmedWhy` returns the REASON it may go, so the deletion line reports what was proved.
         let hashes;
         const contentConfirms = (f) => {
             if (f.bundle) return false;
@@ -2091,15 +2107,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
         const confirmedWhy = (f) => {
             if (!f.bundle && contentConfirms(f)) return 'its text is in the file';
-            // An EMPTY map is not a failed probe - it is the probe saying the accepted file holds no text for this sidecar to be, which is the strongest
-            // possible answer against deleting it. Only a null map (nothing could be read at all) hands the decision back to the metadata resemblance.
-            const metaOnly = f.bundle || !hashes;   // an archive, or a probe that could not run - the two cases the text cannot settle
-            return (metaOnly && markerConfirmsEmbedded(f, embedded, anyFont, mp4Target)) ? 'the file carries a matching subtitle' : '';
+            // A loose sidecar the text cannot confirm STAYS - whether the probe ran and found no such text, or could not run at all. A failed probe must never
+            // hand the unlink to the resemblance instead: the same file whose marker names the sidecar can make the probe fail (one text cue past the
+            // extractor's 1 MiB event buffer exits 190), so a forged marker plus a forced failure would delete a sidecar that was never embedded anywhere.
+            return (f.bundle && markerConfirmsEmbedded(f, embedded, anyFont, mp4Target)) ? 'the file carries a matching subtitle' : '';
         };
         let deleted = 0; let log = '';
         for (const f of scan.rels.map(parseSidecarRel).filter(Boolean).filter((x) => marked.has(x.rel))) {
             const why = confirmedWhy(f);
-            if (!why) { log += `☒[${delReason}] Marker lists ${f.rel} but nothing in the file is confirmed to be it - not deleting (unverified)\n`; continue; }
+            if (!why) {
+                log += `☒[${delReason}] Marker lists ${f.rel} but nothing in the file is confirmed to be it${
+                    hashes === null ? " (the file's subtitle text could not be read)" : ''} - not deleting (unverified)\n`;
+                continue;
+            }
             try { fs.unlinkSync(path.join(workLibDir(), f.rel)); deleted += 1; log += `☑[${delReason}] Deleted sidecar (${why}): ${f.rel}\n`; }
             catch (e) { log += `☒[${delReason}] Could not delete sidecar ${f.rel}: ${e && e.message ? e.message : e}\n`; }
         }
@@ -2261,9 +2281,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 : ((() => { try { return fs.existsSync(full) ? 'local' : ''; } catch (e) { return ''; } })());
             if (existing === 'remote') return { job: null, staged: true, note: `☑[embedded_cc=enabled] Caption sidecar already in the library: ${name}\n` };
             if (existing === 'local') {
-                let text = null;
-                try { text = fs.readFileSync(full, 'utf8'); } catch (e) { text = null; }
-                if (text === null) return { job: null, note: `☒[embedded_cc=enabled] Could not read ${name} to check it - leaving it alone\n` };
+                let text = null; let overCap = '';
+                try { text = readTextCapped(full, SIDECAR_HASH_MAX); } catch (e) { text = null; overCap = e && e.overCap ? e.message : ''; }
+                if (text === null) {
+                    return { job: null, note: `☒[embedded_cc=enabled] Could not read ${name} to check it${overCap ? ` (${overCap})` : ''} - leaving it alone\n` };
+                }
                 if (!hasNoCues(text, 'srt')) {
                     // This sidecar landed on an earlier pass and holds real cue text, so the bitstream copy may NOW be removed - THIS is the pass that owes
                     // the strip. It is deliberately not done in the pass that WRITES the sidecar: ffmpeg exits 0 having written a cue-less srt whenever the
@@ -2715,7 +2737,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // sidecars, so a video with no text subtitles never has one - and a completed round trip deletes the list once its last entry is embedded.
                 // Failing here would quarantine every such file, turning both "nothing to do" and "finished successfully" into errors. This is the same
                 // outcome a mapped node reaches by scanning the folder and finding no sidecars; only the way it looks is different.
-                const listDl = downloadLibraryFile(listDest, listLocal);
+                const listDl = downloadLibraryFile(listDest, listLocal, SUBTITLE_LIST_MAX);
                 // A server-answered miss (curl reached it, HTTP 400/501) genuinely means no list is there - the same "nothing to import" a mapped node reaches
                 // by scanning an empty folder. A transport failure (server unreachable, timed out, dropped, or no server URL) is NOT that: the list may exist and
                 // we simply could not read it, so mapping it to the benign path would file the video under success with a requested import silently skipped -
@@ -2729,8 +2751,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 if (listedRels === null) {
                     let listText = '';
-                    try { listText = fs.readFileSync(listLocal, 'utf8'); } catch (e) {
-                        failFile(`[method_unmapped=text_file] Fetched ${listName} but could not read it back: ${e && e.message ? e.message : e}`);
+                    try { listText = readTextCapped(listLocal, SUBTITLE_LIST_MAX); } catch (e) {
+                        failFile(e && e.overCap ? `[method_unmapped=text_file] ${listName} is too large to be a subtitle list - ${e.message}`
+                            : `[method_unmapped=text_file] Fetched ${listName} but could not read it back: ${e && e.message ? e.message : e}`);
                     }
                     const parsed = readSubtitleList(listText);
                     for (const [entry, why] of parsed.bad) response.infoLog += `☒[method_unmapped=text_file] Ignoring "${logSafe(entry)}" in ${listName} - ${why}\n`;
@@ -2872,7 +2895,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // finds the track already matching and does nothing. See the group-level skip below.
         const candidates = found.filter((f) => {
             if (pathIsPresetSafe(path.join(workLibDir(), f.rel))) return true;
-            response.infoLog += `☒Skipping sidecar with an unsafe filename (a quote, control char or <io>), cannot import safely: ${f.rel}\n`;
+            response.infoLog += `☒Skipping sidecar with an unsafe filename (a quote, control char or <io>), cannot import safely: ${logSafe(f.rel)}\n`;
             return false;
         });
 
@@ -2981,7 +3004,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (cur?.disposition?.default === 1) wantDisp.add('default');
             const sameDisp = sameDispositions(curDisp, wantDisp);
             if (curTitle === (f.title || '') && langKey(resolveLang(cur) || 'und') === langKey(f.lang || 'und') && sameDisp) continue;
-            const named = [f.lang, f.title, ...f.disp].filter(Boolean).join(' ');
+            const named = [logSafe(f.lang), logSafe(f.title), ...f.disp].filter(Boolean).join(' ');
             if (metadataMode !== 'sidecar') {
                 response.infoLog += `☒${streamTag(at)}[method_import_metadata=${metadataMode}] The sidecar name and the embedded track disagree on metadata `
                     + `- keeping the track's own (name: ${named})\n`;
