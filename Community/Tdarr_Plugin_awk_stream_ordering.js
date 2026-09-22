@@ -17,7 +17,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file carrying clean_and_remux's awk_recovered tag: a
         repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. This check
         is always on and has no setting.\n`,
-    Version: '4.999.19',
+    Version: '4.999.20',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -852,6 +852,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return `[${type || 'unknown'}:${codec}]`;
     };
+    // -=-=-= summariseAll [all five] =-=-=-
+    // A whole stream list as its token line - the Input streams line, and every plain "Expected results" line. Those are meant to be the SAME view of the
+    // stream set before and after, often from mutually exclusive branches, so hand-typed copies drift in a way only one run type ever shows.
+    const summariseAll = (list) => list.map((s) => summariseStream(enrichStream(s))).join('');
 
     // -=-=-= globalOutputOpt [all five] =-=-=-
     // Output-side options applied to EVERY run (the place for any universal muxer/output flag). -max_muxing_queue_size 9999 pre-empts ffmpeg's "Too many
@@ -1150,7 +1154,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // ====== END TRUNCATION CHECK ======
 
         // Input summary — the streams exactly as they arrived, before re-ordering.
-        response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
+        response.infoLog += `☐Input streams: ${summariseAll(file.ffProbeData.streams)}\n`;
 
         // ====== ORDERING KEYS ======
 
@@ -1217,10 +1221,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return qualityOrder.dir === 'ascending' ? a.audioQuality - b.audioQuality : b.audioQuality - a.audioQuality;
             return 0;
         };
+        // ====== END ORDERING KEYS ======
 
         // ====== STREAM TABLE + SORT ======
 
-        const streams = [];
+        const sortRows = [];
         for (let i = 0; i < file.ffProbeData.streams.length; i++) {
             const ffstream = file.ffProbeData.streams[i];
             // Enrich with the both-probe bitrate and channel count before audioQuality/summariseStream (see resolveStreamBitrate/resolveChannels above).
@@ -1231,7 +1236,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Resolve the canonical codec once (resolveCodecName does a probe-join + string work); order_codec membership can't change between list entries.
             const canon = streamType === 'audio' ? resolveCodecName(enrichedStream) : '';
 
-            streams.push({
+            sortRows.push({
                 index: ffstream.index,
                 origPos: i,
                 stream: enrichedStream,
@@ -1273,7 +1278,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // default on pass 1, then re-sort it once its default is stripped (a wasteful extra reorder remux before it settles). undefined
         // when no track is flagged default, so audio_first='default_tagged' then falls through to normal ordering. Identity-compared below.
         const winningDefault = audioFirst === 'default_tagged'
-            ? streams.filter(s => s.type === 'audio' && s.default).sort((a, b) => compareAudioKeys(a, b) || a.index - b.index)[0]
+            ? sortRows.filter(s => s.type === 'audio' && s.default).sort((a, b) => compareAudioKeys(a, b) || a.index - b.index)[0]
             : undefined;
 
         // Per-type comparators (pure: read only a/b and the closed-over read-only audioFirst/subtitleFirst/winningDefault/compareAudioKeys). Each
@@ -1315,7 +1320,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
 
         //Sort the streams: stream-type precedence, then the per-type comparator, then source-index order as the final tie-break.
-        streams.sort((a, b) => {
+        sortRows.sort((a, b) => {
             const aOrder = streamOrder[a.type] ?? UNKNOWN_TYPE_ORDER;
             const bOrder = streamOrder[b.type] ?? UNKNOWN_TYPE_ORDER;
 
@@ -1331,6 +1336,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             //Attachments and data get no comparator - their relative order doesn't matter
             return a.index - b.index;
         });
+        // ====== END STREAM TABLE + SORT ======
 
         // ====== JUNK TAG STRIP ======
 
@@ -1374,34 +1380,34 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const canPersistDefault = ['mkv', 'mka', 'webm'].includes(dstContainer) || isMp4Family(dstContainer);
         let defaultFlagSkipped = false;
 
-        for (let i = 0; i < streams.length; i++) {
-            ffmpegMap += ` -map 0:${streams[i].index}`;
+        for (let i = 0; i < sortRows.length; i++) {
+            ffmpegMap += ` -map 0:${sortRows[i].index}`;
             // Compare against each stream's ORIGINAL array position, not its absolute ffprobe index, so a file already in the desired order but with
             // non-contiguous indices (e.g. 0,1,3 after an upstream drop) isn't remuxed pointlessly. -map still uses the absolute index above.
-            if (streams[i].origPos !== i) orderChanged = true;
+            if (sortRows[i].origPos !== i) orderChanged = true;
 
             // remove_junk_tags (per-stream): clear this stream's encoder tags, keyed on its OUTPUT index i (see junkStreamClears).
-            const streamJunk = junkStreamClears(streams[i].stream, i);
+            const streamJunk = junkStreamClears(sortRows[i].stream, i);
             if (streamJunk) {
                 junkArgs += streamJunk;
-                junkLog += `☐${streamTag(streams[i].index)}[remove_junk_tags=${junkTagsMode}] Remove encoder tag(s) from ${streams[i].type} stream\n`;
+                junkLog += `☐${streamTag(sortRows[i].index)}[remove_junk_tags=${junkTagsMode}] Remove encoder tag(s) from ${sortRows[i].type} stream\n`;
             }
 
-            if (streams[i].type === 'audio') {
+            if (sortRows[i].type === 'audio') {
                 audioIndex++;
                 const wantDefault = audioIndex === 0;
                 if (!canPersistDefault) {
                     // Container can't keep the flag - suppress the write (else it loops); remember one skip so the ☒ note below fires exactly once.
-                    if (streams[i].default !== wantDefault) defaultFlagSkipped = true;
+                    if (sortRows[i].default !== wantDefault) defaultFlagSkipped = true;
                 } else {
-                    if (wantDefault && !streams[i].default)
+                    if (wantDefault && !sortRows[i].default)
                         dispositionArgs += ` -disposition:a:${audioIndex} +default`;
-                    else if (!wantDefault && streams[i].default)
+                    else if (!wantDefault && sortRows[i].default)
                         dispositionArgs += ` -disposition:a:${audioIndex} -default`;
                     // Reflect the normalized flag in the Expected results summary (summariseStream reads disposition.default);
                     // shallow-clone so the source probe object is untouched.
-                    if (streams[i].default !== wantDefault)
-                        streams[i].stream = { ...streams[i].stream, disposition: { ...streams[i].stream.disposition, default: wantDefault ? 1 : 0 } };
+                    if (sortRows[i].default !== wantDefault)
+                        sortRows[i].stream = { ...sortRows[i].stream, disposition: { ...sortRows[i].stream.disposition, default: wantDefault ? 1 : 0 } };
                 }
             }
         }
@@ -1416,6 +1422,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     junkLog += `☐[remove_junk_tags=${junkTagsMode}] Remove ${k} tag from file\n`;
                 }
             }
+        // ====== END JUNK TAG STRIP ======
 
         // ====== MOOV / FASTSTART PROBE ======
 
@@ -1456,6 +1463,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const isMp4 = isMp4Family(dstContainer);
         const faststartOn = methodFaststart === 'force';
         const needsFront = faststartOn && isMp4 && !moovBeforeMdat(file.file, otherArguments);
+        // ====== END MOOV / FASTSTART PROBE ======
 
         // ====== DECIDE + REPORT ======
 
@@ -1477,12 +1485,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // is the fixed video → audio → subtitle → attachment → data precedence that no setting changes, while a within-group sort is what the order_* and
         // audio_first/subtitle_first settings decide. Both lines stay BARE of an [input=value] tag: regrouping has no setting behind it, and a within-group
         // sort is the combined verdict of the whole order_* precedence chain, so naming any one of them would be a guess (see the infoLog contract).
-        const originalOrder = streams.slice().sort((a, b) => a.origPos - b.origPos);
+        const originalOrder = sortRows.slice().sort((a, b) => a.origPos - b.origPos);
         const typeSeq = (arr) => arr.map((s) => s.type).join(',');
-        const regrouped = typeSeq(originalOrder) !== typeSeq(streams);
+        const regrouped = typeSeq(originalOrder) !== typeSeq(sortRows);
         const sortedWithin = [];   // "<n> <type>" per type group whose members changed order among themselves
-        for (const t of new Set(streams.map((s) => s.type))) {
-            const positions = streams.filter((s) => s.type === t).map((s) => s.origPos);
+        for (const t of new Set(sortRows.map((s) => s.type))) {
+            const positions = sortRows.filter((s) => s.type === t).map((s) => s.origPos);
             if (!positions.every((p, i) => i === 0 || positions[i - 1] < p)) sortedWithin.push(`${positions.length} ${t}`);
         }
         if (regrouped)
@@ -1497,22 +1505,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // (see mp4MovflagsArg below), so a reorder or a disposition fix front-loads the file just as surely, and a ☐ line marks a change about to be made.
         if (needsFront)
             response.infoLog += `☐[method_mp4_faststart=${methodFaststart}] Front-load the mp4 moov atom on this remux\n`;
+        // ====== END DECIDE + REPORT ======
         // ====== PRESET ASSEMBLY ======
 
         // mp4/mov muxers drop a custom GLOBAL metadata tag (e.g. clean_and_remux's awk_recovered, set upstream) on a -c copy remux unless told to keep it,
         // which would re-trigger recovery on the next pass. Preserve it on the mov family, and append +faststart when method_mp4_faststart is on.
         const mp4MovflagsArg = isMp4 ? ` -movflags use_metadata_tags${faststartOn ? '+faststart' : ''}` : '';
         // The -strict level this mp4/mov -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses
-        // without it. Pass the RAW ffprobe streams (the local `streams` array above is rebuilt for ordering and lacks codec_tag_string / side_data_list, the
-        // DV signals); this plugin only reorders, so every stream is copied and the copied-subset argument stays at its default.
+        // without it. It reads the RAW ffprobe streams, never sortRows (see its header); this plugin only reorders, so every stream is copied and the
+        // copied-subset argument stays at its default.
         const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams);
         response.preset = `<io>${ffmpegMap} -c copy${dispositionArgs}${junkArgs}${strictArg}${globalOutputOpt}${mp4MovflagsArg}`;
         if (dispositionArgs !== '')
             response.infoLog += '☐Set the first audio track as the sole default\n';
         response.infoLog += junkLog;
-        response.infoLog += `☑Expected results: ${streams.map(s => summariseStream(s.stream)).join('')}\n`;
+        response.infoLog += `☑Expected results: ${sortRows.map(s => summariseStream(s.stream)).join('')}\n`;
 
         return response;
+        // ====== END PRESET ASSEMBLY ======
     } catch (err) {
         failUnexpected(err);   // AwkFailFile → rethrow unchanged; anything else → annotate + fail the file with the full infoLog
     }

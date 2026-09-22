@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.37',
+    Version: '4.999.38',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -855,6 +855,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return `[${type || 'unknown'}:${codec}]`;
     };
+    // -=-=-= summariseAll [all five] =-=-=-
+    // A whole stream list as its token line - the Input streams line, and every plain "Expected results" line. Those are meant to be the SAME view of the
+    // stream set before and after, often from mutually exclusive branches, so hand-typed copies drift in a way only one run type ever shows.
+    const summariseAll = (list) => list.map((s) => summariseStream(enrichStream(s))).join('');
 
     // -=-=-= globalOutputOpt [all five] =-=-=-
     // Output-side options applied to EVERY run (the place for any universal muxer/output flag). -max_muxing_queue_size 9999 pre-empts ffmpeg's "Too many
@@ -937,6 +941,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .replace(/"/g, "'")                // double-quote → single-quote (safe inside the quoted value)
         .replace(/<io>/gi, '(io)');        // preset split marker → inert text (a value may never carry a second marker)
     // ===== END SHARED: ffmpeg metadata escaping =====
+    // #endregion
+
+    // #region SHARED helpers (1 section: ffmpeg path)
+    // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: ffmpeg path =====
+    // -=-=-= ffmpegPathOf  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
+    // The node's ffmpeg: Tdarr hands a classic plugin otherArguments.ffmpegPath, and the bare name - a PATH lookup - stands in when it supplied none.
+    // Every spawn in the four plugins that run ffmpeg resolves the binary here, so a change to how it is found reaches all of them at once.
+    const ffmpegPathOf = (otherArgs) => String(otherArgs?.ffmpegPath || 'ffmpeg');
+    // ===== END SHARED: ffmpeg path =====
     // #endregion
 
     // Missing/partial probe data fails the file with a clear reason, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
@@ -1202,16 +1215,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const alwaysDropSubs  = ['xsub', 'dvb_teletext'];
     const mkvOnlyDropSubs = ['ttml'];
     const mp4OnlyDropSubs = ['hdmv_pgs_subtitle', 'dvb_subtitle', 'arib_caption', 'hdmv_text_subtitle'];
-    // Legacy PC/fansub text codecs with no Matroska CodecID and no native mp4 support: a bare -c copy would fail the
-    // remux, but ffmpeg decodes them as text, so BOTH container branches below convert them (mkv -> srt, mp4 -> mov_text).
-    // Hoisted once so the two branches can't drift (a codec added to one list but not the other aborts a remux).
-    const legacyTextSubs = ['microdvd', 'mpl2', 'jacosub', 'sami', 'realtext', 'subviewer', 'subviewer1', 'vplayer', 'pjs', 'stl'];
-    // eia_608 as a real SUBTITLE STREAM - rare but real (a QuickTime 608 capture in the corpus). NOT the bitstream-embedded closed captions, which are
-    // sub_worker's embedded_cc business. Neither container stores it, but ffmpeg DECODES it, so it converts rather than being thrown away. Listed
-    // separately because it converts to `text`, not `srt`, on mkv: cc_dec emits ASS internally and the srt encoder passes unknown override tags THROUGH
-    // (measured 17 `{\an7}`-style tokens on positioned content vs 0 for `text`), which Plex renders as literal on-screen words. Both land as subrip
-    // inside matroska, so the choice costs nothing but the overrides; mov_text strips them too, so mp4 needs no special case.
+
+    // #region SHARED helpers (1 section: decodable text subtitle vocabulary)
+    // ===== SHARED [clean_and_remux, sub_worker]: decodable text subtitle vocabulary =====
+    // -=-=-= LEGACY_TEXT_SUBS / CC_STREAM_SUBS / CC_STREAM_ENCODER  [clean_and_remux, sub_worker] =-=-=-
+    // The decodable-to-text subtitle formats no container we target can store: clean_and_remux CONVERTS them on a remux (a bare -c copy would fail it)
+    // and sub_worker EXTRACTS them, the only way they leave the file on a standalone run. Shared so the two cannot drift - a codec only one side knew would
+    // convert on remux yet be invisible to a standalone extract. Every one has a decoder on the production build.
+    // LEGACY_TEXT_SUBS: PC/fansub text codecs with no Matroska CodecID and no native mp4 support - they become srt (mkv, sidecar) or mov_text (mp4).
+    // CC_STREAM_SUBS: eia_608 as a real SUBTITLE STREAM - rare but real (a QuickTime 608 capture in the corpus), NOT the bitstream-embedded closed captions
+    // (sub_worker's embedded_cc). It takes CC_STREAM_ENCODER rather than srt: cc_dec emits ASS internally and the srt encoder passes unknown override tags
+    // THROUGH - measured, 17 `{\an7}`-style tokens on positioned content against 0 for `text`, plus a <font> wrapper - which Plex renders as literal
+    // on-screen words. `text` lands as subrip in matroska, so the choice costs nothing but the overrides; mov_text strips them too, so mp4 needs no case.
+    const LEGACY_TEXT_SUBS = ['microdvd', 'mpl2', 'jacosub', 'sami', 'realtext', 'subviewer', 'subviewer1', 'vplayer', 'pjs', 'stl'];
     const CC_STREAM_SUBS = ['eia_608'];
+    const CC_STREAM_ENCODER = 'text';
+    // ===== END SHARED: decodable text subtitle vocabulary =====
+    // #endregion
+
     const subFormatDropped = (codec) => alwaysDropSubs.includes(codec)
         || (dstContainer === 'mkv' && mkvOnlyDropSubs.includes(codec))
         || (dstContainer === 'mp4' && mp4OnlyDropSubs.includes(codec));
@@ -1480,7 +1501,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const clearStaged = () => { try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch (e) { /* see above */ } };
         const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', String(file._id || file.file || '')];
         for (const j of staged) args.push(...j.args, j.tmp);
-        const ff = spawnSync(String(otherArguments?.ffmpegPath || 'ffmpeg'), args,
+        const ff = spawnSync(ffmpegPathOf(otherArguments), args,
             { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES });
         if (ff.error || ff.status !== 0) {
             const why = ff.error ? `extraction failed (${ff.error.code || ff.error.message})`
@@ -1595,7 +1616,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: sidecar name tokens =====
     // #endregion
 
-    const exportSidecarName = (ffstream, ext, mark) => {
+    // This stream's export filename - built from the shared sidecar name tokens, the same shape sub_worker's own sidecarBasename writes and parses back.
+    const sidecarBasename = (ffstream, ext, mark) => {
         // Every token but the extension comes from the shared sidecarNameTokens: that vocabulary is what makes the name readable by sub_worker's importer,
         // which treats a bundle's FILENAME as the disposition authority (it writes an explicit `-disposition 0` when the name carries no token). A wrong token
         // therefore clears the wrong disposition on reimport - and this is the one export path that DELETES the source stream (the bundle is meant to be a
@@ -1898,7 +1920,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Summarise the input streams exactly as they arrived, before any removal/remux/quarantine. This plugin runs first, so it captures the file as
         // received; reading it alongside the stream-ordering plugin's output line shows where a file came from and where it ended up. Emitted ahead of the
         // muxability / guard_audio_language / language_fill_mode pre-checks so a quarantine from any of them still carries the input picture.
-        response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
+        response.infoLog += `☐Input streams: ${summariseAll(file.ffProbeData.streams)}\n`;
 
         // method_unmuxable: the destination muxer cannot store one of this file's codecs, so a -c copy remux would die on an opaque ffmpeg error. Runs
         // FIRST among the pre-checks - it is the most fundamental "can this even be written" question - and, load-bearing, before anything reads
@@ -2070,7 +2092,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const sidecarPlan = (ffstream, styled) => {
             const spec = styled ? STYLED_BUNDLE : IMAGE_SUB[codecNameOf(ffstream)];
             return {
-                name: exportSidecarName(ffstream, spec.ext, styled ? STYLED_BUNDLE.mark : ''),
+                name: sidecarBasename(ffstream, spec.ext, styled ? STYLED_BUNDLE.mark : ''),
                 mapTokens: styled
                     ? ['-map', `0:${ffstream.index}`, ...styledFontIndices.flatMap((i) => ['-map', `0:${i}`]), '-c', 'copy', '-f', spec.fmt]
                     : ['-map', `0:${ffstream.index}`, '-c:s', 'copy', '-f', spec.fmt],
@@ -2422,17 +2444,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 emitCommentRemoval('s', subtitleStreamIndex, 'subtitle');
 
-                // mkv: mov_text is a QuickTime-only format that most players won't render in mkv — convert to srt. The legacyTextSubs formats have NO Matroska
-                //      CodecID either, so a bare -c copy would fail the whole remux — ffmpeg decodes them as text, so they convert to srt too. mkv keeps
-                //      subrip/ass/ssa/webvtt/text + the bitmap codecs (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle, hdmv_text_subtitle) natively; xsub has
-                //      no CodecID and is not decodable text, so it is dropped above (alwaysDropSubs).
+                // mkv: mov_text is a QuickTime-only format that most players won't render in mkv — convert to srt. The LEGACY_TEXT_SUBS formats have NO
+                //      Matroska CodecID either, so a bare -c copy would fail the whole remux — ffmpeg decodes them as text, so they convert to srt too.
+                //      mkv keeps subrip/ass/ssa/webvtt/text + the bitmap codecs (hdmv_pgs_subtitle, dvd_subtitle, dvb_subtitle, hdmv_text_subtitle)
+                //      natively; xsub has no CodecID and is not decodable text, so it is dropped above (alwaysDropSubs).
                 // mp4: only mov_text is natively supported, so every decodable text codec converts to it — subrip/srt/ass/ssa/webvtt/text plus
-                //      legacyTextSubs — or they hit the bare -c copy and fail the whole remux. text is raw UTF-8 that ffmpeg normalises to subrip on mux.
+                //      LEGACY_TEXT_SUBS — or they hit the bare -c copy and fail the whole remux. text is raw UTF-8 that ffmpeg normalises to subrip on mux.
                 let subConvertTarget = null;
-                if (dstContainer === 'mkv' && CC_STREAM_SUBS.includes(ffstreamCodec)) subConvertTarget = 'text';   // NOT srt - see CC_STREAM_SUBS
-                else if (dstContainer === 'mkv' && ['mov_text', ...legacyTextSubs].includes(ffstreamCodec)) subConvertTarget = 'srt';
+                if (dstContainer === 'mkv' && CC_STREAM_SUBS.includes(ffstreamCodec)) subConvertTarget = CC_STREAM_ENCODER;   // NOT srt - see CC_STREAM_SUBS
+                else if (dstContainer === 'mkv' && ['mov_text', ...LEGACY_TEXT_SUBS].includes(ffstreamCodec)) subConvertTarget = 'srt';
                 else if (dstContainer === 'mp4'
-                    && ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'text', ...CC_STREAM_SUBS, ...legacyTextSubs].includes(ffstreamCodec))
+                    && ['subrip', 'srt', 'ass', 'ssa', 'webvtt', 'text', ...CC_STREAM_SUBS, ...LEGACY_TEXT_SUBS].includes(ffstreamCodec))
                     subConvertTarget = 'mov_text';
                 if (subConvertTarget) {
                     // The ENCODER and the codec that ends up in the container are the same everywhere except `text`, which matroska stores as subrip

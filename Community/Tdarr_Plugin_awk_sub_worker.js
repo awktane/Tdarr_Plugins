@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.46',
+    Version: '3.999.47',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -713,6 +713,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return `[${type || 'unknown'}:${codec}]`;
     };
+    // -=-=-= summariseAll [all five] =-=-=-
+    // A whole stream list as its token line - the Input streams line, and every plain "Expected results" line. Those are meant to be the SAME view of the
+    // stream set before and after, often from mutually exclusive branches, so hand-typed copies drift in a way only one run type ever shows.
+    const summariseAll = (list) => list.map((s) => summariseStream(enrichStream(s))).join('');
 
     // -=-=-= globalOutputOpt [all five] =-=-=-
     // Output-side options applied to EVERY run (the place for any universal muxer/output flag). -max_muxing_queue_size 9999 pre-empts ffmpeg's "Too many
@@ -798,6 +802,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: ffmpeg metadata escaping =====
     // #endregion
 
+    // #region SHARED helpers (1 section: ffmpeg path)
+    // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: ffmpeg path =====
+    // -=-=-= ffmpegPathOf  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
+    // The node's ffmpeg: Tdarr hands a classic plugin otherArguments.ffmpegPath, and the bare name - a PATH lookup - stands in when it supplied none.
+    // Every spawn in the four plugins that run ffmpeg resolves the binary here, so a change to how it is found reaches all of them at once.
+    const ffmpegPathOf = (otherArgs) => String(otherArgs?.ffmpegPath || 'ffmpeg');
+    // ===== END SHARED: ffmpeg path =====
+    // #endregion
+
+    // #region SHARED helpers (1 section: decodable text subtitle vocabulary)
+    // ===== SHARED [clean_and_remux, sub_worker]: decodable text subtitle vocabulary =====
+    // -=-=-= LEGACY_TEXT_SUBS / CC_STREAM_SUBS / CC_STREAM_ENCODER  [clean_and_remux, sub_worker] =-=-=-
+    // The decodable-to-text subtitle formats no container we target can store: clean_and_remux CONVERTS them on a remux (a bare -c copy would fail it)
+    // and sub_worker EXTRACTS them, the only way they leave the file on a standalone run. Shared so the two cannot drift - a codec only one side knew would
+    // convert on remux yet be invisible to a standalone extract. Every one has a decoder on the production build.
+    // LEGACY_TEXT_SUBS: PC/fansub text codecs with no Matroska CodecID and no native mp4 support - they become srt (mkv, sidecar) or mov_text (mp4).
+    // CC_STREAM_SUBS: eia_608 as a real SUBTITLE STREAM - rare but real (a QuickTime 608 capture in the corpus), NOT the bitstream-embedded closed captions
+    // (sub_worker's embedded_cc). It takes CC_STREAM_ENCODER rather than srt: cc_dec emits ASS internally and the srt encoder passes unknown override tags
+    // THROUGH - measured, 17 `{\an7}`-style tokens on positioned content against 0 for `text`, plus a <font> wrapper - which Plex renders as literal
+    // on-screen words. `text` lands as subrip in matroska, so the choice costs nothing but the overrides; mov_text strips them too, so mp4 needs no case.
+    const LEGACY_TEXT_SUBS = ['microdvd', 'mpl2', 'jacosub', 'sami', 'realtext', 'subviewer', 'subviewer1', 'vplayer', 'pjs', 'stl'];
+    const CC_STREAM_SUBS = ['eia_608'];
+    const CC_STREAM_ENCODER = 'text';
+    // ===== END SHARED: decodable text subtitle vocabulary =====
+    // #endregion
+
     // ====== SUBTITLE SIDECAR HELPERS (non-shared) ======
     // Text subtitle codecs we can round-trip, mapped to the sidecar's native extension + ffmpeg encoder. Bitmap
     // codecs (hdmv_pgs_subtitle/dvd_subtitle/dvb_subtitle/xsub) have no text form: never extracted, never removed.
@@ -809,23 +839,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ass:      { ext: 'ass', enc: 'ass' },
         ssa:      { ext: 'ass', enc: 'ass' },
         webvtt:   { ext: 'vtt', enc: 'webvtt' },
-        // Decodable-to-text formats no container we target can store, so a sidecar is the ONLY way they leave the file - the same set clean_and_remux
-        // converts on a remux, kept in step with it so a standalone sub_worker run is not blind to a subtitle the first plugin would have rescued. Every
-        // one has a decoder on the production build. eia_608 is the single row that does not take the srt encoder: it is a real subtitle STREAM (a
-        // QuickTime 608 capture), cc_dec emits ASS internally, and the srt encoder passes unknown override tags THROUGH - measured, an {\an7}-positioned
-        // cue writes the token literally and gains a <font> wrapper, while `text` writes clean SRT. The legacy family carries no overrides, so it takes
-        // srt like the canonical rows above. Listed AFTER them so EXT_TO_CODEC still resolves .srt back to subrip.
-        eia_608:    { ext: 'srt', enc: 'text' },
-        microdvd:   { ext: 'srt', enc: 'srt' },
-        mpl2:       { ext: 'srt', enc: 'srt' },
-        jacosub:    { ext: 'srt', enc: 'srt' },
-        sami:       { ext: 'srt', enc: 'srt' },
-        realtext:   { ext: 'srt', enc: 'srt' },
-        subviewer:  { ext: 'srt', enc: 'srt' },
-        subviewer1: { ext: 'srt', enc: 'srt' },
-        vplayer:    { ext: 'srt', enc: 'srt' },
-        pjs:        { ext: 'srt', enc: 'srt' },
-        stl:        { ext: 'srt', enc: 'srt' },
+        // The decodable-to-text formats a sidecar is the only way out for (the shared decodable text subtitle vocabulary). eia_608 alone takes its own
+        // encoder; the legacy family carries no overrides, so it takes srt like the canonical rows above. Listed AFTER them so EXT_TO_CODEC still resolves
+        // .srt back to subrip.
+        ...Object.fromEntries(CC_STREAM_SUBS.map((c) => [c, { ext: 'srt', enc: CC_STREAM_ENCODER }])),
+        ...Object.fromEntries(LEGACY_TEXT_SUBS.map((c) => [c, { ext: 'srt', enc: 'srt' }])),
     };
     const isTextSub = (codec) => Object.prototype.hasOwnProperty.call(TEXT_SUB, String(codec).toLowerCase());
     // Both directions of the table above, derived from it so a new codec row is ONE edit: the loose-text sidecar extensions extract writes (parseSidecar
@@ -916,6 +934,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const encodeMarker = (s) => pctEncode(s, MARKER_SAFE);
     const encodeMarkerList = (names) => names.map(encodeMarker).join(',');
     const decodeMarkerList = (v) => String(v || '').split(',').filter(Boolean).map(pctDecode);
+    // The global tag that lists the sidecars an import muxed in - named once, because a read and a write that drift apart fail silently: the import never
+    // recognises its own work again and re-muxes every sidecar on every pass.
+    const SUB_MARKER_TAG = 'awk_sub_worker';
 
     // #region SHARED helpers (5 sections: preset path safety … language display name)
     // ===== SHARED [clean_and_remux, sub_worker]: preset path safety =====
@@ -1070,7 +1091,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const clearStaged = () => { try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch (e) { /* see above */ } };
         const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', String(file._id || file.file || '')];
         for (const j of staged) args.push(...j.args, j.tmp);
-        const ff = spawnSync(String(otherArguments?.ffmpegPath || 'ffmpeg'), args,
+        const ff = spawnSync(ffmpegPathOf(otherArguments), args,
             { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES });
         if (ff.error || ff.status !== 0) {
             const why = ff.error ? `extraction failed (${ff.error.code || ff.error.message})`
@@ -1457,6 +1478,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // Parse each scanned path as a sidecar, carrying its relative path along as the identity everything downstream keys on.
     const parseSidecarRel = (rel) => { const p = parseSidecar(relBasename(rel)); return p ? { ...p, rel } : null; };
+    // ====== END SUBTITLE SIDECAR HELPERS ======
 
     // ====== UNMAPPED-NODE LIBRARY ACCESS (method_unmapped) ======
     // An unmapped node is handed a local MIRROR of the library, never the library itself, and Tdarr withholds the user's own path translators from it -
@@ -1682,6 +1704,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return { ok, bad };
     };
+    // ====== END UNMAPPED-NODE LIBRARY ACCESS ======
 
     // ====== SIDECAR SCAN / HASH / DEDUP (both node types) ======
     // Where a sidecar can legitimately live. Plex is the only one of the three servers that reads a SUBFOLDER: it accepts `subs` or `subtitles` beside the
@@ -1820,7 +1843,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             outs.set(s.index, out);
         }
         const { spawnSync } = require('child_process');
-        const r = spawnSync(String(otherArguments?.ffmpegPath || 'ffmpeg'), args,
+        const r = spawnSync(ffmpegPathOf(otherArguments), args,
             { encoding: 'utf8', timeout: SUB_EXTRACT_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES });
         if (!r.error && r.status === 0) {
             const map = new Map();
@@ -1932,6 +1955,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         try { fs.unlinkSync(listPath); return `☑[${delReason}] Deleted ${listName} - every sidecar it listed is now in the file\n`; }
         catch (e) { return `☒[${delReason}] Could not delete ${listName}: ${e && e.message ? e.message : e}\n`; }
     };
+    // ====== END SIDECAR SCAN / HASH / DEDUP ======
 
     // ====== EMBEDDED CLOSED CAPTIONS ======
     // Captions are read out through the lavfi `movie` source with its subcc output, which decodes the video and surfaces the A53 caption channel as a
@@ -1963,6 +1987,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         '-map', '1:s:0', '-c:s', 'text', '-f', 'srt'];
     // The one wording for "the caption channel was read out to this sidecar", shared by the same two routes.
     const ccReadLine = (videoIdx, name) => `☑${streamTag(videoIdx)}[embedded_cc=enabled] Read the embedded closed captions -> ${name}\n`;
+    // ====== END EMBEDDED CLOSED CAPTIONS ======
 
     // ====== GUARDS + INPUT VALIDATION (before the try, per the suite's failFile convention) ======
     // WHICH STAGE this is. The plugin declares no Stage, so Tdarr runs it in both stacks; post-processing is handed exactly {homePath, handbrakePath,
@@ -1997,7 +2022,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     ];
     for (const [name, value, opts] of dropdownChecks)
         if (!opts.includes(value)) failFile(`[${name}=${logSafe(value)}] invalid value, check your settings`);
-    if (file.fileMedium && file.fileMedium !== 'video') return skip('☑File is not a video\n');
+    // Only a video: '' (a file Tdarr could not classify) skips too, as in the other four - the post-processing pass included, whose file object Tdarr
+    // builds with the same scan that sets fileMedium.
+    if (file.fileMedium !== 'video') return skip('☑File is not a video\n');
     // A language token that is not a language FAILS the file. only_languages scopes which subtitles are touched at all, so a typo ('eng,fer') silently matches
     // nothing and every subtitle in that language is quietly left out of the extract - the user gets a clean run that did none of the work they asked for, with
     // no way to tell it apart from a file that genuinely had no such subtitle. Stopping is the far cheaper failure. The und/mul/zxx/mis/qaa-qtz allowance is
@@ -2038,6 +2065,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // costs depends on the operation, so each site decides for itself rather than the whole plugin declining: an extract memoises through the SIDECAR ON DISK
     // and needs no tag, while an import has nothing else to tell an already-embedded sidecar from a new one.
     const canRecord = markerPersists(dstContainer);
+    // ====== END GUARDS + INPUT VALIDATION ======
     // ====== SUBTITLE METADATA / RETAG ARGS ======
     // The one rule for writing a subtitle language into the output container: mp4 folds to /T (to6392T), mkv keeps the sidecar spelling (normSidecarLang), and mov
     // folds to /T then remaps through MOV_LANG - the shared 'mov language remap' section has the why. escMeta guards the value either way.
@@ -2059,6 +2087,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return args;
     };
+    // ====== END SUBTITLE METADATA / RETAG ARGS ======
 
     // ====== POST-PROCESSING: remove sidecars now that the import is ACCEPTED ======
     // The only hook that runs after Tdarr's accept gate, and so the only place remove_source may act. Deleting during pre-processing would
@@ -2079,7 +2108,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The shared deriveFfprobePath, not a second hand-rolled regex: it replaces only the FINAL path component (the production path carries 'ffmpeg' as a
         // DIRECTORY too), existsSync-checks the result, and returns '' when the binary cannot be located. A lenient local regex that let an unexpected basename
         // slip through to the unmodified ffmpeg path would run FFMPEG with ffprobe's arguments and misreport the failure as an unreadable file.
-        const ffprobePath = deriveFfprobePath(String(otherArguments?.ffmpegPath || 'ffmpeg'));
+        const ffprobePath = deriveFfprobePath(ffmpegPathOf(otherArguments));
         if (!ffprobePath) return null;
         const { spawnSync } = require('child_process');
         const r = spawnSync(ffprobePath, ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', target],
@@ -2097,7 +2126,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // content, so this fails safe.
     const deleteImportedSidecars = (streamList, globalTags, mp4Target) => {
         const delReason = 'remove_source=true';   // this pass only runs when removal is on
-        const marked = new Set(decodeMarkerList(getTagCI(globalTags || {}, 'awk_sub_worker')));
+        const marked = new Set(decodeMarkerList(getTagCI(globalTags || {}, SUB_MARKER_TAG)));
         if (!marked.size) return { deleted: 0, log: '' };
         const scan = scanSidecarDirs();
         if (scan.err) {
@@ -2155,9 +2184,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ====== END POST-PROCESSING ======
 
     // ====== PRESET ASSEMBLY + SUMMARY ======
-    // The stream-summary token line. The input summary and every "Expected results" line are meant to be the SAME view of the stream set before and after,
-    // and those result lines sit in mutually exclusive branches - so hand-typed copies could drift in a way only one run type ever shows.
-    const summariseAll = (list) => list.map((s) => summariseStream(enrichStream(s))).join('');
     // Commit a built output-side arg string as the run: append the DV strict flag, then (mp4 only) -movflags use_metadata_tags, then the universal output
     // options - and set response.processFile, Tdarr's go/no-go switch, so calling this IS the commit point for the whole run. Shared by the extract and
     // import branches so their tails can't drift. The mov muxer writes only the tags it recognises unless that flag is set (measured on jellyfin-ffmpeg),
@@ -2216,7 +2242,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // once so a future hardening of either can't land at one site and not the other. Declared ahead of ccPlan's IIFE, like the notes below.
         const ccProbeVerdict = () => {
             const inj = otherArguments && otherArguments.__awkCap;
-            return probeA53Captions(file.file, deriveFfprobePath(String(otherArguments?.ffmpegPath || 'ffmpeg')), inj ? inj.captions === true : undefined);
+            return probeA53Captions(file.file, deriveFfprobePath(ffmpegPathOf(otherArguments)), inj ? inj.captions === true : undefined);
         };
 
         // The two sentences the caption branches repeat verbatim. Written once because they are a CONTRACT with the user, not incidental wording: the memo
@@ -2369,6 +2395,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const vPos = streams.filter((s) => codecTypeOf(s) === 'video' && !removed.has(s.index)).findIndex((s) => s.index === ccVideo.index);
             return vPos < 0 ? '' : ` -bsf:v:${vPos} filter_units=remove_types=6`;
         };
+        // ====== END EMBEDDED CLOSED CAPTIONS: PER-FILE PLAN ======
 
         if (action === 'extract') {
             // ====== EXTRACT: embedded text subs -> sidecars (+ optional removal) ======
@@ -2633,6 +2660,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const survivors = streams.filter((s) => !removedIndices.has(s.index));
             response.infoLog += `☑Expected results: ${summariseAll(survivors)}\n`;
             return response;
+            // ====== END EXTRACT ======
         }
 
         // ====== IMPORT: sidecars -> embedded (+ safe deletion) ======
@@ -2684,7 +2712,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         // The global marker VALUE lists the sidecar paths (relative to the video's directory) an earlier pass consumed, so a later pass deletes exactly what
         // it embedded (never a pre-existing collision) and never re-adds them. Tdarr only re-runs after a SUCCESSFUL mux, so a listed sidecar is safely in.
-        const importedSet = new Set(decodeMarkerList(getTagCI(file.ffProbeData.format?.tags || {}, 'awk_sub_worker')));
+        const importedSet = new Set(decodeMarkerList(getTagCI(file.ffProbeData.format?.tags || {}, SUB_MARKER_TAG)));
         // Import scope decided from a sidecar's NAME alone (no content, no download): the caption staging file is always ours; otherwise the language must be in
         // only_languages (or the filter is off); and a styled bundle cannot go into an mp4-family target that has no font attachments. Pulled out so the
         // marker-hostile refusal can be decided from the listed names BEFORE the text_file route downloads them, and so that refusal and the found-filter below
@@ -2719,7 +2747,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
         // The marker-hostile refusal message, shared by the pre-fetch check (text_file route) and the post-scan check (mapped route) so they read identically.
         const markerHostileMsg = (n) => `[action=import][container=${dstContainer}] ${n} sidecar${n === 1 ? '' : 's'} to import, but ${dstContainer}`
-            + ' cannot store the awk_sub_worker marker that records them, so every later pass would import them again - remux to mkv or mp4 first'
+            + ` cannot store the ${SUB_MARKER_TAG} marker that records them, so every later pass would import them again - remux to mkv or mp4 first`
             + ' (clean_and_remux does that), then run import';
 
         // Import discovers sidecars by SCANNING the library directory, and an unmapped node has no view of it - libDir there is the node-local
@@ -3074,7 +3102,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += '☒[remove_source=true] Every sidecar is already in the file and this node cannot delete them from the library - '
                 + 'remuxing losslessly, since only an accepted transcode gives the server a pass in which to do it\n';
             for (const rel of stranded) response.infoLog += `☐[remove_source=true] Queued for removal once accepted: ${rel}\n`;
-            commitPreset(` -map 0 -c copy -metadata "awk_sub_worker=${encodeMarkerList(markList)}"`);
+            commitPreset(` -map 0 -c copy -metadata "${SUB_MARKER_TAG}=${encodeMarkerList(markList)}"`);
             response.infoLog += `☑Expected results: ${summariseAll(streams)}\n`;
             return response;
         }
@@ -3167,7 +3195,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // A track a sidecar name has already retuned is left out of the fold: under method_import_metadata=sidecar the filename is the authority, and two
             // full tag sets aimed at one slot would leave the LAST one standing - the fold - discarding the retune this run just logged as applied.
             meta += retagArgs((dupes.retag || []).filter((r) => !retunedAt.has(r.index)), keptSubs);
-            let out = `${inputSide} -map 0${extraMaps} -c copy${ccStrip}${meta} -metadata "awk_sub_worker=${encodeMarkerList(markList)}"`;
+            let out = `${inputSide} -map 0${extraMaps} -c copy${ccStrip}${meta} -metadata "${SUB_MARKER_TAG}=${encodeMarkerList(markList)}"`;
             commitPreset(out);
             // The arrow is required, not stylistic: a bare .map(sidecarToStream) would hand Array.map's INDEX over as the mp4 flag.
             const expected = streams.filter((s) => !removedIndices.has(s.index)).concat(toMux.map((f) => sidecarToStream(f, isMp4)));
@@ -3176,6 +3204,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         return skip(importedSet.size ? '☑Sidecars already imported; nothing to do\n' : '☑All matching subtitles already present; nothing to import\n');
+        // ====== END IMPORT ======
     } catch (err) {
         failUnexpected(err);
     }

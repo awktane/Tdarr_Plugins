@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.33',
+    Version: '4.999.34',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1093,6 +1093,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return `[${type || 'unknown'}:${codec}]`;
     };
+    // -=-=-= summariseAll [all five] =-=-=-
+    // A whole stream list as its token line - the Input streams line, and every plain "Expected results" line. Those are meant to be the SAME view of the
+    // stream set before and after, often from mutually exclusive branches, so hand-typed copies drift in a way only one run type ever shows.
+    const summariseAll = (list) => list.map((s) => summariseStream(enrichStream(s))).join('');
 
     // -=-=-= globalOutputOpt [all five] =-=-=-
     // Output-side options applied to EVERY run (the place for any universal muxer/output flag). -max_muxing_queue_size 9999 pre-empts ffmpeg's "Too many
@@ -1219,6 +1223,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ===== END SHARED: mp4 strict compliance arg =====
 
+    // #endregion
+
+    // #region SHARED helpers (1 section: ffmpeg path)
+    // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: ffmpeg path =====
+    // -=-=-= ffmpegPathOf  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
+    // The node's ffmpeg: Tdarr hands a classic plugin otherArguments.ffmpegPath, and the bare name - a PATH lookup - stands in when it supplied none.
+    // Every spawn in the four plugins that run ffmpeg resolves the binary here, so a change to how it is found reaches all of them at once.
+    const ffmpegPathOf = (otherArgs) => String(otherArgs?.ffmpegPath || 'ffmpeg');
+    // ===== END SHARED: ffmpeg path =====
     // #endregion
 
     // audio_clean-local IDENTITY key: like langKey but KEEPS the region/script subtag, so pt-BR and pt-PT are DISTINCT identities
@@ -1561,7 +1574,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 _encoderSet = new Set();
                 try {
                     const { spawnSync } = require('child_process');
-                    const r = spawnSync((otherArguments && otherArguments.ffmpegPath) || 'ffmpeg', ['-hide_banner', '-encoders'],
+                    const r = spawnSync(ffmpegPathOf(otherArguments), ['-hide_banner', '-encoders'],
                         { encoding: 'utf8', timeout: ENCODERS_PROBE_TIMEOUT_MS });
                     _encoderSet = parseFfmpegEncoders(r && r.stdout);
                 } catch (e) { /* leave empty → native aac fallback, which every build has */ }
@@ -1773,7 +1786,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (Earlier input validation and the not-a-video / no-audio pre-flight checks run before this and fail-or-skip on their own.)
     try {
         // Input summary — the streams exactly as they arrived, before any audio work.
-        response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map(s => summariseStream(enrichStream(s))).join('')}\n`;
+        response.infoLog += `☐Input streams: ${summariseAll(file.ffProbeData.streams)}\n`;
 
         // A secondary track is any commentary, visually-impaired/descriptive, music-and-effects (clean_effects) or karaoke track — the shared classifiers cover
         // the disposition flags and the title keywords. A distinct M&E (dialogue-free) or karaoke mix must never be deduped away as a duplicate of the main
@@ -2196,11 +2209,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // needs the in-place stereo downmix, so a stereo-tier surround source already in surroundCodec must NOT be treated as done here - it has to stay in
         // workStreams to reach that downmix regardless of downmix_to_* / codec.
         const noCodecWorkNeeded = (stream) => {
-            if(stream.channels > 6 && stream.awkTier === 'surround' && (downmixToSix === 'disabled') && (downmixToStereo === 'disabled')
-                    && (forceCovers(stream.channels <= 2, stream.channels) && (codecFamilyOf(stream) === surroundCodec)))
-                return true;
-            else if(stream.channels > 2 && stream.channels <= 6 && stream.awkTier === 'surround' && (downmixToStereo === 'disabled')
-                    && (forceCovers(stream.channels <= 2, stream.channels) && (codecFamilyOf(stream) === surroundCodec)))
+            // A surround-tier track is done when no downmix reaches it - downmix_to_six only touches tracks above 6 channels - and it is already in the
+            // forced surround codec.
+            if (stream.channels > 2 && stream.awkTier === 'surround' && downmixToStereo === 'disabled' && (stream.channels <= 6 || downmixToSix === 'disabled')
+                    && forceCovers(stream.channels <= 2, stream.channels) && codecFamilyOf(stream) === surroundCodec)
                 return true;
             if((stream.channels <= 2) && forceCovers(stream.channels <= 2, stream.channels) && (codecFamilyOf(stream) === stereoCodecFamily))
                 return true;
@@ -2434,7 +2446,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const { spawnSync } = require('child_process');
             const analysisFilter = `${preFilter ? `${preFilter},` : ''}loudnorm=I=${preset.I}:LRA=${preset.LRA}:TP=${preset.TP}:print_format=json`;
             const args = ['-nostats', '-hide_banner', '-i', file.file, '-map', `0:a:${srcAudioIdx}`, '-af', analysisFilter, '-f', 'null', '-'];
-            const result = spawnSync((otherArguments && otherArguments.ffmpegPath) || 'ffmpeg', args,
+            const result = spawnSync(ffmpegPathOf(otherArguments), args,
                 { timeout: loudnormAnalysisTimeoutMs, maxBuffer: LOUDNORM_ANALYSIS_MAX_BYTES, encoding: 'utf-8' });
             // A tripped `timeout` sets BOTH error (code ETIMEDOUT) and signal (SIGTERM), and error is tested first - so the timeout must be named HERE or it
             // reports as a failure to launch, which is the opposite of what happened. The bare signal branch below is then only an external kill (an OOM
@@ -2509,7 +2521,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // at most 0.240 LU from target, a 4x margin inside LOUDNORM_TOLERANCE_LU. Written "<preset>-<plugin version>" but matched on the preset portion
         // ONLY (the version is forensic, reserved for distinguishing a cache written by a known-buggy version). Matroska uppercases custom tag names on
         // write, so read-back goes through getTagCI.
-        const readLoudnormTag = (stream) => getTagCI(stream.tags || {}, 'awk_loudnorm').trim();
+        const LOUDNORM_TAG = 'awk_loudnorm';   // named once: a read and a write that drift apart re-measure every track on every pass
+        const readLoudnormTag = (stream) => getTagCI(stream.tags || {}, LOUDNORM_TAG).trim();
         const loudnormTagMatchesPreset = (stream) => readLoudnormTag(stream).split('-')[0] === methodLoudnorm;
         const loudnormTagValue = () => `${methodLoudnorm}-${details().Version}`;
         // Only Matroska persists arbitrary per-stream tags through a -c copy remux; the mov/mp4/m4a muxers silently DROP a custom awk_loudnorm tag.
@@ -2518,7 +2531,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // will actually survive; on other containers a within-tolerance track is left a true no-op (re-measured next run, but never remuxed). A
         // track that genuinely needs correction still re-encodes once regardless of container, then measures within tolerance next run.
         const loudnormTagPersists = ['mkv', 'webm', 'mka'].includes(dstContainer);
-        const loudnormStampArg = (idx) => (loudnormTagPersists ? ` -metadata:s:a:${idx} "awk_loudnorm=${loudnormTagValue()}"` : '');
+        const loudnormStampArg = (idx) => (loudnormTagPersists ? ` -metadata:s:a:${idx} "${LOUDNORM_TAG}=${loudnormTagValue()}"` : '');
         // A loudnorm correction that RIDES ALONG on a re-encode some other setting fired (a downmix, a codec_force, a remix) has no line of its own - it is
         // chained into that operation's own filter and command. These two render its share of that line so the eight ride-along sites can't drift: the tag
         // stacks onto whatever tag the operation already carries, so the user can see that the settings combined, and the stamp caches the measurement so the
@@ -2529,7 +2542,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The within-tolerance no-op: no re-encode is needed, but the measurement is still worth caching. The caller keeps the loudnormTagPersists/measured
         // gate that decides whether this runs at all - the reasoning for it is at the main-path call site.
         const stampWithinTolerance = (streamIndex, idx) => {
-            workDone += `☐${streamTag(streamIndex)}[method_loudnorm=${methodLoudnorm}] Stamping awk_loudnorm=${methodLoudnorm} (already within tolerance)`
+            workDone += `☐${streamTag(streamIndex)}[method_loudnorm=${methodLoudnorm}] Stamping ${LOUDNORM_TAG}=${methodLoudnorm} (already within tolerance)`
                 + ` - future runs skip re-measuring while loudnorm stays "${methodLoudnorm}"\n`;
             extraArguments += loudnormStampArg(idx);
         };
@@ -2846,9 +2859,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     }
                 }
             }
-        }
             // ====== END FORCE CODEC ======
-
+        }
 
         // ====== LAYOUT-DROP DOWNMIX DERIVATIVES ======
         // A source the layout-drop pre-pass removed (un-writable opus surround, method_layout_err=drop) may have been the sole source its language's

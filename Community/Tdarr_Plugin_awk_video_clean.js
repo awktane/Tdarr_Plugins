@@ -14,7 +14,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.32',
+    Version: '3.999.33',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -758,6 +758,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return `[${type || 'unknown'}:${codec}]`;
     };
+    // -=-=-= summariseAll [all five] =-=-=-
+    // A whole stream list as its token line - the Input streams line, and every plain "Expected results" line. Those are meant to be the SAME view of the
+    // stream set before and after, often from mutually exclusive branches, so hand-typed copies drift in a way only one run type ever shows.
+    const summariseAll = (list) => list.map((s) => summariseStream(enrichStream(s))).join('');
 
     // -=-=-= globalOutputOpt [all five] =-=-=-
     // Output-side options applied to EVERY run (the place for any universal muxer/output flag). -max_muxing_queue_size 9999 pre-empts ffmpeg's "Too many
@@ -845,8 +849,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const fs = require('fs');
     const childProcess = require('child_process');
 
-    // The node's ffmpeg, or the bare name when Tdarr did not supply one. Read at four sites (the encoder + tonemap probes, the idet decode, the A53 probe).
-    const ffmpegPathOf = (oa) => (oa && oa.ffmpegPath) || 'ffmpeg';
+    // #region SHARED helpers (1 section: ffmpeg path)
+    // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: ffmpeg path =====
+    // -=-=-= ffmpegPathOf  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
+    // The node's ffmpeg: Tdarr hands a classic plugin otherArguments.ffmpegPath, and the bare name - a PATH lookup - stands in when it supplied none.
+    // Every spawn in the four plugins that run ffmpeg resolves the binary here, so a change to how it is found reaches all of them at once.
+    const ffmpegPathOf = (otherArgs) => String(otherArgs?.ffmpegPath || 'ffmpeg');
+    // ===== END SHARED: ffmpeg path =====
+    // #endregion
+
+    // The global tag a finished pass is fenced with - the setting it ran at (see videoSig) - so the next pass at the same setting skips. Named once: a read
+    // and a write that drift apart fail silently, and every pass re-encodes the file.
+    const VIDEO_FENCE_TAG = 'awk_video';
 
     // Read a table by a key that came from a PROBE or a user string, never from a validated dropdown. `TABLE[key] || fallback` cannot tell an ABSENT key from
     // one inherited off Object.prototype, and every prototype member is truthy, so the fallback never fires for it - a stream whose codec_name is 'constructor'
@@ -901,10 +915,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // guard_captions CPU re-pick and guard_dv's memory counterfactual each make their own call, and the probe runs even on a forced-CPU pick because
     // cap is computed above the forceCpu early return.
     const queryCapabilities = (ffmpegPath) => {
-        const ff = ffmpegPath || 'ffmpeg';
         const cap = { encoders: new Set(), nvidia: false, dri: false };
         try {
-            const r = childProcess.spawnSync(ff, ['-hide_banner', '-encoders'], { encoding: 'utf8', timeout: ENCODERS_PROBE_TIMEOUT_MS });
+            const r = childProcess.spawnSync(ffmpegPath, ['-hide_banner', '-encoders'], { encoding: 'utf8', timeout: ENCODERS_PROBE_TIMEOUT_MS });
             cap.encoders = parseFfmpegEncoders(r.stdout);
         } catch (e) { /* leave encoders empty -> everything falls back to CPU */ }
         try {
@@ -921,7 +934,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Run one probe command and report only whether it exited 0 - the shared spawn+verdict skeleton for the confirm* probes below, so a future hardening
     // (a maxBuffer cap, stderr capture) lands once instead of per probe. Each caller builds its own args; that is pure string work and cannot throw.
     const probeOk = (ffmpegPath, args) => {
-        try { return childProcess.spawnSync(ffmpegPath || 'ffmpeg', args, { encoding: 'utf8', timeout: CONFIRM_PROBE_TIMEOUT_MS }).status === 0; }
+        try { return childProcess.spawnSync(ffmpegPath, args, { encoding: 'utf8', timeout: CONFIRM_PROBE_TIMEOUT_MS }).status === 0; }
         catch (e) { return false; }
     };
 
@@ -1126,7 +1139,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // head sample under-reports. -ss ahead of -i is safe here because this DECODES; it is only a stream COPY that -ss corrupts.
             const args = ['-nostats', '-hide_banner', ...(startSec > 0 ? ['-ss', String(startSec)] : []), '-i', inputPath,
                 '-frames:v', String(IDET_SAMPLE_FRAMES), '-vf', 'idet', '-an', '-sn', '-f', 'null', '-'];
-            const r = childProcess.spawnSync(ffmpegPath || 'ffmpeg', args,
+            const r = childProcess.spawnSync(ffmpegPath, args,
                 { encoding: 'utf8', timeout: IDET_PROBE_TIMEOUT_MS, maxBuffer: IDET_PROBE_MAX_BYTES });
             // A probe that did not finish gives no verdict. A timeout or the maxBuffer cap still hands back the stderr read SO FAR, and the genuine summary
             // prints last - so a cut-off read holds at best the init block, and at worst whatever the input dump put there.
@@ -1272,6 +1285,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // QuickTime VIDEO containers - the single gate for every fourCC emit in this plugin, used by both the encode path and the copy path. Deliberately
     // mp4/m4v/mov WITHOUT m4a: isMp4Family includes m4a and is right for the -movflags use_metadata_tags decision, but not for tagging a video stream.
     const isQtVideoContainer = (container) => ['mp4', 'm4v', 'mov'].includes(container);
+    // ====== END OUTPUT TIER + CONTAINER ======
 
     // ====== ENCODE MEMORY MODEL ======
     // A CPU 4K encode needs GIGABYTES of anonymous memory, and a node that cannot supply them does not report an error: the kernel SIGKILLs ffmpeg and Tdarr
@@ -1707,7 +1721,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return skip('☑File is not a video\n');
         }
 
-        response.infoLog += `☐Input streams: ${file.ffProbeData.streams.map((s) => summariseStream(enrichStream(s))).join('')}\n`;
+        response.infoLog += `☐Input streams: ${summariseAll(file.ffProbeData.streams)}\n`;
 
         // Primary (non-cover-art) video stream - the one we actually encode.
         const videoStreams = file.ffProbeData.streams.filter((s) => codecTypeOf(s) === 'video');
@@ -2104,8 +2118,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (action === 'shrink' && codecTrigger && !markerPersists(dstContainer)) {
             codecTrigger = false;
             fenceUnstorable = true;
-            response.infoLog += `☒${streamTag(primary.index)}[action=shrink][container=${dstContainer}] A size pass records what it did in an awk_video tag`
-                + ` and ${dstContainer} cannot store one, so every later pass would re-encode this file again - declining the shrink;`
+            response.infoLog += `☒${streamTag(primary.index)}[action=shrink][container=${dstContainer}] A size pass records what it did in an `
+                + `${VIDEO_FENCE_TAG} tag and ${dstContainer} cannot store one, so every later pass would re-encode this file again - declining the shrink;`
                 + ' remux to mkv or mp4 first (clean_and_remux does that) to enable it\n';
         }
         // Three of the four triggers are pure stream metadata; the fourth is the idet DECODE. Split so the cheap ones are tried first and the decode is
@@ -2138,7 +2152,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             ...(effHdrMode === 'tonemap_sdr' ? ['sdr'] : []), ...(effHdrMode === 'strip_dynamic' ? ['strip'] : []), ...(preserveDv ? ['dv'] : []),
             ...(deinterlaceLive ? ['deint'] : [])].join('-'));
         const videoSig = `${videoSigCore}-v${escMeta(details().Version)}`;
-        const priorSig = getTagCI(file.ffProbeData.format?.tags || {}, 'awk_video').trim();
+        const priorSig = getTagCI(file.ffProbeData.format?.tags || {}, VIDEO_FENCE_TAG).trim();
         // core only; the stored -v<version> suffix is forensic, not part of the fence
         const alreadyFenced = priorSig !== '' && priorSig.replace(/-v[^-]*$/, '') === videoSigCore;
 
@@ -2325,7 +2339,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, targetCodec: targetCodecName, qNorm, speed, want10Bit, willDownscale,
                 outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter: deintFilter(),
                 dropCaptions, sliceDecode });
-            let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy${coverArtDrops}${strictArg} -metadata "awk_video=${videoSig}"`;
+            let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy${coverArtDrops}${strictArg} -metadata "${VIDEO_FENCE_TAG}=${videoSig}"`;
             // Retire the request this encode just served. ccExported implies dropCaptions, and buildVideoArgs suppresses A53 on every keep-by-default encoder
             // under dropCaptions (A53_CAP) while every other encoder drops it unaided, so the output provably carries no captions - `removed` is the accurate
             // successor to `strip`, and it is the token that stops any later pass paying a caption probe. Only fires when a request was actually present.
@@ -2407,7 +2421,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         if (realTranscode()) {
             if (alreadyFenced) {
-                return skip(`☑${streamTag(primary.index)}[action=${action}] Already processed by awk_video at this exact setting (${videoSig})`
+                return skip(`☑${streamTag(primary.index)}[action=${action}] Already processed by ${VIDEO_FENCE_TAG} at this exact setting (${videoSig})`
                     + ` - left untouched\n`);
             }
             const reasonTags = [
@@ -2443,9 +2457,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return skip(`☑${streamTag(primary.index)}[action=normalize] Video is already ${targetCodecName}${dispHeight ? ` ${dispHeight}p` : ''}`
             + `${srcIs10 ? ' 10-bit' : ''} and within limits\n`);
+        // ====== END DECIDE, GATED BY ACTION ======
     } catch (err) {
         return failUnexpected(err);
     }
+    // ====== END PER-FILE FLOW ======
 };
 
 module.exports.details = details;
