@@ -16,7 +16,7 @@ const details = () => ({
                 mkv again.
                 \\naction=import muxes matching sidecars back into the file (restoring language, title, and disposition) and, by default, deletes the sidecar
                 once it is safely embedded. Import never drops a subtitle - anything not already embedded is muxed in (a copy already present just becomes a
-                duplicate, never a loss).
+                duplicate, never a loss). It reads .srt/.ass/.ssa/.vtt sidecars; a .smi or .sub is named in the log but not imported (convert it to .srt).
                 \\nAn SRT carries no title/language/disposition, so all of that is encoded in the filename:
                 <video>.s<streamIndex>[.<title>][.<other flags>].<lang>[.<forced|sdh>].<ext> - the stream index keeps names unique, the title is reversibly
                 encoded, and the language plus at most ONE server-documented flag sit last so Plex/Jellyfin/Emby auto-detect them (Plex accepts only one, and
@@ -35,7 +35,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.45',
+    Version: '3.999.46',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -828,12 +828,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         stl:        { ext: 'srt', enc: 'srt' },
     };
     const isTextSub = (codec) => Object.prototype.hasOwnProperty.call(TEXT_SUB, String(codec).toLowerCase());
-    // Both directions of the table above, derived from it so a new codec row is ONE edit: the loose-text sidecar extensions parseSidecar accepts (a bundle
-    // is admitted by STYLED_BUNDLE.ext instead, so 'mks' must never be a TEXT_SUB ext - extract would write one no import could read back), and the reverse ext ->
-    // codec name for a sidecar not muxed in yet. Several codecs share an ext, so the reverse keeps the FIRST row declaring it - the canonical spelling
-    // ffprobe reports back for a sidecar that row's encoder wrote (subrip for .srt, ass for .ass, webvtt for .vtt). Keep the canonical codec first.
+    // Both directions of the table above, derived from it so a new codec row is ONE edit: the loose-text sidecar extensions extract writes (parseSidecar
+    // accepts these plus IMPORT_ONLY_EXTS; a bundle is admitted by STYLED_BUNDLE.ext instead, so 'mks' must never be a TEXT_SUB ext - extract would write
+    // one no import could read back), and the reverse ext -> codec name for a sidecar not muxed in yet. Several codecs share an ext, so the reverse keeps
+    // the FIRST row declaring it - the canonical spelling ffprobe reports back for a sidecar that row's encoder wrote (subrip for .srt, ass for .ass, webvtt
+    // for .vtt). Keep the canonical codec first.
     const TEXT_EXTS = [...new Set(Object.values(TEXT_SUB).map((t) => t.ext))];
     const EXT_TO_CODEC = Object.fromEntries(TEXT_EXTS.map((ext) => [ext, Object.keys(TEXT_SUB).find((c) => TEXT_SUB[c].ext === ext)]));
+    // Sidecar extensions import READS beyond the ones extract writes, each mapped to the extension its codec is written as - parseSidecar reports it under
+    // that, so everything downstream treats an .ssa exactly as an .ass. The ass demuxer reads an .ssa as codec 'ass' and it copies into the file unchanged:
+    // measured on 7.1.4, extracting it back gives the sidecar's own text, so the content identity the skip and the cleanup decide on holds. A SAMI .smi is
+    // deliberately NOT here: Matroska cannot store sami (a copy exits 178), so it would import only as a lossy conversion whose text never matches the
+    // sidecar again - and remove_source would then delete the only original. It is named instead (see NAMED_ONLY_EXTS).
+    const IMPORT_ONLY_EXTS = { ssa: 'ass' };
+    const IMPORT_EXTS = [...TEXT_EXTS, ...Object.keys(IMPORT_ONLY_EXTS)];
+    // Subtitle extensions import never reads but does NAME when one is left beside the video, so a skipped file is not mistaken for an empty folder: .smi
+    // (above), and .sub - MicroDVD text and the image half of a VobSub .sub+.idx pair share it, and only the text one could ever be read.
+    const NAMED_ONLY_EXTS = ['smi', 'sub'];
     // STYLED subtitles render through fonts that exist only as container attachments, so extracting one to a loose text file destroys the styling
     // irrecoverably - it is exported as a Matroska BUNDLE instead, subtitle plus every font attachment. Matroska is the only container that can: mp4/mov
     // reject ass and carry no attachments, WebM allows only WebVTT, and a fonts-ONLY Matroska writes unreadable. .mks is Matroska's subtitle-only
@@ -1180,14 +1191,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ===== END SHARED: closed-caption probe =====
 
-    // ===== SHARED [sub_worker, video_clean]: closed-caption handoff =====
-    // -=-=-= CC_TAG / CC_TOKENS / ccTokensOf  [sub_worker, video_clean] =-=-=-
+    // ===== SHARED [clean_and_remux, sub_worker, video_clean]: closed-caption handoff =====
+    // -=-=-= CC_TAG / CC_TOKENS / ccTokensOf  [clean_and_remux, sub_worker, video_clean] =-=-=-
     // The cross-plugin channel for embedded closed captions. They live in the video BITSTREAM rather than in a stream list, so sub_worker can read them out
     // to a sidecar or a subtitle track but can only DELETE them where its own -c copy pass may filter the bitstream (H.264, not HDR, not Dolby Vision);
     // video_clean is the only plugin that re-encodes video, so it is the only one that can be rid of them on anything else. The request therefore travels in
-    // a global CC_TAG tag on the file, written by sub_worker and read by video_clean. It is SHARED so a token added or renamed on one side cannot go missing
-    // on the other: a writer and a reader whose vocabularies drift fail SILENTLY, leaving the captions in the file twice. Deliberately not the awk_sub_worker
-    // marker - that is a list of sidecar PATHS whose reader matches entries against paths, so a flag word pushed in there would be read as a filename.
+    // a global CC_TAG tag on the file, written by sub_worker and read by video_clean - and by clean_and_remux, whose subtitle filters would otherwise drop an
+    // imported caption track unnoticed. It is SHARED so a token added or renamed on one side cannot go missing on the other: a writer and a reader whose
+    // vocabularies drift fail SILENTLY, leaving the captions in the file twice. Deliberately not the awk_sub_worker marker - that is a list of sidecar PATHS
+    // whose reader matches entries against paths, so a flag word pushed in there would be read as a filename.
     //   strip    - the captions are out (a sidecar or a subtitle track holds them) but the bitstream copy is still there; drop it on the next re-encode.
     //   removed  - the captions are out AND the bitstream copy went with them in that same pass, so nothing is left to find, to probe for, or to remove.
     //              The request/fact pair with `strip`: one asks a later plugin to act, the other tells every later pass there is nothing left to act on.
@@ -1376,9 +1388,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const parseSidecar = (name) => {
         const extMatch = name.match(SIDECAR_EXT_RE);
         if (!extMatch) return null;
-        const ext = extMatch[1].toLowerCase();
-        const bundle = ext === STYLED_BUNDLE.ext;
-        if (!bundle && !TEXT_EXTS.includes(ext)) return null;
+        const rawExt = extMatch[1].toLowerCase();
+        const bundle = rawExt === STYLED_BUNDLE.ext;
+        if (!bundle && !IMPORT_EXTS.includes(rawExt)) return null;
+        const ext = IMPORT_ONLY_EXTS[rawExt] || rawExt;   // own property only: rawExt has passed the IMPORT_EXTS membership test above
         // A bundle is written only by us, always dot-prefixed and always with the s<index> anchor (required below), so an unrelated .mks dropped
         // beside the video is left alone rather than muxed in blind.
         if (bundle && !name.startsWith('.')) return null;
@@ -2166,9 +2179,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // case is why it is worth more than tidiness: a loose styled sidecar is not filtered out for mp4 (only .mks BUNDLES are), so it is silently flattened
     // into mov_text and losing its styling while the log says [sub:eng ass].
     const sidecarToStream = (f, mp4) => {
-        // A bundle always carries a styled subtitle, and can never reach an mp4 target. Every other sidecar maps back through EXT_TO_CODEC behind the same
-        // TEXT_EXTS gate parseSidecar applies, so an ext outside the table cannot reach here - the webvtt fallback only guards a future caller that reads a
-        // sidecar without going through it.
+        // A bundle always carries a styled subtitle, and can never reach an mp4 target. Every other sidecar maps back through EXT_TO_CODEC behind a TEXT_EXTS
+        // gate - parseSidecar reports every ext it admits as one of TEXT_EXTS (see IMPORT_ONLY_EXTS), so an ext outside the table cannot reach here and the
+        // webvtt fallback only guards a future caller that reads a sidecar without going through it.
         const codec = f.bundle ? 'ass' : (mp4 ? 'mov_text' : (TEXT_EXTS.includes(f.ext) ? EXT_TO_CODEC[f.ext] : 'webvtt'));
         const disposition = {};
         for (const d of DISPOSITIONS.concat(EXTRA_DISPOSITIONS)) if ((f.dispTokens.concat(f.extraTokens || [])).includes(d.token)) disposition[d.ff] = 1;
@@ -2831,8 +2844,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // every run, forever, would be noise. Our own bundles are dot-prefixed too, but they parse and never reach this line.
             // A hidden TEXT sidecar named after THIS video is the exception: that is the OCR coming back, it is importable now, so a name that still fails to
             // parse is a genuine mistake (a bad language token, a lost s<index>) and saying nothing would strand the work the user just did.
-            if (relBase.startsWith('.') && !(TEXT_EXTS.includes(relExt) && relBase.slice(1).startsWith(`${videoBase}.`))) continue;
-            if (TEXT_EXTS.includes(relExt) || relExt === STYLED_BUNDLE.ext) response.infoLog += `☒Not a recognised sidecar name, skipping: ${logSafe(rel)}\n`;
+            if (relBase.startsWith('.') && !(IMPORT_EXTS.includes(relExt) && relBase.slice(1).startsWith(`${videoBase}.`))) continue;
+            // Only a file named after THIS video is ours to report. A season folder holds every episode's sidecars, and each of those fails to parse here by
+            // design (wrong video base), so naming them would print every other episode's subtitles as a warning on every run.
+            if (!relBase.replace(/^\./, '').startsWith(`${videoBase}.`)) continue;
+            if (NAMED_ONLY_EXTS.includes(relExt)) {
+                response.infoLog += `☒Not importing ${logSafe(rel)} - .${relExt} subtitles cannot be imported as they are; convert it to .srt to import it\n`;
+            } else if (IMPORT_EXTS.includes(relExt) || relExt === STYLED_BUNDLE.ext) {
+                response.infoLog += `☒Not a recognised sidecar name, skipping: ${logSafe(rel)}\n`;
+            }
         }
         // This pass never removes an embedded subtitle it was not asked to, and the only files it can unlink are sidecars whose content is provably
         // already in the file - the redundant-only branch below, which has nothing to mux and so never reaches post-processing. Every other deletion

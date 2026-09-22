@@ -17,7 +17,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file carrying clean_and_remux's awk_recovered tag: a
         repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. This check
         is always on and has no setting.\n`,
-    Version: '4.999.18',
+    Version: '4.999.19',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -1342,7 +1342,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const JUNK_ENCODER_GLOBAL = new Set(['encoded_by']);
         const JUNK_DESCRIPTIVE = new Set(['compilation', 'gapless_playback', 'hd_video', 'purchase_date', 'sort_name', 'sort_album', 'sort_album_artist',
             'sort_artist', 'sort_composer', 'sort_show', 'genre', 'date', 'description', 'synopsis', 'show', 'episode_id', 'network', 'episode_sort',
-            'season_number', 'media_type', 'artist', 'album', 'album_artist', 'composer', 'grouping', 'lyrics', 'copyright', 'keywords']);
+            'season_number', 'media_type', 'artist', 'album', 'album_artist', 'composer', 'grouping', 'lyrics', 'copyright', 'keywords', 'track', 'disc',
+            'itunmovi', 'itunextc']);   // iTunMOVI (the cast/crew plist) and iTunEXTC (the rating) are freeform atoms the mov demuxer names verbatim
         const JUNK_PERSTREAM = new Set(['encoded_by', 'encoder']);   // only encoder-tier keys are safe per-stream (descriptive ones are functional, kept)
         const junkGlobalStrip = (lowerKey) => junkTagsMode !== 'disabled'
             && (JUNK_ENCODER_GLOBAL.has(lowerKey) || (junkTagsMode === 'descriptive' && JUNK_DESCRIPTIVE.has(lowerKey)));

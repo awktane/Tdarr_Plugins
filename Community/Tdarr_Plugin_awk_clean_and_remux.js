@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.36',
+    Version: '4.999.37',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1741,6 +1741,34 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: recovered marker vocabulary =====
     // #endregion
 
+    // #region SHARED helpers (1 section: closed-caption handoff)
+    // ===== SHARED [clean_and_remux, sub_worker, video_clean]: closed-caption handoff =====
+    // -=-=-= CC_TAG / CC_TOKENS / ccTokensOf  [clean_and_remux, sub_worker, video_clean] =-=-=-
+    // The cross-plugin channel for embedded closed captions. They live in the video BITSTREAM rather than in a stream list, so sub_worker can read them out
+    // to a sidecar or a subtitle track but can only DELETE them where its own -c copy pass may filter the bitstream (H.264, not HDR, not Dolby Vision);
+    // video_clean is the only plugin that re-encodes video, so it is the only one that can be rid of them on anything else. The request therefore travels in
+    // a global CC_TAG tag on the file, written by sub_worker and read by video_clean - and by clean_and_remux, whose subtitle filters would otherwise drop an
+    // imported caption track unnoticed. It is SHARED so a token added or renamed on one side cannot go missing on the other: a writer and a reader whose
+    // vocabularies drift fail SILENTLY, leaving the captions in the file twice. Deliberately not the awk_sub_worker marker - that is a list of sidecar PATHS
+    // whose reader matches entries against paths, so a flag word pushed in there would be read as a filename.
+    //   strip    - the captions are out (a sidecar or a subtitle track holds them) but the bitstream copy is still there; drop it on the next re-encode.
+    //   removed  - the captions are out AND the bitstream copy went with them in that same pass, so nothing is left to find, to probe for, or to remove.
+    //              The request/fact pair with `strip`: one asks a later plugin to act, the other tells every later pass there is nothing left to act on.
+    //   none     - the caption channel was decoded and carried no caption text at all, so no later pass need pay for that decode again.
+    //   imported - the captions are already embedded as a real subtitle track, so sub_worker must not read them out a second time.
+    // The value is a COMMA LIST and every reader splits it, because the states genuinely combine: an imported round trip that could not strip in its own pass
+    // records `imported,strip` - and `imported,removed` where it could. An empty channel records `none` ALONE - it never owes a strip. A writer
+    // therefore EXTENDS the tag rather than replacing it with one token - a whole-value overwrite would erase a pending request instead of deferring it.
+    // A REQUEST is retired by whoever SERVES it, and only then: video_clean rewrites `strip` to `removed` on the encode that carries the removal out. Without
+    // that the tag only ever grows, and a satisfied request is indistinguishable from a fresh one - a file that later regains captions (a re-muxed capture, an
+    // external tool re-inserting A53 SEI) has them dropped by a request answered encodes ago. `none` and `imported` are never retired: they are memos about
+    // the file rather than requests, and they stay true for its life.
+    const CC_TAG = 'awk_cc';
+    const CC_TOKENS = { strip: 'strip', removed: 'removed', none: 'none', imported: 'imported' };
+    const ccTokensOf = (tags) => getTagCI(tags || {}, CC_TAG).toLowerCase().split(',').map((t) => t.trim()).filter(Boolean);
+    // ===== END SHARED: closed-caption handoff =====
+    // #endregion
+
     // Channel layout string from ffprobe, falling back to mediaInfo (ChannelLayout/ChannelPositions) - lets us spot the LFE that separates 3.1 from 4.0 and
     // 2.1 from 3.0 even when ffprobe omits channel_layout. Feeds channelLabel's hasLfe argument at the tag_title call site.
     const channelLayoutStr = (ffstream) => {
@@ -1781,13 +1809,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Matroska has no captions/lyrics flag, MP4/MOV no original/lyrics flag, and `-disposition +karaoke` reads back 0 from both - a +flag for those is
     // silently dropped by the muxer. captions is the SDH synonym of hearing_impaired (which persists in both containers), so hearing_impaired is promoted
     // in its place; a role with no storable flag is skipped - its title keyword still drives the classifiers, summary and sort order, so nothing is lost
-    // but a non-persisting write. The set lists only flags with no storable target: lyrics/karaoke (neither container), original (mp4 only).
+    // but a non-persisting write. The set lists only flags with no storable target: lyrics/karaoke (neither container), original (mp4 only). clean_effects
+    // is never promoted at all (it has no title label) and persists in neither container either - measured. `keys` narrows the roles considered; by
+    // default every role the stream carries.
     const unstorableDisp = { mkv: new Set(['lyrics', 'karaoke']), mp4: new Set(['original', 'lyrics', 'karaoke']) };
-    const dispositionsToPromote = (s, type) => {
+    const promoteTarget = (key) => (key === 'captions' ? 'hearing_impaired' : key);   // canonicalise the SDH synonym to the container-portable flag
+    const dispositionsToPromote = (s, type, keys = dispKeysFor(type).filter((k) => hasDisposition(s, k))) => {
         const out = []; const seen = new Set();
-        for (const key of dispKeysFor(type)) {
-            if (!dispositionTypes[key].tag || !hasDisposition(s, key)) continue;
-            const target = key === 'captions' ? 'hearing_impaired' : key;   // canonicalise the SDH synonym to the container-portable flag
+        for (const key of keys) {
+            if (!dispositionTypes[key].tag) continue;
+            const target = promoteTarget(key);
             if (s.disposition?.[target] === 1 || (unstorableDisp[dstContainer] || new Set()).has(target) || seen.has(target)) continue;
             seen.add(target); out.push(target);
         }
@@ -1803,6 +1834,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return out;
     };
+    // The handler_name this remux clears (mkv) or replaces (mp4) can be the ONLY place a role lives: a QuickTime-family muxer writes the track name
+    // ('Commentary') into the mp4 handler box, and mediaInfo's Title is itself that handler echoed, so one wipe takes the role out of both probes and every
+    // later plugin reads the track as a plain one. handlerOnlyRoles is what the handler carries that no real flag and no SURVIVING text - the title, a
+    // description, mediaInfo's own title with the echo laundered out (mediaTitleFor) - still does. 'default' is a selection flag, not a role.
+    const survivingRoleText = (s) => {
+        const mi = mediaInfoFor(s);
+        return [s.tags?.title, getTagCI(s.tags, 'description'), mediaTitleFor(s), getTagCI(mi?.extra, 'description')]
+            .filter(Boolean).join(' ').trim().toLowerCase();
+    };
+    const handlerOnlyRoles = (s, type) => {
+        const handler = String(getTagCI(s.tags, 'handler_name') || '').toLowerCase();
+        if (!handler) return [];
+        const surviving = survivingRoleText(s);
+        return dispKeysFor(type).filter((k) => k !== 'default' && s.disposition?.[promoteTarget(k)] !== 1
+            && matchesKeyword(handler, dispositionTypes[k].keywords) && !matchesKeyword(surviving, dispositionTypes[k].keywords));
+    };
 
     // remove_sub_sdh safety guard. A "plain" subtitle carries no commentary/descriptive/SDH/lyrics role. On if_plain_survives an SDH/CC subtitle goes only
     // when its language still has a plain subtitle that SURVIVES every whole-file drop reason
@@ -1816,6 +1863,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const hasPlainSameLang = (set, wl) => set.has(langKey(wl));
     const resolveWorkLang = (s) => { const sl = resolveLang(s); return fillApplies(sl, true) ? fillLanguage : (sl || 'und'); };
     const sdhRemoved = (s, wl) => removeSubSdh !== 'disabled' && isSdh(s) && (removeSubSdh === 'all' || hasPlainSameLang(plainSubLangs, wl));
+    // The closed captions sub_worker imported (embedded_cc): a text subtitle it writes as und + hearing_impaired - CEA-608 carries no language - under the
+    // awk_cc 'imported' memo, which also stops sub_worker ever reading them out again. Its staging sidecar is gone by then and the bitstream copy stripped or
+    // owed a strip, so this track is the LAST copy: dropping it loses the captions for good, which neither filter below may do without saying so.
+    const ccImported = ccTokensOf(file.ffProbeData.format?.tags).includes(CC_TOKENS.imported);
+    const isImportedCaptionTrack = (s) => ccImported && codecTypeOf(s) === 'subtitle' && !isImageSub(codecNameOf(s))
+        && s.disposition?.hearing_impaired === 1 && ['', 'und'].includes(resolveLang(s));
     // The two filters that discard a subtitle on its own merits rather than because of its codec or the container - language_sub and remove_sub_sdh - as a
     // predicate the remove_imagesubs=export sites can consult BEFORE writing anything. Mirrors the stream loop's own tests exactly, so the answer here and
     // the drop it takes there can never disagree. Only the export needs it: exporting is one-way, so a sidecar written for a track those filters were about
@@ -1982,6 +2035,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // dropped via -map -0:ffstream.index. subCodecOverride: input stream position -> converted subtitle codec ('srt' / 'mov_text').
         const removedIndices = new Set();
         const subCodecOverride = new Map();
+        // handlerRolePrediction: input stream position -> { adds, roleText } for a stream whose handler held a role (see handlerOnlyRoles) - the flags the
+        // remux promotes and the role text that survives it. handlerRolesLost: '[s N] Role' entries no flag in the target can hold, reported on ONE line.
+        const handlerRolePrediction = new Map();
+        const handlerRolesLost = [];
         // Drop one input stream. The three writes are NOT independent: removedIndices is the sole input to the "Expected results" summary filter and to the
         // orphaned-font survivor test, so a drop site that maps a stream out without recording it makes the summary advertise a stream the command deletes.
         // Per-branch extras (a stream-index decrement, the continue) stay at the call site.
@@ -2115,12 +2172,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             //Metadata edits for this stream, accumulated by the emitters below and flushed onto the command at the end of the iteration.
             let metadataCommand = '';
             let delStream = false;
+            // Keep a role whose only copy is the handler about to go: promote its real flag on this same command even with tag_disposition off - it
+            // preserves what the file already says rather than adding anything. Where tag_disposition covers the type it has promoted every role already
+            // (the handler's included), and a second -disposition for one stream would override the first. A role no flag in the target can hold is lost
+            // with the handler, and said so once for the whole file (handlerRolesLost) rather than per stream.
+            const preserveHandlerRoles = (typeLetter, idx, typeWord) => {
+                const roles = handlerOnlyRoles(ffstream, typeWord);
+                if (!roles.length) return;
+                const covered = appliesToType(tagDisposition, typeWord);
+                const promoted = covered ? dispositionsToPromote(ffstream, typeWord) : dispositionsToPromote(ffstream, typeWord, roles);
+                if (!covered && promoted.length) {
+                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Set disposition (${typeWord}) from handler_name before it is `
+                        + `${dstContainer === 'mkv' ? 'cleared' : 'replaced'} - ${promoted.map((k) => dispositionTypes[k].tag).join(' ')}\n`;
+                    metadataCommand += ` -disposition:${typeLetter}:${idx} ${promoted.map((k) => `+${k}`).join('')}`;
+                }
+                const lost = [...new Set(roles.map(promoteTarget))].filter((k) => !promoted.includes(k));
+                if (lost.length) handlerRolesLost.push(`${streamTag(ffstream.index)} ${lost.map((k) => dispositionTypes[k].tag || k).join(' ')}`);
+                handlerRolePrediction.set(ffstream.index, { adds: promoted, roleText: survivingRoleText(ffstream) });
+            };
             // Per-stream handler_name canonicalisation, common to the subtitle/audio/video branches (mkv wipes it - it can confuse mkv title display; mp4
             // sets the per-type handler); wipeReason lets the video branch append its own note. Read case-insensitively (getTagCI): matroska UPPER-CASES
             // it to HANDLER_NAME, which mediaInfo surfaces as the Title - miss it and the busy handler re-triggers remove_busytitle every pass (an
             // infinite loop). ffmpeg matches -metadata keys case-insensitively, so the lowercase wipe still clears the uppercase tag.
             const emitHandlerMeta = (typeLetter, idx, typeWord, handlerName, wipeReason = '') => {
                 const curHandler = getTagCI(ffstream.tags, 'handler_name');
+                const replaced = (dstContainer === 'mkv' && curHandler) || (dstContainer === 'mp4' && curHandler !== handlerName);
+                if (replaced && (typeWord === 'audio' || typeWord === 'subtitle')) preserveHandlerRoles(typeLetter, idx, typeWord);
                 if (dstContainer === 'mkv' && curHandler) {
                     workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Wiping handler_name tag${wipeReason} (${typeWord})`
                         + ` "${logSafe(curHandler)}"\n`;
@@ -2251,6 +2328,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                     //language_sub: drop a subtitle whose (possibly filled) language is not on the keep list. A blank list keeps every language.
                     if(subLanguage.length > 0 && !langListMatch(workLang, subLangKeys)) {
+                        // Stop rather than lose the imported captions (isImportedCaptionTrack): the file is left untouched for the user to decide, and the
+                        // usual cause is the track's honest und tag - which is exactly what language_fill exists to fill.
+                        if (isImportedCaptionTrack(ffstream)) {
+                            failWithBuffers(`${streamTag(ffstream.index)}[language_sub=${logSafe(inputs.language_sub)}] Would remove the closed-caption track `
+                                + `sub_worker imported (language ${logSafe(workLang)}) - the last copy of those captions, which sub_worker will not read `
+                                + `out again - set language_fill to a language on language_sub`
+                                + `${fillLanguage ? '' : ' (or add und to language_sub)'}, then requeue`);
+                        }
                         // logSafe's 200-char cap matters here: the whole language_sub list is echoed once PER dropped subtitle.
                         workDone += `☐${streamTag(ffstream.index)}[language_sub=${logSafe(inputs.language_sub)}] `
                             + `Remove subtitle language (${logSafe(workLang)})\n`;
@@ -2258,6 +2343,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     } else if (sdhRemoved(ffstream, workLang)) {
                         workDone += `☐${streamTag(ffstream.index)}[remove_sub_sdh=${removeSubSdh}] Remove accessibility subtitle SDH/CC`
                             + ` (${logSafe(roleTextLower(ffstream))})\n`;
+                        // Honoured - removing SDH is what the setting asks for - but this one is the last copy of the imported captions, so say so.
+                        if (isImportedCaptionTrack(ffstream)) {
+                            workDone += `☒${streamTag(ffstream.index)}[remove_sub_sdh=${removeSubSdh}] That is the closed-caption track sub_worker imported - `
+                                + 'the last copy of those captions, which sub_worker will not read out again\n';
+                        }
                         delStream = true;
                     }
                 }
@@ -2470,6 +2560,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
             //Any other stream type (e.g. an unrecognised attachment classified as 'other') is left untouched - remove it with a separate plugin if needed.
         }
+        if (handlerRolesLost.length) {
+            workDone += `☒[container=${dstContainer}] handler_name is being ${dstContainer === 'mkv' ? 'cleared' : 'replaced'} and was the only place these `
+                + `roles lived, with no ${dstContainer} flag to hold them - lost: ${handlerRolesLost.join(', ')}\n`;
+        }
 
         // Resolve deferred font attachments now that subtitle removals are final: embedded fonts are only consumed by styled subtitles (ASS/SSA), so keep
         // them iff one survives in the output. mp4 never keeps fonts - it cannot carry a font attachment at all, and its styled subtitles have either
@@ -2568,12 +2662,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         // Grouped by DEMUXER FAMILY, not extension spelling - ffmpeg picks its demuxer by probing content, while file.container is just the lowercased
-        // extension. mpegts = ts/m2ts/mts/m2t/tp/trp/tod · MPEG-PS = mpg/mpeg/vob/evo/m2p/vro/mod · avi. Add a new spelling to the family it demuxes as.
+        // extension. mpegts = ts/m2ts/mts/m2t/tp/trp/tod · MPEG-PS = mpg/mpeg/vob/evo/m2p/vro/mod/dat · avi. Add a new spelling to the family it demuxes as.
         // Not hypothetical: identical MPEG-PS bytes named .vob hard-fail a bare -c copy remux ("Can't write packet with unknown timestamp", exit -22)
         // while the same bytes named .mpg are repaired here - and vob/evo/m2ts are in Tdarr's DEFAULT containerFilter, so the gap was reachable out of the
-        // box. The bar is "every real spelling of the family", not Tdarr's defaults; all measured on the production build.
+        // box. The bar is "every real spelling of the family", not Tdarr's defaults; all measured on the production build (.dat is a VCD's AVSEQnn.DAT).
         if (['ts', 'm2ts', 'mts', 'm2t', 'tp', 'trp', 'tod',
-            'mpg', 'mpeg', 'vob', 'evo', 'm2p', 'vro', 'mod', 'avi'].includes(srcContainer)) {   // container-forced timestamp fix (always applied)
+            'mpg', 'mpeg', 'vob', 'evo', 'm2p', 'vro', 'mod', 'dat', 'avi'].includes(srcContainer)) {   // container-forced timestamp fix (always applied)
             const genptsAlreadySet = fflags.includes('genpts');
             if(!genptsAlreadySet)
                 fflags += '+genpts';
@@ -2632,14 +2726,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 extraArguments += ' -movflags use_metadata_tags';
             response.preset += `${fflags}${inputArgs}<io>${sidecarOut} -map 0 -c copy${extraArguments}${globalOutputOpt}`;
             response.infoLog += workDone;
-            // Predicted output: re-renders the input streams with the two mutations this summary tracks - removedIndices
-            // filtering and subCodecOverride (converted subtitle codec). It does NOT reflect queued language fills / tag_language
+            // A stream whose handler held a role, as the output will carry it: no handler, the promoted flags set, and only the role text that survives.
+            // roleTextLower memoises per stream OBJECT, so seeding it for this predicted copy is what every classifier then reads - the copy keeps the source
+            // index, which mediaInfoFor joins on, so the handler echo in mediaInfo's Title would otherwise still count.
+            const predictHandlerRoles = (s) => {
+                const p = handlerRolePrediction.get(s.index);
+                if (!p) return s;
+                const tags = Object.fromEntries(Object.entries(s.tags || {}).filter(([k]) => k.toLowerCase() !== 'handler_name'));
+                const out = { ...s, tags, disposition: { ...(s.disposition || {}), ...Object.fromEntries(p.adds.map((k) => [k, 1])) } };
+                roleTextCache.set(out, p.roleText);
+                return out;
+            };
+            // Predicted output: re-renders the input streams with the mutations this summary tracks - removedIndices
+            // filtering, subCodecOverride (converted subtitle codec) and predictHandlerRoles. It does NOT reflect queued language fills / tag_language
             // standardization: those emit only a -metadata:s:...language= arg and never mutate the ffprobe object summariseStream
             // reads, so a track whose blank/looser tag will be rewritten still shows its pre-change lang token here.
             const outSummary = file.ffProbeData.streams
                 .map(s => ({ s: enrichStream(s), idx: s.index }))
                 .filter(({ idx }) => !removedIndices.has(idx))
                 .map(({ s, idx }) => (subCodecOverride.has(idx) ? { ...s, codec_name: subCodecOverride.get(idx) } : s))
+                .map(predictHandlerRoles)
                 .map((s) => summariseStream(s)).join('');
             response.infoLog += `☑Expected results: ${outSummary}\n`;
             response.processFile = true;
