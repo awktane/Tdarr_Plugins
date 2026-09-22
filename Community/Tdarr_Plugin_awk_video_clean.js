@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.34',
+    Version: '3.999.35',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -900,12 +900,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // the fmtprobe `subedge:a53emit` row guards it against an ffmpeg bump). ONE table so the dropCaptions suppression in buildVideoArgs and the guard_captions
     // force-CPU gate can never disagree about which encoder keeps captions:
     //   'keep'  - re-emits captions BY DEFAULT, so DROPPING them needs an explicit suppress (`-a53cc 0`, or `-sei -a53_cc` on vaapi): libx264, h264/hevc/av1
-    //             nvenc, h264/hevc vaapi. (h264_qsv exposes -a53cc but the QSV hwupload strips the side data, so in practice it is 'drop', not 'keep'.)
+    //             nvenc, h264/hevc vaapi.
     //   'optin' - drops by default, so KEEPING needs `-a53cc 1`: libx265.
     //   'error' - h264_videotoolbox CRASHES the encode when it inserts A53 ("Invalid data found"), so it ALWAYS gets `-a53cc 0` and can never keep captions.
-    //   'drop'  - cannot carry captions and has no option to change that: qsv, amf, hevc/av1 videotoolbox, libsvtav1, av1 on qsv/vaapi.
+    //   'drop'  - cannot carry captions and has no option to change that: hevc/av1 qsv, amf, hevc/av1 videotoolbox, libsvtav1, av1 on vaapi.
+    //   'unreliable' - h264_qsv, and it needs BOTH halves of the map to treat it differently, which is why the class exists. Measured 2026-09-22 on both
+    //             Intel Linux nodes (N150/Xe-LP and J4125/UHD 600, iHD 26.2.2, jellyfin-ffmpeg 7.1.4): encoding the caption sample the way this plugin
+    //             does it - a quality setting and a software scale - the captions SURVIVE in about 24 runs out of 25, so treating it as 'drop' and
+    //             emitting nothing leaves a re-encode carrying captions that sub_worker has already exported to a sidecar, and the player shows them
+    //             twice. But it dropped them in roughly 1 run in 5 on one node, so it cannot be trusted to PRESERVE them either. Hence: suppressed like a
+    //             'keep' when captions are being dropped (`-a53cc 0`, measured to work 10 times out of 10 on both nodes), and counted with the droppers
+    //             by guard_captions, which still forces the CPU encoder when captions must survive. Note the encoder is not at fault for the spread: the
+    //             same command with NO rate-control option emits the SEI only sometimes, which is also why fmtprobe's subedge:a53emit row - which uses
+    //             that bare shape - reports a different value run to run and must not be read as a verdict on this cell.
     const A53_CAP = {
-        h264: { cpu: 'keep', videotoolbox: 'error', nvenc: 'keep', qsv: 'drop', vaapi: 'keep', amf: 'drop' },
+        h264: { cpu: 'keep', videotoolbox: 'error', nvenc: 'keep', qsv: 'unreliable', vaapi: 'keep', amf: 'drop' },
         hevc: { cpu: 'optin', videotoolbox: 'drop', nvenc: 'keep', qsv: 'drop', vaapi: 'keep', amf: 'drop' },
         av1: { cpu: 'drop', videotoolbox: 'drop', nvenc: 'keep', qsv: 'drop', vaapi: 'drop', amf: 'drop' },
     };
@@ -1605,7 +1614,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // it - it cannot keep captions at all, which is why guard_captions force-picks libx264 when a caption-bearing file targets H.264 on a Mac.
         const a53cap = (A53_CAP[targetCodec] || {})[family];
         if (a53cap === 'error') parts.push('-a53cc 0');
-        else if (a53cap === 'keep' && dropCaptions) parts.push(family === 'vaapi' ? '-sei -a53_cc' : '-a53cc 0');
+        else if ((a53cap === 'keep' || a53cap === 'unreliable') && dropCaptions) parts.push(family === 'vaapi' ? '-sei -a53_cc' : '-a53cc 0');
         else if (a53cap === 'optin' && !dropCaptions) parts.push('-a53cc 1');
         // hvc1 = Apple/QuickTime HEVC-in-mp4 (primary only); a no-base DV (e.g. profile 5) needs dvh1 or the DV box is dropped. The encode path tags hevc
         // ONLY - see qtVideoTag for why it and the copy path differ
@@ -2286,12 +2295,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // node_strict would silently take a multi-hour software encode for the sole reason that it carries captions. Checking first also skips the
             // bounded caption probe (0.2-17 s) on a file that was already decided to fail.
             if (sel.strictFail) { sel.notes.forEach((n) => { response.infoLog += n; }); failFile(sel.strictFail); }
-            // Probe for captions only where the SELECTED encoder would drop them (A53_CAP 'drop'/'error'). A keep-by-default encoder
+            // Probe for captions only where the SELECTED encoder cannot be trusted to keep them (A53_CAP 'drop'/'error'/'unreliable'). A keep-by-default encoder
             // - any H.264, or HEVC on nvenc/vaapi, or av1 on nvenc - and libx265 (kept via the -a53cc 1 above) all carry them
             // unaided, so a probe would change nothing there. Of the droppers, an H.264 or HEVC target has a caption-keeping CPU
             // encoder to fall back to (libx264 / libx265), so force it; an AV1 target that landed on a dropper has none (libsvtav1
             // has no option, and an av1_nvenc would already have been picked), so it can only warn and continue - hence they differ.
-            const selDropsCaptions = ['drop', 'error'].includes((A53_CAP[targetCodecName] || {})[sel.family]);
+            const selDropsCaptions = ['drop', 'error', 'unreliable'].includes((A53_CAP[targetCodecName] || {})[sel.family]);
             if (guardCaptions && !dropCaptions && selDropsCaptions) {
                 const cc = detectCaptions();
                 if (cc.unknown)
@@ -2343,8 +2352,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter: deintFilter(),
                 dropCaptions, sliceDecode });
             let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy${coverArtDrops}${strictArg} -metadata "${VIDEO_FENCE_TAG}=${videoSig}"`;
-            // Retire the request this encode just served. ccExported implies dropCaptions, and buildVideoArgs suppresses A53 on every keep-by-default encoder
-            // under dropCaptions (A53_CAP) while every other encoder drops it unaided, so the output provably carries no captions - `removed` is the accurate
+            // Retire the request this encode just served. ccExported implies dropCaptions, and buildVideoArgs suppresses A53 on every encoder that can emit it
+            // under dropCaptions ('keep' and 'unreliable' in A53_CAP) while the rest drop it unaided, so the output provably carries no captions - `removed`
+            // is the accurate
             // successor to `strip`, and it is the token that stops any later pass paying a caption probe. Only fires when a request was actually present.
             if (ccExported) {
                 const retired = [...new Set(ccTokens.map((t) => (t === CC_TOKENS.strip ? CC_TOKENS.removed : t)))];
