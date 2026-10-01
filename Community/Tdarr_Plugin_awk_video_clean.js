@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.37',
+    Version: '3.999.38',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -2455,6 +2455,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (alreadyFenced) {
                 return skip(`☑${streamTag(primary.index)}[action=${action}] Already processed by ${VIDEO_FENCE_TAG} at this exact setting (${videoSig})`
                     + ` - left untouched\n`);
+            }
+            // deinterlace=enabled asked for an interlace verdict and the probe could not deliver one, while codec, downscale or tonemap still forces this
+            // encode. Encoding now would bake any combing in for good - a downscale blends the fields beyond repair - and the fence it writes is keyed on
+            // the SETTING (videoSigCore: that is what lets a repaired, now-progressive output converge), so it would skip the file even once a later probe
+            // reads it interlaced. So the file fails instead, untouched: a timeout clears on a requeue, and a file the probe can never read is the user's
+            // call to encode as-is with deinterlace=disabled. With no other trigger nothing is encoded, and deintVerdictLine reports it left as-is.
+            if (deinterlaceLive && idet().kind === 'unknown') {
+                failFile(`${streamTag(primary.index)}[deinterlace=${deinterlaceOpt}] Could not read an interlace verdict from this file${
+                    idetMemo.why ? ` (the probe did not finish: ${idetMemo.why})` : ''} - not encoding, since combing encoded now could never be repaired;`
+                    + ' requeue, or set deinterlace=disabled to encode it as-is');
             }
             const reasonTags = [
                 srcCodecName !== targetCodecName && targetCodecName,   // codec change
