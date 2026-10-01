@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.36',
+    Version: '3.999.37',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1187,18 +1187,34 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const A53_PROBE_FRAMES = 400;                         // captions are sparse, and a programme's opening is often silent; 400 frames spans enough to decide
     const A53_SIDE_DATA = 'A53 Part 4 Closed Captions';   // ffprobe's spelling of the side-data type, and the only positive signal there is
 
-    // Tdarr hands a plugin otherArguments.ffmpegPath and nothing else; ffprobe sits beside it under the same name. Replace only the FINAL path component: the
-    // production path carries 'ffmpeg' as a DIRECTORY as well as the basename (.../assets/app/ffmpeg/darwin_arm64/ffmpeg), so a plain string replace rewrites
-    // the directory and yields a path to nothing. Returns '' when the binary can't be located, which every caller must read as "unknown", never as "no".
+    // Tdarr hands a plugin otherArguments.ffmpegPath and nothing else, and it is not always a path to a file named ffmpeg: Tdarr's Linux Docker image hands
+    // the bare command 'tdarr-ffmpeg', a PATH link into the jellyfin-ffmpeg install, whose ffprobe sits beside the REAL binary - a name test accepting only
+    // 'ffmpeg' leaves every Docker node without a caption probe, so guard_captions never protects there. The probe is the ffmpeg name with 'ffmpeg' in the
+    // FINAL component swapped for 'ffprobe' (ffmpeg -> ffprobe, tdarr-ffmpeg -> tdarr-ffprobe, ffmpeg.exe -> ffprobe.exe), looked for beside the path as
+    // given (a bare command resolved through PATH first) and then beside the target it links to. Only the final component: the production path carries
+    // 'ffmpeg' as a DIRECTORY too (.../assets/app/ffmpeg/darwin_arm64/ffmpeg). A name with no 'ffmpeg' in it, or a derived file that is not there, gives ''
+    // - never ffmpeg itself, which run with ffprobe's arguments would misreport the failure as an unreadable file. Every caller reads '' as "unknown".
     const deriveFfprobePath = (ffmpegPath) => {
-        const p = String(ffmpegPath || '').trim();
-        if (!p) return '';
-        const cut = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
-        const base = p.slice(cut + 1);
-        if (!/^ffmpeg(\.exe)?$/i.test(base)) return '';   // an unexpected basename (a wrapper script, say): no safe derivation
-        const probe = p.slice(0, cut + 1) + base.replace(/^ffmpeg/i, 'ffprobe');
-        if (cut < 0) return probe;                        // a bare 'ffmpeg' means a PATH lookup, and 'ffprobe' resolves the same way
-        try { return fs.existsSync(probe) ? probe : ''; } catch (e) { return ''; }
+        const given = String(ffmpegPath || '').trim();
+        if (!given) return '';
+        const pathMod = require('path');
+        const isFile = (p) => { try { return fs.statSync(p).isFile(); } catch (e) { return false; } };
+        const swap = (p) => {
+            const cut = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+            const base = p.slice(cut + 1);
+            const at = base.toLowerCase().lastIndexOf('ffmpeg');
+            return at < 0 ? '' : `${p.slice(0, cut + 1)}${base.slice(0, at)}ffprobe${base.slice(at + 6)}`;
+        };
+        let resolved = given;
+        if (!/[\\/]/.test(given)) {   // a bare command is a PATH lookup, so resolve it the way the OS would
+            const exts = process.platform === 'win32' ? ['', ...String(process.env.PATHEXT || '.EXE').split(';').filter(Boolean)] : [''];
+            const dirs = String(process.env.PATH || '').split(pathMod.delimiter).filter(Boolean);
+            resolved = dirs.flatMap((d) => exts.map((x) => pathMod.join(d, given + x))).find(isFile) || '';
+            if (!resolved) return '';
+        }
+        const candidates = [swap(resolved)];
+        try { candidates.push(swap(fs.realpathSync(resolved))); } catch (e) { /* an unresolvable link leaves the first candidate only */ }
+        return candidates.find((c) => c && isFile(c)) || '';
     };
 
     // Does the primary video stream carry A53 caption side data? Returns true / false / 'unknown' - and 'unknown' is NOT 'no': it means the probe could not
