@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.41',
+    Version: '4.999.42',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -229,8 +229,8 @@ const details = () => ({
                 \\n=====
                 \\ndisabled (default): keep them.
                 \\nif_plain_survives: remove them, but only where a plain subtitle of the same language survives - one carrying no commentary, descriptive,
-                SDH or lyrics role, in a format the output container keeps, not stripped by remove_imagesubs and not exported to a bundle. So extras go,
-                never your last usable subtitle of that language.
+                SDH or lyrics role and not forced (a forced track holds only the foreign-language lines), in a format the output container keeps, not
+                stripped by remove_imagesubs and not exported to a bundle. So extras go, never your last usable subtitle of that language.
                 \\nall: remove every one of them, whatever else the file carries. A file can legitimately end up with no subtitles at all.
                 \\nAudio description (visual_impaired audio) is not handled here - audio_clean's downmix_secondary owns it, along with commentary and M&E.`,
         },
@@ -1878,14 +1878,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             && matchesKeyword(handler, dispositionTypes[k].keywords) && !matchesKeyword(surviving, dispositionTypes[k].keywords));
     };
 
-    // remove_sub_sdh safety guard. A "plain" subtitle carries no commentary/descriptive/SDH/lyrics role. On if_plain_survives an SDH/CC subtitle goes only
+    // remove_sub_sdh safety guard. A "plain" subtitle carries no commentary/descriptive/SDH/lyrics role and is not FORCED: a forced track holds only the
+    // foreign-language lines, so counting it as the survivor deleted the only full subtitle on the common SDH-plus-forced disc layout. A track titled
+    // just "Signs" is indistinguishable from a plain one and stays one. On if_plain_survives an SDH/CC subtitle goes only
     // when its language still has a plain subtitle that SURVIVES every whole-file drop reason (subDroppedRegardlessOfLanguage), so extras go and the last
     // usable track of that language stays; on `all` it goes regardless, and ending with no subtitles is an accepted outcome there. resolveWorkLang shares
     // canonicalLangMeta's fillApplies rule so the language this guard filters on and the tag that gets written can't drift. Audio has no equivalent:
     // audio_clean's downmix_secondary owns audio-description removal. plainSubLangs is FILLED after the muxability gate below (the format-filter test
     // reads dstContainer, which mkv_fallback can rewrite); sdhRemoved is the single predicate every site consults, so the tiers cannot drift across sites.
     const plainSubLangs = new Set();
-    const isPlainTrack = (s) => !isCommentary(s) && !isDescriptive(s) && !isSdh(s) && !isLyrics(s);
+    const isPlainTrack = (s) => !isCommentary(s) && !isDescriptive(s) && !isSdh(s) && !isLyrics(s) && !hasDisposition(s, 'forced');
     const hasPlainSameLang = (set, wl) => set.has(langKey(wl));
     const resolveWorkLang = (s) => { const sl = resolveLang(s); return fillApplies(sl, true) ? fillLanguage : (sl || 'und'); };
     const sdhRemoved = (s, wl) => removeSubSdh !== 'disabled' && isSdh(s) && (removeSubSdh === 'all' || hasPlainSameLang(plainSubLangs, wl));
