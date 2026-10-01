@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.42',
+    Version: '4.999.43',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -322,8 +322,8 @@ const details = () => ({
                 \\naggressive: also -fflags +discardcorrupt, which drops packets flagged corrupt. Expect small video or audio blips wherever the damage is.
                 \\nRecovery re-runs only when you change one of the recover_bad_* settings, then settles - it will not reprocess the file on every pass.
                 \\nA repaired file can come out INCOMPLETE (a truncated source is salvaged to its true, shorter length), which stream_ordering accepts with a
-                warning rather than failing it. Review such a file in Tdarr and confirm it plays through before approving - do not auto-approve a recovery queue,
-                or an invisibly short result is kept silently.`,
+                warning in the job that repairs it, rather than failing it (a later job checks its length in full again). Review such a file in Tdarr and
+                confirm it plays through before approving - do not auto-approve a recovery queue, or an invisibly short result is kept silently.`,
         },
         {
             name: 'recover_bad_timestamps',
@@ -347,8 +347,8 @@ const details = () => ({
                 \\nRe-runs only on a recover_bad_* change, as for recover_bad_data. Container-forced timestamp fixes apply regardless, for the whole
                 MPEG-TS family (ts/m2ts/mts/m2t/tp/trp/tod), the whole MPEG-PS family (mpg/mpeg/vob/evo/m2p/vro/mod), and avi.
                 \\nA repaired file can come out INCOMPLETE (a truncated source is salvaged to its true, shorter length), which stream_ordering accepts with a
-                warning rather than failing it. Review such a file in Tdarr and confirm it plays through before approving - do not auto-approve a recovery queue,
-                or an invisibly short result is kept silently.`,
+                warning in the job that repairs it, rather than failing it (a later job checks its length in full again). Review such a file in Tdarr and
+                confirm it plays through before approving - do not auto-approve a recovery queue, or an invisibly short result is kept silently.`,
         },
     ],
 });
@@ -1756,9 +1756,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // stream_ordering reads it to soften BOTH truncation verdicts from a failFile quarantine to a warning that accepts the file for review, because a
     // recover_bad_* repair of a truncated source legitimately reports a shorter or absent duration - so a reader that stopped matching would quarantine
     // every salvaged file in a loop the user cannot break (fixed tolerance, no relaxing input). SHARED for the reason the closed-caption handoff gives: a
-    // writer and a reader whose vocabularies drift fail SILENTLY. Only the KEY needs guarding - the read is getTagCI (case-insensitive) and tests
-    // non-emptiness only, so no VALUE format can drift. Interpolate it into the log lines that NAME the tag too, or a rename here leaves user-facing text
-    // pointing at a key nothing writes any more.
+    // writer and a reader whose vocabularies drift fail SILENTLY. Only the KEY needs guarding - the read is getTagCI (case-insensitive) and tests only
+    // non-emptiness and equality with the library original's value, so no VALUE format can drift. Interpolate it into the log lines that NAME the tag too,
+    // or a rename here leaves user-facing text pointing at a key nothing writes any more.
     const RECOVERED_TAG = 'awk_recovered';
     // ===== END SHARED: recovered marker vocabulary =====
     // #endregion

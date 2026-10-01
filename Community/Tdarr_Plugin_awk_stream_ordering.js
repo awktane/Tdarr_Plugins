@@ -14,10 +14,10 @@ const details = () => ({
         playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time
         it's needed).\n\nBecause it runs last it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file
         that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the signature of an out-of-memory-killed or
-        unfinalised encode from an earlier stage. A longer output is accepted, and so is a file carrying clean_and_remux's awk_recovered tag: a
-        repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. This check
-        is always on and has no setting.\n`,
-    Version: '4.999.22',
+        unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same
+        job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. A
+        later job on that file is checked in full again. This check is always on and has no setting.\n`,
+    Version: '4.999.23',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -1038,9 +1038,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // stream_ordering reads it to soften BOTH truncation verdicts from a failFile quarantine to a warning that accepts the file for review, because a
     // recover_bad_* repair of a truncated source legitimately reports a shorter or absent duration - so a reader that stopped matching would quarantine
     // every salvaged file in a loop the user cannot break (fixed tolerance, no relaxing input). SHARED for the reason the closed-caption handoff gives: a
-    // writer and a reader whose vocabularies drift fail SILENTLY. Only the KEY needs guarding - the read is getTagCI (case-insensitive) and tests
-    // non-emptiness only, so no VALUE format can drift. Interpolate it into the log lines that NAME the tag too, or a rename here leaves user-facing text
-    // pointing at a key nothing writes any more.
+    // writer and a reader whose vocabularies drift fail SILENTLY. Only the KEY needs guarding - the read is getTagCI (case-insensitive) and tests only
+    // non-emptiness and equality with the library original's value, so no VALUE format can drift. Interpolate it into the log lines that NAME the tag too,
+    // or a rename here leaves user-facing text pointing at a key nothing writes any more.
     const RECOVERED_TAG = 'awk_recovered';
     // ===== END SHARED: recovered marker vocabulary =====
     // #endregion
@@ -1120,12 +1120,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (sig.needsSameAudio && !sameAudio) continue;
                 if (!verdict && oldDur && newDur) verdict = { name: sig.name, old: oldDur, now: newDur };
             }
-            // A file clean_and_remux repaired (it stamps a format-level awk_recovered tag on every recover_bad_* remux, kept across containers and untouched by
-            // the junk-tag strip) can legitimately be SHORTER than the library-entry original: recovery salvages a truncated source whose intact header claimed
-            // the full length into a file reporting its true, shorter duration - the mirror of the over-length recover_* case the tolerance comment above
-            // already spares. Erroring it removes the salvaged result the user asked for and loops forever (fixed tolerance, no relaxing input), so soften both
-            // verdicts to a ☒ warning and ACCEPT the file for review. Users should NOT auto-approve a recovery queue - the recover_bad_* tooltips say so.
-            const recovered = getTagCI(file.ffProbeData?.format?.tags || {}, RECOVERED_TAG).trim() !== '';
+            // A file clean_and_remux repaired IN THIS JOB can legitimately be SHORTER than the library-entry original: recovery salvages a truncated source
+            // whose intact header claimed the full length into a file reporting its true, shorter duration - the mirror of the over-length recover_* case the
+            // tolerance comment above already spares. Erroring it removes the salvaged result the user asked for and loops forever (fixed tolerance, no
+            // relaxing input), so soften both verdicts to a ☒ warning and ACCEPT the file for review. Users should NOT auto-approve a recovery queue - the
+            // recover_bad_* tooltips say so. The awk_recovered stamp is PERMANENT (no plugin removes it, every later remux and encode carries it, and light
+            // mode stamps healthy files too), so its presence alone would waive this guard for every later job on the file - an OOM-killed encode included,
+            // long after recovery ran. Recovery ran in this job exactly when the stamp differs from the library original's: clean_and_remux re-runs it only for
+            // a mode the stamp does not already record, and a later job's original IS the stamped file. (A container change re-runs it with the same stamp, on
+            // a file already at its true length.)
+            const recoveredTagOf = (probed) => getTagCI(probed?.ffProbeData?.format?.tags || {}, RECOVERED_TAG).trim();
+            const recovered = recoveredTagOf(file) !== '' && recoveredTagOf(file) !== recoveredTagOf(originalFile);
             if (verdict) {
                 const pct = (verdict.now / verdict.old) * 100;
                 if (pct < 100 - DURATION_TOLERANCE_PCT) {
