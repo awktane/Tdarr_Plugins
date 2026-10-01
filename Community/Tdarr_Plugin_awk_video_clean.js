@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.40',
+    Version: '3.999.41',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -902,8 +902,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (codec=source keeps the source codec only when it is one of these). Membership only, so key order is immaterial.
     const ENCODABLE_CODECS = Object.keys(ENCODER_NAME);
     // Per-(codec, family) A53 closed-caption capability, hardware-confirmed on jellyfin-ffmpeg 7.1.4 across Mac / Linux-Intel / Windows-NVIDIA (2026-09-04;
-    // the fmtprobe `subedge:a53emit` row guards it against an ffmpeg bump). ONE table so the dropCaptions suppression in buildVideoArgs and the guard_captions
-    // force-CPU gate can never disagree about which encoder keeps captions:
+    // the fmtprobe `subedge:a53emit` row re-measures every cell against a mirror of this table). ONE table so the dropCaptions suppression in
+    // buildVideoArgs and the guard_captions force-CPU gate can never disagree about which encoder keeps captions:
     //   'keep'  - re-emits captions BY DEFAULT, so DROPPING them needs an explicit suppress (`-a53cc 0`, or `-sei -a53_cc` on vaapi): libx264, h264/hevc/av1
     //             nvenc, h264/hevc vaapi.
     //   'optin' - drops by default, so KEEPING needs `-a53cc 1`: libx265.
@@ -916,8 +916,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //             twice. But it dropped them in roughly 1 run in 5 on one node, so it cannot be trusted to PRESERVE them either. Hence: suppressed like a
     //             'keep' when captions are being dropped (`-a53cc 0`, measured to work 10 times out of 10 on both nodes), and counted with the droppers
     //             by guard_captions, which still forces the CPU encoder when captions must survive. Note the encoder is not at fault for the spread: the
-    //             same command with NO rate-control option emits the SEI only sometimes, which is also why fmtprobe's subedge:a53emit row - which uses
-    //             that bare shape - reports a different value run to run and must not be read as a verdict on this cell.
+    //             same command with NO rate-control option emits the SEI only sometimes. fmtprobe's subedge:a53emit row therefore encodes with one, five
+    //             times, and reads each encoder against this table: a 'keep' must keep in every run, an 'unreliable' only in at least one.
     const A53_CAP = {
         h264: { cpu: 'keep', videotoolbox: 'error', nvenc: 'keep', qsv: 'unreliable', vaapi: 'keep', amf: 'drop' },
         hevc: { cpu: 'optin', videotoolbox: 'drop', nvenc: 'keep', qsv: 'drop', vaapi: 'keep', amf: 'drop' },
