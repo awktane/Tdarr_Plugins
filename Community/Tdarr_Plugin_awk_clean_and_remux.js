@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.43',
+    Version: '4.999.44',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1369,7 +1369,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     const path = require('path'); const fs = require('fs');   // fs: the sidecar placement section below (temp staging dir + sizes) and the export exists-check
 
-    // #region SHARED helpers (2 sections: sidecar path derivation … sidecar placement)
+    // #region SHARED helpers (3 sections: sidecar path derivation … subtitle cue span)
     // ===== SHARED [clean_and_remux, sub_worker]: sidecar path derivation =====
     // -=-=-= libFilePath / libDir / videoBase / sidecarLangToken  [clean_and_remux, sub_worker] =-=-=-
     // Where a sidecar is written, plus the two metadata-derived name parts that get interpolated into the quoted "${path}" token of a preset. These two plugins
@@ -1518,20 +1518,67 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { placed, failed, empty };
     };
     // -=-=-= fileHasBytes  [clean_and_remux, sub_worker] =-=-=-
-    // Is a USABLE sidecar already on disk? One question, asked by both plugins before a destructive step: clean_and_remux drops an embedded subtitle
-    // only because a sidecar is supposed to hold it, and sub_worker skips a re-extract for the same reason. Zero bytes counts as ABSENT, which is
-    // the load-bearing half - an ffmpeg aborted mid-write leaves an empty file, and trusting it then strips the only copy of the subtitle. Any stat
-    // failure is absent too, so a permission error re-extracts rather than silently dropping. Shared so a refinement (treating whitespace-only as
-    // absent, or adding an isFile test so a directory named like a sidecar is not mistaken for one) cannot land on one plugin's copy and leave the
-    // other answering differently about the same file. KNOWN GAP at this level: a run killed AFTER the first flush leaves a non-empty TRUNCATED
-    // sidecar (an MB-scale export is written progressively across the whole remux), which this size>0 test alone would trust as complete. It cannot
-    // be closed inside this helper - a byte-truncated raw .sup is indistinguishable from a legitimately shorter subtitle (ffprobe exits 0 and reads
-    // it as valid - measured), and overwriting blindly would discard a sidecar the user may have OCR'd or edited. A caller that can PROVE the prior
-    // export never completed closes it instead: an image-sub export whose source stream is still present cannot have finished (a completed export
-    // always drops that stream), so it re-exports the .sup rather than trusting the partial. Where no such proof exists - a text/styled sidecar a
-    // user may have edited - the size>0 answer stands, a residual narrowed to a kill-mid-write+requeue on an edited round-trip.
+    // Is ANYTHING at a sidecar's name? The first of two questions both plugins ask before a destructive step - clean_and_remux drops an embedded subtitle
+    // only because a sidecar is supposed to hold it, and sub_worker strips one for the same reason. Zero bytes counts as ABSENT: a killed export leaves
+    // one (measured on 7.1.4 - a small srt is still fully buffered when the run dies), and trusting it strips the only copy. Any stat failure is absent
+    // too, so a permission error re-extracts rather than silently dropping. Whether what IS there holds the whole subtitle is the second question, and
+    // size cannot answer it (a byte-truncated raw .sup reads as valid - measured): see the subtitle cue span section. Shared so a refinement cannot land
+    // on one plugin's copy and leave the other answering differently about the same file.
     const fileHasBytes = (p) => { try { return fs.statSync(p).size > 0; } catch (e) { return false; } };
     // ===== END SHARED: sidecar placement =====
+
+    // ===== SHARED [clean_and_remux, sub_worker]: subtitle cue span =====
+    // -=-=-= SIDECAR_HASH_MAX / CUE_SPAN_SLACK_S  [clean_and_remux, sub_worker] =-=-=-
+    // The ceiling on subtitle text read whole into memory - a sidecar, an embedded track decoded to a temp file, a bundle's subtitle; why 64 MiB and why
+    // each write-time -fs sits one byte above it is explained at sub_worker's embeddedTextHashes. CUE_SPAN_SLACK_S is how far short of the subtitle's
+    // own end a copy's last cue may stop and still count as the whole of it: a complete export ends where the stream does, to the centisecond.
+    const SIDECAR_HASH_MAX = 64 * 1024 * 1024;
+    const CUE_SPAN_SLACK_S = 1;
+    // -=-=-= cueSpan  [clean_and_remux, sub_worker] =-=-=-
+    // How many cues decoded subtitle text holds and where the LAST one ends, in seconds: { cues, end }. Whether a sidecar already on disk is the whole
+    // subtitle or only its start - a run that FAILS partway (an ffmpeg error, not a kill) still finalises every output, so its sidecar is well-formed and
+    // simply stops early, which no size or parse test can see, while a user's edit keeps the timeline. srt/vtt cues are their '-->' timing lines; ass/ssa
+    // cues their Dialogue lines, whose End is the third field in both formats. Untrusted text up to SIDECAR_HASH_MAX, so it is cut into lines first and
+    // each line tested with an anchored or literal-led pattern - nothing here can backtrack across lines (hasNoCues says what an unanchored ^\s* costs).
+    const cueSpan = (text, ext) => {
+        const ass = ext === 'ass' || ext === 'ssa';
+        const secs = (stamp) => stamp.trim().replace(',', '.').split(':').reduce((acc, part) => acc * 60 + Number(part), 0);
+        let cues = 0; let end = 0;
+        for (const line of String(text).split(/\r\n|[\n\r\u2028\u2029]/)) {
+            const m = ass ? /^[^\S\r\n\u2028\u2029]*Dialogue\s*:[^,]*,[^,]*,([^,]*),/i.exec(line) : /-->[ \t]*((?:\d+:)?\d{1,2}:\d{1,2}[.,]\d{1,3})/.exec(line);
+            if (!m) continue;
+            const t = secs(m[1]);
+            if (!Number.isFinite(t)) continue;
+            cues += 1;
+            if (t > end) end = t;
+        }
+        return { cues, end };
+    };
+    // -=-=-= readBundleSubtitle  [clean_and_remux, sub_worker] =-=-=-
+    // The subtitle inside a styled .mks bundle, decoded to ASS by ffmpeg into a private temp dir, and how many font attachments ffmpeg's input listing
+    // names ("Stream #0:1: Attachment: ttf", measured on 7.1.4). { state: 'ok', buf, fonts }, or { state: 'unreadable' } when ffmpeg RAN and could not
+    // decode it - what an interrupted export leaves: killed mid-write it ends "File ended prematurely", and a run whose OTHER output failed at
+    // write_header leaves a header with no cluster ("End of file"), both measured on 7.1.4 - or { state: 'unknown' } when it could not be judged (no temp
+    // dir, a spawn error or timeout, a read-out over the cap), where every caller keeps the answer it had before it could look.
+    const readBundleSubtitle = (p) => {
+        let dir = '';
+        try { dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_subbundle_')); } catch (e) { return { state: 'unknown' }; }
+        const out = path.join(dir, 'b.ass');
+        let res = { state: 'unknown' };
+        try {
+            const { spawnSync } = require('child_process');
+            const r = spawnSync(ffmpegPathOf(otherArguments), ['-hide_banner', '-y', '-loglevel', 'info', '-i', p, '-map', '0:s:0', '-c:s', 'ass',
+                '-fs', String(SIDECAR_HASH_MAX + 1), out], { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES });
+            if (!r.error && r.status !== 0) res = { state: 'unreadable' };
+            else if (!r.error && fs.statSync(out).size <= SIDECAR_HASH_MAX) {
+                res = { state: 'ok', buf: fs.readFileSync(out),
+                    fonts: String(r.stderr || '').split('\n').filter((l) => l.trimStart().startsWith('Stream #') && l.includes(': Attachment:')).length };
+            }
+        } catch (e) { /* not judged - the caller keeps its old answer */ }
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
+        return res;
+    };
+    // ===== END SHARED: subtitle cue span =====
     // #endregion
 
     // Hidden dot-prefixed sidecar name: ".<video>.s<index>.<lang>[.forced][.<mark>].<ext>". The dot makes Plex/Jellyfin ignore it; Emby scans dotfiles, so
@@ -2087,6 +2134,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // placedSidecars, refusing the drop otherwise exactly as an unsafe path does. The pre-scan repeats the loop's own export test, so the two cannot
         // select different streams.
         let exportRefusedCount = 0;   // image-sub exports that could not be written this run - any at all fails the file, see the check after the stream loop
+        // Styled bundles already on disk that could be neither trusted nor replaced (cut short, or undeletable). Unlike the other styled refusals the user can
+        // fix these, so the file fails with the styled original intact rather than flattening it to mov_text for good - see the check after the stream loop.
+        let bundleHeldCount = 0;
         const placedSidecars = new Set(); const failedSidecars = new Map(); const emptySidecars = new Set();
         // The font attachments a styled-subtitle bundle carries. Read once here: they are the same set for every styled subtitle in the file, and the
         // pre-scan below needs them before the stream loop runs.
@@ -2097,6 +2147,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // those two forms is invisible to every check here - one is an array and the other a template literal - and the unmapped copy is UPLOADED into the
         // user's library rather than being a discardable extra output, so the two must not be able to disagree. The REFUSAL paths stay at their call sites:
         // they differ deliberately (an image refusal fails the file, a styled one falls through to mov_text, the pre-scan's just records into failedSidecars).
+        // Where a subtitle stream ENDS, in seconds, or 0 when no probe says: ffprobe's own duration (mp4), else Matroska's per-track DURATION statistics
+        // tag (written by both ffmpeg and mkvmerge, as H:MM:SS.nnnnnnnnn), else mediaInfo's. The yardstick an existing bundle's last cue is held to.
+        const subtitleEndSec = (ffstream) => {
+            const hms = (v) => String(v || '').split(':').reduce((acc, part) => acc * 60 + Number(part), 0);
+            for (const v of [ffstream.duration, hms(getTagCI(ffstream.tags || {}, 'DURATION')), mediaInfoFor(ffstream)?.Duration]) {
+                const n = Number(v);
+                if (Number.isFinite(n) && n > 0) return n;
+            }
+            return 0;
+        };
         const sidecarPlan = (ffstream, styled) => {
             const spec = styled ? STYLED_BUNDLE : IMAGE_SUB[codecNameOf(ffstream)];
             return {
@@ -2126,16 +2186,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const bytes = Buffer.byteLength(name, 'utf8');
             if (bytes > NAME_BYTE_CAP) return { status: 'refused', name, why: 'namecap', bytes };
             if (!pathIsPresetSafe(sidecarPath)) return { status: 'refused', name, why: 'unsafe' };
-            // ffmpeg refuses to overwrite an existing output file and aborts the ENTIRE run, so a sidecar left by an earlier pass would take the whole remux
-            // down with it. A STYLED bundle's sidecar has already served its purpose and may since have been OCR'd or edited, so it is not re-exported and the
-            // drop still goes ahead - forcing it (-y) could only destroy that work. An IMAGE-sub .sup is different: reaching here means the source stream is
-            // still present, and a completed export always drops it, so an existing .sup can only be a run killed mid-write - whose truncated prefix the drop
-            // would otherwise leave as the subtitle's only copy. A raw bitmap .sup is never user-authored (any OCR happens after a completed run, once the
-            // stream is already gone), so re-export it: delete the partial (ffmpeg would abort rather than overwrite) and queue a fresh copy; on an unlink
-            // failure fall back to trusting it, exactly as for a styled sidecar.
-            if (fileHasBytes(sidecarPath)) {
-                if (styled) return { status: 'exists', name };
-                try { fs.unlinkSync(sidecarPath); } catch (e) { return { status: 'exists', name }; }
+            // A file an earlier pass left at this name. ffmpeg refuses to overwrite an existing output (no -y reaches the preset - it answers "Not overwriting
+            // - exiting") and aborts the ENTIRE run, on every requeue, so whatever is not trusted is deleted before the export is queued. Zero bytes is never
+            // trusted: it is what a killed export leaves. An IMAGE-sub .sup is never trusted either: reaching here means the source stream is still present,
+            // and a completed export always drops it, so it can only be a run that died mid-write - and a raw bitmap .sup is never user-authored (any OCR
+            // happens after a completed run, once the stream is already gone). A STYLED bundle may since have been edited, so one that holds the subtitle is
+            // trusted and the drop goes ahead - forcing it (-y) could only destroy that work. What an interrupted export leaves is not that, and
+            // readBundleSubtitle tells them apart: one ffmpeg cannot decode, or that decodes to no cue, is replaced; one whose cues stop more than
+            // CUE_SPAN_SLACK_S short of the stream's own end is neither replaced nor trusted - a run that failed partway still finalises it, and so does an
+            // edit that cut the tail - and the file fails with the subtitle intact. An unjudged read keeps its old trust. A file that cannot be deleted is
+            // refused rather than trusted: each one reaching that is known bad.
+            if (fs.existsSync(sidecarPath)) {
+                if (styled && fileHasBytes(sidecarPath)) {
+                    const bundle = readBundleSubtitle(sidecarPath);
+                    if (bundle.state === 'unknown') return { status: 'exists', name };
+                    const span = bundle.state === 'ok' ? cueSpan(bundle.buf.toString('utf8'), 'ass') : { cues: 0, end: 0 };
+                    const streamEnd = subtitleEndSec(ffstream);
+                    if (span.cues && streamEnd && span.end < streamEnd - CUE_SPAN_SLACK_S) {
+                        return { status: 'refused', name, why: 'short', end: span.end, streamEnd };
+                    }
+                    if (span.cues) return { status: 'exists', name };
+                }
+                try { fs.unlinkSync(sidecarPath); } catch (e) { return { status: 'refused', name, why: 'leftover' }; }
             }
             sidecarOut += ` ${mapTokens.join(' ')} "${sidecarPath}"`;
             return { status: 'queued', name };
@@ -2331,6 +2403,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             namecap: `Sidecar name would be ${bytes} bytes, over the ${NAME_BYTE_CAP}-byte filesystem limit`
                                 + ' - rename the video shorter and requeue, keeping the subtitle',
                             unsafe: `Library directory has a quote, control char or <io> - cannot write ${sidecarName} safely, keeping the subtitle`,
+                            leftover: `An incomplete ${sidecarName} from an earlier run could not be deleted to export it again - delete it and requeue,`
+                                + ' keeping the subtitle',
                         };
                         exportRefused = true; exportRefusedCount += 1;
                         response.infoLog += `☒${inputTag} ${refusal[why]}\n`;
@@ -2394,7 +2468,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // (the bundle then holds the only styled copy); a refusal falls through to the mov_text conversion below with a ☒ naming the loss - a
                 // mangled subtitle beats a vanished one.
                 if (styledSubExported(ffstreamCodec)) {
-                    const { status, name: sidecarName, why, bytes } = stageSidecar(ffstream, true);
+                    const staged = stageSidecar(ffstream, true);
+                    const { status, name: sidecarName, why, bytes } = staged;
                     const inputTag = `${streamTag(ffstream.index)}[container=mp4]`;
                     const fontNote = styledFontIndices.length
                         ? ` with ${styledFontIndices.length} font attachment${styledFontIndices.length === 1 ? '' : 's'}` : ' (no embedded fonts to carry)';
@@ -2407,7 +2482,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     } else if (status === 'exists') {
                         workDone += `☑${inputTag} Styled-subtitle bundle already exists, not overwriting: ${sidecarName}\n`;
                     } else {
-                        // A refusal falls through to the mov_text conversion below with a ☒ naming the loss - a mangled subtitle beats a vanished one. The
+                        // A refusal falls through to the mov_text conversion below with a ☒ naming the loss - a mangled subtitle beats a vanished one - except
+                        // a bundle on disk cut short or undeletable, which the user CAN fix, so it fails the file instead (bundleHeldCount). The
                         // bundle route has no 'empty' answer of its own and does not need one: placeSidecars files an empty extraction under BOTH
                         // empty and failed, so the unmapped refusal already names it ('extraction produced no data') rather than reading undefined.
                         const refusal = {
@@ -2417,7 +2493,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                                 + ' instead, which loses the styling; rename the video shorter to keep it',
                             unsafe: `Library directory has a quote, control char or <io> - cannot write ${sidecarName} safely; converting to mov_text`
                                 + ' instead, which loses the styling',
+                            leftover: `An incomplete ${sidecarName} from an earlier run could not be deleted to export it again - delete it and requeue`,
+                            short: `${sidecarName} already on disk stops at ${Number(staged.end).toFixed(1)} s but this subtitle runs to `
+                                + `${Number(staged.streamEnd).toFixed(1)} s - a run that failed partway, or an edit that cut the end, so it cannot be `
+                                + 'trusted with the only copy - delete it and requeue to export the whole subtitle',
                         };
+                        if (why === 'short' || why === 'leftover') bundleHeldCount += 1;
                         response.infoLog += `☒${inputTag} ${refusal[why || 'unmapped']}\n`;
                     }
                     if (exported) { dropStream(ffstream.index); subtitleStreamIndex--; continue; }
@@ -2745,6 +2826,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (exportRefusedCount) {
             failWithBuffers(`[remove_imagesubs=export] ${exportRefusedCount} image subtitle${exportRefusedCount === 1 ? '' : 's'} could not be exported,`
                 + ' see the reasons above - nothing was removed from the file');
+        }
+        if (bundleHeldCount) {
+            failWithBuffers(`[container=mp4] ${bundleHeldCount} styled subtitle${bundleHeldCount === 1 ? '' : 's'} could not be exported over a bundle `
+                + 'already on disk, see the reasons above - nothing was flattened or removed');
         }
 
         if (convert === true) {

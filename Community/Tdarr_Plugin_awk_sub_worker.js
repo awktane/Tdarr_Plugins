@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.54',
+    Version: '3.999.55',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -952,7 +952,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // recognises its own work again and re-muxes every sidecar on every pass.
     const SUB_MARKER_TAG = 'awk_sub_worker';
 
-    // #region SHARED helpers (5 sections: preset path safety … language display name)
+    // #region SHARED helpers (6 sections: preset path safety … language display name)
     // ===== SHARED [clean_and_remux, sub_worker]: preset path safety =====
     // -=-=-= pathIsPresetSafe  [clean_and_remux, sub_worker] =-=-=-
     // True when a real on-disk path can be embedded in a preset's quoted "${path}" token. Tdarr never shells out, but its worker tokenises each preset
@@ -1123,20 +1123,67 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { placed, failed, empty };
     };
     // -=-=-= fileHasBytes  [clean_and_remux, sub_worker] =-=-=-
-    // Is a USABLE sidecar already on disk? One question, asked by both plugins before a destructive step: clean_and_remux drops an embedded subtitle
-    // only because a sidecar is supposed to hold it, and sub_worker skips a re-extract for the same reason. Zero bytes counts as ABSENT, which is
-    // the load-bearing half - an ffmpeg aborted mid-write leaves an empty file, and trusting it then strips the only copy of the subtitle. Any stat
-    // failure is absent too, so a permission error re-extracts rather than silently dropping. Shared so a refinement (treating whitespace-only as
-    // absent, or adding an isFile test so a directory named like a sidecar is not mistaken for one) cannot land on one plugin's copy and leave the
-    // other answering differently about the same file. KNOWN GAP at this level: a run killed AFTER the first flush leaves a non-empty TRUNCATED
-    // sidecar (an MB-scale export is written progressively across the whole remux), which this size>0 test alone would trust as complete. It cannot
-    // be closed inside this helper - a byte-truncated raw .sup is indistinguishable from a legitimately shorter subtitle (ffprobe exits 0 and reads
-    // it as valid - measured), and overwriting blindly would discard a sidecar the user may have OCR'd or edited. A caller that can PROVE the prior
-    // export never completed closes it instead: an image-sub export whose source stream is still present cannot have finished (a completed export
-    // always drops that stream), so it re-exports the .sup rather than trusting the partial. Where no such proof exists - a text/styled sidecar a
-    // user may have edited - the size>0 answer stands, a residual narrowed to a kill-mid-write+requeue on an edited round-trip.
+    // Is ANYTHING at a sidecar's name? The first of two questions both plugins ask before a destructive step - clean_and_remux drops an embedded subtitle
+    // only because a sidecar is supposed to hold it, and sub_worker strips one for the same reason. Zero bytes counts as ABSENT: a killed export leaves
+    // one (measured on 7.1.4 - a small srt is still fully buffered when the run dies), and trusting it strips the only copy. Any stat failure is absent
+    // too, so a permission error re-extracts rather than silently dropping. Whether what IS there holds the whole subtitle is the second question, and
+    // size cannot answer it (a byte-truncated raw .sup reads as valid - measured): see the subtitle cue span section. Shared so a refinement cannot land
+    // on one plugin's copy and leave the other answering differently about the same file.
     const fileHasBytes = (p) => { try { return fs.statSync(p).size > 0; } catch (e) { return false; } };
     // ===== END SHARED: sidecar placement =====
+
+    // ===== SHARED [clean_and_remux, sub_worker]: subtitle cue span =====
+    // -=-=-= SIDECAR_HASH_MAX / CUE_SPAN_SLACK_S  [clean_and_remux, sub_worker] =-=-=-
+    // The ceiling on subtitle text read whole into memory - a sidecar, an embedded track decoded to a temp file, a bundle's subtitle; why 64 MiB and why
+    // each write-time -fs sits one byte above it is explained at sub_worker's embeddedTextHashes. CUE_SPAN_SLACK_S is how far short of the subtitle's
+    // own end a copy's last cue may stop and still count as the whole of it: a complete export ends where the stream does, to the centisecond.
+    const SIDECAR_HASH_MAX = 64 * 1024 * 1024;
+    const CUE_SPAN_SLACK_S = 1;
+    // -=-=-= cueSpan  [clean_and_remux, sub_worker] =-=-=-
+    // How many cues decoded subtitle text holds and where the LAST one ends, in seconds: { cues, end }. Whether a sidecar already on disk is the whole
+    // subtitle or only its start - a run that FAILS partway (an ffmpeg error, not a kill) still finalises every output, so its sidecar is well-formed and
+    // simply stops early, which no size or parse test can see, while a user's edit keeps the timeline. srt/vtt cues are their '-->' timing lines; ass/ssa
+    // cues their Dialogue lines, whose End is the third field in both formats. Untrusted text up to SIDECAR_HASH_MAX, so it is cut into lines first and
+    // each line tested with an anchored or literal-led pattern - nothing here can backtrack across lines (hasNoCues says what an unanchored ^\s* costs).
+    const cueSpan = (text, ext) => {
+        const ass = ext === 'ass' || ext === 'ssa';
+        const secs = (stamp) => stamp.trim().replace(',', '.').split(':').reduce((acc, part) => acc * 60 + Number(part), 0);
+        let cues = 0; let end = 0;
+        for (const line of String(text).split(/\r\n|[\n\r\u2028\u2029]/)) {
+            const m = ass ? /^[^\S\r\n\u2028\u2029]*Dialogue\s*:[^,]*,[^,]*,([^,]*),/i.exec(line) : /-->[ \t]*((?:\d+:)?\d{1,2}:\d{1,2}[.,]\d{1,3})/.exec(line);
+            if (!m) continue;
+            const t = secs(m[1]);
+            if (!Number.isFinite(t)) continue;
+            cues += 1;
+            if (t > end) end = t;
+        }
+        return { cues, end };
+    };
+    // -=-=-= readBundleSubtitle  [clean_and_remux, sub_worker] =-=-=-
+    // The subtitle inside a styled .mks bundle, decoded to ASS by ffmpeg into a private temp dir, and how many font attachments ffmpeg's input listing
+    // names ("Stream #0:1: Attachment: ttf", measured on 7.1.4). { state: 'ok', buf, fonts }, or { state: 'unreadable' } when ffmpeg RAN and could not
+    // decode it - what an interrupted export leaves: killed mid-write it ends "File ended prematurely", and a run whose OTHER output failed at
+    // write_header leaves a header with no cluster ("End of file"), both measured on 7.1.4 - or { state: 'unknown' } when it could not be judged (no temp
+    // dir, a spawn error or timeout, a read-out over the cap), where every caller keeps the answer it had before it could look.
+    const readBundleSubtitle = (p) => {
+        let dir = '';
+        try { dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_subbundle_')); } catch (e) { return { state: 'unknown' }; }
+        const out = path.join(dir, 'b.ass');
+        let res = { state: 'unknown' };
+        try {
+            const { spawnSync } = require('child_process');
+            const r = spawnSync(ffmpegPathOf(otherArguments), ['-hide_banner', '-y', '-loglevel', 'info', '-i', p, '-map', '0:s:0', '-c:s', 'ass',
+                '-fs', String(SIDECAR_HASH_MAX + 1), out], { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES });
+            if (!r.error && r.status !== 0) res = { state: 'unreadable' };
+            else if (!r.error && fs.statSync(out).size <= SIDECAR_HASH_MAX) {
+                res = { state: 'ok', buf: fs.readFileSync(out),
+                    fonts: String(r.stderr || '').split('\n').filter((l) => l.trimStart().startsWith('Stream #') && l.includes(': Attachment:')).length };
+            }
+        } catch (e) { /* not judged - the caller keeps its old answer */ }
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
+        return res;
+    };
+    // ===== END SHARED: subtitle cue span =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language display name =====
     // -=-=-= langDisplayName  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
@@ -1825,7 +1872,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return ext === 'ass' ? !/^[^\S\r\n\u2028\u2029]*Dialogue\s*:/mi.test(text) : !/-->/.test(text);
     };
 
-    const SIDECAR_HASH_MAX = 64 * 1024 * 1024;
     // The same stat-first rule for the other library files read whole as TEXT - the caption sidecar and the subtitle list sit at names anyone can put a
     // file at. Over the cap it throws like an unreadable file, so each caller's catch keeps its own failure direction; `overCap` lets one say why.
     const readTextCapped = (p, cap) => {
@@ -1887,6 +1933,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Source indices whose text decoded to no cues at all, filled in by embeddedTextHashes on the one pass it already makes. Only meaningful once that
     // call has returned, and it always has: dedupeEmbeddedSubs forces it first, so an unrun probe can never be mistaken for "no empty tracks".
     const embeddedEmptyIdx = new Set();
+    // The same pass's cueSpan of every embedded text track it could read, keyed by source index: the yardstick existingSidecarVerdict holds a copy to.
+    const embeddedSpan = new Map();
 
     // The CONTENT of every embedded text subtitle, as a sha1 keyed by source stream index - the only sound answer to "is this sidecar already in the
     // file": metadata cannot answer it in either direction (retitling changes every visible field while the text stays identical; two tracks can share
@@ -1943,9 +1991,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // only what is READ, leaving the pass free to stage N x (whatever the container decodes to) in os.tmpdir() first.
                     if (fs.statSync(out).size > SIDECAR_HASH_MAX) continue;
                     const buf = fs.readFileSync(out);
+                    const text = buf.toString('utf8');
+                    const ext = path.extname(out).replace('.', '');
+                    embeddedSpan.set(idx, cueSpan(text, ext));
                     // A track that decoded to no cues is EMPTY, not a duplicate. It gets no hash deliberately: every empty track would otherwise hash
                     // alike and be reported as a copy of the others, which describes the wrong problem and leaves one empty track standing.
-                    if (hasNoCues(buf.toString('utf8'), path.extname(out).replace('.', ''))) { embeddedEmptyIdx.add(idx); continue; }
+                    if (hasNoCues(text, ext)) { embeddedEmptyIdx.add(idx); continue; }
                     map.set(idx, crypto.createHash('sha1').update(subTextForHash(buf, path.extname(out))).digest('hex'));
                 } catch (e) {
                     /* a stream that could not be read simply has no hash, and matches nothing */
@@ -2001,24 +2052,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (bundleMemo.has(f.rel)) return bundleMemo.get(f.rel);
         bundleMemo.set(f.rel, null);
         if (!f.bundle || !sidecarContent(f)) return null;   // gone, or over the cap
-        let dir = '';
-        try { dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_subbundle_')); } catch (e) { return null; }
-        const out = path.join(dir, 'b.ass');
-        try {
-            const { spawnSync } = require('child_process');
-            const args = ['-hide_banner', '-y', '-loglevel', 'info', '-i', path.join(workLibDir(), f.rel), '-map', '0:s:0', '-c:s', 'ass',
-                '-fs', String(SIDECAR_HASH_MAX + 1), out];
-            const r = spawnSync(ffmpegPathOf(otherArguments), args, { encoding: 'utf8', timeout: SUB_EXTRACT_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES });
-            if (!r.error && r.status === 0 && fs.statSync(out).size <= SIDECAR_HASH_MAX) {
-                const buf = fs.readFileSync(out);
-                bundleMemo.set(f.rel, {
-                    // A subtitle with no cues gets no hash, exactly as embeddedTextHashes gives an empty track none - the name decides for it, as before.
-                    sha1: hasNoCues(buf.toString('utf8'), 'ass') ? null : crypto.createHash('sha1').update(subTextForHash(buf, '.ass')).digest('hex'),
-                    fonts: String(r.stderr || '').split('\n').filter((l) => l.trimStart().startsWith('Stream #') && l.includes(': Attachment:')).length,
-                });
-            }
-        } catch (e) { /* no content identity - callers fall back to the name */ }
-        try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
+        const b = readBundleSubtitle(path.join(workLibDir(), f.rel));
+        if (b.state !== 'ok') return null;   // no content identity - callers fall back to the name
+        const text = b.buf.toString('utf8');
+        bundleMemo.set(f.rel, {
+            // A subtitle with no cues gets no hash, exactly as embeddedTextHashes gives an empty track none - the name decides for it, as before.
+            sha1: hasNoCues(text, 'ass') ? null : crypto.createHash('sha1').update(subTextForHash(b.buf, '.ass')).digest('hex'),
+            fonts: b.fonts,
+            span: cueSpan(text, 'ass'),
+        });
         return bundleMemo.get(f.rel);
     };
     // Is this bundle's subtitle one of these embedded text hashes? true / false, or null when the bundle could not be read out.
@@ -2040,6 +2082,31 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const deletionLoss = (f, how, mp4) => (how === 'roundtrip' ? (sidecarContent(f)?.loss?.[mp4 ? 'mp4' : 'any'] || '') : '');
     const keepForLossLine = (rel, loss) => `☒[remove_source=true] Keeping ${logSafe(rel)}: its text is in the file, but importing it dropped ${loss}`
         + ' - delete it yourself if you do not need that\n';
+    // What a sidecar already at an extract's name is worth when remove_source is about to strip the stream it copies - an earlier run's file there would
+    // otherwise become the ONLY copy, unexamined. { state }: 'whole' when it holds this stream's text exactly, or when its cues reach the stream's own end
+    // (an edit that kept the timeline - trusted, as it always was); 'aborted' when it is empty, cue-less, or a bundle ffmpeg cannot decode while the stream
+    // has cues - what an interrupted run leaves (readBundleSubtitle); 'short' (+ end, streamEnd) when its cues stop more than CUE_SPAN_SLACK_S before the
+    // stream's own - a run that failed partway still finalises its outputs, and an edit can cut the tail, so neither may take the only copy; 'unknown' when
+    // either side could not be read, and the caller keeps its old answer.
+    const existingSidecarVerdict = (s, rel, bundle) => {
+        const hashes = embeddedTextHashes(streams);
+        const span = embeddedSpan.get(s.index);
+        if (!hashes || !span) return { state: 'unknown' };
+        const ext = bundle ? 'ass' : path.extname(rel).slice(1).toLowerCase();
+        let buf = null;   // the copy's decoded text; null = a bundle ffmpeg could not decode
+        if (bundle) {
+            const b = readBundleSubtitle(path.join(workLibDir(), rel));
+            if (b.state === 'unknown') return { state: 'unknown' };
+            if (b.state === 'ok') ({ buf } = b);
+        } else {
+            try { buf = Buffer.from(readTextCapped(path.join(workLibDir(), rel), SIDECAR_HASH_MAX), 'utf8'); } catch (e) { return { state: 'unknown' }; }
+        }
+        const own = hashes.get(s.index);
+        if (buf && own && crypto.createHash('sha1').update(subTextForHash(buf, `.${ext}`)).digest('hex') === own) return { state: 'whole' };
+        const copy = buf ? cueSpan(buf.toString('utf8'), ext) : { cues: 0, end: 0 };
+        if (!copy.cues) return { state: span.cues ? 'aborted' : 'whole' };   // an empty copy of an empty stream is a copy
+        return copy.end < span.end - CUE_SPAN_SLACK_S ? { state: 'short', end: copy.end, streamEnd: span.end } : { state: 'whole' };
+    };
 
     // deduplicate=enabled_checkmedia: the same duplicate test turned on the file's OWN tracks. Two subtitle streams holding identical text are one
     // subtitle stored twice, however their tags read, and this is the only place in the plugin that removes a subtitle the user did not ask to extract -
@@ -2630,7 +2697,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // stream - which is why the placement decision is made HERE: Tdarr runs the preset only after the plugin returns, so a preset output that
             // fails against a read-only mount cannot be caught and rerouted, only quarantined.
             let sidecarOut = ''; const removedIndices = new Set(dupes.dropIdx); let wrote = 0; let skipped = 0; let refused = 0; let bundled = 0;
-            let deferred = 0;
+            let deferred = 0; let held = 0;
             const placeJobs = [];
             // The caption extraction leads on both routes; on the API one that is a hard requirement - placeSidecars concatenates every job's args after a
             // single -i, so the caption job's '-f lavfi -i' only precedes all outputs if its job is first. On the direct-write route the same input is emitted
@@ -2728,8 +2795,33 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         + 'not overwriting it, keeping the embedded subtitle for a later pass\n';
                     continue;
                 }
-                const alreadyExtracted = remote ? remote.state === 'present'
+                let alreadyExtracted = remote ? remote.state === 'present'
                     : (removeSource ? fileHasBytes(full) : fs.existsSync(full));
+                // remove_source is about to strip the stream this name copies, so a file already there must HOLD it (existingSidecarVerdict). An interrupted
+                // run's leftover is replaced - deleted first on the direct-write route, since ffmpeg aborts the whole run rather than overwrite an output, and
+                // simply uploaded over on the API route - and one cut short keeps the stream. Unjudged, a file with bytes keeps the trust it always had.
+                if (!remote && removeSource && fs.existsSync(full)) {
+                    const verdict = existingSidecarVerdict(s, name, bundle);
+                    if (verdict.state === 'short') {
+                        held += 1;
+                        response.infoLog += `☒${streamTag(s.index)}[remove_source=true] ${name} already on disk stops at ${verdict.end.toFixed(1)} s but this `
+                            + `subtitle runs to ${verdict.streamEnd.toFixed(1)} s - a run that failed partway, or an edit that cut the end; keeping the `
+                            + 'embedded subtitle (delete the sidecar to extract it again)\n';
+                        continue;
+                    }
+                    if (verdict.state === 'aborted' || (verdict.state === 'unknown' && !fileHasBytes(full))) {
+                        if (!placeViaApi()) {
+                            try { fs.unlinkSync(full); } catch (e) {
+                                refused += 1;
+                                response.infoLog += `☒${streamTag(s.index)} An incomplete ${name} from an earlier run could not be deleted to extract it again `
+                                    + '- delete it and requeue, keeping the embedded subtitle\n';
+                                continue;
+                            }
+                        }
+                        alreadyExtracted = false;
+                        response.infoLog += `☐${streamTag(s.index)}[remove_source=true] Replacing ${name} - an earlier run left it incomplete\n`;
+                    } else alreadyExtracted = true;
+                }
                 if (alreadyExtracted) { skipped += 1; response.infoLog += `☑${streamTag(s.index)} Sidecar already exists, not overwriting: ${name}\n`; }
                 // API placement: the extraction is deferred to placeSidecars after the loop, so this stream's removedIndices entry and its bundled tally
                 // wait for the server's answer - nothing may be stripped until the sidecar is confirmed in the library.
@@ -2847,14 +2939,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // ccStrip and ccMeta count as work in their own right: on the API route the sidecars are already placed, so a caption-only run has an empty
             // sidecarOut and no removedIndices, and testing those alone would skip the pass that removes the captions from the bitstream.
             if (!sidecarOut && !removedIndices.size && !ccMeta && !ccStrip) {
-                if (refused && !wrote && !skipped && !deferred) {
+                if (refused && !wrote && !skipped && !deferred && !held) {
                     failFile('No subtitle could be extracted - every eligible subtitle was refused, see the reasons above');
                 }
                 // The tag reports the value IN EFFECT, which is not always false here: a caption job never enters removedIndices, so a run that placed only
                 // captions and could neither strip them nor record the request reaches this line with removal ON - one line under the ☒ that says why.
                 if (wrote) return skip(`☑[remove_source=${removeSource}] Sidecars placed in the library - nothing left to remux\n`);
-                return skip(deferred ? '☒Nothing extracted this pass - the library could not be checked, see the reasons above\n'
-                    : '☑All eligible subtitles already extracted\n');
+                if (deferred || held) {
+                    const why = deferred ? 'the library could not be checked' : 'a sidecar on disk stops short of its subtitle';
+                    return skip(`☒Nothing extracted this pass - ${why}, see the reasons above\n`);
+                }
+                return skip('☑All eligible subtitles already extracted\n');
             }
 
             let out = `${ccInput}${sidecarOut} -map 0`;
