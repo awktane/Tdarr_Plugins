@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.45',
+    Version: '4.999.46',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1910,19 +1910,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // The handler_name this remux clears (mkv) or replaces (mp4) can be the ONLY place a role lives: a QuickTime-family muxer writes the track name
     // ('Commentary') into the mp4 handler box, and mediaInfo's Title is itself that handler echoed, so one wipe takes the role out of both probes and every
-    // later plugin reads the track as a plain one. handlerOnlyRoles is what the handler carries that no real flag and no SURVIVING text - the title, a
-    // description, mediaInfo's own title with the echo laundered out (mediaTitleFor) - still does. 'default' is a selection flag, not a role.
-    const survivingRoleText = (s) => {
+    // later plugin reads the track as a plain one. So can a busy title remove_busytitle blanks ('Movie.2020.Director.Commentary.1080p'). clearedOnlyRoles is
+    // what those carriers hold that no real flag and no SURVIVING text still does - surviving meaning the title this command WRITES, never the source's
+    // (which the busy-title clear blanks on the same command, so counting it let a role carried by both title and handler go with neither), plus a
+    // description and mediaInfo's. The source title is mediaInfo's own with the handler echo laundered out (mediaTitleFor) when the tag is absent.
+    // 'default' is a selection flag, not a role.
+    const survivingRoleText = (s, newTitle) => {
         const mi = mediaInfoFor(s);
-        return [s.tags?.title, getTagCI(s.tags, 'description'), mediaTitleFor(s), getTagCI(mi?.extra, 'description')]
-            .filter(Boolean).join(' ').trim().toLowerCase();
+        return [newTitle, getTagCI(s.tags, 'description'), getTagCI(mi?.extra, 'description')].filter(Boolean).join(' ').trim().toLowerCase();
     };
-    const handlerOnlyRoles = (s, type) => {
-        const handler = String(getTagCI(s.tags, 'handler_name') || '').toLowerCase();
-        if (!handler) return [];
-        const surviving = survivingRoleText(s);
-        return dispKeysFor(type).filter((k) => k !== 'default' && s.disposition?.[promoteTarget(k)] !== 1
-            && matchesKeyword(handler, dispositionTypes[k].keywords) && !matchesKeyword(surviving, dispositionTypes[k].keywords));
+    const clearedOnlyRoles = (s, type, newTitle, handlerCleared) => {
+        const handler = handlerCleared ? String(getTagCI(s.tags, 'handler_name') || '').toLowerCase() : '';
+        const title = String(s.tags?.title || mediaTitleFor(s) || '').toLowerCase();
+        if (!handler && !title) return { roles: [], viaTitle: false, viaHandler: false };
+        const surviving = survivingRoleText(s, newTitle);
+        const roles = dispKeysFor(type).filter((k) => k !== 'default' && s.disposition?.[promoteTarget(k)] !== 1
+            && (matchesKeyword(handler, dispositionTypes[k].keywords) || matchesKeyword(title, dispositionTypes[k].keywords))
+            && !matchesKeyword(surviving, dispositionTypes[k].keywords));
+        return { roles, viaTitle: roles.some((k) => matchesKeyword(title, dispositionTypes[k].keywords)),
+            viaHandler: roles.some((k) => matchesKeyword(handler, dispositionTypes[k].keywords)) };
     };
 
     // remove_sub_sdh safety guard. A "plain" subtitle carries no commentary/descriptive/SDH/lyrics role and is not FORCED: a forced track holds only the
@@ -2112,10 +2118,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // dropped via -map -0:ffstream.index. subCodecOverride: input stream position -> converted subtitle codec ('srt' / 'mov_text').
         const removedIndices = new Set();
         const subCodecOverride = new Map();
-        // handlerRolePrediction: input stream position -> { adds, roleText } for a stream whose handler held a role (see handlerOnlyRoles) - the flags the
-        // remux promotes and the role text that survives it. handlerRolesLost: '[s N] Role' entries no flag in the target can hold, reported on ONE line.
+        // handlerRolePrediction: input stream position -> { adds, roleText } for a stream whose cleared carrier held a role (see clearedOnlyRoles) - the
+        // flags the remux promotes and the role text that survives it. handlerRolesLost: '[s N] Role' entries no flag in the target can hold, on ONE line.
         const handlerRolePrediction = new Map();
         const handlerRolesLost = [];
+        const titleRolesLost = [];   // the same, for roles a busy title being blanked was the last carrier of
         // Drop one input stream. The three writes are NOT independent: removedIndices is the sole input to the "Expected results" summary filter and to the
         // orphaned-font survivor test, so a drop site that maps a stream out without recording it makes the summary advertise a stream the command deletes.
         // Per-branch extras (a stream-index decrement, the continue) stay at the call site.
@@ -2278,32 +2285,40 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             //Metadata edits for this stream, accumulated by the emitters below and flushed onto the command at the end of the iteration.
             let metadataCommand = '';
             let shouldDrop = false;
-            // Keep a role whose only copy is the handler about to go: promote its real flag on this same command even with tag_disposition off - it
-            // preserves what the file already says rather than adding anything. Where tag_disposition covers the type it has promoted every role already
-            // (the handler's included), and a second -disposition for one stream would override the first. A role no flag in the target can hold is lost
-            // with the handler, and said so once for the whole file (handlerRolesLost) rather than per stream.
-            const preserveHandlerRoles = (typeLetter, idx, typeWord) => {
-                const roles = handlerOnlyRoles(ffstream, typeWord);
+            // Keep a role whose only copies are a handler and/or a busy title this command clears: promote its real flag on this same command even with
+            // tag_disposition off - it preserves what the file already says rather than adding anything. Where tag_disposition covers the type it has
+            // promoted every role already, and a second -disposition for one stream would override the first. A role no flag in the target can hold is lost
+            // with its carrier, and said so once for the whole file (handlerRolesLost / titleRolesLost) rather than per stream. Runs once the title this
+            // command writes is decided, since that title is what survives.
+            const preserveClearedRoles = (typeLetter, idx, typeWord, newTitle, handlerCleared) => {
+                const { roles, viaTitle, viaHandler } = clearedOnlyRoles(ffstream, typeWord, newTitle, handlerCleared);
                 if (!roles.length) return;
                 const covered = appliesToType(tagDisposition, typeWord);
                 const promoted = covered ? dispositionsToPromote(ffstream, typeWord) : dispositionsToPromote(ffstream, typeWord, roles);
                 if (!covered && promoted.length) {
-                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Set disposition (${typeWord}) from handler_name before it is `
-                        + `${dstContainer === 'mkv' ? 'cleared' : 'replaced'} - ${promoted.map((k) => dispositionTypes[k].tag).join(' ')}\n`;
+                    const handlerFate = dstContainer === 'mkv' ? 'cleared' : 'replaced';
+                    const from = viaTitle && viaHandler ? `the title and handler_name before they are cleared`
+                        : (viaTitle ? 'the title before it is cleared' : `handler_name before it is ${handlerFate}`);
+                    const cause = [viaTitle && 'remove_busytitle=true', viaHandler && `container=${dstContainer}`].filter(Boolean).join('][');
+                    workDone += `☐${streamTag(ffstream.index)}[${cause}] Set disposition (${typeWord}) from ${from} - `
+                        + `${promoted.map((k) => dispositionTypes[k].tag).join(' ')}\n`;
                     metadataCommand += ` -disposition:${typeLetter}:${idx} ${promoted.map((k) => `+${k}`).join('')}`;
                 }
                 const lost = [...new Set(roles.map(promoteTarget))].filter((k) => !promoted.includes(k));
-                if (lost.length) handlerRolesLost.push(`${streamTag(ffstream.index)} ${lost.map((k) => dispositionTypes[k].tag || k).join(' ')}`);
-                handlerRolePrediction.set(ffstream.index, { adds: promoted, roleText: survivingRoleText(ffstream) });
+                if (lost.length) {
+                    const entry = `${streamTag(ffstream.index)} ${lost.map((k) => dispositionTypes[k].tag || k).join(' ')}`;
+                    (viaTitle ? titleRolesLost : handlerRolesLost).push(entry);
+                }
+                handlerRolePrediction.set(ffstream.index, { adds: promoted, roleText: survivingRoleText(ffstream, newTitle) });
             };
             // Per-stream handler_name canonicalisation, common to the subtitle/audio/video branches (mkv wipes it - it can confuse mkv title display; mp4
             // sets the per-type handler); wipeReason lets the video branch append its own note. Read case-insensitively (getTagCI): matroska UPPER-CASES
             // it to HANDLER_NAME, which mediaInfo surfaces as the Title - miss it and the busy handler re-triggers remove_busytitle every pass (an
             // infinite loop). ffmpeg matches -metadata keys case-insensitively, so the lowercase wipe still clears the uppercase tag.
+            // Returns whether the handler is cleared or replaced, for preserveClearedRoles.
             const emitHandlerMeta = (typeLetter, idx, typeWord, handlerName, wipeReason = '') => {
                 const curHandler = getTagCI(ffstream.tags, 'handler_name');
-                const replaced = (dstContainer === 'mkv' && curHandler) || (dstContainer === 'mp4' && curHandler !== handlerName);
-                if (replaced && (typeWord === 'audio' || typeWord === 'subtitle')) preserveHandlerRoles(typeLetter, idx, typeWord);
+                const replaced = !!((dstContainer === 'mkv' && curHandler) || (dstContainer === 'mp4' && curHandler !== handlerName));
                 if (dstContainer === 'mkv' && curHandler) {
                     workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Wiping handler_name tag${wipeReason} (${typeWord})`
                         + ` "${logSafe(curHandler)}"\n`;
@@ -2313,6 +2328,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         + ` "${logSafe(curHandler)}"\n`;
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "handler_name=${handlerName}"`;
                 }
+                return replaced;
             };
             // tag_disposition (audio/subtitle): import any surfaced disposition keyword
             // found in the title into the real flag (additive, so existing flags are kept).
@@ -2324,9 +2340,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     metadataCommand += ` -disposition:${typeLetter}:${idx} ${promote.map(k => `+${k}`).join('')}`;
                 }
             };
-            // Busy-title removal (audio/subtitle): once tag_disposition (above) has captured any role keywords into
-            // the real flags, clear an over-dotted title so tag_title (below) re-names it by the usual rules - it
-            // drops in and is treated as a blank title (an empty base becomes the channel label). Returns the title.
+            // Busy-title removal (audio/subtitle): clear an over-dotted title so tag_title (below) re-names it by the usual rules - it drops in and is
+            // treated as a blank title (an empty base becomes the channel label). A role the title carried survives through tag_disposition's flag,
+            // tag_title's rebuilt name, or, when neither covers the type, preserveClearedRoles' flag. Returns the title.
             const clearBusyTitle = (title, titleCauses) => {
                 if (removeBusytitle && tooManyPeriods(title)) {
                     titleCauses.push('remove_busytitle=true');
@@ -2537,7 +2553,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 emitTitleMeta('s', subtitleStreamIndex, 'subtitle', streamTitle, newStreamTitle, titleCauses);
 
-                emitHandlerMeta('s', subtitleStreamIndex, 'subtitle', 'SubtitleHandler');
+                preserveClearedRoles('s', subtitleStreamIndex, 'subtitle', newStreamTitle,
+                    emitHandlerMeta('s', subtitleStreamIndex, 'subtitle', 'SubtitleHandler'));
 
                 emitCommentRemoval('s', subtitleStreamIndex, 'subtitle');
 
@@ -2594,7 +2611,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 emitTitleMeta('a', audioStreamIndex, 'audio', streamTitle, newStreamTitle, titleCauses);
 
-                emitHandlerMeta('a', audioStreamIndex, 'audio', 'SoundHandler');
+                preserveClearedRoles('a', audioStreamIndex, 'audio', newStreamTitle, emitHandlerMeta('a', audioStreamIndex, 'audio', 'SoundHandler'));
 
                 emitCommentRemoval('a', audioStreamIndex, 'audio');
 
@@ -2682,6 +2699,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (handlerRolesLost.length) {
             workDone += `☒[container=${dstContainer}] handler_name is being ${dstContainer === 'mkv' ? 'cleared' : 'replaced'} and was the only place these `
                 + `roles lived, with no ${dstContainer} flag to hold them - lost: ${handlerRolesLost.join(', ')}\n`;
+        }
+        if (titleRolesLost.length) {
+            workDone += `☒[remove_busytitle=true] A busy title being cleared was the only place these roles lived, with no ${dstContainer} flag to hold them `
+                + `- lost: ${titleRolesLost.join(', ')}\n`;
         }
 
         // Resolve deferred font attachments now that subtitle removals are final: embedded fonts are only consumed by styled subtitles (ASS/SSA), so keep
