@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.48',
+    Version: '4.999.49',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -640,10 +640,67 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: codec name resolution =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: mp4-family container =====
     // -=-=-= isMp4Family [all five] =-=-=-
-    // The mp4/mov container family whose -c copy needs `-movflags use_metadata_tags` to keep sibling plugins' GLOBAL awk_* markers through the remux (dropping
-    // one re-triggers work upstream); also the container test behind the mp4 `-strict` gates. One source so no consumer drifts on the set (video_clean's
+    // The mp4/mov container family: the containers whose -c copy keeps a custom GLOBAL tag (a sibling plugin's awk_* marker) only under `-movflags
+    // use_metadata_tags` (see mp4TagPlan), and the container test behind the mp4 `-strict` gates. One source so no consumer drifts on the set (video_clean's
     // video-only hvc1 gate is deliberately mp4/m4v/mov WITHOUT m4a and stays separate).
     const isMp4Family = (container) => ['mp4', 'm4v', 'mov', 'm4a'].includes(String(container || '').toLowerCase());
+    // -=-=-= MP4_NATIVE_TAGS (+ MP4_REGENERATED_TAGS) [all five] =-=-=-
+    // The global tags the mov muxer stores WITHOUT use_metadata_tags - as iTunes atoms in mp4/m4v/m4a, as QuickTime udta strings in mov - measured on
+    // jellyfin 7.1.4 by writing each and reading it back (awk-ffmpeg-test's fmtprobe tag:native re-measures it per node). A flagless mux drops every other
+    // key; the regenerated ones are rebuilt by the muxer itself (ftyp, mvhd, the video track's own timecode, its own encoder string), so none is lost.
+    const MP4_NATIVE_TAGS = {
+        mp4: ['title', 'artist', 'album_artist', 'composer', 'album', 'date', 'comment', 'genre', 'copyright', 'grouping', 'lyrics', 'description', 'synopsis',
+            'show', 'episode_id', 'network', 'keywords', 'track', 'disc', 'compilation', 'gapless_playback', 'hd_video', 'media_type', 'episode_sort',
+            'season_number'],
+        mov: ['title', 'artist', 'album', 'date', 'comment', 'genre', 'copyright', 'location', 'make', 'model'],
+    };
+    const MP4_REGENERATED_TAGS = ['major_brand', 'minor_version', 'compatible_brands', 'creation_time', 'encoder', 'timecode'];
+    // -=-=-= mp4TagPlan [all five] =-=-=-
+    // Whether an mp4-family output needs `-movflags use_metadata_tags`, and what a mux without it leaves behind. The flag is the ONLY way such a file keeps a
+    // custom global key, but it is not free: the muxer then writes EVERY global tag as a QuickTime mdta key instead of its native form, which iTunes-style
+    // readers (mutagen, so Picard and beets) and Apple's own players cannot read while ffprobe still shows every tag, and mp4/m4v/m4a lose their covr cover
+    // art - ffmpeg cannot write covr beside mdta keys (measured 2026-10-01, jellyfin 7.1.4). So it is set only when the output will carry an awk_* marker, the
+    // one tag whose loss makes a sibling redo its work; otherwise the native tags keep their readable form and any other custom key is dropped (`dropped`).
+    // A `normalize-` awk_video fence is no such marker: normalize fires only on a mismatch its own encode removes, so video_clean writes none into the mp4
+    // family, and one an earlier version wrote lapses on the next flagless mux. `writes` holds the global keys this run sets (an empty value clears one);
+    // keys match case-insensitively, as ffmpeg's -metadata does.
+    const mp4TagPlan = (container, formatTags, writes = {}) => {
+        const c = String(container || '').toLowerCase();
+        if (!isMp4Family(c)) return { flag: false, markers: [], dropped: [] };
+        const out = new Map();
+        for (const [k, v] of [...Object.entries(formatTags || {}), ...Object.entries(writes)]) out.set(k.toLowerCase(), [k, String(v ?? '').trim()]);
+        const kept = [...out.values()].filter(([, v]) => v !== '');
+        const markers = kept.filter(([k, v]) => /^awk_/i.test(k) && !(k.toLowerCase() === 'awk_video' && /^normalize-/i.test(v))).map(([k]) => k);
+        const native = MP4_NATIVE_TAGS[c === 'mov' ? 'mov' : 'mp4'];
+        const dropped = markers.length ? [] : kept.map(([k]) => k)
+            .filter((k) => !/^awk_/i.test(k) && !native.includes(k.toLowerCase()) && !MP4_REGENERATED_TAGS.includes(k.toLowerCase()));
+        return { flag: markers.length > 0, markers, dropped };
+    };
+    // -=-=-= mp4CoversLost [all five] =-=-=-
+    // The attached covers among `kept` (the streams a plugin maps into the output) that the container will not store: every one in mov (the QuickTime flavour
+    // writes no covr at all, flag or not), and in mp4/m4v/m4a the ones use_metadata_tags costs. The plugins that drop cover art themselves pass none; the
+    // others leave these out of their Expected results line too, so the summary and the warning agree.
+    const mp4CoversLost = (plan, container, kept = []) => {
+        const c = String(container || '').toLowerCase();
+        return isMp4Family(c) && (c === 'mov' || plan.flag) ? kept.filter((s) => hasDisposition(s, 'attached_pic')) : [];
+    };
+    // -=-=-= mp4TagPlanLog [all five] =-=-=-
+    // What the plan costs, as log lines: the custom keys a flagless mux leaves behind, and each cover mp4CoversLost names (same `kept` argument).
+    const mp4TagPlanLog = (plan, container, kept = []) => {
+        const c = String(container || '').toLowerCase();
+        const names = (keys) => keys.map((k) => logSafe(k, 40)).join(', ');
+        let log = '';
+        if (plan.dropped.length) {
+            log += `☐Not carrying ${names(plan.dropped)} - .${c} has no standard tag for ${plan.dropped.length === 1 ? 'it' : 'them'}`
+                + `, and keeping one would rewrite every other tag in a form taggers cannot read${c === 'mov' ? '' : ' and drop any cover art'}\n`;
+        }
+        for (const s of mp4CoversLost(plan, c, kept)) {
+            log += c === 'mov' ? `☒${streamTag(s.index)} Cover art dropped - .mov cannot store it\n`
+                : `☒${streamTag(s.index)} Cover art dropped - keeping the ${names(plan.markers)} marker in .${c} takes QuickTime metadata keys, and ffmpeg `
+                + 'cannot write cover art beside them\n';
+        }
+        return log;
+    };
     // ===== END SHARED: mp4-family container =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: case-insensitive tag lookup =====
     // -=-=-= getTagCI  [all five] =-=-=-
@@ -2117,6 +2174,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         let extraArguments = '';
+        const globalWrites = {};   // every container-global -metadata write below, for mp4TagPlan
         let sidecarOut = '';   // remove_imagesubs=export: accumulates the per-image-sub sidecar outputs, prepended to the main output in the preset below.
                                // Stays empty on an unmapped node, where placeSidecars below uploads the exports instead of riding them on the remux.
         let fflags = '';
@@ -2769,12 +2827,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if((removeComments === true) && fileComment) {
             workDone += `☐[remove_comments=true] Remove comment from file "${logSafe(fileComment)}"\n`;
             extraArguments += ` -metadata "comment="`;
+            globalWrites.comment = '';
             convert = true;
         }
 
         if((removeBusytitle === true) && tooManyPeriods(file.ffProbeData.format?.tags?.title ?? '')) {
             workDone += `☐[remove_busytitle=true] Remove title from file "${logSafe((file.ffProbeData.format?.tags?.title ?? '').trim())}"\n`;
             extraArguments += ` -metadata "title="`;
+            globalWrites.title = '';
             convert = true;
         }
 
@@ -2855,11 +2915,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Re-stamp the recover intent on every remux while recover is requested, even when it already matches
         // (e.g. across mkv->mp4), so awk_recovered is refreshed and recovery doesn't re-trigger next pass.
-        // (The mp4 use_metadata_tags that makes any global tag persist is added for all mp4 remuxes below.)
         if (convert === true && recoverRequested) {
             if (runRecover)
                 workDone += `☐Stamp ${RECOVERED_TAG}=${recoverIntent} - recovery re-runs only if a recover_bad_* mode changes\n`;
             extraArguments += ` -metadata "${RECOVERED_TAG}=${recoverIntent}"`;
+            globalWrites[RECOVERED_TAG] = recoverIntent;
         }
 
         // remove_imagesubs=export asked for a sidecar that could not be written, so the export did not happen and neither did the drop it protects. Fail
@@ -2878,12 +2938,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         if (convert === true) {
-            // mp4/mov drops GLOBAL custom tags on a -c copy remux unless use_metadata_tags is set - this plugin's own awk_recovered
-            // AND any awk_video/awk_sub_worker written by a sibling plugin. Add it for EVERY mp4 remux (not just recovery ones),
-            // matching the other four plugins, so those markers survive. This plugin runs first, so a marker it drops is gone
-            // before the plugin that wrote it re-reads it (e.g. sub_worker's sidecar-delete would then find no marker).
-            if (dstContainer === 'mp4')
-                extraArguments += ' -movflags use_metadata_tags';
+            // An mp4 output keeps a global awk_* marker - this plugin's own awk_recovered, or one a sibling wrote - only under use_metadata_tags, and the
+            // flag costs the native tags their readable form (mp4TagPlan). This plugin runs first, so a marker it drops is gone before the plugin that
+            // wrote it re-reads it (sub_worker's sidecar-delete would then find no marker). Cover art never reaches the output here, so none is passed.
+            const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, globalWrites);
+            if (tagPlan.flag) extraArguments += ' -movflags use_metadata_tags';
+            workDone += mp4TagPlanLog(tagPlan, dstContainer);
             response.preset += `${fflags}${inputArgs}<io>${sidecarOut} -map 0 -c copy${extraArguments}${globalOutputOpt}`;
             response.infoLog += workDone;
             // A stream whose handler held a role, as the output will carry it: no handler, the promoted flags set, and only the role text that survives.
