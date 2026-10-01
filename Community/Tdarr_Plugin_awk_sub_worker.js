@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.55',
+    Version: '3.999.56',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -2568,7 +2568,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (text === null) {
                     return { job: null, note: `☒[embedded_cc=enabled] Could not read ${name} to check it${overCap ? ` (${overCap})` : ''} - leaving it alone\n` };
                 }
-                if (!hasNoCues(text, 'srt')) {
+                // Cue text proves the channel carried captions, not that this file holds ALL of them. On the direct-write routes the srt is an extra output
+                // of Tdarr's own ffmpeg run, written progressively (12 of 120 cues after 5 s of a killed 7.1.4 run), so a pass cancelled, killed or failed
+                // partway leaves a well-formed PREFIX while its main output is never accepted - and the read's own memo rides in that main output. So a
+                // finished read is exactly a decoded/decoded2 token on the file; without one this is that prefix, and stripping the bitstream or importing on
+                // it would lose every caption past the cut. It is read again instead. Where the memos cannot persist (a marker-hostile container) nothing can
+                // tell the two apart and a re-read would repeat forever, so the cue text stands there as before.
+                const finishedRead = ccTokens.includes(CC_TOKENS.decoded) || ccTokens.includes(CC_TOKENS.decoded2);
+                if (!hasNoCues(text, 'srt') && (finishedRead || !canRecord)) {
                     // This sidecar landed on an earlier pass and holds real cue text, so the bitstream copy may NOW be removed - THIS is the pass that owes
                     // the strip. It is deliberately not done in the pass that WRITES the sidecar: ffmpeg exits 0 having written a cue-less srt whenever the
                     // caption channel decodes empty (a field-2-only capture with padded field 1 does exactly that), so a same-pass strip deletes captions
@@ -2583,30 +2590,42 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 let unlinked = true;
                 try { fs.unlinkSync(full); } catch (e) { unlinked = false; }
-                // An empty sidecar is a verdict only once BOTH fields have been read to completion (CC_TOKENS decoded, decoded2). After the first read it
-                // sends the decode back for field 2 - a padded field 1 makes the default decode come back empty on captions that are really there (0 bytes
-                // on auto, the full captions with -data_field 1, jellyfin-ffmpeg 7.1.4); with no read recorded at all it is what an interrupted read
-                // leaves (ffmpeg creates the srt when it opens its outputs), so the captions are simply read again. Recording `none` on either was what let
-                // video_clean drop captions nothing had captured. Only where the memos persist: a marker-hostile container cannot record which reads ran,
-                // so the single-read verdict stands there.
-                if (!canRecord || !unlinked || ccTokens.includes(CC_TOKENS.decoded2)) {
-                    // Recording the verdict takes a mux of its own, and that is only safe where the tag comes back out. On a marker-hostile container the
-                    // memo cannot be stored, so the identical tag-only pass would be recomputed and re-emitted every time - which Tdarr refuses as an
-                    // infinite transcode loop and ERRORS the file. Decline the memo and say so: the decode is paid again, bounded, rather than the file lost.
-                    return {
-                        job: null,
-                        record: canRecord ? CC_TOKENS.none : '',
-                        note: `☒[embedded_cc=enabled] The caption channel carries no caption text - ${unlinked
-                            ? `removed the empty ${name}` : `${name} could not be removed`}${canRecord ? ' and recorded it so no later pass re-reads it'
-                            : ccMemoTail()}\n`,
-                    };
+                if (!hasNoCues(text, 'srt')) {
+                    // An unfinished read's prefix (see finishedRead). One that cannot be removed is left alone and kept out of the import below, which
+                    // would otherwise mux the prefix in and strip the bitstream on it; the captions stay in the video.
+                    if (!unlinked) {
+                        return { job: null, untrusted: true, note: `☒[embedded_cc=enabled] ${name} holds captions no finished read stands behind (an `
+                            + 'interrupted pass?) and could not be removed - leaving it, and the captions in the video\n' };
+                    }
+                    leftoverNote = `☒[embedded_cc=enabled] Removed ${name}: it holds captions no finished read stands behind (an interrupted pass?) - `
+                        + 'reading them again\n';
+                } else {
+                    // An empty sidecar is a verdict only once BOTH fields have been read to completion (CC_TOKENS decoded, decoded2). After the first read it
+                    // sends the decode back for field 2 - a padded field 1 makes the default decode come back empty on captions that are really there (0 bytes
+                    // on auto, the full captions with -data_field 1, jellyfin-ffmpeg 7.1.4); with no read recorded at all it is what an interrupted read leaves
+                    // (ffmpeg creates the srt when it opens its outputs), so the captions are simply read again. Recording `none` on either was what let
+                    // video_clean drop captions nothing had captured. Only where the memos persist: a marker-hostile container cannot record which reads ran,
+                    // so the single-read verdict stands there.
+                    if (!canRecord || !unlinked || ccTokens.includes(CC_TOKENS.decoded2)) {
+                        // Recording the verdict takes a mux of its own, and that is only safe where the tag comes back out. On a marker-hostile container the
+                        // memo cannot be stored, so the identical tag-only pass would be recomputed and re-emitted every time - which Tdarr refuses as an
+                        // infinite transcode loop and ERRORS the file. Decline the memo and say so: the decode is paid again, bounded, rather than the file
+                        // lost.
+                        return {
+                            job: null,
+                            record: canRecord ? CC_TOKENS.none : '',
+                            note: `☒[embedded_cc=enabled] The caption channel carries no caption text - ${unlinked
+                                ? `removed the empty ${name}` : `${name} could not be removed`}${canRecord ? ' and recorded it so no later pass re-reads it'
+                                : ccMemoTail()}\n`,
+                        };
+                    }
+                    if (ccTokens.includes(CC_TOKENS.decoded)) {
+                        return { job: { name, full, remoteDest, field2: true }, note: '☐[embedded_cc=enabled] The first read of the caption channel found no '
+                            + 'text - reading its second field, where some broadcasts carry them\n' };
+                    }
+                    leftoverNote = `☒[embedded_cc=enabled] Removed an empty ${name} that no finished read stands behind (an interrupted pass?) - `
+                        + 'reading the captions again\n';
                 }
-                if (ccTokens.includes(CC_TOKENS.decoded)) {
-                    return { job: { name, full, remoteDest, field2: true }, note: '☐[embedded_cc=enabled] The first read of the caption channel found no '
-                        + 'text - reading its second field, where some broadcasts carry them\n' };
-                }
-                leftoverNote = `☒[embedded_cc=enabled] Removed an empty ${name} that no finished read stands behind (an interrupted pass?) - `
-                    + 'reading the captions again\n';
             }
             // Nothing memoised, so pay for the cheap check. Only `true` from the library scan is information - it reports false both for a file with no
             // captions and for one its scanner could not parse - so a false still goes to the probe, and an 'unknown' probe leaves the file alone.
@@ -3032,6 +3051,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // target that has no font attachments. Pulled out so the marker-hostile refusal can be decided from the listed names BEFORE the
         // text_file route downloads them, and so that refusal and the found-filter below can never drift on what counts as importable.
         const subLangInScope = (f) => (ccName && f.rel === ccName) || !langFilter || langFilter.has(langKey(f.lang));
+        // The caption staging sidecar ccPlan found unfinished and could not remove: never imported, so nothing is muxed or stripped on a prefix.
+        const ccUntrusted = (f) => ccPlan.untrusted === true && ccName && f.rel === ccName;
         const subBundleFits = (f) => !(f.bundle && isMp4);
         // The shared scope verdict WITH its user-facing line, used by the found-filter below and by the text_file route's pre-fetch filter, so the two
         // routes can never log different reasons. Every drop says so: a sidecar that is on disk and never mentioned again is indistinguishable from one
@@ -3045,6 +3066,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //   and strand its fonts - and remove_source would then delete the only copy that has them. Leave the bundle untouched on disk (a drop here also
         //   keeps it out of the deletion pass below); remux the file to mkv and run import again to restore it.
         const subInScopeLogged = (f) => {
+            if (ccUntrusted(f)) return false;   // ccPlan's line already says why
             if (!subLangInScope(f)) {
                 // The tag echoes a free-text input, so it gets the same treatment failLangToken gives its token: control characters collapsed (a raw
                 // newline would split the line into a continuation with no ☐/☑/☒ symbol) and capped, since nothing bounds the list and this line is
