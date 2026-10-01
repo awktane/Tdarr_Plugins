@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.37',
+    Version: '4.999.38',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -3093,7 +3093,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // reassigning default is outside this plugin's scope. mp4/mov muxers drop a custom GLOBAL tag (clean_and_remux's awk_recovered) on a -c copy
             // remux unless told to keep it, which would re-trigger recovery next pass - preserve it. (Per-stream custom tags like awk_loudnorm are NOT
             // rescued by this flag, verified against the real mov muxer - why loudnorm caches on Matroska only; see loudnormTagPersists.)
-            const mp4KeepTags = isMp4Family(dstContainer) ? ' -movflags use_metadata_tags' : '';
+            // An audio-medium .m4a never gets it: no sibling marker can be on one (the other plugins skip audio files, and stream_ordering takes only .mka),
+            // and the flag rewrites every iTunes atom (title, artist, album...) as a QuickTime mdta key and drops the covr cover art - measured on jellyfin
+            // 7.1.4, an iTunes-style reader (mutagen, as Picard and beets use) then sees no tags at all, while ffprobe still shows them.
+            const mp4KeepTags = isMp4Family(dstContainer) && file.fileMedium !== 'audio' ? ' -movflags use_metadata_tags' : '';
             // The -strict level this mp4/mov -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses
             // without it. The second list is what this run actually COPIES - a track removedIndices drops, or an in-place transcode replaces (recorded in
             // outputAudioOverride, keyed by output audio index), is left out, so a TrueHD track on its way out never asks for a flag the output cannot need.
