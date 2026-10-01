@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.44',
+    Version: '4.999.45',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -2138,6 +2138,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // fix these, so the file fails with the styled original intact rather than flattening it to mov_text for good - see the check after the stream loop.
         let bundleHeldCount = 0;
         const placedSidecars = new Set(); const failedSidecars = new Map(); const emptySidecars = new Set();
+        // The subset of failedSidecars whose only fault is that the server could not say whether the sidecar is already there - a transient answer, not a
+        // placement that failed. A styled export never flattens over one (see the styled refusal).
+        const unconfirmedSidecars = new Set();
         // The font attachments a styled-subtitle bundle carries. Read once here: they are the same set for every styled subtitle in the file, and the
         // pre-scan below needs them before the stream loop runs.
         const styledFontIndices = (file.ffProbeData.streams || [])
@@ -2177,7 +2180,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (isUnmappedNode) {
                 if (placedSidecars.has(name)) return { status: 'placed', name };
                 if (emptySidecars.has(name)) return { status: 'empty', name };
-                return { status: 'refused', name, why: 'unmapped' };
+                return { status: 'refused', name, why: unconfirmedSidecars.has(name) ? 'unconfirmed' : 'unmapped' };
             }
             // videoBase is the user's own filename and nothing bounds it, so the finished name can exceed the filesystem's 255-byte basename cap on its own.
             // The sidecar and the strip are outputs of ONE ffmpeg command, so an over-long name does not merely lose the sidecar: ffmpeg answers "File name
@@ -2230,6 +2233,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const there = sidecarExistsRemote(dest);
                 if (there.state === 'present') { placedSidecars.add(name); continue; }
                 if (there.state === 'unknown') {
+                    unconfirmedSidecars.add(name);
                     failedSidecars.set(name, `could not confirm whether it is already there (${there.why}), so it was not exported over it`);
                     continue;
                 }
@@ -2400,6 +2404,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         // Every refusal keeps the subtitle, and any at all fails the file after the loop: the sidecar would have been its only copy.
                         const refusal = {
                             unmapped: `Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}, keeping the subtitle`,
+                            unconfirmed: `Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}, keeping the subtitle`,
                             namecap: `Sidecar name would be ${bytes} bytes, over the ${NAME_BYTE_CAP}-byte filesystem limit`
                                 + ' - rename the video shorter and requeue, keeping the subtitle',
                             unsafe: `Library directory has a quote, control char or <io> - cannot write ${sidecarName} safely, keeping the subtitle`,
@@ -2483,7 +2488,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         workDone += `☑${inputTag} Styled-subtitle bundle already exists, not overwriting: ${sidecarName}\n`;
                     } else {
                         // A refusal falls through to the mov_text conversion below with a ☒ naming the loss - a mangled subtitle beats a vanished one - except
-                        // a bundle on disk cut short or undeletable, which the user CAN fix, so it fails the file instead (bundleHeldCount). The
+                        // a bundle on disk cut short or undeletable, or a server that could not say whether one is there: those clear on a requeue, so the file
+                        // fails with the styled original intact instead of flattening it for good (bundleHeldCount). The
                         // bundle route has no 'empty' answer of its own and does not need one: placeSidecars files an empty extraction under BOTH
                         // empty and failed, so the unmapped refusal already names it ('extraction produced no data') rather than reading undefined.
                         const refusal = {
@@ -2494,11 +2500,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             unsafe: `Library directory has a quote, control char or <io> - cannot write ${sidecarName} safely; converting to mov_text`
                                 + ' instead, which loses the styling',
                             leftover: `An incomplete ${sidecarName} from an earlier run could not be deleted to export it again - delete it and requeue`,
+                            unconfirmed: `Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}; a transient answer, so the`
+                                + ' styled subtitle is not flattened over it - requeue once the server answers',
                             short: `${sidecarName} already on disk stops at ${Number(staged.end).toFixed(1)} s but this subtitle runs to `
                                 + `${Number(staged.streamEnd).toFixed(1)} s - a run that failed partway, or an edit that cut the end, so it cannot be `
                                 + 'trusted with the only copy - delete it and requeue to export the whole subtitle',
                         };
-                        if (why === 'short' || why === 'leftover') bundleHeldCount += 1;
+                        if (why === 'short' || why === 'leftover' || why === 'unconfirmed') bundleHeldCount += 1;
                         response.infoLog += `☒${inputTag} ${refusal[why || 'unmapped']}\n`;
                     }
                     if (exported) { dropStream(ffstream.index); subtitleStreamIndex--; continue; }
@@ -2820,16 +2828,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // remove_imagesubs=export asked for a sidecar that could not be written, so the export did not happen and neither did the drop it protects. Fail
         // rather than remux around it: every cause counted here is environmental (a quote in the library directory, no path translator, a rejected upload)
-        // and so recurs on every future run, which would leave the export setting quietly doing nothing while each run reported success. Failing costs
-        // nothing - the file is untouched and the image subtitle is still embedded - and the error clears itself once the environment is fixed and the file
-        // requeued. That last clause is why an EMPTY extraction is diverted above rather than counted: nothing about it is fixable, so it would never clear.
+        // and recurs on every future run, or transient (a server that could not say whether the sidecar is already there), and either way a remux around it
+        // would leave the export setting quietly doing nothing while each run reported success. Failing costs nothing - the file is untouched and the image
+        // subtitle is still embedded - and the error clears once the environment is fixed or the server answers, and the file is requeued. That last clause
+        // is why an EMPTY extraction is diverted above rather than counted: nothing about it is fixable, so it would never clear.
         if (exportRefusedCount) {
             failWithBuffers(`[remove_imagesubs=export] ${exportRefusedCount} image subtitle${exportRefusedCount === 1 ? '' : 's'} could not be exported,`
                 + ' see the reasons above - nothing was removed from the file');
         }
         if (bundleHeldCount) {
-            failWithBuffers(`[container=mp4] ${bundleHeldCount} styled subtitle${bundleHeldCount === 1 ? '' : 's'} could not be exported over a bundle `
-                + 'already on disk, see the reasons above - nothing was flattened or removed');
+            failWithBuffers(`[container=mp4] ${bundleHeldCount} styled subtitle${bundleHeldCount === 1 ? '' : 's'} could not be exported to a bundle, see the `
+                + 'reasons above - nothing was flattened or removed');
         }
 
         if (convert === true) {
