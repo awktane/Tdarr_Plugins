@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.40',
+    Version: '4.999.41',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -319,11 +319,11 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\ndefault (default) - ffmpeg's built-in downmix (-ac 2). The standard, least-surprising fold; its auto-levelling can occasionally sound
-                quiet, with dialogue buried.
-                \\ndialogue - a Lo/Ro downmix matrix, keeping the centre at -3 dB and dropping the LFE, so dialogue stays clear and the level stays up.
-                The cost is a more opinionated fold that shifts the spatial image.
-                \\nFalls back to default automatically for unusual layouts such as 2.1 and 3.0.`,
+                \\ndefault (default) - ffmpeg's built-in downmix matrix, the one -ac 2 uses. The standard, least-surprising fold.
+                \\ndialogue - a Lo/Ro downmix matrix, keeping the centre at -3 dB and dropping the LFE, so dialogue stays clear. The cost is a more
+                opinionated fold that shifts the spatial image.
+                \\nFalls back to default automatically for unusual layouts such as 2.1 and 3.0. Either fold ends in a peak limiter at -2 dBFS, so a hot
+                surround mix cannot clip on the way down; it acts only on the peaks, costing under 1 LU of loudness on the hottest mixes.`,
         },
         {
             name: 'guard_lossless',
@@ -2353,8 +2353,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Per-speaker contribution to the L and R downmix outputs - the standard Lo/Ro gains, matching what Blu-ray players, AV receivers and streaming
         // services do. FL/FR pass at full scale (peak 1.0); FC folds in at -3 dB (0.707) into both sides so dialogue stays clear; back/side/wide fold at -3 dB
-        // into their own side; any centered channel (FC, BC) splits equally to both; LFE contributes nothing (dropping it avoids mud). That -3 dB attenuation
-        // on center/surround is what provides the clipping headroom.
+        // into their own side; any centered channel (FC, BC) splits equally to both; LFE contributes nothing (dropping it avoids mud). These gains do NOT
+        // keep a hot mix under full scale - a fold sums several channels - which is what FOLD_LIMITER is for.
         const SPEAKER_GAINS = {
             FL:  { L: 1.0,   R: 0     },
             FR:  { L: 0,     R: 1.0   },
@@ -2590,29 +2590,39 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
         };
 
+        // Every fold sums channels, and on a hot mix that lands above full scale. Measured on jellyfin-ffmpeg 7.1.4 with three hot corpus samples (eac3
+        // 5.1.2, DTS-HD 7.1, DTS:X 7.1.4): a stereo fold peaked +2.30/+4.37/+2.85 dBFS, -ac 2 exactly as hot as the dialogue pan, because swresample
+        // normalises its matrix only for INTEGER output and every stereo encoder here takes float; the dialogue pan on a 24-bit (s32p) source ran in the
+        // integer domain and hard-clipped at 0.00 dBFS instead; and -ac 6 from 7.1 peaked +1.83 dBFS. So every fold runs in float and ends in this limiter:
+        // a -2 dBFS ceiling, level=0 (its auto-level would otherwise lift the whole track to that ceiling) and latency=1 (compensates the 5 ms lookahead so
+        // A/V sync holds). -2 rather than -1 because of the lossy encoder after it: at -1 dBFS libopus at 192k still decoded +0.66 dBFS on the eac3 mix
+        // (54 samples over), while at -2 aac, eac3 and opus all decoded under full scale on all three. The cost is integrated loudness on a peaky mix: 0.0 /
+        // 0.9 / 0.9 LU on the three (-1 dBFS cost 0.0 / 0.5 / 0.7). A global sum-normalisation would also stop the clipping, at 6-8 dB of lost level.
+        const FOLD_LIMITER = 'alimiter=limit=0.794:level=0:latency=1';
+        const foldFilter = (layout, matrix) => (matrix ? `aformat=sample_fmts=fltp,${matrix},${FOLD_LIMITER}`
+            : `aformat=sample_fmts=fltp:channel_layouts=${layout},${FOLD_LIMITER}`);
+
         // Channel/filter snippet for a new or replaced stereo track. No guard check here: every call site either already passed guardBlocks or is a
-        // brand-new appended derivative (an unconditional lossy re-encode by construction), so loudnorm rides on whichever guarantee applies. The
-        // no-verified-pan-matrix fallback must be an explicit filter (aformat=channel_layouts=stereo, verified equivalent to -ac 2) rather than bare -ac
-        // when loudnorm is active, so the downmix chains BEFORE loudnorm's filter - ffmpeg applies an implicit -ac AFTER an explicit -filter:a, which
-        // would measure/correct the wrong, pre-downmix signal. Returns { arg, measured, changed }: `measured` gates the awk_loudnorm stamp, `changed`
-        // the ride-along log tag. Callers that don't run loudnorm read both false.
+        // brand-new appended derivative (an unconditional lossy re-encode by construction), so loudnorm rides on whichever guarantee applies. The fold is
+        // always an explicit filter (foldFilter - aformat=channel_layouts=stereo is the matrix -ac 2 uses) rather than a bare -ac: ffmpeg applies an implicit
+        // -ac AFTER an explicit -filter:a, so neither the limiter nor loudnorm would see the folded signal. Returns { arg, measured, changed }: `measured`
+        // gates the awk_loudnorm stamp, `changed` the ride-along log tag. Callers that don't run loudnorm read both false.
         const stereoArg = (idx, srcStream) => {
-            const matrix = (methodStereoDownmix === 'dialogue') ? downmixMatrix(srcStream) : null;
-            if (methodLoudnorm === 'disabled')
-                return { arg: matrix ? ` -filter:a:${idx} "${matrix}"` : ` -ac:a:${idx} 2`, measured: false, changed: false };
-            const preFilter = matrix || 'aformat=channel_layouts=stereo';
+            const fold = foldFilter('stereo', (methodStereoDownmix === 'dialogue') ? downmixMatrix(srcStream) : null);
+            if (methodLoudnorm === 'disabled') return { arg: ` -filter:a:${idx} "${fold}"`, measured: false, changed: false };
             const srcAudioIdx = inputAudioIdxMap.get(srcStream.index);
-            const { filter, changed, measured } = buildLoudnormFilter(srcStream.index, srcAudioIdx, preFilter, LOUDNORM_PRESETS[methodLoudnorm]);
+            const { filter, changed, measured } = buildLoudnormFilter(srcStream.index, srcAudioIdx, fold, LOUDNORM_PRESETS[methodLoudnorm]);
             return { arg: ` -filter:a:${idx} "${filter}"`, measured, changed };
         };
 
-        // 6ch (5.1) channel/filter snippet for a new or replaced 5.1 track, mirroring stereoArg for the surround case: a bare -ac 6 when loudnorm is off, else
-        // an explicit aformat=channel_layouts=5.1 (verified equivalent to -ac 6) chained BEFORE loudnorm's analysis/correction so it measures the post-downmix
-        // signal - the same -ac ordering trap stereoArg documents. Shared by append6ch and the in-place downmix_to_six 'replace' branch so the two can't drift.
+        // 6ch (5.1) channel/filter snippet for a new or replaced 5.1 track, mirroring stereoArg for the surround case: the explicit 5.1 fold (foldFilter -
+        // aformat=channel_layouts=5.1 is the matrix -ac 6 uses) ahead of the limiter and of loudnorm's analysis/correction, for the same -ac ordering trap
+        // stereoArg documents. Shared by append6ch and the in-place downmix_to_six 'replace' branch so the two can't drift.
         const sixArg = (idx, srcStream) => {
-            if (methodLoudnorm === 'disabled') return { arg: ` -ac:a:${idx} 6`, measured: false, changed: false };
-            const { filter, changed, measured } = buildLoudnormFilter(srcStream.index, inputAudioIdxMap.get(srcStream.index),
-                'aformat=channel_layouts=5.1', LOUDNORM_PRESETS[methodLoudnorm]);
+            const fold = foldFilter('5.1', null);
+            if (methodLoudnorm === 'disabled') return { arg: ` -filter:a:${idx} "${fold}"`, measured: false, changed: false };
+            const { filter, changed, measured } = buildLoudnormFilter(srcStream.index, inputAudioIdxMap.get(srcStream.index), fold,
+                LOUDNORM_PRESETS[methodLoudnorm]);
             return { arg: ` -filter:a:${idx} "${filter}"`, measured, changed };
         };
 
@@ -2739,7 +2749,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         const dstBps = resolveBitrate(surroundCodec, 6);
                         const dstBitArg = encoderArgsBps(surroundCodec, outputAudioIdx, dstBps);
                         // guardBlocks already passed for sixMode==='replace' (loudnorm rides on that guarantee - see stereoArg above); sixArg builds the
-                        // -ac 6 / aformat=channel_layouts=5.1 snippet.
+                        // 5.1 fold snippet (foldFilter).
                         const six = sixArg(outputAudioIdx, ffstream);
                         workDone += `☐${streamTag(ffstream.index)}[downmix_to_six=${downmixToSix}]${loudnormRideTag(six.changed)} Transcoding `
                             + `${ffstreamCodec} ${ffstreamChannels}ch @ ${srcRateStr} → ${surroundCodec} 6ch @ ${dstBps / 1000} kb/s\n`;
