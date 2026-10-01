@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.48',
+    Version: '3.999.49',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -131,7 +131,9 @@ const details = () => ({
                 \\ntrue (default) on EXTRACT - remove each text subtitle from the video, but only after its sidecar is confirmed written, so a failed write
                 costs you nothing but the extraction. For embedded closed captions this also strips the caption data out of the video bitstream - see
                 embedded_cc.
-                \\ntrue (default) on IMPORT - delete each sidecar once its text is confirmed to be one of the embedded subtitles.
+                \\ntrue (default) on IMPORT - delete each sidecar once its text is confirmed to be one of the embedded subtitles. A sidecar the import could
+                only store in part is kept, and the log says what was dropped: a WebVTT's positioning, styling or voice tags, or an ASS/SSA - or an srt's
+                font and {\\an8} overrides - going into an mp4.
                 \\nfalse - keep both copies: nothing leaves the video on extract, and no sidecar is deleted on import.
                 \\nADD THIS PLUGIN TO THE POST-PROCESSING PLUGIN STACK as well as the pre-processing one, or import will never delete anything. The deletion
                 has to wait until you accept the transcode, since deleting sooner would destroy the sidecars of a run you then reject. Miss that stack entry
@@ -1746,10 +1748,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // because a name that merely parses as a sidecar says nothing about what is behind it - a runaway OCR dump or a mis-renamed file left as
     // <video>.eng.srt would otherwise be pulled into the worker whole for a hash that is not even needed. Real text subtitles are kilobytes and a heavily
     // typeset ASS a few MB, so 64 MiB is orders of magnitude of headroom and never refuses a genuine one. (Node itself already refuses past 2 GiB.)
-    // Sidecar identity is compared against text ffmpeg RE-SERIALISED out of the container, so the two sides are only equal after the same normalisation.
-    // ffmpeg's srt muxer/encoder rewrites on the way through, measured on 7.1.4: CRLF folds to LF, a UTF-8 BOM is dropped, a missing final blank line is
-    // added, and cue numbers are RENUMBERED from 1 (same byte COUNT, different bytes - a size check cannot even hint at it). Hashing raw bytes therefore
-    // said "different subtitle" for every ordinary downloaded .srt, which is CRLF and often gap-numbered. Both hash sites must use THIS function.
+    // Every subtitle hash goes through THIS function, so a sidecar's own text, its round trip and an embedded extraction compare like for like. It undoes
+    // the rewrites cheap enough to undo here, measured on 7.1.4: CRLF folds to LF, a UTF-8 BOM is dropped, a missing final blank line is added, and cue
+    // numbers are RENUMBERED from 1 (same byte COUNT, different bytes - a size check cannot even hint at it). That lets an ordinary CRLF, gap-numbered
+    // .srt match on its OWN text, the match that proves an import lost nothing; everything else ffmpeg rewrites is left to sidecarRoundTripHash.
     // Two traps, both deliberate: (1) only a numeric line IMMEDIATELY PRECEDING a "-->" line is dropped, because that is structurally the cue number - a
     // blanket "drop standalone numeric lines" would delete a cue whose text is literally "7" and make two different subtitles collide; (2) ass is
     // normalised for line endings ONLY, never reduced to its Dialogue: lines, because that would hash two subtitles differing only in typesetting alike.
@@ -1788,9 +1790,37 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (size > cap) throw Object.assign(new Error(`it is ${size} bytes, over the ${cap}-byte limit`), { overCap: true });
         return fs.readFileSync(p, 'utf8');
     };
-    // One read per sidecar answers BOTH content questions - hash identity (contentKey) and cue emptiness (groupHasNoCues) - mirroring embeddedTextHashes,
-    // whose one ffmpeg pass answers the same pair for the embedded side. Memoised per rel. null = unreadable or over the cap; each caller keeps its own
-    // failure direction (contentKey -> a unique never-merged key, groupHasNoCues -> false = not provably empty).
+    // What importing a sidecar provably DROPS, so remove_source never deletes the only complete copy (deletionLoss). Measured on jellyfin-ffmpeg 7.1.4 by
+    // muxing each shape into mkv and mp4 and extracting it back. Into Matroska an srt or ass/ssa survives whole - spaces, timestamp spelling, cue order,
+    // tag case and Comment placement are re-serialised, nothing visible changes - but a WebVTT loses its cue settings (align/position/line), STYLE and
+    // REGION blocks, and every tag except <b>/<i>/<u>: voice, class, lang, ruby (flattened into the text) and karaoke timestamps. Into mp4's mov_text an
+    // ass/ssa loses all its styling, and an srt or vtt its <font> tags and {\...} overrides ({\an8} positioning). Over-reporting only keeps a sidecar that
+    // could have gone, so the scan is coarse - and linear, never a backtracking pattern, since a sidecar is untrusted text up to SIDECAR_HASH_MAX.
+    // Returns the first loss for each target family, '' for none.
+    const importLosses = (text, ext) => {
+        let any = '';
+        if (ext === 'vtt') {
+            for (const line of text.split('\n')) {
+                const t = line.trim();
+                if (t === 'STYLE' || t === 'REGION') { any = 'its STYLE/REGION block'; break; }
+                const arrow = line.indexOf('-->');
+                if (arrow >= 0 && line.slice(arrow + 3).trim().split(/\s+/).length > 1) { any = 'its cue positioning'; break; }
+            }
+            for (let p = text.indexOf('<'); !any && p >= 0;) {
+                const q = text.indexOf('>', p);
+                if (q < 0) break;
+                if (!/^\/?[biu]$/i.test(text.slice(p + 1, q).trim())) any = 'its WebVTT voice, class, ruby or timing tags';
+                p = text.indexOf('<', q + 1);
+            }
+        }
+        let mp4 = any;
+        if (!mp4) mp4 = ext === 'ass' ? 'its ASS styling' : ((/<font\b/i.test(text) || text.includes('{\\')) ? 'its font and positioning overrides' : '');
+        return { any, mp4 };
+    };
+
+    // One read per sidecar answers every content question - hash identity (contentKey), cue emptiness (groupHasNoCues) and what importing it would drop
+    // (importLosses) - mirroring embeddedTextHashes, whose one ffmpeg pass answers the first two for the embedded side. Memoised per rel. null = unreadable
+    // or over the cap; each caller keeps its own failure direction (contentKey -> a unique never-merged key, groupHasNoCues -> false = not provably empty).
     const sidecarContentMemo = new Map();
     const sidecarContent = (f) => {
         if (sidecarContentMemo.has(f.rel)) return sidecarContentMemo.get(f.rel);
@@ -1799,9 +1829,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const p = path.join(workLibDir(), f.rel);
             if (fs.statSync(p).size <= SIDECAR_HASH_MAX) {
                 const buf = fs.readFileSync(p);
+                const text = buf.toString('utf8');
                 out = {
                     sha1: crypto.createHash('sha1').update(subTextForHash(buf, path.extname(f.rel))).digest('hex'),
-                    noCues: hasNoCues(buf.toString('utf8'), f.ext),
+                    noCues: hasNoCues(text, f.ext),
+                    loss: importLosses(text, f.ext),
                 };
             }
         } catch (e) { out = null; }
@@ -1817,7 +1849,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // file": metadata cannot answer it in either direction (retitling changes every visible field while the text stays identical; two tracks can share
     // language+title with different text). One ffmpeg run extracts them all in a SINGLE pass through the same codec->format map the sidecars were written
     // with. The bytes are NOT directly comparable - ffmpeg re-serialises on the way out (CRLF folded, BOM dropped, cue numbers renumbered from 1), which is
-    // identical only for a sidecar ffmpeg itself wrote - so both sides hash subTextForHash() instead. Costs one sequential read (0.3s on an 885MB
+    // identical only for a sidecar ffmpeg itself wrote - so every side hashes subTextForHash(), and a sidecar ffmpeg did not write is compared through
+    // its round trip (sidecarRoundTripHash). Costs one sequential read (0.3s on an 885MB
     // mkv), so callers only reach it with a real candidate - but two of the three (the post-processing sidecar-delete confirmation, and the import path) are
     // gated on remove_source rather than deduplicate, so stock settings DO arrive here. An empty map means "asked, found nothing"; null means the probe could
     // not run, which every caller must read as "cannot prove anything" and import - a redundant track is recoverable, a dropped one is not.
@@ -1880,6 +1913,54 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
         return embeddedHashCache;
     };
+
+    // A sidecar's identity as the IMPORT will store it: the sidecar alone, muxed into the target's container the way the import mux does it (copied into
+    // Matroska, converted to mov_text for mp4) and extracted back through TEXT_SUB like every embedded track. Its own text cannot stand in for that: ffmpeg
+    // re-serialises far more than subTextForHash undoes - trimmed spaces, sorted cues, rewritten timestamps, a dropped vtt header, ass Comment lines moved,
+    // every vtt/ass into mp4 back as srt - and each mismatch made the import add the same subtitle as one more track every cycle, never deleting the
+    // sidecar. Re-serialised by ffmpeg itself, the two sides match by construction: on jellyfin-ffmpeg 7.1.4 this matched the real import's embedded copy
+    // on all 34 shapes tried (17 srt/vtt/ass/ssa sidecars x mkv/mp4). The container step is required - decoding and re-encoding with none differed for
+    // mov_text on 2 of them. Two short ffmpeg runs, memoised per target; null when either fails, and callers then have the sidecar's own text alone.
+    const roundTripMemo = new Map();
+    const sidecarRoundTripHash = (f, mp4) => {
+        const key = `${mp4 ? 'mp4' : 'mkv'}|${f.rel}`;
+        if (roundTripMemo.has(key)) return roundTripMemo.get(key);
+        roundTripMemo.set(key, null);
+        // An archive is not text, and a sidecar sidecarContent could not read (gone, or over the cap) is never handed to ffmpeg either.
+        const enc = TEXT_SUB[mp4 ? 'mov_text' : EXT_TO_CODEC[f.ext]];
+        if (f.bundle || !enc || !sidecarContent(f)) return null;
+        let dir = '';
+        try { dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_subrt_')); } catch (e) { return null; }
+        const { spawnSync } = require('child_process');
+        const ff = (args) => spawnSync(ffmpegPathOf(otherArguments), ['-y', '-loglevel', 'error', ...args],
+            { encoding: 'utf8', timeout: SUB_EXTRACT_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES });
+        const mux = path.join(dir, mp4 ? 'rt.mp4' : 'rt.mkv');
+        const out = path.join(dir, `rt.${enc.ext}`);
+        try {
+            let r = ff(['-sub_charenc', 'UTF-8', '-i', path.join(workLibDir(), f.rel), '-map', '0:0', '-c:s', mp4 ? 'mov_text' : 'copy',
+                '-f', mp4 ? 'mp4' : 'matroska', mux]);
+            if (!r.error && r.status === 0) r = ff(['-i', mux, '-map', '0:s:0', '-c:s', enc.enc, '-fs', String(SIDECAR_HASH_MAX + 1), out]);
+            if (!r.error && r.status === 0 && fs.statSync(out).size <= SIDECAR_HASH_MAX) {
+                roundTripMemo.set(key, crypto.createHash('sha1').update(subTextForHash(fs.readFileSync(out), path.extname(out))).digest('hex'));
+            }
+        } catch (e) { /* no round-trip identity - callers fall back to the sidecar's own text */ }
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
+        return roundTripMemo.get(key);
+    };
+    // Which of a sidecar's two identities one of these embedded hashes carries: 'text' (its own text - the file holds it whole) or 'roundtrip' (what the
+    // import stores - the file holds what ffmpeg KEPT of it), else null. The own-text test runs first and costs nothing; the round trip only on a miss.
+    const sidecarMatch = (f, mp4, hashes) => {
+        const set = new Set(hashes);
+        const own = sidecarContent(f)?.sha1;
+        if (own && set.has(own)) return 'text';
+        const rt = sidecarRoundTripHash(f, mp4);
+        return rt && set.has(rt) ? 'roundtrip' : null;
+    };
+    // remove_source deletes a sidecar only when nothing is lost by it. A 'text' match proves the file holds the whole subtitle; a 'roundtrip' match only
+    // that it holds what the import kept, so a sidecar the import strips stays, and this names what deleting it would cost ('' = safe to delete).
+    const deletionLoss = (f, how, mp4) => (how === 'roundtrip' ? (sidecarContent(f)?.loss?.[mp4 ? 'mp4' : 'any'] || '') : '');
+    const keepForLossLine = (rel, loss) => `☒[remove_source=true] Keeping ${logSafe(rel)}: its text is in the file, but importing it dropped ${loss}`
+        + ' - delete it yourself if you do not need that\n';
 
     // deduplicate=enabled_checkmedia: the same duplicate test turned on the file's OWN tracks. Two subtitle streams holding identical text are one
     // subtitle stored twice, however their tags read, and this is the only place in the plugin that removes a subtitle the user did not ask to extract -
@@ -2112,12 +2193,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // construction, yet its content is provably one of them. The hashes cost one pass over the accepted library file on every successful round trip - the
         // price of never unlinking a sidecar on a resemblance. `confirmedWhy` returns the REASON it may go, so the deletion line reports what was proved.
         let hashes;
+        // 'text' / 'roundtrip' / null - which identity proved it (sidecarMatch); the loop below keeps a round-trip match the import stripped.
         const contentConfirms = (f) => {
-            if (f.bundle) return false;
+            if (f.bundle) return null;
             if (hashes === undefined) hashes = embeddedTextHashes(embedded);
-            if (!hashes || !hashes.size) return false;
-            const h = sidecarContent(f)?.sha1;
-            return !!h && [...hashes.values()].includes(h);
+            if (!hashes || !hashes.size) return null;
+            return sidecarMatch(f, mp4Target, hashes.values());
         };
         const confirmedWhy = (f) => {
             if (!f.bundle && contentConfirms(f)) return 'its text is in the file';
@@ -2134,6 +2215,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     hashes === null ? " (the file's subtitle text could not be read)" : ''} - not deleting (unverified)\n`;
                 continue;
             }
+            const loss = deletionLoss(f, contentConfirms(f), mp4Target);
+            if (loss) { log += keepForLossLine(f.rel, loss); continue; }
             try { fs.unlinkSync(path.join(workLibDir(), f.rel)); deleted += 1; log += `☑[${delReason}] Deleted sidecar (${why}): ${f.rel}\n`; }
             catch (e) { log += `☒[${delReason}] Could not delete sidecar ${f.rel}: ${e && e.message ? e.message : e}\n`; }
         }
@@ -3007,7 +3090,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const surviving = survivingTextHashes();
             if (!surviving) return true;       // the probe could not run, so nothing is proven either way and the marker's metadata match decides
             if (!surviving.size) return false; // the probe RAN and no surviving track holds text, so this sidecar is demonstrably not in the file - import it
-            return [...surviving.values()].includes(groupHash.get(f.members) || contentKey(f));
+            return !!sidecarMatch(f, isMp4, surviving.values());
         };
         // The marker skip, now that a group has ONE identity. A group is done only when EVERY member is confirmed embedded AND the group's text is really
         // there: a partly-confirmed group still has something to say (its merged title or flags may not be on the track yet), and processing it is harmless
@@ -3026,10 +3109,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // information is the test, not which container it ends up living in.
         const embeddedHashes = (dedupeSidecars && merged.some((f) => !f.bundle)) ? survivingTextHashes() : new Map();
         // A bundle is an archive, not comparable text, so it is never matched this way; a null map means the probe could not run (see embeddedTextHashes).
+        // f.matchedBy records which identity matched (sidecarMatch), so the deletion below can keep a sidecar the import stripped.
         const embeddedAt = (f) => {
-            if (f.bundle || !embeddedHashes || !embeddedHashes.size) return null;
-            const h = groupHash.get(f.members);
-            if (!h) return null;
+            if (f.bundle || !embeddedHashes || !embeddedHashes.size || !groupHash.has(f.members)) return null;
+            f.matchedBy = sidecarMatch(f, isMp4, embeddedHashes.values());
+            if (!f.matchedBy) return null;
+            const h = f.matchedBy === 'text' ? sidecarContent(f)?.sha1 : sidecarRoundTripHash(f, isMp4);
             for (const [idx, eh] of embeddedHashes) if (eh === h) return idx;
             return null;
         };
@@ -3085,8 +3170,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // directly (the file API has no delete; with nothing to mux there is no acceptance and no server-side pass), so the placeViaApi() branch buys the
         // server pass instead of claiming a deletion it did not perform. Both cleanup shortcuts below must be the EXACT negation of the mux branch's
         // trigger (toMux || retuneMeta || removedIndices) - a queued embedded-dedup drop is work on the FILE, and returning here would discard it silently.
-        if (nothingToMux && alreadyInFile.length && removeSource && placeViaApi()) {
-            const stranded = alreadyInFile.flatMap((f) => f.members.map((m) => m.rel));
+        // A sidecar whose import stripped something stays whichever route would remove it (deletionLoss) - said once, here, for both.
+        const deletable = (nothingToMux && removeSource) ? alreadyInFile.filter((f) => {
+            const loss = deletionLoss(f, f.matchedBy, isMp4);
+            if (loss) for (const m of f.members) response.infoLog += keepForLossLine(m.rel, loss);
+            return !loss;
+        }) : alreadyInFile;
+        if (nothingToMux && deletable.length && removeSource && placeViaApi()) {
+            const stranded = deletable.flatMap((f) => f.members.map((m) => m.rel));
             // Forcing twice for the same sidecar is worse than not forcing at all: Tdarr ERRORS a file whose consecutive passes emit identical arguments
             // (its own infinite-transcode-loop guard), so a repeat does not merely waste a remux, it quarantines the video. The marker is the record of
             // what an earlier pass already queued, and it is checked DIRECTLY here rather than through alreadyEmbedded, which cannot confirm a sidecar whose
@@ -3113,9 +3204,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += `☑Expected results: ${summariseAll(streams)}\n`;
             return response;
         }
-        if (nothingToMux && alreadyInFile.length && removeSource) {
+        if (nothingToMux && deletable.length && removeSource) {
             let gone = 0; const removedRels = new Set();
-            for (const rel of alreadyInFile.flatMap((f) => f.members.map((m) => m.rel))) {
+            for (const rel of deletable.flatMap((f) => f.members.map((m) => m.rel))) {
                 try {
                     fs.unlinkSync(path.join(workLibDir(), rel)); gone += 1; removedRels.add(rel);
                     response.infoLog += `☑[remove_source=true] Deleted sidecar (its content is already in the file): ${rel}\n`;
