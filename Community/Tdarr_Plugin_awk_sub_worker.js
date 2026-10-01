@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.49',
+    Version: '3.999.50',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -52,7 +52,9 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\nextract: pull embedded text subtitles out of the video into sidecar files beside it.
-                \\nimport: mux sidecar files sitting beside the video back into it.`,
+                \\nimport: mux sidecar files sitting beside the video back into it. A sidecar it imported that something later removed from the file -
+                clean_and_remux's language_sub or remove_sub_sdh, say - is not imported again, and stays on disk; rename it to bring it back. Matching
+                only_languages to language_sub skips that one wasted import.`,
         },
         {
             name: 'only_languages',
@@ -936,8 +938,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const NEVER_SAFE = /(?!)/;
     const encodeTitle = (t) => pctEncode(t, TITLE_SAFE);
     const encodeMarker = (s) => pctEncode(s, MARKER_SAFE);
-    const encodeMarkerList = (names) => names.map(encodeMarker).join(',');
-    const decodeMarkerList = (v) => String(v || '').split(',').filter(Boolean).map(pctDecode);
+    // A marker entry is a sidecar path, then ':' and the first 12 hex of the sha1 of the text it was imported with - ':' never occurs inside an encoded
+    // path, since MARKER_SAFE escapes it. The hash is what tells a sidecar REMOVED from the file since its import from one EDITED since (goneSinceImport);
+    // an entry without one proves nothing about content and is read as the bare path it is.
+    const MARKER_SHA_LEN = 12;
+    const encodeMarkerEntries = (entries) => entries.map((e) => encodeMarker(e.rel) + (e.sha ? `:${e.sha.slice(0, MARKER_SHA_LEN)}` : '')).join(',');
+    const decodeMarkerEntries = (v) => String(v || '').split(',').filter(Boolean).map((x) => {
+        const [p, sha] = x.split(':');
+        return { rel: pctDecode(p), sha: /^[0-9a-f]{12}$/.test(sha || '') ? sha : null };
+    });
+    const decodeMarkerList = (v) => decodeMarkerEntries(v).map((e) => e.rel);
     // The global tag that lists the sidecars an import muxed in - named once, because a read and a write that drift apart fail silently: the import never
     // recognises its own work again and re-muxes every sidecar on every pass.
     const SUB_MARKER_TAG = 'awk_sub_worker';
@@ -2565,6 +2575,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (!rt) return st;
                 return { ...st, tags: { ...(st.tags || {}), language: rt.lang, title: rt.title }, disposition: Object.fromEntries(rt.disp.map((f) => [f, 1])) };
             };
+            // The sidecars whose subtitle this pass takes OUT of the file - each leaves the import marker too (see the preset below).
+            const extractedRels = new Set();
             for (const s of eligible) {
                 const { enc } = TEXT_SUB[String(s.codec_name).toLowerCase()];
                 const bundle = fontIndices.length > 0 && isStyledSub(s.codec_name);
@@ -2639,7 +2651,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     sidecarOut += ` -map 0:${s.index} -c:s ${enc} "${full}"`; wrote += 1; response.infoLog += `☐${streamTag(s.index)} Extract -> ${name}\n`;
                 }
                 if (bundle) bundled += 1;
-                if (removeSource) removedIndices.add(s.index);
+                if (removeSource) { removedIndices.add(s.index); extractedRels.add(name); }
             }
             // API placement: the deferred extractions run HERE, in one ffmpeg pass, and each result is uploaded to the library. Only a sidecar the server
             // confirms in place counts as written and earns its stream a removal - a failure logs ☒ and keeps that subtitle embedded, so the worst case
@@ -2673,7 +2685,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (j.bundle) bundled += 1;
                     // NEVER for a caption job: its index is the video stream's, and removedIndices becomes a -map -0:N exclusion. Captions leave the
                     // bitstream through the strip filter below (or through video_clean on a re-encode), never by dropping the stream that carries them.
-                    if (removeSource && !j.caption) removedIndices.add(j.index);
+                    if (removeSource && !j.caption) { removedIndices.add(j.index); extractedRels.add(j.name); }
                     const bundleNote = j.bundle ? ` (styled subtitle bundled with ${fontIndices.length} font${fontIndices.length === 1 ? '' : 's'})` : '';
                     response.infoLog += j.caption ? ccReadLine(j.index, j.name) : `☑${streamTag(j.index)} Extracted -> ${j.name}${bundleNote}\n`;
                 }
@@ -2744,6 +2756,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             out += ' -c copy';
             const keptSubs = streams.filter((s) => !removedIndices.has(s.index) && codecTypeOf(s) === 'subtitle');
             out += retagArgs(dupes.retag, keptSubs) + ccStrip + ccMeta;
+            // The marker names what an import put INTO the file. A subtitle this extract takes out leaves the list with it, so a later import of that
+            // sidecar - edited or not - is a real arrival rather than a removal the import must respect (goneSinceImport). An emptied list clears the tag.
+            const markerNow = decodeMarkerEntries(getTagCI(file.ffProbeData.format?.tags || {}, SUB_MARKER_TAG));
+            const markerLeft = markerNow.filter((e) => !extractedRels.has(e.rel));
+            if (markerLeft.length !== markerNow.length) out += ` -metadata "${SUB_MARKER_TAG}=${encodeMarkerEntries(markerLeft)}"`;
             commitPreset(out);
             const survivors = streams.filter((s) => !removedIndices.has(s.index));
             response.infoLog += `☑Expected results: ${summariseAll(survivors)}\n`;
@@ -2800,7 +2817,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         // The global marker VALUE lists the sidecar paths (relative to the video's directory) an earlier pass consumed, so a later pass deletes exactly what
         // it embedded (never a pre-existing collision) and never re-adds them. Tdarr only re-runs after a SUCCESSFUL mux, so a listed sidecar is safely in.
-        const importedSet = new Set(decodeMarkerList(getTagCI(file.ffProbeData.format?.tags || {}, SUB_MARKER_TAG)));
+        const markerEntries = decodeMarkerEntries(getTagCI(file.ffProbeData.format?.tags || {}, SUB_MARKER_TAG));
+        const importedSet = new Set(markerEntries.map((e) => e.rel));
+        const markerSha = new Map(markerEntries.map((e) => [e.rel, e.sha]));
         // Import scope decided from a sidecar's NAME alone (no content, no download): the caption staging file is always ours;
         // otherwise the language must be in only_languages (or the filter is off); and a styled bundle cannot go into an mp4-family
         // target that has no font attachments. Pulled out so the marker-hostile refusal can be decided from the listed names BEFORE the
@@ -3019,6 +3038,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // from outside. Each sidecar muxes as -i "${workLibDir()}/${rel}": a " or control char in that real path would close the quote and inject ffmpeg args
         // (pathIsPresetSafe), and unlike a name we generate it must match the file byte-for-byte, so it can't be sanitised - skip it, never break out.
         const alreadyEmbedded = (f) => importedSet.has(f.rel) && markerConfirmsEmbedded(f, embeddedSubs, hasFontAttachment, isMp4);
+        // The marker entries a write records: each listed sidecar with the hash of its text now (what this pass imports, or carries forward), else the
+        // hash an earlier entry already held for it.
+        const markerFor = (rels) => rels.map((rel) => {
+            const f = found.find((x) => x.rel === rel);
+            return { rel, sha: (f && sidecarContent(f)?.sha1) || markerSha.get(rel) || null };
+        });
         // A sidecar written with remove_source=false left the track it came from IN the file, so importing it adds a SECOND copy of that subtitle.
         // That is not a mistake to correct - it is the point of an edit round trip, where the sidecar on disk is deliberately no longer what was extracted -
         // and this pass cannot tell an edited sidecar from an untouched one without decoding the embedded track, so it must not drop either. But it can SAY
@@ -3160,6 +3185,33 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Is there anything to write to the FILE at all: a sidecar to mux, a metadata retune, or a dedup drop. Named once because the two cleanup
         // shortcuts below must be its EXACT negation and the mux branch its plain form - three hand-spelled copies of one five-term condition are
         // three chances for them to stop agreeing.
+        // A sidecar this plugin imported, UNCHANGED since (its text still hashes to the one the marker recorded), whose content the file no longer holds,
+        // was removed by something else after the import - clean_and_remux's language_sub or remove_sub_sdh on the next cycle, or the user. Importing it
+        // again undoes that removal every cycle: the two plugins alternate import and drop, the presets alternate too, so Tdarr's identical-arguments guard
+        // never fires and the worker remuxes the file forever (measured with language_sub=eng and a French sidecar, and with remove_sub_sdh=all and the
+        // imported closed captions). So the removal stands, the sidecar stays on disk, and the line says how to bring it back. An EDITED sidecar hashes
+        // differently and is imported as usual, and an extract that takes a subtitle out drops it from the marker, so extract -> reimport still round-trips.
+        // Proof of absence is the content: a probe that cannot run proves nothing, and the import then goes ahead as before.
+        const unchangedSinceImport = (m) => {
+            const was = markerSha.get(m.rel);
+            const now = sidecarContent(m)?.sha1;
+            return !!was && !!now && now.startsWith(was);
+        };
+        const goneSinceImport = (f) => {
+            if (f.bundle || !f.members.every(unchangedSinceImport)) return false;
+            const surviving = survivingTextHashes();
+            return !!surviving && !sidecarMatch(f, isMp4, surviving.values());
+        };
+        for (let k = toMux.length - 1; k >= 0; k -= 1) {
+            const f = toMux[k];
+            if (!goneSinceImport(f)) continue;
+            toMux.splice(k, 1);
+            response.infoLog += f.rel === ccName
+                ? `☒[embedded_cc=enabled] The closed captions imported from ${logSafe(f.rel)} have since been removed from the file (by another plugin's `
+                    + 'subtitle filter, or by hand) - not importing them again; that hidden sidecar now holds the only copy\n'
+                : `☒ ${logSafe(f.rel)} was imported by an earlier pass and has since been removed from the file (by another plugin's subtitle filter, or by `
+                    + 'hand) - not importing it again, which would undo that every cycle; the sidecar stays on disk - rename it to import it again\n';
+        }
         const nothingToMux = !toMux.length && !retuneMeta && !removedIndices.size;
 
         // Sidecars that were only ever redundant, with nothing to mux alongside them: no transcode to wait on, so the deletion happens now rather than in
@@ -3200,7 +3252,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += '☒[remove_source=true] Every sidecar is already in the file and this node cannot delete them from the library - '
                 + 'remuxing losslessly, since only an accepted transcode gives the server a pass in which to do it\n';
             for (const rel of stranded) response.infoLog += `☐[remove_source=true] Queued for removal once accepted: ${rel}\n`;
-            commitPreset(` -map 0 -c copy -metadata "${SUB_MARKER_TAG}=${encodeMarkerList(markList)}"`);
+            commitPreset(` -map 0 -c copy -metadata "${SUB_MARKER_TAG}=${encodeMarkerEntries(markerFor(markList))}"`);
             response.infoLog += `☑Expected results: ${summariseAll(streams)}\n`;
             return response;
         }
@@ -3293,7 +3345,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // A track a sidecar name has already retuned is left out of the fold: under method_import_metadata=sidecar the filename is the authority, and two
             // full tag sets aimed at one slot would leave the LAST one standing - the fold - discarding the retune this run just logged as applied.
             meta += retagArgs((dupes.retag || []).filter((r) => !retunedAt.has(r.index)), keptSubs);
-            const out = `${inputSide} -map 0${extraMaps} -c copy${ccStrip}${meta} -metadata "${SUB_MARKER_TAG}=${encodeMarkerList(markList)}"`;
+            const out = `${inputSide} -map 0${extraMaps} -c copy${ccStrip}${meta} -metadata "${SUB_MARKER_TAG}=${encodeMarkerEntries(markerFor(markList))}"`;
             commitPreset(out);
             // The arrow is required, not stylistic: a bare .map(sidecarToStream) would hand Array.map's INDEX over as the mp4 flag.
             const expected = streams.filter((s) => !removedIndices.has(s.index)).concat(toMux.map((f) => sidecarToStream(f, isMp4)));

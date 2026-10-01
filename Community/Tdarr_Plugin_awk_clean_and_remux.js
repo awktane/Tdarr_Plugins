@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.39',
+    Version: '4.999.40',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1885,8 +1885,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const resolveWorkLang = (s) => { const sl = resolveLang(s); return fillApplies(sl, true) ? fillLanguage : (sl || 'und'); };
     const sdhRemoved = (s, wl) => removeSubSdh !== 'disabled' && isSdh(s) && (removeSubSdh === 'all' || hasPlainSameLang(plainSubLangs, wl));
     // The closed captions sub_worker imported (embedded_cc): a text subtitle it writes as und + hearing_impaired - CEA-608 carries no language - under the
-    // awk_cc 'imported' memo, which also stops sub_worker ever reading them out again. Its staging sidecar is gone by then and the bitstream copy stripped or
-    // owed a strip, so this track is the LAST copy: dropping it loses the captions for good, which neither filter below may do without saying so.
+    // awk_cc 'imported' memo, which also stops sub_worker ever reading them out again. The bitstream copy is stripped or owed a strip, so this track is the
+    // only copy left IN the video: dropping it leaves the captions at most in sub_worker's hidden staging sidecar - kept while the import job is still
+    // running (sub_worker does not re-import a track removed after its import), deleted once an accepted import is confirmed - which neither filter below
+    // may do without saying so.
     const ccImported = ccTokensOf(file.ffProbeData.format?.tags).includes(CC_TOKENS.imported);
     const isImportedCaptionTrack = (s) => ccImported && codecTypeOf(s) === 'subtitle' && !isImageSub(codecNameOf(s))
         && s.disposition?.hearing_impaired === 1 && ['', 'und'].includes(resolveLang(s));
@@ -2353,8 +2355,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         // usual cause is the track's honest und tag - which is exactly what language_fill exists to fill.
                         if (isImportedCaptionTrack(ffstream)) {
                             failWithBuffers(`${streamTag(ffstream.index)}[language_sub=${logSafe(inputs.language_sub)}] Would remove the closed-caption track `
-                                + `sub_worker imported (language ${logSafe(workLang)}) - the last copy of those captions, which sub_worker will not read `
-                                + `out again - set language_fill to a language on language_sub`
+                                + `sub_worker imported (language ${logSafe(workLang)}) - the only copy of those captions left in the video, which sub_worker `
+                                + `will not read out again - set language_fill to a language on language_sub`
                                 + `${fillLanguage ? '' : ' (or add und to language_sub)'}, then requeue`);
                         }
                         // logSafe's 200-char cap matters here: the whole language_sub list is echoed once PER dropped subtitle.
@@ -2367,7 +2369,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         // Honoured - removing SDH is what the setting asks for - but this one is the last copy of the imported captions, so say so.
                         if (isImportedCaptionTrack(ffstream)) {
                             workDone += `☒${streamTag(ffstream.index)}[remove_sub_sdh=${removeSubSdh}] That is the closed-caption track sub_worker imported - `
-                                + 'the last copy of those captions, which sub_worker will not read out again\n';
+                                + 'the only copy of those captions left in the video; sub_worker will not read them out or import them again\n';
                         }
                         shouldDrop = true;
                     }
