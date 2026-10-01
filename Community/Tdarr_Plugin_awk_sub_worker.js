@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.57',
+    Version: '3.999.58',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1362,7 +1362,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const normSidecarLang = (lang) => (LANG_CODE_SHAPE.test(String(lang)) ? canonSidecarRegion(String(lang)) : to6392T(lang));
 
-    // #region SHARED helpers (1 section: sidecar name tokens)
+    // #region SHARED helpers (2 sections: track title … sidecar name tokens)
+    // ===== SHARED [audio_clean, clean_and_remux, sub_worker]: track title =====
+    // -=-=-= mediaTitleFor  [audio_clean, clean_and_remux, sub_worker] =-=-=-
+    // A stream's OWN title: ffprobe's tag where there is one, else mediaInfo's Title with the container HANDLER laundered out. Shared because every carrier
+    // WRITES what it returns (a title tag, or sub_worker's sidecar name), and taking the raw join welds the handler into the title - "Core Media Audio -> 2.0"
+    // on an Apple mp4 track, which then becomes a real ffprobe tag no later pass will repair, because it is indistinguishable from a title the user chose.
+    // mediaInfo does not report a track's title on its own: it JOINS the handler to it with " / ", and the ORDER is per-container - measured on the bundled
+    // MediaInfoLib 23.07, mp4 puts the handler first ("Main Feature / Movie.2020.x264-GRP") and mkv puts the title first. So filter by PART, never by prefix,
+    // and never compare the whole string: an exact-equality test sees nothing and a dot count over the join charges the handler's periods to the title. What is
+    // left is the track's own title, empty when the handler was all of it. This is needed at all because ffprobe does not surface an mp4 track's udta/name box,
+    // so on mp4 the joined mediaInfo Title is the ONLY place a per-track title appears. Read the handler case-insensitively - matroska stores the key
+    // uppercase. MediaInfoLib drops the Title entirely when the handler contains "Handler" (capital H) or " handler", so that boilerplate never reaches here;
+    // what does is the naming that escapes the filter, Apple's "Core Media Audio"/"Core Media Video" above all.
+    const mediaTitleFor = (s) => {
+        const ownTagTitle = (s?.tags?.title || '').trim();
+        if (ownTagTitle) return ownTagTitle;
+        const handler = (getTagCI(s?.tags, 'handler_name') || '').trim();
+        const mediaTitle = (mediaInfoFor(s)?.Title ?? '').trim();
+        if (!handler || !mediaTitle) return mediaTitle;
+        return mediaTitle.split(' / ').filter((part) => part.trim() !== handler).join(' / ').trim();
+    };
+    // ===== END SHARED: track title =====
     // ===== SHARED [clean_and_remux, sub_worker]: sidecar name tokens =====
     // -=-=-= DISPOSITIONS / DISP_ALIAS / DISP_IGNORE / DISP_TOKENS / DISP_AMBIGUOUS_LANG  [clean_and_remux, sub_worker] =-=-=-
     // Dispositions encoded as filename tokens, in fixed order. `ff` is the ffmpeg -disposition name restored on import; `flags` are the ffprobe
@@ -1412,8 +1433,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // nothing is lost because our own parser reads both regions. forced wins the slot over sdh: it drives AUTOMATIC selection (a forced track that loses
     // its flag stops appearing by itself), whereas an unlabelled SDH track is still listed and selectable, just not marked.
     const SERVER_FLAG_TOKENS = ['forced', 'sdh'];
-    // extract: one canonical token per role the stream's real flags carry (sdh covers hearing_impaired OR captions), deduped.
-    const dispTokensOf = (s) => DISPOSITIONS.filter((d) => d.flags.some((f) => s.disposition?.[f] === 1)).map((d) => d.token);
+    // extract: one canonical token per role the stream's real flags carry (sdh covers hearing_impaired OR captions), deduped - plus a role whose only
+    // carrier is the handler_name. A sidecar keeps no handler, and a QuickTime-family muxer writes the track name ('SDH', 'Forced') there and nowhere
+    // else, so without the token the role is simply gone after import (measured: an mp4 handler 'SDH' and an mkv HANDLER_NAME 'Forced' both came back
+    // as plain tracks). A role the track's own title also names is left to that title, which the name carries (encoded) and import restores.
+    const handlerOnlyDisp = (d, s) => {
+        const handler = String(getTagCI(s.tags, 'handler_name') || '').toLowerCase();
+        const keywords = dispositionTypes[d.ff]?.keywords || [];
+        return !!handler && matchesKeyword(handler, keywords) && !matchesKeyword(String(mediaTitleFor(s) || '').toLowerCase(), keywords);
+    };
+    const dispTokensOf = (s) => DISPOSITIONS.filter((d) => d.flags.some((f) => s.disposition?.[f] === 1) || handlerOnlyDisp(d, s)).map((d) => d.token);
     const extraTokensOf = (s) => EXTRA_DISPOSITIONS.filter((d) => d.flags.some((f) => s.disposition?.[f] === 1)).map((d) => d.token);
     // -=-=-= sidecarNameTokens  [clean_and_remux, sub_worker] =-=-=-
     // The language slot and the two disposition runs that surround it, for any sidecar either plugin writes - the part of a sidecar name that BOTH a media
@@ -1477,7 +1506,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const ext = bundle ? STYLED_BUNDLE.ext : TEXT_SUB[String(s.codec_name).toLowerCase()].ext;
         const dot = bundle ? '.' : '';
         const mark = bundle ? `.${STYLED_BUNDLE.mark}` : '';
-        const rawTitle = s.tags?.title || '';
+        // The stream's own title, mediaInfo's when ffprobe has none (mp4 keeps it in udta/name, which ffprobe never surfaces) - see mediaTitleFor. Only for
+        // a real subtitle stream: the caption pseudo-stream shares the VIDEO's index, and a mediaInfo join on it would read the video's title.
+        const rawTitle = codecTypeOf(s) === 'subtitle' ? mediaTitleFor(s) : (s.tags?.title || '');
         // The same collision one field to the left: TITLE_SAFE passes letters and '_' straight through, so a title that IS a token ("forced", "original")
         // would encode to that exact word and be eaten by parseSidecar's token strip - losing the title and inventing a flag. Encoding only ever expands, so
         // ONLY a title that already is the token can reach that spelling; escape its first character in that one case, which pctDecode reverses exactly. A

@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.46',
+    Version: '4.999.47',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1635,8 +1635,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // nothing is lost because our own parser reads both regions. forced wins the slot over sdh: it drives AUTOMATIC selection (a forced track that loses
     // its flag stops appearing by itself), whereas an unlabelled SDH track is still listed and selectable, just not marked.
     const SERVER_FLAG_TOKENS = ['forced', 'sdh'];
-    // extract: one canonical token per role the stream's real flags carry (sdh covers hearing_impaired OR captions), deduped.
-    const dispTokensOf = (s) => DISPOSITIONS.filter((d) => d.flags.some((f) => s.disposition?.[f] === 1)).map((d) => d.token);
+    // extract: one canonical token per role the stream's real flags carry (sdh covers hearing_impaired OR captions), deduped - plus a role whose only
+    // carrier is the handler_name. A sidecar keeps no handler, and a QuickTime-family muxer writes the track name ('SDH', 'Forced') there and nowhere
+    // else, so without the token the role is simply gone after import (measured: an mp4 handler 'SDH' and an mkv HANDLER_NAME 'Forced' both came back
+    // as plain tracks). A role the track's own title also names is left to that title, which the name carries (encoded) and import restores.
+    const handlerOnlyDisp = (d, s) => {
+        const handler = String(getTagCI(s.tags, 'handler_name') || '').toLowerCase();
+        const keywords = dispositionTypes[d.ff]?.keywords || [];
+        return !!handler && matchesKeyword(handler, keywords) && !matchesKeyword(String(mediaTitleFor(s) || '').toLowerCase(), keywords);
+    };
+    const dispTokensOf = (s) => DISPOSITIONS.filter((d) => d.flags.some((f) => s.disposition?.[f] === 1) || handlerOnlyDisp(d, s)).map((d) => d.token);
     const extraTokensOf = (s) => EXTRA_DISPOSITIONS.filter((d) => d.flags.some((f) => s.disposition?.[f] === 1)).map((d) => d.token);
     // -=-=-= sidecarNameTokens  [clean_and_remux, sub_worker] =-=-=-
     // The language slot and the two disposition runs that surround it, for any sidecar either plugin writes - the part of a sidecar name that BOTH a media
@@ -1673,7 +1681,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const { lang, pre, disp } = sidecarNameTokens(ffstream);
         return `.${videoBase}.s${ffstream.index}${pre}.${lang}${disp}${mark ? `.${mark}` : ''}.${ext}`;
     };
-    // #region SHARED helpers (1 section: title canonicalization)
+    // #region SHARED helpers (2 sections: title canonicalization … track title)
     // ===== SHARED [audio_clean, clean_and_remux]: title canonicalization =====
     // Canonical audio-title machinery, shared so audio_clean's downmix titles come out already in clean_and_remux's tag_title form (no wasted remux).
     // Canonical form: "<channel/downmix base> - <role tags>", roles LAST ("5.1 -> 2.0 - Commentary"). canonicalAudioTitle is the entry point.
@@ -1773,17 +1781,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const suffix = roleTags.join(' ');
         return suffix ? `${base} - ${suffix}` : base;
     };
-    // -=-=-= mediaTitleFor  [audio_clean, clean_and_remux] =-=-=-
-    // A stream's OWN title: ffprobe's tag where there is one, else mediaInfo's Title with the container HANDLER laundered out. Shared because both
-    // carriers WRITE what it returns, and taking the raw join welds the handler into the title - "Core Media Audio -> 2.0" on an Apple mp4 track,
-    // which then becomes a real ffprobe tag no later pass will repair, because it is indistinguishable from a title the user chose. mediaInfo does not
-    // report a track's title on its own: it JOINS the handler to it with " / ", and the ORDER is per-container - measured on the bundled MediaInfoLib
-    // 23.07, mp4 puts the handler first ("Main Feature / Movie.2020.x264-GRP") and mkv puts the title first. So filter by PART, never by prefix, and
-    // never compare the whole string: an exact-equality test sees nothing and a dot count over the join charges the handler's periods to the title.
-    // What is left is the track's own title, empty when the handler was all of it. This is needed at all because ffprobe does not surface an mp4
-    // track's udta/name box, so on mp4 the joined mediaInfo Title is the ONLY place a per-track title appears. Read the handler case-insensitively -
-    // matroska stores the key uppercase. MediaInfoLib drops the Title entirely when the handler contains "Handler" (capital H) or " handler", so that
-    // boilerplate never reaches here; what does is the naming that escapes the filter, Apple's "Core Media Audio"/"Core Media Video" above all.
+    // ===== END SHARED: title canonicalization =====
+    // ===== SHARED [audio_clean, clean_and_remux, sub_worker]: track title =====
+    // -=-=-= mediaTitleFor  [audio_clean, clean_and_remux, sub_worker] =-=-=-
+    // A stream's OWN title: ffprobe's tag where there is one, else mediaInfo's Title with the container HANDLER laundered out. Shared because every carrier
+    // WRITES what it returns (a title tag, or sub_worker's sidecar name), and taking the raw join welds the handler into the title - "Core Media Audio -> 2.0"
+    // on an Apple mp4 track, which then becomes a real ffprobe tag no later pass will repair, because it is indistinguishable from a title the user chose.
+    // mediaInfo does not report a track's title on its own: it JOINS the handler to it with " / ", and the ORDER is per-container - measured on the bundled
+    // MediaInfoLib 23.07, mp4 puts the handler first ("Main Feature / Movie.2020.x264-GRP") and mkv puts the title first. So filter by PART, never by prefix,
+    // and never compare the whole string: an exact-equality test sees nothing and a dot count over the join charges the handler's periods to the title. What is
+    // left is the track's own title, empty when the handler was all of it. This is needed at all because ffprobe does not surface an mp4 track's udta/name box,
+    // so on mp4 the joined mediaInfo Title is the ONLY place a per-track title appears. Read the handler case-insensitively - matroska stores the key
+    // uppercase. MediaInfoLib drops the Title entirely when the handler contains "Handler" (capital H) or " handler", so that boilerplate never reaches here;
+    // what does is the naming that escapes the filter, Apple's "Core Media Audio"/"Core Media Video" above all.
     const mediaTitleFor = (s) => {
         const ownTagTitle = (s?.tags?.title || '').trim();
         if (ownTagTitle) return ownTagTitle;
@@ -1792,7 +1802,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!handler || !mediaTitle) return mediaTitle;
         return mediaTitle.split(' / ').filter((part) => part.trim() !== handler).join(' / ').trim();
     };
-    // ===== END SHARED: title canonicalization =====
+    // ===== END SHARED: track title =====
     // #endregion
 
     // #region SHARED helpers (1 section: recovered marker vocabulary)

@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.38',
+    Version: '4.999.39',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1234,7 +1234,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: ffmpeg path =====
     // #endregion
 
-    // #region SHARED helpers (3 sections: ffmpeg metadata escaping … title canonicalization)
+    // #region SHARED helpers (4 sections: ffmpeg metadata escaping … track title)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
     // -=-=-= escMeta [all five] =-=-=-
     // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array for child_process.spawn, so shell metacharacters
@@ -1364,17 +1364,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const suffix = roleTags.join(' ');
         return suffix ? `${base} - ${suffix}` : base;
     };
-    // -=-=-= mediaTitleFor  [audio_clean, clean_and_remux] =-=-=-
-    // A stream's OWN title: ffprobe's tag where there is one, else mediaInfo's Title with the container HANDLER laundered out. Shared because both
-    // carriers WRITE what it returns, and taking the raw join welds the handler into the title - "Core Media Audio -> 2.0" on an Apple mp4 track,
-    // which then becomes a real ffprobe tag no later pass will repair, because it is indistinguishable from a title the user chose. mediaInfo does not
-    // report a track's title on its own: it JOINS the handler to it with " / ", and the ORDER is per-container - measured on the bundled MediaInfoLib
-    // 23.07, mp4 puts the handler first ("Main Feature / Movie.2020.x264-GRP") and mkv puts the title first. So filter by PART, never by prefix, and
-    // never compare the whole string: an exact-equality test sees nothing and a dot count over the join charges the handler's periods to the title.
-    // What is left is the track's own title, empty when the handler was all of it. This is needed at all because ffprobe does not surface an mp4
-    // track's udta/name box, so on mp4 the joined mediaInfo Title is the ONLY place a per-track title appears. Read the handler case-insensitively -
-    // matroska stores the key uppercase. MediaInfoLib drops the Title entirely when the handler contains "Handler" (capital H) or " handler", so that
-    // boilerplate never reaches here; what does is the naming that escapes the filter, Apple's "Core Media Audio"/"Core Media Video" above all.
+    // ===== END SHARED: title canonicalization =====
+    // ===== SHARED [audio_clean, clean_and_remux, sub_worker]: track title =====
+    // -=-=-= mediaTitleFor  [audio_clean, clean_and_remux, sub_worker] =-=-=-
+    // A stream's OWN title: ffprobe's tag where there is one, else mediaInfo's Title with the container HANDLER laundered out. Shared because every carrier
+    // WRITES what it returns (a title tag, or sub_worker's sidecar name), and taking the raw join welds the handler into the title - "Core Media Audio -> 2.0"
+    // on an Apple mp4 track, which then becomes a real ffprobe tag no later pass will repair, because it is indistinguishable from a title the user chose.
+    // mediaInfo does not report a track's title on its own: it JOINS the handler to it with " / ", and the ORDER is per-container - measured on the bundled
+    // MediaInfoLib 23.07, mp4 puts the handler first ("Main Feature / Movie.2020.x264-GRP") and mkv puts the title first. So filter by PART, never by prefix,
+    // and never compare the whole string: an exact-equality test sees nothing and a dot count over the join charges the handler's periods to the title. What is
+    // left is the track's own title, empty when the handler was all of it. This is needed at all because ffprobe does not surface an mp4 track's udta/name box,
+    // so on mp4 the joined mediaInfo Title is the ONLY place a per-track title appears. Read the handler case-insensitively - matroska stores the key
+    // uppercase. MediaInfoLib drops the Title entirely when the handler contains "Handler" (capital H) or " handler", so that boilerplate never reaches here;
+    // what does is the naming that escapes the filter, Apple's "Core Media Audio"/"Core Media Video" above all.
     const mediaTitleFor = (s) => {
         const ownTagTitle = (s?.tags?.title || '').trim();
         if (ownTagTitle) return ownTagTitle;
@@ -1383,7 +1385,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!handler || !mediaTitle) return mediaTitle;
         return mediaTitle.split(' / ').filter((part) => part.trim() !== handler).join(' / ').trim();
     };
-    // ===== END SHARED: title canonicalization =====
+    // ===== END SHARED: track title =====
     // #endregion
 
     // Bail out gracefully on missing/partial probe data, rather than an uncaught TypeError on the first file.ffProbeData.streams access below.
