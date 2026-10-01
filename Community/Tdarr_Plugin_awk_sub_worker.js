@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.53',
+    Version: '3.999.54',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1577,12 +1577,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The library directory as THIS node can actually open it, or '' with the reason it could not. Candidates are tried in order and each is PROBED - a
     // path is only accepted once a real readdir succeeds, never because its shape looked right. ENOENT and EACCES are reported apart because they send you
     // to different places: a wrong value versus a path that exists but this node has no credentials for (typically Tdarr running as a service).
-    // `writable` carries the access(W_OK) verdict, and it steers ROUTING, never acceptance: a read-only mount is still the best possible view for reads
-    // (scans, dedup, feeding ffmpeg inputs), while every write falls back to the file API exactly as if no mount had resolved. A writable candidate is
-    // preferred over an earlier read-only one - both name the same library, and taking the writable view spares the API round-trips. The probe is
-    // advisory by design: on Windows fs.access ignores directory ACLs (only FILE_ATTRIBUTE_READONLY is honoured), so a false "writable" can slip through
-    // - and then the direct write fails exactly as it did before the probe existed, so a wrong verdict never makes anything worse. A dotfile write-probe
-    // would be airtight but plants artifacts in a library every media server watches, and a crash strands them - rejected on those grounds.
+    // `writable` (dirWritable) steers ROUTING, never acceptance: a read-only mount is still the best possible view for reads (scans, dedup, feeding ffmpeg
+    // inputs), while every write falls back to the file API exactly as if no mount had resolved. A writable candidate is preferred over an earlier read-only
+    // one - both name the same library, and taking the writable view spares the API round-trips.
+    // Can this node write into dir? access(W_OK) answers truthfully on Linux and macOS, but on Windows it answers yes for EVERY directory (libuv's
+    // fs__access: "Directories cannot be read-only on Windows" - ACLs and read-only shares alike), and a wrong yes aims extract's sidecar outputs at a
+    // read-only mount, where ffmpeg fails the whole command and the file is quarantined on every requeue. So on Windows the answer takes a real write: a
+    // zero-byte dot-named file created exclusively and removed in the same breath. That is the one place a file appears in the library for the probe's
+    // sake, and only on Windows, where nothing cheaper is truthful; a media server skips a dotfile, and one stranded by a crash between the two calls is
+    // a zero-byte dotfile, inert.
+    const dirWritable = (dir) => {
+        if (process.platform !== 'win32') {
+            try { fs.accessSync(dir, fs.constants.W_OK); return true; } catch (e) { return false; }
+        }
+        const probe = path.join(dir, `.awk_write_probe_${process.pid}_${Date.now()}`);
+        try { fs.closeSync(fs.openSync(probe, 'wx')); } catch (e) { return false; }
+        try { fs.unlinkSync(probe); } catch (e) { /* inert if it stays - see above */ }
+        return true;
+    };
     const resolveMountedLibDir = () => {
         const serverDir = serverSidePath(libDir);
         if (!serverDir) return { dir: '', why: `no path translator maps ${libDir} back to the server, so this node cannot name the library at all` };
@@ -1604,8 +1616,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     : (code === 'EACCES' || code === 'EPERM' ? 'exists but unreadable from this node, check credentials' : code || e.message)}`);
                 continue;
             }
-            try { fs.accessSync(dir, fs.constants.W_OK); return { dir, via: label, writable: true }; }
-            catch (e) { if (!readOnly) readOnly = { dir, via: label, writable: false }; }
+            if (dirWritable(dir)) return { dir, via: label, writable: true };
+            if (!readOnly) readOnly = { dir, via: label, writable: false };
         }
         if (readOnly) return readOnly;
         return { dir: '',
