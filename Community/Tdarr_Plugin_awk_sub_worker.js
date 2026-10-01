@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.51',
+    Version: '3.999.52',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1239,7 +1239,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //   strip    - the captions are out (a sidecar or a subtitle track holds them) but the bitstream copy is still there; drop it on the next re-encode.
     //   removed  - the captions are out AND the bitstream copy went with them in that same pass, so nothing is left to find, to probe for, or to remove.
     //              The request/fact pair with `strip`: one asks a later plugin to act, the other tells every later pass there is nothing left to act on.
-    //   none     - the caption channel was decoded and carried no caption text at all, so no later pass need pay for that decode again.
+    //   none     - the caption channel was decoded and carried no caption text at all, so no later pass need pay for that decode again. Written only
+    //              once BOTH fields have been read empty: a broadcast carrying its captions in field 2 behind a padded field 1 reads empty on the default
+    //              decode, and a later re-encode told `none` drops captions nothing ever captured.
+    //   decoded  - a full read of the caption channel finished (field auto-selected); decoded2 - a read of field 2 finished. sub_worker's own progress
+    //              memos, stamped by the pass that runs the read: an empty sidecar with neither behind it was left by an interrupted read, not by an
+    //              empty channel. Every other reader ignores them.
     //   imported - the captions are already embedded as a real subtitle track, so sub_worker must not read them out a second time.
     // The value is a COMMA LIST and every reader splits it, because the states genuinely combine: an imported round trip that could not strip in its own pass
     // records `imported,strip` - and `imported,removed` where it could. An empty channel records `none` ALONE - it never owes a strip. A writer
@@ -1249,7 +1254,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // external tool re-inserting A53 SEI) has them dropped by a request answered encodes ago. `none` and `imported` are never retired: they are memos about
     // the file rather than requests, and they stay true for its life.
     const CC_TAG = 'awk_cc';
-    const CC_TOKENS = { strip: 'strip', removed: 'removed', none: 'none', imported: 'imported' };
+    const CC_TOKENS = { strip: 'strip', removed: 'removed', none: 'none', decoded: 'decoded', decoded2: 'decoded2', imported: 'imported' };
     const ccTokensOf = (tags) => getTagCI(tags || {}, CC_TAG).toLowerCase().split(',').map((t) => t.trim()).filter(Boolean);
     // ===== END SHARED: closed-caption handoff =====
     // #endregion
@@ -2348,8 +2353,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // falling through to the mux - and a correction applied to one array only (making the map tolerant, say) would leave the two behaving differently on the
     // SAME file and the SAME node, in the one route no mapped test run ever exercises. The MAPPED route's preset forms stay written out at their call sites:
     // they name file.file because Tdarr runs that command against the working file, where this spawn needs the real path the node holds now.
-    const ccLavfiArgs = () => ['-f', 'lavfi', '-i', `movie=${escapeMoviePath(String(file._id || file.file || ''))}[out0+subcc]`,
-        '-map', '1:s:0', '-c:s', 'text', '-f', 'srt'];
+    // cc_dec's field selector, an input option on the lavfi caption source. Its default (auto) locks onto whichever field it meets first, so a broadcast
+    // that pads field 1 and carries its captions in field 2 decodes to nothing; this reads field 2 instead (measured on jellyfin-ffmpeg 7.1.4).
+    const CC_FIELD2_ARGS = ['-data_field', '1'];
+    const ccLavfiArgs = (field2) => [...(field2 ? CC_FIELD2_ARGS : []), '-f', 'lavfi', '-i',
+        `movie=${escapeMoviePath(String(file._id || file.file || ''))}[out0+subcc]`, '-map', '1:s:0', '-c:s', 'text', '-f', 'srt'];
+    // The same read as the two mapped routes' preset input, field 2 when asked.
+    const ccPresetInput = (field2) => `${field2 ? `${CC_FIELD2_ARGS.join(' ')} ` : ''}-f lavfi -i "movie=${escapeMoviePath(file.file)}[out0+subcc]" `;
     // The one wording for "the caption channel was read out to this sidecar", shared by the same two routes.
     const ccReadLine = (videoIdx, name) => `☑${streamTag(videoIdx)}[embedded_cc=enabled] Read the embedded closed captions -> ${name}\n`;
     // ====== END EMBEDDED CLOSED CAPTIONS ======
@@ -2453,6 +2463,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return { job: null, note: `☒[embedded_cc=enabled] Could not confirm whether ${name} is already in the library (${remote.why}) - `
                     + 'not overwriting it; the captions stay in the video for a later pass\n' };
             }
+            let leftoverNote = '';
             const existing = remote ? (remote.state === 'present' ? 'remote' : '')
                 : ((() => { try { return fs.existsSync(full) ? 'local' : ''; } catch (e) { return ''; } })());
             if (existing === 'remote') return { job: null, staged: true, note: `☑[embedded_cc=enabled] Caption sidecar already in the library: ${name}\n` };
@@ -2477,26 +2488,43 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 let unlinked = true;
                 try { fs.unlinkSync(full); } catch (e) { unlinked = false; }
-                // Recording the verdict takes a mux of its own, and that is only safe where the tag comes back out. On a marker-hostile container the memo
-                // cannot be stored, so the identical tag-only pass would be recomputed and re-emitted every time - which Tdarr refuses as an infinite
-                // transcode loop and ERRORS the file. Decline the memo and say so: the decode is paid again, which is bounded, rather than the file lost.
-                return {
-                    job: null,
-                    record: canRecord ? CC_TOKENS.none : '',
-                    note: `☒[embedded_cc=enabled] The caption channel carries no caption text - ${unlinked
-                        ? `removed the empty ${name}` : `${name} could not be removed`}${canRecord ? ' and recorded it so no later pass re-reads it'
-                        : ccMemoTail()}\n`,
-                };
+                // An empty sidecar is a verdict only once BOTH fields have been read to completion (CC_TOKENS decoded, decoded2). After the first read it
+                // sends the decode back for field 2 - a padded field 1 makes the default decode come back empty on captions that are really there (0 bytes
+                // on auto, the full captions with -data_field 1, jellyfin-ffmpeg 7.1.4); with no read recorded at all it is what an interrupted read
+                // leaves (ffmpeg creates the srt when it opens its outputs), so the captions are simply read again. Recording `none` on either was what let
+                // video_clean drop captions nothing had captured. Only where the memos persist: a marker-hostile container cannot record which reads ran,
+                // so the single-read verdict stands there.
+                if (!canRecord || !unlinked || ccTokens.includes(CC_TOKENS.decoded2)) {
+                    // Recording the verdict takes a mux of its own, and that is only safe where the tag comes back out. On a marker-hostile container the
+                    // memo cannot be stored, so the identical tag-only pass would be recomputed and re-emitted every time - which Tdarr refuses as an
+                    // infinite transcode loop and ERRORS the file. Decline the memo and say so: the decode is paid again, bounded, rather than the file lost.
+                    return {
+                        job: null,
+                        record: canRecord ? CC_TOKENS.none : '',
+                        note: `☒[embedded_cc=enabled] The caption channel carries no caption text - ${unlinked
+                            ? `removed the empty ${name}` : `${name} could not be removed`}${canRecord ? ' and recorded it so no later pass re-reads it'
+                            : ccMemoTail()}\n`,
+                    };
+                }
+                if (ccTokens.includes(CC_TOKENS.decoded)) {
+                    return { job: { name, full, remoteDest, field2: true }, note: '☐[embedded_cc=enabled] The first read of the caption channel found no '
+                        + 'text - reading its second field, where some broadcasts carry them\n' };
+                }
+                leftoverNote = `☒[embedded_cc=enabled] Removed an empty ${name} that no finished read stands behind (an interrupted pass?) - `
+                    + 'reading the captions again\n';
             }
             // Nothing memoised, so pay for the cheap check. Only `true` from the library scan is information - it reports false both for a file with no
             // captions and for one its scanner could not parse - so a false still goes to the probe, and an 'unknown' probe leaves the file alone.
             if (file.hasClosedCaptions !== true) {
                 const seen = ccProbeVerdict();
-                if (seen === 'unknown')
-                    return { job: null, note: '☒[embedded_cc=enabled] Could not check this file for closed captions on this node - leaving it alone\n' };
-                if (seen === false) return { job: null, note: '☑[embedded_cc=enabled] No embedded closed captions in this file\n' };
+                if (seen === 'unknown') {
+                    return { job: null,
+                        note: `${leftoverNote}☒[embedded_cc=enabled] Could not check this file for closed captions on this node - leaving it alone\n` };
+                }
+                if (seen === false) return { job: null, note: `${leftoverNote}☑[embedded_cc=enabled] No embedded closed captions in this file\n` };
             }
-            return { job: { name, full, remoteDest }, note: '' };
+            // A field-2 read already ran on this file (decoded2) and its sidecar is gone since, so the next read goes straight back to field 2.
+            return { job: { name, full, remoteDest, field2: ccTokens.includes(CC_TOKENS.decoded2) }, note: leftoverNote };
         })();
         response.infoLog += ccPlan.note;
         // Whether the caption staging sidecar is in the library RIGHT NOW - either ccPlan's existence probe found it there, or this pass uploads it below.
@@ -2590,13 +2618,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 placeJobs.push({
                     name: ccPlan.job.name,
                     dest: ccPlan.job.remoteDest,
-                    args: ccLavfiArgs(),
+                    args: ccLavfiArgs(ccPlan.job.field2),
                     index: ccVideo.index,
                     bundle: false,
                     caption: true,
                 });
             } else if (ccPlan.job) {
-                ccInput = `-f lavfi -i "movie=${escapeMoviePath(file.file)}[out0+subcc]" `;
+                ccInput = ccPresetInput(ccPlan.job.field2);
+                // The read's own memo, on the same output: the next pass only trusts an empty sidecar as a verdict once a finished read stands behind it.
+                if (canRecord) ccRecord.add(ccPlan.job.field2 ? CC_TOKENS.decoded2 : CC_TOKENS.decoded);
                 sidecarOut += ` -map 1:s:0 -c:s text -f srt "${ccPlan.job.full}"`;
                 wrote += 1;
                 // Deliberately does NOT authorise the strip: ffmpeg exits 0 on an empty caption decode, writing a 0-byte srt while the same command would
@@ -2698,6 +2728,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // is an unextracted subtitle rather than a lost one.
             if (placeJobs.length) {
                 const { placed, failed, empty: emptyExtractions } = placeSidecars(placeJobs);
+                // In-plugin, the read is known to have finished, so an empty first read goes straight to field 2 (see ccPlan) before it counts as empty.
+                const ccFirst = placeJobs.find((j) => j.caption && emptyExtractions.has(j.name) && !ccPlan.job.field2);
+                if (ccFirst) {
+                    const again = placeSidecars([{ ...ccFirst, args: ccLavfiArgs(true) }]);
+                    if (!again.empty.has(ccFirst.name)) emptyExtractions.delete(ccFirst.name);
+                    if (again.placed.has(ccFirst.name)) placed.add(ccFirst.name);
+                    else if (again.failed.has(ccFirst.name)) failed.set(ccFirst.name, again.failed.get(ccFirst.name));
+                }
                 for (const j of placeJobs) {
                     if (!placed.has(j.name)) {
                         // A caption job's failure is not a subtitle left embedded, and its index names the VIDEO stream, so it says so in its own words.
@@ -2814,7 +2852,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // is embedded, converts to mov_text for an mp4 target, restores metadata from the name and deletes the file afterwards. Muxing the captions straight
         // in would be a second, weaker copy of all of that. The staging file is dot-prefixed so no media server offers it in the gap between the two passes.
         if (ccPlan.job && !placeViaApi()) {
-            commitPreset(`-f lavfi -i "movie=${escapeMoviePath(file.file)}[out0+subcc]" -map 1:s:0 -c:s text -f srt "${ccPlan.job.full}" -map 0 -c copy`);
+            const readMemo = canRecord ? ccTagArg(ccPlan.job.field2 ? CC_TOKENS.decoded2 : CC_TOKENS.decoded) : '';   // see the extract route
+            commitPreset(`${ccPresetInput(ccPlan.job.field2)}-map 1:s:0 -c:s text -f srt "${ccPlan.job.full}" -map 0 -c copy${readMemo}`);
             response.infoLog += `☐${streamTag(ccVideo.index)}[embedded_cc=enabled] Reading the embedded closed captions -> ${ccPlan.job.name}`
                 + ' (decodes the video); the next pass muxes them in as a subtitle track\n';
             response.infoLog += `☑Expected results: ${summariseAll(streams)}\n`;
@@ -2823,7 +2862,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // With no writable library view to aim an extra ffmpeg output at, the same extraction runs in-plugin and uploads through the file API - and
         // then falls THROUGH into the import below rather than returning, because the sidecar is in the library now and this pass can still mux it.
         if (ccPlan.job) {
-            const { placed, failed, empty: emptyExtractions } = placeSidecars([{ name: ccPlan.job.name, dest: ccPlan.job.remoteDest, args: ccLavfiArgs() }]);
+            const ccJob = { name: ccPlan.job.name, dest: ccPlan.job.remoteDest, args: ccLavfiArgs(ccPlan.job.field2) };
+            let { placed, failed, empty: emptyExtractions } = placeSidecars([ccJob]);
+            // In-plugin, the read is known to have finished, so an empty first read goes straight to field 2 (see ccPlan) before it counts as empty.
+            if (emptyExtractions.has(ccJob.name) && !ccPlan.job.field2) {
+                ({ placed, failed, empty: emptyExtractions } = placeSidecars([{ ...ccJob, args: ccLavfiArgs(true) }]));
+            }
             if (placed.has(ccPlan.job.name)) {
                 response.infoLog += ccReadLine(ccVideo.index, ccPlan.job.name);
                 ccStaged = true;
