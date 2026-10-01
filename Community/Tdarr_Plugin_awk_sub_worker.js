@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.58',
+    Version: '3.999.59',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -363,14 +363,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= matchesKeyword [all five] =-=-=-
     // Whole-token keyword matcher: a keyword matches only when not flanked by a letter/digit - '[sdh]', 'eng-sdh', 'sdh.' match, 'deafening' does not -
     // and an internal space matches any run of non-alphanumerics ('hearing impaired' == 'hearing_impaired'). text must already be lowercased. The compiled
-    // regex is a pure function of the keyword list, so it is memoized by keyword-array identity rather than recompiled per classifier call.
+    // regex is a pure function of the keyword list, so it is memoized by keyword-array identity rather than recompiled per classifier call. A gap before
+    // a token that itself starts with a non-alphanumeric ('music & effects') excludes that character: otherwise the gap and the literal can both take the
+    // same '&', and on a title of 'music' plus a long run of '&' the two runs backtrack quadratically (1.7 s at 32k chars, measured) over role text that
+    // nothing caps. Every spelling that matched still matches - the gap only stops short of the literal it was about to overlap.
     const keywordRegexCache = new WeakMap();
     const matchesKeyword = (text, keywords) => {
         if (!keywords.length) return false;
         let re = keywordRegexCache.get(keywords);
         if (!re) {
+            const esc = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            const gapBefore = (token) => (/^[\p{L}\p{N}]/u.test(token) ? '[^\\p{L}\\p{N}]+' : `[^\\p{L}\\p{N}${token[0].replace(/[\\\]^-]/g, '\\$&')}]+`);
             const pattern = keywords
-                .map(k => k.replace(/[.*+?^${}()|[\]\\]/g, '\\$&').replace(/\s+/g, '[^\\p{L}\\p{N}]+'))
+                .map((k) => k.trim().split(/\s+/).map((token, i) => (i ? gapBefore(token) : '') + esc(token)).join(''))
                 .join('|');
             re = new RegExp(`(?<![\\p{L}\\p{N}])(?:${pattern})(?![\\p{L}\\p{N}])`, 'u');
             keywordRegexCache.set(keywords, re);
