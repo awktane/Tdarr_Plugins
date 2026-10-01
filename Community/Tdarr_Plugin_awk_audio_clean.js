@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.36',
+    Version: '4.999.37',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1759,6 +1759,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return skip(`☑[${dstContainer || 'none'}] Audio-only file in a container this plugin cannot work in - only `
                 + `${AUDIO_MEDIUM_CONTAINERS.join('/')} hold several audio streams of any codec\n`);
         return skip('☑File is not a video\n');
+    }
+    // An .mka with cover art is left alone: production ffprobe (jellyfin 7.1.4) reports Matroska's image attachment as an attached_pic VIDEO stream, and no
+    // ffmpeg remux keeps it an attachment - -c copy writes it back as a real V_MJPEG video track (measured with and without -disposition attached_pic),
+    // after which Tdarr reads the music file as a video and clean_and_remux renames it to .mkv. stream_ordering leaves it alone for the same reason.
+    if (file.fileMedium === 'audio' && dstContainer === 'mka' && file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'video')) {
+        return skip('☒[mka] This .mka carries cover art, and any remux would turn it into a video track - left untouched\n');
     }
 
     // Only a VIDEO file can reach this: fileMedium 'audio' is assigned on the presence of an audio stream, so an audio-medium file always has one.

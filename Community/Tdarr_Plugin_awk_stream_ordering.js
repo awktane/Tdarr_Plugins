@@ -17,7 +17,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file carrying clean_and_remux's awk_recovered tag: a
         repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. This check
         is always on and has no setting.\n`,
-    Version: '4.999.21',
+    Version: '4.999.22',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -1014,17 +1014,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // lowercasing it there would rename the file rather than answer a question about it.
     const dstContainer = String(file.container || '').toLowerCase().trim();
 
-    // mka ONLY, and the reason is cover art. Matroska carries it as an ATTACHMENT, so an .mka has no video-typed stream and the rank table below already
-    // orders it correctly - nothing needs changing to support it. Every other audio container carries cover art as an attached_pic VIDEO stream, which
-    // streamOrder ranks 0: it would be hoisted above the music to become track 0, and a music file whose first track is a JPEG reads as a video to taggers
-    // and media servers. Excluding them is what lets the comparator stay untouched, so none of this can reach a video file.
-    // Accepted residual: a contrived .mka carrying a genuine video-typed stream at avg_frame_rate 0/0 classifies as 'audio' and would be sorted to track 0.
-    // Guarding it means editing the comparator every video file traverses - a certain risk to the common case to protect a file that does not occur.
+    // mka ONLY, and the reason is cover art. Every other audio container carries it as an attached_pic VIDEO stream, which streamOrder ranks 0: it would
+    // be hoisted above the music to become track 0, and a music file whose first track is a JPEG reads as a video to taggers and media servers. Excluding
+    // them is what lets the comparator stay untouched, so none of this can reach a video file. An .mka is no exception once it HAS cover art: production
+    // ffprobe (jellyfin 7.1.4) reports Matroska's image attachment the same way - video/mjpeg, attached_pic, avg_frame_rate 0/0, probed last - and no
+    // ffmpeg remux keeps it an attachment: -c copy writes it back as a real V_MJPEG video TRACK (measured with and without -disposition attached_pic), which
+    // Tdarr then classifies as a video and clean_and_remux renames to .mkv. So an .mka with any video-typed stream is left untouched, and says why.
     if (file.fileMedium !== 'video' && !(file.fileMedium === 'audio' && dstContainer === 'mka')) {
         if (file.fileMedium === 'audio')
             return skip(`☑[${dstContainer || 'none'}] Audio-only file - only mka is reordered, since every other audio container carries cover art as a `
                 + 'video stream that would be ordered ahead of the audio\n');
         return skip('☑File is not a video\n');
+    }
+    if (file.fileMedium === 'audio' && (file.ffProbeData?.streams || []).some((s) => codecTypeOf(s) === 'video')) {
+        return skip('☒[mka] This .mka carries cover art, and any remux would turn it into a video track - left untouched\n');
     }
 
     // #region SHARED helpers (1 section: recovered marker vocabulary)
