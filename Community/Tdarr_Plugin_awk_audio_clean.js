@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.35',
+    Version: '4.999.36',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -262,8 +262,9 @@ const details = () => ({
                 \\nkeep (default) - leave the track in its source codec rather than writing it as opus. Nothing fails and no audio is lost; a
                 loudnorm-only run simply leaves that one track un-normalized.
                 \\ndrop - remove the track entirely, but only where it is codec_force sending it to opus. On the method_loudnorm route the removal would
-                come too late, so drop behaves as keep and the track stays un-normalized in its source codec. The last remaining audio track is never
-                dropped, falling back to keep, and a stereo or 5.1 that a downmix would derive from the track is still created.
+                come too late, so drop behaves as keep and the track stays un-normalized in its source codec. The last remaining audio track - and the
+                last main one, where the rest are commentary or descriptive audio - is never dropped, falling back to keep, and a stereo or 5.1 that a
+                downmix would derive from the track is still created.
                 \\nremix - downmix the track to a codec_stereo stereo, using method_stereo_downmix, with loudness applied when method_loudnorm is active.
                 It defers to downmix_to_stereo and the stereo tier (language_stereo, language_unlisted=stereo, downmix_secondary=stereo) when they already
                 convert the track, and falls back to keep rather than create a duplicate stereo.
@@ -2093,6 +2094,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // silently lose that derivative. Each such dropped source is recorded here and its stereo/5.1 derivative is created after the main loop, but
         // only when the language didn't otherwise get one (so a redundant dropped source adds nothing). See the post-loop derivative pass below.
         const layoutDroppedDeriveSources = [];
+        // The drop floor. Never the last audio track; and never a MAIN track that
+        // would leave commentary or descriptive audio standing in for it - the last main track in the file, or the last of its language while that language
+        // still has a secondary track. Dropping it there loses the programme audio and keeps the track the user ranks lowest; and downmix_secondary=delete,
+        // resolved after this pass, can then not remove that secondary either, since it never leaves a language with no audio - so English 6.0 main audio
+        // beside an English description set to delete ended as the description alone. A language with no secondary track is dropped as the tooltip says.
+        // Why the floor kept each track, recorded here because the loop reports it AFTER the role deletes have changed what is left.
+        const dropKeptWhy = new Map();
+        const dropFloor = (s) => {
+            if (countSurvivingAudio() <= 1) return 'it is the last audio track';
+            if (s.awkSecondaryTrack) return '';
+            const left = audioStreams.filter((x) => !removedIndices.has(x.index));
+            if (left.filter((x) => !x.awkSecondaryTrack).length <= 1) return 'it is the last main audio track';
+            const sameLang = left.filter((x) => x.awkLangKey === s.awkLangKey);
+            return sameLang.some((x) => x.awkSecondaryTrack) && sameLang.filter((x) => !x.awkSecondaryTrack).length <= 1
+                ? `it is the last main ${langTok(s.awkLangKey)} track, and only commentary or descriptive audio would be left` : '';
+        };
 
         // method_layout_err=drop must remove streams BEFORE outputAudioIdxMap / the -map removal are built below - a mid-loop removal
         // would break the OTHER forced tracks' -c:a:N numbering. Pre-scan for a surround track codec_force would send to opus with a
@@ -2120,7 +2137,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const stereoPath = s.awkTier === 'stereo';                                   // the in-place stereo downmix converts it anyway
                 const surroundPath = !s.awkSecondaryTrack && s.awkTier === 'surround';   // only a genuine surround track reaches downmix_to_*
                 if (stereoPath || (surroundPath && (downmixToStereo === 'replace' || (ch > 6 && downmixToSix === 'replace')))) continue;
-                if (countSurvivingAudio() <= 1) continue;                                    // never drop the last audio track
+                const floor = dropFloor(s);
+                if (floor) { dropKeptWhy.set(s.index, floor); continue; }
                 removedIndices.add(s.index);
                 // this IS a queued change (a removal), so it takes the change symbol like every other removal line, not the warning symbol
                 workDone += `☐${streamTag(s.index)}[method_layout_err=${methodLayoutErr}] Dropping - libopus can't encode a `
@@ -2804,7 +2822,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // track was pre-empted (per-language slot already filled). Report the actual reason, not a fixed one.
                             let why;
                             if (remixDefer) why = ' (a stereo already exists for this language)';
-                            else if (methodLayoutErr === 'drop') why = countSurvivingAudio() <= 1 ? ' (kept - it is the last audio track)'
+                            else if (methodLayoutErr === 'drop') why = dropKeptWhy.has(ffstream.index) ? ` (kept - ${dropKeptWhy.get(ffstream.index)})`
                                 : ' (kept - no downmix converted it to an opus-safe layout)';
                             else why = ', enable a downmix option or set method_layout_err to drop/remix';
                             skipDone += `☒${streamTag(ffstream.index)}[codec_force=${forceCodec}] Not forcing opus - libopus can't encode a `
