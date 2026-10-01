@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.50',
+    Version: '3.999.51',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1957,6 +1957,42 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
         return roundTripMemo.get(key);
     };
+    // A styled bundle's identity: the ASS inside it, read out the way embeddedTextHashes reads every embedded ass track. Import copies those packets in
+    // unchanged (-map k:s:0, -c copy), so the bundle and its imported track hash alike by construction - the content test a bundle never had, which left
+    // its NAME as the only evidence: a bundle whose subtitle carries a title the name does not spell (clean_and_remux's export writes no title token), or
+    // one with no fonts at all, never matched its own imported track and was added again on every pass. The same run counts the bundle's font
+    // attachments from ffmpeg's input listing ("Stream #0:1: Attachment: ttf", measured on 7.1.4), so a deletion knows whether the file must hold fonts
+    // for nothing to be lost. Memoised per rel; null when the run fails, and callers then fall back to the name (markerConfirmsEmbedded).
+    const bundleMemo = new Map();
+    const bundleContent = (f) => {
+        if (bundleMemo.has(f.rel)) return bundleMemo.get(f.rel);
+        bundleMemo.set(f.rel, null);
+        if (!f.bundle || !sidecarContent(f)) return null;   // gone, or over the cap
+        let dir = '';
+        try { dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_subbundle_')); } catch (e) { return null; }
+        const out = path.join(dir, 'b.ass');
+        try {
+            const { spawnSync } = require('child_process');
+            const args = ['-hide_banner', '-y', '-loglevel', 'info', '-i', path.join(workLibDir(), f.rel), '-map', '0:s:0', '-c:s', 'ass',
+                '-fs', String(SIDECAR_HASH_MAX + 1), out];
+            const r = spawnSync(ffmpegPathOf(otherArguments), args, { encoding: 'utf8', timeout: SUB_EXTRACT_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES });
+            if (!r.error && r.status === 0 && fs.statSync(out).size <= SIDECAR_HASH_MAX) {
+                const buf = fs.readFileSync(out);
+                bundleMemo.set(f.rel, {
+                    // A subtitle with no cues gets no hash, exactly as embeddedTextHashes gives an empty track none - the name decides for it, as before.
+                    sha1: hasNoCues(buf.toString('utf8'), 'ass') ? null : crypto.createHash('sha1').update(subTextForHash(buf, '.ass')).digest('hex'),
+                    fonts: String(r.stderr || '').split('\n').filter((l) => l.trimStart().startsWith('Stream #') && l.includes(': Attachment:')).length,
+                });
+            }
+        } catch (e) { /* no content identity - callers fall back to the name */ }
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
+        return bundleMemo.get(f.rel);
+    };
+    // Is this bundle's subtitle one of these embedded text hashes? true / false, or null when the bundle could not be read out.
+    const bundleInFile = (f, hashes) => {
+        const b = bundleContent(f);
+        return b && b.sha1 ? new Set(hashes).has(b.sha1) : null;
+    };
     // Which of a sidecar's two identities one of these embedded hashes carries: 'text' (its own text - the file holds it whole) or 'roundtrip' (what the
     // import stores - the file holds what ffmpeg KEPT of it), else null. The own-text test runs first and costs nothing; the round trip only on a miss.
     const sidecarMatch = (f, mp4, hashes) => {
@@ -2025,9 +2061,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // writes - except on an mp4/mov target, which DROPS per-stream subtitle titles on the mux, so there language alone decides (else a titled sidecar we
     // DID embed never matches its now-title-less stream). A bundle additionally has to see a font attachment - carrying fonts is its reason to exist.
     // Metadata can only say "something like this is here", never "this one is here" (an edited sidecar keeps its name and matches just as well), so a
-    // DELETION trusts it alone only for a bundle (an archive is not comparable text); the import skip also leans on it when the text cannot be read, since
-    // a wrong skip loses nothing. Otherwise the sidecar's own bytes must be one of the tracks. Only a TEXT subtitle can stand in for a loose sidecar - a
-    // PGS/VobSub track holds pictures, however well its metadata matches.
+    // DELETION trusts it alone only for a bundle whose subtitle cannot be read out (bundleContent); the import skip also leans on it when the text cannot
+    // be read, since a wrong skip loses nothing. Otherwise the sidecar's own bytes must be one of the tracks. Only a TEXT subtitle can stand in for a
+    // loose sidecar - a PGS/VobSub track holds pictures, however well its metadata matches.
     const markerConfirmsEmbedded = (f, subs, anyFont, mp4Target) => (!f.bundle || anyFont)
         && subs.filter((s) => f.bundle || isTextSub(s.codec_name)).some((s) =>
             langKey(resolveLang(s) || 'und') === langKey(f.lang || 'und') && (mp4Target || (s.tags?.title || '') === (f.title || '')));
@@ -2198,10 +2234,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const embedded = streamList.filter((s) => codecTypeOf(s) === 'subtitle');
         const anyFont = streamList.some((s) => codecTypeOf(s) === 'attachment' && isFontAttachment(s));
         // Language + title is a proxy for "this is in the file"; the TEXT is the fact itself, and only the fact may authorise an unlink. So the content test
-        // is the ONLY one for an ordinary sidecar, and the metadata match serves just what content cannot cover: a bundle (an .mks is an archive, and its
-        // fonts are what the metadata path checks for). That is also what lets a copy the user named themselves be cleaned up: its title matches no track by
-        // construction, yet its content is provably one of them. The hashes cost one pass over the accepted library file on every successful round trip - the
-        // price of never unlinking a sidecar on a resemblance. `confirmedWhy` returns the REASON it may go, so the deletion line reports what was proved.
+        // is the ONLY one for an ordinary sidecar; a bundle is proved by the subtitle inside it plus, when it carries fonts, fonts in the file - the metadata
+        // match serves only a bundle that cannot be read out. That is also what lets a copy the user named themselves be cleaned up: its title matches no
+        // track by construction, yet its content is provably one of them. The hashes cost one pass over the accepted library file on every successful round
+        // trip - the price of never unlinking a sidecar on a resemblance. `confirmedWhy` returns the REASON it may go, for the deletion line to report.
         let hashes;
         // 'text' / 'roundtrip' / null - which identity proved it (sidecarMatch); the loop below keeps a round-trip match the import stripped.
         const contentConfirms = (f) => {
@@ -2215,7 +2251,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // A loose sidecar the text cannot confirm STAYS - whether the probe ran and found no such text, or could not run at all. A failed probe must never
             // hand the unlink to the resemblance instead: the same file whose marker names the sidecar can make the probe fail (one text cue past the
             // extractor's 1 MiB event buffer exits 190), so a forged marker plus a forced failure would delete a sidecar that was never embedded anywhere.
-            return (f.bundle && markerConfirmsEmbedded(f, embedded, anyFont, mp4Target)) ? 'the file carries a matching subtitle' : '';
+            if (!f.bundle) return '';
+            if (hashes === undefined) hashes = embeddedTextHashes(embedded);
+            const b = bundleContent(f);
+            if (b && b.sha1 && hashes) return bundleInFile(f, hashes.values()) && (b.fonts === 0 || anyFont) ? 'its subtitle is in the file' : '';
+            return markerConfirmsEmbedded(f, embedded, anyFont, mp4Target) ? 'the file carries a matching subtitle' : '';
         };
         let deleted = 0; let log = '';
         for (const f of scan.rels.map(parseSidecarRel).filter(Boolean).filter((x) => marked.has(x.rel))) {
@@ -3037,7 +3077,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // trusted alone - see markerConfirmsEmbedded). Either way the decision is logged - "nothing happened" and "nothing needed to happen" look identical
         // from outside. Each sidecar muxes as -i "${workLibDir()}/${rel}": a " or control char in that real path would close the quote and inject ffmpeg args
         // (pathIsPresetSafe), and unlike a name we generate it must match the file byte-for-byte, so it can't be sanitised - skip it, never break out.
-        const alreadyEmbedded = (f) => importedSet.has(f.rel) && markerConfirmsEmbedded(f, embeddedSubs, hasFontAttachment, isMp4);
+        // A bundle is confirmed by the subtitle inside it whenever that can be read out (bundleContent) - its name cannot spell the title the subtitle
+        // carries in, nor vouch for fonts it never had - and by the name otherwise, as every loose sidecar's metadata half is.
+        const bundleConfirmed = (f) => {
+            const surviving = survivingTextHashes();
+            const inFile = surviving ? bundleInFile(f, surviving.values()) : null;
+            return inFile === null ? markerConfirmsEmbedded(f, embeddedSubs, hasFontAttachment, isMp4) : inFile;
+        };
+        const alreadyEmbedded = (f) => importedSet.has(f.rel)
+            && (f.bundle ? bundleConfirmed(f) : markerConfirmsEmbedded(f, embeddedSubs, hasFontAttachment, isMp4));
         // The marker entries a write records: each listed sidecar with the hash of its text now (what this pass imports, or carries forward), else the
         // hash an earlier entry already held for it.
         const markerFor = (rels) => rels.map((rel) => {
@@ -3107,9 +3155,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const groupHasNoCues = (f) => sidecarContent(f)?.noCues === true;
         // The counterpart of contentConfirms above, and DELIBERATELY the opposite polarity - hence the different verb. contentConfirms guards an UNLINK, so
         // "cannot prove it" must mean "do not delete on content grounds" and it fails CLOSED. This one guards a SKIP, so "cannot prove it" must mean "defer to
-        // the marker", which alreadyEmbedded has already confirmed against the live streams - it fails OPEN. Returning false for a bundle here would re-import
-        // an already-imported styled bundle as a duplicate on every pass, and a bundle is an archive rather than comparable text, so nothing could ever settle
-        // it again. The name says which way it fails; do not "fix" it to match its sibling.
+        // the marker", which alreadyEmbedded has already confirmed against the live streams - it fails OPEN. A bundle answers true here because alreadyEmbedded
+        // has already decided it on the subtitle inside it (bundleConfirmed), or on its name when that cannot be read out; returning false would re-import an
+        // already-imported styled bundle as a duplicate on every pass. The name says which way it fails; do not "fix" it to match its sibling.
         const contentAllowsSkip = (f) => {
             if (f.bundle || groupHasNoCues(f)) return true;
             const surviving = survivingTextHashes();
@@ -3198,9 +3246,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return !!was && !!now && now.startsWith(was);
         };
         const goneSinceImport = (f) => {
-            if (f.bundle || !f.members.every(unchangedSinceImport)) return false;
+            if (!f.members.every(unchangedSinceImport)) return false;
             const surviving = survivingTextHashes();
-            return !!surviving && !sidecarMatch(f, isMp4, surviving.values());
+            if (!surviving) return false;
+            return f.bundle ? bundleInFile(f, surviving.values()) === false : !sidecarMatch(f, isMp4, surviving.values());
         };
         for (let k = toMux.length - 1; k >= 0; k -= 1) {
             const f = toMux[k];
