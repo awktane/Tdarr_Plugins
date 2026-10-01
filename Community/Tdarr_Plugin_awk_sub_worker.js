@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.56',
+    Version: '3.999.57',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -2805,8 +2805,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // subtitle stream (measured on jellyfin-ffmpeg 7.1.4), so with removeSource=false the stream is never removed and a cue-less srt would
                 // re-extract the identical 0-byte sidecar every pass - Tdarr errors the second identical preset as an infinite transcode loop. When nothing
                 // will be stripped, plain existence is enough to mean "already handled", which breaks that loop. On the API route an UNCONFIRMED answer
-                // is neither: extracting would upload over a sidecar that may be there, so the stream waits for a later pass - not counted in `refused`,
-                // since a transient server condition must not fail an undamaged video (see the placement-failure note below).
+                // is neither: extracting would upload over a sidecar that may be there, so the stream waits - for this job's next cycle when anything else
+                // lands this pass, and otherwise for a requeue, since the pass then fails the file (see the endings below).
                 const remote = readViaApi() ? sidecarExistsRemote(remoteDest) : null;
                 if (remote && remote.state === 'unknown') {
                     deferred += 1;
@@ -2958,8 +2958,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // ccStrip and ccMeta count as work in their own right: on the API route the sidecars are already placed, so a caption-only run has an empty
             // sidecarOut and no removedIndices, and testing those alone would skip the pass that removes the captions from the bitstream.
             if (!sidecarOut && !removedIndices.size && !ccMeta && !ccStrip) {
-                if (refused && !wrote && !skipped && !deferred && !held) {
-                    failFile('No subtitle could be extracted - every eligible subtitle was refused, see the reasons above');
+                // Nothing landed. Refused or unconfirmed alike, a skip here would file the video as not required: Tdarr schedules no later pass for it, so
+                // the "wait" would be forever - and a rejected API key or a proxy answering 404 would silently stop every extraction, where failing makes the
+                // misconfiguration visible and a requeue retries a transient one. A sidecar already on disk, even one cut short (held), has landed.
+                if ((refused || deferred) && !wrote && !skipped && !held) {
+                    failFile(deferred
+                        ? 'No subtitle could be extracted - the library could not be checked, see the reasons above; requeue once the server answers'
+                        : 'No subtitle could be extracted - every eligible subtitle was refused, see the reasons above');
                 }
                 // The tag reports the value IN EFFECT, which is not always false here: a caption job never enters removedIndices, so a run that placed only
                 // captions and could neither strip them nor record the request reaches this line with removal ON - one line under the ☒ that says why.
