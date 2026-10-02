@@ -17,7 +17,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same
         job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. A
         later job on that file is checked in full again. This check is always on and has no setting.\n`,
-    Version: '4.999.25',
+    Version: '4.999.26',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -288,7 +288,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (14 sections: stream codec type … mp4 strict compliance arg)
+    // #region SHARED helpers (15 sections: stream codec type … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -547,6 +547,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return log;
     };
     // ===== END SHARED: mp4-family container =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 uncopyable streams =====
+    // -=-=-= mp4UncopyableStreams (+ mp4RebuiltTimecodes, mp4UncopyableLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The data streams an mp4/m4v/m4a -c copy cannot carry: one ffprobe names no codec for - in practice a camera's tmcd timecode track. The mp4 muxer refuses
+    // it outright ("Could not find tag for codec none", exit 234 on jellyfin 7.1.4) and takes the whole command down, so a -map 0 copy of such a file fails on
+    // every requeue; each remux here leaves the stream out instead. A timecode survives that: the muxer rebuilds the tmcd track from the video stream's own
+    // timecode tag (measured 2026-10-01: 01:00:00:00 in and out). mov copies the track as-is and is left alone, and clean_and_remux drops every data stream
+    // itself, so in the designed stack only a run without it meets one. The log line names each stream left out and says whether its timecode carries over.
+    const mp4UncopyableStreams = (container, streams) => (['mp4', 'm4v', 'm4a'].includes(String(container || '').toLowerCase())
+        ? (streams || []).filter((s) => codecTypeOf(s) === 'data' && ['', 'unknown', 'none'].includes(String(s.codec_name || '').toLowerCase())) : []);
+    // The dropped tmcd tracks the muxer puts back - one rebuilt from the video stream's timecode tag reads exactly as the copy would have, so an Expected
+    // results line keeps it; with no such tag the timecode is gone.
+    const mp4RebuiltTimecodes = (dropped, streams) => ((streams || []).some((s) => codecTypeOf(s) === 'video' && getTagCI(s.tags, 'timecode').trim() !== '')
+        ? dropped.filter((s) => String(s.codec_tag_string || '').toLowerCase() === 'tmcd') : []);
+    const mp4UncopyableLog = (container, dropped, streams) => {
+        const rebuilt = mp4RebuiltTimecodes(dropped, streams);
+        return dropped.map((s) => {
+            const tmcd = String(s.codec_tag_string || '').toLowerCase() === 'tmcd';
+            const timecode = !tmcd ? '' : rebuilt.includes(s) ? ', and its timecode is rebuilt from the video track'
+                : ', and with no timecode on the video track it is lost';
+            const what = tmcd ? 'tmcd timecode' : 'unidentified data';
+            return `☐${streamTag(s.index)} Leaving out the ${what} track - .${String(container).toLowerCase()} cannot copy a stream with no codec${timecode}\n`;
+        }).join('');
+    };
+    // ===== END SHARED: mp4 uncopyable streams =====
 
     // ===== SHARED [audio_clean, stream_ordering]: audio codec scoring =====
     // -=-=-= codecInfo  [audio_clean, stream_ordering] =-=-=-
@@ -1451,14 +1475,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const canPersistDefault = ['mkv', 'mka', 'webm'].includes(dstContainer) || isMp4Family(dstContainer);
         let defaultFlagSkipped = false;
 
+        // A data track the container cannot copy (mp4UncopyableStreams) is left out of the map, so outIdx - the output position every per-stream write keys
+        // on - counts only the streams actually mapped.
+        const uncopyable = mp4UncopyableStreams(dstContainer, file.ffProbeData.streams);
+        let outIdx = -1;
         for (let i = 0; i < sortRows.length; i++) {
-            ffmpegMap += ` -map 0:${sortRows[i].index}`;
             // Compare against each stream's ORIGINAL array position, not its absolute ffprobe index, so a file already in the desired order but with
-            // non-contiguous indices (e.g. 0,1,3 after an upstream drop) isn't remuxed pointlessly. -map still uses the absolute index above.
+            // non-contiguous indices (e.g. 0,1,3 after an upstream drop) isn't remuxed pointlessly. -map uses the absolute index below.
             if (sortRows[i].origPos !== i) orderChanged = true;
+            if (uncopyable.some((s) => s.index === sortRows[i].index)) continue;
+            outIdx++;
+            ffmpegMap += ` -map 0:${sortRows[i].index}`;
 
-            // remove_junk_tags (per-stream): clear this stream's encoder tags, keyed on its OUTPUT index i (see junkStreamClears).
-            const streamJunk = junkStreamClears(sortRows[i].stream, i);
+            // remove_junk_tags (per-stream): clear this stream's encoder tags, keyed on its OUTPUT index (see junkStreamClears).
+            const streamJunk = junkStreamClears(sortRows[i].stream, outIdx);
             if (streamJunk) {
                 junkArgs += streamJunk;
                 junkLog += `☐${streamTag(sortRows[i].index)}[remove_junk_tags=${junkTagsMode}] Remove encoder tag(s) from ${sortRows[i].type} stream\n`;
@@ -1598,9 +1628,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.preset = `<io>${ffmpegMap} -c copy${dispositionArgs}${junkArgs}${strictArg}${globalOutputOpt}${mp4MovflagsArg}`;
         if (dispositionArgs !== '')
             response.infoLog += '☐Set the first audio track as the sole default\n';
-        response.infoLog += junkLog + mp4TagPlanLog(tagPlan, dstContainer, file.ffProbeData.streams);
-        const lostCovers = new Set(mp4CoversLost(tagPlan, dstContainer, file.ffProbeData.streams).map((c) => c.index));
-        response.infoLog += `☑Expected results: ${sortRows.filter((s) => !lostCovers.has(s.stream.index)).map(s => summariseStream(s.stream)).join('')}\n`;
+        const mapped = file.ffProbeData.streams.filter((s) => !uncopyable.includes(s));
+        response.infoLog += junkLog + mp4UncopyableLog(dstContainer, uncopyable, file.ffProbeData.streams) + mp4TagPlanLog(tagPlan, dstContainer, mapped);
+        const goneData = uncopyable.filter((s) => !mp4RebuiltTimecodes(uncopyable, file.ffProbeData.streams).includes(s));
+        const leftOut = new Set([...goneData, ...mp4CoversLost(tagPlan, dstContainer, mapped)].map((s) => s.index));
+        response.infoLog += `☑Expected results: ${sortRows.filter((s) => !leftOut.has(s.index)).map(s => summariseStream(s.stream)).join('')}\n`;
 
         return response;
         // ====== END PRESET ASSEMBLY ======

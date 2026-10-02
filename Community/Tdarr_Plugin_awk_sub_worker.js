@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.60',
+    Version: '3.999.61',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -287,7 +287,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (14 sections: file-failure helpers … ffmpeg metadata escaping)
+    // #region SHARED helpers (15 sections: file-failure helpers … ffmpeg metadata escaping)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: file-failure helpers =====
     // -=-=-= AwkFailFile / failFile / failUnexpected [all five] =-=-=-
     // Fail the whole file (Tdarr's error queue) carrying the full infoLog: a returned processFile:false is Tdarr's "no work / skip" signal, NOT a failure -
@@ -556,6 +556,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return log;
     };
     // ===== END SHARED: mp4-family container =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 uncopyable streams =====
+    // -=-=-= mp4UncopyableStreams (+ mp4RebuiltTimecodes, mp4UncopyableLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The data streams an mp4/m4v/m4a -c copy cannot carry: one ffprobe names no codec for - in practice a camera's tmcd timecode track. The mp4 muxer refuses
+    // it outright ("Could not find tag for codec none", exit 234 on jellyfin 7.1.4) and takes the whole command down, so a -map 0 copy of such a file fails on
+    // every requeue; each remux here leaves the stream out instead. A timecode survives that: the muxer rebuilds the tmcd track from the video stream's own
+    // timecode tag (measured 2026-10-01: 01:00:00:00 in and out). mov copies the track as-is and is left alone, and clean_and_remux drops every data stream
+    // itself, so in the designed stack only a run without it meets one. The log line names each stream left out and says whether its timecode carries over.
+    const mp4UncopyableStreams = (container, streams) => (['mp4', 'm4v', 'm4a'].includes(String(container || '').toLowerCase())
+        ? (streams || []).filter((s) => codecTypeOf(s) === 'data' && ['', 'unknown', 'none'].includes(String(s.codec_name || '').toLowerCase())) : []);
+    // The dropped tmcd tracks the muxer puts back - one rebuilt from the video stream's timecode tag reads exactly as the copy would have, so an Expected
+    // results line keeps it; with no such tag the timecode is gone.
+    const mp4RebuiltTimecodes = (dropped, streams) => ((streams || []).some((s) => codecTypeOf(s) === 'video' && getTagCI(s.tags, 'timecode').trim() !== '')
+        ? dropped.filter((s) => String(s.codec_tag_string || '').toLowerCase() === 'tmcd') : []);
+    const mp4UncopyableLog = (container, dropped, streams) => {
+        const rebuilt = mp4RebuiltTimecodes(dropped, streams);
+        return dropped.map((s) => {
+            const tmcd = String(s.codec_tag_string || '').toLowerCase() === 'tmcd';
+            const timecode = !tmcd ? '' : rebuilt.includes(s) ? ', and its timecode is rebuilt from the video track'
+                : ', and with no timecode on the video track it is lost';
+            const what = tmcd ? 'tmcd timecode' : 'unidentified data';
+            return `☐${streamTag(s.index)} Leaving out the ${what} track - .${String(container).toLowerCase()} cannot copy a stream with no codec${timecode}\n`;
+        }).join('');
+    };
+    // ===== END SHARED: mp4 uncopyable streams =====
     // ===== SHARED [sub_worker, video_clean]: marker persistence =====
     // -=-=-= markerPersists  [sub_worker, video_clean] =-=-=-
     // Can a container carry a GLOBAL awk_* marker back out of a mux? Matroska and its siblings store an arbitrary tag natively; the mp4 family keeps one only
@@ -2485,32 +2509,37 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Every container-global -metadata write the run queues, recorded where it is built so commitPreset hands mp4TagPlan exactly what the preset sets. A run
     // commits at most one preset, so one record serves it; a write built on a path that then skips is never committed and so never read.
     const globalWrites = {};
-    const lostCovers = new Set();   // indexes of the covers the committed preset's container will not store - see outputView
+    const leftOut = new Set();   // indexes of the streams the committed preset's container will not hold - see outputView
     const globalMetaArg = (key, value) => {
         globalWrites[key] = value;
         return ` -metadata "${key}=${value}"`;
     };
-    // Commit a built output-side arg string as the run: append the DV strict flag, then -movflags use_metadata_tags where mp4TagPlan asks for it, then the
-    // universal output options - and set response.processFile, Tdarr's go/no-go switch, so calling this IS the commit point for the whole run. Shared by the
-    // extract and import branches so their tails can't drift. Without that flag an mp4-family mux drops every custom global tag, so it is what keeps a
-    // sibling's awk_* marker (awk_video/awk_recovered) through a -c copy and lands this plugin's own awk_sub_worker and awk_cc at all - without it an mp4
-    // marker silently vanishes and the next pass re-imports every sidecar it should have skipped.
+    // Commit a built output-side arg string as the run: leave out any data track the container cannot copy (mp4UncopyableStreams), append the DV strict flag,
+    // then -movflags use_metadata_tags where mp4TagPlan asks for it, then the universal output options - and set response.processFile, Tdarr's go/no-go switch,
+    // so calling this IS the commit point for the whole run. Shared by the extract and import branches so their tails can't drift. Without that flag an
+    // mp4-family mux drops every custom global tag, so it is what keeps a sibling's awk_* marker (awk_video/awk_recovered) through a -c copy and lands this
+    // plugin's own awk_sub_worker and awk_cc at all - without it an mp4 marker silently vanishes and the next pass re-imports every sidecar it should have
+    // skipped.
     const commitPreset = (out) => {
         // The -strict level either -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses without it.
         // Only subtitle streams - and, on a bundled extract, their font attachments - are ever added or dropped here, so every audio/video stream is copied
-        // and the copied-subset argument stays at its default; that includes any cover art, which is why every stream is offered to the cover check.
-        let full = out + mp4StrictArg(dstContainer, streams);
+        // and the copied-subset argument stays at its default; that includes any cover art, which is why every mapped stream is offered to the cover check.
+        // The drops come last: a negative -map undoes the earlier `-map 0` for just that stream.
+        const uncopyable = mp4UncopyableStreams(dstContainer, streams);
+        const mapped = streams.filter((s) => !uncopyable.includes(s));
+        let full = out + uncopyable.map((s) => ` -map -0:${s.index}`).join('') + mp4StrictArg(dstContainer, streams);
         const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, globalWrites);
         if (tagPlan.flag) full += ' -movflags use_metadata_tags';
         full += globalOutputOpt;
         response.preset = `<io>${full}`;
         response.processFile = true;
-        response.infoLog += mp4TagPlanLog(tagPlan, dstContainer, streams);
-        for (const c of mp4CoversLost(tagPlan, dstContainer, streams)) lostCovers.add(c.index);
+        response.infoLog += mp4UncopyableLog(dstContainer, uncopyable, streams) + mp4TagPlanLog(tagPlan, dstContainer, mapped);
+        const goneData = uncopyable.filter((s) => !mp4RebuiltTimecodes(uncopyable, streams).includes(s));
+        for (const s of [...goneData, ...mp4CoversLost(tagPlan, dstContainer, mapped)]) leftOut.add(s.index);
     };
-    // The stream list as the committed output will actually hold it - every Expected results line goes through this, so a cover the container loses is not
-    // promised under the ☒ line that reports it lost.
-    const outputView = (list) => list.filter((s) => !lostCovers.has(s.index));
+    // The stream list as the committed output will actually hold it - every Expected results line goes through this, so a stream the container cannot hold
+    // is not promised under the line that reports it left out.
+    const outputView = (list) => list.filter((s) => !leftOut.has(s.index));
 
     // Synthetic stream so a not-yet-muxed sidecar renders through summariseStream in the expected-results line. It stands in for the RESULT, so `mp4` names the
     // codec the mux is about to produce, not the one the sidecar arrived as: an mp4-family target transcodes every text sidecar to mov_text, and reporting

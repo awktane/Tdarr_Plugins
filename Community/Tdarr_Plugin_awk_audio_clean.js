@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.43',
+    Version: '4.999.44',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -531,7 +531,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (15 sections: stream codec type … mp4 strict compliance arg)
+    // #region SHARED helpers (16 sections: stream codec type … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -778,6 +778,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return log;
     };
     // ===== END SHARED: mp4-family container =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 uncopyable streams =====
+    // -=-=-= mp4UncopyableStreams (+ mp4RebuiltTimecodes, mp4UncopyableLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The data streams an mp4/m4v/m4a -c copy cannot carry: one ffprobe names no codec for - in practice a camera's tmcd timecode track. The mp4 muxer refuses
+    // it outright ("Could not find tag for codec none", exit 234 on jellyfin 7.1.4) and takes the whole command down, so a -map 0 copy of such a file fails on
+    // every requeue; each remux here leaves the stream out instead. A timecode survives that: the muxer rebuilds the tmcd track from the video stream's own
+    // timecode tag (measured 2026-10-01: 01:00:00:00 in and out). mov copies the track as-is and is left alone, and clean_and_remux drops every data stream
+    // itself, so in the designed stack only a run without it meets one. The log line names each stream left out and says whether its timecode carries over.
+    const mp4UncopyableStreams = (container, streams) => (['mp4', 'm4v', 'm4a'].includes(String(container || '').toLowerCase())
+        ? (streams || []).filter((s) => codecTypeOf(s) === 'data' && ['', 'unknown', 'none'].includes(String(s.codec_name || '').toLowerCase())) : []);
+    // The dropped tmcd tracks the muxer puts back - one rebuilt from the video stream's timecode tag reads exactly as the copy would have, so an Expected
+    // results line keeps it; with no such tag the timecode is gone.
+    const mp4RebuiltTimecodes = (dropped, streams) => ((streams || []).some((s) => codecTypeOf(s) === 'video' && getTagCI(s.tags, 'timecode').trim() !== '')
+        ? dropped.filter((s) => String(s.codec_tag_string || '').toLowerCase() === 'tmcd') : []);
+    const mp4UncopyableLog = (container, dropped, streams) => {
+        const rebuilt = mp4RebuiltTimecodes(dropped, streams);
+        return dropped.map((s) => {
+            const tmcd = String(s.codec_tag_string || '').toLowerCase() === 'tmcd';
+            const timecode = !tmcd ? '' : rebuilt.includes(s) ? ', and its timecode is rebuilt from the video track'
+                : ', and with no timecode on the video track it is lost';
+            const what = tmcd ? 'tmcd timecode' : 'unidentified data';
+            return `☐${streamTag(s.index)} Leaving out the ${what} track - .${String(container).toLowerCase()} cannot copy a stream with no codec${timecode}\n`;
+        }).join('');
+    };
+    // ===== END SHARED: mp4 uncopyable streams =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: case-insensitive tag lookup =====
     // -=-=-= getTagCI  [all five] =-=-=-
     // Look up a tag value case-insensitively on BOTH sides - matroska UPPER-CASES tag keys on write, so a plugin reading its sibling's awk_*
@@ -3141,12 +3165,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // streams are enriched with resolveStreamBitrate before summariseStream, matching the input summary line - so untouched tracks (e.g. a copied stereo
         // track) show their bitrate correctly. A re-encoded track is summarised through summariseStream's output descriptor, which prints an aac_vbr
         // override's approximate rate (~192k) and drops the source-only markers a fresh encode cannot carry.
-        // Covers the output container will not store (mp4CoversLost) - filled in when the preset is built, read here so the summary never promises one.
-        const lostCovers = new Set();
+        // Streams the output will not hold though no setting removed them - a data track the container cannot copy (mp4UncopyableStreams) and a cover it
+        // cannot store (mp4CoversLost). Filled in when the preset is built and read here, so the summary never promises one.
+        const leftOut = new Set();
         const buildOutputSummary = () => {
             const tokens = [];
             for (const s of file.ffProbeData.streams) {
-                if (lostCovers.has(s.index)) continue;
+                if (leftOut.has(s.index)) continue;
                 const enriched = enrichStream(s);
                 if (codecTypeOf(s) === 'audio') {
                     if (removedIndices.has(s.index)) continue;
@@ -3169,24 +3194,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         response.infoLog += workDone + skipDone;
         if (convert === true) {
-            // Dispositions (default flag) are intentionally untouched: ffmpeg copies the source disposition onto mapped/transcoded outputs, so a
-            // downmix from a default-flagged source also carries default - two default tracks, acceptable (near-identical content, players cope);
-            // reassigning default is outside this plugin's scope. An mp4-family output keeps a sibling's GLOBAL awk_* marker (clean_and_remux's
-            // awk_recovered, say) only under use_metadata_tags, so mp4TagPlan sets it exactly when one is there; this plugin writes no global tag of its own.
-            // (Per-stream custom tags like awk_loudnorm are NOT rescued by the flag, verified against the real mov muxer - why loudnorm caches on Matroska
-            // only; see loudnormTagPersists.) Every stream but a removed audio track reaches the output, cover art included.
+            // Dispositions (default flag) are intentionally untouched: ffmpeg copies the source disposition onto mapped/transcoded outputs, so a downmix from a
+            // default-flagged source also carries default - two default tracks, acceptable (near-identical content, players cope); reassigning default is
+            // outside this plugin's scope. An mp4-family output keeps a sibling's GLOBAL awk_* marker (clean_and_remux's awk_recovered, say) only under
+            // use_metadata_tags, so mp4TagPlan sets it exactly when one is there; this plugin writes no global tag of its own. (Per-stream custom tags like
+            // awk_loudnorm are NOT rescued by the flag, verified against the real mov muxer - why loudnorm caches on Matroska only; see loudnormTagPersists.)
+            // Every stream but a removed audio track or an uncopyable data track reaches the output, cover art included.
             const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags);
             const mp4KeepTags = tagPlan.flag ? ' -movflags use_metadata_tags' : '';
-            const keptStreams = file.ffProbeData.streams.filter((s) => !removedIndices.has(s.index));
-            response.infoLog += mp4TagPlanLog(tagPlan, dstContainer, keptStreams);
-            for (const c of mp4CoversLost(tagPlan, dstContainer, keptStreams)) lostCovers.add(c.index);
+            const uncopyable = mp4UncopyableStreams(dstContainer, file.ffProbeData.streams);
+            const keptStreams = file.ffProbeData.streams.filter((s) => !removedIndices.has(s.index) && !uncopyable.includes(s));
+            response.infoLog += mp4UncopyableLog(dstContainer, uncopyable, file.ffProbeData.streams) + mp4TagPlanLog(tagPlan, dstContainer, keptStreams);
+            const goneData = uncopyable.filter((s) => !mp4RebuiltTimecodes(uncopyable, file.ffProbeData.streams).includes(s));
+            for (const s of [...goneData, ...mp4CoversLost(tagPlan, dstContainer, keptStreams)]) leftOut.add(s.index);
             // The -strict level this mp4/mov -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses
             // without it. The second list is what this run actually COPIES - a track removedIndices drops, or an in-place transcode replaces (recorded in
             // outputAudioOverride, keyed by output audio index), is left out, so a TrueHD track on its way out never asks for a flag the output cannot need.
             const copiedStreams = file.ffProbeData.streams
                 .filter((s) => !removedIndices.has(s.index) && !outputAudioOverride.has(outputAudioIdxMap.get(s.index)));
             const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams, copiedStreams);
-            response.preset += `<io>-map 0 -c copy${extraArguments}${strictArg}${globalOutputOpt}${mp4KeepTags}`;
+            const uncopyableDrops = uncopyable.map((s) => ` -map -0:${s.index}`).join('');
+            response.preset += `<io>-map 0${uncopyableDrops} -c copy${extraArguments}${strictArg}${globalOutputOpt}${mp4KeepTags}`;
             response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;
             response.processFile = true;
         } else {

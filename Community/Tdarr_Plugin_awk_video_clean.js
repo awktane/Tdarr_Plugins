@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.42',
+    Version: '3.999.43',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -347,7 +347,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (8 sections: stream codec type … stream / language / preset helpers)
+    // #region SHARED helpers (9 sections: stream codec type … stream / language / preset helpers)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -594,6 +594,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return log;
     };
     // ===== END SHARED: mp4-family container =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 uncopyable streams =====
+    // -=-=-= mp4UncopyableStreams (+ mp4RebuiltTimecodes, mp4UncopyableLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The data streams an mp4/m4v/m4a -c copy cannot carry: one ffprobe names no codec for - in practice a camera's tmcd timecode track. The mp4 muxer refuses
+    // it outright ("Could not find tag for codec none", exit 234 on jellyfin 7.1.4) and takes the whole command down, so a -map 0 copy of such a file fails on
+    // every requeue; each remux here leaves the stream out instead. A timecode survives that: the muxer rebuilds the tmcd track from the video stream's own
+    // timecode tag (measured 2026-10-01: 01:00:00:00 in and out). mov copies the track as-is and is left alone, and clean_and_remux drops every data stream
+    // itself, so in the designed stack only a run without it meets one. The log line names each stream left out and says whether its timecode carries over.
+    const mp4UncopyableStreams = (container, streams) => (['mp4', 'm4v', 'm4a'].includes(String(container || '').toLowerCase())
+        ? (streams || []).filter((s) => codecTypeOf(s) === 'data' && ['', 'unknown', 'none'].includes(String(s.codec_name || '').toLowerCase())) : []);
+    // The dropped tmcd tracks the muxer puts back - one rebuilt from the video stream's timecode tag reads exactly as the copy would have, so an Expected
+    // results line keeps it; with no such tag the timecode is gone.
+    const mp4RebuiltTimecodes = (dropped, streams) => ((streams || []).some((s) => codecTypeOf(s) === 'video' && getTagCI(s.tags, 'timecode').trim() !== '')
+        ? dropped.filter((s) => String(s.codec_tag_string || '').toLowerCase() === 'tmcd') : []);
+    const mp4UncopyableLog = (container, dropped, streams) => {
+        const rebuilt = mp4RebuiltTimecodes(dropped, streams);
+        return dropped.map((s) => {
+            const tmcd = String(s.codec_tag_string || '').toLowerCase() === 'tmcd';
+            const timecode = !tmcd ? '' : rebuilt.includes(s) ? ', and its timecode is rebuilt from the video track'
+                : ', and with no timecode on the video track it is lost';
+            const what = tmcd ? 'tmcd timecode' : 'unidentified data';
+            return `☐${streamTag(s.index)} Leaving out the ${what} track - .${String(container).toLowerCase()} cannot copy a stream with no codec${timecode}\n`;
+        }).join('');
+    };
+    // ===== END SHARED: mp4 uncopyable streams =====
     // ===== SHARED [sub_worker, video_clean]: marker persistence =====
     // -=-=-= markerPersists  [sub_worker, video_clean] =-=-=-
     // Can a container carry a GLOBAL awk_* marker back out of a mux? Matroska and its siblings store an arbitrary tag natively; the mp4 family keeps one only
@@ -2010,7 +2034,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // ---- shared emit helpers ----
         const coverArtStreams = videoStreams.filter((s) => isCoverArt(s));                                 // embedded cover-art / still-image "video" streams
-        const coverArtDrops = coverArtStreams.map((s) => ` -map -0:${s.index}`).join('');                  // dropped from every output this plugin emits
+        const uncopyable = mp4UncopyableStreams(dstContainer, file.ffProbeData.streams);                     // a data track the container cannot copy
+        const outputDrops = [...coverArtStreams, ...uncopyable].map((s) => ` -map -0:${s.index}`).join(''); // dropped from every output this plugin emits
         // A queued change gets its own ☐ line - without this the only trace is the stream's absence from the ☑ summary. Appended by whichever preset path
         // runs (on a skipped file nothing is dropped, so an unconditional line would announce work that never happens). No [input=...] tag: no setting
         // causes this, the stream simply is not video. In the designed run order clean_and_remux has already dropped these, so this only fires when
@@ -2018,6 +2043,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const coverArtLog = coverArtStreams
             .map((s) => `☐${streamTag(s.index)} Remove cover-art/thumbnail (video-${(s.codec_name || 'unknown').trim().toLowerCase()})\n`)
             .join('');
+        const dropLog = coverArtLog + mp4UncopyableLog(dstContainer, uncopyable, file.ffProbeData.streams);
         // Apple/QuickTime fourCC for a COPIED stream, gated on isQtVideoContainer rather than isMp4Family (see its definition). The CODEC COVERAGE difference
         // against the encode path above is intentional and must stay: this path copies an arbitrary source codec (so it maps all three), while the encode path
         // only ever emits a fourCC for hevc and picks dvh1-vs-hvc1 from whether the DV RPU survives - a choice a copy cannot make. Do not merge the two.
@@ -2025,8 +2051,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const QT_VIDEO_TAG = { hevc: ' -tag:v:0 hvc1', av1: ' -tag:v:0 av01', h264: ' -tag:v:0 avc1' };
         const qtVideoTag = (cn) => (isQtVideoContainer(dstContainer)
             ? tableGet(QT_VIDEO_TAG, cn, '') : '');
-        // input streams minus dropped cover-art video
-        const keptStreams = () => file.ffProbeData.streams.filter((s) => !(isCoverArt(s) && codecTypeOf(s) === 'video'));
+        // input streams minus dropped cover-art video and any uncopyable data track the muxer does not rebuild
+        const goneData = uncopyable.filter((s) => !mp4RebuiltTimecodes(uncopyable, file.ffProbeData.streams).includes(s));
+        const keptStreams = () => file.ffProbeData.streams.filter((s) => !(isCoverArt(s) && codecTypeOf(s) === 'video') && !goneData.includes(s));
         // The output summary, built once for both exits (the lossless strip and the transcode). Only the primary video's token differs between them, so it is
         // the one argument; every other stream is summarised from its own enriched form, exactly as the input summary does.
         const expectedResultsLine = (primaryToken) => `☑Expected results: ${keptStreams()
@@ -2054,13 +2081,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 : '';
             response.infoLog += `☐${streamTag(primary.index)}[hdr_mode=strip_dynamic] Stripping ${stripped} losslessly (-c:v copy, base HDR10 retained)`
                 + `${leftover}\n`;
-            let out = `-map 0 -c copy -bsf:v:0 ${bsf}${coverArtDrops}${qtVideoTag(srcCodecName)} -c:a copy -c:s copy${strictArg}${globalOutputOpt}`;
+            let out = `-map 0 -c copy -bsf:v:0 ${bsf}${outputDrops}${qtVideoTag(srcCodecName)} -c:a copy -c:s copy${strictArg}${globalOutputOpt}`;
             // same as the transcode path: keep sibling plugins' GLOBAL awk_* markers through an mp4/mov copy
             const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags);
             if (tagPlan.flag) out += ' -movflags use_metadata_tags';
             response.preset = `<io>${out}`;   // no input-side args
             response.processFile = true;
-            response.infoLog += coverArtLog + mp4TagPlanLog(tagPlan, dstContainer);
+            response.infoLog += dropLog + mp4TagPlanLog(tagPlan, dstContainer);
             // The strip removes exactly the layer the 'dv'/'hdr10+' token names (see clearDynamicHdrCarriers), leaving the HDR10/HLG base's own transfer,
             // inferred off HDR_Format when neither probe reported one. Everything else about the stream is untouched, since this path is a -c:v copy.
             const strippedVideo = clearDynamicHdrCarriers({ ...primary });
@@ -2454,7 +2481,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // A fence this file already carries is cleared rather than left to describe an encode that this one replaces.
             const fenceFree = !(action === 'normalize' && isMp4Family(dstContainer));
             const globalWrites = fenceFree ? { [VIDEO_FENCE_TAG]: videoSig } : priorSig ? { [VIDEO_FENCE_TAG]: '' } : {};
-            let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy${coverArtDrops}${strictArg}`;
+            let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy${outputDrops}${strictArg}`;
             if (VIDEO_FENCE_TAG in globalWrites) out += ` -metadata "${VIDEO_FENCE_TAG}=${globalWrites[VIDEO_FENCE_TAG]}"`;
             // Retire the request this encode just served. ccExported implies dropCaptions, and buildVideoArgs suppresses A53 on every encoder that can emit it
             // under dropCaptions ('keep' and 'unreliable' in A53_CAP) while the rest drop it unaided, so the output provably carries no captions - `removed` is
@@ -2470,7 +2497,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             out += globalOutputOpt;
             response.preset = `${enc.inputSide}<io>${out}`;
             response.processFile = true;
-            response.infoLog += coverArtLog + mp4TagPlanLog(tagPlan, dstContainer);
+            response.infoLog += dropLog + mp4TagPlanLog(tagPlan, dstContainer);
             // The interlace repair's own ☐ line lands HERE, with the preset, for the reason coverArtLog states: every guard between the detection and this
             // point can still end the run with nothing emitted, and a ☐ line means a change about to be MADE. It also makes the frame-rate change legible on
             // the files it happens to, and its absence legible on the film-originated ones where it never applies.
