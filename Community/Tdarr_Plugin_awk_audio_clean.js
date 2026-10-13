@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.46',
+    Version: '4.999.47',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -305,7 +305,8 @@ const details = () => ({
                 is measured and corrected on its own, while one already being modified rides on that same re-encode instead of a separate one.
                 \\nOn a Matroska container (mkv, webm, mka) a track untouched by anything else this run is stamped with an awk_loudnorm tag once measured,
                 and a later run trusts that tag and skips re-measuring while this setting stays the same; changing the setting forces a fresh measurement.
-                mp4 and m4a muxers drop custom tags, so there loudnorm re-measures every run - an already-correct track stays a no-op rather than remuxing.`,
+                The mp4-family muxers (mp4, m4v, m4a, mov) drop custom tags, so there loudnorm re-measures on every stack cycle - each later plugin that
+                changes the file sends it round the stack again - while an already-correct track stays a no-op rather than remuxing.`,
         },
         {
             name: 'method_stereo_downmix',
@@ -1781,6 +1782,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const forceCovers = (isStereo, channels) => forceCodec === 'all'
         || (forceCodec === '6below' && (isStereo || channels <= 6))
         || (forceCodec === '2below' && isStereo);
+    // ====== CONTAINER AUDIO WALLS ======
+    // Every new or re-encoded track is written back into the source's own container, and some muxers refuse a codec outright - at header write, so the
+    // whole run fails on every requeue with nothing but ffmpeg's message. Measured on jellyfin 7.1.4 by encoding each target into each container (every
+    // accepted cell reads back as the right codec). mkv, mp4 and mka take all four, and .m4v/.m4a are written through the mp4 muxer (outputMuxerArg), so in
+    // the designed stack - clean_and_remux first - none of these is ever met; only a standalone run, or one ordered before it, reaches them. A refused codec
+    // is out of reach wherever a track's target is chosen: the downmix, codec_force or remix that would need it stands down for that track with its own
+    // line, and loudnorm falls back to the track's own codec. awk-ffmpeg-test's muxmatrix re-measures every cell (AUDIO_WRITEBACK_REFUSES mirrors this).
+    const AUDIO_CONTAINER_REFUSES = {
+        webm: ['aac', 'ac3', 'eac3'], ogg: ['aac', 'ac3', 'eac3'], ogv: ['aac', 'ac3', 'eac3'],
+        mpg: ['aac', 'eac3', 'opus'], mpeg: ['aac', 'eac3', 'opus'], vob: ['aac', 'eac3', 'opus'],
+        flv: ['ac3', 'eac3', 'opus'], '3gp': ['ac3', 'eac3', 'opus'], '3g2': ['ac3', 'eac3', 'opus'],
+        mov: ['opus'], avi: ['opus'], divx: ['opus'], wmv: ['opus'], asf: ['opus'],
+    };
+    const containerRefusesAudio = (codec) => Object.prototype.hasOwnProperty.call(AUDIO_CONTAINER_REFUSES, dstContainer)
+        && AUDIO_CONTAINER_REFUSES[dstContainer].includes(aacFamily(codec));
+    // The words every wall line shares: what this container refuses, and the two ways out.
+    const wallText = (codec) => `a .${dstContainer} file cannot hold ${aacFamily(codec)} audio`;
+    const wallRemedy = (setting) => `set ${setting} to ${['aac', 'ac3', 'eac3', 'opus'].filter((c) => !containerRefusesAudio(c)).join(' or ')}`
+        + ', or remux it to mkv or mp4 first (clean_and_remux does that)';
+    let walledOps = 0;   // tracks a wall stood an operation down for, so a run left with nothing to write says why rather than claiming all was well
+    // ====== END CONTAINER AUDIO WALLS ======
 
     // [inputName, parsedValue, validOptions] - checked top-down, failing on the first bad value, and the message always echoes the value that was tested.
     const dropdownChecks = [
@@ -2238,7 +2260,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // libopus-incompatible layout that NO downmix will convert to stereo, and remove it (never the last audio track). keep/remix stay in
         // the loop; this mirrors the loop's surround shouldForce for exactly the drop subset. (The loudnorm-only convergence-to-opus path
         // can't drop here - it only knows a track needs re-encoding after measuring, past this point - so there 'drop' falls back to 'keep'.)
-        if (methodLayoutErr === 'drop' && forceCodec !== 'disabled' && surroundCodec === 'opus') {
+        // A container that refuses opus leaves codec_force nothing to drop FOR: the force site stands that track down, so dropping it here would lose it.
+        if (methodLayoutErr === 'drop' && forceCodec !== 'disabled' && surroundCodec === 'opus' && !containerRefusesAudio(surroundCodec)) {
             for (const s of audioStreams) {
                 if (removedIndices.has(s.index)) continue;
                 const ch = s.awkChannels;
@@ -2261,6 +2284,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (stereoPath || (surroundPath && (downmixToStereo === 'replace' || (ch > 6 && downmixToSix === 'replace')))) continue;
                 const floor = dropFloor(s);
                 if (floor) { dropKeptWhy.set(s.index, floor); continue; }
+                // Dropped, this track is replaced by the downmix derivative below - which a container that refuses its codec (CONTAINER AUDIO WALLS) cannot
+                // hold, leaving the language with neither. So it is kept; the pre-pass cannot yet see whether the language has a stereo of its own anyway.
+                const walledDerive = surroundPath && ((downmixToStereo !== 'disabled' && containerRefusesAudio(stereoCodec)) ? stereoCodec
+                    : ((ch > 6 && downmixToSix !== 'disabled' && containerRefusesAudio(surroundCodec)) ? surroundCodec : ''));
+                if (walledDerive) {
+                    dropKeptWhy.set(s.index, `the downmix meant to replace it needs ${aacFamily(walledDerive)}, which a .${dstContainer} file cannot hold`);
+                    continue;
+                }
                 removedIndices.add(s.index);
                 // this IS a queued change (a removal), so it takes the change symbol like every other removal line, not the warning symbol
                 workDone += `☐${streamTag(s.index)}[method_layout_err=${methodLayoutErr}] Dropping - libopus can't encode a `
@@ -2653,8 +2684,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Only Matroska persists arbitrary per-stream tags through a -c copy remux; the mov/mp4/m4a muxers silently DROP a custom awk_loudnorm tag.
         // On those containers the cache stamp would vanish and be re-applied every reprocess - and for an already-within-tolerance track that stamp
         // is the ONLY change, so it would remux the file on every single pass forever (a non-idempotent loop). So the stamp is emitted only when it
-        // will actually survive; on other containers a within-tolerance track is left a true no-op (re-measured next run, but never remuxed). A
-        // track that genuinely needs correction still re-encodes once regardless of container, then measures within tolerance next run.
+        // will actually survive; on other containers a within-tolerance track is left a true no-op (re-measured on the next stack cycle, but never
+        // remuxed). A track that genuinely needs correction still re-encodes once regardless of container, then measures within tolerance next run.
+        // DECLINED: a GLOBAL awk_loudnorm marker, which the mov muxer does keep. It would force -movflags use_metadata_tags on every such file for good
+        // (mp4TagPlan), turning its native iTunes tags into mdta keys that taggers and Apple players cannot read and costing its covr cover art - a worse
+        // trade than one analysis per eligible track per stack cycle.
         const loudnormTagPersists = ['mkv', 'webm', 'mka'].includes(dstContainer);
         const loudnormStampArg = (idx) => (loudnormTagPersists ? ` -metadata:s:a:${idx} "${LOUDNORM_TAG}=${loudnormTagValue()}"` : '');
         // A loudnorm correction that RIDES ALONG on a re-encode some other setting fired (a downmix, a codec_force, a remix) has no line of its own - it is
@@ -2836,6 +2870,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     : (langStereoKeys.includes(ffstream.awkLangKey) ? 'language_stereo' : `language_unlisted=${langUnlisted}`);
                 if (ffstream.awkTier === 'stereo' && !(ffstreamChannels > 0) && !modifiedAudioIdx.has(outputAudioIdx)) {
                     skipDone += noChannelCountSkip(ffstream.index, tierTag, "can't tell whether it needs the stereo downmix");
+                } else if (ffstream.awkTier === 'stereo' && ffstreamChannels > 2 && !modifiedAudioIdx.has(outputAudioIdx)
+                        && containerRefusesAudio(stereoCodec)) {
+                    skipDone += `☒${streamTag(ffstream.index)}[${tierTag}][codec_stereo=${stereoCodec}] Not downmixing to stereo - ${wallText(stereoCodec)}; `
+                        + `left as ${ffstreamCodec} ${ffstreamChannels}ch - ${wallRemedy('codec_stereo')}\n`;
+                    walledOps += 1;
                 } else if (ffstream.awkTier === 'stereo' && ffstreamChannels > 2 && !modifiedAudioIdx.has(outputAudioIdx)) {
                     // Downmix changes channel count, so the source bitrate isn't a comparable floor - stereoEnc uses the 2ch target (aac_vbr: no low-info
                     // tier).
@@ -2853,7 +2892,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // ====== DOWNMIX TO 6 CHANNELS ======
                 // One 6ch per language, from its best >6ch source. A guarded source (guardBlocks) is never replaced in place, so 'replace' becomes 'add'
                 // for it.
-                if (downmixToSix !== 'disabled' && ffstreamChannels > 6 && !hasSixForLang(ffstreamRegionKey)) {
+                if (downmixToSix !== 'disabled' && ffstreamChannels > 6 && !hasSixForLang(ffstreamRegionKey) && containerRefusesAudio(surroundCodec)) {
+                    skipDone += `☒${streamTag(ffstream.index)}[downmix_to_six=${downmixToSix}][codec_surround=${surroundCodec}] Not making a 5.1 - `
+                        + `${wallText(surroundCodec)}; ${wallRemedy('codec_surround')}\n`;
+                    walledOps += 1;
+                } else if (downmixToSix !== 'disabled' && ffstreamChannels > 6 && !hasSixForLang(ffstreamRegionKey)) {
                     const sixMode = (downmixToSix === 'replace' && guardBlocks(ffstream, surroundCodec, 6, ffstreamChannels)) ? 'add' : downmixToSix;
 
                     if (sixMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
@@ -2886,7 +2929,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // >6ch source, both downmixes enabled), the in-place slot is taken, so we fall back to ADDING a stereo from the original input. The user
                 // enabled downmix_to_stereo expecting a 2.0 in the output, so a lone 7.1 with both downmixes on yields a 5.1 and a 2.0 rather than silently
                 // dropping the stereo.
-                if (downmixToStereo !== 'disabled' && ffstreamChannels > 2 && !hasStereoForLang(ffstreamRegionKey)) {
+                if (downmixToStereo !== 'disabled' && ffstreamChannels > 2 && !hasStereoForLang(ffstreamRegionKey) && containerRefusesAudio(stereoCodec)) {
+                    skipDone += `☒${streamTag(ffstream.index)}[downmix_to_stereo=${downmixToStereo}][codec_stereo=${stereoCodec}] Not making a stereo - `
+                        + `${wallText(stereoCodec)}; ${wallRemedy('codec_stereo')}\n`;
+                    walledOps += 1;
+                } else if (downmixToStereo !== 'disabled' && ffstreamChannels > 2 && !hasStereoForLang(ffstreamRegionKey)) {
                     const twoMode = (downmixToStereo === 'replace' && guardBlocks(ffstream, stereoCodec, 2, ffstreamChannels)) ? 'add' : downmixToStereo;
 
                     if (twoMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
@@ -2934,6 +2981,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         skipDone += `☒${streamTag(ffstream.index)}[codec_force=${forceCodec}] Not forcing ${targetCodecFamily} - ${ffstreamCodec} `
                             + `${forceChannels}ch @ ${srcRateStr} exceeds the ${targetMaxCh}ch limit for ${targetCodecFamily}; enable downmix_to_six to `
                             + `create a 5.1 from it first\n`;
+                    } else if (shouldForce && containerRefusesAudio(targetCodec)) {
+                        const codecSetting = isStereo ? 'codec_stereo' : 'codec_surround';
+                        skipDone += `☒${streamTag(ffstream.index)}[codec_force=${forceCodec}][${codecSetting}=${targetCodec}] Not forcing `
+                            + `${targetCodecFamily} - ${wallText(targetCodec)}; left as ${ffstreamCodec} - ${wallRemedy(codecSetting)}\n`;
+                        walledOps += 1;
                     } else if (shouldForce && guardBlocks(ffstream, targetCodec, forceChannels, forceChannels)) {
                         // Guarded: forcing this codec would irreversibly lose detail the target can't hold - see the FORCE CODEC note above.
                         skipDone += `☒${streamTag(ffstream.index)}[codec_force=${forceCodec}] Not forcing ${targetCodecFamily} - would lose detail vs `
@@ -2950,7 +3002,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         const remixDefer = opusBad && remixDefersToExistingStereo(ffstream, relabel);
                         let forced = false;
 
-                        if (opusBad && !relabel && (methodLayoutErr === 'keep' || methodLayoutErr === 'drop' || remixDefer)) {
+                        const remixWalled = opusBad && methodLayoutErr === 'remix' && containerRefusesAudio(stereoCodec);
+                        if (opusBad && !relabel && (methodLayoutErr === 'keep' || methodLayoutErr === 'drop' || remixDefer || remixWalled)) {
                             // No lossless relabel exists (relabelable layouts fall through to the transcode branch below in every
                             // mode). keep; a remix that deferred to an existing stereo; or a drop the pre-pass couldn't apply - leave
                             // the source codec. Real drops already happened in the pre-pass (before the index map); a drop reaches here
@@ -2958,6 +3011,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // track was pre-empted (per-language slot already filled). Report the actual reason, not a fixed one.
                             let why;
                             if (remixDefer) why = ' (a stereo already exists for this language)';
+                            else if (remixWalled) why = ` (the remix would need codec_stereo=${stereoCodec}, and ${wallText(stereoCodec)})`;
                             else if (methodLayoutErr === 'drop') why = dropKeptWhy.has(ffstream.index) ? ` (kept - ${dropKeptWhy.get(ffstream.index)})`
                                 : ' (kept - no downmix converted it to an opus-safe layout)';
                             else why = ', enable a downmix option or set method_layout_err to drop/remix';
@@ -3072,7 +3126,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // fallback codecNameOf supplies when ffprobe carries none.
                 const srcFamily = codecFamilyOf({ codec_name: ffstreamCodec });
                 const keepCodec = ENCODABLE_CODECS.includes(srcFamily) ? srcFamily : configuredCodec;
-                const reachable = (c) => channels <= codecMaxCh(aacFamily(c)) && !guardBlocks(ffstream, c, channels, channels);
+                const reachable = (c) => channels <= codecMaxCh(aacFamily(c)) && !guardBlocks(ffstream, c, channels, channels) && !containerRefusesAudio(c);
                 const wantCodec = forceCovers(isStereo, channels) ? configuredCodec : keepCodec;
                 let targetCodec = reachable(wantCodec) ? wantCodec : (reachable(keepCodec) ? keepCodec : null);
                 // The opus layout wall counts as out of reach too: when libopus refuses this layout with no lossless relabel and no remix will run
@@ -3092,7 +3146,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (channels > codecMaxCh(aacFamily(keepCodec)))
                         skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Skipping - ${ffstreamCodec} ${channels}ch exceeds the `
                             + `${codecMaxCh(aacFamily(keepCodec))}ch limit for ${aacFamily(keepCodec)}\n`;
-                    else
+                    else if (containerRefusesAudio(keepCodec)) {
+                        const remedy = keepCodec === configuredCodec ? ` - ${wallRemedy(isStereo ? 'codec_stereo' : 'codec_surround')}` : '';
+                        skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - ${wallText(keepCodec)}, the codec it `
+                            + `would be re-encoded to; left as ${ffstreamCodec}${remedy}\n`;
+                        walledOps += 1;
+                    } else
                         skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - would lose detail vs `
                             + `${codecDisplayName(ffstream)} ${channels}ch (${guardTriple()}); left as ${ffstreamCodec}\n`;
                     continue;
@@ -3118,7 +3177,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         if (relabel) {
                             // lossless relabel to an opus-safe layout, chained ahead of loudnorm
                             loudnormRelabel = `channelmap=map=${relabel.map}:channel_layout=${relabel.layout}`;
-                        } else if (methodLayoutErr === 'remix' && !remixDefer) {
+                        } else if (methodLayoutErr === 'remix' && !remixDefer && !containerRefusesAudio(stereoCodec)) {
                             // MEASURE FIRST, then decide. The gain correction is the only mandate this loop has - with method_loudnorm=disabled it never runs
                             // at all and the track keeps its source codec and channels - so a track already within LOUDNORM_TOLERANCE_LU (or one the analysis
                             // cap left unmeasured) must not be flattened from surround to stereo for nothing. Every other exit of this loop already bails on
@@ -3147,7 +3206,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             convert = true;
                             continue;
                         } else {
-                            const why = remixDefer ? 'a stereo already exists for this language' : `method_layout_err=${methodLayoutErr}`;
+                            const why = remixDefer ? 'a stereo already exists for this language' : (methodLayoutErr === 'remix'
+                                ? `the remix would need codec_stereo=${stereoCodec}, and ${wallText(stereoCodec)}` : `method_layout_err=${methodLayoutErr}`);
                             skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - libopus can't encode a `
                                 + `${lay || `${channels}ch`} layout; left as ${ffstreamCodec} (${why})\n`;
                             continue;
@@ -3259,7 +3319,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;
             response.processFile = true;
         } else {
-            response.infoLog += `☑Audio already has the correct formats available\n`;
+            response.infoLog += walledOps ? `☒Nothing written - every change wanted here needs a codec a .${dstContainer} file cannot hold (see above)\n`
+                : '☑Audio already has the correct formats available\n';
             response.processFile = false;
         }
         return response;
