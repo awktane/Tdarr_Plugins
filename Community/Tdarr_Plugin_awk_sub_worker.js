@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.63',
+    Version: '3.999.64',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1217,6 +1217,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // size cannot answer it (a byte-truncated raw .sup reads as valid - measured): see the subtitle cue span section. Shared so a refinement cannot land
     // on one plugin's copy and leave the other answering differently about the same file.
     const fileHasBytes = (p) => { try { return fs.statSync(p).size > 0; } catch (e) { return false; } };
+    // -=-=-= isSymlinkAt  [clean_and_remux, sub_worker] =-=-=-
+    // Is the entry at a sidecar's library name a symbolic link? Asked before either question above, because both plugins write a sidecar as an extra output
+    // of Tdarr's ffmpeg run and ffmpeg opens an output THROUGH a link (no O_NOFOLLOW - verified on 7.1.4): one planted at the predictable name, pointing at
+    // a file that does not exist, has the export create that file wherever the link points, as the Tdarr user, holding bytes the media supplier chose.
+    // existsSync and stat follow the link, so a dangling one reads as absent - hence lstat. A link found here is refused, never followed or deleted: the
+    // name is ours, so a link at it was planted. Only the pre-planted link is closed; one created between the plugin returning and ffmpeg's open() is not.
+    const isSymlinkAt = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch (e) { return false; } };
     // ===== END SHARED: sidecar placement =====
 
     // ===== SHARED [clean_and_remux, sub_worker]: subtitle cue span =====
@@ -1803,6 +1810,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const readViaApi = () => isUnmappedNode && !mountedLib().dir;
     const placeViaApi = () => isUnmappedNode && !(mountedLib().dir && mountedLib().writable);
     const serverDestFor = (name) => serverSidePath(path.join(libDir, name));
+    // A path, or an fs error message carrying one, echoed into infoLog: sanitised like every echo (logSafe), but never cut - PATH_MAX already bounds it,
+    // and the tail a cap would drop is the part that names the file. The library directory is the user's own name, so it can hold a newline.
+    const logPath = (v) => logSafe(v, Infinity);
 
     const CURL_FILESIZE_EXCEEDED = 63;   // curl's exit status when --max-filesize refuses a transfer
 
@@ -2302,7 +2312,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!entries.length || !entries.some((n) => marked.has(n))) return '';
         if (entries.some((n) => fs.existsSync(path.join(workLibDir(), n)))) return '';
         try { fs.unlinkSync(listPath); return `☑[${delReason}] Deleted ${listName} - every sidecar it listed is now in the file\n`; }
-        catch (e) { return `☒[${delReason}] Could not delete ${listName}: ${e && e.message ? e.message : e}\n`; }
+        catch (e) { return `☒[${delReason}] Could not delete ${listName}: ${logPath(e && e.message ? e.message : e)}\n`; }
     };
     // ====== END SIDECAR SCAN / HASH / DEDUP ======
 
@@ -2447,7 +2457,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!marked.size) return { deleted: 0, log: '' };
         const scan = scanSidecarDirs();
         if (scan.err) {
-            return { deleted: 0, log: `☒[${delReason}] Cannot read the library directory to remove imported sidecars: ${scan.err.message || scan.err}\n` };
+            return { deleted: 0, log: `☒[${delReason}] Cannot read the library directory to remove imported sidecars: `
+                + `${logPath(scan.err.message || scan.err)}\n` };
         }
         const embedded = streamList.filter((s) => codecTypeOf(s) === 'subtitle');
         const anyFont = streamList.some((s) => codecTypeOf(s) === 'attachment' && isFontAttachment(s));
@@ -2479,14 +2490,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         for (const f of scan.rels.map(parseSidecarRel).filter(Boolean).filter((x) => marked.has(x.rel))) {
             const why = confirmedWhy(f);
             if (!why) {
-                log += `☒[${delReason}] Marker lists ${f.rel} but nothing in the file is confirmed to be it${
+                log += `☒[${delReason}] Marker lists ${logSafe(f.rel)} but nothing in the file is confirmed to be it${
                     hashes === null ? " (the file's subtitle text could not be read)" : ''} - not deleting (unverified)\n`;
                 continue;
             }
             const loss = deletionLoss(f, contentConfirms(f), mp4Target);
             if (loss) { log += keepForLossLine(f.rel, loss); continue; }
-            try { fs.unlinkSync(path.join(workLibDir(), f.rel)); deleted += 1; log += `☑[${delReason}] Deleted sidecar (${why}): ${f.rel}\n`; }
-            catch (e) { log += `☒[${delReason}] Could not delete sidecar ${f.rel}: ${e && e.message ? e.message : e}\n`; }
+            try { fs.unlinkSync(path.join(workLibDir(), f.rel)); deleted += 1; log += `☑[${delReason}] Deleted sidecar (${why}): ${logSafe(f.rel)}\n`; }
+            catch (e) { log += `☒[${delReason}] Could not delete sidecar ${logSafe(f.rel)}: ${logPath(e && e.message ? e.message : e)}\n`; }
         }
         log += deleteSpentSubtitleList(delReason, marked);
         return { deleted, log };
@@ -2501,7 +2512,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const probed = probeCurrentFile();
         if (!probed) return skip('☒[remove_source=true] Cannot read the accepted file to confirm what is embedded - every sidecar is left in place\n');
         const { log } = deleteImportedSidecars(probed.streams, probed.tags, isMp4);
-        return skip(log ? `☑[remove_source=true] Working in ${workLibDir()}\n${log}`
+        return skip(log ? `☑[remove_source=true] Working in ${logPath(workLibDir())}\n${log}`
             : `☑[remove_source=true] No imported sidecar is waiting to be removed\n`);
     }
     // ====== END POST-PROCESSING ======
@@ -2694,6 +2705,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (remote && remote.state === 'unknown') {
                 return { job: null, note: `☒[embedded_cc=enabled] Could not confirm whether ${name} is already in the library (${remote.why}) - `
                     + 'not overwriting it; the captions stay in the video for a later pass\n' };
+            }
+            // A symbolic link at the name (isSymlinkAt) is neither read as the memo nor written through, and is kept out of the import below like any
+            // untrusted sidecar. Only a local view can see one; the API route asks the server, which cannot say.
+            if (!remote && isSymlinkAt(full)) {
+                return { job: null, untrusted: true, note: `☒[embedded_cc=enabled] ${name} in the library is a symbolic link - not reading or writing`
+                    + ' through it, since it could point anywhere; remove it and requeue, the captions stay in the video\n' };
             }
             let leftoverNote = '';
             const existing = remote ? (remote.state === 'present' ? 'remote' : '')
@@ -2958,6 +2975,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     deferred += 1;
                     response.infoLog += `☒${streamTag(s.index)} Could not confirm whether ${name} is already in the library (${remote.why}) - `
                         + 'not overwriting it, keeping the embedded subtitle for a later pass\n';
+                    continue;
+                }
+                // A symbolic link at the name (isSymlinkAt) is refused - neither trusted as the sidecar nor written through. Only a local view can see one.
+                if (!remote && isSymlinkAt(full)) {
+                    refused += 1;
+                    response.infoLog += `☒${streamTag(s.index)} ${name} in the library is a symbolic link - not extracting through it, since it could point `
+                        + 'anywhere; remove it and requeue, keeping the embedded subtitle\n';
                     continue;
                 }
                 let alreadyExtracted = remote ? remote.state === 'present'
@@ -3250,11 +3274,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // The tag echoes a free-text input, so it gets the same treatment failLangToken gives its token: control characters collapsed (a raw
                 // newline would split the line into a continuation with no ☐/☑/☒ symbol) and capped, since nothing bounds the list and this line is
                 // per-sidecar.
-                response.infoLog += `☑[only_languages=${logSafe(inputs.only_languages)}] Skipping ${f.rel} - ${f.lang} is not in the list\n`;
+                response.infoLog += `☑[only_languages=${logSafe(inputs.only_languages)}] Skipping ${logSafe(f.rel)} - ${logSafe(f.lang)} is not in`
+                    + ' the list\n';
                 return false;
             }
             if (!subBundleFits(f)) {
-                response.infoLog += `☒Cannot import ${f.rel} - an ${dstContainer} target carries no font attachments, `
+                response.infoLog += `☒Cannot import ${logSafe(f.rel)} - an ${dstContainer} target carries no font attachments, `
                     + 'keeping the styled-subtitle bundle on disk\n';
                 return false;
             }
@@ -3370,10 +3395,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // wrong copy of the library. It also says when the node type is UNKNOWN: that comes from otherArguments.configVars, which only the classic worker
         // supplies, so a caller passing less (the flow shim passes no configVars at all) leaves an unmapped node indistinguishable from a mapped one, and the
         // mapped assumption points every read and every delete at the mirror. Naming both the directory and the missing configuration turns that into one line.
-        if (!isUnmappedNode) response.infoLog += `☑Reading sidecars from ${workLibDir()}${
+        if (!isUnmappedNode) response.infoLog += `☑Reading sidecars from ${logPath(workLibDir())}${
             otherArguments?.configVars ? '' : ' (node type unknown - Tdarr passed no node configuration for this run)'}\n`;
         const scan = listedRels ? { rels: listedRels } : scanSidecarDirs();
-        if (scan.err) failFile(`Cannot read the library directory to find sidecars: ${scan.err.message || scan.err}`);
+        if (scan.err) failFile(`Cannot read the library directory to find sidecars: ${logPath(scan.err.message || scan.err)}`);
         // Parse every scanned name once - the found-filter and the unparseable-name warning below read the same parse. The scope filter (with its skip
         // lines) is subInScopeLogged above; on the text_file route it already ran against the listed names, and re-testing the fetched survivors here
         // passes silently.

@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.50',
+    Version: '4.999.51',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1588,6 +1588,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // size cannot answer it (a byte-truncated raw .sup reads as valid - measured): see the subtitle cue span section. Shared so a refinement cannot land
     // on one plugin's copy and leave the other answering differently about the same file.
     const fileHasBytes = (p) => { try { return fs.statSync(p).size > 0; } catch (e) { return false; } };
+    // -=-=-= isSymlinkAt  [clean_and_remux, sub_worker] =-=-=-
+    // Is the entry at a sidecar's library name a symbolic link? Asked before either question above, because both plugins write a sidecar as an extra output
+    // of Tdarr's ffmpeg run and ffmpeg opens an output THROUGH a link (no O_NOFOLLOW - verified on 7.1.4): one planted at the predictable name, pointing at
+    // a file that does not exist, has the export create that file wherever the link points, as the Tdarr user, holding bytes the media supplier chose.
+    // existsSync and stat follow the link, so a dangling one reads as absent - hence lstat. A link found here is refused, never followed or deleted: the
+    // name is ours, so a link at it was planted. Only the pre-planted link is closed; one created between the plugin returning and ffmpeg's open() is not.
+    const isSymlinkAt = (p) => { try { return fs.lstatSync(p).isSymbolicLink(); } catch (e) { return false; } };
     // ===== END SHARED: sidecar placement =====
 
     // ===== SHARED [clean_and_remux, sub_worker]: subtitle cue span =====
@@ -2319,10 +2326,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
         };
         // The mechanical half of an export, shared by the image-sub and the styled-bundle branches so the two cannot stage a file differently: the path join,
-        // the unmapped-node lookups, the two refusal tests, the already-exists probe, and the single sidecarOut append that rides the export on the remux.
+        // the unmapped-node lookups, the refusal tests, the already-exists probe, and the single sidecarOut append that rides the export on the remux.
         // Returns { status, name, why, bytes } - 'placed' (unmapped, already uploaded), 'empty' (unmapped, the decode produced nothing), 'exists', 'queued'
-        // or 'refused'. A refusal names only the CAUSE ('unmapped', and failedSidecars holds the detail; 'namecap', with `bytes`; 'unsafe'), because the two
-        // callers spell the CONSEQUENCE differently: an image refusal keeps the subtitle and fails the file, a styled one falls through to mov_text.
+        // or 'refused'. A refusal names only the CAUSE in `why` ('namecap' carries `bytes`, 'short' the two ends, and failedSidecars holds the detail of
+        // 'unmapped' and 'unconfirmed'), because the two callers spell the CONSEQUENCE differently: an image refusal keeps the subtitle and fails the file,
+        // a styled one falls through to mov_text unless a requeue can clear it (bundleHeldCount).
         const stageSidecar = (ffstream, styled) => {
             const { name, mapTokens } = sidecarPlan(ffstream, styled);
             const sidecarPath = path.join(libDir, name);
@@ -2347,7 +2355,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // happens after a completed run, once the stream is already gone). A STYLED bundle may since have been edited, so one that holds the subtitle is
             // trusted and the drop goes ahead - forcing it (-y) could only destroy that work. judgeBundle tells that apart from what an interrupted export
             // leaves: 'replace' is deleted and re-exported, 'short' fails the file with the subtitle intact. A file that cannot be deleted is refused rather
-            // than trusted: each one reaching that is known bad.
+            // than trusted: each one reaching that is known bad. A symbolic link at the name is refused first (isSymlinkAt).
+            if (isSymlinkAt(sidecarPath)) return { status: 'refused', name, why: 'symlink' };
             if (fs.existsSync(sidecarPath)) {
                 if (styled && fileHasBytes(sidecarPath)) {
                     const judged = judgeBundle(sidecarPath, ffstream);
@@ -2582,6 +2591,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             unsafe: `Library directory has a quote, control char or <io> - cannot write ${sidecarName} safely, keeping the subtitle`,
                             leftover: `An incomplete ${sidecarName} from an earlier run could not be deleted to export it again - delete it and requeue,`
                                 + ' keeping the subtitle',
+                            symlink: `${sidecarName} in the library is a symbolic link - not exporting through it, since it could point anywhere; remove it`
+                                + ' and requeue, keeping the subtitle',
                         };
                         exportRefused = true; exportRefusedCount += 1;
                         response.infoLog += `☒${inputTag} ${refusal[why]}\n`;
@@ -2672,13 +2683,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             unsafe: `Library directory has a quote, control char or <io> - cannot write ${sidecarName} safely; converting to mov_text`
                                 + ' instead, which loses the styling',
                             leftover: `An incomplete ${sidecarName} from an earlier run could not be deleted to export it again - delete it and requeue`,
+                            symlink: `${sidecarName} in the library is a symbolic link - not exporting through it, since it could point anywhere; remove it`
+                                + ' and requeue',
                             unconfirmed: `Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}; a transient answer, so the`
                                 + ' styled subtitle is not flattened over it - requeue once the server answers',
                             short: `${sidecarName} already in the library stops at ${Number(staged.end).toFixed(1)} s but this subtitle runs to `
                                 + `${Number(staged.streamEnd).toFixed(1)} s - a run that failed partway, or an edit that cut the end, so it cannot be `
                                 + 'trusted with the only copy - delete it and requeue to export the whole subtitle',
                         };
-                        if (why === 'short' || why === 'leftover' || why === 'unconfirmed') bundleHeldCount += 1;
+                        if (why === 'short' || why === 'leftover' || why === 'symlink' || why === 'unconfirmed') bundleHeldCount += 1;
                         response.infoLog += `☒${inputTag} ${refusal[why || 'unmapped']}\n`;
                     }
                     if (exported) { dropStream(ffstream.index); subtitleStreamIndex--; continue; }
