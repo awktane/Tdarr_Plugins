@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.65',
+    Version: '3.999.66',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -327,16 +327,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each keyword
     // lives on ONE flag PER STREAM TYPE - hasDisposition scopes by entry.streams - so title->flag promotion stays unambiguous; descriptive/descriptions/dvs
     // deliberately appear on both the audio and subtitle entries), and the canonical title string (tag, null when never written). The single table every
-    // classifier, sort key, summary token and title tagger reads, so the lists can never drift.
+    // classifier, sort key, summary token and title tagger reads, so the lists can never drift. The commentary, audio-description and dub roles also carry
+    // the words European releases title such tracks with, unflagged (German, French, Spanish, Portuguese, Italian, Dutch, Polish and the Nordic languages):
+    // each is a whole-token match, so only a word that means nothing else in a track title belongs here, and every one is pinned by the harness.
     const dispositionTypes = {
-        comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                                            tag: 'Commentary'  },
-        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','descriptions','dvs','audio description','described video','visually impaired','visual impaired'], tag: 'Descriptive' },
+        comment:          { streams:['audio','subtitle'],         keywords: ['commentary', 'kommentar', 'commentaire', 'comentario', 'comentário', 'commento',
+                                'commentaar', 'komentarz', 'kommentaari'],                                                      tag: 'Commentary'  },
+        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','descriptions','dvs','audio description','described video',
+                                'visually impaired','visual impaired', 'audiodeskription', 'hörfilm', 'audiodescription', 'audiodescripción',
+                                'audiodescrição', 'audiodescrizione', 'audiodescriptie', 'audiodeskrypcja', 'syntolkning', 'synstolkning', 'synstolking',
+                                'kuvailutulkkaus'],                                                                             tag: 'Descriptive' },
         descriptions:     { streams:['subtitle'],                 keywords: ['descriptive','descriptions','dvs'],                      tag: 'Descriptive' },
         hearing_impaired: { streams:['subtitle'],                 keywords: ['sdh','hearing impaired','hard of hearing','hoh','deaf'], tag: 'SDH'         },
         captions:         { streams:['subtitle'],                 keywords: ['caption','captions','cc'],                               tag: 'SDH'         },
         lyrics:           { streams:['subtitle'],                 keywords: ['songs','lyrics'],                                        tag: 'Lyrics'      },
         forced:           { streams:['subtitle'],                 keywords: ['forced','foreign'],                                      tag: 'Forced'      },
-        dub:              { streams:['audio'],                    keywords: ['dub','dubbed'],                                          tag: 'Dub'         },
+        dub:              { streams:['audio'],                    keywords: ['dub','dubbed', 'dubbing', 'doublage', 'doblaje', 'doblado', 'dublado', 'dublagem',
+                                'doppiaggio', 'doppiato', 'dubbad', 'dubbet'],                                                  tag: 'Dub'         },
         original:         { streams:['audio'],                    keywords: ['original'],                                              tag: 'Original'    },
         clean_effects:    { streams:['audio'],                    keywords: ['music and effects','music & effects','m&e','m and e'],   tag: null          },
         karaoke:          { streams:['audio'],                    keywords: ['karaoke'],                                               tag: 'Karaoke'     },
@@ -350,13 +357,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // by stream object (WeakMap, per-run closure) because hasDisposition calls it repeatedly per stream. Both description reads go
     // through getTagCI, and neither casing is a guess: matroska UPPER-CASES tag keys on write, so the ffprobe side comes back
     // DESCRIPTION; and MediaInfo defines Comment/Description as GENERAL-only parameters, so a per-TRACK value never appears top-level
-    // - it lands in the track's 'extra' bag under whatever spelling the container used. A fixed-case top-level read matches neither.
+    // - it lands in the track's 'extra' bag under whatever spelling the container used. A fixed-case top-level read matches neither. NFC first, so a
+    // title stored decomposed (an o followed by a combining diaeresis) matches the precomposed keyword it reads as.
     const roleTextCache = new WeakMap();
     const roleTextLower = (s) => {
         if (roleTextCache.has(s)) return roleTextCache.get(s);
         const mi = mediaInfoFor(s);
         const text = [s.tags?.title, getTagCI(s.tags, 'description'), s.tags?.handler_name,
-            mi?.Title, getTagCI(mi?.extra, 'description')].filter(Boolean).join(' ').trim().toLowerCase();
+            mi?.Title, getTagCI(mi?.extra, 'description')].filter(Boolean).join(' ').trim().normalize('NFC').toLowerCase();
         roleTextCache.set(s, text);
         return text;
     };

@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.46',
+    Version: '3.999.47',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -270,9 +270,9 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['true', 'false'],
             },
-            tooltip: `Protect a LOSSLESS or mastering-grade video source from being re-encoded: ProRes, DNxHD, CineForm, JPEG 2000, FFV1, HuffYUV, FFVHuff,
-                    MagicYUV, UtVideo, Lagarith, SheerVideo, QuickTime/Microsoft RLE, the lossless screen-capture codecs (Flash Screen Video, TechSmith
-                    TSCC, ZMBV), and uncompressed video (raw, v210/v410/v408/v308, y41p, r210/r10k).
+            tooltip: `Protect a LOSSLESS or mastering-grade video source from being re-encoded: ProRes, DNxHD, CineForm, JPEG 2000, JPEG-LS, FFV1, HuffYUV,
+                    FFVHuff, MagicYUV, UtVideo, Lagarith, SheerVideo, Canopus Lossless, LCL (zlib/mszh), QuickTime/Microsoft RLE, the lossless screen- and
+                    game-capture codecs (Flash Screen Video, TechSmith TSCC, ZMBV, Fraps), and uncompressed video (raw, v210/v410/v408/v308, y41p, r210/r10k).
                 \\n=====
                 \\nActions
                 \\n=====
@@ -365,16 +365,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each keyword
     // lives on ONE flag PER STREAM TYPE - hasDisposition scopes by entry.streams - so title->flag promotion stays unambiguous; descriptive/descriptions/dvs
     // deliberately appear on both the audio and subtitle entries), and the canonical title string (tag, null when never written). The single table every
-    // classifier, sort key, summary token and title tagger reads, so the lists can never drift.
+    // classifier, sort key, summary token and title tagger reads, so the lists can never drift. The commentary, audio-description and dub roles also carry
+    // the words European releases title such tracks with, unflagged (German, French, Spanish, Portuguese, Italian, Dutch, Polish and the Nordic languages):
+    // each is a whole-token match, so only a word that means nothing else in a track title belongs here, and every one is pinned by the harness.
     const dispositionTypes = {
-        comment:          { streams:['audio','subtitle'],         keywords: ['commentary'],                                            tag: 'Commentary'  },
-        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','descriptions','dvs','audio description','described video','visually impaired','visual impaired'], tag: 'Descriptive' },
+        comment:          { streams:['audio','subtitle'],         keywords: ['commentary', 'kommentar', 'commentaire', 'comentario', 'comentário', 'commento',
+                                'commentaar', 'komentarz', 'kommentaari'],                                                      tag: 'Commentary'  },
+        visual_impaired:  { streams:['audio'],                    keywords: ['descriptive','descriptions','dvs','audio description','described video',
+                                'visually impaired','visual impaired', 'audiodeskription', 'hörfilm', 'audiodescription', 'audiodescripción',
+                                'audiodescrição', 'audiodescrizione', 'audiodescriptie', 'audiodeskrypcja', 'syntolkning', 'synstolkning', 'synstolking',
+                                'kuvailutulkkaus'],                                                                             tag: 'Descriptive' },
         descriptions:     { streams:['subtitle'],                 keywords: ['descriptive','descriptions','dvs'],                      tag: 'Descriptive' },
         hearing_impaired: { streams:['subtitle'],                 keywords: ['sdh','hearing impaired','hard of hearing','hoh','deaf'], tag: 'SDH'         },
         captions:         { streams:['subtitle'],                 keywords: ['caption','captions','cc'],                               tag: 'SDH'         },
         lyrics:           { streams:['subtitle'],                 keywords: ['songs','lyrics'],                                        tag: 'Lyrics'      },
         forced:           { streams:['subtitle'],                 keywords: ['forced','foreign'],                                      tag: 'Forced'      },
-        dub:              { streams:['audio'],                    keywords: ['dub','dubbed'],                                          tag: 'Dub'         },
+        dub:              { streams:['audio'],                    keywords: ['dub','dubbed', 'dubbing', 'doublage', 'doblaje', 'doblado', 'dublado', 'dublagem',
+                                'doppiaggio', 'doppiato', 'dubbad', 'dubbet'],                                                  tag: 'Dub'         },
         original:         { streams:['audio'],                    keywords: ['original'],                                              tag: 'Original'    },
         clean_effects:    { streams:['audio'],                    keywords: ['music and effects','music & effects','m&e','m and e'],   tag: null          },
         karaoke:          { streams:['audio'],                    keywords: ['karaoke'],                                               tag: 'Karaoke'     },
@@ -388,13 +395,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // by stream object (WeakMap, per-run closure) because hasDisposition calls it repeatedly per stream. Both description reads go
     // through getTagCI, and neither casing is a guess: matroska UPPER-CASES tag keys on write, so the ffprobe side comes back
     // DESCRIPTION; and MediaInfo defines Comment/Description as GENERAL-only parameters, so a per-TRACK value never appears top-level
-    // - it lands in the track's 'extra' bag under whatever spelling the container used. A fixed-case top-level read matches neither.
+    // - it lands in the track's 'extra' bag under whatever spelling the container used. A fixed-case top-level read matches neither. NFC first, so a
+    // title stored decomposed (an o followed by a combining diaeresis) matches the precomposed keyword it reads as.
     const roleTextCache = new WeakMap();
     const roleTextLower = (s) => {
         if (roleTextCache.has(s)) return roleTextCache.get(s);
         const mi = mediaInfoFor(s);
         const text = [s.tags?.title, getTagCI(s.tags, 'description'), s.tags?.handler_name,
-            mi?.Title, getTagCI(mi?.extra, 'description')].filter(Boolean).join(' ').trim().toLowerCase();
+            mi?.Title, getTagCI(mi?.extra, 'description')].filter(Boolean).join(' ').trim().normalize('NFC').toLowerCase();
         roleTextCache.set(s, text);
         return text;
     };
@@ -1789,11 +1797,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // uncompressed packed layouts that arrive under their own codec_name. Every name is a decoder on the production build, so none is dead membership.
     // Two membership calls, stated because each reads as an omission otherwise. jpeg2000 IS here: it is the DCP / IMF / broadcast-mezzanine codec the shared
     // IMAGE_CODECS comment names, and though the format has a lossy mode neither probe reports which was used, so mastering-grade is the fail-safe reading.
-    // The screen-capture rows stop at the three that reach a real library (Flash screencasts, Camtasia recordings, DOSBox captures): tscc2 is TechSmith's
+    // jpegls is here on the same reading: ffmpeg flags it lossless AND lossy (its near-lossless mode), and nothing reports which a file used.
+    // The screen-capture rows stop at those that reach a real library (Flash screencasts, Camtasia recordings, DOSBox and Fraps captures): tscc2 is TechSmith's
     // LOSSY second generation, and the remote-desktop family (rscc, mwsc, rasc, srgc, scpr, vmnc, mss1/mss2/msa1) is recorder-internal rather than a library
     // file, several of them lossy hybrids in any case.
     const LOSSLESS_VIDEO_CODECS = ['ffv1', 'huffyuv', 'ffvhuff', 'hymt', 'magicyuv', 'utvideo', 'lagarith', 'sheervideo', 'prores', 'dnxhd', 'cfhd',
-        'jpeg2000', 'qtrle', 'msrle', 'flashsv', 'flashsv2', 'tscc', 'zmbv',
+        'cllc', 'zlib', 'mszh', 'jpeg2000', 'jpegls', 'qtrle', 'msrle', 'flashsv', 'flashsv2', 'tscc', 'zmbv', 'fraps',
         'rawvideo', 'v210', 'v210x', 'v410', 'v408', 'v308', 'y41p', 'r210', 'r10k'];
 
     // Efficiency rank for shrink's never-downgrade rule: vp9~hevc and vp8~h264, so an efficient WebM/VP source isn't "upgraded" to a less-efficient
@@ -1911,12 +1920,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.container = `.${dstContainer}`;
         // ...so a container that cannot hold the codec this run would write is a refusal, not an encode. Two failure shapes, both measured on jellyfin-ffmpeg
         // 7.1.4 by encoding into every container in Tdarr's default filter plus the 3gp/ogg/asf family and reading the result back (explicit hvc1/hev1/av01
-        // tags change nothing; .divx and .tp/.trp/.tod through the -f their muxer needs): the muxer REFUSES at header write (exit 234, so the file reaches the error queue with nothing but ffmpeg's own message), or it
-        // exits 0 and writes a file that no longer reads back as that codec - AV1 into MPEG-PS reads back 'unknown', into MPEG-TS as nothing, and HEVC into
-        // avi as rawvideo, which would make every later pass re-encode it. mkv, mp4 and flv take all three. In the designed stack clean_and_remux has
-        // already remuxed to mkv or mp4, so only a standalone run - or one ordered before it - meets these. awk-ffmpeg-test's muxmatrix re-measures every
-        // cell (its WRITEBACK rows mirror this table, guarded by selftest_mirrors). .m4v is absent because it is written through the mp4 muxer, which takes all
-        // three, and an extension no muxer writes back at all (.evo and the rest) never gets this far - both are the output muxer section's business.
+        // tags change nothing; .divx and .tp/.trp/.tod were written through the -f their muxer needs): the muxer REFUSES at header write (exit 234, so the
+        // file reaches the error queue with nothing but ffmpeg's own message), or it exits 0 and writes a file that no longer reads back as that codec - AV1
+        // into MPEG-PS reads back 'unknown', into MPEG-TS as nothing, and HEVC into avi as rawvideo, which would make every later pass re-encode it. mkv, mp4
+        // and flv take all three. In the designed stack clean_and_remux has already remuxed to mkv or mp4, so only a standalone run - or one ordered before
+        // it - meets these. awk-ffmpeg-test's muxmatrix re-measures every cell (its WRITEBACK rows mirror this table, guarded by selftest_mirrors). .m4v is
+        // absent because it is written through the mp4 muxer, which takes all three, and an extension no muxer writes back at all (.evo and the rest) never
+        // gets this far - both are the output muxer section's business.
         const CONTAINER_REFUSES_VIDEO = {
             webm: ['hevc', 'h264'], mov: ['av1'], '3gp': ['hevc', 'av1'], '3g2': ['hevc', 'av1'],
             wmv: ['hevc'], asf: ['hevc'], ogv: ['hevc', 'h264', 'av1'], ogg: ['hevc', 'h264', 'av1'],
