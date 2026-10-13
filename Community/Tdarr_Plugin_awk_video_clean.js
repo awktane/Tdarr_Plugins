@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.49',
+    Version: '3.999.50',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -60,7 +60,7 @@ const details = () => ({
                 H.264 breaks device support. HDR10 plays poorly in H.264, so prefer hevc for an HDR source.
                 \\nav1: the most efficient, but slow on CPU. Hardware AV1 needs a very new GPU (Intel Arc, RTX 40-series, RDNA3); otherwise the libsvtav1
                 software encoder does it.
-                \\nDolby Vision needs HEVC: with guard_dv on, a DV source that is already HEVC stays HEVC whatever you set here, because only libx265
+                \\nDolby Vision needs HEVC: with guard_dv enabled, a DV source that is already HEVC stays HEVC whatever you set here, because only libx265
                 carries the DV RPU and only from an HEVC source.`,
         },
         {
@@ -119,7 +119,7 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\npreserve (default, recommended): keep HDR as it is. Static HDR10/HLG transcodes normally, and Dolby Vision / HDR10+ / HDR Vivid is
-                protected - with guard_dv on, DV survives a transcode via libx265, and under hdr_cleanup_only nothing is touched at all.
+                protected - with guard_dv enabled, DV survives a transcode via libx265, and under hdr_cleanup_only nothing is touched at all.
                 \\nstrip_dynamic: drop just the dynamic layer and keep the base HDR10. When that is the ONLY thing to do, with no codec or resolution
                 change, it is LOSSLESS - a -c:v copy with a bitstream filter, at no quality cost - and it folds into a real transcode if codec or
                 downscale also fire. Overridden per file by guard_dv, which preserves the DV instead.
@@ -214,11 +214,11 @@ const details = () => ({
         },
         {
             name: 'guard_captions',
-            type: 'boolean',
-            defaultValue: false,
+            type: 'string',
+            defaultValue: 'disabled',
             inputUI: {
                 type: 'dropdown',
-                options: ['false', 'true'],
+                options: ['disabled', 'enabled'],
             },
             tooltip: `Protect embedded closed captions through a transcode. These are not a subtitle track - they ride inside the video bitstream itself
                     (A53/EIA-608, common on North American broadcast recordings), so re-encoding is the one thing that can destroy them, and only some
@@ -226,10 +226,10 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nfalse (default): do not look and do not protect. Wherever the chosen encoder cannot carry captions they are lost silently - a QSV or AMF
+                \\ndisabled (default): do not look and do not protect. Wherever the chosen encoder cannot carry captions they are lost silently - a QSV or AMF
                 node, an Apple VideoToolbox (Mac) encoder, or any AV1 target that is not on an NVIDIA GPU. They ride through untouched on the encoders that
                 keep them: libx264 and libx265, the NVENC and VAAPI encoders for H.264 and HEVC, and NVENC for AV1.
-                \\ntrue: check whether this file really has captions and, if it does, keep them. Where the chosen encoder would drop them the encode moves
+                \\nenabled: check whether this file really has captions and, if it does, keep them. Where the chosen encoder would drop them the encode moves
                 to the CPU - libx264 for an H.264 target, libx265 for HEVC - which is slower than the GPU. AV1 has no caption-carrying CPU encoder, so an AV1
                 target that lands on a dropping encoder is warned about and continues rather than silently changing your codec.
                 \\nCaptions are better handled by lifting them into a real subtitle track - run sub_worker BEFORE this plugin. Once it has, this guard
@@ -242,20 +242,20 @@ const details = () => ({
         },
         {
             name: 'guard_dv',
-            type: 'boolean',
-            defaultValue: true,
+            type: 'string',
+            defaultValue: 'enabled',
             inputUI: {
                 type: 'dropdown',
-                options: ['true', 'false'],
+                options: ['enabled', 'disabled'],
             },
             tooltip: `Protect Dolby Vision through a transcode.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\ntrue (default): carry the DV RPU through a re-encode so the output stays Dolby Vision. To manage that it forces the libx265 software
+                \\nenabled (default): carry the DV RPU through a re-encode so the output stays Dolby Vision. To manage that it forces the libx265 software
                 encoder, the HEVC codec (overriding your codec choice) and 10-bit, and it overrides hdr_mode=strip_dynamic or tonemap_sdr on DV files,
                 preserving the DV with a warning.
-                \\nfalse: do not protect DV. A transcode that would destroy it is still skipped under hdr_mode=preserve, but strip_dynamic and tonemap_sdr
+                \\ndisabled: do not protect DV. A transcode that would destroy it is still skipped under hdr_mode=preserve, but strip_dynamic and tonemap_sdr
                 are honoured, and the DV layer is dropped or flattened as asked.
                 \\nOnly an HEVC source qualifies: libx265 is the sole encoder that carries the RPU, and only from HEVC, so DV in any other codec (AV1,
                 say) is not protected here. Since every hardware HEVC encoder drops the RPU, a GPU or auto node falls back to the CPU for these files.
@@ -264,11 +264,11 @@ const details = () => ({
         },
         {
             name: 'guard_lossless',
-            type: 'boolean',
-            defaultValue: true,
+            type: 'string',
+            defaultValue: 'enabled',
             inputUI: {
                 type: 'dropdown',
-                options: ['true', 'false'],
+                options: ['enabled', 'disabled'],
             },
             tooltip: `Protect a LOSSLESS or mastering-grade video source from being re-encoded: ProRes, DNxHD, CineForm, JPEG 2000, JPEG-LS, FFV1, HuffYUV,
                     FFVHuff, MagicYUV, UtVideo, Lagarith, SheerVideo, Canopus Lossless, LCL (zlib/mszh), QuickTime/Microsoft RLE, the lossless screen- and
@@ -276,9 +276,9 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\ntrue (default): skip the whole file when the source video is one of those codecs and anything would re-encode it - normalize, shrink,
+                \\nenabled (default): skip the whole file when the source video is one of those codecs and anything would re-encode it - normalize, shrink,
                 downscale and tonemap_sdr alike.
-                \\nfalse: treat a lossless source like any other and convert it. Choose this deliberately, since it replaces an editing or archival master
+                \\ndisabled: treat a lossless source like any other and convert it. Choose this deliberately, since it replaces an editing or archival master
                 with a lossy delivery encode.
                 \\nWhy it is worth guarding: every encode here is lossy AND lands 4:2:0 at 8 or 10 bit, so a 4:2:2, 4:4:4 or 12-bit master loses chroma
                 resolution and bit depth on top of the compression - exactly the detail an intermediate format exists to keep, and no later pass can bring
@@ -1863,9 +1863,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const encoderOpt = ddValue(inputs.method_encoder, 'node');
     const hdrMode = ddValue(inputs.hdr_mode, 'preserve');
     const deinterlaceOpt = ddValue(inputs.deinterlace, 'disabled');
-    const guardCaptions = String(inputs.guard_captions) === 'true';   // boolean, default FALSE - opt-in, unlike the two guards below (see its tooltip)
-    const guardDv = String(inputs.guard_dv) === 'true';   // boolean, default true
-    const guardLossless = String(inputs.guard_lossless) === 'true';   // boolean, default true
+    const guardCaptionsOpt = ddValue(inputs.guard_captions, 'disabled');   // opt-in, unlike the two guards below (see its tooltip)
+    const guardDvOpt = ddValue(inputs.guard_dv, 'enabled');
+    const guardLosslessOpt = ddValue(inputs.guard_lossless, 'enabled');
 
     // The two free-text NUMERIC inputs are the only user-typed values this plugin echoes back, and failFile's message becomes the
     // file's stored error, so they get the same treatment as every other free-text echo in the suite - the shared logSafe(v):
@@ -1894,16 +1894,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // value. A uniform table is an anchor it can find; eight differently-shaped `if` statements are not, and one of them going stale is invisible - that is
     // how video_clean's method_encoder kept accepting five retired encoder families for seventeen minor versions. Non-dropdown checks stay where they are.
     const dropdownChecks = [
-        ['action',           action,          ['hdr_cleanup_only', 'normalize', 'shrink']],
-        ['codec',            codec,           ['source', 'hevc', 'h264', 'av1']],
-        ['downscale',        downscaleOpt,    ['disabled', '2160', '1440', '1080', '720']],
-        ['method_speed',     speed,           ['slow', 'medium', 'fast']],
-        ['method_bitdepth',  bitDepthOpt,     ['source', '8', '10']],
-        ['method_encoder',   encoderOpt,      ['node', 'node_strict', 'auto', 'cpu']],
-        ['hdr_mode',         hdrMode,         ['preserve', 'strip_dynamic', 'tonemap_sdr']],
-        ['deinterlace',      deinterlaceOpt,  ['disabled', 'enabled']],
+        ['action',           action,           ['hdr_cleanup_only', 'normalize', 'shrink']],
+        ['codec',            codec,            ['source', 'hevc', 'h264', 'av1']],
+        ['downscale',        downscaleOpt,     ['disabled', '2160', '1440', '1080', '720']],
+        ['method_speed',     speed,            ['slow', 'medium', 'fast']],
+        ['method_bitdepth',  bitDepthOpt,      ['source', '8', '10']],
+        ['method_encoder',   encoderOpt,       ['node', 'node_strict', 'auto', 'cpu']],
+        ['hdr_mode',         hdrMode,          ['preserve', 'strip_dynamic', 'tonemap_sdr']],
+        ['deinterlace',      deinterlaceOpt,   ['disabled', 'enabled']],
+        ['guard_captions',   guardCaptionsOpt, ['disabled', 'enabled']],
+        ['guard_dv',         guardDvOpt,       ['enabled', 'disabled']],
+        ['guard_lossless',   guardLosslessOpt, ['enabled', 'disabled']],
     ];
     checkDropdowns(dropdownChecks);
+    const guardCaptions = guardCaptionsOpt === 'enabled';
+    const guardDv = guardDvOpt === 'enabled';
+    const guardLossless = guardLosslessOpt === 'enabled';
     // The one cross-input config error: tonemap_sdr is a pixel-domain re-encode, so it can never satisfy hdr_cleanup_only's lossless-or-skip promise.
     if (hdrMode === 'tonemap_sdr' && action === 'hdr_cleanup_only')
         failFile('[hdr_mode=tonemap_sdr][action=hdr_cleanup_only] tonemapping is always a re-encode (never lossless)'
@@ -2056,14 +2062,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const preserveDv = dvSignal && guardDvLive && srcCodecName === 'hevc';
         if (preserveDv) targetCodecName = 'hevc';   // force HEVC (overrides codec / codec=source)
         if (preserveDv && codec !== 'source' && codec !== 'hevc')
-            response.infoLog += `☒${streamTag(primary.index)}[codec=${codec}][guard_dv=true] ${dvLabel} - forcing HEVC (only libx265 carries the DV RPU);`
-                + ` set guard_dv=false to use ${codec}\n`;
+            response.infoLog += `☒${streamTag(primary.index)}[codec=${codec}][guard_dv=enabled] ${dvLabel} - forcing HEVC (only libx265 carries the DV RPU);`
+                + ` set guard_dv=disabled to use ${codec}\n`;
         // guard_dv wins: keep the DV, suppress the strip/tonemap request
         const dvOverridesHdr = preserveDv && (hdrMode === 'strip_dynamic' || hdrMode === 'tonemap_sdr');
         const effHdrMode = dvOverridesHdr ? 'preserve' : hdrMode;
         if (dvOverridesHdr)
-            response.infoLog += `☒${streamTag(primary.index)}[guard_dv=true][hdr_mode=${hdrMode}] ${dvLabel} - guard_dv keeps the Dolby Vision instead of `
-                + `${hdrMode === 'tonemap_sdr' ? 'tonemapping to SDR' : 'stripping the dynamic layer'}; set guard_dv=false to `
+            response.infoLog += `☒${streamTag(primary.index)}[guard_dv=enabled][hdr_mode=${hdrMode}] ${dvLabel} - guard_dv keeps the Dolby Vision instead of `
+                + `${hdrMode === 'tonemap_sdr' ? 'tonemapping to SDR' : 'stripping the dynamic layer'}; set guard_dv=disabled to `
                 + `${hdrMode === 'tonemap_sdr' ? 'tonemap' : 'strip'} it\n`;
         const dvIptC2 = preserveDv && srcIsIptC2;   // skip below rather than emit a command libx265 would reject
 
@@ -2344,7 +2350,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // other target follows method_bitdepth (10 / source-depth); guard_dv then forces 10-bit for a DV file, which an 8-bit output would break.
         let want10Bit = targetCodecName === 'h264' ? false : (bitDepthOpt === '10' || (bitDepthOpt === 'source' && srcIs10));
         if (preserveDv && !want10Bit) {
-            response.infoLog += `☒${streamTag(primary.index)}[method_bitdepth=${bitDepthOpt}][guard_dv=true] Dolby Vision requires 10-bit`
+            response.infoLog += `☒${streamTag(primary.index)}[method_bitdepth=${bitDepthOpt}][guard_dv=enabled] Dolby Vision requires 10-bit`
                 + ` - keeping 10-bit output (ignoring the 8-bit request)\n`;
             want10Bit = true;
         }
@@ -2389,7 +2395,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // the file is skipped as "already processed at this exact setting" while the work it now asks for never runs. The fingerprint is a FIXED POINT, not a
         // pure function of the settings: four tokens are SOURCE-derived and are correct only because the transform makes the output re-read as the thing that
         // produced them - targetCodecName under codec=source, want10Bit under method_bitdepth=source, q from the OUTPUT height, and dv from preserveDv. Do NOT
-        // "correct" one of these to key on its setting instead: keying dv on guardDvLive would stamp the token on EVERY file processed with guard_dv on (the
+        // "correct" one of these to key on its setting instead: keying dv on guardDvLive would stamp the token on EVERY file run with guard_dv enabled (the
         // default), invalidating every awk_video tag in the field and costing every user one full re-encode pass, to prevent a divergence that cannot occur - a
         // preserved encode carries the RPU through, so pass 2 re-reads dvSignal and recomputes the same token (measured 2026-08-26 on jellyfin 7.1.4 with a
         // real profile-8.1 RPU: dvhe/p8/L6 in, dvh1/p8/L6 out, record intact; see awk-ffmpeg-test's build-facts.md). The fixed point is pinned by the scenario
@@ -2461,10 +2467,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let hwAlt = null;
             let forcedBy = '';
             if (sel.family === 'cpu' && (refuse || tight)) {
-                if (selUnforced !== sel && selUnforced.family && selUnforced.family !== 'cpu') { hwAlt = selUnforced; forcedBy = 'guard_captions=true'; }
+                if (selUnforced !== sel && selUnforced.family && selUnforced.family !== 'cpu') { hwAlt = selUnforced; forcedBy = 'guard_captions=enabled'; }
                 else if (preserveDv) {
                     const alt = selectEncoder({ codec: targetCodecName, encoderOpt, otherArguments, forceCpu: false });
-                    if (alt.family && alt.family !== 'cpu') { hwAlt = alt; forcedBy = 'guard_dv=true'; }   // its notes are discarded - it never ran
+                    if (alt.family && alt.family !== 'cpu') { hwAlt = alt; forcedBy = 'guard_dv=enabled'; }   // its notes are discarded - it never ran
                 }
             }
             const label = `${outHeight}p ${want10Bit ? '10-bit' : '8-bit'} ${sel.encoderName}`;
@@ -2513,10 +2519,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Build the transcode preset (encoder resolved per node) + the predicted output summary.
         const emitTranscode = (encodeTag) => {
-            if (preserveDv) response.infoLog += `☐${streamTag(primary.index)}[guard_dv=true] ${dvLabel} - keeping the DV RPU through the re-encode (libx265)\n`;
+            if (preserveDv)
+                response.infoLog += `☐${streamTag(primary.index)}[guard_dv=enabled] ${dvLabel} - keeping the DV RPU through the re-encode (libx265)\n`;
             // libx265 carries only the RPU through a re-encode; any other dynamic layer on the same file is lost, and every other path that loses one says so.
             const lostWithDv = preserveDv ? [isHdr10Plus ? 'HDR10+' : '', isHdrVivid ? 'HDR Vivid' : ''].filter(Boolean).join(' and ') : '';
-            if (lostWithDv) response.infoLog += `☒${streamTag(primary.index)}[guard_dv=true] The ${lostWithDv} layer is dropped - no encoder here carries it`
+            if (lostWithDv) response.infoLog += `☒${streamTag(primary.index)}[guard_dv=enabled] The ${lostWithDv} layer is dropped - no encoder here carries it`
                 + ' through a re-encode\n';
             let sel = selectEncoder({ codec: targetCodecName, encoderOpt, otherArguments, forceCpu: preserveDv,
                 forceCpuWhy: 'for Dolby Vision - hardware encoders drop the RPU' });
@@ -2540,15 +2547,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (guardCaptions && !dropCaptions && selDropsCaptions) {
                 const cc = detectCaptions();
                 if (cc.unknown)
-                    response.infoLog += `☒${streamTag(primary.index)}[guard_captions=true] Could not check for closed captions on this node (no ffprobe`
+                    response.infoLog += `☒${streamTag(primary.index)}[guard_captions=enabled] Could not check for closed captions on this node (no ffprobe`
                         + ` beside ffmpeg) - continuing without the protection\n`;
                 else if (cc.present && targetCodecName !== 'av1') {
-                    response.infoLog += `☐${streamTag(primary.index)}[guard_captions=true] Closed captions found by ${cc.via} - encoding on the CPU so they`
+                    response.infoLog += `☐${streamTag(primary.index)}[guard_captions=enabled] Closed captions found by ${cc.via} - encoding on the CPU so they`
                         + ` survive; extract them with sub_worker's embedded_cc to keep the hardware encoder\n`;
                     sel = selectEncoder({ codec: targetCodecName, encoderOpt, otherArguments, forceCpu: true,
                         forceCpuWhy: 'to keep the embedded closed captions on the CPU encoder' });
                 } else if (cc.present)
-                    response.infoLog += `☒${streamTag(primary.index)}[codec=${codec}][guard_captions=true] Closed captions found by ${cc.via}, and no AV1`
+                    response.infoLog += `☒${streamTag(primary.index)}[codec=${codec}][guard_captions=enabled] Closed captions found by ${cc.via}, and no AV1`
                         + ` encoder on this node can carry them - they will be lost; extract them with sub_worker's embedded_cc first to keep them\n`;
             }
             // `removed` is a memo, not a request - sub_worker took the captions out AND filtered the bitstream copy away in its own pass - so it gets a ☑
@@ -2573,7 +2580,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // A CPU encode never asks for the node's GPU tonemap (the backend follows the encoder family), so only a hardware encode whose tonemap probe
                 // failed may blame the node; otherwise name what put the encode on the CPU. guard_dv needs no arm: it suppresses tonemap_sdr outright.
                 const [why, tag] = sel.family !== 'cpu' ? ['no GPU tonemap available on this node', '']
-                    : sel !== selUnforced ? ['the encode was forced onto the CPU to keep the closed captions', '[guard_captions=true]']
+                    : sel !== selUnforced ? ['the encode was forced onto the CPU to keep the closed captions', '[guard_captions=enabled]']
                         : encoderOpt === 'cpu' ? ['the encode is pinned to the CPU encoder', '[method_encoder=cpu]']
                             : ['the encode landed on the CPU encoder (see the Encoder line)', ''];
                 const tail = sel.family === 'cpu' ? ', and a GPU tonemap runs only beside a hardware encoder' : '';
@@ -2647,8 +2654,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // "don't touch this file at all", so it should answer for a lossless source whatever else also applies. It keys on realTranscode,
         // so the lossless -c:v copy paths (hdr_cleanup_only, a bare strip_dynamic) still run - they cost the master nothing.
         if (guardLossless && LOSSLESS_VIDEO_CODECS.includes(srcCodecName) && realTranscode()) {
-            return skip(`☒${streamTag(primary.index)}[guard_lossless=true] ${srcCodecName} is a lossless/mastering source - a re-encode would flatten it`
-                + ` to lossy 4:2:0 ${want10Bit ? '10' : '8'}-bit; set guard_lossless=false to convert it anyway\n`);
+            return skip(`☒${streamTag(primary.index)}[guard_lossless=enabled] ${srcCodecName} is a lossless/mastering source - a re-encode would flatten it`
+                + ` to lossy 4:2:0 ${want10Bit ? '10' : '8'}-bit; set guard_lossless=disabled to convert it anyway\n`);
         }
         if (!canEncodeTarget && realTranscode()) {   // codec=source resolved to a legacy codec with no encoder, but downscale/tonemap/deinterlace force one
             return skip(`☒${streamTag(primary.index)}[codec=${codec}] Source codec ${srcCodecName || 'unknown'} has no encoder - can't keep it through the `
@@ -2656,8 +2663,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 + `; set codec=hevc/h264/av1 to convert it\n`);
         }
         if (dvIptC2 && realTranscode()) {
-            return skip(`☒${streamTag(primary.index)}[guard_dv=true] ${dvLabel} uses the IPT-C2 colour matrix that libx265 cannot re-encode`
-                + ` - left untouched; set guard_dv=false and hdr_mode=tonemap_sdr to flatten it to SDR\n`);
+            return skip(`☒${streamTag(primary.index)}[guard_dv=enabled] ${dvLabel} uses the IPT-C2 colour matrix that libx265 cannot re-encode`
+                + ` - left untouched; set guard_dv=disabled and hdr_mode=tonemap_sdr to flatten it to SDR\n`);
         }
         if (effHdrMode === 'strip_dynamic' && dvNoBaseLayer && realTranscode()) {
             return skip(`☒${streamTag(primary.index)}[hdr_mode=strip_dynamic] ${dvLabel} has no HDR10 base layer - a re-encode would leave a mis-coloured`
