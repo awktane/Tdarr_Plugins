@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.66',
+    Version: '3.999.67',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -287,7 +287,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (16 sections: file-failure helpers … ffmpeg metadata escaping)
+    // #region SHARED helpers (17 sections: file-failure helpers … ffmpeg metadata escaping)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: file-failure helpers =====
     // -=-=-= AwkFailFile / failFile / failUnexpected [all five] =-=-=-
     // Fail the whole file (Tdarr's error queue) carrying the full infoLog: a returned processFile:false is Tdarr's "no work / skip" signal, NOT a failure -
@@ -441,8 +441,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['mpegh',  'mpegh3d'],   // ffmpeg reports MPEG-H 3D Audio as mpegh_3d_audio; map it to the codecInfo key so it scores + gets object-audio protection
         ['aac_latm', 'aac'],     // AAC in MPEG-TS/LATM (broadcast/DVR .ts captures) reports codec_name aac_latm; fold to aac so it scores + displays as AAC, not an unknown codec
     ];
+    // -=-=-= foldCodecAlias [all five] =-=-=-
+    // A normalised codec name with its alias prefix folded to the canonical key (first matching row wins) and nothing more: resolveCodecName's first
+    // step, and on its own the fold an identity check wants.
+    const foldCodecAlias = (codec) => {
+        for (const [prefix, replacement] of codecAliases) if (codec.startsWith(prefix)) return replacement;
+        return codec;
+    };
     // -=-=-= resolveCodecName [all five] =-=-=-
-    // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the _x variant when DTS:X is
+    // Folds aliases (foldCodecAlias), maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the _x variant when DTS:X is
     // detected) and eac3/truehd into eac3atmos/truehdatmos - scoring for the carriers that score, accurate display labels for the rest. Each refinement
     // checks longName, the ffprobe profile AND mediaInfo's Format_Commercial_IfAny, because no single source is complete: DTS longName in MP4/M4V is
     // "DCA (DTS Coherent Acoustics)" with no subtype keyword, and an E-AC-3 longName carries no Atmos marker (an editable title tag never counts - it
@@ -450,15 +457,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // undocumented format, so a real DTS:X track may still classify as the plain subtype - never the reverse, since detection only fires on an actual
     // reported value, never on the absence of one.
     const resolveCodecName = (stream) => {
-        let codec = codecNameOf(stream);
+        let codec = foldCodecAlias(codecNameOf(stream));
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
-
-        for (const [prefix, replacement] of codecAliases) {
-            if (codec.startsWith(prefix)) {
-                codec = replacement;
-                break;
-            }
-        }
 
         // Fold dca -> dts before the DTS subtype refinements below, which are gated on the 'dts' name
         if (codec === 'dca')
@@ -491,14 +491,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // -=-=-= codecDisplayName [all five] =-=-=-
     // Friendly display token for the codecs resolveCodecName REFINES beyond the bare codec_name; anything else falls back to its own raw codec_name
-    // (pcm_s16le keeps its bit depth) - this only ever ADDS subtype detail, never collapses an already-informative name.
-    const CODEC_DISPLAY = {
+    // (pcm_s16le keeps its bit depth) - this only ever ADDS subtype detail, never collapses an already-informative name. Null-prototype, so a codec_name
+    // spelling an Object.prototype member ('constructor') misses the table instead of displaying an inherited function.
+    const CODEC_DISPLAY = Object.assign(Object.create(null), {
         dtsma:   'dts-hd-ma',   dtsmax:      'dts-hd-ma-x',
         dtshr:   'dts-hd-hr',   dtshrx:      'dts-hd-hr-x',
         dtsx:    'dts-x',       dtsexpress:  'dts-express',   dtsexpressx: 'dts-express-x',
         eac3atmos: 'eac3-atmos', truehdatmos: 'truehd-atmos', mpegh3d: 'mpeg-h',
-    };
-    const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
+    });
+    const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || codecNameOf(stream) || 'unknown';
     // ===== END SHARED: codec name resolution =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: mp4-family container =====
     // -=-=-= isMp4Family [all five] =-=-=-
@@ -564,19 +565,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return log;
     };
     // ===== END SHARED: mp4-family container =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: matroska-family container =====
+    // -=-=-= isMatroskaFamily  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The Matroska family: mkv, its audio (mka) and subtitle (mks) spellings, and WebM, the Matroska subset. All of them store arbitrary tags and flags
+    // natively, so each "does this survive a remux" test starts here - and each consumer keeps its own measurement of the property it relies on.
+    const isMatroskaFamily = (container) => ['mkv', 'mka', 'mks', 'webm'].includes(String(container || '').toLowerCase());
+    // ===== END SHARED: matroska-family container =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 uncopyable streams =====
-    // -=-=-= mp4UncopyableStreams (+ mp4RebuiltTimecodes, mp4UncopyableLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // -=-=-= mp4UncopyableStreams (+ mp4RebuiltTimecodes, mp4LostData, mp4UncopyableLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // The data streams an mp4/m4v/m4a -c copy cannot carry: one ffprobe names no codec for - in practice a camera's tmcd timecode track. The mp4 muxer refuses
     // it outright ("Could not find tag for codec none", exit 234 on jellyfin 7.1.4) and takes the whole command down, so a -map 0 copy of such a file fails on
     // every requeue; each remux here leaves the stream out instead. A timecode survives that: the muxer rebuilds the tmcd track from the video stream's own
     // timecode tag (measured 2026-10-01: 01:00:00:00 in and out). mov copies the track as-is and is left alone, and clean_and_remux drops every data stream
     // itself, so in the designed stack only a run without it meets one. The log line names each stream left out and says whether its timecode carries over.
     const mp4UncopyableStreams = (container, streams) => (['mp4', 'm4v', 'm4a'].includes(String(container || '').toLowerCase())
-        ? (streams || []).filter((s) => codecTypeOf(s) === 'data' && ['', 'unknown', 'none'].includes(String(s.codec_name || '').toLowerCase())) : []);
+        ? (streams || []).filter((s) => codecTypeOf(s) === 'data' && ['', 'unknown', 'none'].includes(codecNameOf(s))) : []);
     // The dropped tmcd tracks the muxer puts back - one rebuilt from the video stream's timecode tag reads exactly as the copy would have, so an Expected
     // results line keeps it; with no such tag the timecode is gone.
     const mp4RebuiltTimecodes = (dropped, streams) => ((streams || []).some((s) => codecTypeOf(s) === 'video' && getTagCI(s.tags, 'timecode').trim() !== '')
         ? dropped.filter((s) => String(s.codec_tag_string || '').toLowerCase() === 'tmcd') : []);
+    // The dropped streams whose data really leaves the output - all of them but a tmcd the muxer rebuilds - so an Expected results line never promises one.
+    const mp4LostData = (dropped, streams) => {
+        const rebuilt = mp4RebuiltTimecodes(dropped, streams);
+        return dropped.filter((s) => !rebuilt.includes(s));
+    };
     const mp4UncopyableLog = (container, dropped, streams) => {
         const rebuilt = mp4RebuiltTimecodes(dropped, streams);
         return dropped.map((s) => {
@@ -617,7 +629,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // as without, so no marker can exist in one. Both carriers keep the SOURCE container, so the answer is the source's; clean_and_remux always writes mkv or
     // mp4, which is the way out of a hostile one. The stake is the same wherever a marker records work: a pass that cannot remember what it did does it again,
     // and where the arguments come out identical Tdarr ERRORS the file as an infinite transcode loop rather than merely repeating the cost.
-    const markerPersists = (container) => ['mkv', 'mka', 'mks', 'webm'].includes(String(container || '').toLowerCase()) || isMp4Family(container);
+    const markerPersists = (container) => isMatroskaFamily(container) || isMp4Family(container);
     // ===== END SHARED: marker persistence =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: case-insensitive tag lookup =====
     // -=-=-= getTagCI  [all five] =-=-=-
@@ -670,9 +682,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return 0;
     };
 
-    // -=-=-= resolveChannels (+ channelsFromLayout helper) [all five] =-=-=-
+    // -=-=-= resolveChannels (+ channelsFromLayout, resolveChannelLayout helpers) [all five] =-=-=-
     // Audio channel count, ffprobe first then fallbacks (mirrors resolveStreamBitrate): mediaInfo Channels, then a channel-layout string from either probe
-    // - "5.1(side)" -> 6, "FL+FR+LFE" -> 3. Returns 0 only when no source reports it.
+    // - "5.1(side)" -> 6, "FL+FR+LFE" -> 3. Returns 0 only when no source reports it. resolveChannelLayout is that string, '' when neither probe has one.
     const channelsFromLayout = (layout) => {
         const s = String(layout || '').toLowerCase().trim();
         if (!s) return 0;
@@ -685,13 +697,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const tokens = s.split(/[+\s,]+/).filter((t) => t && !t.endsWith(':'));
         return tokens.length > 1 ? tokens.length : 0;
     };
+    const resolveChannelLayout = (s, mi = mediaInfoFor(s)) => String(s.channel_layout || mi?.ChannelLayout || mi?.ChannelPositions || '');
     const resolveChannels = (ffstream) => {
         const ff = Number(ffstream.channels || 0);
         if (ff > 0) return ff;
         const ffmedia = mediaInfoFor(ffstream);
         const miChannels = Number(ffmedia?.Channels || 0);
         if (miChannels > 0) return miChannels;
-        return channelsFromLayout(ffstream.channel_layout || ffmedia?.ChannelLayout || ffmedia?.ChannelPositions);
+        return channelsFromLayout(resolveChannelLayout(ffstream, ffmedia));
     };
 
     // -=-=-= enrichStream [all five] =-=-=-
@@ -723,6 +736,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The HDR transfer curves - ffmpeg's two HDR color_trc enums (smpte2084 = PQ, arib-std-b67 = HLG) plus the MediaInfo spellings (pq, hlg). The single
     // source for every HDR-curve test.
     const HDR_TRANSFERS = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'];
+    // -=-=-= videoTransferOf (+ isHdrVideo) [all five] =-=-=-
+    // A video stream's transfer curve from either probe (ffprobe's tag is routinely absent, or a loose bt2020-10, on a file mediaInfo reads as HDR10), and
+    // whether the stream is HDR: an HDR curve, or ANY HDR format mediaInfo names (static HDR10 announces itself "SMPTE ST 2086"). It is the summary's hdr
+    // token, so a gate that must treat a file as HDR whenever the log calls it hdr - video_clean's tonemap, sub_worker's SEI strip - builds on it.
+    const videoTransferOf = (s, mi = mediaInfoFor(s)) => (s.color_transfer || mi?.transfer_characteristics || '').toLowerCase().trim();
+    const isHdrVideo = (s, mi = mediaInfoFor(s)) => HDR_TRANSFERS.includes(videoTransferOf(s, mi)) || !!String(mi?.HDR_Format || '').trim();
     // -=-=-= HDR10P_RE / VIVID_HDR_RE [all five] =-=-=-
     // Dynamic-HDR recognisers over a lowercased HDR_Format, split BY FORMAT because they differ downstream: HDR10+ has a lossless strip path
     // (hevc_metadata=remove_hdr10plus, HEVC only), HDR Vivid/CUVA has none. A bare '2094' suffices for HDR10+ (plain static HDR10 is ST 2086 only), and
@@ -765,7 +784,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // data label fallbacks below implement the same rule, so it lives once here.
         const mimeSubtype = (m) => (m.includes('/') ? m.slice(m.indexOf('/') + 1).replace(/^x-/, '') : '');
         const type = codecTypeOf(s);
-        let codec = (s.codec_name || 'unknown').trim().toLowerCase();
+        let codec = codecNameOf(s) || 'unknown';
         if (codec === 'subrip') codec = 'srt';
         const langRaw = tok(resolveLang(s) || 'und');
         const lang = langRaw !== 'und' ? langRaw : '';
@@ -774,8 +793,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const vmi = mediaInfoFor(s);
             const vHeight = Number(s.height || vmi?.Height || 0);
             const vTenbit = is10Bit(s, vmi);
-            const vXfer = (s.color_transfer || vmi?.transfer_characteristics || '').toLowerCase().trim();
-            const vHdr = HDR_TRANSFERS.includes(vXfer) || !!String(vmi?.HDR_Format || '').trim();
+            const vHdr = isHdrVideo(s, vmi);
             // HDR sub-type marker, shown in place of 'hdr'. DV via the shared isDolbyVisionVideo - also surfacing Profile-5 DV whose non-standard transfer
             // sets no hdr flag. HDR10+ and HDR Vivid are stream-visible only via mediaInfo (ffprobe carries their metadata per-FRAME, which Tdarr doesn't
             // probe), so both degrade to plain 'hdr' without it. A stream can carry BOTH at once (real DVB multiplexes do), so the token names every
@@ -965,7 +983,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ...Object.fromEntries(CC_STREAM_SUBS.map((c) => [c, { ext: 'srt', enc: CC_STREAM_ENCODER }])),
         ...Object.fromEntries(LEGACY_TEXT_SUBS.map((c) => [c, { ext: 'srt', enc: 'srt' }])),
     };
-    const isTextSub = (codec) => Object.prototype.hasOwnProperty.call(TEXT_SUB, String(codec).toLowerCase());
+    const isTextSub = (s) => Object.prototype.hasOwnProperty.call(TEXT_SUB, codecNameOf(s));
     // Both directions of the table above, derived from it so a new codec row is ONE edit: the loose-text sidecar extensions extract writes (parseSidecar
     // accepts these plus IMPORT_ONLY_EXTS; a bundle is admitted by STYLED_BUNDLE.ext instead, so 'mks' must never be a TEXT_SUB ext - extract would write
     // one no import could read back), and the reverse ext -> codec name for a sidecar not muxed in yet. Several codecs share an ext, so the reverse keeps
@@ -1451,7 +1469,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // as-is. Used where a 3-letter code is required - sub_worker's mp4-family sidecar import (mdhd stores only /T) and the
     // mov remap below - and it is the fold MOV_LANG expects. Mirrors clean_and_remux's toCanonicalTag threeLetter(false).
     const to6392T = (lang) => { const key = langKey(lang); if (!key || key.length !== 2) return lang; return ISO639_1_TO_2[key] || lang; };
-    // -=-=-= MOV_LANG  [audio_clean, sub_worker] =-=-=-
+    // -=-=-= MOV_LANG (+ movLangCode)  [audio_clean, sub_worker] =-=-=-
     // mov is the exception to writing a language into the output container (mp4 stores only lowercase 3-letter /T, mkv keeps the raw spelling). The QuickTime
     // muxer does not store the letters: mov_write_mdhd_tag looks the code up in ffmpeg's legacy Macintosh language table and writes 0x7fff ("unspecified") on
     // a miss, which the demuxer then excludes - so the track reads back with NO language at all, exit 0 and no warning from either side. That table predates
@@ -1459,11 +1477,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // jellyfin-ffmpeg 7.1.4: nld/deu/zho land 0x7fff, dut/ger/chi land a real code; 106 of the 184 codes to6392T can emit are dropped). ces/ron/slk/fra are
     // deliberately ABSENT - QuickTime spells those four the /T way and remapping them would break what works - and mri is absent because the table has no
     // Maori under any code. Anyone extending this must re-measure against the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a
-    // safe source. mp4/m4v/m4a pack the letters directly and keep either spelling, which is why this is mov-only. Both writers fold to /T then remap:
+    // safe source. mp4/m4v/m4a pack the letters directly and keep either spelling, which is why this is mov-only. movLangCode folds to /T then remaps:
     // audio_clean on an audio language write, sub_worker on a subtitle language write. Null-prototype so a container tag spelling an Object.prototype member
     // ('constructor', '__proto__') misses the table and falls through to the pass-through instead of resolving an inherited function.
     const MOV_LANG = Object.assign(Object.create(null), { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
         deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel' });
+    const movLangCode = (lang) => { const t = to6392T(lang); return MOV_LANG[t] || t; };
     // ===== END SHARED: mov language remap =====
     // #endregion
     // Plex/Jellyfin/Emby all accept a spelled-out language NAME in a sidecar name (Movie.English.srt), which isRealLanguageToken recognises - but the name
@@ -1625,7 +1644,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // differently. Only the TITLE token is assembled locally - sub_worker is the one that writes one. The `collides` escape below keeps the slot
         // immediately ahead of the language free of anything parseSidecar's strip would mistake for a language.
         const { lang, pre, disp } = sidecarNameTokens(s);
-        const ext = bundle ? STYLED_BUNDLE.ext : TEXT_SUB[String(s.codec_name).toLowerCase()].ext;
+        const ext = bundle ? STYLED_BUNDLE.ext : TEXT_SUB[codecNameOf(s)].ext;
         const dot = bundle ? '.' : '';
         const mark = bundle ? `.${STYLED_BUNDLE.mark}` : '';
         // The stream's own title, mediaInfo's when ffprobe has none (mp4 keeps it in udta/name, which ffprobe never surfaces) - see mediaTitleFor. Only for
@@ -2011,6 +2030,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const lines = t.split('\n');
         return lines.filter((ln, i) => !(/^\d+$/.test(ln.trim()) && String(lines[i + 1] || '').includes('-->'))).join('\n').trimEnd();
     };
+    // The identity every sidecar comparison keys on: the sha1 of the normalised text above.
+    const subTextHash = (buf, ext) => crypto.createHash('sha1').update(subTextForHash(buf, ext)).digest('hex');
 
     // Does decoded subtitle text contain any actual CUES? Only srt writes a genuinely 0-byte file when it has nothing to say - webvtt still writes its WEBVTT
     // header and ass its whole [Script Info]/[V4+ Styles] preamble - so a size test alone would call an empty ass track populated. Both timed formats mark
@@ -2076,7 +2097,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const buf = fs.readFileSync(p);
                 const text = buf.toString('utf8');
                 out = {
-                    sha1: crypto.createHash('sha1').update(subTextForHash(buf, path.extname(f.rel))).digest('hex'),
+                    sha1: subTextHash(buf, path.extname(f.rel)),
                     noCues: hasNoCues(text, f.ext),
                     loss: importLosses(text, f.ext),
                 };
@@ -2106,7 +2127,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (embeddedHashCache !== undefined) return embeddedHashCache;
         embeddedHashCache = null;
         const target = String(file._id || file.file || libFilePath || '');
-        const wanted = subs.filter((s) => isTextSub(s.codec_name));
+        const wanted = subs.filter((s) => isTextSub(s));
         // The two are NOT the same answer, and every caller acts on the difference (see the contract above): with no path there is nothing to read, so the
         // probe could not run; a readable file that simply holds no text subtitle stream IS a run, and its empty map is positive evidence that no text
         // sidecar is embedded here.
@@ -2119,7 +2140,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const args = ['-y', '-loglevel', 'error', '-i', target];
         const outs = new Map();
         for (const s of wanted) {
-            const enc = TEXT_SUB[String(s.codec_name).toLowerCase()];
+            const enc = TEXT_SUB[codecNameOf(s)];
             const out = path.join(dir, `s${s.index}.${enc.ext}`);
             // -fs is a per-OUTPUT byte cap, so it bounds this staging directory at write time rather than after the fact - see the SIDECAR_HASH_MAX
             // comment below for what it buys and why the ceiling sits one byte above the cap.
@@ -2153,7 +2174,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // A track that decoded to no cues is EMPTY, not a duplicate. It gets no hash deliberately: every empty track would otherwise hash
                     // alike and be reported as a copy of the others, which describes the wrong problem and leaves one empty track standing.
                     if (hasNoCues(text, ext)) { embeddedEmptyIdx.add(idx); continue; }
-                    map.set(idx, crypto.createHash('sha1').update(subTextForHash(buf, path.extname(out))).digest('hex'));
+                    map.set(idx, subTextHash(buf, path.extname(out)));
                 } catch (e) {
                     /* a stream that could not be read simply has no hash, and matches nothing */
                 }
@@ -2191,7 +2212,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 '-f', mp4 ? 'mp4' : 'matroska', mux]);
             if (!r.error && r.status === 0) r = ff(['-i', mux, '-map', '0:s:0', '-c:s', enc.enc, '-fs', String(SIDECAR_HASH_MAX + 1), out]);
             if (!r.error && r.status === 0 && fs.statSync(out).size <= SIDECAR_HASH_MAX) {
-                roundTripMemo.set(key, crypto.createHash('sha1').update(subTextForHash(fs.readFileSync(out), path.extname(out))).digest('hex'));
+                roundTripMemo.set(key, subTextHash(fs.readFileSync(out), path.extname(out)));
             }
         } catch (e) { /* no round-trip identity - callers fall back to the sidecar's own text */ }
         try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
@@ -2213,7 +2234,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const text = b.buf.toString('utf8');
         bundleMemo.set(f.rel, {
             // A subtitle with no cues gets no hash, exactly as embeddedTextHashes gives an empty track none - the name decides for it, as before.
-            sha1: hasNoCues(text, 'ass') ? null : crypto.createHash('sha1').update(subTextForHash(b.buf, '.ass')).digest('hex'),
+            sha1: hasNoCues(text, 'ass') ? null : subTextHash(b.buf, '.ass'),
             fonts: b.fonts,
             span: cueSpan(text, 'ass'),
         });
@@ -2258,7 +2279,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             try { buf = Buffer.from(readTextCapped(path.join(workLibDir(), rel), SIDECAR_HASH_MAX), 'utf8'); } catch (e) { return { state: 'unknown' }; }
         }
         const own = hashes.get(s.index);
-        if (buf && own && crypto.createHash('sha1').update(subTextForHash(buf, `.${ext}`)).digest('hex') === own) return { state: 'whole' };
+        if (buf && own && subTextHash(buf, `.${ext}`) === own) return { state: 'whole' };
         const copy = buf ? cueSpan(buf.toString('utf8'), ext) : { cues: 0, end: 0 };
         if (!copy.cues) return { state: span.cues ? 'aborted' : 'whole' };   // an empty copy of an empty stream is a copy
         return copy.end < span.end - CUE_SPAN_SLACK_S ? { state: 'short', end: copy.end, streamEnd: span.end } : { state: 'whole' };
@@ -2321,7 +2342,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // be read, since a wrong skip loses nothing. Otherwise the sidecar's own bytes must be one of the tracks. Only a TEXT subtitle can stand in for a
     // loose sidecar - a PGS/VobSub track holds pictures, however well its metadata matches.
     const markerConfirmsEmbedded = (f, subs, anyFont, mp4Target) => (!f.bundle || anyFont)
-        && subs.filter((s) => f.bundle || isTextSub(s.codec_name)).some((s) =>
+        && subs.filter((s) => f.bundle || isTextSub(s)).some((s) =>
             langKey(resolveLang(s) || 'und') === langKey(f.lang || 'und') && (mp4Target || (s.tags?.title || '') === (f.title || '')));
 
     // The subtitle list is a file the USER may have typed into, so it is removed only once it demonstrably has nothing left to say: every name in it gone
@@ -2423,8 +2444,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ====== END GUARDS + INPUT VALIDATION ======
     // ====== SUBTITLE METADATA / RETAG ARGS ======
     // The one rule for writing a subtitle language into the output container: mp4 folds to /T (to6392T), mkv keeps the sidecar spelling (normSidecarLang),
-    // and mov folds to /T then remaps through MOV_LANG - the shared 'mov language remap' section has the why. escMeta guards the value either way.
-    const langMetaValue = (l) => { const v = isMp4 ? to6392T(l) : normSidecarLang(l); return escMeta(dstContainer === 'mov' ? (MOV_LANG[v] || v) : v); };
+    // and mov goes through movLangCode - the shared 'mov language remap' section has the why. escMeta guards the value either way.
+    const langMetaValue = (l) => escMeta(dstContainer === 'mov' ? movLangCode(l) : isMp4 ? to6392T(l) : normSidecarLang(l));
     // Everything this plugin writes onto a subtitle stream, for ONE stream. Two callers reach it - the duplicate fold below and the sidecar-metadata retune -
     // and they must agree on both load-bearing rules: outIdx is the position among the SURVIVING subtitle streams, which is what -map 0 minus the drops
     // leaves; and an empty disposition set is written as the explicit 0 sentinel rather than omitted, or a flag the fold dropped would silently come back.
@@ -2575,7 +2596,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.preset = `<io>${full}`;
         response.processFile = true;
         response.infoLog += mp4UncopyableLog(dstContainer, uncopyable, streams) + mp4TagPlanLog(tagPlan, dstContainer, mapped);
-        const goneData = uncopyable.filter((s) => !mp4RebuiltTimecodes(uncopyable, streams).includes(s));
+        const goneData = mp4LostData(uncopyable, streams);
         for (const s of [...goneData, ...mp4CoversLost(tagPlan, dstContainer, mapped)]) leftOut.add(s.index);
     };
     // The stream list as the committed output will actually hold it - every Expected results line goes through this, so a stream the container cannot hold
@@ -2644,19 +2665,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // where would it land? Everything that can end the question cheaply is checked before the probe, and the probe before the decode.
         // Returns a job only when there is real work; otherwise a note saying why not, so an enabled setting never passes in silence.
         const ccVideo = streams.find((s) => codecTypeOf(s) === 'video' && !isCoverArt(s));
-        // Both HDR tests read what summariseStream reads, and that is load-bearing: this filter deletes EVERY SEI NAL, and HDR10's static metadata
-        // (mastering-display colour volume, MaxCLL/MaxFALL) lives in exactly those - a guard narrower than the plugin's own notion of HDR silently
-        // un-HDRs a file on a -c copy pass while the log still prints `hdr`. So the transfer is both-probe (ffprobe's tag is routinely absent, or a loose
-        // bt2020-10 in no allow-list, on a file mediaInfo still reports as HDR10), and ANY non-empty HDR_Format blocks, not only the dynamic spellings -
-        // static HDR10 announces itself "SMPTE ST 2086", matching neither 2094 nor hdr10+. A refused file is not a lost feature: it takes the awk_cc strip
-        // route and video_clean removes the captions on its next re-encode, the right answer for HDR anyway.
+        // The HDR test is the summary's own isHdrVideo, widened by HDR_Format_Compatibility so it can never be narrower than the plugin's notion of HDR -
+        // and that is load-bearing: this filter deletes EVERY SEI NAL, and HDR10's static metadata (mastering-display colour volume, MaxCLL/MaxFALL) lives
+        // in exactly those, so a narrower guard silently un-HDRs a file on a -c copy pass while the log still prints `hdr`. A refused file is not a lost
+        // feature: it takes the awk_cc strip route and video_clean removes the captions on its next re-encode, the right answer for HDR anyway.
         const ccStripAllowed = () => {
             if (!ccVideo) return false;
             const mi = mediaInfoFor(ccVideo) || {};
-            const xfer = String(ccVideo.color_transfer || mi.transfer_characteristics || '').toLowerCase().trim();
-            const hdrFmt = String(mi.HDR_Format || mi.HDR_Format_Compatibility || '').trim();
-            return codecNameOf(ccVideo) === 'h264'
-                && !isDolbyVisionVideo(ccVideo, mi) && !HDR_TRANSFERS.includes(xfer) && !hdrFmt;
+            return codecNameOf(ccVideo) === 'h264' && !isDolbyVisionVideo(ccVideo, mi) && !isHdrVideo(ccVideo, mi)
+                && !String(mi.HDR_Format_Compatibility || '').trim();
         };
         // The A53 caption probe as ccPlan's two strip/plan sites both spell it - the __awkCap test-injection contract plus the ffprobe-path derivation, defined
         // once so a future hardening of either can't land at one site and not the other. Declared ahead of ccPlan's IIFE, like the notes below.
@@ -2875,7 +2892,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // decided was redundant comes straight back on the next import under a name of its own.
             const dupes = dedupeStreams ? dedupeEmbeddedSubs(streams.filter((s) => codecTypeOf(s) === 'subtitle')) : { dropIdx: [], retag: null, log: '' };
             response.infoLog += dupes.log;
-            const eligible = streams.filter((s) => codecTypeOf(s) === 'subtitle' && isTextSub(s.codec_name)
+            const eligible = streams.filter((s) => codecTypeOf(s) === 'subtitle' && isTextSub(s)
                 && !dupes.dropIdx.includes(s.index)
                 && !(langFilter && !langFilter.has(langKey(resolveLang(s) || 'und'))));
             // A DEFERRED caption strip is work of its own: the sidecar landed on an earlier pass, so there is no job and nothing to extract, yet the
@@ -2954,7 +2971,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // The sidecars whose subtitle this pass takes OUT of the file - each leaves the import marker too (see the preset below).
             const extractedRels = new Set();
             for (const s of eligible) {
-                const { enc } = TEXT_SUB[String(s.codec_name).toLowerCase()];
+                const { enc } = TEXT_SUB[codecNameOf(s)];
                 const bundle = fontIndices.length > 0 && isStyledSub(s.codec_name);
                 const name = sidecarBasename(foldRetag(s), bundle);
                 const full = path.join(workLibDir(), name);

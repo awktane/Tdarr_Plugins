@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.52',
+    Version: '4.999.53',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -587,8 +587,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['mpegh',  'mpegh3d'],   // ffmpeg reports MPEG-H 3D Audio as mpegh_3d_audio; map it to the codecInfo key so it scores + gets object-audio protection
         ['aac_latm', 'aac'],     // AAC in MPEG-TS/LATM (broadcast/DVR .ts captures) reports codec_name aac_latm; fold to aac so it scores + displays as AAC, not an unknown codec
     ];
+    // -=-=-= foldCodecAlias [all five] =-=-=-
+    // A normalised codec name with its alias prefix folded to the canonical key (first matching row wins) and nothing more: resolveCodecName's first
+    // step, and on its own the fold an identity check wants.
+    const foldCodecAlias = (codec) => {
+        for (const [prefix, replacement] of codecAliases) if (codec.startsWith(prefix)) return replacement;
+        return codec;
+    };
     // -=-=-= resolveCodecName [all five] =-=-=-
-    // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the _x variant when DTS:X is
+    // Folds aliases (foldCodecAlias), maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the _x variant when DTS:X is
     // detected) and eac3/truehd into eac3atmos/truehdatmos - scoring for the carriers that score, accurate display labels for the rest. Each refinement
     // checks longName, the ffprobe profile AND mediaInfo's Format_Commercial_IfAny, because no single source is complete: DTS longName in MP4/M4V is
     // "DCA (DTS Coherent Acoustics)" with no subtype keyword, and an E-AC-3 longName carries no Atmos marker (an editable title tag never counts - it
@@ -596,15 +603,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // undocumented format, so a real DTS:X track may still classify as the plain subtype - never the reverse, since detection only fires on an actual
     // reported value, never on the absence of one.
     const resolveCodecName = (stream) => {
-        let codec = codecNameOf(stream);
+        let codec = foldCodecAlias(codecNameOf(stream));
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
-
-        for (const [prefix, replacement] of codecAliases) {
-            if (codec.startsWith(prefix)) {
-                codec = replacement;
-                break;
-            }
-        }
 
         // Fold dca -> dts before the DTS subtype refinements below, which are gated on the 'dts' name
         if (codec === 'dca')
@@ -637,14 +637,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // -=-=-= codecDisplayName [all five] =-=-=-
     // Friendly display token for the codecs resolveCodecName REFINES beyond the bare codec_name; anything else falls back to its own raw codec_name
-    // (pcm_s16le keeps its bit depth) - this only ever ADDS subtype detail, never collapses an already-informative name.
-    const CODEC_DISPLAY = {
+    // (pcm_s16le keeps its bit depth) - this only ever ADDS subtype detail, never collapses an already-informative name. Null-prototype, so a codec_name
+    // spelling an Object.prototype member ('constructor') misses the table instead of displaying an inherited function.
+    const CODEC_DISPLAY = Object.assign(Object.create(null), {
         dtsma:   'dts-hd-ma',   dtsmax:      'dts-hd-ma-x',
         dtshr:   'dts-hd-hr',   dtshrx:      'dts-hd-hr-x',
         dtsx:    'dts-x',       dtsexpress:  'dts-express',   dtsexpressx: 'dts-express-x',
         eac3atmos: 'eac3-atmos', truehdatmos: 'truehd-atmos', mpegh3d: 'mpeg-h',
-    };
-    const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
+    });
+    const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || codecNameOf(stream) || 'unknown';
     // ===== END SHARED: codec name resolution =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: mp4-family container =====
     // -=-=-= isMp4Family [all five] =-=-=-
@@ -761,9 +762,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return 0;
     };
 
-    // -=-=-= resolveChannels (+ channelsFromLayout helper) [all five] =-=-=-
+    // -=-=-= resolveChannels (+ channelsFromLayout, resolveChannelLayout helpers) [all five] =-=-=-
     // Audio channel count, ffprobe first then fallbacks (mirrors resolveStreamBitrate): mediaInfo Channels, then a channel-layout string from either probe
-    // - "5.1(side)" -> 6, "FL+FR+LFE" -> 3. Returns 0 only when no source reports it.
+    // - "5.1(side)" -> 6, "FL+FR+LFE" -> 3. Returns 0 only when no source reports it. resolveChannelLayout is that string, '' when neither probe has one.
     const channelsFromLayout = (layout) => {
         const s = String(layout || '').toLowerCase().trim();
         if (!s) return 0;
@@ -776,13 +777,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const tokens = s.split(/[+\s,]+/).filter((t) => t && !t.endsWith(':'));
         return tokens.length > 1 ? tokens.length : 0;
     };
+    const resolveChannelLayout = (s, mi = mediaInfoFor(s)) => String(s.channel_layout || mi?.ChannelLayout || mi?.ChannelPositions || '');
     const resolveChannels = (ffstream) => {
         const ff = Number(ffstream.channels || 0);
         if (ff > 0) return ff;
         const ffmedia = mediaInfoFor(ffstream);
         const miChannels = Number(ffmedia?.Channels || 0);
         if (miChannels > 0) return miChannels;
-        return channelsFromLayout(ffstream.channel_layout || ffmedia?.ChannelLayout || ffmedia?.ChannelPositions);
+        return channelsFromLayout(resolveChannelLayout(ffstream, ffmedia));
     };
 
     // -=-=-= enrichStream [all five] =-=-=-
@@ -814,6 +816,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The HDR transfer curves - ffmpeg's two HDR color_trc enums (smpte2084 = PQ, arib-std-b67 = HLG) plus the MediaInfo spellings (pq, hlg). The single
     // source for every HDR-curve test.
     const HDR_TRANSFERS = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'];
+    // -=-=-= videoTransferOf (+ isHdrVideo) [all five] =-=-=-
+    // A video stream's transfer curve from either probe (ffprobe's tag is routinely absent, or a loose bt2020-10, on a file mediaInfo reads as HDR10), and
+    // whether the stream is HDR: an HDR curve, or ANY HDR format mediaInfo names (static HDR10 announces itself "SMPTE ST 2086"). It is the summary's hdr
+    // token, so a gate that must treat a file as HDR whenever the log calls it hdr - video_clean's tonemap, sub_worker's SEI strip - builds on it.
+    const videoTransferOf = (s, mi = mediaInfoFor(s)) => (s.color_transfer || mi?.transfer_characteristics || '').toLowerCase().trim();
+    const isHdrVideo = (s, mi = mediaInfoFor(s)) => HDR_TRANSFERS.includes(videoTransferOf(s, mi)) || !!String(mi?.HDR_Format || '').trim();
     // -=-=-= HDR10P_RE / VIVID_HDR_RE [all five] =-=-=-
     // Dynamic-HDR recognisers over a lowercased HDR_Format, split BY FORMAT because they differ downstream: HDR10+ has a lossless strip path
     // (hevc_metadata=remove_hdr10plus, HEVC only), HDR Vivid/CUVA has none. A bare '2094' suffices for HDR10+ (plain static HDR10 is ST 2086 only), and
@@ -856,7 +864,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // data label fallbacks below implement the same rule, so it lives once here.
         const mimeSubtype = (m) => (m.includes('/') ? m.slice(m.indexOf('/') + 1).replace(/^x-/, '') : '');
         const type = codecTypeOf(s);
-        let codec = (s.codec_name || 'unknown').trim().toLowerCase();
+        let codec = codecNameOf(s) || 'unknown';
         if (codec === 'subrip') codec = 'srt';
         const langRaw = tok(resolveLang(s) || 'und');
         const lang = langRaw !== 'und' ? langRaw : '';
@@ -865,8 +873,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const vmi = mediaInfoFor(s);
             const vHeight = Number(s.height || vmi?.Height || 0);
             const vTenbit = is10Bit(s, vmi);
-            const vXfer = (s.color_transfer || vmi?.transfer_characteristics || '').toLowerCase().trim();
-            const vHdr = HDR_TRANSFERS.includes(vXfer) || !!String(vmi?.HDR_Format || '').trim();
+            const vHdr = isHdrVideo(s, vmi);
             // HDR sub-type marker, shown in place of 'hdr'. DV via the shared isDolbyVisionVideo - also surfacing Profile-5 DV whose non-standard transfer
             // sets no hdr flag. HDR10+ and HDR Vivid are stream-visible only via mediaInfo (ffprobe carries their metadata per-FRAME, which Tdarr doesn't
             // probe), so both degrade to plain 'hdr' without it. A stream can carry BOTH at once (real DVB multiplexes do), so the token names every
@@ -1934,12 +1941,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: closed-caption handoff =====
     // #endregion
 
-    // Channel layout string from ffprobe, falling back to mediaInfo (ChannelLayout/ChannelPositions), so tag_title can name the layout even when ffprobe
-    // omits channel_layout.
-    const channelLayoutStr = (ffstream) => {
-        const ffmedia = mediaInfoFor(ffstream);
-        return (ffstream.channel_layout || ffmedia?.ChannelLayout || ffmedia?.ChannelPositions || '').toLowerCase();
-    };
+    // The both-probe channel layout (resolveChannelLayout), lowercased, so tag_title can name the layout even when ffprobe omits channel_layout.
+    const channelLayoutStr = (ffstream) => resolveChannelLayout(ffstream).toLowerCase();
     // ffprobe's canonical layout strings for 2.1 and 3.1 are literally "2.1"/"3.1" - no "lfe" substring - so a plain .includes('lfe') misses them. Treat a
     // nonzero digit after the first dot ("2.1","3.1","5.1","7.1.4") as an LFE too, alongside the verbose "FL+FR+LFE" form.
     const layoutHasLfe = (ffstream) => { const s = channelLayoutStr(ffstream); return /lfe/.test(s) || /^\d+\.[1-9]/.test(s.trim()); };
@@ -3077,8 +3080,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (recoverRequested && intentMatches)
                 response.infoLog += `☑Already recovered with these options (${RECOVERED_TAG}=${recoveredTag}) - skipping to avoid reprocessing;`
                     + ' change a recover_bad_* mode to run again\n';
-            response.infoLog += `☑File is already ${dstContainer} and contains no streams requiring removal or conversion\n`;
-            response.processFile = false;
+            return skip(`☑File is already ${dstContainer} and contains no streams requiring removal or conversion\n`);
         }
         return response;
     } catch (err) {

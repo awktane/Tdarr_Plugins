@@ -17,7 +17,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same
         job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. A
         later job on that file is checked in full again. This check is always on and has no setting.\n`,
-    Version: '4.999.29',
+    Version: '4.999.30',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -288,7 +288,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (16 sections: stream codec type … mp4 strict compliance arg)
+    // #region SHARED helpers (17 sections: stream codec type … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -432,8 +432,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['mpegh',  'mpegh3d'],   // ffmpeg reports MPEG-H 3D Audio as mpegh_3d_audio; map it to the codecInfo key so it scores + gets object-audio protection
         ['aac_latm', 'aac'],     // AAC in MPEG-TS/LATM (broadcast/DVR .ts captures) reports codec_name aac_latm; fold to aac so it scores + displays as AAC, not an unknown codec
     ];
+    // -=-=-= foldCodecAlias [all five] =-=-=-
+    // A normalised codec name with its alias prefix folded to the canonical key (first matching row wins) and nothing more: resolveCodecName's first
+    // step, and on its own the fold an identity check wants.
+    const foldCodecAlias = (codec) => {
+        for (const [prefix, replacement] of codecAliases) if (codec.startsWith(prefix)) return replacement;
+        return codec;
+    };
     // -=-=-= resolveCodecName [all five] =-=-=-
-    // Applies the alias prefixes, maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the _x variant when DTS:X is
+    // Folds aliases (foldCodecAlias), maps dca->dts, then refines DTS into its HD MA / HR / Express subtype (further into the _x variant when DTS:X is
     // detected) and eac3/truehd into eac3atmos/truehdatmos - scoring for the carriers that score, accurate display labels for the rest. Each refinement
     // checks longName, the ffprobe profile AND mediaInfo's Format_Commercial_IfAny, because no single source is complete: DTS longName in MP4/M4V is
     // "DCA (DTS Coherent Acoustics)" with no subtype keyword, and an E-AC-3 longName carries no Atmos marker (an editable title tag never counts - it
@@ -441,15 +448,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // undocumented format, so a real DTS:X track may still classify as the plain subtype - never the reverse, since detection only fires on an actual
     // reported value, never on the absence of one.
     const resolveCodecName = (stream) => {
-        let codec = codecNameOf(stream);
+        let codec = foldCodecAlias(codecNameOf(stream));
         const longName = (stream.codec_long_name || '').toLowerCase().trim();
-
-        for (const [prefix, replacement] of codecAliases) {
-            if (codec.startsWith(prefix)) {
-                codec = replacement;
-                break;
-            }
-        }
 
         // Fold dca -> dts before the DTS subtype refinements below, which are gated on the 'dts' name
         if (codec === 'dca')
@@ -482,14 +482,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // -=-=-= codecDisplayName [all five] =-=-=-
     // Friendly display token for the codecs resolveCodecName REFINES beyond the bare codec_name; anything else falls back to its own raw codec_name
-    // (pcm_s16le keeps its bit depth) - this only ever ADDS subtype detail, never collapses an already-informative name.
-    const CODEC_DISPLAY = {
+    // (pcm_s16le keeps its bit depth) - this only ever ADDS subtype detail, never collapses an already-informative name. Null-prototype, so a codec_name
+    // spelling an Object.prototype member ('constructor') misses the table instead of displaying an inherited function.
+    const CODEC_DISPLAY = Object.assign(Object.create(null), {
         dtsma:   'dts-hd-ma',   dtsmax:      'dts-hd-ma-x',
         dtshr:   'dts-hd-hr',   dtshrx:      'dts-hd-hr-x',
         dtsx:    'dts-x',       dtsexpress:  'dts-express',   dtsexpressx: 'dts-express-x',
         eac3atmos: 'eac3-atmos', truehdatmos: 'truehd-atmos', mpegh3d: 'mpeg-h',
-    };
-    const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || (stream.codec_name || 'unknown').trim().toLowerCase();
+    });
+    const codecDisplayName = (stream) => CODEC_DISPLAY[resolveCodecName(stream)] || codecNameOf(stream) || 'unknown';
     // ===== END SHARED: codec name resolution =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: mp4-family container =====
     // -=-=-= isMp4Family [all five] =-=-=-
@@ -555,19 +556,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return log;
     };
     // ===== END SHARED: mp4-family container =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: matroska-family container =====
+    // -=-=-= isMatroskaFamily  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The Matroska family: mkv, its audio (mka) and subtitle (mks) spellings, and WebM, the Matroska subset. All of them store arbitrary tags and flags
+    // natively, so each "does this survive a remux" test starts here - and each consumer keeps its own measurement of the property it relies on.
+    const isMatroskaFamily = (container) => ['mkv', 'mka', 'mks', 'webm'].includes(String(container || '').toLowerCase());
+    // ===== END SHARED: matroska-family container =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 uncopyable streams =====
-    // -=-=-= mp4UncopyableStreams (+ mp4RebuiltTimecodes, mp4UncopyableLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // -=-=-= mp4UncopyableStreams (+ mp4RebuiltTimecodes, mp4LostData, mp4UncopyableLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // The data streams an mp4/m4v/m4a -c copy cannot carry: one ffprobe names no codec for - in practice a camera's tmcd timecode track. The mp4 muxer refuses
     // it outright ("Could not find tag for codec none", exit 234 on jellyfin 7.1.4) and takes the whole command down, so a -map 0 copy of such a file fails on
     // every requeue; each remux here leaves the stream out instead. A timecode survives that: the muxer rebuilds the tmcd track from the video stream's own
     // timecode tag (measured 2026-10-01: 01:00:00:00 in and out). mov copies the track as-is and is left alone, and clean_and_remux drops every data stream
     // itself, so in the designed stack only a run without it meets one. The log line names each stream left out and says whether its timecode carries over.
     const mp4UncopyableStreams = (container, streams) => (['mp4', 'm4v', 'm4a'].includes(String(container || '').toLowerCase())
-        ? (streams || []).filter((s) => codecTypeOf(s) === 'data' && ['', 'unknown', 'none'].includes(String(s.codec_name || '').toLowerCase())) : []);
+        ? (streams || []).filter((s) => codecTypeOf(s) === 'data' && ['', 'unknown', 'none'].includes(codecNameOf(s))) : []);
     // The dropped tmcd tracks the muxer puts back - one rebuilt from the video stream's timecode tag reads exactly as the copy would have, so an Expected
     // results line keeps it; with no such tag the timecode is gone.
     const mp4RebuiltTimecodes = (dropped, streams) => ((streams || []).some((s) => codecTypeOf(s) === 'video' && getTagCI(s.tags, 'timecode').trim() !== '')
         ? dropped.filter((s) => String(s.codec_tag_string || '').toLowerCase() === 'tmcd') : []);
+    // The dropped streams whose data really leaves the output - all of them but a tmcd the muxer rebuilds - so an Expected results line never promises one.
+    const mp4LostData = (dropped, streams) => {
+        const rebuilt = mp4RebuiltTimecodes(dropped, streams);
+        return dropped.filter((s) => !rebuilt.includes(s));
+    };
     const mp4UncopyableLog = (container, dropped, streams) => {
         const rebuilt = mp4RebuiltTimecodes(dropped, streams);
         return dropped.map((s) => {
@@ -806,9 +818,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return 0;
     };
 
-    // -=-=-= resolveChannels (+ channelsFromLayout helper) [all five] =-=-=-
+    // -=-=-= resolveChannels (+ channelsFromLayout, resolveChannelLayout helpers) [all five] =-=-=-
     // Audio channel count, ffprobe first then fallbacks (mirrors resolveStreamBitrate): mediaInfo Channels, then a channel-layout string from either probe
-    // - "5.1(side)" -> 6, "FL+FR+LFE" -> 3. Returns 0 only when no source reports it.
+    // - "5.1(side)" -> 6, "FL+FR+LFE" -> 3. Returns 0 only when no source reports it. resolveChannelLayout is that string, '' when neither probe has one.
     const channelsFromLayout = (layout) => {
         const s = String(layout || '').toLowerCase().trim();
         if (!s) return 0;
@@ -821,13 +833,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const tokens = s.split(/[+\s,]+/).filter((t) => t && !t.endsWith(':'));
         return tokens.length > 1 ? tokens.length : 0;
     };
+    const resolveChannelLayout = (s, mi = mediaInfoFor(s)) => String(s.channel_layout || mi?.ChannelLayout || mi?.ChannelPositions || '');
     const resolveChannels = (ffstream) => {
         const ff = Number(ffstream.channels || 0);
         if (ff > 0) return ff;
         const ffmedia = mediaInfoFor(ffstream);
         const miChannels = Number(ffmedia?.Channels || 0);
         if (miChannels > 0) return miChannels;
-        return channelsFromLayout(ffstream.channel_layout || ffmedia?.ChannelLayout || ffmedia?.ChannelPositions);
+        return channelsFromLayout(resolveChannelLayout(ffstream, ffmedia));
     };
 
     // -=-=-= enrichStream [all five] =-=-=-
@@ -859,6 +872,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The HDR transfer curves - ffmpeg's two HDR color_trc enums (smpte2084 = PQ, arib-std-b67 = HLG) plus the MediaInfo spellings (pq, hlg). The single
     // source for every HDR-curve test.
     const HDR_TRANSFERS = ['smpte2084', 'arib-std-b67', 'pq', 'hlg'];
+    // -=-=-= videoTransferOf (+ isHdrVideo) [all five] =-=-=-
+    // A video stream's transfer curve from either probe (ffprobe's tag is routinely absent, or a loose bt2020-10, on a file mediaInfo reads as HDR10), and
+    // whether the stream is HDR: an HDR curve, or ANY HDR format mediaInfo names (static HDR10 announces itself "SMPTE ST 2086"). It is the summary's hdr
+    // token, so a gate that must treat a file as HDR whenever the log calls it hdr - video_clean's tonemap, sub_worker's SEI strip - builds on it.
+    const videoTransferOf = (s, mi = mediaInfoFor(s)) => (s.color_transfer || mi?.transfer_characteristics || '').toLowerCase().trim();
+    const isHdrVideo = (s, mi = mediaInfoFor(s)) => HDR_TRANSFERS.includes(videoTransferOf(s, mi)) || !!String(mi?.HDR_Format || '').trim();
     // -=-=-= HDR10P_RE / VIVID_HDR_RE [all five] =-=-=-
     // Dynamic-HDR recognisers over a lowercased HDR_Format, split BY FORMAT because they differ downstream: HDR10+ has a lossless strip path
     // (hevc_metadata=remove_hdr10plus, HEVC only), HDR Vivid/CUVA has none. A bare '2094' suffices for HDR10+ (plain static HDR10 is ST 2086 only), and
@@ -901,7 +920,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // data label fallbacks below implement the same rule, so it lives once here.
         const mimeSubtype = (m) => (m.includes('/') ? m.slice(m.indexOf('/') + 1).replace(/^x-/, '') : '');
         const type = codecTypeOf(s);
-        let codec = (s.codec_name || 'unknown').trim().toLowerCase();
+        let codec = codecNameOf(s) || 'unknown';
         if (codec === 'subrip') codec = 'srt';
         const langRaw = tok(resolveLang(s) || 'und');
         const lang = langRaw !== 'und' ? langRaw : '';
@@ -910,8 +929,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const vmi = mediaInfoFor(s);
             const vHeight = Number(s.height || vmi?.Height || 0);
             const vTenbit = is10Bit(s, vmi);
-            const vXfer = (s.color_transfer || vmi?.transfer_characteristics || '').toLowerCase().trim();
-            const vHdr = HDR_TRANSFERS.includes(vXfer) || !!String(vmi?.HDR_Format || '').trim();
+            const vHdr = isHdrVideo(s, vmi);
             // HDR sub-type marker, shown in place of 'hdr'. DV via the shared isDolbyVisionVideo - also surfacing Profile-5 DV whose non-standard transfer
             // sets no hdr flag. HDR10+ and HDR Vivid are stream-visible only via mediaInfo (ffprobe carries their metadata per-FRAME, which Tdarr doesn't
             // probe), so both degrade to plain 'hdr' without it. A stream can carry BOTH at once (real DVB multiplexes do), so the token names every
@@ -1512,12 +1530,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let orderChanged = false;
         let audioIndex = -1;
 
-        // A default-track flag only round-trips in a container that can STORE it: Matroska (mkv/mka/webm) and mp4-family persist it; MPEG-TS and AVI silently
+        // A default-track flag only round-trips in a container that can STORE it: the Matroska and mp4 families persist it; MPEG-TS and AVI silently
         // drop it (measured on jellyfin-ffmpeg 7.1.4 via set→remux→re-probe). This plugin keeps the source container (dstContainer = file.container), so a
         // standalone run on a .ts/.avi capture would otherwise write '+default' every pass, read it back missing, and re-emit a byte-identical preset - which
         // Tdarr's infinite-transcode-loop guard errors, quarantining a healthy file. Normalize the sole-default flag only where it sticks; elsewhere leave the
         // audio default flags untouched (the same container-unstorable-flag skip clean_and_remux's tag_disposition already applies to captions/original).
-        const canPersistDefault = ['mkv', 'mka', 'webm'].includes(dstContainer) || isMp4Family(dstContainer);
+        const canPersistDefault = isMatroskaFamily(dstContainer) || isMp4Family(dstContainer);
         let defaultFlagSkipped = false;
 
         // A data track the container cannot copy (mp4UncopyableStreams) is left out of the map, so outIdx - the output position every per-stream write keys
@@ -1561,15 +1579,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // ====== JUNK TAG STRIP: GLOBAL ======
         // remove_junk_tags (global): clear the provenance / descriptive container tags present, matched case-insensitively. escMeta guards the key. Each
-        // clear is also recorded in junkWrites, for mp4TagPlan - keyed by a name read off the media, hence no prototype for one to collide with.
-        const junkWrites = Object.create(null);
+        // clear is also recorded in globalWrites, for mp4TagPlan - keyed by a name read off the media, hence no prototype for one to collide with.
+        const globalWrites = Object.create(null);
         if (junkTagsMode !== 'disabled')
             for (const k of Object.keys(file.ffProbeData.format?.tags || {})) {
                 const lk = k.toLowerCase();
                 if (lk === 'title' || lk === 'comment' || lk === 'creation_time' || lk.startsWith('awk_')) continue;
                 if (junkGlobalStrip(lk)) {
                     junkArgs += ` -metadata "${escMeta(k)}="`;
-                    junkWrites[k] = '';
+                    globalWrites[k] = '';
                     junkLog += `☐[remove_junk_tags=${junkTagsMode}] Remove ${k} tag from file\n`;
                 }
             }
@@ -1663,7 +1681,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // An mp4-family -c copy keeps a sibling's custom GLOBAL marker (clean_and_remux's awk_recovered, set upstream) only under use_metadata_tags, so
         // mp4TagPlan sets it exactly when one is there - dropping it would re-trigger that plugin's work - and +faststart rides along when
         // method_mp4_faststart is on. A reorder maps every stream, cover art included.
-        const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, junkWrites);
+        const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, globalWrites);
         const movflags = [tagPlan.flag ? 'use_metadata_tags' : '', isMp4 && faststartOn ? '+faststart' : ''].join('');
         const mp4MovflagsArg = movflags ? ` -movflags ${movflags}` : '';
         // The -strict level this mp4/mov -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses
@@ -1675,7 +1693,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += '☐Set the first audio track as the sole default\n';
         const mapped = file.ffProbeData.streams.filter((s) => !uncopyable.includes(s));
         response.infoLog += junkLog + mp4UncopyableLog(dstContainer, uncopyable, file.ffProbeData.streams) + mp4TagPlanLog(tagPlan, dstContainer, mapped);
-        const goneData = uncopyable.filter((s) => !mp4RebuiltTimecodes(uncopyable, file.ffProbeData.streams).includes(s));
+        const goneData = mp4LostData(uncopyable, file.ffProbeData.streams);
         const leftOut = new Set([...goneData, ...mp4CoversLost(tagPlan, dstContainer, mapped)].map((s) => s.index));
         response.infoLog += `☑Expected results: ${sortRows.filter((s) => !leftOut.has(s.index)).map(s => summariseStream(s.stream)).join('')}\n`;
 
