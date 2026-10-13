@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.44',
+    Version: '3.999.45',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1213,16 +1213,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const IDET_SEEK_MIN_DURATION_SEC = 90;   // shorter than this and there is nothing to seek past, so sample from the start
     const IDET_SEEK_FRACTION = 3;            // sample from a third of the way in, clear of opening titles
     const IDET_SEEK_MAX_SEC = 600;           // ceiling, so a feature-length programme is not sampled from an hour in
-    // Only the filter's OWN lines are counters. The input dump prints container tag values to the same stderr and starts a new line at every newline inside
-    // one, so a crafted title can spell out a whole counter line; every dump line is indented, so requiring idet's log prefix at the START of the line shuts
-    // all of them out. The pointer after '@' is matched loosely - 0x-prefixed on Mac/Linux, bare hex on Windows.
+    // Only the filter's OWN lines are counters. The input and output dumps print container text to the same stderr, and a newline inside it starts a fresh
+    // line. A tag VALUE is re-indented after each newline, so requiring idet's log prefix at the START of the line shuts those out; a tag KEY and a filename
+    // are printed raw, so a crafted one can spell out a whole counter line at column 0, prefix and all (verified on 7.1.4 with an mp4 mdta key). Those are
+    // beaten by POSITION instead (lastIdetCounts). The pointer after '@' is matched loosely - 0x-prefixed on Mac/Linux, bare hex on Windows.
     const IDET_LINE_PREFIX = '^\\[Parsed_idet_\\d+ @ [^\\]\\n]+\\] ';
-    // Pull the LAST populated match out of idet's stderr: ffmpeg emits the counters more than once (an all-zero block from a discarded init leads, and the
-    // muxer summary trails), so anchoring to the first block reads zeros and anchoring to the end matches nothing - either way no file gets a verdict.
+    // Read the FINAL match, populated or not. ffmpeg emits the counters more than once - an all-zero block from a discarded init leads, and the genuine
+    // summary prints at filter uninit, after both dumps, followed only by the muxer's line, which carries no counters - so the last block is always the
+    // genuine one. Taking the last POPULATED block instead hands a sample that decoded no frames to a forged block from a dump, and a file can seek its
+    // own sample past the end of its video through format.duration; an all-zero final block must stay all-zero and read as no verdict.
     const lastIdetCounts = (text, re) => {
         const rx = new RegExp(IDET_LINE_PREFIX + re, 'gm');
         let best = null; let hit;
-        while ((hit = rx.exec(text)) !== null) if (hit.slice(1).some((n) => Number(n) > 0)) best = hit;
+        while ((hit = rx.exec(text)) !== null) best = hit;
         // The CAPTURE GROUPS as numbers - index 0, the whole match, is dropped, so the caller's [0] is group 1. Both consumers index on that: the four-name
         // destructure below, and rep[1] + rep[2] meaning Top + Bottom.
         return best ? best.slice(1).map(Number) : null;
