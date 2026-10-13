@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.45',
+    Version: '3.999.46',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -347,7 +347,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (9 sections: stream codec type … stream / language / preset helpers)
+    // #region SHARED helpers (10 sections: stream codec type … stream / language / preset helpers)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -618,6 +618,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }).join('');
     };
     // ===== END SHARED: mp4 uncopyable streams =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: output muxer =====
+    // -=-=-= OUTPUT_MUXER_BY_EXT (+ outputMuxerArg, noMuxerSkipLine)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // These four plugins write back into the source's own extension, and ffmpeg picks the muxer from the extension alone - which is wrong, or impossible,
+    // for some extensions they accept (measured on jellyfin 7.1.4). .m4v and .m4a select the ipod muxer, which refuses HEVC, AV1, E-AC-3 and Opus, even on a
+    // stream copy (exit 234); the mp4 muxer takes all of them into the same filename with identical iTunes tags and cover art, only major_brand moving to
+    // isom. .tp/.trp/.tod and .divx have no muxer by extension at all but are plain MPEG-TS and AVI. A null entry has no -f that serves it: .m2p/.vro/.mod/
+    // .evo (-f vob) and .dat (-f mpeg) take native DVD content but refuse a copied AAC track, so such a file is left for clean_and_remux to remux instead.
+    // awk-ffmpeg-test's muxmatrix mirrors this table (guarded by selftest_mirrors) and re-measures its rows.
+    const OUTPUT_MUXER_BY_EXT = {
+        m4v: 'mp4', m4a: 'mp4', tp: 'mpegts', trp: 'mpegts', tod: 'mpegts', divx: 'avi', m2p: null, vro: null, mod: null, evo: null, dat: null,
+    };
+    // The output-side -f a container needs: '' where ffmpeg's own pick by extension is right, null where no muxer can write the extension back at all.
+    const outputMuxerArg = (container) => {
+        const c = String(container || '').toLowerCase();
+        if (!Object.prototype.hasOwnProperty.call(OUTPUT_MUXER_BY_EXT, c)) return '';
+        return OUTPUT_MUXER_BY_EXT[c] ? ` -f ${OUTPUT_MUXER_BY_EXT[c]}` : null;
+    };
+    const noMuxerSkipLine = (container) => `☒A .${container} file has no ffmpeg muxer that can write it back - left untouched; remux it to mkv or mp4 first`
+        + ' (clean_and_remux does that)\n';
+    // ===== END SHARED: output muxer =====
     // ===== SHARED [sub_worker, video_clean]: marker persistence =====
     // -=-=-= markerPersists  [sub_worker, video_clean] =-=-=-
     // Can a container carry a GLOBAL awk_* marker back out of a mux? Matroska and its siblings store an arbitrary tag natively; the mp4 family keeps one only
@@ -1891,15 +1911,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.container = `.${dstContainer}`;
         // ...so a container that cannot hold the codec this run would write is a refusal, not an encode. Two failure shapes, both measured on jellyfin-ffmpeg
         // 7.1.4 by encoding into every container in Tdarr's default filter plus the 3gp/ogg/asf family and reading the result back (explicit hvc1/hev1/av01
-        // tags change nothing): the muxer REFUSES at header write (exit 234, so the file reaches the error queue with nothing but ffmpeg's own message), or it
+        // tags change nothing; .divx and .tp/.trp/.tod through the -f their muxer needs): the muxer REFUSES at header write (exit 234, so the file reaches the error queue with nothing but ffmpeg's own message), or it
         // exits 0 and writes a file that no longer reads back as that codec - AV1 into MPEG-PS reads back 'unknown', into MPEG-TS as nothing, and HEVC into
         // avi as rawvideo, which would make every later pass re-encode it. mkv, mp4 and flv take all three. In the designed stack clean_and_remux has
         // already remuxed to mkv or mp4, so only a standalone run - or one ordered before it - meets these. awk-ffmpeg-test's muxmatrix re-measures every
-        // cell (its WRITEBACK rows mirror this table, guarded by selftest_mirrors).
+        // cell (its WRITEBACK rows mirror this table, guarded by selftest_mirrors). .m4v is absent because it is written through the mp4 muxer, which takes all
+        // three, and an extension no muxer writes back at all (.evo and the rest) never gets this far - both are the output muxer section's business.
         const CONTAINER_REFUSES_VIDEO = {
-            webm: ['hevc', 'h264'], m4v: ['hevc', 'av1'], mov: ['av1'], '3gp': ['hevc', 'av1'], '3g2': ['hevc', 'av1'],
-            wmv: ['hevc'], asf: ['hevc'], ogv: ['hevc', 'h264', 'av1'], ogg: ['hevc', 'h264', 'av1'], evo: ['hevc', 'h264', 'av1'],
-            avi: ['hevc'], mpg: ['av1'], mpeg: ['av1'], vob: ['av1'], ts: ['av1'], m2ts: ['av1'], mts: ['av1'],
+            webm: ['hevc', 'h264'], mov: ['av1'], '3gp': ['hevc', 'av1'], '3g2': ['hevc', 'av1'],
+            wmv: ['hevc'], asf: ['hevc'], ogv: ['hevc', 'h264', 'av1'], ogg: ['hevc', 'h264', 'av1'],
+            avi: ['hevc'], divx: ['hevc'], mpg: ['av1'], mpeg: ['av1'], vob: ['av1'], ts: ['av1'], m2ts: ['av1'], mts: ['av1'], tp: ['av1'], trp: ['av1'],
+            tod: ['av1'],
         };
         const containerRefusesTarget = (codec) => Object.prototype.hasOwnProperty.call(CONTAINER_REFUSES_VIDEO, dstContainer)
             && CONTAINER_REFUSES_VIDEO[dstContainer].includes(codec);
@@ -1909,11 +1931,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // copy that keeps the source's working tag muxes and reads back fine; and the MPEG-PS/TS AV1 cells cannot be reached by a copy, since a source
         // those muxers cannot carry never probes as av1. awk-ffmpeg-test's muxmatrix mirrors this table too (WRITEBACK_COPY_REFUSES).
         const CONTAINER_REFUSES_COPY = {
-            webm: ['hevc', 'h264'], m4v: ['hevc', 'av1'], mov: ['av1'], '3gp': ['hevc', 'av1'], '3g2': ['hevc', 'av1'],
-            ogv: ['hevc', 'h264', 'av1'], ogg: ['hevc', 'h264', 'av1'], evo: ['hevc', 'h264', 'av1'],
+            webm: ['hevc', 'h264'], mov: ['av1'], '3gp': ['hevc', 'av1'], '3g2': ['hevc', 'av1'],
+            ogv: ['hevc', 'h264', 'av1'], ogg: ['hevc', 'h264', 'av1'],
         };
         const containerRefusesCopy = (codec) => Object.prototype.hasOwnProperty.call(CONTAINER_REFUSES_COPY, dstContainer)
             && CONTAINER_REFUSES_COPY[dstContainer].includes(codec);
+        if (outputMuxerArg(dstContainer) === null) return skip(noMuxerSkipLine(dstContainer));   // an extension no muxer writes back (outputMuxerArg)
 
         // Bit depth: source-detected (raw sample depth, or a 10-bit pixel format / profile), overridable. H.264 is always 8-bit. Shares the is10Bit helper with
         // summariseStream's 10bit token so the re-encode depth decision and the logged token can't drift.
@@ -2121,7 +2144,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 : '';
             response.infoLog += `☐${streamTag(primary.index)}[hdr_mode=strip_dynamic] Stripping ${stripped} losslessly (-c:v copy, base HDR10 retained)`
                 + `${leftover}\n`;
-            let out = `-map 0 -c copy -bsf:v:0 ${bsf}${outputDrops}${qtVideoTag(srcCodecName)}${riffTag} -c:a copy -c:s copy${strictArg}${globalOutputOpt}`;
+            let out = `-map 0 -c copy -bsf:v:0 ${bsf}${outputDrops}${qtVideoTag(srcCodecName)}${riffTag} -c:a copy -c:s copy${strictArg}${globalOutputOpt}`
+                + outputMuxerArg(dstContainer);
             // same as the transcode path: keep sibling plugins' GLOBAL awk_* markers through an mp4/mov copy
             const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags);
             if (tagPlan.flag) out += ' -movflags use_metadata_tags';
@@ -2541,7 +2565,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, globalWrites);
             if (tagPlan.flag) out += ' -movflags use_metadata_tags';
-            out += globalOutputOpt;
+            out += globalOutputOpt + outputMuxerArg(dstContainer);
             response.preset = `${enc.inputSide}<io>${out}`;
             response.processFile = true;
             response.infoLog += dropLog + mp4TagPlanLog(tagPlan, dstContainer);

@@ -17,7 +17,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same
         job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. A
         later job on that file is checked in full again. This check is always on and has no setting.\n`,
-    Version: '4.999.27',
+    Version: '4.999.28',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -288,7 +288,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (15 sections: stream codec type … mp4 strict compliance arg)
+    // #region SHARED helpers (16 sections: stream codec type … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -571,6 +571,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }).join('');
     };
     // ===== END SHARED: mp4 uncopyable streams =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: output muxer =====
+    // -=-=-= OUTPUT_MUXER_BY_EXT (+ outputMuxerArg, noMuxerSkipLine)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // These four plugins write back into the source's own extension, and ffmpeg picks the muxer from the extension alone - which is wrong, or impossible,
+    // for some extensions they accept (measured on jellyfin 7.1.4). .m4v and .m4a select the ipod muxer, which refuses HEVC, AV1, E-AC-3 and Opus, even on a
+    // stream copy (exit 234); the mp4 muxer takes all of them into the same filename with identical iTunes tags and cover art, only major_brand moving to
+    // isom. .tp/.trp/.tod and .divx have no muxer by extension at all but are plain MPEG-TS and AVI. A null entry has no -f that serves it: .m2p/.vro/.mod/
+    // .evo (-f vob) and .dat (-f mpeg) take native DVD content but refuse a copied AAC track, so such a file is left for clean_and_remux to remux instead.
+    // awk-ffmpeg-test's muxmatrix mirrors this table (guarded by selftest_mirrors) and re-measures its rows.
+    const OUTPUT_MUXER_BY_EXT = {
+        m4v: 'mp4', m4a: 'mp4', tp: 'mpegts', trp: 'mpegts', tod: 'mpegts', divx: 'avi', m2p: null, vro: null, mod: null, evo: null, dat: null,
+    };
+    // The output-side -f a container needs: '' where ffmpeg's own pick by extension is right, null where no muxer can write the extension back at all.
+    const outputMuxerArg = (container) => {
+        const c = String(container || '').toLowerCase();
+        if (!Object.prototype.hasOwnProperty.call(OUTPUT_MUXER_BY_EXT, c)) return '';
+        return OUTPUT_MUXER_BY_EXT[c] ? ` -f ${OUTPUT_MUXER_BY_EXT[c]}` : null;
+    };
+    const noMuxerSkipLine = (container) => `☒A .${container} file has no ffmpeg muxer that can write it back - left untouched; remux it to mkv or mp4 first`
+        + ' (clean_and_remux does that)\n';
+    // ===== END SHARED: output muxer =====
 
     // ===== SHARED [audio_clean, stream_ordering]: audio codec scoring =====
     // -=-=-= codecInfo  [audio_clean, stream_ordering] =-=-=-
@@ -1115,6 +1135,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (file.fileMedium === 'audio' && (file.ffProbeData?.streams || []).some((s) => codecTypeOf(s) === 'video')) {
         return skip('☒[mka] This .mka carries cover art, and any remux would turn it into a video track - left untouched\n');
     }
+    if (outputMuxerArg(dstContainer) === null) return skip(noMuxerSkipLine(dstContainer));   // an extension no muxer writes back (outputMuxerArg)
 
     // #region SHARED helpers (1 section: recovered marker vocabulary)
     // ===== SHARED [clean_and_remux, stream_ordering]: recovered marker vocabulary =====
@@ -1632,7 +1653,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // without it. It reads the RAW ffprobe streams, never sortRows (see its header); this plugin only reorders, so every stream is copied and the
         // copied-subset argument stays at its default.
         const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams);
-        response.preset = `<io>${ffmpegMap} -c copy${dispositionArgs}${junkArgs}${strictArg}${globalOutputOpt}${mp4MovflagsArg}`;
+        response.preset = `<io>${ffmpegMap} -c copy${dispositionArgs}${junkArgs}${strictArg}${globalOutputOpt}${mp4MovflagsArg}${outputMuxerArg(dstContainer)}`;
         if (dispositionArgs !== '')
             response.infoLog += '☐Set the first audio track as the sole default\n';
         const mapped = file.ffProbeData.streams.filter((s) => !uncopyable.includes(s));

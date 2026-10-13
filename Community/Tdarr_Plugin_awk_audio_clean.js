@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.45',
+    Version: '4.999.46',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -531,7 +531,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (16 sections: stream codec type … mp4 strict compliance arg)
+    // #region SHARED helpers (17 sections: stream codec type … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -802,6 +802,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }).join('');
     };
     // ===== END SHARED: mp4 uncopyable streams =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: output muxer =====
+    // -=-=-= OUTPUT_MUXER_BY_EXT (+ outputMuxerArg, noMuxerSkipLine)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // These four plugins write back into the source's own extension, and ffmpeg picks the muxer from the extension alone - which is wrong, or impossible,
+    // for some extensions they accept (measured on jellyfin 7.1.4). .m4v and .m4a select the ipod muxer, which refuses HEVC, AV1, E-AC-3 and Opus, even on a
+    // stream copy (exit 234); the mp4 muxer takes all of them into the same filename with identical iTunes tags and cover art, only major_brand moving to
+    // isom. .tp/.trp/.tod and .divx have no muxer by extension at all but are plain MPEG-TS and AVI. A null entry has no -f that serves it: .m2p/.vro/.mod/
+    // .evo (-f vob) and .dat (-f mpeg) take native DVD content but refuse a copied AAC track, so such a file is left for clean_and_remux to remux instead.
+    // awk-ffmpeg-test's muxmatrix mirrors this table (guarded by selftest_mirrors) and re-measures its rows.
+    const OUTPUT_MUXER_BY_EXT = {
+        m4v: 'mp4', m4a: 'mp4', tp: 'mpegts', trp: 'mpegts', tod: 'mpegts', divx: 'avi', m2p: null, vro: null, mod: null, evo: null, dat: null,
+    };
+    // The output-side -f a container needs: '' where ffmpeg's own pick by extension is right, null where no muxer can write the extension back at all.
+    const outputMuxerArg = (container) => {
+        const c = String(container || '').toLowerCase();
+        if (!Object.prototype.hasOwnProperty.call(OUTPUT_MUXER_BY_EXT, c)) return '';
+        return OUTPUT_MUXER_BY_EXT[c] ? ` -f ${OUTPUT_MUXER_BY_EXT[c]}` : null;
+    };
+    const noMuxerSkipLine = (container) => `☒A .${container} file has no ffmpeg muxer that can write it back - left untouched; remux it to mkv or mp4 first`
+        + ' (clean_and_remux does that)\n';
+    // ===== END SHARED: output muxer =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: case-insensitive tag lookup =====
     // -=-=-= getTagCI  [all five] =-=-=-
     // Look up a tag value case-insensitively on BOTH sides - matroska UPPER-CASES tag keys on write, so a plugin reading its sibling's awk_*
@@ -1857,6 +1877,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (file.fileMedium === 'audio' && dstContainer === 'mka' && file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'video')) {
         return skip('☒[mka] This .mka carries cover art, and any remux would turn it into a video track - left untouched\n');
     }
+
+    if (outputMuxerArg(dstContainer) === null) return skip(noMuxerSkipLine(dstContainer));   // an extension no muxer writes back (outputMuxerArg)
 
     // Only a VIDEO file can reach this: fileMedium 'audio' is assigned on the presence of an audio stream, so an audio-medium file always has one.
     let audioStreams = file.ffProbeData.streams.filter(stream => codecTypeOf(stream) === 'audio');
@@ -3232,7 +3254,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 .filter((s) => !removedIndices.has(s.index) && !outputAudioOverride.has(outputAudioIdxMap.get(s.index)));
             const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams, copiedStreams);
             const uncopyableDrops = uncopyable.map((s) => ` -map -0:${s.index}`).join('');
-            response.preset += `<io>-map 0${uncopyableDrops} -c copy${extraArguments}${strictArg}${globalOutputOpt}${mp4KeepTags}`;
+            response.preset += `<io>-map 0${uncopyableDrops} -c copy${extraArguments}${strictArg}${globalOutputOpt}${mp4KeepTags}`
+                + outputMuxerArg(dstContainer);
             response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;
             response.processFile = true;
         } else {
