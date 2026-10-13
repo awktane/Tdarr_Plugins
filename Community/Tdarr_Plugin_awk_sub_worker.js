@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.62',
+    Version: '3.999.63',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1127,18 +1127,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const key = apiAuthKey();
         return key ? `header = "x-api-key: ${key}"\nheader = "tdarrKey: ${key}"\nheader = "Authorization: Bearer ${key}"\n` : '';
     };
-    // Is a non-empty sidecar already at this server path? Download is the only read the API offers, so the test IS a fetch - discarded to the null device
-    // and measured with curl's own counters, never buffered through spawnSync (a large body silently exceeds maxBuffer and fakes a failure).
+    // Is a non-empty sidecar already at this server path? Download is the only read the API offers, so the test IS a fetch - discarded to the null device,
+    // or written to `saveTo` (a path in the caller's private staging directory) when the caller must judge the body - and measured with curl's own
+    // counters, never buffered through spawnSync (a large body silently exceeds maxBuffer and fakes a failure).
     // Three answers, not two, because a caller's next step on 'absent' is an upload, and the upload endpoint REPLACES whatever is there - possibly a
     // sidecar the user has OCR'd or edited. So 'absent' needs a completed request the server answered definitively: its File-not-found (HTTP 400), or a
     // 200 with no body, which holds nothing to lose. Everything else - no URL, a spawn error, a non-zero curl exit (connection refused, the -m timeout,
     // a dropped transfer), a 5xx, a 501 - is 'unknown': the sidecar may well be there, so the caller leaves it alone this pass instead of writing over it.
     // Returns { state: 'present' | 'absent' | 'unknown', why }; `why` is for the user's log line and is '' unless the state is 'unknown'.
-    const sidecarExistsRemote = (dest) => {
+    const sidecarExistsRemote = (dest, saveTo = '') => {
         const { spawnSync } = require('child_process');
         const url = serverApiUrl();
         if (!url) return { state: 'unknown', why: 'the node config carries no server URL' };
-        const r = spawnSync('curl', ['-sS', '-m', SIDECAR_SPAWN_TIMEOUT_S, '-o', nullDevice, '-w', '%{http_code} %{size_download}', ...apiAuthArgs(),
+        const r = spawnSync('curl', ['-sS', '-m', SIDECAR_SPAWN_TIMEOUT_S, '-o', saveTo || nullDevice, '-w', '%{http_code} %{size_download}', ...apiAuthArgs(),
             '-X', 'POST', '-H', 'Content-Type: application/json', '-d', JSON.stringify({ filePath: dest }), `${url}/api/v2/file/download`],
             { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, input: apiAuthInput() });
         if (r.error) return { state: 'unknown', why: `the existence check failed (${r.error.code || r.error.message})` };
@@ -2742,6 +2743,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // (ffmpeg creates the srt when it opens its outputs), so the captions are simply read again. Recording `none` on either was what let
                     // video_clean drop captions nothing had captured. Only where the memos persist: a marker-hostile container cannot record which reads ran,
                     // so the single-read verdict stands there.
+                    // One that cannot be removed (a read-only mount) before both fields have been read is no verdict either: re-reading it would need ffmpeg to
+                    // write over a file it cannot replace, so it is declined - nothing recorded, kept out of the import - and the captions stay in the video.
+                    // video_clean takes awk_cc=none as leave to drop them, so recording it here would be the wrong fail-safe direction.
+                    if (canRecord && !unlinked && !ccTokens.includes(CC_TOKENS.decoded2)) {
+                        return { job: null, untrusted: true, note: `☒[embedded_cc=enabled] ${name} is empty, but no read of both caption fields stands behind it,`
+                            + ' and it could not be removed - leaving it, and the captions in the video\n' };
+                    }
                     if (!canRecord || !unlinked || ccTokens.includes(CC_TOKENS.decoded2)) {
                         // Recording the verdict takes a mux of its own, and that is only safe where the tag comes back out. On a marker-hostile container the
                         // memo cannot be stored, so the identical tag-only pass would be recomputed and re-emitted every time - which Tdarr refuses as an
@@ -2780,6 +2788,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Whether the caption staging sidecar is in the library RIGHT NOW - either ccPlan's existence probe found it there, or this pass uploads it below.
         // Only the text_file import route reads it, because that route has no directory to scan and cannot put the name into the user's list.
         let ccStaged = ccPlan.staged === true;
+        // The read memo the API placement route owes the import's -c copy pass when the import does not consume the staged caption sidecar.
+        let ccApiRead = '';
 
         // Captions are removed from the VIDEO BITSTREAM, not from a stream list, so the removal is a bitstream filter rather than a -map exclusion. It is
         // picture-lossless on H.264 only: remove_types takes NAL unit types and the numbering is CODEC-SPECIFIC, so 6 is SEI on H.264 but a VCL slice type
@@ -3005,10 +3015,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const { placed, failed, empty: emptyExtractions } = placeSidecars(placeJobs);
                 // In-plugin, the read is known to have finished, so an empty first read goes straight to field 2 (see ccPlan) before it counts as empty.
                 const ccFirst = placeJobs.find((j) => j.caption && emptyExtractions.has(j.name) && !ccPlan.job.field2);
+                // Which field the placed caption sidecar came from, for its read memo below.
+                let ccReadField2 = !!(ccPlan.job && ccPlan.job.field2);
                 if (ccFirst) {
                     const again = placeSidecars([{ ...ccFirst, args: ccLavfiArgs(true) }]);
                     if (!again.empty.has(ccFirst.name)) emptyExtractions.delete(ccFirst.name);
-                    if (again.placed.has(ccFirst.name)) placed.add(ccFirst.name);
+                    if (again.placed.has(ccFirst.name)) { placed.add(ccFirst.name); ccReadField2 = true; }
                     else if (again.failed.has(ccFirst.name)) failed.set(ccFirst.name, again.failed.get(ccFirst.name));
                 }
                 for (const j of placeJobs) {
@@ -3034,7 +3046,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         continue;
                     }
                     wrote += 1;
-                    if (j.caption) ccPlaced = true;   // the server confirms it holds the caption srt, which is what the bitstream removal below waits on
+                    if (j.caption) {
+                        ccPlaced = true;   // the server confirms it holds the caption srt, which is what the bitstream removal below waits on
+                        // The read is known to have finished (it ran in-plugin, synchronously), so record it as the direct-write route does - without the
+                        // memo, every later pass would see this sidecar through a read-only mount as an interrupted read's prefix it cannot remove, and warn
+                        // so for the life of the file. With remove_source off this costs one tag-only mux on this pass; the file then settles.
+                        if (canRecord) ccRecord.add(ccReadField2 ? CC_TOKENS.decoded2 : CC_TOKENS.decoded);
+                    }
                     if (j.bundle) bundled += 1;
                     // NEVER for a caption job: its index is the video stream's, and removedIndices becomes a -map -0:N exclusion. Captions leave the
                     // bitstream through the strip filter below (or through video_clean on a re-encode), never by dropping the stream that carries them.
@@ -3130,6 +3148,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         // ====== IMPORT: sidecars -> embedded (+ safe deletion) ======
+        // An import that ends with nothing to mux would leave no record of a caption read the API placement route just finished in-plugin (ccApiRead), so
+        // the next pass would take the placed sidecar for an interrupted read's prefix - and through a read-only mount neither remove nor import it. So
+        // each such exit spends one tag-only mux on the memo instead of skipping; the next pass reads nothing and settles.
+        const importSkip = (msg) => {
+            if (!ccApiRead) return skip(msg);
+            response.infoLog += `${msg}☐[embedded_cc=enabled] Recording the finished caption read so no later pass takes the sidecar for an interrupted one\n`;
+            commitPreset(`-map 0 -c copy${ccTagArg(ccApiRead)}`);
+            response.infoLog += `☑Expected results: ${summariseAll(outputView(streams))}\n`;
+            return response;
+        };
         // Captions reach a subtitle TRACK over two passes, and that is a reuse decision rather than a compromise: this pass only reads them out to a hidden
         // staging sidecar, and the next runs that file through the ordinary import path, which already verifies content, collapses duplicates against what
         // is embedded, converts to mov_text for an mp4 target, restores metadata from the name and deletes the file afterwards. Muxing the captions straight
@@ -3147,13 +3175,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (ccPlan.job) {
             const ccJob = { name: ccPlan.job.name, dest: ccPlan.job.remoteDest, args: ccLavfiArgs(ccPlan.job.field2) };
             let { placed, failed, empty: emptyExtractions } = placeSidecars([ccJob]);
+            let readField2 = ccPlan.job.field2;
             // In-plugin, the read is known to have finished, so an empty first read goes straight to field 2 (see ccPlan) before it counts as empty.
             if (emptyExtractions.has(ccJob.name) && !ccPlan.job.field2) {
                 ({ placed, failed, empty: emptyExtractions } = placeSidecars([{ ...ccJob, args: ccLavfiArgs(true) }]));
+                readField2 = true;
             }
             if (placed.has(ccPlan.job.name)) {
                 response.infoLog += ccReadLine(ccVideo.index, ccPlan.job.name);
                 ccStaged = true;
+                // The finished read's memo, written with this pass's import (see the extract route): the import below normally consumes the staged sidecar and
+                // records `imported`, but one it does not consume must not be taken for an interrupted read's prefix next pass and left un-imported.
+                if (canRecord) ccApiRead = readField2 ? CC_TOKENS.decoded2 : CC_TOKENS.decoded;
                 // The list is seeded here only when there ISN'T one yet; an existing list is the user's file and is never rewritten (seedSubtitleList).
                 // A real failure to create one is reported exactly as the extract route reports it - swallowed, the user is never told the list is missing.
                 if (unmappedMode === 'text_file') {
@@ -3195,6 +3228,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The caption staging sidecar ccPlan found unfinished and could not remove: never imported, so nothing is muxed or stripped on a prefix.
         const ccUntrusted = (f) => ccPlan.untrusted === true && ccName && f.rel === ccName;
         const subBundleFits = (f) => !(f.bundle && isMp4);
+        // The WebM muxer stores WebVTT subtitles only, and no attachments: a -c copy of anything else (srt, ass/ssa, a bundle's ass and fonts) exits 234 at
+        // header write on every requeue. Converting would flatten ASS styling and break the content identity remove_source deletes on, so it is refused.
+        const subWebmFits = (f) => dstContainer !== 'webm' || (!f.bundle && String(f.ext || '').toLowerCase() === 'vtt');
         // The shared scope verdict WITH its user-facing line, used by the found-filter below and by the text_file route's pre-fetch filter, so the two
         // routes can never log different reasons. Every drop says so: a sidecar that is on disk and never mentioned again is indistinguishable from one
         // the plugin never saw, and that is precisely the report a user cannot debug. Idempotent by construction (pure predicates), so a rel the
@@ -3206,6 +3242,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // - bundle-vs-mp4: an mp4-family target carries no font attachments at all, so importing a styled-subtitle bundle there would embed the subtitle
         //   and strand its fonts - and remove_source would then delete the only copy that has them. Leave the bundle untouched on disk (a drop here also
         //   keeps it out of the deletion pass below); remux the file to mkv and run import again to restore it.
+        // - webm: only a .vtt sidecar imports (subWebmFits); everything else stays on disk with a remux-to-mkv pointer. The caption staging sidecar never
+        //   meets this rule - webm carries VP8/VP9/AV1, none of which holds embedded A53 captions, so embedded_cc has nothing to stage on a webm file.
         const subInScopeLogged = (f) => {
             if (ccUntrusted(f)) return false;   // ccPlan's line already says why
             if (!subLangInScope(f)) {
@@ -3218,6 +3256,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!subBundleFits(f)) {
                 response.infoLog += `☒Cannot import ${f.rel} - an ${dstContainer} target carries no font attachments, `
                     + 'keeping the styled-subtitle bundle on disk\n';
+                return false;
+            }
+            if (!subWebmFits(f)) {
+                response.infoLog += `☒Cannot import ${logSafe(f.rel)} - a webm target stores only WebVTT subtitles and no font attachments, so it stays on disk;`
+                    + ' remux to mkv (clean_and_remux does that) and run import again\n';
                 return false;
             }
             return true;
@@ -3377,11 +3420,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // sidecar, and this is the one route to it that has none - a library with no sidecars at all, or a round trip that has already finished and cleaned
         // up after itself, would otherwise never have its duplicates collapsed.
         if (!found.length) {
-            if (!removedIndices.size) return skip('☑No subtitle sidecars found to import\n');
+            if (!removedIndices.size) return importSkip('☑No subtitle sidecars found to import\n');
             let dropOnly = ' -map 0';
             for (const idx of removedIndices) dropOnly += ` -map -0:${idx}`;
             dropOnly += ' -c copy';
             dropOnly += retagArgs(dupes.retag, keptSubs);
+            if (ccApiRead) dropOnly += ccTagArg(ccApiRead);   // see importSkip
             commitPreset(dropOnly);
             response.infoLog += `☑Expected results: ${summariseAll(outputView(streams.filter((x) => !removedIndices.has(x.index))))}\n`;
             return response;
@@ -3617,7 +3661,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!stranded.some((rel) => !importedSet.has(rel))) {
                 response.infoLog += '☑[remove_source=true] Already queued for removal by an earlier pass - '
                     + 'nothing more to do until the post-processing stage runs\n';
-                return skip('☑Nothing to import - every sidecar was already in the file\n');
+                return importSkip('☑Nothing to import - every sidecar was already in the file\n');
             }
             // The marker is written whole, so anything left out of it is erased. Carry forward every sidecar still on disk that an earlier pass already
             // settled (alreadyEmbedded), exactly as the mux path below does for the same reason: dropped from the marker, it is no longer skipped and the
@@ -3645,7 +3689,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 catch (e) { response.infoLog += `☒[remove_source=true] Could not delete sidecar ${rel}: ${e && e.message ? e.message : e}\n`; }
             }
             response.infoLog += deleteSpentSubtitleList('remove_source=true', removedRels);   // same cleanup whichever route removed them
-            return skip(`☑Nothing to import - every sidecar was already in the file${gone ? `, ${gone} removed from ${workLibDir()}` : ''}\n`);
+            return importSkip(`☑Nothing to import - every sidecar was already in the file${gone ? `, ${gone} removed from ${workLibDir()}` : ''}\n`);
         }
 
         // A retune is a mux of its own: no new inputs and no new maps, just the metadata of a stream that is already there. It rides the same output as any
@@ -3718,6 +3762,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     }
                 }
                 meta += ccTagArg(...ccAdd);
+            } else if (ccApiRead) {
+                meta += ccTagArg(ccApiRead);
             }
             // drops first, so the -map 0 they subtract from is still the whole file
             for (const idx of removedIndices) extraMaps = ` -map -0:${idx}${extraMaps}`;
@@ -3732,7 +3778,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return response;
         }
 
-        return skip(importedSet.size ? '☑Sidecars already imported; nothing to do\n' : '☑All matching subtitles already present; nothing to import\n');
+        return importSkip(importedSet.size ? '☑Sidecars already imported; nothing to do\n' : '☑All matching subtitles already present; nothing to import\n');
         // ====== END IMPORT ======
     } catch (err) {
         failUnexpected(err);

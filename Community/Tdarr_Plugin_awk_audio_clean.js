@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.44',
+    Version: '4.999.45',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1355,8 +1355,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Canonical audio-title machinery, shared so audio_clean's downmix titles come out already in clean_and_remux's tag_title form (no wasted remux).
     // Canonical form: "<channel/downmix base> - <role tags>", roles LAST ("5.1 -> 2.0 - Commentary"). canonicalAudioTitle is the entry point.
     // -=-=-= channel-label vocab: channelTitleLabels / bareChannelRegex / downmixChannelRegex  [audio_clean, clean_and_remux] =-=-=-
-    // The channel labels we recognise/replace for tag_title - 2.0 included so it can be overwritten with Stereo
-    const channelTitleLabels = ['7.1', '6.1', '5.1', '5.0', '4.0', '3.1', '3.0', '2.1', '2.0', 'stereo', 'mono'];
+    // The channel labels we recognise/replace for tag_title - 2.0 included so it can be overwritten with Stereo. Every label clean_and_remux's layoutLabel
+    // can write is listed (the 7.0 / 6.0 / 4.1 / 8.0 and height layouts included), so a title it wrote stays OWNED: its role suffix is normalised and a
+    // downmix base built on it is recognised, instead of being taken for a custom title on the next pass.
+    const channelTitleLabels = ['22.2', '10.0.6', '9.1.4', '7.2.3', '7.1.4', '7.1.2', '5.1.4', '5.1.2', '4.0.4', '3.1.2', '8.0', '7.1', '7.0', '6.1', '6.0',
+        '5.1', '5.0', '4.1', '4.0', '3.1', '3.0', '2.1', '2.0', 'stereo', 'mono'];
     const channelLabelAlternation = channelTitleLabels.map(l => l.replace(/\./g, '\\.')).join('|');
     // A bare channel title (the whole title is just a channel label) - we own these and may derive/overwrite them
     const bareChannelRegex = new RegExp(`^(${channelLabelAlternation})$`, 'i');
@@ -1919,6 +1922,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // dedup, codec_force, loudnorm - which is what the 0 sentinel is for. The ambient `.channels` comparisons elsewhere (existing2ch/6chLangs,
                 // noCodecWorkNeeded, the dedup guard block) read the enriched field instead, which stays undefined on an unmeasurable stream and so fails
                 // closed: do NOT swap them to awkChannels, whose 0 compares true against `<= 2` and would silently drop the no-channel-count diagnostic.
+                // The two SORT comparators (workStreams, dedup byQuality) are the opposite case and read awkChannels: an undefined there yields NaN, which
+                // Array.sort treats as a tie, so 8ch = unmeasured = 6ch but 8ch > 6ch - an inconsistent order that could put the 5.1 ahead of the 7.1 as a
+                // downmix source. The 0 sentinel sorts an unmeasured track last, a total order.
                 awkChannels: resolveChannels(enrichedItem),
                 awkQuality: audioQuality(enrichedItem),
                 // Used by codec_force to suppress the source-bitrate floor in resolveBitrate for lossless sources. A lossless bitrate (e.g. 4 Mbps TrueHD)
@@ -2036,7 +2042,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // EX copy carries an extra matrixed rear channel a non-EX decoder folds harmlessly, so keeping it is never worse. Both bumps
             // usually get separated by the score/bitrate first; the tie-breaks only matter when everything above them lands exactly equal.
             const byQuality = [...audioStreams].sort((a, b) =>
-                (trustedRate(b) ? 1 : 0) - (trustedRate(a) ? 1 : 0) || b.awkQuality - a.awkQuality || b.channels - a.channels
+                (trustedRate(b) ? 1 : 0) - (trustedRate(a) ? 1 : 0) || b.awkQuality - a.awkQuality || b.awkChannels - a.awkChannels
                 || (b.awkObjectAudio ? 1 : 0) - (a.awkObjectAudio ? 1 : 0)
                 || (b.awkMatrixSurround ? 1 : 0) - (a.awkMatrixSurround ? 1 : 0) || a.index - b.index);
             // Only worth reporting the und exemption below when two or more untagged MAIN tracks are present: a lone untagged track has nothing it could be
@@ -2331,8 +2337,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const bRole = (b.awkSecondaryTrack || b.awkTier !== 'surround') ? 1 : 0;
             if (aRole !== bRole) return aRole - bRole;
 
-            if (a.channels !== b.channels)
-                return b.channels - a.channels;
+            if (a.awkChannels !== b.awkChannels)
+                return b.awkChannels - a.awkChannels;
 
             const aQuality = a.awkQuality;
             const bQuality = b.awkQuality;
@@ -3046,7 +3052,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const keepCodec = ENCODABLE_CODECS.includes(srcFamily) ? srcFamily : configuredCodec;
                 const reachable = (c) => channels <= codecMaxCh(aacFamily(c)) && !guardBlocks(ffstream, c, channels, channels);
                 const wantCodec = forceCovers(isStereo, channels) ? configuredCodec : keepCodec;
-                const targetCodec = reachable(wantCodec) ? wantCodec : (reachable(keepCodec) ? keepCodec : null);
+                let targetCodec = reachable(wantCodec) ? wantCodec : (reachable(keepCodec) ? keepCodec : null);
+                // The opus layout wall counts as out of reach too: when libopus refuses this layout with no lossless relabel and no remix will run
+                // (method_layout_err keep/drop, or remix standing down for an existing stereo - the branch below), an opus target ends in "Not normalizing".
+                // ac3/eac3/aac carry every layout, so an encodable source codec takes the correction instead; with no such codec to fall back to, the branch
+                // below still reports the wall.
+                const opusWalled = (c) => {
+                    if (aacFamily(c) !== 'opus' || channels <= 2 || ffstreamCodec === 'opus') return false;
+                    const { ok, relabel } = opusLayoutFor(ffstream, channels);
+                    return !ok && !relabel && (methodLayoutErr !== 'remix' || remixDefersToExistingStereo(ffstream, relabel));
+                };
+                if (targetCodec !== null && targetCodec !== keepCodec && opusWalled(targetCodec) && reachable(keepCodec) && !opusWalled(keepCodec)) {
+                    targetCodec = keepCodec;
+                }
                 if (targetCodec === null) {
                     // Both candidates are out of reach; report against keepCodec, the one the track would otherwise have stayed in.
                     if (channels > codecMaxCh(aacFamily(keepCodec)))

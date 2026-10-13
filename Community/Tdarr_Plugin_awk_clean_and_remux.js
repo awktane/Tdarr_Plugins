@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.49',
+    Version: '4.999.50',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1498,18 +1498,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const key = apiAuthKey();
         return key ? `header = "x-api-key: ${key}"\nheader = "tdarrKey: ${key}"\nheader = "Authorization: Bearer ${key}"\n` : '';
     };
-    // Is a non-empty sidecar already at this server path? Download is the only read the API offers, so the test IS a fetch - discarded to the null device
-    // and measured with curl's own counters, never buffered through spawnSync (a large body silently exceeds maxBuffer and fakes a failure).
+    // Is a non-empty sidecar already at this server path? Download is the only read the API offers, so the test IS a fetch - discarded to the null device,
+    // or written to `saveTo` (a path in the caller's private staging directory) when the caller must judge the body - and measured with curl's own
+    // counters, never buffered through spawnSync (a large body silently exceeds maxBuffer and fakes a failure).
     // Three answers, not two, because a caller's next step on 'absent' is an upload, and the upload endpoint REPLACES whatever is there - possibly a
     // sidecar the user has OCR'd or edited. So 'absent' needs a completed request the server answered definitively: its File-not-found (HTTP 400), or a
     // 200 with no body, which holds nothing to lose. Everything else - no URL, a spawn error, a non-zero curl exit (connection refused, the -m timeout,
     // a dropped transfer), a 5xx, a 501 - is 'unknown': the sidecar may well be there, so the caller leaves it alone this pass instead of writing over it.
     // Returns { state: 'present' | 'absent' | 'unknown', why }; `why` is for the user's log line and is '' unless the state is 'unknown'.
-    const sidecarExistsRemote = (dest) => {
+    const sidecarExistsRemote = (dest, saveTo = '') => {
         const { spawnSync } = require('child_process');
         const url = serverApiUrl();
         if (!url) return { state: 'unknown', why: 'the node config carries no server URL' };
-        const r = spawnSync('curl', ['-sS', '-m', SIDECAR_SPAWN_TIMEOUT_S, '-o', nullDevice, '-w', '%{http_code} %{size_download}', ...apiAuthArgs(),
+        const r = spawnSync('curl', ['-sS', '-m', SIDECAR_SPAWN_TIMEOUT_S, '-o', saveTo || nullDevice, '-w', '%{http_code} %{size_download}', ...apiAuthArgs(),
             '-X', 'POST', '-H', 'Content-Type: application/json', '-d', JSON.stringify({ filePath: dest }), `${url}/api/v2/file/download`],
             { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, input: apiAuthInput() });
         if (r.error) return { state: 'unknown', why: `the existence check failed (${r.error.code || r.error.message})` };
@@ -1748,8 +1749,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Canonical audio-title machinery, shared so audio_clean's downmix titles come out already in clean_and_remux's tag_title form (no wasted remux).
     // Canonical form: "<channel/downmix base> - <role tags>", roles LAST ("5.1 -> 2.0 - Commentary"). canonicalAudioTitle is the entry point.
     // -=-=-= channel-label vocab: channelTitleLabels / bareChannelRegex / downmixChannelRegex  [audio_clean, clean_and_remux] =-=-=-
-    // The channel labels we recognise/replace for tag_title - 2.0 included so it can be overwritten with Stereo
-    const channelTitleLabels = ['7.1', '6.1', '5.1', '5.0', '4.0', '3.1', '3.0', '2.1', '2.0', 'stereo', 'mono'];
+    // The channel labels we recognise/replace for tag_title - 2.0 included so it can be overwritten with Stereo. Every label clean_and_remux's layoutLabel
+    // can write is listed (the 7.0 / 6.0 / 4.1 / 8.0 and height layouts included), so a title it wrote stays OWNED: its role suffix is normalised and a
+    // downmix base built on it is recognised, instead of being taken for a custom title on the next pass.
+    const channelTitleLabels = ['22.2', '10.0.6', '9.1.4', '7.2.3', '7.1.4', '7.1.2', '5.1.4', '5.1.2', '4.0.4', '3.1.2', '8.0', '7.1', '7.0', '6.1', '6.0',
+        '5.1', '5.0', '4.1', '4.0', '3.1', '3.0', '2.1', '2.0', 'stereo', 'mono'];
     const channelLabelAlternation = channelTitleLabels.map(l => l.replace(/\./g, '\\.')).join('|');
     // A bare channel title (the whole title is just a channel label) - we own these and may derive/overwrite them
     const bareChannelRegex = new RegExp(`^(${channelLabelAlternation})$`, 'i');
@@ -1915,17 +1919,47 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: closed-caption handoff =====
     // #endregion
 
-    // Channel layout string from ffprobe, falling back to mediaInfo (ChannelLayout/ChannelPositions) - lets us spot the LFE that separates 3.1 from 4.0 and
-    // 2.1 from 3.0 even when ffprobe omits channel_layout. Feeds channelLabel's hasLfe argument at the tag_title call site.
+    // Channel layout string from ffprobe, falling back to mediaInfo (ChannelLayout/ChannelPositions), so tag_title can name the layout even when ffprobe
+    // omits channel_layout.
     const channelLayoutStr = (ffstream) => {
         const ffmedia = mediaInfoFor(ffstream);
         return (ffstream.channel_layout || ffmedia?.ChannelLayout || ffmedia?.ChannelPositions || '').toLowerCase();
     };
-    // ffprobe's canonical layout strings for 2.1 and 3.1 are literally "2.1"/"3.1" - no "lfe" substring - so a plain
-    // .includes('lfe') misses them and channelLabel would mislabel (and clobber) a 2.1 track as 3.0 / a 3.1 as 4.0. Treat
-    // a nonzero digit after the first dot ("2.1","3.1","5.1","7.1.4") as an LFE too, alongside the verbose "FL+FR+LFE"
-    // form. Only channelLabel's 3ch (2.1 vs 3.0) and 4ch (3.1 vs 4.0) cases read hasLfe, so 6/8-ch labels are unaffected.
+    // ffprobe's canonical layout strings for 2.1 and 3.1 are literally "2.1"/"3.1" - no "lfe" substring - so a plain .includes('lfe') misses them. Treat a
+    // nonzero digit after the first dot ("2.1","3.1","5.1","7.1.4") as an LFE too, alongside the verbose "FL+FR+LFE" form.
     const layoutHasLfe = (ffstream) => { const s = channelLayoutStr(ffstream); return /lfe/.test(s) || /^\d+\.[1-9]/.test(s.trim()); };
+    // tag_title's channel label, read from the stream's LAYOUT so it names what the layout is rather than the conventional layout for its channel count.
+    // channelLabel alone reads the LFE only at 3-4 channels, so it names 7.0 '6.1', 6.0 '5.1', 4.1 '5.0' and octagonal '7.1' - it stays as it is because
+    // audio_clean names downmix TARGETS with it, where a 6ch result is 5.1. Read in order:
+    // - ffprobe's numeric names (7.0, 6.0(front), 4.1, 5.1(side), 5.1.2, 7.1.4, 7.2.3, 22.2) as-is, when their digits add up to the channel count;
+    // - its other named layouts, mapped to the same form (NAMED_LAYOUT_LABEL, from `ffmpeg -layouts` on jellyfin-ffmpeg 7.1.4);
+    // - a verbose ffprobe/mediaInfo listing, counted: LFE/LFE2 are the LFE digit, T-prefixed (top) and Vh (vertical height) channels the height digit;
+    // - with no layout at all 7.0 cannot be told from 6.1, so a title that already names a layout of the right size is kept, and only an unnamed track
+    //   gets the conventional label - otherwise a correct "7.0" would be overwritten with "6.1".
+    const NAMED_LAYOUT_LABEL = { quad: '4.0', 'quad(side)': '4.0', hexagonal: '6.0', octagonal: '8.0', cube: '4.0.4', hexadecagonal: '10.0.6' };
+    const labelChannelSum = (label) => String(label).split('.').reduce((n, d) => n + Number(d), 0);
+    const layoutLabel = (ffstream, channels, currentTitle) => {
+        if (channels <= 2) return channelLabel(channels, false);
+        const s = channelLayoutStr(ffstream).trim();
+        const numeric = /^(\d+\.\d+(?:\.\d+)?)(?:\([a-z-]+\))?$/.exec(s);
+        if (numeric && labelChannelSum(numeric[1]) === channels) return numeric[1];
+        const named = NAMED_LAYOUT_LABEL[s];
+        if (named && labelChannelSum(named) === channels) return named;
+        if (s) {
+            let main = 0; let lfe = 0; let height = 0; let section = '';
+            for (const tok of s.split(/[\s+,/]+/).filter(Boolean)) {
+                if (tok.endsWith(':')) { section = tok; continue; }
+                if (/^lfe\d?$/.test(tok)) lfe += 1;
+                else if (section === 'top:' || /^(t[fbs]?[lrc]|tc|vh[lrc])$/.test(tok)) height += 1;
+                else main += 1;
+            }
+            if (main + lfe + height === channels) return height ? `${main}.${lfe}.${height}` : `${main}.${lfe}`;
+            return channels >= 5 ? (layoutHasLfe(ffstream) ? `${channels - 1}.1` : `${channels}.0`) : channelLabel(channels, layoutHasLfe(ffstream));
+        }
+        const base = stripDispositionWords(currentTitle);
+        if (/^\d/.test(base) && bareChannelRegex.test(base) && labelChannelSum(base) === channels) return base;
+        return channelLabel(channels, false);
+    };
 
     // >3-period 'busy'/scene-release title test (>4 dot-segments). Callers apply it AFTER role tagging, per the cleanStreamTitle note.
     const tooManyPeriods = (s) => (s || '').trim().split('.').length > 4;
@@ -2091,9 +2125,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         + ' or remux this file outside Tdarr');
                 }
                 if (methodUnmuxable === 'error') {
-                    failFile(`[method_unmuxable=error][container=${dstContainer}] ${names} cannot be stored in ${dstContainer}`
-                        + ` - set container=${dstContainer === 'mp4' ? 'mkv' : 'mp4'}, or method_unmuxable=drop to remove`
-                        + ` ${offenders.length > 1 ? 'those streams' : 'that stream'} / mkv_fallback to keep just this file in mkv`);
+                    // Offer only the remedies that would clear it. Switching container helps only when the OTHER container stores every audio/video stream
+                    // in the file - not just the offenders: a stream that muxes fine into the current target can be the one the other refuses (mpegh_3d_audio
+                    // beside an mp4-refused codec). mkv_fallback is the mp4 target's version of the same switch, so it is offered exactly when that holds.
+                    const other = dstContainer === 'mp4' ? 'mkv' : 'mp4';
+                    const refusedBy = (container, codec) => UNMUXABLE_ANYWHERE.includes(codec) || (container === 'mp4'
+                        ? MP4_UNMUXABLE.includes(codec) || (MP4_STRICT_GATED.includes(codec) && !isMp4Family(srcContainer))
+                        : MKV_UNMUXABLE.includes(codec));
+                    const streamCodecs = (file.ffProbeData.streams || []).filter((s) => ['audio', 'video'].includes(codecTypeOf(s))).map(codecNameOf);
+                    const stuckInOther = [...new Set(streamCodecs.filter((c) => refusedBy(other, c)))];
+                    const keepable = [...new Set(offenders.map((o) => o.codec).filter((c) => !refusedBy(other, c)))];
+                    const streams = offenders.length > 1 ? 'those streams' : 'that stream';
+                    let advice;
+                    if (!stuckInOther.length) {
+                        advice = `${names} cannot be stored in ${dstContainer} - set container=${other}, or method_unmuxable=drop to remove ${streams}`
+                            + `${dstContainer === 'mp4' ? ' / mkv_fallback to keep just this file in mkv' : ''}`;
+                    } else if (!keepable.length && offenders.every((o) => o.cls === 'anywhere')) {
+                        advice = `${names} cannot be stored in mkv or mp4 - set method_unmuxable=drop to remove ${streams}, or remux this file outside Tdarr`;
+                    } else {
+                        advice = `${names} cannot be stored in ${dstContainer}, and ${other} cannot store ${stuckInOther.join(', ')} - set method_unmuxable=drop to`
+                            + ` remove ${streams}${keepable.length ? ` (with container=${other} as well it keeps ${keepable.join(', ')} and drops only`
+                            + ` ${stuckInOther.join(', ')})` : ''}, or remux this file outside Tdarr`;
+                    }
+                    failFile(`[method_unmuxable=error][container=${dstContainer}] ${advice}`);
                 }
                 if (methodUnmuxable === 'drop') {
                     for (const o of offenders) unmuxableDrops.add(o.s.index);
@@ -2240,6 +2294,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             return 0;
         };
+        // What a styled bundle already in the library is worth, judged ONE way for both routes - the mapped one reads it in place, the unmapped one from a
+        // private staging copy of the server's file - so they cannot disagree about whether a sidecar holds the only copy: 'trust' (its cues reach the
+        // stream's end, or it could not be judged, which keeps the trust it had), 'short' (its cues stop more than CUE_SPAN_SLACK_S short of the stream's
+        // end - a run that failed partway still finalises it, and so does an edit that cut the tail - so it is neither trusted nor replaced), or 'replace'
+        // (ffmpeg cannot decode it, or it decodes to no cue: what an interrupted export leaves).
+        const judgeBundle = (localPath, ffstream) => {
+            const bundle = readBundleSubtitle(localPath);
+            if (bundle.state === 'unknown') return { verdict: 'trust' };
+            const span = bundle.state === 'ok' ? cueSpan(bundle.buf.toString('utf8'), 'ass') : { cues: 0, end: 0 };
+            const streamEnd = subtitleEndSec(ffstream);
+            if (span.cues && streamEnd && span.end < streamEnd - CUE_SPAN_SLACK_S) return { verdict: 'short', end: span.end, streamEnd };
+            return { verdict: span.cues ? 'trust' : 'replace' };
+        };
+        // The unmapped pre-scan's verdicts on bundles already on the server, for stageSidecar to answer from: trusted ones are 'exists', short ones are held.
+        const trustedRemoteBundles = new Set(); const shortRemoteBundles = new Map();
         const sidecarPlan = (ffstream, styled) => {
             const spec = styled ? STYLED_BUNDLE : IMAGE_SUB[codecNameOf(ffstream)];
             return {
@@ -2259,6 +2328,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const sidecarPath = path.join(libDir, name);
             if (isUnmappedNode) {
                 if (placedSidecars.has(name)) return { status: 'placed', name };
+                if (trustedRemoteBundles.has(name)) return { status: 'exists', name };
+                if (shortRemoteBundles.has(name)) return { status: 'refused', name, why: 'short', ...shortRemoteBundles.get(name) };
                 if (emptySidecars.has(name)) return { status: 'empty', name };
                 return { status: 'refused', name, why: unconfirmedSidecars.has(name) ? 'unconfirmed' : 'unmapped' };
             }
@@ -2274,21 +2345,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // trusted: it is what a killed export leaves. An IMAGE-sub .sup is never trusted either: reaching here means the source stream is still present,
             // and a completed export always drops it, so it can only be a run that died mid-write - and a raw bitmap .sup is never user-authored (any OCR
             // happens after a completed run, once the stream is already gone). A STYLED bundle may since have been edited, so one that holds the subtitle is
-            // trusted and the drop goes ahead - forcing it (-y) could only destroy that work. What an interrupted export leaves is not that, and
-            // readBundleSubtitle tells them apart: one ffmpeg cannot decode, or that decodes to no cue, is replaced; one whose cues stop more than
-            // CUE_SPAN_SLACK_S short of the stream's own end is neither replaced nor trusted - a run that failed partway still finalises it, and so does an
-            // edit that cut the tail - and the file fails with the subtitle intact. An unjudged read keeps its old trust. A file that cannot be deleted is
-            // refused rather than trusted: each one reaching that is known bad.
+            // trusted and the drop goes ahead - forcing it (-y) could only destroy that work. judgeBundle tells that apart from what an interrupted export
+            // leaves: 'replace' is deleted and re-exported, 'short' fails the file with the subtitle intact. A file that cannot be deleted is refused rather
+            // than trusted: each one reaching that is known bad.
             if (fs.existsSync(sidecarPath)) {
                 if (styled && fileHasBytes(sidecarPath)) {
-                    const bundle = readBundleSubtitle(sidecarPath);
-                    if (bundle.state === 'unknown') return { status: 'exists', name };
-                    const span = bundle.state === 'ok' ? cueSpan(bundle.buf.toString('utf8'), 'ass') : { cues: 0, end: 0 };
-                    const streamEnd = subtitleEndSec(ffstream);
-                    if (span.cues && streamEnd && span.end < streamEnd - CUE_SPAN_SLACK_S) {
-                        return { status: 'refused', name, why: 'short', end: span.end, streamEnd };
-                    }
-                    if (span.cues) return { status: 'exists', name };
+                    const judged = judgeBundle(sidecarPath, ffstream);
+                    if (judged.verdict === 'short') return { status: 'refused', name, why: 'short', end: judged.end, streamEnd: judged.streamEnd };
+                    if (judged.verdict === 'trust') return { status: 'exists', name };
                 }
                 try { fs.unlinkSync(sidecarPath); } catch (e) { return { status: 'refused', name, why: 'leftover' }; }
             }
@@ -2308,10 +2372,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const { name, mapTokens } = sidecarPlan(s, styled);
                 const dest = serverSidePath(path.join(libDir, name));
                 if (!dest) { failedSidecars.set(name, 'no path translator maps this library directory back to the server'); continue; }
-                // Already on the server (a re-run, or a prior export the drop never followed): count it placed rather than re-extracting and re-uploading it.
-                // An unconfirmed answer is a failed placement - an upload could replace a sidecar that is there - so the stream is kept, as for any other.
-                const there = sidecarExistsRemote(dest);
-                if (there.state === 'present') { placedSidecars.add(name); continue; }
+                // An image .sup is always extracted again and uploaded over whatever is there, as the mapped route deletes and re-exports one: the source
+                // stream is still embedded, so a .sup already there is a run that died mid-write, and a raw bitmap .sup is never user-authored. Trusting
+                // it because it is non-empty would drop the stream with a truncated copy left as the only one.
+                if (image) { exportJobs.push({ name, dest, args: mapTokens }); continue; }
+                // A styled bundle may have been edited, so one already on the server is fetched to private staging and judged exactly as the mapped route
+                // judges one on disk (judgeBundle). An unconfirmed answer is a failed placement - an upload could replace a bundle that is there - so the
+                // stream is kept, as for any other.
+                let there;
+                let stageDir = '';
+                try {
+                    stageDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_bundlecheck_'));
+                    const local = path.join(stageDir, 'b.mks');
+                    there = sidecarExistsRemote(dest, local);
+                    if (there.state === 'present') {
+                        const judged = judgeBundle(local, s);
+                        if (judged.verdict === 'trust') { trustedRemoteBundles.add(name); continue; }
+                        if (judged.verdict === 'short') { shortRemoteBundles.set(name, { end: judged.end, streamEnd: judged.streamEnd }); continue; }
+                    }
+                } catch (e) {
+                    there = { state: 'unknown', why: `could not stage it for a check (${e && e.message ? e.message : e})` };
+                } finally {
+                    if (stageDir) try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
+                }
                 if (there.state === 'unknown') {
                     unconfirmedSidecars.add(name);
                     failedSidecars.set(name, `could not confirm whether it is already there (${there.why}), so it was not exported over it`);
@@ -2577,7 +2660,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         workDone += `☑${inputTag} Styled-subtitle bundle already exists, not overwriting: ${sidecarName}\n`;
                     } else {
                         // A refusal falls through to the mov_text conversion below with a ☒ naming the loss - a mangled subtitle beats a vanished one - except
-                        // a bundle on disk cut short or undeletable, or a server that could not say whether one is there: those clear on a requeue, so the file
+                        // a bundle already in the library cut short or undeletable, or a server that could not say whether one is there: those clear on a requeue, so the file
                         // fails with the styled original intact instead of flattening it for good (bundleHeldCount). The
                         // bundle route has no 'empty' answer of its own and does not need one: placeSidecars files an empty extraction under BOTH
                         // empty and failed, so the unmapped refusal already names it ('extraction produced no data') rather than reading undefined.
@@ -2591,7 +2674,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             leftover: `An incomplete ${sidecarName} from an earlier run could not be deleted to export it again - delete it and requeue`,
                             unconfirmed: `Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}; a transient answer, so the`
                                 + ' styled subtitle is not flattened over it - requeue once the server answers',
-                            short: `${sidecarName} already on disk stops at ${Number(staged.end).toFixed(1)} s but this subtitle runs to `
+                            short: `${sidecarName} already in the library stops at ${Number(staged.end).toFixed(1)} s but this subtitle runs to `
                                 + `${Number(staged.streamEnd).toFixed(1)} s - a run that failed partway, or an edit that cut the end, so it cannot be `
                                 + 'trusted with the only copy - delete it and requeue to export the whole subtitle',
                         };
@@ -2678,7 +2761,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 //governs whether the role is also promoted into a real flag, above). Shared canonicalAudioTitle - audio_clean names its downmixes the same way.
                 const audioCh = appliesToType(tagTitle, 'audio') ? resolveChannels(ffstream) : 0;
                 if(audioCh) {
-                    const rebuilt = canonicalAudioTitle(newStreamTitle, channelLabel(audioCh, layoutHasLfe(ffstream)), titleTagsFor(ffstream));
+                    const rebuilt = canonicalAudioTitle(newStreamTitle, layoutLabel(ffstream, audioCh, newStreamTitle), titleTagsFor(ffstream));
                     if(rebuilt !== newStreamTitle) { newStreamTitle = rebuilt; titleCauses.push(`tag_title=${tagTitle}`); }
                 }
 
