@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.61',
+    Version: '3.999.62',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -3588,7 +3588,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += f.rel === ccName
                 ? `☒[embedded_cc=enabled] The closed captions imported from ${logSafe(f.rel)} have since been removed from the file (by another plugin's `
                     + 'subtitle filter, or by hand) - not importing them again; that hidden sidecar now holds the only copy\n'
-                : `☒ ${logSafe(f.rel)} was imported by an earlier pass and has since been removed from the file (by another plugin's subtitle filter, or by `
+                : `☒${logSafe(f.rel)} was imported by an earlier pass and has since been removed from the file (by another plugin's subtitle filter, or by `
                     + 'hand) - not importing it again, which would undo that every cycle; the sidecar stays on disk - rename it to import it again\n';
         }
         const nothingToMux = !toMux.length && !retuneMeta && !removedIndices.size;
