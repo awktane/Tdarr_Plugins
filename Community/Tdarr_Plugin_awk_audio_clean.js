@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.50',
+    Version: '4.999.51',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -2636,10 +2636,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 Math.max(LOUDNORM_ANALYSIS_MIN_TIMEOUT_MS, Math.round(loudnormAnalysisDurationSec * LOUDNORM_ANALYSIS_MS_PER_AUDIO_SEC)))
             : LOUDNORM_ANALYSIS_MAX_TIMEOUT_MS;
         const LOUDNORM_ANALYSIS_MAX_BYTES = 64 * 1024 * 1024;
+        // The stats block in a stretch of analysis stderr: the LAST {...} that parses AND carries input_i (the brace-bearing-title case above).
+        const loudnormStatsIn = (text) => {
+            let stats = null;
+            for (const block of (String(text).match(/\{[^{}]*\}/g) || [])) {
+                try { const parsed = JSON.parse(block); if (parsed && 'input_i' in parsed) stats = parsed; } catch (e) { /* not the JSON block */ }
+            }
+            return stats;
+        };
+        const loudnormAnalysisFilter = (preFilter, preset, instance = 'loudnorm') =>
+            `${preFilter ? `${preFilter},` : ''}${instance}=I=${preset.I}:LRA=${preset.LRA}:TP=${preset.TP}:print_format=json`;
+        // What prefetchLoudness measured ahead of the leftovers loop, keyed source audio index + pre-filter; measureLoudness serves a request from here
+        // before spawning a pass of its own.
+        const loudnormPrefetched = new Map();
+        const loudnormKey = (srcAudioIdx, preFilter) => `${srcAudioIdx}|${preFilter || ''}`;
         const measureLoudness = (srcAudioIdx, preFilter, preset) => {
+            const prefetched = loudnormPrefetched.get(loudnormKey(srcAudioIdx, preFilter));
+            if (prefetched) return prefetched;
             const { spawnSync } = require('child_process');
-            const analysisFilter = `${preFilter ? `${preFilter},` : ''}loudnorm=I=${preset.I}:LRA=${preset.LRA}:TP=${preset.TP}:print_format=json`;
-            const args = ['-nostats', '-hide_banner', '-i', file.file, '-map', `0:a:${srcAudioIdx}`, '-af', analysisFilter, '-f', 'null', '-'];
+            const args = ['-nostats', '-hide_banner', '-i', file.file, '-map', `0:a:${srcAudioIdx}`, '-af', loudnormAnalysisFilter(preFilter, preset),
+                '-f', 'null', '-'];
             const result = spawnSync(ffmpegPathOf(otherArguments), args,
                 { timeout: loudnormAnalysisTimeoutMs, maxBuffer: LOUDNORM_ANALYSIS_MAX_BYTES, encoding: 'utf-8' });
             // A tripped `timeout` sets BOTH error (code ETIMEDOUT) and signal (SIGTERM), and error is tested first - so the timeout must be named HERE or it
@@ -2650,14 +2666,42 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (result.error) return { error: `could not start ffmpeg (${result.error.message})` };
             if (result.signal) return { error: `ffmpeg was killed from outside (signal ${result.signal})` };
             if (result.status !== 0) return { error: `ffmpeg exited with status ${result.status}` };
-            const jsonBlocks = String(result.stderr || '').match(/\{[^{}]*\}/g);
-            // Keep the LAST block that parses AND carries input_i (the brace-bearing-title case is why - see above).
-            let stats = null;
-            for (const block of (jsonBlocks || [])) {
-                try { const parsed = JSON.parse(block); if (parsed && 'input_i' in parsed) stats = parsed; } catch (e) { /* not the JSON block */ }
-            }
+            const stats = loudnormStatsIn(result.stderr || '');
             if (!stats) return { error: 'could not find loudnorm measurement JSON in ffmpeg output' };
             return { stats };
+        };
+
+        // Distinct tracks measured by ONE ffmpeg instead of one each: a -map/-af/null output per track, every loudnorm named loudnorm@rN so its block is
+        // tied back by name - the outputs print in no stable order. Measured 2026-10-13 on jellyfin 7.1.4 against a real 737 s TrueHD 7.1 + ac3 + eac3 +
+        // ac3 remux: four tracks took 150-187 s against 299-363 s one by one, from local disk and SMB alike, with byte-identical stats - the outputs
+        // decode and filter in parallel and the file is read once. The SAME track measured twice (a 7.1 and its stereo fold) gained nothing (100-143 s
+        // against 108-144 s), so the downmix / codec_force / remix sites keep one pass each and only the leftovers loop - distinct tracks, all known
+        // before it emits - is batched. A batch that fails in any way measures nothing: each track then takes its own pass, which names the culprit.
+        // Its kill-switch is the sequential total, one per-track budget each under the same cap. LOUDNORM_BATCH_MAX bounds the parallel filter
+        // instances (~217 MB each) to ~1.7 GB.
+        const LOUDNORM_BATCH_MAX = 8;
+        const prefetchLoudness = (srcAudioIdxs, preset) => {
+            const { spawnSync } = require('child_process');
+            for (let at = 0; srcAudioIdxs.length - at >= 2; at += LOUDNORM_BATCH_MAX) {
+                const batch = srcAudioIdxs.slice(at, at + LOUDNORM_BATCH_MAX);
+                const args = ['-nostats', '-hide_banner', '-i', file.file];
+                batch.forEach((idx, k) => args.push('-map', `0:a:${idx}`, '-af', loudnormAnalysisFilter('', preset, `loudnorm@r${k}`), '-f', 'null', '-'));
+                const timeout = Math.min(LOUDNORM_ANALYSIS_MAX_TIMEOUT_MS, loudnormAnalysisTimeoutMs * batch.length);
+                const result = spawnSync(ffmpegPathOf(otherArguments), args, { timeout, maxBuffer: LOUDNORM_ANALYSIS_MAX_BYTES, encoding: 'utf-8' });
+                const err = String(result.stderr || '');
+                const starts = batch.map((idx, k) => err.indexOf(`[loudnorm@r${k} @ `));
+                // Each block is read only between its own name and the next one, so a neighbour's block can never answer for it.
+                const found = starts.map((s) => (s < 0 ? null : loudnormStatsIn(err.slice(s, Math.min(...starts.filter((t) => t > s), err.length)))));
+                const why = result.error ? (result.error.code === 'ETIMEDOUT' ? 'it ran past its timeout' : `ffmpeg could not start (${result.error.message})`)
+                    : result.signal ? `ffmpeg was killed (signal ${result.signal})` : result.status !== 0 ? `ffmpeg exited with status ${result.status}`
+                        : found.some((s) => !s) ? 'a track reported no loudness' : '';
+                if (why) {
+                    response.infoLog += `☒[method_loudnorm=${methodLoudnorm}] Measuring ${batch.length} tracks in one pass failed (${why}) - measuring each `
+                        + 'on its own instead\n';
+                    continue;
+                }
+                batch.forEach((idx, k) => loudnormPrefetched.set(loudnormKey(idx, ''), { stats: found[k] }));
+            }
         };
 
         // Measure, then decide the correction filter comma-chained onto preFilter, or return unchanged (changed:false) when already within
@@ -3140,6 +3184,52 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // buildLoudnormFilter at its own emit point); this loop only handles the leftovers.
         if (methodLoudnorm !== 'disabled') {
             const preset = LOUDNORM_PRESETS[methodLoudnorm];
+            // WHICH codec a leftover's re-encode lands on. Two candidates, in preference order: keepCodec - the codec the track already has, whenever this
+            // plugin can encode it (what a track outside codec_force's scope gets - forceCovers false, e.g. codec_force=disabled - and the only option for
+            // a source outside our encodable domain: a kept DTS core, an MP3); configuredCodec - codec_stereo/codec_surround, when codec_force's scope
+            // covers this track (the FORCE CODEC block may have declined it as not worth a lossy generation on its own, but the generation is already
+            // being spent on the gain correction - this is what makes codec_stereo=aac_vbr reach a track already aac). A guard-protected or over-channel-
+            // limit target falls back to the other candidate rather than cancelling the pass, so enabling codec_force can never silently switch loudnorm
+            // off. The opus layout wall counts as out of reach too: when libopus refuses the layout with no lossless relabel and no remix will run
+            // (method_layout_err keep/drop, or remix standing down for an existing stereo - the loop's opus branch), an opus target ends in "Not
+            // normalizing"; ac3/eac3/aac carry every layout, so an encodable source codec takes the correction instead. null = neither is in reach.
+            const leftoverTarget = (ffstream, channels) => {
+                const ffstreamCodec = codecNameOf(ffstream) || 'unknown';
+                const isStereo = channels <= 2;
+                const configuredCodec = isStereo ? stereoCodec : surroundCodec;
+                // Folded like every other identity check (codecFamilyOf), so an aac_latm track keeps AAC.
+                const srcFamily = codecFamilyOf(ffstream);
+                const keepCodec = ENCODABLE_CODECS.includes(srcFamily) ? srcFamily : configuredCodec;
+                const reachable = (c) => channels <= codecMaxCh(aacFamily(c)) && !guardBlocks(ffstream, c, channels, channels) && !containerRefusesAudio(c);
+                const wantCodec = forceCovers(isStereo, channels) ? configuredCodec : keepCodec;
+                let targetCodec = reachable(wantCodec) ? wantCodec : (reachable(keepCodec) ? keepCodec : null);
+                const opusWalled = (c) => {
+                    if (aacFamily(c) !== 'opus' || channels <= 2 || ffstreamCodec === 'opus') return false;
+                    const { ok, relabel } = opusLayoutFor(ffstream, channels);
+                    return !ok && !relabel && (methodLayoutErr !== 'remix' || remixDefersToExistingStereo(ffstream, relabel));
+                };
+                if (targetCodec !== null && targetCodec !== keepCodec && opusWalled(targetCodec) && reachable(keepCodec) && !opusWalled(keepCodec)) {
+                    targetCodec = keepCodec;
+                }
+                return { targetCodec, keepCodec, configuredCodec, isStereo };
+            };
+            // COLLECT, then MEASURE, then emit: every leftover whose correction is a bare analysis of its own track goes to prefetchLoudness in one pass
+            // before the loop below emits anything, and the loop reads the results back through measureLoudness. The test mirrors the loop's path to its
+            // pre-filter-free buildLoudnormFilter call, so a divergence costs a wasted or a missed prefetch, never a wrong measurement; a track the opus
+            // layout wall routes through a relabel or a remix keeps its own pass, with that pre-filter.
+            const leftoverIdxs = [];
+            for (const ffstream of audioStreams) {
+                const outputAudioIdx = outputAudioIdxMap.get(ffstream.index);
+                const srcAudioIdx = inputAudioIdxMap.get(ffstream.index);
+                const channels = ffstream.awkChannels;
+                if (removedIndices.has(ffstream.index) || outputAudioIdx === undefined || srcAudioIdx === undefined || modifiedAudioIdx.has(outputAudioIdx)
+                    || channels <= 0 || loudnormTagMatchesPreset(ffstream)) continue;
+                const { targetCodec } = leftoverTarget(ffstream, channels);
+                if (targetCodec === null || (aacFamily(targetCodec) === 'opus' && channels > 2 && codecNameOf(ffstream) !== 'opus'
+                    && !opusLayoutFor(ffstream, channels).ok)) continue;
+                leftoverIdxs.push(srcAudioIdx);
+            }
+            prefetchLoudness(leftoverIdxs.slice(0, Math.max(0, LOUDNORM_MAX_TRACKS - loudnormMeasureCount)), preset);
             for (const ffstream of audioStreams) {
                 if (removedIndices.has(ffstream.index)) continue;
                 const outputAudioIdx = outputAudioIdxMap.get(ffstream.index);
@@ -3152,32 +3242,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
                 const ffstreamCodec = codecNameOf(ffstream) || 'unknown';
-                const isStereo = channels <= 2;
-                // WHICH codec this re-encode lands on. Two candidates, in preference order: keepCodec - the codec the track already has, whenever this plugin
-                // can encode it (what a track outside codec_force's scope gets - forceCovers false, e.g. codec_force=disabled - and the only option for a
-                // source outside our encodable domain: a kept DTS core, an MP3); configuredCodec - codec_stereo/codec_surround, when codec_force's scope covers
-                // this track (the FORCE CODEC block may have declined it as not worth a lossy generation on its own, but the generation is already being spent
-                // on the gain correction - this is what makes codec_stereo=aac_vbr reach a track already aac). A guard-protected or over-channel-limit target
-                // falls back to the other candidate rather than cancelling the pass, so enabling codec_force can never silently switch loudnorm off.
-                const configuredCodec = isStereo ? stereoCodec : surroundCodec;
-                // Folded like every other identity check (codecFamilyOf), so an aac_latm track keeps AAC.
-                const srcFamily = codecFamilyOf(ffstream);
-                const keepCodec = ENCODABLE_CODECS.includes(srcFamily) ? srcFamily : configuredCodec;
-                const reachable = (c) => channels <= codecMaxCh(aacFamily(c)) && !guardBlocks(ffstream, c, channels, channels) && !containerRefusesAudio(c);
-                const wantCodec = forceCovers(isStereo, channels) ? configuredCodec : keepCodec;
-                let targetCodec = reachable(wantCodec) ? wantCodec : (reachable(keepCodec) ? keepCodec : null);
-                // The opus layout wall counts as out of reach too: when libopus refuses this layout with no lossless relabel and no remix will run
-                // (method_layout_err keep/drop, or remix standing down for an existing stereo - the branch below), an opus target ends in "Not normalizing".
-                // ac3/eac3/aac carry every layout, so an encodable source codec takes the correction instead; with no such codec to fall back to, the branch
-                // below still reports the wall.
-                const opusWalled = (c) => {
-                    if (aacFamily(c) !== 'opus' || channels <= 2 || ffstreamCodec === 'opus') return false;
-                    const { ok, relabel } = opusLayoutFor(ffstream, channels);
-                    return !ok && !relabel && (methodLayoutErr !== 'remix' || remixDefersToExistingStereo(ffstream, relabel));
-                };
-                if (targetCodec !== null && targetCodec !== keepCodec && opusWalled(targetCodec) && reachable(keepCodec) && !opusWalled(keepCodec)) {
-                    targetCodec = keepCodec;
-                }
+                const { targetCodec, keepCodec, configuredCodec, isStereo } = leftoverTarget(ffstream, channels);
                 if (targetCodec === null) {
                     // Both candidates are out of reach; report against keepCodec, the one the track would otherwise have stayed in.
                     if (channels > codecMaxCh(aacFamily(keepCodec)))
