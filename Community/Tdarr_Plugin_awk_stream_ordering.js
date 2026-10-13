@@ -17,7 +17,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same
         job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. A
         later job on that file is checked in full again. This check is always on and has no setting.\n`,
-    Version: '4.999.26',
+    Version: '4.999.27',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -1437,7 +1437,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // per-stream encoder/encoded_by); 'descriptive' (superset) also drops iTunes/movie-TV container tags. Always kept: title/comment, awk_* markers
         // (idempotency), creation_time, the mkv BPS/statistics family (mediaInfo's per-track bitrate source), the functional per-stream tags, and the GLOBAL
         // 'encoder' tag (muxer-managed: every mux re-stamps it, so stripping would loop). Per-stream 'encoder' - including the Lavc tag an upstream re-encode
-        // stamps - is NOT re-added on a -c copy, so running last clears it in the SAME remux (a first-in-stack plugin could only catch it a pass later).
+        // stamps - is NOT re-added on a -c copy, so running last clears it in the SAME remux (a first-in-stack plugin could only catch it a pass later). The one
+        // exception is muxerRegenerates below.
         const JUNK_ENCODER_GLOBAL = new Set(['encoded_by']);
         const JUNK_DESCRIPTIVE = new Set(['compilation', 'gapless_playback', 'hd_video', 'purchase_date', 'sort_name', 'sort_album', 'sort_album_artist',
             'sort_artist', 'sort_composer', 'sort_show', 'genre', 'date', 'description', 'synopsis', 'show', 'episode_id', 'network', 'episode_sort',
@@ -1446,13 +1447,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const JUNK_PERSTREAM = new Set(['encoded_by', 'encoder']);   // only encoder-tier keys are safe per-stream (descriptive ones are functional, kept)
         const junkGlobalStrip = (lowerKey) => junkTagsMode !== 'disabled'
             && (JUNK_ENCODER_GLOBAL.has(lowerKey) || (junkTagsMode === 'descriptive' && JUNK_DESCRIPTIVE.has(lowerKey)));
+        // For MPEG-2 video at the XDCAM frame sizes (1280x720, 1440x1080, 1920x1080) with no encoder tag, the mov/mp4 muxer synthesises an 'XDCAM EX 1080p29'-
+        // style stsd compressorname, and the mov demuxer reports it back as the stream's encoder tag (measured, jellyfin-ffmpeg 7.1.4). Clearing it is exactly
+        // what makes the muxer write it, so the next pass would build the identical preset and Tdarr's identical-preset guard would error the file. It is muxer
+        // provenance this plugin cannot remove: leave it. Matched on the VALUE, so a non-XDCAM tag on such a stream is still cleared once and then settles.
+        const muxerRegenerates = (ffstream, key) => key.toLowerCase() === 'encoder' && isMp4Family(dstContainer) && codecNameOf(ffstream) === 'mpeg2video'
+            && /^xdcam /i.test(String(ffstream.tags[key]));
         // Per-stream encoder/encoded_by clears for the stream at OUTPUT index outIdx - the post-sort position -metadata:s:<index> targets, not the source
         // ffprobe index. Present-only, so a clean stream adds nothing and never forces a mux on its own. escMeta guards the probe-derived key.
         const junkStreamClears = (ffstream, outIdx) => {
             if (junkTagsMode === 'disabled') return '';
             let meta = '';
             for (const k of Object.keys(ffstream.tags || {}))
-                if (JUNK_PERSTREAM.has(k.toLowerCase())) meta += ` -metadata:s:${outIdx} "${escMeta(k)}="`;
+                if (JUNK_PERSTREAM.has(k.toLowerCase()) && !muxerRegenerates(ffstream, k)) meta += ` -metadata:s:${outIdx} "${escMeta(k)}="`;
             return meta;
         };
         // ====== END JUNK TAG STRIP ======
