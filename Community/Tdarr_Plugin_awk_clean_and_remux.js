@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.53',
+    Version: '4.999.54',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -446,6 +446,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The OTHER terminal: a benign skip means there is nothing for this plugin to do - the file is left untouched and the flow moves on. Every call site
     // keeps its own `return`, so a skip still reads as a terminal where it stands.
     const skip = (msg) => { response.infoLog += msg; response.processFile = false; return response; };
+    // -=-=-= ddValue (+ checkDropdowns) [all five] =-=-=-
+    // Every dropdown is read through ddValue - case- and whitespace-folded, only an ABSENT value (undefined/null/'') taking the input's default - so
+    // the value checkDropdowns validates is the value each use site compares, and a hand-edited 'Enabled' reads the same in all five plugins (Tdarr
+    // trims a saved value but does not fold its case). A non-string falsy value is not absent: Tdarr hands a saved boolean false to an input that has
+    // since become a dropdown unchanged, and it must stop the file as invalid rather than quietly read as the default. checkDropdowns stops the file on
+    // the first value outside its option set, naming the input and the offending value.
+    const ddValue = (v, dflt) => String(v === undefined || v === null || v === '' ? dflt : v).toLowerCase().trim();
+    const checkDropdowns = (checks) => {
+        for (const [name, value, opts] of checks)
+            if (!opts.includes(value)) failFile(`[${name}=${logSafe(value)}] invalid value, check your settings`);
+    };
     // ===== END SHARED: file-failure helpers =====
     // #endregion
 
@@ -1051,30 +1062,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Recovery modes: two symptom dropdowns, each disabled/light/aggressive. light = no-data-loss flags only; aggressive adds the side-effect ones.
     // Values outside the dropdown are rejected below (failFile) rather than silently no-op'd. tsLight/dataLight are "light-and-up" (true for light+aggressive).
-    const recoverTs = String(inputs.recover_bad_timestamps).toLowerCase().trim();
-    const recoverData = String(inputs.recover_bad_data).toLowerCase().trim();
+    const recoverTs = ddValue(inputs.recover_bad_timestamps, 'disabled');
+    const recoverData = ddValue(inputs.recover_bad_data, 'disabled');
     const tsLight = recoverTs === 'light' || recoverTs === 'aggressive';
     const tsAgg = recoverTs === 'aggressive';
     const dataLight = recoverData === 'light' || recoverData === 'aggressive';
     const dataAgg = recoverData === 'aggressive';
-    const tagDisposition = String(inputs.tag_disposition || 'disabled').toLowerCase();
-    const tagTitle = String(inputs.tag_title || 'disabled').toLowerCase();
+    const tagDisposition = ddValue(inputs.tag_disposition, 'disabled');
+    const tagTitle = ddValue(inputs.tag_title, 'disabled');
     // Does a tag_disposition / tag_title mode (disabled|audio|subtitle|both) cover this stream type?
     const appliesToType = (mode, type) => mode === 'both' || mode === type;
     const removeComments = String(inputs.remove_comments) === 'true';
     const removeBusytitle = String(inputs.remove_busytitle) === 'true';
-    const removeImageSubs = String(inputs.remove_imagesubs || 'unsupported').toLowerCase();
-    const methodUnmuxable = String(inputs.method_unmuxable || 'error').toLowerCase().trim();
+    const removeImageSubs = ddValue(inputs.remove_imagesubs, 'unsupported');
+    const methodUnmuxable = ddValue(inputs.method_unmuxable, 'error');
 
     const fillLanguage = (inputs.language_fill ? inputs.language_fill.toLowerCase().trim() : '');
     const subLanguage = splitList(inputs.language_sub).map(lang => lang.toLowerCase());
     // Pre-normalise the user language list to comparison keys once (langKey folds en/eng/english/en-US and 639-2/B vs /T) - the filter matches against these.
     const subLangKeys = subLanguage.map(langKey);
-    const fillMode = String(inputs.language_fill_mode || 'single-or-error').toLowerCase();
-    const removeSubSdh = String(inputs.remove_sub_sdh || 'disabled').toLowerCase();
-    const tagLanguage = String(inputs.tag_language || 'invalid').toLowerCase();
-    const methodTagLanguage = String(inputs.method_tag_language || 'container').toLowerCase();
-    const guardAudioLanguage = String(inputs.guard_audio_language || 'disabled').toLowerCase();
+    const fillMode = ddValue(inputs.language_fill_mode, 'single-or-error');
+    const removeSubSdh = ddValue(inputs.remove_sub_sdh, 'disabled');
+    const tagLanguage = ddValue(inputs.tag_language, 'invalid');
+    const methodTagLanguage = ddValue(inputs.method_tag_language, 'container');
+    const guardAudioLanguage = ddValue(inputs.guard_audio_language, 'disabled');
 
     // #region SHARED helpers (1 section: language display name)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language display name =====
@@ -1154,8 +1165,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['remove_imagesubs',     removeImageSubs,    ['unsupported', 'all', 'export']],
         ['method_unmuxable',     methodUnmuxable,    ['error', 'drop', 'mkv_fallback']],
     ];
-    for (const [name, value, opts] of dropdownChecks)
-        if (!opts.includes(value)) failFile(`[${name}=${logSafe(value)}] invalid value, check your settings`);
+    checkDropdowns(dropdownChecks);
 
     // This benign skip (processFile:false) sits BETWEEN config validation (above) and the per-file CONTENT checks (below), and both edges are load-bearing:
     // a bad setting must still fail loudly on a non-video file, while the language_fill_mode / guard_audio_language pre-checks can failFile (quarantine),

@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.49',
+    Version: '4.999.50',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -523,6 +523,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The OTHER terminal: a benign skip means there is nothing for this plugin to do - the file is left untouched and the flow moves on. Every call site
     // keeps its own `return`, so a skip still reads as a terminal where it stands.
     const skip = (msg) => { response.infoLog += msg; response.processFile = false; return response; };
+    // -=-=-= ddValue (+ checkDropdowns) [all five] =-=-=-
+    // Every dropdown is read through ddValue - case- and whitespace-folded, only an ABSENT value (undefined/null/'') taking the input's default - so
+    // the value checkDropdowns validates is the value each use site compares, and a hand-edited 'Enabled' reads the same in all five plugins (Tdarr
+    // trims a saved value but does not fold its case). A non-string falsy value is not absent: Tdarr hands a saved boolean false to an input that has
+    // since become a dropdown unchanged, and it must stop the file as invalid rather than quietly read as the default. checkDropdowns stops the file on
+    // the first value outside its option set, naming the input and the offending value.
+    const ddValue = (v, dflt) => String(v === undefined || v === null || v === '' ? dflt : v).toLowerCase().trim();
+    const checkDropdowns = (checks) => {
+        for (const [name, value, opts] of checks)
+            if (!opts.includes(value)) failFile(`[${name}=${logSafe(value)}] invalid value, check your settings`);
+    };
     // ===== END SHARED: file-failure helpers =====
     // #endregion
 
@@ -1778,22 +1789,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const langStereoKeys = langStereo.map(langKey);         // normalised comparison keys (folds en/eng/english/en-US and 639-2/B vs /T)
     const langSurround = splitList(inputs.language_surround).map(lang => lang.toLowerCase());
     const langSurroundKeys = langSurround.map(langKey);
-    const langUnlisted = String(inputs.language_unlisted).trim();
-    const forceCodec = String(inputs.codec_force).trim();
-    const stereoCodec = String(inputs.codec_stereo).trim();
-    const surroundCodec = String(inputs.codec_surround).trim();
-    const downmixSecondary = String(inputs.downmix_secondary).trim();
-    const downmixToSix = String(inputs.downmix_to_six).trim();
-    const downmixToStereo = String(inputs.downmix_to_stereo).trim();
-    const methodDedupRegion = String(inputs.method_dedup_region).trim();
-    const methodDeduplicate = String(inputs.method_deduplicate).trim();
-    const methodLayoutErr = String(inputs.method_layout_err).trim();
-    const methodLoudnorm = String(inputs.method_loudnorm).trim();
-    const methodStereoDownmix = String(inputs.method_stereo_downmix).trim();
-    const guardLossless = String(inputs.guard_lossless).trim();
-    const guardObjectAudio = String(inputs.guard_object_audio).trim();
-    const guardOriginal = String(inputs.guard_original).trim();
-    const guardQuality = String(inputs.guard_quality).trim();
+    const langUnlisted = ddValue(inputs.language_unlisted, 'surround');
+    const forceCodec = ddValue(inputs.codec_force, 'disabled');
+    const stereoCodec = ddValue(inputs.codec_stereo, 'aac');
+    const surroundCodec = ddValue(inputs.codec_surround, 'aac');
+    const downmixSecondary = ddValue(inputs.downmix_secondary, 'surround');
+    const downmixToSix = ddValue(inputs.downmix_to_six, 'disabled');
+    const downmixToStereo = ddValue(inputs.downmix_to_stereo, 'disabled');
+    const methodDedupRegion = ddValue(inputs.method_dedup_region, 'fold');
+    const methodDeduplicate = ddValue(inputs.method_deduplicate, 'disabled');
+    const methodLayoutErr = ddValue(inputs.method_layout_err, 'keep');
+    const methodLoudnorm = ddValue(inputs.method_loudnorm, 'disabled');
+    const methodStereoDownmix = ddValue(inputs.method_stereo_downmix, 'default');
+    const guardLossless = ddValue(inputs.guard_lossless, 'enabled');
+    const guardObjectAudio = ddValue(inputs.guard_object_audio, 'enabled');
+    const guardOriginal = ddValue(inputs.guard_original, 'disabled');
+    const guardQuality = ddValue(inputs.guard_quality, 'enabled');
     // The container this plugin writes, derived the same way in every other plugin that needs it. This plugin never changes the container, so it is always
     // the source's - but every membership test must see it normalised: a Tdarr container string of 'MKV' misses a bare includes() and silently takes the
     // marker-hostile branch. The response.container default above deliberately keeps the RAW value: that string becomes the output file's extension, and
@@ -1851,8 +1862,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['guard_original',        guardOriginal,        ['disabled', 'enabled']],
         ['guard_quality',         guardQuality,         ['enabled', 'strict', 'disabled']],
     ];
-    for (const [name, value, opts] of dropdownChecks)
-        if (!opts.includes(value)) failFile(`[${name}=${logSafe(value)}] invalid value, check your settings`);
+    checkDropdowns(dropdownChecks);
 
     // Both free-text language lists are checked through this because dormancy is NOT a typo net - it only fires when NOTHING matches EITHER list, so a typo in
     // one list while the other still matches leaves that language "unlisted", where language_unlisted=stereo downmixes it and language_unlisted=delete removes

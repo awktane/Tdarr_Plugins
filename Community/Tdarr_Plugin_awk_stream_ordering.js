@@ -17,7 +17,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same
         job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. A
         later job on that file is checked in full again. This check is always on and has no setting.\n`,
-    Version: '4.999.30',
+    Version: '4.999.31',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -279,6 +279,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The OTHER terminal: a benign skip means there is nothing for this plugin to do - the file is left untouched and the flow moves on. Every call site
     // keeps its own `return`, so a skip still reads as a terminal where it stands.
     const skip = (msg) => { response.infoLog += msg; response.processFile = false; return response; };
+    // -=-=-= ddValue (+ checkDropdowns) [all five] =-=-=-
+    // Every dropdown is read through ddValue - case- and whitespace-folded, only an ABSENT value (undefined/null/'') taking the input's default - so
+    // the value checkDropdowns validates is the value each use site compares, and a hand-edited 'Enabled' reads the same in all five plugins (Tdarr
+    // trims a saved value but does not fold its case). A non-string falsy value is not absent: Tdarr hands a saved boolean false to an input that has
+    // since become a dropdown unchanged, and it must stop the file as invalid rather than quietly read as the default. checkDropdowns stops the file on
+    // the first value outside its option set, naming the input and the offending value.
+    const ddValue = (v, dflt) => String(v === undefined || v === null || v === '' ? dflt : v).toLowerCase().trim();
+    const checkDropdowns = (checks) => {
+        for (const [name, value, opts] of checks)
+            if (!opts.includes(value)) failFile(`[${name}=${logSafe(value)}] invalid value, check your settings`);
+    };
     // ===== END SHARED: file-failure helpers =====
     // #endregion
 
@@ -1097,14 +1108,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // [inputName, valueToTest, validOptions], top-down, failing on the first bad value. Every dropdown value is case/whitespace-normalised ONCE here and the
     // use sites below read those same constants, so the value that gets validated is provably the value that gets executed, and the failFile message shows that
     // normalised value - the same discipline the other four plugins follow.
-    const junkTagsMode = String(inputs.remove_junk_tags || 'disabled').toLowerCase().trim();
-    const methodFaststart = String(inputs.method_mp4_faststart || 'force').toLowerCase().trim();
+    const junkTagsMode = ddValue(inputs.remove_junk_tags, 'disabled');
+    const methodFaststart = ddValue(inputs.method_mp4_faststart, 'force');
     // The four order/promotion selectors, case/whitespace-normalised ONCE (like the two above) so validation, the sort reads and the echo all see one value.
     // Defaults: audio_first/subtitle_first 'disabled', order_channel/order_quality 'descending'.
-    const audioFirst = String(inputs.audio_first || 'disabled').toLowerCase().trim();
-    const subtitleFirst = String(inputs.subtitle_first || 'disabled').toLowerCase().trim();
-    const orderChannel = String(inputs.order_channel || 'descending').toLowerCase().trim();
-    const orderQuality = String(inputs.order_quality || 'descending').toLowerCase().trim();
+    const audioFirst = ddValue(inputs.audio_first, 'disabled');
+    const subtitleFirst = ddValue(inputs.subtitle_first, 'disabled');
+    const orderChannel = ddValue(inputs.order_channel, 'descending');
+    const orderQuality = ddValue(inputs.order_quality, 'descending');
 
     const dropdownChecks = [
         ['audio_first',          audioFirst,      ['disabled', 'original_tagged', 'default_tagged', 'descriptive_tagged']],
@@ -1114,8 +1125,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['remove_junk_tags',     junkTagsMode,    ['disabled', 'encoder', 'descriptive']],
         ['method_mp4_faststart', methodFaststart, ['force', 'strip']],
     ];
-    for (const [name, value, opts] of dropdownChecks)
-        if (!opts.includes(value)) failFile(`[${name}=${logSafe(value)}] invalid value, check your settings`);
+    checkDropdowns(dropdownChecks);
     // order_language has no option set, but it still holds LANGUAGES, so a token that is not one FAILS the file. A typo does not announce itself here: an
     // unmatched entry simply scores as "not listed" and the tracks the user meant to promote stay wherever they were, which reads exactly like the ordering
     // rules not working. order_codec is genuinely open (codec names come and go, and an unknown one is inert rather than misleading), so it stays unchecked.

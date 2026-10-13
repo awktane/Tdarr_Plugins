@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.48',
+    Version: '3.999.49',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -338,6 +338,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The OTHER terminal: a benign skip means there is nothing for this plugin to do - the file is left untouched and the flow moves on. Every call site
     // keeps its own `return`, so a skip still reads as a terminal where it stands.
     const skip = (msg) => { response.infoLog += msg; response.processFile = false; return response; };
+    // -=-=-= ddValue (+ checkDropdowns) [all five] =-=-=-
+    // Every dropdown is read through ddValue - case- and whitespace-folded, only an ABSENT value (undefined/null/'') taking the input's default - so
+    // the value checkDropdowns validates is the value each use site compares, and a hand-edited 'Enabled' reads the same in all five plugins (Tdarr
+    // trims a saved value but does not fold its case). A non-string falsy value is not absent: Tdarr hands a saved boolean false to an input that has
+    // since become a dropdown unchanged, and it must stop the file as invalid rather than quietly read as the default. checkDropdowns stops the file on
+    // the first value outside its option set, naming the input and the offending value.
+    const ddValue = (v, dflt) => String(v === undefined || v === null || v === '' ? dflt : v).toLowerCase().trim();
+    const checkDropdowns = (checks) => {
+        for (const [name, value, opts] of checks)
+            if (!opts.includes(value)) failFile(`[${name}=${logSafe(value)}] invalid value, check your settings`);
+    };
     // ===== END SHARED: file-failure helpers =====
     // #endregion
 
@@ -1844,14 +1855,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Parse inputs. Numeric inputs are free text (parsed + range-checked); only type:'string' dropdowns get an option guard (booleans are
     // coerced by loadDefaultValues, so a guard is dead code).
-    const action = String(inputs.action || 'hdr_cleanup_only').toLowerCase().trim();
-    const codec = String(inputs.codec || 'source').toLowerCase().trim();
-    const downscaleOpt = String(inputs.downscale || 'disabled').toLowerCase().trim();
-    const speed = String(inputs.method_speed || 'slow').toLowerCase().trim();
-    const bitDepthOpt = String(inputs.method_bitdepth || 'source').toLowerCase().trim();
-    const encoderOpt = String(inputs.method_encoder || 'node').toLowerCase().trim();
-    const hdrMode = String(inputs.hdr_mode || 'preserve').toLowerCase().trim();
-    const deinterlaceOpt = String(inputs.deinterlace || 'disabled').toLowerCase().trim();
+    const action = ddValue(inputs.action, 'hdr_cleanup_only');
+    const codec = ddValue(inputs.codec, 'source');
+    const downscaleOpt = ddValue(inputs.downscale, 'disabled');
+    const speed = ddValue(inputs.method_speed, 'slow');
+    const bitDepthOpt = ddValue(inputs.method_bitdepth, 'source');
+    const encoderOpt = ddValue(inputs.method_encoder, 'node');
+    const hdrMode = ddValue(inputs.hdr_mode, 'preserve');
+    const deinterlaceOpt = ddValue(inputs.deinterlace, 'disabled');
     const guardCaptions = String(inputs.guard_captions) === 'true';   // boolean, default FALSE - opt-in, unlike the two guards below (see its tooltip)
     const guardDv = String(inputs.guard_dv) === 'true';   // boolean, default true
     const guardLossless = String(inputs.guard_lossless) === 'true';   // boolean, default true
@@ -1892,8 +1903,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['hdr_mode',         hdrMode,         ['preserve', 'strip_dynamic', 'tonemap_sdr']],
         ['deinterlace',      deinterlaceOpt,  ['disabled', 'enabled']],
     ];
-    for (const [name, value, opts] of dropdownChecks)
-        if (!opts.includes(value)) failFile(`[${name}=${logSafe(value)}] invalid value, check your settings`);
+    checkDropdowns(dropdownChecks);
     // The one cross-input config error: tonemap_sdr is a pixel-domain re-encode, so it can never satisfy hdr_cleanup_only's lossless-or-skip promise.
     if (hdrMode === 'tonemap_sdr' && action === 'hdr_cleanup_only')
         failFile('[hdr_mode=tonemap_sdr][action=hdr_cleanup_only] tonemapping is always a re-encode (never lossless)'
