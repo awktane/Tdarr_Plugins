@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.43',
+    Version: '3.999.44',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1546,15 +1546,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // cgroup) and always returns something, so a ladder reaching it can never admit ignorance; process.availableMemory()/constrainedMemory() are no better
     // (page-cache-dominated / memory.high, a throttle not the kill point). Occupancy comes from memory.stat anon (v2) / rss (v1): measured idle, anon was
     // 103 MB against memory.current's 1317 MB - a 12x difference that would discard a quarter of the container before the encode started. Tests inject the
-    // verdict through __awkCap.mem; an injected cap with NO mem key means "no verdict", inert rather than a real /sys read.
+    // verdict through __awkCap.mem, or macOS's raw reading through __awkCap.macMemory ({ total, level }); an injected cap with neither means "no verdict",
+    // inert rather than a real /sys read.
+    // macOS occupancy is read from kern.memorystatus_level - the percentage of memory macOS can hand out, counting the inactive, speculative and purgeable
+    // pages it reclaims on demand. os.freemem() there counts only the free page LIST, which macOS keeps near empty on purpose (measured 0.08 GB against a
+    // memorystatus_level of 40% - 3.2 GB - on an 8 GB Mac), so it raised the "only X GB is free ... by swapping" warning on almost every encode. One bounded
+    // sysctl per file (~40 ms under load); an unreadable answer leaves the check inert rather than falling back to the free list.
+    const MAC_MEMLEVEL_TIMEOUT_MS = 5000;
+    const macMemoryLevel = () => {
+        try {
+            const r = require('child_process').spawnSync('sysctl', ['-n', 'kern.memorystatus_level'], { encoding: 'utf8', timeout: MAC_MEMLEVEL_TIMEOUT_MS });
+            return r.status === 0 ? Number(String(r.stdout || '').trim()) : NaN;
+        } catch (e) { return NaN; }
+    };
     const memNodeBudget = (otherArguments) => {
         const inj = otherArguments && otherArguments.__awkCap;
-        if (inj) return inj.mem ? { swapBytes: 0, anonBytes: 0, scope: 'container', cacheFsType: '', cores: 0, ...inj.mem } : null;
+        if (inj && inj.mem) return { swapBytes: 0, anonBytes: 0, scope: 'container', cacheFsType: '', cores: 0, ...inj.mem };
+        if (inj && !inj.macMemory) return null;
         let limitBytes = NaN;
         let swapBytes = 0;
         let anonBytes = 0;
         let scope = 'unknown';
-        if (os.platform() === 'linux') {
+        const platform = inj ? 'darwin' : os.platform();   // the only host reading a test injects is macOS's
+        if (platform === 'linux') {
             const v2 = memCgroupLimit(memReadFile('/sys/fs/cgroup/memory.max'));
             if (Number.isFinite(v2)) {
                 limitBytes = v2;
@@ -1586,9 +1600,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     anonBytes = Number.isFinite(avail) ? Math.max(0, total - avail) : 0;
                 }
             }
+        } else if (platform === 'darwin') {
+            // macOS swap grows on demand, so it has no ceiling worth reading - and it does not matter, because host scope never refuses and swap only ever
+            // feeds the refusal comparison.
+            const total = inj ? Number(inj.macMemory.total) : os.totalmem();
+            const level = inj ? Number(inj.macMemory.level) : macMemoryLevel();
+            if (Number.isFinite(total) && total > 0 && Number.isFinite(level) && level >= 0 && level <= 100) {
+                limitBytes = total; scope = 'host'; anonBytes = Math.round(total * (1 - level / 100));
+            }
         } else {
-            // macOS swap and a system-managed Windows pagefile both grow on demand, so neither has a ceiling worth reading - and it does not matter, because
-            // host scope never refuses and swap only ever feeds the refusal comparison.
+            // A system-managed Windows pagefile grows on demand like macOS swap; os.freemem() there includes the standby list, so it is the right figure.
             const total = os.totalmem();
             if (Number.isFinite(total) && total > 0) { limitBytes = total; scope = 'host'; anonBytes = Math.max(0, total - os.freemem()); }
         }
@@ -1879,6 +1900,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
         const containerRefusesTarget = (codec) => Object.prototype.hasOwnProperty.call(CONTAINER_REFUSES_VIDEO, dstContainer)
             && CONTAINER_REFUSES_VIDEO[dstContainer].includes(codec);
+        // The cells where even a STREAM COPY back into the same container is refused, for the lossless strip: the muxer has no way to store the codec at all,
+        // so it refuses at header write whatever tag the stream carries (measured on jellyfin-ffmpeg 7.1.4, 2026-10-12). The rest of CONTAINER_REFUSES_VIDEO
+        // fails only an ENCODE: avi/asf/wmv write whatever fourcc the stream carries, so an encode with none is refused or reads back as rawvideo while a
+        // copy that keeps the source's working tag muxes and reads back fine; and the MPEG-PS/TS AV1 cells cannot be reached by a copy, since a source
+        // those muxers cannot carry never probes as av1. awk-ffmpeg-test's muxmatrix mirrors this table too (WRITEBACK_COPY_REFUSES).
+        const CONTAINER_REFUSES_COPY = {
+            webm: ['hevc', 'h264'], m4v: ['hevc', 'av1'], mov: ['av1'], '3gp': ['hevc', 'av1'], '3g2': ['hevc', 'av1'],
+            ogv: ['hevc', 'h264', 'av1'], ogg: ['hevc', 'h264', 'av1'], evo: ['hevc', 'h264', 'av1'],
+        };
+        const containerRefusesCopy = (codec) => Object.prototype.hasOwnProperty.call(CONTAINER_REFUSES_COPY, dstContainer)
+            && CONTAINER_REFUSES_COPY[dstContainer].includes(codec);
 
         // Bit depth: source-detected (raw sample depth, or a 10-bit pixel format / profile), overridable. H.264 is always 8-bit. Shares the is10Bit helper with
         // summariseStream's 10bit token so the re-encode depth decision and the logged token can't drift.
@@ -2076,12 +2108,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Neither filter covers every codec, so each is gated (stripDv / stripHdr10Plus) and tryLosslessStrip refuses or annotates whatever is left over.
             const bsfList = [stripDv ? 'dovi_rpu=strip=1' : '', stripHdr10Plus ? 'hevc_metadata=remove_hdr10plus=1' : ''].filter(Boolean);
             const bsf = bsfList.join(',');   // never empty: tryLosslessStrip skips the no-layer-to-strip case before it reaches here
+            // An avi stream keeps its fourcc through -c copy, and the avi demuxer reads dvhe/dvh1 back as HEVC Dolby Vision - so a stripped stream still tagged
+            // dvhe would be detected as Dolby Vision again on the next pass and re-stripped with the identical preset, which Tdarr's identical-preset guard
+            // errors. Retag it to ffmpeg's plain HEVC fourcc (measured with the real profile 8.1 sample: reads back hevc/HEVC and decodes). Nothing else
+            // needs it: the avi muxer refuses a dav1 tag outright and asf reads dvhe back as codec 'unknown', so neither reaches a strip.
+            const riffTag = dstContainer === 'avi' && srcCodecName === 'hevc' && dvCodecTag ? ' -tag:v:0 HEVC' : '';
             const stripped = [stripDv ? dvLabel : '', stripHdr10Plus ? 'HDR10+' : ''].filter(Boolean).join(' + ') || dynLabel;
             const leftover = isHdr10Plus && !stripHdr10Plus ? `, but the HDR10+ layer stays - no filter here removes it from ${srcCodecName || 'this codec'}`
                 : '';
             response.infoLog += `☐${streamTag(primary.index)}[hdr_mode=strip_dynamic] Stripping ${stripped} losslessly (-c:v copy, base HDR10 retained)`
                 + `${leftover}\n`;
-            let out = `-map 0 -c copy -bsf:v:0 ${bsf}${outputDrops}${qtVideoTag(srcCodecName)} -c:a copy -c:s copy${strictArg}${globalOutputOpt}`;
+            let out = `-map 0 -c copy -bsf:v:0 ${bsf}${outputDrops}${qtVideoTag(srcCodecName)}${riffTag} -c:a copy -c:s copy${strictArg}${globalOutputOpt}`;
             // same as the transcode path: keep sibling plugins' GLOBAL awk_* markers through an mp4/mov copy
             const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags);
             if (tagPlan.flag) out += ' -movflags use_metadata_tags';
@@ -2102,8 +2139,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const vividAlso = vividAlsoNames ? `, so the ${vividAlsoNames} alongside it stays too` : '';
 
         // Lossless dynamic-HDR strip eligibility, shared by hdr_cleanup_only and the no-real-transcode strip path: a no-base DV, any HDR Vivid, a DV signal
-        // on a codec dovi_rpu refuses, and an HDR10+ layer with nothing else strippable all have no lossless path (skip); otherwise strip. The four skip
-        // messages are built HERE so they cannot drift between the two callers - each passes only its own two advice fragments. Vivid is tested FIRST on
+        // on a codec dovi_rpu refuses, an HDR10+ layer with nothing else strippable, and a container whose muxer refuses the codec even on a copy all have no
+        // lossless path (skip); otherwise strip. The skip messages are built HERE so they cannot drift between the two callers - each passes only its own two
+        // advice fragments. Vivid is tested FIRST on
         // purpose: no filter here removes a CUVA block, so stripping any other layer would leave the file still dynamic-HDR while the log reported a
         // completed strip - the one case where a partial strip is worse than none, because nothing about it converges.
         const tryLosslessStrip = (tonemapAdvice, reencodeAdvice) => {
@@ -2135,6 +2173,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!stripDv && !stripHdr10Plus) {
                 return skip(`${head}${dynLabel} in ${srcCodecName || 'this codec'} has no lossless strip path`
                     + ` - left untouched${reencodeAdvice}\n`);
+            }
+            // The strip copies back into the source's own container, and some muxers refuse the codec even on a copy (CONTAINER_REFUSES_COPY) - emitting it
+            // would exit 234 on every requeue with only ffmpeg's message. A benign skip leaves the file untouched instead, as the transcode path does.
+            if (containerRefusesCopy(srcCodecName)) {
+                return skip(`${head}A .${dstContainer} file cannot hold ${srcCodecName} video, so even a lossless copy is refused - left untouched; remux it to`
+                    + ' mkv or mp4 first (clean_and_remux does that)\n');
             }
             return emitLosslessStrip();
         };
