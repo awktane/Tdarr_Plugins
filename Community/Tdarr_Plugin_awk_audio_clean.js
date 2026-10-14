@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.51',
+    Version: '4.999.52',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -267,7 +267,8 @@ const details = () => ({
                 downmix would derive from the track is still created.
                 \\nremix - downmix the track to a codec_stereo stereo, using method_stereo_downmix, with loudness applied when method_loudnorm is active.
                 It defers to downmix_to_stereo and the stereo tier (language_stereo, language_unlisted=stereo, downmix_secondary=stereo) when they already
-                convert the track, and falls back to keep rather than create a duplicate stereo.
+                convert the track, and falls back to keep rather than create a duplicate stereo. A track guard_quality protects keeps its channels: the
+                stereo is added beside it, and the track stays in its source codec.
                 \\nThis only arises when codec_surround is opus and the track's layout is one libopus cannot encode - 2.1, 4.0, 4.1, 6.0, 7.0 or
                 7.1(wide); AC3, EAC3 and AAC accept every layout. It is reached either because codec_force is sending the track to opus, or because
                 method_loudnorm has to re-encode a kept track whose own codec ffmpeg cannot encode, such as a DTS core, and it converges to codec_surround.
@@ -410,8 +411,9 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['enabled','strict','disabled'],
             },
-            tooltip: `Protect a track from a destructive operation - downmix_to_six or downmix_to_stereo 'replace', codec_force, duplicate removal, and
-                method_loudnorm - whenever that operation would reduce the channel count, or a lossy source's predicted quality drop is significant.
+            tooltip: `Protect a track from a destructive operation - downmix_to_six or downmix_to_stereo 'replace', codec_force, duplicate removal,
+                method_loudnorm, and a method_layout_err remix - whenever that operation would reduce the channel count, or a lossy source's predicted
+                quality drop is significant.
                 \\n=====
                 \\nActions
                 \\n=====
@@ -424,8 +426,9 @@ const details = () => ({
                 \\nProtection is earned PER OPERATION, judged against that operation's real target codec and channel count, rather than being a single
                 "best track" flag. As with the other guards, one that fires turns a downmix 'replace' into 'add', skips a codec_force or method_loudnorm
                 re-encode, and keeps a duplicate; only a genuine track kept at surround is eligible (see language_surround).
-                \\nBecause a downmix always drops channels, a downmix 'replace' always behaves as 'add' under either enabled or strict. codec_force='all'
-                does not override this either - a guarded track is left alone in every force mode.`,
+                \\nBecause a downmix always drops channels, a downmix 'replace' always behaves as 'add' under either enabled or strict, and so does a
+                method_layout_err remix: its stereo is added beside the track, which keeps its channels and source codec. codec_force='all' does not
+                override this either - a guarded track is left alone in every force mode.`,
         },
     ],
 });
@@ -2039,19 +2042,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // guard_lossless/guard_quality/guard_object_audio block a destructive operation only when it would irreversibly lose detail the destination can't
         // hold (a fully independent set, not a fallback chain - see the tooltips). Protection is earned PER OPERATION: each decision site calls
-        // guardBlocks with its own real target codec/channels. Only a genuine tier-'surround' track is protectable (never a secondary, nor one already
-        // sent to stereo/delete); a dormant language setting leaves a foreign-only track at 'surround', so it stays protectable. guard_quality decides the
-        // channel-drop rule and the margin math: 'strict' protects on ANY predicted score drop, 'enabled' (default) only when the drop EXCEEDS
-        // QUALITY_MARGIN. Comparable swaps pass (640k eac3 -> 640k ac3 = 5pt; 1509k DTS 5.1 -> 640k ac3 = 7pt); flattening a premium master is kept
-        // (Atmos -> ac3 = 8pt, DTS-HD -> ac3 = 10pt). QUALITY_MARGIN = 7 is the DTS(91)-vs-ac3(84) base-score gap, so DTS core -> ac3 sits exactly at the
-        // margin on the pass side (a drop must STRICTLY exceed it to protect) - preserving the force-DTS-to-ac3 behaviour.
+        // guardBlocks with its own real target codec/channels - a layout remix with the 2ch stereo it emits, not the opus it can't. Only a genuine
+        // tier-'surround' track is protectable (never a secondary, nor one already sent to stereo/delete); a dormant language setting leaves a foreign-only
+        // track at 'surround', so it stays protectable. guard_quality decides the channel-drop rule and the margin math: 'strict' protects on ANY predicted
+        // score drop, 'enabled' (default) only when the drop EXCEEDS QUALITY_MARGIN. Comparable swaps pass (640k eac3 -> 640k ac3 = 5pt; 1509k DTS 5.1 ->
+        // 640k ac3 = 7pt); flattening a premium master is kept (Atmos -> ac3 = 8pt, DTS-HD -> ac3 = 10pt). QUALITY_MARGIN = 7 is the DTS(91)-vs-ac3(84)
+        // base-score gap, so DTS core -> ac3 sits exactly at the margin on the pass side (a drop must STRICTLY exceed it to protect) - preserving the
+        // force-DTS-to-ac3 behaviour.
         const QUALITY_MARGIN = 7;
         // The three-guard parenthetical shared by the codec_force and loudnorm "would lose detail" skip lines, defined once so the two cannot word-drift.
         const guardTriple = () => `guard_lossless=${guardLossless}, guard_quality=${guardQuality}, guard_object_audio=${guardObjectAudio}`;
+        // The two guards that refuse EVERY lossy re-encode whatever its target: lossless detail survives none, and an Atmos/DTS:X/MPEG-H/AC-4 object layer
+        // has no ffmpeg encoder. A track the remix folds is judged by these alone before the fold (remixFoldsTrack).
+        const guardRefusesAnyEncode = (stream) => !stream.awkSecondaryTrack && stream.awkTier === 'surround'
+            && ((guardLossless === 'enabled' && !!stream.awkLossless) || (guardObjectAudio === 'enabled' && !!stream.awkObjectAudio));
         const guardBlocks = (stream, targetCodec, targetChannels, srcChannels) => {
             if (stream.awkSecondaryTrack || stream.awkTier !== 'surround') return false;
-            if (guardLossless === 'enabled' && stream.awkLossless) return true;         // lossless detail can't survive any lossy re-encode
-            if (guardObjectAudio === 'enabled' && stream.awkObjectAudio) return true;   // Atmos/DTS:X/MPEG-H/AC-4 object layer has no ffmpeg encoder
+            if (guardRefusesAnyEncode(stream)) return true;
             if (guardQuality === 'disabled') return false;
             if (Number(targetChannels) < Number(srcChannels)) return true;       // the operation drops channels
             const family = aacFamily(targetCodec);      // aac_vbr scores as the aac family
@@ -2482,6 +2489,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // the duplicate this rule avoids can never be collapsed, and downmix_secondary=stereo already makes one stereo per secondary beside the main one.
         // Takes the ffstream rather than a key so both sites read the same fields off the same object.
         const remixDefersToExistingStereo = (s, relabel) => !relabel && methodLayoutErr === 'remix' && !s.awkSecondaryTrack && hasStereoForLang(s.awkRegionKey);
+        // "This remix will run" - a track whose opus target its layout walls off (no lossless relabel) and that method_layout_err=remix folds to a codec_stereo
+        // stereo: not standing down for an existing stereo, and codec_stereo not refused by the container. Its operation is that fold, so both remix sites
+        // let only guardRefusesAnyEncode stop it up front and judge guard_quality against the stereo it emits - never against the opus it can't be.
+        const remixFoldsTrack = (s, channels) => {
+            if (channels <= 2 || codecNameOf(s) === 'opus' || methodLayoutErr !== 'remix') return false;
+            const { ok, relabel } = opusLayoutFor(s, channels);
+            return !ok && !relabel && !remixDefersToExistingStereo(s, relabel) && !containerRefusesAudio(stereoCodec);
+        };
 
         // Tracks which OUTPUT audio indices have already received a -c:a:N assignment so we don't emit conflicting codec directives for the same stream.
         const modifiedAudioIdx = new Set();
@@ -2867,9 +2882,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Emit an APPENDED downmix track - a brand-new output stream derived from the ORIGINAL input audio via -map 0:a:N, whether or not that source stream
         // survives in the output: encoder+bitrate+loudnorm, the -c:a/filter/title/-metadata emit, the appendedAudio record, created*Langs registration, and the
-        // newStreamOutputIdx/convert bookkeeping. Shared by the downmix_to_six/_stereo 'add' branches AND the layout-drop derivatives so the four append sites
+        // newStreamOutputIdx/convert bookkeeping. Shared by the downmix_to_six/_stereo 'add' branches AND the layout-drop derivatives so the append sites
         // can't drift. srcCodecStr is the source's display codec at each site; logSuffix carries the layout-drop "(source dropped ...)" note. An appended track
-        // is an unconditional lossy re-encode, so loudnorm always rides it (no guardBlocks - see the callers).
+        // is an unconditional lossy re-encode, so loudnorm always rides it (no guardBlocks - see the callers). append2ch also serves a guarded layout remix:
+        // `tag` then names the settings behind the add, and `measuredTwo` is the stereoArg that remix already ran to decide whether to add at all.
         const append6ch = (srcStream, srcAudioIdx, srcCodecStr, srcRateStr, regionKeyVal, logSuffix) => {
             const newTitle = escMeta(buildTitle(srcStream, '5.1'));
             const dstBps = resolveBitrate(surroundCodec, 6);
@@ -2885,12 +2901,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             created6chLangs.add(regionKeyVal);
             convert = true;
         };
-        const append2ch = (srcStream, srcAudioIdx, srcCodecStr, srcRateStr, regionKeyVal, logSuffix) => {
+        const append2ch = (srcStream, srcAudioIdx, srcCodecStr, srcRateStr, regionKeyVal, logSuffix, { tag, measuredTwo } = {}) => {
             const newTitle = escMeta(buildTitle(srcStream, '2.0'));
             const enc = stereoEnc(newStreamOutputIdx);
-            const two = stereoArg(newStreamOutputIdx, srcStream);
-            workDone += `☐${streamTag(srcStream.index)}[downmix_to_stereo=${downmixToStereo}]${loudnormRideTag(two.changed)} Adding ${enc.logCodec} `
-                + `stereo @ ${enc.rate}${enc.label ? ` (${enc.label})` : ''} from ${srcCodecStr} ${srcStream.channels}ch @ ${srcRateStr}${logSuffix}\n`;
+            const two = measuredTwo || stereoArg(newStreamOutputIdx, srcStream);
+            workDone += `☐${streamTag(srcStream.index)}${tag || `[downmix_to_stereo=${downmixToStereo}]`}${loudnormRideTag(two.changed)} Adding `
+                + `${enc.logCodec} stereo @ ${enc.rate}${enc.label ? ` (${enc.label})` : ''} from ${srcCodecStr} ${srcStream.channels}ch @ ${srcRateStr}`
+                + `${logSuffix}\n`;
             extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${enc.frag}${two.arg}`
                 + `${loudnormRideStamp(newStreamOutputIdx, two.measured, srcStream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
             extraArguments += langMetaArg(newStreamOutputIdx, langForWrite(srcStream));
@@ -3058,6 +3075,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const shouldForce = forceCovers(isStereo, forceChannels);
 
                     const targetMaxCh = codecMaxCh(targetCodec);
+                    const folds = shouldForce && targetCodec === 'opus' && remixFoldsTrack(ffstream, forceChannels);
 
                     if (shouldForce && forceChannels > targetMaxCh) {
                         skipDone += `☒${streamTag(ffstream.index)}[codec_force=${forceCodec}] Not forcing ${targetCodecFamily} - ${ffstreamCodec} `
@@ -3068,8 +3086,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         skipDone += `☒${streamTag(ffstream.index)}[codec_force=${forceCodec}][${codecSetting}=${targetCodec}] Not forcing `
                             + `${targetCodecFamily} - ${wallText(targetCodec)}; left as ${ffstreamCodec} - ${wallRemedy(codecSetting)}\n`;
                         walledOps += 1;
-                    } else if (shouldForce && guardBlocks(ffstream, targetCodec, forceChannels, forceChannels)) {
-                        // Guarded: forcing this codec would irreversibly lose detail the target can't hold - see the FORCE CODEC note above.
+                    } else if (shouldForce && (folds ? guardRefusesAnyEncode(ffstream) : guardBlocks(ffstream, targetCodec, forceChannels, forceChannels))) {
+                        // Guarded: forcing this codec would irreversibly lose detail the target can't hold - see the FORCE CODEC note above. A track the
+                        // remix folds faces guard_quality at the fold instead (remixFoldsTrack).
                         skipDone += `☒${streamTag(ffstream.index)}[codec_force=${forceCodec}] Not forcing ${targetCodecFamily} - would lose detail vs `
                             + `${codecDisplayName(ffstream)} ${forceChannels}ch @ ${srcRateStr} (${guardTriple()}); left as ${ffstreamCodec}\n`;
                     } else if (shouldForce) {
@@ -3085,7 +3104,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         let forced = false;
 
                         const remixWalled = opusBad && methodLayoutErr === 'remix' && containerRefusesAudio(stereoCodec);
-                        if (opusBad && !relabel && (methodLayoutErr === 'keep' || methodLayoutErr === 'drop' || remixDefer || remixWalled)) {
+                        if (opusBad && !relabel && !folds) {
                             // No lossless relabel exists (relabelable layouts fall through to the transcode branch below in every
                             // mode). keep; a remix that deferred to an existing stereo; or a drop the pre-pass couldn't apply - leave
                             // the source codec. Real drops already happened in the pre-pass (before the index map); a drop reaches here
@@ -3099,7 +3118,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             else why = ', enable a downmix option or set method_layout_err to drop/remix';
                             skipDone += `☒${streamTag(ffstream.index)}[codec_force=${forceCodec}] Not forcing opus - libopus can't encode a `
                                 + `${layoutName} layout; left as ${ffstreamCodec}${why}\n`;
-                        } else if (opusBad && methodLayoutErr === 'remix' && !relabel) {
+                        } else if (folds && guardBlocks(ffstream, stereoCodec, 2, forceChannels)) {
+                            // The remix drops channels, so it is judged against the stereo it emits, not the opus it can't: a track guard_quality protects
+                            // keeps its channels and source codec, and the codec_stereo stereo is ADDED beside it - a downmix 'replace' becoming 'add'. The
+                            // added stereo takes the language's stereo slot, so the next run's remix defers to it and the file settles.
+                            append2ch(ffstream, srcAudioIdx, ffstreamCodec, srcRateStr, ffstreamRegionKey,
+                                ` (${layoutName}, opus-incompatible; the source is kept as ${ffstreamCodec})`,
+                                { tag: `[method_layout_err=${methodLayoutErr}][guard_quality=${guardQuality}]` });
+                            forced = true;
+                        } else if (folds) {
                             // remix→stereo: downmix in place to a codec_stereo track (NOT opus) so it stays stereo-codec-consistent and idempotent (a stereo
                             // opus would be re-forced to codec_stereo next run). Mirrors the in-place stereo tier; the 2ch table target (surround source
                             // bitrate isn't a comparable floor).
@@ -3191,8 +3218,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // being spent on the gain correction - this is what makes codec_stereo=aac_vbr reach a track already aac). A guard-protected or over-channel-
             // limit target falls back to the other candidate rather than cancelling the pass, so enabling codec_force can never silently switch loudnorm
             // off. The opus layout wall counts as out of reach too: when libopus refuses the layout with no lossless relabel and no remix will run
-            // (method_layout_err keep/drop, or remix standing down for an existing stereo - the loop's opus branch), an opus target ends in "Not
-            // normalizing"; ac3/eac3/aac carry every layout, so an encodable source codec takes the correction instead. null = neither is in reach.
+            // (remixFoldsTrack: method_layout_err keep/drop, a remix standing down for an existing stereo, or codec_stereo walled by the container), an opus
+            // target ends in "Not normalizing"; ac3/eac3/aac carry every layout, so an encodable source codec takes the correction instead. An opus target
+            // the remix folds is judged as that fold: only guardRefusesAnyEncode refuses it here, and guard_quality picks add or replace at the remix.
+            // null = neither is in reach.
             const leftoverTarget = (ffstream, channels) => {
                 const ffstreamCodec = codecNameOf(ffstream) || 'unknown';
                 const isStereo = channels <= 2;
@@ -3200,13 +3229,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // Folded like every other identity check (codecFamilyOf), so an aac_latm track keeps AAC.
                 const srcFamily = codecFamilyOf(ffstream);
                 const keepCodec = ENCODABLE_CODECS.includes(srcFamily) ? srcFamily : configuredCodec;
-                const reachable = (c) => channels <= codecMaxCh(aacFamily(c)) && !guardBlocks(ffstream, c, channels, channels) && !containerRefusesAudio(c);
+                const folds = remixFoldsTrack(ffstream, channels);
+                const reachable = (c) => channels <= codecMaxCh(aacFamily(c)) && !containerRefusesAudio(c)
+                    && !(folds && aacFamily(c) === 'opus' ? guardRefusesAnyEncode(ffstream) : guardBlocks(ffstream, c, channels, channels));
                 const wantCodec = forceCovers(isStereo, channels) ? configuredCodec : keepCodec;
                 let targetCodec = reachable(wantCodec) ? wantCodec : (reachable(keepCodec) ? keepCodec : null);
                 const opusWalled = (c) => {
                     if (aacFamily(c) !== 'opus' || channels <= 2 || ffstreamCodec === 'opus') return false;
                     const { ok, relabel } = opusLayoutFor(ffstream, channels);
-                    return !ok && !relabel && (methodLayoutErr !== 'remix' || remixDefersToExistingStereo(ffstream, relabel));
+                    return !ok && !relabel && !folds;
                 };
                 if (targetCodec !== null && targetCodec !== keepCodec && opusWalled(targetCodec) && reachable(keepCodec) && !opusWalled(keepCodec)) {
                     targetCodec = keepCodec;
@@ -3279,7 +3310,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         if (relabel) {
                             // lossless relabel to an opus-safe layout, chained ahead of loudnorm
                             loudnormRelabel = `channelmap=map=${relabel.map}:channel_layout=${relabel.layout}`;
-                        } else if (methodLayoutErr === 'remix' && !remixDefer && !containerRefusesAudio(stereoCodec)) {
+                        } else if (remixFoldsTrack(ffstream, channels)) {
                             // MEASURE FIRST, then decide. The gain correction is the only mandate this loop has - with method_loudnorm=disabled it never runs
                             // at all and the track keeps its source codec and channels - so a track already within LOUDNORM_TOLERANCE_LU (or one the analysis
                             // cap left unmeasured) must not be flattened from surround to stereo for nothing. Every other exit of this loop already bails on
@@ -3291,12 +3322,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // the false claim would land exactly on the loud tracks loudnorm exists to tame - and this loop's cache check trusts the tag
                             // before any codec/layout reasoning, so it would suppress the correction for good once the settings stop routing this track
                             // through the remix. The cost is one analysis spawn per pass, the same price a container that cannot persist the tag already pays.
-                            const two = stereoArg(outputAudioIdx, ffstream);
+                            // A track guard_quality protects is judged against the stereo the remix emits (see the codec_force remix): its normalized stereo
+                            // is ADDED beside it, and the track stays un-normalized in its source codec - opus can't take its layout, and a codec this plugin
+                            // encodes never gets here (leftoverTarget hands it the correction, or the codec_force remix has already run on it).
+                            const guarded = guardBlocks(ffstream, stereoCodec, 2, channels);
+                            const two = stereoArg(guarded ? newStreamOutputIdx : outputAudioIdx, ffstream);
                             if (!two.changed) {
                                 skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] ${two.measured
                                     ? 'Remix not needed - the stereo fold is already within tolerance'
                                     : 'Remix skipped - the per-file analysis cap left the stereo fold unmeasured (a later pass can normalize it)'}; left as `
                                     + `${ffstreamCodec} ${channels}ch un-normalized\n`;
+                                continue;
+                            }
+                            if (guarded) {
+                                append2ch(ffstream, srcAudioIdx, ffstreamCodec, srcRateToken(ffstream), ffstream.awkRegionKey,
+                                    ` (libopus can't encode its ${lay || `${channels}ch`} layout; the source is kept un-normalized as ${ffstreamCodec})`,
+                                    { tag: `[method_layout_err=${methodLayoutErr}][guard_quality=${guardQuality}]`, measuredTwo: two });
                                 continue;
                             }
                             const enc = stereoEnc(outputAudioIdx);
