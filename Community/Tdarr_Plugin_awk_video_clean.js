@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.50',
+    Version: '3.999.51',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -371,6 +371,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const codecNameOf = (s) => (s?.codec_name || '').trim().toLowerCase();
     // ===== END SHARED: stream codec type =====
 
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: case-insensitive tag lookup =====
+    // -=-=-= getTagCI  [all five] =-=-=-
+    // Look up a tag value case-insensitively on BOTH sides - matroska UPPER-CASES tag keys on write, so a plugin reading its sibling's awk_*
+    // marker gets an uppercased key back, and the lookup name is folded too so a mixed-case name still matches. Returns the raw value (or '' if
+    // absent); callers trim/decode as needed. One source so the five plugins that read each other's markers can't drift on the lookup convention.
+    const getTagCI = (tags, name) => {
+        const want = String(name).toLowerCase();
+        const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === want);
+        return hit === undefined ? '' : String(tags[hit] ?? '');
+    };
+    // ===== END SHARED: case-insensitive tag lookup =====
+
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: role/disposition classifiers =====
     // -=-=-= dispositionTypes [all five] =-=-=-
     // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each keyword
@@ -680,18 +692,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // and where the arguments come out identical Tdarr ERRORS the file as an infinite transcode loop rather than merely repeating the cost.
     const markerPersists = (container) => isMatroskaFamily(container) || isMp4Family(container);
     // ===== END SHARED: marker persistence =====
-    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: case-insensitive tag lookup =====
-    // -=-=-= getTagCI  [all five] =-=-=-
-    // Look up a tag value case-insensitively on BOTH sides - matroska UPPER-CASES tag keys on write, so a plugin reading its sibling's awk_*
-    // marker gets an uppercased key back, and the lookup name is folded too so a mixed-case name still matches. Returns the raw value (or '' if
-    // absent); callers trim/decode as needed. One source so the five plugins that read each other's markers can't drift on the lookup convention.
-    const getTagCI = (tags, name) => {
-        const want = String(name).toLowerCase();
-        const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === want);
-        return hit === undefined ? '' : String(tags[hit] ?? '');
-    };
-    // ===== END SHARED: case-insensitive tag lookup =====
-
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream / language / preset helpers =====
     // -=-=-= mediaInfoFor [all five] =-=-=-
     // The single join point between the two probes: the mediaInfo track whose StreamOrder equals the ffprobe index; undefined when absent. Deliberately
@@ -1347,11 +1347,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!given) return '';
         const pathMod = require('path');
         const isFile = (p) => { try { return fs.statSync(p).isFile(); } catch (e) { return false; } };
+        const token = 'ffmpeg';   // the part of the final component swapped for 'ffprobe'
         const swap = (p) => {
             const cut = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
             const base = p.slice(cut + 1);
-            const at = base.toLowerCase().lastIndexOf('ffmpeg');
-            return at < 0 ? '' : `${p.slice(0, cut + 1)}${base.slice(0, at)}ffprobe${base.slice(at + 6)}`;
+            const at = base.toLowerCase().lastIndexOf(token);
+            return at < 0 ? '' : `${p.slice(0, cut + 1)}${base.slice(0, at)}ffprobe${base.slice(at + token.length)}`;
         };
         let resolved = given;
         if (!/[\\/]/.test(given)) {   // a bare command is a PATH lookup, so resolve it the way the OS would

@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.52',
+    Version: '4.999.53',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -559,6 +559,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const codecNameOf = (s) => (s?.codec_name || '').trim().toLowerCase();
     // ===== END SHARED: stream codec type =====
 
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: case-insensitive tag lookup =====
+    // -=-=-= getTagCI  [all five] =-=-=-
+    // Look up a tag value case-insensitively on BOTH sides - matroska UPPER-CASES tag keys on write, so a plugin reading its sibling's awk_*
+    // marker gets an uppercased key back, and the lookup name is folded too so a mixed-case name still matches. Returns the raw value (or '' if
+    // absent); callers trim/decode as needed. One source so the five plugins that read each other's markers can't drift on the lookup convention.
+    const getTagCI = (tags, name) => {
+        const want = String(name).toLowerCase();
+        const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === want);
+        return hit === undefined ? '' : String(tags[hit] ?? '');
+    };
+    // ===== END SHARED: case-insensitive tag lookup =====
+
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: role/disposition classifiers =====
     // -=-=-= dispositionTypes [all five] =-=-=-
     // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each keyword
@@ -857,18 +869,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const noMuxerSkipLine = (container) => `☒A .${container} file has no ffmpeg muxer that can write it back - left untouched; remux it to mkv or mp4 first`
         + ' (clean_and_remux does that)\n';
     // ===== END SHARED: output muxer =====
-    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: case-insensitive tag lookup =====
-    // -=-=-= getTagCI  [all five] =-=-=-
-    // Look up a tag value case-insensitively on BOTH sides - matroska UPPER-CASES tag keys on write, so a plugin reading its sibling's awk_*
-    // marker gets an uppercased key back, and the lookup name is folded too so a mixed-case name still matches. Returns the raw value (or '' if
-    // absent); callers trim/decode as needed. One source so the five plugins that read each other's markers can't drift on the lookup convention.
-    const getTagCI = (tags, name) => {
-        const want = String(name).toLowerCase();
-        const hit = Object.keys(tags || {}).find((k) => k.toLowerCase() === want);
-        return hit === undefined ? '' : String(tags[hit] ?? '');
-    };
-    // ===== END SHARED: case-insensitive tag lookup =====
-
     // ===== SHARED [audio_clean, stream_ordering]: audio codec scoring =====
     // -=-=-= codecInfo  [audio_clean, stream_ordering] =-=-=-
     // Codec quality weights + bitrate thresholds for picking the best track (audioQuality). Three row shapes, each field one job:
