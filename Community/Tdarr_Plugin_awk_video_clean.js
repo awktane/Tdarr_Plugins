@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.52',
+    Version: '3.999.53',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -612,7 +612,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // What the plan costs, as log lines: the custom keys a flagless mux leaves behind, and each cover mp4CoversLost names (same `kept` argument).
     const mp4TagPlanLog = (plan, container, kept = []) => {
         const c = String(container || '').toLowerCase();
-        const names = (keys) => keys.map((k) => logSafe(k, 40)).join(', ');
+        const TAG_KEY_LOG_MAX = 40;   // several keys share one line, and a key is a name rather than free text, so each echo is kept short
+        const names = (keys) => keys.map((k) => logSafe(k, TAG_KEY_LOG_MAX)).join(', ');
         let log = '';
         if (plan.dropped.length) {
             log += `☐Not carrying ${names(plan.dropped)} - .${c} has no standard tag for ${plan.dropped.length === 1 ? 'it' : 'them'}`
@@ -1477,18 +1478,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return bestType;
     };
-    // Resolve this node's memory budget, in bytes. `scope` is 'container' when a real cgroup limit was found - the ONLY scope allowed to refuse a file,
-    // since a cgroup is the only place a hard OOM kill lives; bare metal grows swap/pagefile and degrades instead. Returns null when nothing could be
-    // established (check goes inert). os.totalmem() is never consulted on Linux: it reports the HOST from inside Docker (measured 11x overshoot vs a 1 GiB
-    // cgroup) and always returns something, so a ladder reaching it can never admit ignorance; process.availableMemory()/constrainedMemory() are no better
-    // (page-cache-dominated / memory.high, a throttle not the kill point). Occupancy comes from memory.stat anon (v2) / rss (v1): measured idle, anon was
-    // 103 MB against memory.current's 1317 MB - a 12x difference that would discard a quarter of the container before the encode started. Tests inject the
-    // verdict through __awkCap.mem, or macOS's raw reading through __awkCap.macMemory ({ total, level }); an injected cap with neither means "no verdict",
-    // inert rather than a real /sys read.
-    // macOS occupancy is read from kern.memorystatus_level - the percentage of memory macOS can hand out, counting the inactive, speculative and purgeable
-    // pages it reclaims on demand. os.freemem() there counts only the free page LIST, which macOS keeps near empty on purpose (measured 0.08 GB against a
-    // memorystatus_level of 40% - 3.2 GB - on an 8 GB Mac), so it raised the "only X GB is free ... by swapping" warning on almost every encode. One bounded
-    // sysctl per file (~40 ms under load); an unreadable answer leaves the check inert rather than falling back to the free list.
+    // Resolve this node's memory budget, in bytes. `scope` is 'container' when a real cgroup limit was found - the ONLY scope allowed to refuse a file, since
+    // a cgroup is the only place a hard OOM kill lives; bare metal grows swap/pagefile and degrades instead. Returns null when nothing could be established
+    // (check goes inert). os.totalmem() is never consulted on Linux: it reports the HOST from inside Docker (measured 11x overshoot vs a 1 GiB cgroup) and
+    // always returns something, so a ladder reaching it can never admit ignorance; process.availableMemory()/constrainedMemory() are no better
+    // (page-cache-dominated / memory.high, a throttle not the kill point). Occupancy comes from memory.stat anon (v2) / rss (v1): measured idle, anon was 103
+    // MB against memory.current's 1317 MB - a 12x difference that would discard a quarter of the container before the encode started. Tests inject the verdict
+    // through __awkCap.mem, or macOS's raw reading through __awkCap.macMemory ({ total, level }); an injected cap with neither means "no verdict", inert
+    // rather than a real /sys read. macOS occupancy is read from kern.memorystatus_level - the percentage of memory macOS can hand out, counting the inactive,
+    // speculative and purgeable pages it reclaims on demand. os.freemem() there counts only the free page LIST, which macOS keeps near empty on purpose
+    // (measured 0.08 GB against a memorystatus_level of 40% - 3.2 GB - on an 8 GB Mac), so it raised the "only X GB is free ... by swapping" warning on almost
+    // every encode. One bounded sysctl per file (~40 ms under load); an unreadable answer leaves the check inert rather than falling back to the free list.
     const MAC_MEMLEVEL_TIMEOUT_MS = 5000;
     const macMemoryLevel = () => {
         try {
@@ -1927,12 +1927,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const dropdownChecks = [
         ['action',           action,           ['hdr_cleanup_only', 'normalize', 'shrink']],
         ['codec',            codec,            ['source', 'hevc', 'h264', 'av1']],
+        ['deinterlace',      deinterlaceOpt,   ['disabled', 'enabled']],
         ['downscale',        downscaleOpt,     ['disabled', '2160', '1440', '1080', '720']],
-        ['method_speed',     speed,            ['slow', 'medium', 'fast']],
+        ['hdr_mode',         hdrMode,          ['preserve', 'strip_dynamic', 'tonemap_sdr']],
         ['method_bitdepth',  bitDepthOpt,      ['source', '8', '10']],
         ['method_encoder',   encoderOpt,       ['node', 'node_strict', 'auto', 'cpu']],
-        ['hdr_mode',         hdrMode,          ['preserve', 'strip_dynamic', 'tonemap_sdr']],
-        ['deinterlace',      deinterlaceOpt,   ['disabled', 'enabled']],
+        ['method_speed',     speed,            ['slow', 'medium', 'fast']],
         ['guard_captions',   guardCaptionsOpt, ['disabled', 'enabled']],
         ['guard_dv',         guardDvOpt,       ['enabled', 'disabled']],
         ['guard_lossless',   guardLosslessOpt, ['enabled', 'disabled']],
@@ -2219,9 +2219,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Lossless dynamic-HDR strip eligibility, shared by hdr_cleanup_only and the no-real-transcode strip path: a no-base DV, any HDR Vivid, a DV signal
         // on a codec dovi_rpu refuses, an HDR10+ layer with nothing else strippable, and a container whose muxer refuses the codec even on a copy all have no
         // lossless path (skip); otherwise strip. The skip messages are built HERE so they cannot drift between the two callers - each passes only its own two
-        // advice fragments. Vivid is tested FIRST on
-        // purpose: no filter here removes a CUVA block, so stripping any other layer would leave the file still dynamic-HDR while the log reported a
-        // completed strip - the one case where a partial strip is worse than none, because nothing about it converges.
+        // advice fragments. Vivid is tested FIRST on purpose: no filter here removes a CUVA block, so stripping any other layer would leave the file still
+        // dynamic-HDR while the log reported a completed strip - the one case where a partial strip is worse than none, because nothing about it converges.
         const tryLosslessStrip = (tonemapAdvice, reencodeAdvice) => {
             const head = `☒${pTag}[hdr_mode=strip_dynamic] `;
             if (dvNoBaseLayer) { return skip(`${head}${dvLabel} has no HDR10 base layer - can't strip losslessly; ${tonemapAdvice}\n`); }

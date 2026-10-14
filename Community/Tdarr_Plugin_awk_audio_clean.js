@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.54',
+    Version: '4.999.55',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -800,7 +800,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // What the plan costs, as log lines: the custom keys a flagless mux leaves behind, and each cover mp4CoversLost names (same `kept` argument).
     const mp4TagPlanLog = (plan, container, kept = []) => {
         const c = String(container || '').toLowerCase();
-        const names = (keys) => keys.map((k) => logSafe(k, 40)).join(', ');
+        const TAG_KEY_LOG_MAX = 40;   // several keys share one line, and a key is a name rather than free text, so each echo is kept short
+        const names = (keys) => keys.map((k) => logSafe(k, TAG_KEY_LOG_MAX)).join(', ');
         let log = '';
         if (plan.dropped.length) {
             log += `☐Not carrying ${names(plan.dropped)} - .${c} has no standard tag for ${plan.dropped.length === 1 ? 'it' : 'them'}`
@@ -1264,9 +1265,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ===== SHARED [audio_clean, clean_and_remux, sub_worker]: iso639-1 to iso639-2 map =====
     // -=-=-= ISO639_1_TO_2  [audio_clean, clean_and_remux, sub_worker] =-=-=-
-    // ISO 639-1 (2-letter) -> ISO 639-2/T (terminologic 3-letter), complete for every current 639-1 code; each row
-    // verified to name the same language via ICU. Both writers map to /T for an mp4 target (its mdhd stores only a
-    // 3-letter code): clean_and_remux via toCanonicalTag/method_tag_language, sub_worker via to6392T on subtitle import.
+    // ISO 639-1 (2-letter) -> ISO 639-2/T (terminologic 3-letter), complete for every current 639-1 code; each row verified to name the same language via ICU.
+    // Both writers map to /T for an mp4 target (its mdhd stores only a 3-letter code): clean_and_remux via toCanonicalTag/method_tag_language, sub_worker via
+    // to6392T on subtitle import.
     const ISO639_1_TO_2 = {
         aa:'aar',ab:'abk',ae:'ave',af:'afr',ak:'aka',am:'amh',an:'arg',ar:'ara',as:'asm',av:'ava',ay:'aym',az:'aze',ba:'bak',be:'bel',bg:'bul',
         bh:'bih',bi:'bis',bm:'bam',bn:'ben',bo:'bod',br:'bre',bs:'bos',ca:'cat',ce:'che',ch:'cha',co:'cos',cr:'cre',cs:'ces',cu:'chu',cv:'chv',
@@ -1286,10 +1287,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ===== SHARED [audio_clean, sub_worker]: mov language remap =====
     // -=-=-= to6392T  [audio_clean, sub_worker] =-=-=-
-    // Fold a language token to a lowercase 3-letter ISO 639-2/T code: langKey folds spelled names and 639-2/B onto the
-    // 2-letter key, which ISO639_1_TO_2 maps to /T; an already-3-letter code (eng, fil, und) or an unmappable token is left
-    // as-is. Used where a 3-letter code is required - sub_worker's mp4-family sidecar import (mdhd stores only /T) and the
-    // mov remap below - and it is the fold MOV_LANG expects. Mirrors clean_and_remux's toCanonicalTag threeLetter(false).
+    // Fold a language token to a lowercase 3-letter ISO 639-2/T code: langKey folds spelled names and 639-2/B onto the 2-letter key, which ISO639_1_TO_2 maps
+    // to /T; an already-3-letter code (eng, fil, und) or an unmappable token is left as-is. Used where a 3-letter code is required - sub_worker's mp4-family
+    // sidecar import (mdhd stores only /T) and the mov remap below - and it is the fold MOV_LANG expects. Mirrors clean_and_remux's toCanonicalTag
+    // threeLetter(false).
     const to6392T = (lang) => { const key = langKey(lang); if (!key || key.length !== 2) return lang; return ISO639_1_TO_2[key] || lang; };
     // -=-=-= MOV_LANG (+ movLangCode)  [audio_clean, sub_worker] =-=-=-
     // mov is the exception to writing a language into the output container (mp4 stores only lowercase 3-letter /T, mkv keeps the raw spelling). The QuickTime
@@ -1798,6 +1799,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // persists the whole error message, and a raw newline in the echo would split the line into a continuation carrying no ☐/☑/☒ status symbol.
     const failLangToken = (name, token) => failFile(`[${name}=${logSafe(token)}] not a recognised language`
         + ' - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)');
+    // -=-=-= checkLangLists  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // The free-text language lists' counterpart of checkDropdowns: one loop over [input name, raw tokens] rows, failing on the first token this plugin's
+    // knownLangToken does not recognise. Rows and tokens run in order, so the first failure is the first bad token of the first listed input.
+    const checkLangLists = (checks) => {
+        for (const [name, tokens] of checks) for (const tok of tokens) if (!knownLangToken(langKey(tok))) failLangToken(name, tok);
+    };
     // ===== END SHARED: language token failure =====
     // #endregion
 
@@ -1851,10 +1858,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // a typo in one list while the other still matches leaves that language "unlisted", where language_unlisted=stereo downmixes it and
     // language_unlisted=delete removes it. A rejected token fails the file. clean_and_remux runs the same check on its own lists, through its langName wrapper
     // rather than this predicate.
-    for(let i = 0; i < langStereoKeys.length; i++)
-        if(!knownLangToken(langStereoKeys[i])) failLangToken('language_stereo', langStereo[i]);
-    for(let i = 0; i < langSurroundKeys.length; i++)
-        if(!knownLangToken(langSurroundKeys[i])) failLangToken('language_surround', langSurround[i]);
+    checkLangLists([['language_stereo', langStereo], ['language_surround', langSurround]]);
 
     // The container this plugin writes, derived the same way in every other plugin that needs it. This plugin never changes the container, so it is always
     // the source's - but every membership test must see it normalised: a Tdarr container string of 'MKV' misses a bare includes() and silently takes the
@@ -2289,12 +2293,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // silently lose that derivative. Each such dropped source is recorded here and its stereo/5.1 derivative is created after the main loop, but
         // only when the language didn't otherwise get one (so a redundant dropped source adds nothing). See the post-loop derivative pass below.
         const layoutDroppedDeriveSources = [];
-        // The drop floor. Never the last audio track; and never a MAIN track that
-        // would leave commentary or descriptive audio standing in for it - the last main track in the file, or the last of its language while that language
-        // still has a secondary track. Dropping it there loses the programme audio and keeps the track the user ranks lowest; and downmix_secondary=delete,
-        // resolved after this pass, can then not remove that secondary either, since it never leaves a language with no audio - so English 6.0 main audio
-        // beside an English description set to delete ended as the description alone. A language with no secondary track is dropped as the tooltip says.
-        // Why the floor kept each track, recorded here because the loop reports it AFTER the role deletes have changed what is left.
+        // The drop floor. Never the last audio track; and never a MAIN track that would leave commentary or descriptive audio standing in
+        // for it - the last main track in the file, or the last of its language while that language still has a secondary track. Dropping it
+        // there loses the programme audio and keeps the track the user ranks lowest; and downmix_secondary=delete, resolved after this pass,
+        // can then not remove that secondary either, since it never leaves a language with no audio - so English 6.0 main audio beside an
+        // English description set to delete ended as the description alone. A language with no secondary track is dropped as the tooltip
+        // says. Why the floor kept each track, recorded here because the loop reports it AFTER the role deletes have changed what is left.
         const dropKeptWhy = new Map();
         const dropFloor = (s) => {
             if (countSurvivingAudio() <= 1) return 'it is the last audio track';

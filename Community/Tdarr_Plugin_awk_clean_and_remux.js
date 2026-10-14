@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.56',
+    Version: '4.999.57',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -719,7 +719,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // What the plan costs, as log lines: the custom keys a flagless mux leaves behind, and each cover mp4CoversLost names (same `kept` argument).
     const mp4TagPlanLog = (plan, container, kept = []) => {
         const c = String(container || '').toLowerCase();
-        const names = (keys) => keys.map((k) => logSafe(k, 40)).join(', ');
+        const TAG_KEY_LOG_MAX = 40;   // several keys share one line, and a key is a name rather than free text, so each echo is kept short
+        const names = (keys) => keys.map((k) => logSafe(k, TAG_KEY_LOG_MAX)).join(', ');
         let log = '';
         if (plan.dropped.length) {
             log += `☐Not carrying ${names(plan.dropped)} - .${c} has no standard tag for ${plan.dropped.length === 1 ? 'it' : 'them'}`
@@ -1127,6 +1128,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // persists the whole error message, and a raw newline in the echo would split the line into a continuation carrying no ☐/☑/☒ status symbol.
     const failLangToken = (name, token) => failFile(`[${name}=${logSafe(token)}] not a recognised language`
         + ' - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)');
+    // -=-=-= checkLangLists  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // The free-text language lists' counterpart of checkDropdowns: one loop over [input name, raw tokens] rows, failing on the first token this plugin's
+    // knownLangToken does not recognise. Rows and tokens run in order, so the first failure is the first bad token of the first listed input.
+    const checkLangLists = (checks) => {
+        for (const [name, tokens] of checks) for (const tok of tokens) if (!knownLangToken(langKey(tok))) failLangToken(name, tok);
+    };
     // ===== END SHARED: language token failure =====
     // #endregion
     // Value checks resume here (container was checked above): the free-text language inputs first, their cross-check once both are known-good, then the
@@ -1140,30 +1147,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if(fillLanguage && isNonLang(langKey(fillLanguage)))
         failFile(`[language_fill=${logSafe(fillLanguage)}] a special code (und/mul/zxx/mis/qaa-qtz) cannot be written as a fill - an untagged track already`
             + ' counts as und; use a real language code, or clear language_fill and list the special code in language_sub to keep those tracks');
-    for(let i = 0; i < subLangKeys.length; i++)
-        if(!knownLangToken(subLangKeys[i])) failLangToken('language_sub', subLanguage[i]);
+    checkLangLists([['language_sub', subLanguage]]);
     // If fillLanguage is set it should be a subtitle that's kept. (There is no audio equivalent: audio_clean owns audio language, and it reads the tag
     // this plugin has already written rather than language_fill itself, so there is nothing here to cross-check against.)
     if(fillLanguage && subLanguage.length > 0 && !subLangKeys.includes(langKey(fillLanguage)))
         failFile(`[language_fill=${logSafe(fillLanguage)}] not in language_sub - untagged subtitle streams would be removed;`
             + ' add it to language_sub or clear language_fill');
-    // Every dropdown's accepted set, as ONE table driving the shared checkDropdowns loop. The shape matters beyond the line count: CLAUDE.md's retired-option
-    // policy says a value the dropdown no longer offers must STOP the file, and input_surface_diff.js has to locate each dropdown's validator to report an
-    // accepted-but-not-offered value. A uniform table is an anchor it can find; a run of differently-shaped `if` statements is not, and one of them going
-    // stale is invisible. Non-dropdown checks stay where they are.
-    // `container` is NOT here: it is checked far earlier, because response.container is derived from it before this point.
+    // Every dropdown's accepted set, as ONE table driving the shared checkDropdowns loop. The shape matters beyond the line count:
+    // CLAUDE.md's retired-option policy says a value the dropdown no longer offers must STOP the file, and input_surface_diff.js has
+    // to locate each dropdown's validator to report an accepted-but-not-offered value. A uniform table is an anchor it can find; a
+    // run of differently-shaped `if` statements is not, and one of them going stale is invisible. Non-dropdown checks stay where
+    // they are. `container` is NOT here: it is checked far earlier, because response.container is derived from it before this point.
     const dropdownChecks = [
         ['language_fill_mode',   fillMode,           ['single-or-error', 'force-any']],
-        ['remove_sub_sdh',       removeSubSdh,       ['disabled', 'if_plain_survives', 'all']],
         ['tag_disposition',      tagDisposition,     ['disabled', 'audio', 'subtitle', 'both']],
-        ['tag_title',            tagTitle,           ['disabled', 'audio', 'subtitle', 'both']],
         ['tag_language',         tagLanguage,        ['invalid', 'strict', 'disabled']],
+        ['tag_title',            tagTitle,           ['disabled', 'audio', 'subtitle', 'both']],
+        ['remove_imagesubs',     removeImageSubs,    ['unsupported', 'all', 'export']],
+        ['remove_sub_sdh',       removeSubSdh,       ['disabled', 'if_plain_survives', 'all']],
         ['method_tag_language',  methodTagLanguage,  ['container', '639-2/t', '639-2/b', 'bcp47']],
+        ['method_unmuxable',     methodUnmuxable,    ['error', 'drop', 'mkv_fallback']],
+        ['guard_audio_language', guardAudioLanguage, ['disabled', 'enabled']],
         ['recover_bad_data',     recoverData,        ['disabled', 'light', 'aggressive']],
         ['recover_bad_timestamps', recoverTs,        ['disabled', 'light', 'aggressive']],
-        ['guard_audio_language', guardAudioLanguage, ['disabled', 'enabled']],
-        ['remove_imagesubs',     removeImageSubs,    ['unsupported', 'all', 'export']],
-        ['method_unmuxable',     methodUnmuxable,    ['error', 'drop', 'mkv_fallback']],
     ];
     checkDropdowns(dropdownChecks);
 
@@ -1175,9 +1181,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // #region SHARED helpers (1 section: iso639-1 to iso639-2 map)
     // ===== SHARED [audio_clean, clean_and_remux, sub_worker]: iso639-1 to iso639-2 map =====
     // -=-=-= ISO639_1_TO_2  [audio_clean, clean_and_remux, sub_worker] =-=-=-
-    // ISO 639-1 (2-letter) -> ISO 639-2/T (terminologic 3-letter), complete for every current 639-1 code; each row
-    // verified to name the same language via ICU. Both writers map to /T for an mp4 target (its mdhd stores only a
-    // 3-letter code): clean_and_remux via toCanonicalTag/method_tag_language, sub_worker via to6392T on subtitle import.
+    // ISO 639-1 (2-letter) -> ISO 639-2/T (terminologic 3-letter), complete for every current 639-1 code; each row verified to name the same language via ICU.
+    // Both writers map to /T for an mp4 target (its mdhd stores only a 3-letter code): clean_and_remux via toCanonicalTag/method_tag_language, sub_worker via
+    // to6392T on subtitle import.
     const ISO639_1_TO_2 = {
         aa:'aar',ab:'abk',ae:'ave',af:'afr',ak:'aka',am:'amh',an:'arg',ar:'ara',as:'asm',av:'ava',ay:'aym',az:'aze',ba:'bak',be:'bel',bg:'bul',
         bh:'bih',bi:'bis',bm:'bam',bn:'ben',bo:'bod',br:'bre',bs:'bos',ca:'cat',ce:'che',ch:'cha',co:'cos',cr:'cre',cs:'ces',cu:'chu',cv:'chv',
@@ -1528,14 +1534,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const key = apiAuthKey();
         return key ? `header = "x-api-key: ${key}"\nheader = "tdarrKey: ${key}"\nheader = "Authorization: Bearer ${key}"\n` : '';
     };
-    // Is a non-empty sidecar already at this server path? Download is the only read the API offers, so the test IS a fetch - discarded to the null device,
-    // or written to `saveTo` (a path in the caller's private staging directory) when the caller must judge the body - and measured with curl's own
-    // counters, never buffered through spawnSync (a large body silently exceeds maxBuffer and fakes a failure).
-    // Three answers, not two, because a caller's next step on 'absent' is an upload, and the upload endpoint REPLACES whatever is there - possibly a
-    // sidecar the user has OCR'd or edited. So 'absent' needs a completed request the server answered definitively: its File-not-found (HTTP 400), or a
-    // 200 with no body, which holds nothing to lose. Everything else - no URL, a spawn error, a non-zero curl exit (connection refused, the -m timeout,
-    // a dropped transfer), a 5xx, a 501 - is 'unknown': the sidecar may well be there, so the caller leaves it alone this pass instead of writing over it.
-    // Returns { state: 'present' | 'absent' | 'unknown', why }; `why` is for the user's log line and is '' unless the state is 'unknown'.
+    // Is a non-empty sidecar already at this server path? Download is the only read the API offers, so the test IS a fetch - discarded to the null device, or
+    // written to `saveTo` (a path in the caller's private staging directory) when the caller must judge the body - and measured with curl's own counters, never
+    // buffered through spawnSync (a large body silently exceeds maxBuffer and fakes a failure). Three answers, not two, because a caller's next step on
+    // 'absent' is an upload, and the upload endpoint REPLACES whatever is there - possibly a sidecar the user has OCR'd or edited. So 'absent' needs a
+    // completed request the server answered definitively: its File-not-found (HTTP 400), or a 200 with no body, which holds nothing to lose. Everything else -
+    // no URL, a spawn error, a non-zero curl exit (connection refused, the -m timeout, a dropped transfer), a 5xx, a 501 - is 'unknown': the sidecar may well
+    // be there, so the caller leaves it alone this pass instead of writing over it. Returns { state: 'present' | 'absent' | 'unknown', why }; `why` is for the
+    // user's log line and is '' unless the state is 'unknown'.
     const sidecarExistsRemote = (dest, saveTo = '') => {
         const { spawnSync } = require('child_process');
         const url = serverApiUrl();
@@ -1830,8 +1836,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Plex/Jellyfin/Emby - or by hand from their docs - still imports with its role intact instead of being read as the language and skipped:
     // 'cc' and 'hi' are the closed-captions/hearing-impaired spellings of SDH, 'foreign' is Jellyfin's and Emby's spelling of forced.
     const DISP_ALIAS = { cc: 'sdh', hi: 'sdh', foreign: 'forced' };
-    // Parse-only tokens recognised so they aren't mis-read as the language, but carrying
-    // NO disposition: 'default' is muxer-managed, not a role we track or restore.
+    // Parse-only tokens recognised so they aren't mis-read as the language, but carrying NO disposition: 'default' is muxer-managed, not a role we track or
+    // restore.
     const DISP_IGNORE = new Set(['default']);
     const DISP_TOKENS = new Set([...DISPOSITIONS.map((d) => d.token), ...Object.keys(DISP_ALIAS), ...DISP_IGNORE]);
     // Alias tokens that are ALSO a real ISO 639-1 code, so the right-to-left disposition strip must not swallow the language slot: 'hi' is both the

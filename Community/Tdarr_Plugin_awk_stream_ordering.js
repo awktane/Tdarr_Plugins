@@ -18,7 +18,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same
         job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. A
         later job on that file is checked in full again. This check is always on and has no setting.\n`,
-    Version: '4.999.33',
+    Version: '4.999.34',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -555,7 +555,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // What the plan costs, as log lines: the custom keys a flagless mux leaves behind, and each cover mp4CoversLost names (same `kept` argument).
     const mp4TagPlanLog = (plan, container, kept = []) => {
         const c = String(container || '').toLowerCase();
-        const names = (keys) => keys.map((k) => logSafe(k, 40)).join(', ');
+        const TAG_KEY_LOG_MAX = 40;   // several keys share one line, and a key is a name rather than free text, so each echo is kept short
+        const names = (keys) => keys.map((k) => logSafe(k, TAG_KEY_LOG_MAX)).join(', ');
         let log = '';
         if (plan.dropped.length) {
             log += `☐Not carrying ${names(plan.dropped)} - .${c} has no standard tag for ${plan.dropped.length === 1 ? 'it' : 'them'}`
@@ -1062,6 +1063,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // persists the whole error message, and a raw newline in the echo would split the line into a continuation carrying no ☐/☑/☒ status symbol.
     const failLangToken = (name, token) => failFile(`[${name}=${logSafe(token)}] not a recognised language`
         + ' - use an ISO-639 code (en/eng/fre), an English name (English), a BCP-47 tag (pt-BR), or a special code (und/mul/zxx/mis/qaa-qtz)');
+    // -=-=-= checkLangLists  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+    // The free-text language lists' counterpart of checkDropdowns: one loop over [input name, raw tokens] rows, failing on the first token this plugin's
+    // knownLangToken does not recognise. Rows and tokens run in order, so the first failure is the first bad token of the first listed input.
+    const checkLangLists = (checks) => {
+        for (const [name, tokens] of checks) for (const tok of tokens) if (!knownLangToken(langKey(tok))) failLangToken(name, tok);
+    };
     // ===== END SHARED: language token failure =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: dolby vision detection =====
@@ -1150,8 +1157,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // #endregion
 
     const orderLangTokens = splitList(inputs.order_language);
-    for (const tok of orderLangTokens)
-        if (!knownLangToken(langKey(tok))) failLangToken('order_language', tok);
+    checkLangLists([['order_language', orderLangTokens]]);
 
     // The container this plugin writes, derived the same way in every other plugin that needs it. This plugin never changes the container, so it is always
     // the source's - but every membership test must see it normalised: a Tdarr container string of 'MKV' misses a bare includes() and silently takes the
@@ -1493,12 +1499,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // ====== JUNK TAG STRIP: PER-STREAM ======
 
-        // remove_junk_tags: strip encoder/muxer-provenance (+ optional descriptive) tags on the reorder remux. 'encoder' = pure provenance (global encoded_by;
-        // per-stream encoder/encoded_by); 'descriptive' (superset) also drops iTunes/movie-TV container tags. Always kept: title/comment, awk_* markers
-        // (idempotency), creation_time, the mkv BPS/statistics family (mediaInfo's per-track bitrate source), the functional per-stream tags, and the GLOBAL
-        // 'encoder' tag (muxer-managed: every mux re-stamps it, so stripping would loop). Per-stream 'encoder' - including the Lavc tag an upstream re-encode
-        // stamps - is NOT re-added on a -c copy, so running last clears it in the SAME remux (a first-in-stack plugin could only catch it a pass later). The one
-        // exception is muxerRegenerates below.
+        // remove_junk_tags: strip encoder/muxer-provenance (+ optional descriptive) tags on the reorder remux. 'encoder' = pure provenance
+        // (global encoded_by; per-stream encoder/encoded_by); 'descriptive' (superset) also drops iTunes/movie-TV container tags. Always kept:
+        // title/comment, awk_* markers (idempotency), creation_time, the mkv BPS/statistics family (mediaInfo's per-track bitrate source), the
+        // functional per-stream tags, and the GLOBAL 'encoder' tag (muxer-managed: every mux re-stamps it, so stripping would loop).
+        // Per-stream 'encoder' - including the Lavc tag an upstream re-encode stamps - is NOT re-added on a -c copy, so running last clears it
+        // in the SAME remux (a first-in-stack plugin could only catch it a pass later). The one exception is muxerRegenerates below.
         const JUNK_PERSTREAM = new Set(['encoded_by', 'encoder']);   // only encoder-tier keys are safe per-stream (descriptive ones are functional, kept)
         // For MPEG-2 video at the XDCAM frame sizes (1280x720, 1440x1080, 1920x1080) with no encoder tag, the mov/mp4 muxer synthesises an 'XDCAM EX 1080p29'-
         // style stsd compressorname, and the mov demuxer reports it back as the stream's encoder tag (measured, jellyfin-ffmpeg 7.1.4). Clearing it is exactly
