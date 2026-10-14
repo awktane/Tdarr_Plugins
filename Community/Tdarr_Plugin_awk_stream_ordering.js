@@ -17,7 +17,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same
         job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. A
         later job on that file is checked in full again. This check is always on and has no setting.\n`,
-    Version: '4.999.31',
+    Version: '4.999.32',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -85,7 +85,8 @@ const details = () => ({
                 \\nMatching streams are grouped above non-matching ones within their language, and each group is still ordered by order_channel then
                 order_quality. The list is a membership set, not a ranking. It sits below role and above channels and quality.
                 \\nMatching is by family prefix on the canonical codec: dts matches DTS-HD MA, HR and Express, and eac3 includes Atmos. Use dtsma, dtshr,
-                dtsexpress or eac3atmos to name a specific variant.
+                dtsexpress or eac3atmos to name a specific variant; the spelling the Input streams log line prints, such as dts-hd-ma or eac3-atmos, works
+                too.
                 \\nExample:\\neac3,aac`,
         },
         {
@@ -1324,7 +1325,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const subtitleRoleRank = (s) => (s.commentary ? 4 : (s.descriptive ? 3 : (s.sdh ? 2 : (s.lyrics ? 1 : 0))));
         const audioRoleRank = (s) => (s.commentary ? 2 : (s.descriptive ? 1 : 0));
         const preferredLangKeys = orderLangTokens.map(langKey);   // normalised: en/eng/english/en-US and 639-2/B vs /T all rank together (langKey lowercases)
-        const codecFirstList = splitList(inputs.order_codec).map(c => c.toLowerCase());   // canon codec names are lowercase, so the list must be too
+        // order_codec takes the canonical key (eac3atmos) or the spelling this plugin's own Input streams line prints (eac3-atmos): a display token maps
+        // back to its key, so a codec copied from the log matches. Built from the shared CODEC_DISPLAY, so a new display name needs no second edit here.
+        const codecKeyForDisplay = new Map(Object.entries(CODEC_DISPLAY).map(([key, shown]) => [shown, key]));
+        const codecFirstList = splitList(inputs.order_codec).map(c => c.toLowerCase())   // canon codec names are lowercase, so the list must be too
+            .map(c => codecKeyForDisplay.get(c) || c);
 
         // Parse an order mode ('descending' | 'descending <=N' | 'ascending' | 'disabled') into {enabled, dir, cap}. The '<=N' suffix caps descending: a stream
         // whose cap-metric exceeds N is demoted below every at/under-cap stream. A trailing 'k' (order_quality's bitrate cap) means N is in kbps -> bps. Parsed
