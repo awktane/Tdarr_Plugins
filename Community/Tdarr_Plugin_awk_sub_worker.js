@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.73',
+    Version: '3.999.74',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1415,7 +1415,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // parseSidecar's right-to-left disp strip, nulling or corrupting the reimport - collapse any such collision to 'und' so the fixed language slot can
         // never be shaped like a disposition token. A DISP_AMBIGUOUS_LANG token is exempt because it is also a real language code: the disp strip only reads
         // it as a disposition when a real language sits immediately before it, so a Hindi track keeps 'hi' here rather than losing its language to 'und'.
-        const lang = ((DISP_TOKENS.has(langRaw) && !DISP_AMBIGUOUS_LANG.has(langRaw)) || EXTRA_TOKENS.has(langRaw)) ? 'und' : langRaw;
+        // The bundle mark is the third word the slot must never spell: an image-subtitle export carries no mark, so a language of 'styled' after a flag
+        // token ('.visual_impaired.styled.mks') read back as a styled bundle and muxed the picture subtitle this pass removed straight back in.
+        const lang = ((DISP_TOKENS.has(langRaw) && !DISP_AMBIGUOUS_LANG.has(langRaw)) || EXTRA_TOKENS.has(langRaw) || langRaw === STYLED_BUNDLE.mark)
+            ? 'und' : langRaw;
         const roles = dispTokensOf(s);
         const trailing = SERVER_FLAG_TOKENS.find((t) => roles.includes(t));   // at most one, and only a token every server documents
         // Everything else - a second server flag Plex could not have taken anyway, plus our own roles - rides ahead of the language beside 'original'.

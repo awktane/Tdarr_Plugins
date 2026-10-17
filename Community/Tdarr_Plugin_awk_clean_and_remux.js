@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.59',
+    Version: '4.999.60',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1890,7 +1890,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // parseSidecar's right-to-left disp strip, nulling or corrupting the reimport - collapse any such collision to 'und' so the fixed language slot can
         // never be shaped like a disposition token. A DISP_AMBIGUOUS_LANG token is exempt because it is also a real language code: the disp strip only reads
         // it as a disposition when a real language sits immediately before it, so a Hindi track keeps 'hi' here rather than losing its language to 'und'.
-        const lang = ((DISP_TOKENS.has(langRaw) && !DISP_AMBIGUOUS_LANG.has(langRaw)) || EXTRA_TOKENS.has(langRaw)) ? 'und' : langRaw;
+        // The bundle mark is the third word the slot must never spell: an image-subtitle export carries no mark, so a language of 'styled' after a flag
+        // token ('.visual_impaired.styled.mks') read back as a styled bundle and muxed the picture subtitle this pass removed straight back in.
+        const lang = ((DISP_TOKENS.has(langRaw) && !DISP_AMBIGUOUS_LANG.has(langRaw)) || EXTRA_TOKENS.has(langRaw) || langRaw === STYLED_BUNDLE.mark)
+            ? 'und' : langRaw;
         const roles = dispTokensOf(s);
         const trailing = SERVER_FLAG_TOKENS.find((t) => roles.includes(t));   // at most one, and only a token every server documents
         // Everything else - a second server flag Plex could not have taken anyway, plus our own roles - rides ahead of the language beside 'original'.
