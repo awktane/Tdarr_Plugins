@@ -18,7 +18,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same
         job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. A
         later job on that file is checked in full again. This check is always on and has no setting.\n`,
-    Version: '4.999.35',
+    Version: '4.999.36',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -1212,9 +1212,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // which Tdarr scans in full - ffProbeData and mediaInfo alike. Signals are tried in order and the first that resolves on BOTH sides decides, so a
         // container that stores one but not the other cannot make a healthy file look broken. FRAME COUNT is deliberately not among them: video_clean's
         // interlace repair emits bwdif=mode=send_field, which DOUBLES the frame count at field rate, so a frame comparison reports a 2x change on a
-        // perfectly good file. Wall time survives that operation untouched. Container duration comes last and only when the audio track count is unchanged,
-        // since it is the maximum across all streams - audio_clean dropping a commentary track longer than the video legitimately shrinks it - and Matroska
-        // frequently stores no per-stream duration on the ffprobe side, which is why mediaInfo leads. isCoverArt joins role text through mediaInfoFor, which
+        // perfectly good file. Wall time survives that operation untouched. Container duration comes last and only when no timed stream was added or
+        // removed, since it is the maximum across all streams - audio_clean dropping a commentary track, or clean_and_remux a subtitle, that outlasts the
+        // video legitimately shrinks it. Matroska stores no per-stream duration on the ffprobe side, so that signal reads the track's DURATION tag there,
+        // and mediaInfo leads. isCoverArt joins role text through mediaInfoFor, which
         // is bound to THIS file's mediaInfo (see its header) - sound for the current file's streams but NOT for a foreign list like originalLibraryFile's,
         // where it would read the transcoded file's mediaInfo track at the same index. durVideoStream runs over BOTH files, so it tests cover art
         // self-contained: an image codec, or a raw cover-art disposition flag. The three cover-art dispositionTypes are streams:['video'], keywords:[], so
@@ -1222,7 +1223,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const foreignCoverArt = (s) => IMAGE_CODECS.includes(codecNameOf(s))
             || s.disposition?.attached_pic === 1 || s.disposition?.still_image === 1 || s.disposition?.timed_thumbnails === 1;
         const durVideoStream = (obj) => (obj?.ffProbeData?.streams || []).find(s => codecTypeOf(s) === 'video' && !foreignCoverArt(s));
-        const durAudioCount = (obj) => (obj?.ffProbeData?.streams || []).filter(s => codecTypeOf(s) === 'audio').length;
+        // The timed streams a container duration spans, as a sorted type list - equal on both sides exactly when no type's count changed. Attachments and
+        // cover art carry no timeline, so dropping one cannot move the container duration.
+        const durStreamShape = (obj) => (obj?.ffProbeData?.streams || []).filter((s) => codecTypeOf(s) !== 'attachment' && !foreignCoverArt(s))
+            .map((s) => codecTypeOf(s)).sort().join(',');
+        // Matroska's per-track statistics tag, "HH:MM:SS.nnnnnnnnn" - where an mkv keeps a video track's length. ffmpeg's matroska muxer writes it fresh from
+        // the packets when it finalises a file and never carries the source's over (a 20 s mkv cut to 5 s, copied or re-encoded, reports 5 s), and a killed,
+        // unfinalised file carries none - measured on jellyfin-ffmpeg 7.1.4. So it cannot vouch for a truncated output.
+        const durTagSeconds = (v) => {
+            const m = /^(\d{1,3}):([0-5]\d):([0-5]\d(?:\.\d{1,9})?)$/.exec(String(v ?? '').trim());
+            return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : 0;
+        };
         // Every DURATION_SIGNALS row must answer with a real duration or 0 - 0 IS the "no signal" sentinel the oldAny/newAny/verdict accumulation below
         // reads by truthiness, and the failFile at the end of that accumulation turns "the old side had one and the new side has none" into a
         // quarantine. A row that returns something else (a NaN, a negative, an already-coerced value) breaks the guard silently.
@@ -1235,8 +1246,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 read: (probed) => { const v = durVideoStream(probed); if (!v) return 0;
                     return durOrZero(((probed?.mediaInfo?.track || []).find(t => t['@type'] === 'Video'
                         && Number(t.StreamOrder) === v.index) || {}).Duration); } },
-            { name: 'the ffprobe video-stream duration', read: (probed) => durOrZero(durVideoStream(probed)?.duration) },
-            { name: 'the container duration', read: (probed) => durOrZero(probed?.ffProbeData?.format?.duration), needsSameAudio: true },
+            { name: 'the ffprobe video-stream duration', read: (probed) => { const v = durVideoStream(probed);
+                return durOrZero(v?.duration) || durOrZero(durTagSeconds(getTagCI(v?.tags, 'DURATION'))); } },
+            { name: 'the container duration', read: (probed) => durOrZero(probed?.ffProbeData?.format?.duration), needsSameStreams: true },
         ];
         // Tolerance is 1% SHORT, fixed, with no input to relax it: a user hitting a false positive would have no recourse but removing the plugin, so the
         // headroom is deliberately double the 0.5% the long-standing community duration-check plugin defaults to. A dead encode is short by far more.
@@ -1254,7 +1266,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const REVIEW_HINT = 'accepted for review rather than failed; play it through in Tdarr before approving, and do not auto-approve a recovery queue';
         const originalFile = otherArguments?.originalLibraryFile;
         if (originalFile?.ffProbeData) {
-            const sameAudio = durAudioCount(originalFile) === durAudioCount(file);
+            const sameStreams = durStreamShape(originalFile) === durStreamShape(file);
             const newVideo = durVideoStream(file);
             // Carries its own trailing separator, so an audio-only file (or one whose only video stream is cover art - durVideoStream excludes those) does not
             // leave a bare space sitting directly after the ☒ status symbol.
@@ -1266,12 +1278,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const oldDur = sig.read(originalFile);
                 const newDur = sig.read(file);
                 // ANY resolved duration proves that side HAS a duration, so every signal feeds oldAny/newAny - otherwise the no-duration
-                // verdict below fires on a healthy audio-cleaned file whose only resolvable signal is the container's. The needsSameAudio
-                // caveat concerns duration SHRINKAGE (a dropped commentary track longer than the video legitimately shortens the container
-                // maximum), a property of the COMPARISON, so it gates only whether this signal may set the verdict - never the existence test.
+                // verdict below fires on a healthy audio-cleaned file whose only resolvable signal is the container's. The needsSameStreams
+                // caveat concerns duration SHRINKAGE (a dropped track longer than the video legitimately shortens the container maximum),
+                // a property of the COMPARISON, so it gates only whether this signal may set the verdict - never the existence test.
                 if (!oldAny) oldAny = oldDur;
                 if (!newAny) newAny = newDur;
-                if (sig.needsSameAudio && !sameAudio) continue;
+                if (sig.needsSameStreams && !sameStreams) continue;
                 if (!verdict && oldDur && newDur) verdict = { name: sig.name, old: oldDur, now: newDur };
             }
             // A file clean_and_remux repaired IN THIS JOB can legitimately be SHORTER than the library-entry original: recovery salvages a truncated source
@@ -1541,15 +1553,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const canPersistDefault = isMatroskaFamily(dstContainer) || isMp4Family(dstContainer);
         let defaultFlagSkipped = false;
 
-        // A data track the container cannot copy (mp4UncopyableStreams) is left out of the map, so outIdx - the output position every per-stream write keys
-        // on - counts only the streams actually mapped.
+        // Two kinds of stream are left out of the map, so outIdx - the output position every per-stream write keys on - counts only the streams actually
+        // mapped: a data track the container cannot copy (mp4UncopyableStreams), and a stream ffmpeg cannot identify at all - ffprobe omits its codec_type
+        // (an MPEG-TS private-section PID, stream_type 0x05, as DVB recordings carry) and ffmpeg refuses an explicit map of it ("Cannot map stream ...
+        // unsupported type", exit 234 on jellyfin-ffmpeg 7.1.4), so mapping it would fail every remux this plugin emits for the file. Neither forces a remux
+        // on its own: the order test reads only the mapped streams, so a leftover is dropped only from a remux some other change already called for.
         const uncopyable = mp4UncopyableStreams(dstContainer, file.ffProbeData.streams);
+        const unidentified = sortRows.filter((r) => TYPE_ORDER[r.type] === undefined);
+        const leftOutOfMap = (r) => uncopyable.some((s) => s.index === r.index) || unidentified.includes(r);
+        const mappedRows = sortRows.filter((r) => !leftOutOfMap(r));
         let outIdx = -1;
+        let lastPos = -1;
         for (let i = 0; i < sortRows.length; i++) {
-            // Compare against each stream's ORIGINAL array position, not its absolute ffprobe index, so a file already in the desired order but with
-            // non-contiguous indices (e.g. 0,1,3 after an upstream drop) isn't remuxed pointlessly. -map uses the absolute index below.
-            if (sortRows[i].origPos !== i) orderChanged = true;
-            if (uncopyable.some((s) => s.index === sortRows[i].index)) continue;
+            if (leftOutOfMap(sortRows[i])) continue;
+            // Compare each mapped stream's ORIGINAL array position, not its absolute ffprobe index, against the one mapped before it, so a file already in the
+            // desired order but with non-contiguous indices (e.g. 0,1,3 after an upstream drop) isn't remuxed pointlessly. -map uses the absolute index below.
+            if (sortRows[i].origPos < lastPos) orderChanged = true;
+            lastPos = sortRows[i].origPos;
             outIdx++;
             ffmpegMap += ` -map 0:${sortRows[i].index}`;
 
@@ -1669,12 +1689,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // is the fixed video → audio → subtitle → attachment → data precedence that no setting changes, while a within-group sort is what the order_* and
         // audio_first/subtitle_first settings decide. Both lines stay BARE of an [input=value] tag: regrouping has no setting behind it, and a within-group
         // sort is the combined verdict of the whole order_* precedence chain, so naming any one of them would be a guess (see the infoLog contract).
-        const originalOrder = sortRows.slice().sort((a, b) => a.origPos - b.origPos);
+        const originalOrder = mappedRows.slice().sort((a, b) => a.origPos - b.origPos);
         const typeSeq = (arr) => arr.map((s) => s.type).join(',');
-        const regrouped = typeSeq(originalOrder) !== typeSeq(sortRows);
+        const regrouped = typeSeq(originalOrder) !== typeSeq(mappedRows);
         const sortedWithin = [];   // "<n> <type>" per type group whose members changed order among themselves
-        for (const t of new Set(sortRows.map((s) => s.type))) {
-            const positions = sortRows.filter((s) => s.type === t).map((s) => s.origPos);
+        for (const t of new Set(mappedRows.map((s) => s.type))) {
+            const positions = mappedRows.filter((s) => s.type === t).map((s) => s.origPos);
             if (!positions.every((p, i) => i === 0 || positions[i - 1] < p)) sortedWithin.push(`${positions.length} ${t}`);
         }
         if (regrouped)
@@ -1707,9 +1727,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams);
         response.preset = `<io>${ffmpegMap} -c copy${dispositionArgs}${junkArgs}${strictArg}${globalOutputOpt}${mp4MovflagsArg}${outputMuxerArg(dstContainer)}`;
         const mapped = file.ffProbeData.streams.filter((s) => !uncopyable.includes(s));
-        response.infoLog += mp4UncopyableLog(dstContainer, uncopyable, file.ffProbeData.streams) + mp4TagPlanLog(tagPlan, dstContainer, mapped);
+        response.infoLog += mp4UncopyableLog(dstContainer, uncopyable, file.ffProbeData.streams) + mp4TagPlanLog(tagPlan, dstContainer, mapped)
+            + unidentified.map((r) => `☐${streamTag(r.index)} Leaving out a stream ffmpeg cannot identify - it cannot be copied`
+                + ` (${r.type || 'unknown'}-${codecNameOf(r.stream) || 'none'})\n`).join('');
         const goneData = mp4LostData(uncopyable, file.ffProbeData.streams);
-        const leftOut = new Set([...goneData, ...mp4CoversLost(tagPlan, dstContainer, mapped)].map((s) => s.index));
+        const leftOut = new Set([...goneData, ...mp4CoversLost(tagPlan, dstContainer, mapped), ...unidentified.map((r) => r.stream)].map((s) => s.index));
         response.infoLog += `☑Expected results: ${sortRows.filter((s) => !leftOut.has(s.index)).map(s => summariseStream(s.stream)).join('')}\n`;
 
         return response;
