@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.58',
+    Version: '4.999.59',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -546,7 +546,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (18 sections: stream codec type … mp4 strict compliance arg)
+    // #region SHARED helpers (19 sections: stream codec type … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -656,6 +656,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const isSdh         = (s) => hasDisposition(s, 'hearing_impaired') || hasDisposition(s, 'captions');
     const isLyrics      = (s) => hasDisposition(s, 'lyrics');
     // ===== END SHARED: role/disposition classifiers =====
+
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: secondary audio role =====
+    // -=-=-= isSecondaryTrack  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
+    // A secondary audio track is any commentary, visually-impaired/descriptive, music-and-effects (clean_effects) or karaoke track, by flag or title keyword
+    // through the shared classifiers (lyrics is a subtitle-only role). None carries the dialogue a viewer picks a film's audio by, so none speaks for a
+    // language: audio_clean keeps them out of the language tiers and the dedup groups, clean_and_remux's guard_audio_language does not count their
+    // languages, and stream_ordering never ranks one above a main track. One definition, so the three cannot disagree about which tracks those are.
+    const isSecondaryTrack = (stream) => isCommentary(stream) || isDescriptive(stream)
+        || hasDisposition(stream, 'clean_effects') || hasDisposition(stream, 'karaoke');
+    // ===== END SHARED: secondary audio role =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: image / cover-art codecs =====
     // -=-=-= IMAGE_CODECS / isCoverArt [all five] =-=-=-
@@ -1960,11 +1970,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             try { return String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase(); } catch (e) { return langKey(x); }
         };
 
-        // A secondary track is any commentary, visually-impaired/descriptive, music-and-effects (clean_effects) or karaoke track — the shared classifiers cover
-        // the disposition flags and the title keywords. A distinct M&E (dialogue-free) or karaoke mix must never be deduped away as a duplicate of the main
-        // mix. Lyrics/songs are subtitle-only, so they never apply to an audio stream. Secondary is a ROLE: it follows downmix_secondary whatever its language.
-        const isSecondaryTrack = (stream) => isCommentary(stream) || isDescriptive(stream)
-            || hasDisposition(stream, 'clean_effects') || hasDisposition(stream, 'karaoke');
+        // Secondary (the shared isSecondaryTrack) is a ROLE: such a track follows downmix_secondary whatever its language, and a distinct M&E or karaoke
+        // mix is never deduped away as a duplicate of the main mix.
         // Which of the four roles made a track secondary, for the removal log: a line saying only "secondary" leaves the user unable to tell WHY a track
         // counted as one, and since the role is never a language the settings pages give them nowhere else to look. Called only where isSecondaryTrack has
         // already matched, so the last branch is karaoke by elimination; first match wins, because a track can carry more than one role.

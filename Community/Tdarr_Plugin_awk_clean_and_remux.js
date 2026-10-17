@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.60',
+    Version: '4.999.61',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -294,9 +294,9 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\ndisabled (default): no check. audio_clean handles whatever it finds.
-                \\nenabled: abort the file to the error queue when it carries MORE THAN ONE audio language among its genuine (non-commentary,
-                non-descriptive) tracks and NO audio track is marked original - either the ffmpeg 'original' disposition flag or an "original" keyword in
-                the title or handler. Mark the original track and requeue; audio_clean's guard_original can then protect it.
+                \\nenabled: abort the file to the error queue when it carries MORE THAN ONE audio language among its genuine tracks (not commentary,
+                audio description, M&E or karaoke) and NO audio track is marked original - either the ffmpeg 'original' disposition flag or an
+                "original" keyword in the title or handler. Mark the original track and requeue; audio_clean's guard_original can then protect it.
                 \\nWhy it is worth catching early: audio_clean is what keeps or drops audio by language, but it can only trust a track marked original -
                 it has no way to tell which of several untagged languages is the real one.
                 \\nLanguages are compared folded, so en/eng/English/en-US count as one, and an untagged track counts as whatever language_fill would give
@@ -465,7 +465,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (12 sections: stream codec type … ffmpeg metadata escaping)
+    // #region SHARED helpers (13 sections: stream codec type … ffmpeg metadata escaping)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -575,6 +575,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const isSdh         = (s) => hasDisposition(s, 'hearing_impaired') || hasDisposition(s, 'captions');
     const isLyrics      = (s) => hasDisposition(s, 'lyrics');
     // ===== END SHARED: role/disposition classifiers =====
+
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: secondary audio role =====
+    // -=-=-= isSecondaryTrack  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
+    // A secondary audio track is any commentary, visually-impaired/descriptive, music-and-effects (clean_effects) or karaoke track, by flag or title keyword
+    // through the shared classifiers (lyrics is a subtitle-only role). None carries the dialogue a viewer picks a film's audio by, so none speaks for a
+    // language: audio_clean keeps them out of the language tiers and the dedup groups, clean_and_remux's guard_audio_language does not count their
+    // languages, and stream_ordering never ranks one above a main track. One definition, so the three cannot disagree about which tracks those are.
+    const isSecondaryTrack = (stream) => isCommentary(stream) || isDescriptive(stream)
+        || hasDisposition(stream, 'clean_effects') || hasDisposition(stream, 'karaoke');
+    // ===== END SHARED: secondary audio role =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: image / cover-art codecs =====
     // -=-=-= IMAGE_CODECS / isCoverArt [all five] =-=-=-
@@ -2225,14 +2235,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // guard_audio_language: an early warning, BEFORE the remux costs anything. audio_clean decides what audio to keep but can only trust a track
         // MARKED 'original' - so when this file carries more than one genuine audio language and marks no original, abort and let the user tag it.
-        // Languages fold through langKey; an untagged track counts as the language language_fill would give it, else "und". Commentary/descriptive
-        // tracks are excluded - a foreign-language commentary says nothing about which track is the original. Counts only tracks that WILL REACH THE
+        // Languages fold through langKey; an untagged track counts as the language language_fill would give it, else "und". Secondary tracks
+        // (isSecondaryTrack) are excluded - a foreign commentary or karaoke mix says nothing about the original. Counts only tracks that WILL REACH THE
         // OUTPUT, the same rule the language_fill_mode check below states in full. It cuts both ways here: a second language carried only by a track
         // method_unmuxable=drop deletes never reaches audio_clean, so quarantining over it is a stop the user cannot act on; and an 'original' flag
         // sitting on such a track is no answer either, so counting it would wave through exactly the ambiguity this guard is for.
         if (guardAudioLanguage === 'enabled') {
             const audioStreams = streams.filter((s) => codecTypeOf(s) === 'audio' && !unmuxableDrops.has(s.index));
-            const genuineLangs = new Set(audioStreams.filter((s) => !isCommentary(s) && !isDescriptive(s)).map((s) => langKey(resolveWorkLang(s))));
+            const genuineLangs = new Set(audioStreams.filter((s) => !isSecondaryTrack(s)).map((s) => langKey(resolveWorkLang(s))));
             // logSafe each token, like every other echo of a container-supplied value: langKey deliberately passes an unrecognised tag through as-is (right for
             // matching), so this set can hold an arbitrary-length, control-character-bearing string, and THIS message is what Tdarr stores in the error queue.
             // Uncapped, a 200k tag carrying a newline produced a 200,351-character entry whose abort line was split across rows with no leading symbol - the

@@ -6,19 +6,19 @@ const details = () => ({
     Name: 'Re-order streams video, audio, subtitle, then anything else',
     Type: 'Any',
     Operation: 'Transcode',
-    Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then
-        main/descriptive/commentary role, then preferred codec, channels and quality - audio_first can lift whichever track the file flags original, default
-        or descriptive above language, for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can lift the track flagged
-        default, SDH or descriptive. The first audio track is marked the sole default (in containers that can store the flag - Matroska and mp4/mov; ts/avi are
-        left as they are). Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller descriptive set - rides the reorder remux, so
-        no extra pass) and front-load the mp4 moov atom for instant remote
+    Description: `Reorders streams into a clean layout: Video -> Audio -> Subtitles -> Attachments -> Data. Audio sorts by language, then role (main,
+        descriptive, commentary, then M&E and karaoke), then preferred codec, channels and quality - audio_first can lift whichever track the file flags
+        original, default or descriptive above language, for foreign films. Subtitles sort forced-first, then by language and role - subtitle_first can
+        lift the track flagged default, SDH or descriptive. The first audio track is marked the sole default (in containers that can store the flag -
+        Matroska and mp4/mov; ts/avi are left as they are). Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller
+        descriptive set - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for instant remote
         playback (method_mp4_faststart - rides the reorder remux when one is already happening, otherwise forces one extra lossless remux the first time
         it's needed).\n\nBecause it runs last it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file
         that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the signature of an out-of-memory-killed or
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same
         job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. A
         later job on that file is checked in full again. This check is always on and has no setting.\n`,
-    Version: '4.999.36',
+    Version: '4.999.37',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -301,7 +301,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (17 sections: stream codec type … mp4 strict compliance arg)
+    // #region SHARED helpers (18 sections: stream codec type … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -411,6 +411,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const isSdh         = (s) => hasDisposition(s, 'hearing_impaired') || hasDisposition(s, 'captions');
     const isLyrics      = (s) => hasDisposition(s, 'lyrics');
     // ===== END SHARED: role/disposition classifiers =====
+
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering]: secondary audio role =====
+    // -=-=-= isSecondaryTrack  [audio_clean, clean_and_remux, stream_ordering] =-=-=-
+    // A secondary audio track is any commentary, visually-impaired/descriptive, music-and-effects (clean_effects) or karaoke track, by flag or title keyword
+    // through the shared classifiers (lyrics is a subtitle-only role). None carries the dialogue a viewer picks a film's audio by, so none speaks for a
+    // language: audio_clean keeps them out of the language tiers and the dedup groups, clean_and_remux's guard_audio_language does not count their
+    // languages, and stream_ordering never ranks one above a main track. One definition, so the three cannot disagree about which tracks those are.
+    const isSecondaryTrack = (stream) => isCommentary(stream) || isDescriptive(stream)
+        || hasDisposition(stream, 'clean_effects') || hasDisposition(stream, 'karaoke');
+    // ===== END SHARED: secondary audio role =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: image / cover-art codecs =====
     // -=-=-= IMAGE_CODECS / isCoverArt [all five] =-=-=-
@@ -1343,7 +1353,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Role precedence within a language, lowest first. Defined once per stream type and applied to both comparands: written inline it was the same
         // ternary chain twice, where a change to one copy silently makes the comparator asymmetric.
         const subtitleRoleRank = (s) => (s.commentary ? 4 : (s.descriptive ? 3 : (s.sdh ? 2 : (s.lyrics ? 1 : 0))));
-        const audioRoleRank = (s) => (s.commentary ? 2 : (s.descriptive ? 1 : 0));
+        // Any other secondary role (isSecondaryTrack: M&E, karaoke) ranks LAST: neither carries dialogue a viewer would choose, and ranked as main a 5.1 mix
+        // outsorted the 2.0 dialogue track and became the sole default every player auto-selects.
+        const audioRoleRank = (s) => (s.commentary ? 2 : (s.descriptive ? 1 : (s.secondary ? 3 : 0)));
         const preferredLangKeys = orderLangTokens.map(langKey);   // normalised: en/eng/english/en-US and 639-2/B vs /T all rank together (langKey lowercases)
         // order_codec takes the canonical key (eac3atmos) or the spelling this plugin's own Input streams line prints (eac3-atmos): a display token maps
         // back to its key, so a codec copied from the log matches. Built from the shared CODEC_DISPLAY, so a new display name needs no second edit here.
@@ -1461,6 +1473,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // Role classification via the shared classifiers (single source of truth — keeps the sort and the summary line in agreement).
                 commentary: isCommentary(ffstream),
                 descriptive: isDescriptive(ffstream),
+                secondary: isSecondaryTrack(ffstream),
                 sdh: isSdh(ffstream),
                 lyrics: isLyrics(ffstream),
 
