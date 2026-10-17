@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.64',
+    Version: '4.999.65',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1072,15 +1072,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Input validation - every type:'string' input is checked; the free-text ones (language_fill, language_sub) against the language recogniser
     // (knownLangToken below), since a typo silently changes which streams survive. type:'boolean' inputs are coerced by loadDefaultValues, so a guard on
-    // them would be dead code. container goes first, before the dstContainer parse: loadDefaultValues defaults only an undefined or '' value, so a saved
-    // null or false still arrives here, and fails cleanly rather than as a raw TypeError.
-    if (!inputs.container)
-        failFile(`[container=${inputs.container || ''}] not configured, check your settings`);
-
+    // them would be dead code. container goes first, because response.container and every container test below derive from it.
     const srcContainer = String(file.container || '').toLowerCase().trim();
     // let, not const: method_unmuxable=mkv_fallback rewrites this (and response.container) for THIS file when the target container cannot store one of its
     // codecs. The rewrite happens before any consumer runs - see the muxability gate at the top of the per-file work below.
-    let dstContainer = inputs.container.toLowerCase().trim();
+    let dstContainer = ddValue(inputs.container, 'mkv');
     // Membership guard, like the sibling dropdown guards below: all container-specific logic branches on the literals mkv/mp4, so an out-of-set value (only
     // reachable via a hand-edited/imported config) would silently fall through to a generic remux into an unsupported container - a runtime ffmpeg muxer
     // error instead of a clean quarantine.
@@ -1297,14 +1293,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             desired = (tagLanguage !== 'disabled' || dstContainer === 'mp4')
                 ? toCanonicalTag(fillLanguage)
                 : (canonicalRegionTag(fillLanguage) || toCanonicalTag(fillLanguage));
-        } else if (!blank && tagLanguage !== 'disabled' && (tagLanguage === 'strict' || (!rawTag && langName(sl)) || !storesCleanly(rawTag))) {
+        } else if (!blank && tagLanguage !== 'disabled'
+            && ((tagLanguage === 'strict' && (rawTag || langName(sl))) || (!rawTag && langName(sl)) || !storesCleanly(rawTag))) {
             // strict enforces the method form (folds region under container/639-2); invalid only repairs syntax, so a recognised region/script tag keeps
             // its region (canonicalised: en_us -> en-US, pt-br -> pt-BR) on mkv. mp4 can't store a region, so it still folds to 639-2/T via toCanonicalTag.
             // The !rawTag arm is the both-probe promotion: a language resolved with NO ffprobe tag behind it lives only where mediaInfo can see it (an mkv
             // carrying LanguageIETF beside an explicit und), and ffmpeg demuxes the same dict ffprobe printed - so with no write the remux drops the very
-            // language this run used to decide keep/drop, and the summary promises one the file will not carry. langName(sl) is mandatory, not defensive:
-            // toCanonicalTag hands an unrecognised key back unchanged, and mediaInfo can report a string that is no language at all (the MPEG-TS Menu join),
-            // which must never reach the container. tag_language=disabled still means "never change an existing tag", so it declines the promotion too.
+            // language this run used to decide keep/drop, and the summary promises one the file will not carry. langName(sl) is mandatory, not defensive, on
+            // both arms that can write a language only mediaInfo reports (strict's and the promotion): toCanonicalTag hands an unrecognised key back
+            // unchanged, and a mediaInfo Language that is no language at all must never reach the container. tag_language=disabled still means "never
+            // change an existing tag", so it declines the promotion too.
             const repairRegion = tagLanguage === 'invalid' && dstContainer !== 'mp4' ? canonicalRegionTag(sl) : '';
             desired = repairRegion || toCanonicalTag(sl);
         }
