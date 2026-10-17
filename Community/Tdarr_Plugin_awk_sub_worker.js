@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.74',
+    Version: '3.999.75',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1564,9 +1564,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // The sidecar-name extension, and the basename of a library-relative path. Both are read by parseSidecar and again by the unparseable-name
     // warning in the import scan, which must agree with it exactly: a name the warning classifies differently from the parser is either a silent
-    // skip or a false complaint. Windows-style separators are folded first, since a rel can arrive with either.
+    // skip or a false complaint. Every rel is built with '/' (scanSidecarDirs joins with it, readSubtitleList folds a typed '\' to it), so the platform's
+    // own basename is exact: on Linux and macOS a '\' is an ordinary filename character that extract keeps ('AC\DC Live.s2.eng.srt'), and folding it
+    // there cut the name at the backslash, so import never recognised its own sidecar. path.win32 splits on both, so Windows reads the same.
     const SIDECAR_EXT_RE = /\.([A-Za-z0-9]+)$/;
-    const relBasename = (rel) => path.posix.basename(rel.replace(/\\/g, '/'));
+    const relBasename = (rel) => path.basename(rel);
 
     // sidecarBasename <-> parseSidecar are exact inverses. Name = <videoBase>.s<index>[.<encTitle>].<lang>[.<disp...>].<ext>. parseSidecar ALSO
     // accepts a server-native name with no s<index> (e.g. <videoBase>.en.forced.srt), anchored on a recognized <lang> token. A styled-subtitle BUNDLE
@@ -1866,8 +1868,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (there.state === 'present') return LIST_SEED_EXISTS;
         if (there.state === 'unknown') return `could not confirm whether one is already in the library (${there.why}), so it was left alone`;
         const body = [
-            `# Subtitles to import for ${path.basename(libFilePath)} - one filename per line.`,
-            '# Lines starting with # are ignored. This file was created once, automatically; it is yours to edit now.',
+            `# Subtitles to import for ${logPath(path.basename(libFilePath))} - one filename per line.`,
+            '# Lines starting with "# " are ignored. This file was created once, automatically; it is yours to edit now.',
+            '# A backslash is read as a folder separator, so a file whose own name contains one cannot be listed here.',
             '# Add any subtitle you have made yourself here - for example one you OCR\'d from an exported image subtitle -',
             '# naming it the same way as the lines below, since the language, title and flags are read from the filename.',
             ...rels,
@@ -1887,15 +1890,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return up.ok ? '' : up.why;
     };
 
-    // One line per filename, # for comments. Deliberately the simplest format that can be hand-edited without getting quoting wrong, because maintaining it
-    // IS the point - it is how a subtitle OCR'd from an exported image sub announces itself. Every entry is confined to the library folder: '..', an
-    // absolute path and a UNC path are all rejected outright, and the joined result is then resolved and re-checked to stay under the directory, so
-    // anything that slips the syntactic tests fails on the outcome instead.
+    // One line per filename, '# ' for comments. Deliberately the simplest format that can be hand-edited without getting quoting wrong, because maintaining
+    // it IS the point - it is how a subtitle OCR'd from an exported image sub announces itself. It must hold every name extract seeds, and those start with
+    // the video's own name, which can itself begin with '#' ('#Alive (2020).mkv') or a space: so a comment is '#' followed by a space or nothing, and only
+    // TRAILING space is forgiven (a name always ends in its extension). A leading byte-order mark, which some editors save, is dropped. Every entry is
+    // confined to the library folder: '..', an absolute path and a UNC path are all rejected outright, and the joined result is then resolved and
+    // re-checked to stay under the directory, so anything that slips the syntactic tests fails on the outcome instead.
     const readSubtitleList = (text) => {
         const ok = []; const bad = [];
-        for (const line of String(text || '').split(/\r?\n/)) {
-            const entry = line.trim();
-            if (!entry || entry.startsWith('#')) continue;
+        for (const line of String(text || '').replace(/^\uFEFF/, '').split(/\r?\n/)) {
+            const entry = line.trimEnd();
+            if (!entry || /^#(\s|$)/.test(entry)) continue;
             const norm = entry.replace(/\\/g, '/');
             if (/^([a-zA-Z]:|\/|\\)/.test(entry) || norm.startsWith('//')) {
                 bad.push([entry, 'absolute paths are not allowed, name a file inside the video\'s own folder']); continue;
@@ -1926,18 +1931,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // levels because readdir order is filesystem-dependent (ext4 hash order vs APFS): the callers that do NOT re-sort - the unparseable-name warnings and the
     // post-processing deletion pass - then report and delete in the same order on every node. Import re-sorts into original stream order (byOriginalPosition).
     // A relative path is also what the marker stores, so a sidecar in a subfolder is distinguishable from a same-named one beside the video.
+    // Only a regular file, or a link to one, can be a sidecar; anything else at a sidecar-shaped name goes to `irregular` for the import to name. Read as a
+    // sidecar, a directory reached ffmpeg as an -i it refuses, failing the file on every requeue, and a FIFO blocked the read until something wrote to it,
+    // hanging the worker with no timeout (the spawn ceilings cover child processes, not an fs read).
     const scanSidecarDirs = () => {
         let top;
         try { top = fs.readdirSync(workLibDir(), { withFileTypes: true }); } catch (e) { return { err: e }; }
-        const rels = top.filter((d) => !d.isDirectory()).map((d) => d.name).sort();
-        const subs = top.filter((d) => d.isDirectory() && SIDECAR_SUBDIRS.includes(d.name.toLowerCase())).map((d) => d.name).sort();
+        const rels = []; const irregular = [];
+        const byName = (a, b) => (a.name < b.name ? -1 : (a.name > b.name ? 1 : 0));
+        const regular = (d, full) => d.isFile() || (d.isSymbolicLink() && (() => { try { return fs.statSync(full).isFile(); } catch (e) { return false; } })());
+        const subs = [];
+        for (const d of top.sort(byName)) {
+            if (d.isDirectory() && SIDECAR_SUBDIRS.includes(d.name.toLowerCase())) subs.push(d.name);
+            else (regular(d, path.join(workLibDir(), d.name)) ? rels : irregular).push(d.name);
+        }
         for (const s of subs) {
             let inner = [];
             // unreadable subfolder: the sidecars beside the video still import
-            try { inner = fs.readdirSync(path.join(workLibDir(), s)); } catch (e) { continue; }
-            for (const n of inner.sort()) rels.push(`${s}/${n}`);
+            try { inner = fs.readdirSync(path.join(workLibDir(), s), { withFileTypes: true }); } catch (e) { continue; }
+            for (const d of inner.sort(byName)) (regular(d, path.join(workLibDir(), s, d.name)) ? rels : irregular).push(`${s}/${d.name}`);
         }
-        return { rels };
+        return { rels, irregular };
     };
     // Import order = the ORIGINAL stream order. Our own names carry the source stream index in their s<index> anchor, and that is the whole point of it:
     // a round trip should hand the tracks back in the order it found them, not in the order their names happen to sort (a plain lexical sort puts s11
@@ -1988,10 +2002,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     // The same stat-first rule for the other library files read whole as TEXT - the caption sidecar and the subtitle list sit at names anyone can put a
-    // file at. Over the cap it throws like an unreadable file, so each caller's catch keeps its own failure direction; `overCap` lets one say why.
+    // file at. Over the cap, or not a regular file (a FIFO would block the read; see scanSidecarDirs), it throws like an unreadable file, so each caller's
+    // catch keeps its own failure direction; `overCap` and `notRegular` let one say why.
     const readTextCapped = (p, cap) => {
-        const size = fs.statSync(p).size;
-        if (size > cap) throw Object.assign(new Error(`it is ${size} bytes, over the ${cap}-byte limit`), { overCap: true });
+        const st = fs.statSync(p);
+        if (!st.isFile()) throw Object.assign(new Error('it is not a regular file'), { notRegular: true });
+        if (st.size > cap) throw Object.assign(new Error(`it is ${st.size} bytes, over the ${cap}-byte limit`), { overCap: true });
         return fs.readFileSync(p, 'utf8');
     };
     // What importing a sidecar provably DROPS, so remove_source never deletes the only complete copy (deletionLoss). Measured on jellyfin-ffmpeg 7.1.4 by
@@ -2031,7 +2047,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let out = null;
         try {
             const p = path.join(workLibDir(), f.rel);
-            if (fs.statSync(p).size <= SIDECAR_HASH_MAX) {
+            const st = fs.statSync(p);
+            if (st.isFile() && st.size <= SIDECAR_HASH_MAX) {
                 const buf = fs.readFileSync(p);
                 const text = buf.toString('utf8');
                 out = {
@@ -2293,7 +2310,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const listPath = path.join(workLibDir(), subtitleListName);
         let text;
         try { text = readTextCapped(listPath, SUBTITLE_LIST_MAX); } catch (e) {   // no list at all is the normal case, and says nothing
-            return e && e.overCap ? `☒[${delReason}] Leaving ${subtitleListName} in place - ${e.message}\n` : '';
+            return e && (e.overCap || e.notRegular) ? `☒[${delReason}] Leaving ${subtitleListName} in place - ${e.message}\n` : '';
         }
         const entries = readSubtitleList(text).ok;
         if (!entries.length || !entries.some((n) => marked.has(n))) return '';
@@ -2746,10 +2763,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // or, having removed an unfinished or empty one, return { leftoverNote } so ccPlan reads the captions again. Out of ccPlan so its decode gate reads
         // as a list; it runs only from there, with its early returns and the unlink in their original order.
         const judgeLocalCaptionSidecar = (full, name, ccTokens, remoteDest) => {
-            let text = null; let overCap = '';
-            try { text = readTextCapped(full, SIDECAR_HASH_MAX); } catch (e) { text = null; overCap = e && e.overCap ? e.message : ''; }
+            let text = null; let why = '';
+            try { text = readTextCapped(full, SIDECAR_HASH_MAX); } catch (e) { text = null; why = e && (e.overCap || e.notRegular) ? e.message : ''; }
             if (text === null) {
-                return { job: null, note: `☒[embedded_cc=enabled] Could not read ${name} to check it${overCap ? ` (${overCap})` : ''} - leaving it alone\n` };
+                return { job: null, note: `☒[embedded_cc=enabled] Could not read ${name} to check it${why ? ` (${why})` : ''} - leaving it alone\n` };
             }
             // Cue text proves the channel carried captions, not that this file holds ALL of them. On the direct-write routes the srt is an extra output
             // of Tdarr's own ffmpeg run, written progressively (12 of 120 cues after 5 s of a killed 7.1.4 run), so a pass cancelled, killed or failed
@@ -3523,6 +3540,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             } else if (IMPORT_EXTS.includes(relExt) || relExt === STYLED_BUNDLE.ext) {
                 response.infoLog += `☒Not a recognised sidecar name, skipping: ${logSafe(rel)}\n`;
             }
+        }
+        // A directory, FIFO or dangling link at one of this video's sidecar names (scanSidecarDirs set it apart) is named, never imported.
+        for (const rel of scan.irregular || []) {
+            if (parseSidecarRel(rel)) response.infoLog += `☒Not importing ${logSafe(rel)} - it is not a regular file\n`;
         }
         // This pass never removes an embedded subtitle it was not asked to, and apart from ccPlan clearing an unfinished caption staging file and the spent
         // subtitle list, the only files it can unlink are sidecars whose content is provably already in the file - the redundant-only branch below, which has
