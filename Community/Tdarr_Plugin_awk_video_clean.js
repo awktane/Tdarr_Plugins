@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.58',
+    Version: '3.999.59',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1968,11 +1968,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // unforeseen throw in there must still reach the error queue carrying this plugin's own infoLog rather than as a bare Error with none of it.
     try {
         // Ahead of the input summary, which walks BOTH probes for every stream: a file this plugin will not touch should cost one log line, not a full
-        // enrich pass whose output is then thrown away. Keep it FIRST INSIDE the try rather than above it - the guard reads one scalar and cannot throw,
-        // so nothing the failUnexpected wrapper exists to protect moves out from under it.
+        // enrich pass whose output is then thrown away. Both such skips sit FIRST INSIDE the try rather than above it - each reads one scalar and cannot
+        // throw, so nothing the failUnexpected wrapper exists to protect moves out from under them.
         if (file.fileMedium !== 'video') {
             return skip('☑File is not a video\n');
         }
+        // Output container = source container: clean_and_remux owns container policy; this plugin only re-encodes video (tagging the QuickTime fourCC below).
+        // dstContainer is normalised for the membership tests, while the response.container default keeps the RAW value: that string becomes the output
+        // file's extension, and lowercasing it would rename the file.
+        const dstContainer = String(file.container || '').toLowerCase().trim();
+        if (outputMuxerArg(dstContainer) === null) return skip(noMuxerSkipLine(dstContainer));   // an extension no muxer writes back (outputMuxerArg)
 
         response.infoLog += `☐Input streams: ${summariseAll(file.ffProbeData.streams)}\n`;
 
@@ -2001,10 +2006,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const quarterTurned = Number.isFinite(rotationDeg) && Math.abs(Math.round(rotationDeg / 90)) % 2 === 1;
         const dispHeight = quarterTurned && srcWidth > 0 ? srcWidth : srcHeight;   // the height the downscale and the quality tier both judge
         const dispWidth = quarterTurned && srcHeight > 0 ? srcHeight : srcWidth;    // its partner, for the 16:9 box test below
-        // Output container = source container: clean_and_remux owns container policy; this plugin only re-encodes video (tagging the QuickTime fourCC below).
-        const dstContainer = String(file.container || '').toLowerCase().trim();
-        response.container = `.${dstContainer}`;
-        if (outputMuxerArg(dstContainer) === null) return skip(noMuxerSkipLine(dstContainer));   // an extension no muxer writes back (outputMuxerArg)
 
         // Bit depth: source-detected (raw sample depth, or a 10-bit pixel format / profile), overridable. H.264 is always 8-bit. Shares the is10Bit helper with
         // summariseStream's 10bit token so the re-encode depth decision and the logged token can't drift.
