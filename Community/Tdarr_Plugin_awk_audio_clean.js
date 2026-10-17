@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.56',
+    Version: '4.999.57',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -2632,6 +2632,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const LOUDNORM_MAX_TRACKS = 24;
         let loudnormMeasureCount = 0;
         let loudnormCapWarned = false;
+        // A sample rate read off either probe, as a plain integer in a real audio range - it is spliced into the filter string, so nothing else passes.
+        const sampleRateOf = (v) => { const n = Number(v); return Number.isInteger(n) && n >= 8000 && n <= 768000 ? n : 0; };
         const buildLoudnormFilter = (streamIndex, srcAudioIdx, preFilter, preset) => {
             if (loudnormMeasureCount >= LOUDNORM_MAX_TRACKS) {
                 if (!loudnormCapWarned) {
@@ -2665,8 +2667,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (!LOUDNORM_MEASURED_SHAPE.test(String(val)) || !Number.isFinite(Number(val)))
                     failWithBuffers(`${streamTag(streamIndex)}[method_loudnorm=${methodLoudnorm}] malformed loudnorm measurement JSON from the analysis pass `
                         + `(${field}=${logSafe(String(val), 40)}) - the file may be corrupt or carry crafted metadata; leave method_loudnorm=disabled for it`);
+            // loudnorm honours linear=true only while the measured LRA fits the target and linear gain keeps the peak under TP; otherwise it falls back to
+            // dynamic mode, which OUTPUTS 192 kHz, and the encoder then picks the supported rate nearest that - native aac (and libfdk_aac, which lists the
+            // same rates) take 96 kHz, which many TV and hardware decoders refuse. Measured on jellyfin-ffmpeg 7.1.4: a 48 kHz source at measured_LRA 17
+            // under tv came out 96000 Hz on aac and 48000 on ac3/eac3/libopus/aac_at, and a 44.1 kHz one moved to 48000 even on ac3. The trailing
+            // aresample returns every encoder to the source rate (48000 measured), and is a no-op in linear mode.
+            const src = file.ffProbeData.streams.find((s) => s.index === streamIndex);
+            const srcRate = sampleRateOf(src?.sample_rate) || (src && sampleRateOf(mediaInfoFor(src)?.SamplingRate)) || 48000;
             const corrected = `loudnorm=I=${preset.I}:LRA=${preset.LRA}:TP=${preset.TP}:measured_I=${stats.input_i}:measured_LRA=${stats.input_lra}`
-                + `:measured_TP=${stats.input_tp}:measured_thresh=${stats.input_thresh}:offset=${stats.target_offset}:linear=true`;
+                + `:measured_TP=${stats.input_tp}:measured_thresh=${stats.input_thresh}:offset=${stats.target_offset}:linear=true,aresample=${srcRate}`;
             return { filter: preFilter ? `${preFilter},${corrected}` : corrected, changed: true, measured: true };
         };
 
