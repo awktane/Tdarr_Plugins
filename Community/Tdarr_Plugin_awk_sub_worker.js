@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.81',
+    Version: '3.999.82',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -263,6 +263,7 @@ const langKey = (x) => {
 
 const plugin = (file, librarySettings, inputs, otherArguments) => {
     const lib = require('../methods/lib')(); const fs = require('fs'); const path = require('path'); const crypto = require('crypto');
+    const { spawnSync } = require('child_process'); const os = require('os');
     // eslint-disable-next-line no-param-reassign
     inputs = lib.loadDefaultValues(inputs, details);
 
@@ -1704,11 +1705,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //               node config already carries.
     //   text_file - no directory access at all; the user lists the filenames and each is fetched by name through the download API.
     const SUBTITLE_LIST_SUFFIX = '.subtitles.txt';
-    const subtitleListName = `${videoBase}${SUBTITLE_LIST_SUFFIX}`;   // one name for the file, rather than the same join at five sites
+    const subtitleListName = `${videoBase}${SUBTITLE_LIST_SUFFIX}`;   // one name for the file, rather than the same join at every site
     const SUBTITLE_LIST_MAX = 1024 * 1024;   // one filename per line is a few KB; a file this size at the list's name is something else
-    // seedSubtitleList answers '' for success and free prose for a real failure - but two of its outcomes are NOT failures and the caller has to tell them
-    // apart to decide whether to warn. Naming them makes that a comparison against a constant rather than against a sentence someone may reasonably reword,
-    // which would turn a healthy state into a ☒ on every pass.
+    // seedSubtitleList answers '' for success and free prose for a real failure - but two of the values the caller compares its answer
+    // against are NOT failures and the caller has to tell them apart to decide whether to warn. Naming them makes that a comparison against
+    // a constant rather than against a sentence someone may reasonably reword, which would turn a healthy state into a ☒ on every pass.
     const LIST_SEED_EXISTS = 'exists';                              // the library already holds a list; nothing to create, nothing to say
     const LIST_SEED_NOTHING = 'nothing was placed to list';         // the caller's own answer when no sidecar landed, so there is nothing to list yet
     // Spawn ceilings for the helpers below, named once. curl counts SECONDS and spawnSync MILLISECONDS, so each pair is derived from a single number rather
@@ -1733,7 +1734,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             cached = [];
             const url = serverApiUrl();
             if (!url) return cached;
-            const { spawnSync } = require('child_process');
             const r = spawnSync('curl', ['-sS', '-m', String(NODE_TAG_FETCH_S), ...apiAuthArgs(), `${url}/api/v2/get-nodes`],
                 { encoding: 'utf8', timeout: NODE_TAG_FETCH_S * 1000, maxBuffer: SPAWN_MAX_OUTPUT_BYTES, input: apiAuthInput() });
             if (r.error || r.status !== 0) return cached;
@@ -1797,6 +1797,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { dir: '',
             why: `nothing reachable. Tried: ${tried.join('; ')}${nodeTagPairs().length ? '' : '. No "key=value" Node Tag is set for this node'}` };
     };
+    // Reads unmappedMode, which is declared with the other dropdown reads further down - so this closure must stay lazy (called, never evaluated here).
     const mountedLib = (() => {
         let c = null;
         return () => { if (!c) c = (isUnmappedNode && unmappedMode === 'mount') ? resolveMountedLibDir() : { dir: '' }; return c; };
@@ -1809,6 +1810,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // derive from libDir, never workLibDir(): the translators map the node MIRROR back to the server, a mount tree matches no translator prefix, and a
     // mount-joined path would therefore translate to '' and refuse an upload the mirror path can name.
     const workLibDir = () => mountedLib().dir || libDir;
+    const libPathOf = (...parts) => path.join(workLibDir(), ...parts);   // a path in the NODE's view of the library; libDir joins are server/mirror space
     const readViaApi = () => isUnmappedNode && !mountedLib().dir;
     const placeViaApi = () => isUnmappedNode && !(mountedLib().dir && mountedLib().writable);
     const serverDestFor = (name) => serverSidePath(path.join(libDir, name));
@@ -1831,7 +1833,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const downloadLibraryFile = (dest, local, maxBytes) => {
         const url = serverApiUrl();
         if (!url) return { ok: false, serverAnswered: false, why: 'the node config carries no server URL' };
-        const { spawnSync } = require('child_process');
         try { fs.mkdirSync(path.dirname(local), { recursive: true }); } catch (e) { /* already there */ }
         const r = spawnSync('curl', ['-sS', '-m', String(LIBRARY_DOWNLOAD_S), ...(maxBytes ? ['--max-filesize', String(maxBytes)] : []),
             '-o', local, '-w', '%{http_code}', ...apiAuthArgs(),
@@ -1898,7 +1899,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Staged in a private mkdtemp directory for the same reason placeSidecars is: a pid-derived name in the world-writable temp dir can be pre-created
         // as a symlink by another local user, and writeFileSync follows it. The inner name is fixed, so nothing user-supplied reaches curl's -F syntax.
         let stageDir = '';
-        try { stageDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_sublist_')); }
+        try { stageDir = fs.mkdtempSync(path.join(os.tmpdir(), 'awk_sublist_')); }
         catch (e) { return `could not stage the list (${e && e.message ? e.message : e})`; }
         const tmp = path.join(stageDir, 'list.txt');
         try { fs.writeFileSync(tmp, body); } catch (e) { return `could not stage the list (${e && e.message ? e.message : e})`; }
@@ -1936,9 +1937,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ====== END UNMAPPED-NODE LIBRARY ACCESS ======
 
     // ====== SIDECAR SCAN / HASH / DEDUP (both node types) ======
-    // Spawn ceilings for the subtitle hash and round-trip reads below and post-processing's ffprobe: each scales with the container, and each is a
-    // ceiling on a hang, not a target.
-    const PROBE_TIMEOUT_MS = 300000;
+    // The spawn ceiling for the subtitle hash and round-trip reads below: it scales with the container, and is a ceiling on a hang, not a target.
     const SUB_EXTRACT_TIMEOUT_MS = 600000;
     // Where a sidecar can legitimately live. Plex is the only one of the three servers that reads a SUBFOLDER: it accepts `subs` or `subtitles` beside the
     // video (the season directory for a show), with the files inside named exactly as they would be beside the video. Jellyfin reads only the video's own
@@ -1962,13 +1961,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const subs = [];
         for (const d of top.sort(byName)) {
             if (d.isDirectory() && SIDECAR_SUBDIRS.includes(d.name.toLowerCase())) subs.push(d.name);
-            else (regular(d, path.join(workLibDir(), d.name)) ? rels : irregular).push(d.name);
+            else (regular(d, libPathOf(d.name)) ? rels : irregular).push(d.name);
         }
         for (const s of subs) {
             let inner = [];
             // unreadable subfolder: the sidecars beside the video still import
-            try { inner = fs.readdirSync(path.join(workLibDir(), s), { withFileTypes: true }); } catch (e) { continue; }
-            for (const d of inner.sort(byName)) (regular(d, path.join(workLibDir(), s, d.name)) ? rels : irregular).push(`${s}/${d.name}`);
+            try { inner = fs.readdirSync(libPathOf(s), { withFileTypes: true }); } catch (e) { continue; }
+            for (const d of inner.sort(byName)) (regular(d, libPathOf(s, d.name)) ? rels : irregular).push(`${s}/${d.name}`);
         }
         return { rels, irregular };
     };
@@ -2065,7 +2064,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (sidecarContentMemo.has(f.rel)) return sidecarContentMemo.get(f.rel);
         let out = null;
         try {
-            const p = path.join(workLibDir(), f.rel);
+            const p = libPathOf(f.rel);
             const st = fs.statSync(p);
             if (st.isFile() && st.size <= SIDECAR_HASH_MAX) {
                 const buf = fs.readFileSync(p);
@@ -2108,7 +2107,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!target) return embeddedHashCache;   // null - the probe could not run
         if (!wanted.length) { embeddedHashCache = new Map(); return embeddedHashCache; }
         let dir = '';
-        try { dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_subcmp_')); } catch (e) { return embeddedHashCache; }
+        try { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'awk_subcmp_')); } catch (e) { return embeddedHashCache; }
         // Files rather than stdout: one run writing N outputs is one pass over the container, where N stdout captures would be N passes - and a large ASS
         // would sit against spawnSync's maxBuffer, reporting a failure that never happened.
         const args = ['-y', '-loglevel', 'error', '-i', target];
@@ -2121,7 +2120,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             args.push('-map', `0:${s.index}`, '-c:s', enc.enc, '-fs', String(SIDECAR_HASH_MAX + 1), out);
             outs.set(s.index, out);
         }
-        const { spawnSync } = require('child_process');
         const r = spawnSync(ffmpegPathOf(otherArguments), args,
             { encoding: 'utf8', timeout: SUB_EXTRACT_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES });
         if (!r.error && r.status === 0) {
@@ -2175,14 +2173,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const enc = TEXT_SUB[mp4 ? 'mov_text' : EXT_TO_CODEC[f.ext]];
         if (f.bundle || !enc || !sidecarContent(f)) return null;
         let dir = '';
-        try { dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_subrt_')); } catch (e) { return null; }
-        const { spawnSync } = require('child_process');
+        try { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'awk_subrt_')); } catch (e) { return null; }
         const ff = (args) => spawnSync(ffmpegPathOf(otherArguments), ['-y', '-loglevel', 'error', ...args],
             { encoding: 'utf8', timeout: SUB_EXTRACT_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES });
         const mux = path.join(dir, mp4 ? 'rt.mp4' : 'rt.mkv');
         const out = path.join(dir, `rt.${enc.ext}`);
         try {
-            let r = ff(['-sub_charenc', 'UTF-8', '-i', path.join(workLibDir(), f.rel), '-map', '0:0', '-c:s', mp4 ? 'mov_text' : 'copy',
+            let r = ff(['-sub_charenc', 'UTF-8', '-i', libPathOf(f.rel), '-map', '0:0', '-c:s', mp4 ? 'mov_text' : 'copy',
                 '-f', mp4 ? 'mp4' : 'matroska', mux]);
             if (!r.error && r.status === 0) r = ff(['-i', mux, '-map', '0:s:0', '-c:s', enc.enc, '-fs', String(SIDECAR_HASH_MAX + 1), out]);
             if (!r.error && r.status === 0 && fs.statSync(out).size <= SIDECAR_HASH_MAX) {
@@ -2203,7 +2200,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (bundleMemo.has(f.rel)) return bundleMemo.get(f.rel);
         bundleMemo.set(f.rel, null);
         if (!f.bundle || !sidecarContent(f)) return null;   // gone, or over the cap
-        const b = readBundleSubtitle(path.join(workLibDir(), f.rel));
+        const b = readBundleSubtitle(libPathOf(f.rel));
         if (b.state !== 'ok') return null;   // no content identity - callers fall back to the name
         const text = b.buf.toString('utf8');
         bundleMemo.set(f.rel, {
@@ -2246,11 +2243,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const ext = bundle ? 'ass' : path.extname(rel).slice(1).toLowerCase();
         let buf = null;   // the copy's decoded text; null = a bundle ffmpeg could not decode
         if (bundle) {
-            const b = readBundleSubtitle(path.join(workLibDir(), rel));
+            const b = readBundleSubtitle(libPathOf(rel));
             if (b.state === 'unknown') return { state: 'unknown' };
             if (b.state === 'ok') ({ buf } = b);
         } else {
-            try { buf = Buffer.from(readTextCapped(path.join(workLibDir(), rel), SIDECAR_HASH_MAX), 'utf8'); } catch (e) { return { state: 'unknown' }; }
+            try { buf = Buffer.from(readTextCapped(libPathOf(rel), SIDECAR_HASH_MAX), 'utf8'); } catch (e) { return { state: 'unknown' }; }
         }
         const own = hashes.get(s.index);
         if (buf && own && subTextHash(buf, `.${ext}`) === own) return { state: 'whole' };
@@ -2310,13 +2307,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // subtitle titles on the mux (else a titled sidecar we DID embed never matches its now-title-less stream).
     const metaMatchesStream = (s, m, mp4) => langKey(resolveLang(s) || 'und') === langKey(m.lang || 'und')
         && (mp4 || (s.tags?.title || '') === (m.title || ''));
-    // Does a marker-listed sidecar RESEMBLE something in the file? The marker records what the last import muxed and NOTHING ever clears it (an extract
-    // pass strips the subtitles and leaves the tag still naming them, and the value is ordinary container metadata any file can carry), so both readers
-    // confirm it against the streams as they stand rather than trusting it. This is the METADATA half (metaMatchesStream). A bundle additionally has to see
-    // a font attachment - carrying fonts is its reason to exist. Metadata can only say "something like this is here", never "this one is here" (an edited
-    // sidecar keeps its name and matches just as well), so a DELETION trusts it alone only for a bundle whose subtitle cannot be read out (bundleContent);
-    // the import skip also leans on it when the text cannot be read, since a wrong skip loses nothing. Otherwise the sidecar's own bytes must be one of the
-    // tracks. Only a TEXT subtitle can stand in for a loose sidecar - a PGS/VobSub track holds pictures, however well its metadata matches.
+    // Does a marker-listed sidecar RESEMBLE something in the file? The marker records what the last import muxed; only an extract that takes a subtitle
+    // OUT removes its entry (see the extract branch), and the value is ordinary container metadata any file can carry, so both readers confirm it against
+    // the streams as they stand rather than trusting it. This is the METADATA half (metaMatchesStream). A bundle additionally has to see a font attachment
+    // - carrying fonts is its reason to exist. Metadata can only say "something like this is here", never "this one is here" (an edited sidecar keeps its
+    // name and matches just as well), so a DELETION trusts it alone only for a bundle whose subtitle cannot be read out (bundleContent); the import skip
+    // also leans on it when the text cannot be read, since a wrong skip loses nothing. Otherwise the sidecar's own bytes must be one of the tracks. Only a
+    // TEXT subtitle can stand in for a loose sidecar - a PGS/VobSub track holds pictures, however well its metadata matches.
     const metadataMatchesEmbedded = (f, subs, anyFont, mp4Target) => (!f.bundle || anyFont)
         && subs.filter((s) => f.bundle || isTextSub(s)).some((s) => metaMatchesStream(s, f, mp4Target));
 
@@ -2326,14 +2323,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // method_unmapped: a list written by a text_file run and imported through mount is exactly as spent. Nothing is lost either way - a text_file extract
     // seeds a fresh one when it next needs it.
     const deleteSpentSubtitleList = (delReason, marked) => {
-        const listPath = path.join(workLibDir(), subtitleListName);
+        const listPath = libPathOf(subtitleListName);
         let text;
         try { text = readTextCapped(listPath, SUBTITLE_LIST_MAX); } catch (e) {   // no list at all is the normal case, and says nothing
             return e && (e.overCap || e.notRegular) ? `☒[${delReason}] Leaving ${subtitleListName} in place - ${e.message}\n` : '';
         }
         const entries = readSubtitleList(text).ok;
         if (!entries.length || !entries.some((n) => marked.has(n))) return '';
-        if (entries.some((n) => fs.existsSync(path.join(workLibDir(), n)))) return '';
+        if (entries.some((n) => fs.existsSync(libPathOf(n)))) return '';
         try { fs.unlinkSync(listPath); return `☑[${delReason}] Deleted ${subtitleListName} - every sidecar it listed is now in the file\n`; }
         catch (e) { return `☒[${delReason}] Could not delete ${subtitleListName}: ${logPath(e && e.message ? e.message : e)}\n`; }
     };
@@ -2557,17 +2554,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The streams and global tags of the file as it stands NOW. Pre-processing is always handed ffProbeData; the post-processing stage may not be, so fall
     // back to running ffprobe here - otherArguments supplies ffmpegPath and ffprobe sits beside it under the matching name. null means neither route
     // worked, which the caller must read as "cannot confirm what is embedded" and therefore delete nothing.
+    const PROBE_TIMEOUT_MS = 300000;   // the ceiling on its ffprobe: it scales with the container, and is a ceiling on a hang, not a target
     const probeCurrentFile = () => {
         const ff = file.ffProbeData;
         if (ff && Array.isArray(ff.streams)) return { streams: ff.streams, tags: ff.format?.tags || {} };
         const target = String(file._id || file.file || libFilePath || '');
         if (!target) return null;
-        // The shared deriveFfprobePath, not a second hand-rolled regex: it replaces only the FINAL path component (the production path carries 'ffmpeg' as a
-        // DIRECTORY too), existsSync-checks the result, and returns '' when the binary cannot be located. A lenient local regex that let an unexpected basename
-        // slip through to the unmodified ffmpeg path would run FFMPEG with ffprobe's arguments and misreport the failure as an unreadable file.
+        // The shared deriveFfprobePath, not a second hand-rolled regex: it replaces only the FINAL path component (the
+        // production path carries 'ffmpeg' as a DIRECTORY too), checks that the result is a regular file (isFile), and returns
+        // '' when the binary cannot be located. A lenient local regex that let an unexpected basename slip through to the
+        // unmodified ffmpeg path would run FFMPEG with ffprobe's arguments and misreport the failure as an unreadable file.
         const ffprobePath = deriveFfprobePath(ffmpegPathOf(otherArguments));
         if (!ffprobePath) return null;
-        const { spawnSync } = require('child_process');
         const r = spawnSync(ffprobePath, ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', target],
             { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES });
         if (r.error || r.status !== 0) return null;
@@ -2627,7 +2625,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             const loss = deletionLoss(f, contentConfirms(f), mp4Target);
             if (loss) { log += keepForLossLine(f.rel, loss); continue; }
-            try { fs.unlinkSync(path.join(workLibDir(), f.rel)); deleted += 1; log += `☑[${delReason}] Deleted sidecar (${why}): ${logSafe(f.rel)}\n`; }
+            try { fs.unlinkSync(libPathOf(f.rel)); deleted += 1; log += `☑[${delReason}] Deleted sidecar (${why}): ${logSafe(f.rel)}\n`; }
             catch (e) { log += `☒[${delReason}] Could not delete sidecar ${logSafe(f.rel)}: ${logPath(e && e.message ? e.message : e)}\n`; }
         }
         log += deleteSpentSubtitleList(delReason, marked);
@@ -2677,6 +2675,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // commits at most one preset, so one record serves it; a write built on a path that then skips is never committed and so never read.
     const globalWrites = {};
     const leftOut = new Set();   // indexes of the streams the committed preset's container will not hold - see outputView
+    const dropMaps = (indices) => [...indices].map((i) => ` -map -0:${i}`).join('');   // a negative map per dropped input index, in the order given
     const globalMetaArg = (key, value) => {
         globalWrites[key] = value;
         return ` -metadata "${key}=${value}"`;
@@ -2694,7 +2693,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The drops come last: a negative -map undoes the earlier `-map 0` for just that stream.
         const uncopyable = mp4UncopyableStreams(dstContainer, streams);
         const mapped = streams.filter((s) => !uncopyable.includes(s));
-        let full = out + uncopyable.map((s) => ` -map -0:${s.index}`).join('') + mp4StrictArg(dstContainer, streams);
+        let full = out + dropMaps(uncopyable.map((s) => s.index)) + mp4StrictArg(dstContainer, streams);
         const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, globalWrites);
         if (tagPlan.flag) full += ' -movflags use_metadata_tags';
         full += globalOutputOpt + outputMuxerArg(dstContainer);
@@ -2794,7 +2793,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // it would lose every caption past the cut. It is read again instead. Where the memos cannot persist (a marker-hostile container) nothing can
             // tell the two apart and a re-read would repeat forever, so the cue text stands there as before.
             const finishedRead = ccTokens.includes(CC_TOKENS.decoded) || ccTokens.includes(CC_TOKENS.decoded2);
-            if (!hasNoCues(text, 'srt') && (finishedRead || !canRecord)) {
+            const cueless = hasNoCues(text, 'srt');
+            if (!cueless && (finishedRead || !canRecord)) {
                 // This sidecar landed on an earlier pass and holds real cue text, so the bitstream copy may NOW be removed - THIS is the pass that owes
                 // the strip. It is deliberately not done in the pass that WRITES the sidecar: ffmpeg exits 0 having written a cue-less srt whenever the
                 // caption channel decodes empty (a field-2-only capture with padded field 1 does exactly that), so a same-pass strip deletes captions
@@ -2809,7 +2809,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             let unlinked = true;
             try { fs.unlinkSync(full); } catch (e) { unlinked = false; }
-            if (!hasNoCues(text, 'srt')) {
+            if (!cueless) {
                 // An unfinished read's prefix (see finishedRead). One that cannot be removed is left alone and kept out of the import below, which
                 // would otherwise mux the prefix in and strip the bitstream on it; the captions stay in the video.
                 if (!unlinked) {
@@ -2879,7 +2879,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return { job: null, note: `☒[embedded_cc=enabled] Caption sidecar name would be ${nameBytes} bytes, over the ${NAME_BYTE_CAP}-byte filesystem `
                     + 'limit - rename the video shorter and requeue, keeping the captions in the video\n' };
             }
-            const full = path.join(workLibDir(), name);
+            const full = libPathOf(name);
             if (!pathIsPresetSafe(full))
                 return { job: null, note: `☒[embedded_cc=enabled] Library directory has a quote, control char or <io> - cannot write ${name} safely\n` };
             // The caption SOURCE path needs the same test, and the joined path above cannot stand in for it: videoBase strips a quote out of the NAME, so one
@@ -2920,7 +2920,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return verdict.job ? { ...verdict, job: { ...verdict.job, name, full, remoteDest } } : verdict;
             };
             const spellings = [[name, full, remoteDest]];
-            if (action === 'import') spellings.push([ccNameBare, path.join(workLibDir(), ccNameBare), placeViaApi() ? serverDestFor(ccNameBare) : '']);
+            if (action === 'import') spellings.push([ccNameBare, libPathOf(ccNameBare), placeViaApi() ? serverDestFor(ccNameBare) : '']);
             let leftoverNote = '';
             for (const [at, atFull, atDest] of spellings) {
                 const found = lookFor(at, atFull, atDest);
@@ -2942,12 +2942,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return { job: { name, full, remoteDest, field2: ccTokens.includes(CC_TOKENS.decoded2) }, note: leftoverNote };
         })();
         response.infoLog += ccPlan.note;
-        // Whether the caption staging sidecar is in the library RIGHT NOW - either ccPlan's existence probe found it there, or this pass uploads it below.
-        // Only the text_file import route reads it, because that route has no directory to scan and cannot put the name into the user's list.
-        let ccStaged = ccPlan.staged === true;
-        const ccStagedName = ccPlan.stagedName || ccName;   // the spelling ccPlan found in the library, for the text_file fetch
-        // The read memo the API placement route owes the import's -c copy pass when the import does not consume the staged caption sidecar.
-        let ccApiRead = '';
         // An in-plugin caption read is known to have finished, so an empty first read goes straight to field 2 (see ccPlan) before it counts as empty. One
         // spelling for both API routes: the retry is merged into the first read's result sets in place, and the answer is whether the sidecar placed came
         // from field 2.
@@ -3021,6 +3015,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // nothing to carry and are far more useful as editable text on disk.
             const fontIndices = streams.filter((s) => codecTypeOf(s) === 'attachment' && isFontAttachment(s)).map((s) => s.index);
             const fontMaps = fontIndices.map((i) => ` -map 0:${i}`).join('');
+            // deduplicate=enabled_checkmedia folds the removed duplicates' flags/title/language onto the keeper via dupes.retag, and
+            // retagArgs restamps the SURVIVING embedded stream with it. But when the keeper is itself extracted with remove_source=true it
+            // leaves keptSubs, so that restamp is silently dropped (retagArgs: outIdx < 0) - and the sidecar NAME is the sole authority on
+            // the reimported identity, so the fold has to reach the name instead or the round trip loses the folded SDH flag / title /
+            // real-language-onto-und keeper. Project the pending retag onto a stand-in stream and name from THAT (retag.disp already holds
+            // ffmpeg flag names, so it rebuilds a disposition object directly). No-op when no fold is pending for this stream.
+            const foldRetag = (st) => {
+                const rt = (dupes.retag || []).find((r) => r.index === st.index);
+                if (!rt) return st;
+                return { ...st, tags: { ...(st.tags || {}), language: rt.lang, title: rt.title }, disposition: Object.fromEntries(rt.disp.map((f) => [f, 1])) };
+            };
 
             // sidecarOut carries the extra ffmpeg outputs that write the sidecars on a node with a WRITABLE library view (mapped, or a writable mount).
             // Without one the same extractions are collected in placeJobs instead, to be run and uploaded by placeSidecars once the loop has seen every
@@ -3029,15 +3034,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let sidecarOut = ''; const removedIndices = new Set(dupes.dropIdx); let wrote = 0; let skipped = 0; let refused = 0; let bundled = 0;
             let deferred = 0; let held = 0;
             const placeJobs = [];
-            // The caption extraction leads on both routes; on the API one that is a hard requirement - placeSidecars concatenates every job's args after a
-            // single -i, so the caption job's '-f lavfi -i' only precedes all outputs if its job is first. On the direct-write route the same input is emitted
-            // at the head of the OUTPUT side, where Tdarr's own -i is already spliced in ahead - on the input side it would become input 0 and silently shift
-            // every existing -map 0. ccRecord is a SET because the awk_cc states genuinely combine and only one value is written, so a single-token overwrite
-            // would erase whichever came first - `imported` pairs with either `strip` or `removed` on the import side. In THIS branch at most one token is
-            // ever added: a recorded `none` short-circuits the strip/defer block below, because an empty channel never owes a strip. ccPlaced earns the
-            // removal: on the API route the caption srt is uploaded BEFORE the preset returns (a rejected upload must not be followed by a strip that leaves
-            // the captions nowhere). On the direct-write route ccPlaced deliberately stays false, so the fresh-extract pass never strips - the strip is owed
-            // on a later pass via stripOwed, once the sidecar is proven to hold cues (see the empty-decode deferral note in that branch below).
+            // The caption extraction leads on both routes; on the API one that is a hard requirement - placeSidecars concatenates every job's args
+            // after a single -i, so the caption job's '-f lavfi -i' only precedes all outputs if its job is first. On the direct-write route the
+            // same input is emitted at the head of the OUTPUT side, where Tdarr's own -i is already spliced in ahead - on the input side it would
+            // become input 0 and silently shift every existing -map 0. ccRecord is a SET because the awk_cc states genuinely combine and only one
+            // value is written, so a single-token overwrite would erase whichever came first - `imported` pairs with either `strip` or `removed` on
+            // the import side. In THIS branch the read memo (decoded/decoded2) can combine with removed or strip on the API route; a recorded `none`
+            // short-circuits the strip/defer block below, because an empty channel never owes a strip. ccPlaced earns the removal: on the API route
+            // the caption srt is uploaded BEFORE the preset returns (a rejected upload must not be followed by a strip that leaves the captions
+            // nowhere). On the direct-write route ccPlaced deliberately stays false, so the fresh-extract pass never strips - the strip is owed on a
+            // later pass via stripOwed, once the sidecar is proven to hold cues (see the empty-decode deferral note in that branch below).
             let ccInput = ''; const ccRecord = new Set(); let ccPlaced = false;
             if (ccPlan.job && placeViaApi()) {
                 placeJobs.push({
@@ -3059,24 +3065,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.infoLog += `☐${streamTag(ccVideo.index)}[embedded_cc=enabled] Reading the embedded closed captions -> ${ccPlan.job.name}`
                     + ' (decodes the video, so this pass is slower than an ordinary extract)\n';
             }
-            // deduplicate=enabled_checkmedia folds the removed duplicates' flags/title/language onto the keeper via dupes.retag, and
-            // retagArgs restamps the SURVIVING embedded stream with it. But when the keeper is itself extracted with remove_source=true it
-            // leaves keptSubs, so that restamp is silently dropped (retagArgs: outIdx < 0) - and the sidecar NAME is the sole authority on
-            // the reimported identity, so the fold has to reach the name instead or the round trip loses the folded SDH flag / title /
-            // real-language-onto-und keeper. Project the pending retag onto a stand-in stream and name from THAT (retag.disp already holds
-            // ffmpeg flag names, so it rebuilds a disposition object directly). No-op when no fold is pending for this stream.
-            const foldRetag = (st) => {
-                const rt = (dupes.retag || []).find((r) => r.index === st.index);
-                if (!rt) return st;
-                return { ...st, tags: { ...(st.tags || {}), language: rt.lang, title: rt.title }, disposition: Object.fromEntries(rt.disp.map((f) => [f, 1])) };
-            };
             // The sidecars whose subtitle this pass takes OUT of the file - each leaves the import marker too (see the preset below).
             const extractedRels = new Set();
             for (const s of eligible) {
                 const { enc } = TEXT_SUB[codecNameOf(s)];
                 const bundle = fontIndices.length > 0 && isStyledSub(s.codec_name);
                 const name = sidecarBasename(foldRetag(s), bundle);
-                const full = path.join(workLibDir(), name);
+                const full = libPathOf(name);
                 // The path goes into the quoted "${full}" token of the extract preset, so it has to survive Tdarr's quote-aware tokenizer
                 // (pathIsPresetSafe). Only the library directory can fail that - the name we build is already sanitised - and a directory has to stay
                 // literal, so the extract is skipped instead. The stream is NOT recorded in removedIndices either: a refused extract must never strip the
@@ -3186,10 +3181,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (placeJobs.length) {
                 const placedRes = placeSidecars(placeJobs);
                 const { placed, failed, empty: emptyExtractions } = placedRes;
-                const ccFirst = placeJobs.find((j) => j.caption);
+                const ccJob = placeJobs.find((j) => j.caption);
                 // Which field the placed caption sidecar came from, for its read memo below.
                 let ccReadField2 = !!(ccPlan.job && ccPlan.job.field2);
-                if (ccFirst && retryCaptionField2(ccFirst, placedRes)) ccReadField2 = true;
+                if (ccJob && retryCaptionField2(ccJob, placedRes)) ccReadField2 = true;
                 for (const j of placeJobs) {
                     if (!placed.has(j.name)) {
                         // A caption job's failure is not a subtitle left embedded, and its index names the VIDEO stream, so it says so in its own words.
@@ -3298,7 +3293,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
 
             let out = `${ccInput}${sidecarOut} -map 0`;
-            for (const idx of removedIndices) out += ` -map -0:${idx}`;
+            out += dropMaps(removedIndices);
             out += ' -c copy';
             const keptSubs = streams.filter((s) => !removedIndices.has(s.index) && codecTypeOf(s) === 'subtitle');
             out += retagArgs(dupes.retag, keptSubs) + ccStrip + ccMeta;
@@ -3312,10 +3307,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         // ====== IMPORT: sidecars -> embedded (+ safe deletion) ======
+        // Whether the caption staging sidecar is in the library RIGHT NOW - either ccPlan's existence probe found it there, or this pass uploads it below.
+        // Only the text_file import route reads it, because that route has no directory to scan and cannot put the name into the user's list.
+        let ccStaged = ccPlan.staged === true;
+        const ccStagedName = ccPlan.stagedName || ccName;   // the spelling ccPlan found in the library, for the text_file fetch
+        // The read memo the API placement route owes the import's -c copy pass when the import does not consume the staged caption sidecar.
+        let ccApiRead = '';
         // An import that ends with nothing to mux would leave no record of a caption read the API placement route just finished in-plugin (ccApiRead), so
         // the next pass would take the placed sidecar for an interrupted read's prefix - and through a read-only mount neither remove nor import it. So
         // each such exit spends one tag-only mux on the memo instead of skipping; the next pass reads nothing and settles.
-        const importSkip = (msg) => {
+        const endImport = (msg) => {
             if (!ccApiRead) return skip(msg);
             response.infoLog += `${msg}☐[embedded_cc=enabled] Recording the finished caption read so no later pass takes the sidecar for an interrupted one\n`;
             return commitWithExpected(`-map 0 -c copy${ccTagArg(ccApiRead)}`, streams);
@@ -3335,17 +3336,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // then falls THROUGH into the import below rather than returning, because the sidecar is in the library now and this pass can still mux it.
         if (ccPlan.job) {
             const ccJob = { name: ccPlan.job.name, dest: ccPlan.job.remoteDest, args: ccLavfiArgs(ccPlan.job.field2) };
-            const ccRead = placeSidecars([ccJob]);
-            const { placed, failed, empty: emptyExtractions } = ccRead;
-            const readField2 = retryCaptionField2(ccJob, ccRead) || ccPlan.job.field2;
+            const placedRes = placeSidecars([ccJob]);
+            const { placed, failed, empty: emptyExtractions } = placedRes;
+            const readField2 = retryCaptionField2(ccJob, placedRes) || ccPlan.job.field2;
             if (placed.has(ccPlan.job.name)) {
                 response.infoLog += ccReadLine(ccVideo.index, ccPlan.job.name);
                 ccStaged = true;
                 // The finished read's memo, written with this pass's import (see the extract route): the import below normally consumes the staged sidecar and
                 // records `imported`, but one it does not consume must not be taken for an interrupted read's prefix next pass and left un-imported.
                 if (canRecord) ccApiRead = readField2 ? CC_TOKENS.decoded2 : CC_TOKENS.decoded;
-                // The list is seeded here only when there ISN'T one yet; an existing list is the user's file and is never rewritten (seedSubtitleList).
-                // A real failure to create one is reported exactly as the extract route reports it - swallowed, the user is never told the list is missing.
+                // The list is seeded here only when there ISN'T one yet; an existing list is the user's file and is never rewritten (seedSubtitleList). A real
+                // failure to create one is reported exactly as the extract route reports it; swallowing it would leave the user never told the list is missing.
                 if (unmappedMode === 'text_file') {
                     const why = seedSubtitleList([ccPlan.job.name]);
                     if (why && why !== LIST_SEED_EXISTS)
@@ -3575,17 +3576,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.infoLog += dupes.log;
         const removedIndices = new Set(dupes.dropIdx);
         const keptSubs = embeddedSubs.filter((s) => !removedIndices.has(s.index));
+        // The sha1 of every text track that will STILL be in the file after this pass, so the marker skip below can be decided on the same fact the dedup
+        // further down decides on. embeddedTextHashes memoises its one ffmpeg pass, so the two share it however many times either asks.
+        const survivingTextHashes = () => {
+            const all = embeddedTextHashes(embeddedSubs);
+            return all && new Map([...all].filter(([idx]) => !removedIndices.has(idx)));
+        };
 
         // Nothing to import does not mean nothing to do: the file's OWN duplicate subtitle streams are still removed. Reaching the mux below requires a
         // sidecar, and this is the one route to it that has none - a library with no sidecars at all, or a round trip that has already finished and cleaned
         // up after itself, would otherwise never have its duplicates collapsed.
         if (!found.length) {
-            if (!removedIndices.size) return importSkip('☑No subtitle sidecars found to import\n');
+            if (!removedIndices.size) return endImport('☑No subtitle sidecars found to import\n');
             let dropOnly = ' -map 0';
-            for (const idx of removedIndices) dropOnly += ` -map -0:${idx}`;
+            dropOnly += dropMaps(removedIndices);
             dropOnly += ' -c copy';
             dropOnly += retagArgs(dupes.retag, keptSubs);
-            if (ccApiRead) dropOnly += ccTagArg(ccApiRead);   // see importSkip
+            if (ccApiRead) dropOnly += ccTagArg(ccApiRead);   // see endImport
             return commitWithExpected(dropOnly, streams.filter((x) => !removedIndices.has(x.index)));
         }
 
@@ -3605,12 +3612,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Import is NON-DESTRUCTIVE: every recognized sidecar not already handled by our own prior pass (marker) is muxed in. A sidecar is never suppressed
         // just because an embedded sub shares its lang|title|disposition - metadata can't prove same content, and dropping a distinct track is data loss,
         // whereas a redundant duplicate is not (genuine duplication collapses by CONTENT - deduplicate, below). The marker suppresses a re-import only while
-        // the file STILL CARRIES that subtitle: the metadata match here plus the group's own text further down (the marker is never cleared, so it cannot be
-        // trusted alone - see metadataMatchesEmbedded). Either way the decision is logged - "nothing happened" and "nothing needed to happen" look identical
-        // from outside. Each sidecar muxes as -i "${workLibDir()}/${rel}": a " or control char in that real path would close the quote and inject ffmpeg args
-        // (pathIsPresetSafe), and unlike a name we generate it must match the file byte-for-byte, so it can't be sanitised - skip it, never break out.
-        // A bundle is confirmed by the subtitle inside it whenever that can be read out (bundleContent) - its name cannot spell the title the subtitle
-        // carries in, nor vouch for fonts it never had - and by the name otherwise, as every loose sidecar's metadata half is.
+        // the file STILL CARRIES that subtitle: the metadata match here plus the group's own text further down (the marker is not cleared by anything but an
+        // extract, so it cannot be trusted alone - see metadataMatchesEmbedded). Either way the decision is logged - "nothing happened" and "nothing needed
+        // to happen" look identical from outside. Each sidecar muxes as -i "${workLibDir()}/${rel}": a " or control char in that real path would close the
+        // quote and inject ffmpeg args (pathIsPresetSafe), and unlike a name we generate it must match the file byte-for-byte, so it can't be sanitised -
+        // skip it, never break out. A bundle is confirmed by the subtitle inside it whenever that can be read out (bundleContent) - its name cannot spell
+        // the title the subtitle carries in, nor vouch for fonts it never had - and by the name otherwise, as every loose sidecar's metadata half is.
         const bundleConfirmed = (f) => {
             const surviving = survivingTextHashes();
             const inFile = surviving ? bundleInFile(f, surviving.values()) : null;
@@ -3636,7 +3643,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // ping-pongs between their two titles forever. Grouping first gives the group one identity no matter which member is confirmed, and the retune then
         // finds the track already matching and does nothing. See the group-level skip below.
         const candidates = found.filter((f) => {
-            if (pathIsPresetSafe(path.join(workLibDir(), f.rel))) return true;
+            if (pathIsPresetSafe(libPathOf(f.rel))) return true;
             response.infoLog += `☒Skipping sidecar with an unsafe filename (a quote, control char or <io>), cannot import safely: ${logSafe(f.rel)}\n`;
             return false;
         });
@@ -3670,19 +3677,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
         });
 
-        // The sha1 of every text track that will STILL be in the file after this pass, so the marker skip below can be decided on the same fact the dedup
-        // further down decides on. embeddedTextHashes memoises its one ffmpeg pass, so the two share it however many times either asks.
-        const survivingTextHashes = () => {
-            const all = embeddedTextHashes(embeddedSubs);
-            return all && new Map([...all].filter(([idx]) => !removedIndices.has(idx)));
-        };
-        // The CONTENT half of the same rule (the marker is never cleared - see metadataMatchesEmbedded). Specific to THIS site: a sidecar the user EDITED
-        // keeps its name, so metadata still matches while the text no longer does - a group is settled only once its own bytes are one of the surviving
-        // tracks, or that edit would be skipped as "already embedded". A bundle (archive, not comparable text) and a probe that could not run fall back to
-        // the marker's metadata match. Group-level by construction: every member is byte-identical. A sidecar with no CUES can never be confirmed by
-        // content - importing it produces a track that decodes to nothing and gets no hash, so the marker skip could never fire and the same empty
-        // subtitle would be muxed in again every cycle, one more dead track each time; the marker's metadata match decides there too. An unreadable or
-        // oversized sidecar answers false and takes the ordinary content route, which imports - the recoverable direction.
+        // The CONTENT half of the same rule (the marker is not cleared by anything but an extract - see metadataMatchesEmbedded). Specific to THIS site:
+        // a sidecar the user EDITED keeps its name, so metadata still matches while the text no longer does - a group is settled only once its own bytes
+        // are one of the surviving tracks, or that edit would be skipped as "already embedded". A bundle (archive, not comparable text) and a probe that
+        // could not run fall back to the marker's metadata match. Group-level by construction: every member is byte-identical. A sidecar with no CUES
+        // can never be confirmed by content - importing it produces a track that decodes to nothing and gets no hash, so the marker skip could never
+        // fire and the same empty subtitle would be muxed in again every cycle, one more dead track each time; the marker's metadata match decides there
+        // too. An unreadable or oversized sidecar answers false and takes the ordinary content route, which imports - the recoverable direction.
         const groupHasNoCues = (f) => sidecarContent(f)?.noCues === true;
         // The counterpart of contentConfirms above, and DELIBERATELY the opposite polarity - hence the different verb. contentConfirms guards an UNLINK, so
         // "cannot prove it" must mean "do not delete on content grounds" and it fails CLOSED. This one guards a SKIP, so "cannot prove it" must mean "defer to
@@ -3804,14 +3805,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const nothingToMux = !toMux.length && !retuneMeta && !removedIndices.size;
 
         // Sidecars that were only ever redundant, with nothing to mux alongside them: no transcode to wait on, so the deletion happens now rather than in
-        // post-processing - safe precisely because these never entered the marker (anything reaching here had its content in the file BEFORE this flow
-        // started, so it is in the accepted library copy however the flow ends). Requires a WRITABLE library view, which placeViaApi() is the negation
-        // of: a read-only mount refuses the unlink, and without any mount workLibDir() is the node-local mirror - under text_file the sidecars there are
-        // this run's own downloaded scratch copies, so unlinking them reports a deletion that never touched the library. Nor can any other route delete
+        // post-processing - safe because anything reaching here had its content in the file BEFORE this flow started, so it is in the accepted library
+        // copy however the flow ends (a marker-listed member is handled below). Requires a WRITABLE library view, which placeViaApi() is the negation of:
+        // a read-only mount refuses the unlink, and without any mount workLibDir() is the node-local mirror - under text_file the sidecars there are this
+        // run's own downloaded scratch copies, so unlinking them reports a deletion that never touched the library. Nor can any other route delete
         // directly (the file API has no delete; with nothing to mux there is no acceptance and no server-side pass), so the placeViaApi() branch buys the
         // server pass instead of claiming a deletion it did not perform. Both cleanup shortcuts below must be the EXACT negation of the mux branch's
-        // trigger (toMux || retuneMeta || removedIndices) - a queued embedded-dedup drop is work on the FILE, and returning here would discard it silently.
-        // A sidecar whose import stripped something stays whichever route would remove it (deletionLoss) - said once, here, for both.
+        // trigger (toMux || retuneMeta || removedIndices) - a queued embedded-dedup drop is work on the FILE, and returning here would discard it
+        // silently. A sidecar whose import stripped something stays whichever route would remove it (deletionLoss) - said once, here, for both.
         const deletable = (nothingToMux && removeSource) ? alreadyInFile.filter((f) => {
             const loss = deletionLoss(f, f.matchedBy, isMp4);
             if (loss) for (const m of f.members) response.infoLog += keepForLossLine(m.rel, loss);
@@ -3827,7 +3828,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!stranded.some((rel) => !importedSet.has(rel))) {
                 response.infoLog += '☑[remove_source=true] Already queued for removal by an earlier pass - '
                     + 'nothing more to do until the post-processing stage runs\n';
-                return importSkip('☑Nothing to import - every sidecar was already in the file\n');
+                return endImport('☑Nothing to import - every sidecar was already in the file\n');
             }
             // The marker is written whole, so anything left out of it is erased. Carry forward every sidecar still on disk that an earlier pass already
             // settled (alreadyEmbedded), exactly as the mux path below does for the same reason: dropped from the marker, it is no longer skipped and the
@@ -3847,13 +3848,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let gone = 0; const removedRels = new Set();
             for (const rel of deletable.flatMap((f) => f.members.map((m) => m.rel))) {
                 try {
-                    fs.unlinkSync(path.join(workLibDir(), rel)); gone += 1; removedRels.add(rel);
+                    fs.unlinkSync(libPathOf(rel)); gone += 1; removedRels.add(rel);
                     response.infoLog += `☑[remove_source=true] Deleted sidecar (its content is already in the file): ${rel}\n`;
                 }
                 catch (e) { response.infoLog += `☒[remove_source=true] Could not delete sidecar ${rel}: ${e && e.message ? e.message : e}\n`; }
             }
             response.infoLog += deleteSpentSubtitleList('remove_source=true', removedRels);   // same cleanup whichever route removed them
-            return importSkip(`☑Nothing to import - every sidecar was already in the file${gone ? `, ${gone} removed from ${workLibDir()}` : ''}\n`);
+            return endImport(`☑Nothing to import - every sidecar was already in the file${gone ? `, ${gone} removed from ${workLibDir()}` : ''}\n`);
         }
 
         // A retune is a mux of its own: no new inputs and no new maps, just the metadata of a stream that is already there. It rides the same output as any
@@ -3868,11 +3869,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // and a second bundle (or a re-import into a file that kept its fonts) can never duplicate them.
                 const restoreFonts = f.bundle && !hasFontAttachment && !fontsRestored;
                 if (f.bundle) {
-                    inputSide += ` -i "${path.join(workLibDir(), f.rel)}"`;
+                    inputSide += ` -i "${libPathOf(f.rel)}"`;
                     extraMaps += ` -map ${k + 1}:s:0`;
                     if (restoreFonts) { extraMaps += ` -map ${k + 1}:t?`; fontsRestored = true; }
                 } else {
-                    inputSide += ` -sub_charenc UTF-8 -i "${path.join(workLibDir(), f.rel)}"`;
+                    inputSide += ` -sub_charenc UTF-8 -i "${libPathOf(f.rel)}"`;
                     extraMaps += ` -map ${k + 1}:0`;
                 }
                 meta += ` -metadata:s:s:${outIdx} "language=${langMetaValue(f.lang)}"`;
@@ -3930,7 +3931,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 meta += ccTagArg(ccApiRead);
             }
             // drops first, so the -map 0 they subtract from is still the whole file
-            for (const idx of removedIndices) extraMaps = ` -map -0:${idx}${extraMaps}`;
+            extraMaps = dropMaps(removedIndices) + extraMaps;
             // A track a sidecar name has already retuned is left out of the fold: under method_import_metadata=sidecar the filename is the authority, and two
             // full tag sets aimed at one slot would leave the LAST one standing - the fold - discarding the retune this run just logged as applied.
             meta += retagArgs((dupes.retag || []).filter((r) => !retunedAt.has(r.index)), keptSubs);
@@ -3939,7 +3940,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return commitWithExpected(out, streams.filter((s) => !removedIndices.has(s.index)).concat(toMux.map((f) => sidecarToStream(f, isMp4))));
         }
 
-        return importSkip(importedSet.size ? '☑Sidecars already imported; nothing to do\n' : '☑All matching subtitles already present; nothing to import\n');
+        return endImport(importedSet.size ? '☑Sidecars already imported; nothing to do\n' : '☑All matching subtitles already present; nothing to import\n');
         // ====== END IMPORT ======
     } catch (err) {
         failUnexpected(err);
