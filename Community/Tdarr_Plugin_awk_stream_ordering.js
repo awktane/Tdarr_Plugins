@@ -18,7 +18,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same
         job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. A
         later job on that file is checked in full again. This check is always on and has no setting.\n`,
-    Version: '4.999.43',
+    Version: '4.999.44',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -1156,16 +1156,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const subtitleFirst = ddValue(inputs.subtitle_first, 'disabled');
     const orderChannel = ddValue(inputs.order_channel, 'descending');
     const orderQuality = ddValue(inputs.order_quality, 'descending');
-    const junkTagsMode = ddValue(inputs.remove_junk_tags, 'disabled');
-    const methodFaststart = ddValue(inputs.method_mp4_faststart, 'force');
+    const removeJunkTags = ddValue(inputs.remove_junk_tags, 'disabled');
+    const methodMp4Faststart = ddValue(inputs.method_mp4_faststart, 'force');
 
     const dropdownChecks = [
-        ['audio_first',          audioFirst,      ['disabled', 'original_tagged', 'default_tagged', 'descriptive_tagged']],
-        ['subtitle_first',       subtitleFirst,   ['disabled', 'default_tagged', 'sdh_tagged', 'descriptive_tagged']],
-        ['order_channel',        orderChannel,    ['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled']],
-        ['order_quality',        orderQuality,    ['descending', 'descending <=1024k', 'ascending', 'disabled']],
-        ['remove_junk_tags',     junkTagsMode,    ['disabled', 'encoder', 'descriptive']],
-        ['method_mp4_faststart', methodFaststart, ['force', 'strip']],
+        ['audio_first',          audioFirst,         ['disabled', 'original_tagged', 'default_tagged', 'descriptive_tagged']],
+        ['subtitle_first',       subtitleFirst,      ['disabled', 'default_tagged', 'sdh_tagged', 'descriptive_tagged']],
+        ['order_channel',        orderChannel,       ['descending', 'descending <=6', 'descending <=8', 'ascending', 'disabled']],
+        ['order_quality',        orderQuality,       ['descending', 'descending <=1024k', 'ascending', 'disabled']],
+        ['remove_junk_tags',     removeJunkTags,     ['disabled', 'encoder', 'descriptive']],
+        ['method_mp4_faststart', methodMp4Faststart, ['force', 'strip']],
     ];
     checkDropdowns(dropdownChecks);
     // order_language has no option set, but it still holds LANGUAGES, so a token that is not one FAILS the file. A typo does not announce itself here: an
@@ -1241,24 +1241,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // and the check sits ahead of everything else here BECAUSE the ordinary outcome is `skip` a few hundred lines down: on the final cycle the streams are
         // usually already in order, and a check placed beside the reordering work would be dead in exactly the case it exists for.
         //
-        // Compared against otherArguments.originalLibraryFile, which is the file as it entered the library rather than the previous stage's output, and
-        // which Tdarr scans in full - ffProbeData and mediaInfo alike. Signals are tried in order and the first that resolves on BOTH sides decides, so a
-        // container that stores one but not the other cannot make a healthy file look broken. FRAME COUNT is deliberately not among them: video_clean's
-        // interlace repair emits bwdif=mode=send_field, which DOUBLES the frame count at field rate, so a frame comparison reports a 2x change on a
-        // perfectly good file. Wall time survives that operation untouched. Container duration comes last and only when no timed stream was added or
-        // removed, since it is the maximum across all streams - audio_clean dropping a commentary track, or clean_and_remux a subtitle, that outlasts the
-        // video legitimately shrinks it. Matroska stores no per-stream duration on the ffprobe side, so that signal reads the track's DURATION tag there,
-        // and mediaInfo leads. isCoverArt joins role text through mediaInfoFor, which
-        // is bound to THIS file's mediaInfo (see its header) - sound for the current file's streams but NOT for a foreign list like originalLibraryFile's,
-        // where it would read the transcoded file's mediaInfo track at the same index. durVideoStream runs over BOTH files, so it tests cover art
-        // self-contained: an image codec, or a raw cover-art disposition flag. The three cover-art dispositionTypes are streams:['video'], keywords:[], so
-        // for a video stream this resolves to exactly what isCoverArt does today (behaviour-identical) and it stays sound if a keyword is ever added.
-        const foreignCoverArt = (s) => IMAGE_CODECS.includes(codecNameOf(s))
+        // Compared against otherArguments.originalLibraryFile, which is the file as it entered the library rather than the previous stage's output, and which
+        // Tdarr scans in full - ffProbeData and mediaInfo alike. Signals are tried in order and the first that resolves on BOTH sides decides, so a container
+        // that stores one but not the other cannot make a healthy file look broken. FRAME COUNT is deliberately not among them: video_clean's interlace repair
+        // emits bwdif=mode=send_field, which DOUBLES the frame count at field rate, so a frame comparison reports a 2x change on a perfectly good file. Wall
+        // time survives that operation untouched. Container duration comes last and only when no timed stream was added or removed, since it is the maximum
+        // across all streams - audio_clean dropping a commentary track, or clean_and_remux a subtitle, that outlasts the video legitimately shrinks it.
+        // Matroska stores no per-stream duration on the ffprobe side, so that signal reads the track's DURATION tag there, and mediaInfo leads. isCoverArt
+        // joins role text through mediaInfoFor, which is bound to THIS file's mediaInfo (see its header) - sound for the current file's streams but NOT for a
+        // foreign list like originalLibraryFile's, where it would read the transcoded file's mediaInfo track at the same index. durVideoStream runs over BOTH
+        // files, so it tests cover art with probeOnlyCoverArt instead: ffprobe fields only - an image codec, or a raw cover-art disposition flag - which is
+        // sound on a foreign stream list such as originalLibraryFile's. The three cover-art dispositionTypes are streams:['video'], keywords:[], so for a
+        // video stream this resolves to exactly what isCoverArt does today (behaviour-identical) and it stays sound if a keyword is ever added.
+        const probeOnlyCoverArt = (s) => IMAGE_CODECS.includes(codecNameOf(s))
             || s.disposition?.attached_pic === 1 || s.disposition?.still_image === 1 || s.disposition?.timed_thumbnails === 1;
-        const durVideoStream = (obj) => (obj?.ffProbeData?.streams || []).find(s => codecTypeOf(s) === 'video' && !foreignCoverArt(s));
+        const durVideoStream = (obj) => (obj?.ffProbeData?.streams || []).find(s => codecTypeOf(s) === 'video' && !probeOnlyCoverArt(s));
         // The timed streams a container duration spans, as a sorted type list - equal on both sides exactly when no type's count changed. Attachments and
         // cover art carry no timeline, so dropping one cannot move the container duration.
-        const durStreamShape = (obj) => (obj?.ffProbeData?.streams || []).filter((s) => codecTypeOf(s) !== 'attachment' && !foreignCoverArt(s))
+        const durStreamShape = (obj) => (obj?.ffProbeData?.streams || []).filter((s) => codecTypeOf(s) !== 'attachment' && !probeOnlyCoverArt(s))
             .map((s) => codecTypeOf(s)).sort().join(',');
         // Matroska's per-track statistics tag, "HH:MM:SS.nnnnnnnnn" - where an mkv keeps a video track's length. ffmpeg's matroska muxer writes it fresh from
         // the packets when it finalises a file and never carries the source's over (a 20 s mkv cut to 5 s, copied or re-encoded, reports 5 s), and a killed,
@@ -1330,31 +1330,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // a file already at its true length.)
             const recoveredTagOf = (probed) => getTagCI(probed?.ffProbeData?.format?.tags || {}, RECOVERED_TAG).trim();
             const recovered = recoveredTagOf(file) !== '' && recoveredTagOf(file) !== recoveredTagOf(originalFile);
+            // Both verdicts below: a recover_bad_* repair from THIS job is accepted for review with a warning, anything else fails the file.
+            const truncationVerdict = (soft, hard, reviewTail = '', failTail = '') => {
+                if (recovered) response.infoLog += `☒${durTag}${soft}\n☒${durTag}${REVIEW_HINT}${reviewTail}\n`;
+                else failFile(`${durTag}${hard}\n☒${durTag}${OOM_HINT}${failTail}`);
+            };
             if (verdict) {
                 const pct = (verdict.now / verdict.old) * 100;
                 if (pct < 100 - DURATION_TOLERANCE_PCT) {
-                    if (recovered)
-                        response.infoLog += `☒${durTag}output duration ${verdict.now.toFixed(1)} s is ${pct.toFixed(1)}% of the original `
-                            + `${verdict.old.toFixed(1)} s, but this file carries an ${RECOVERED_TAG} tag - a recover_bad_* repair of a truncated source `
-                            + `legitimately reports a shorter true duration\n☒${durTag}${REVIEW_HINT} (compared using ${verdict.name})\n`;
-                    else
-                        failFile(`${durTag}output duration ${verdict.now.toFixed(1)} s is ${pct.toFixed(1)}% of the original ${verdict.old.toFixed(1)} s`
-                            + ` - the transcode did not run to completion`
-                            + `\n☒${durTag}${OOM_HINT}`
-                            + `\n☒${durTag}(compared using ${verdict.name})`);
+                    const shorter = `output duration ${verdict.now.toFixed(1)} s is ${pct.toFixed(1)}% of the original ${verdict.old.toFixed(1)} s`;
+                    const compared = `(compared using ${verdict.name})`;
+                    truncationVerdict(`${shorter}, but this file carries an ${RECOVERED_TAG} tag - a recover_bad_* repair of a truncated source `
+                        + 'legitimately reports a shorter true duration', `${shorter} - the transcode did not run to completion`, ` ${compared}`,
+                        `\n☒${durTag}${compared}`);
                 }
             } else if (oldAny && !newAny) {
                 // A severely truncated or unfinalised output is precisely the file most likely to probe with no duration at all, so treating "no duration" as
                 // "nothing to compare" would silence the guard on exactly what it hunts. Reaching here means NO signal resolved on the new side while at least
                 // one did on the old, so it cannot fire merely because a container stores one signal and not another.
-                if (recovered)
-                    response.infoLog += `☒${durTag}the output reports no duration at all while the original had ${oldAny.toFixed(1)} s, but this file `
-                        + `carries an ${RECOVERED_TAG} tag - a recover_bad_* repair of a truncated source can legitimately report a shorter or absent duration`
-                        + `\n☒${durTag}${REVIEW_HINT}\n`;
-                else
-                    failFile(`${durTag}the output reports no duration at all while the original had ${oldAny.toFixed(1)} s - that is what a truncated or`
-                        + ` unfinalised transcode looks like`
-                        + `\n☒${durTag}${OOM_HINT}`);
+                const absent = `the output reports no duration at all while the original had ${oldAny.toFixed(1)} s`;
+                truncationVerdict(`${absent}, but this file carries an ${RECOVERED_TAG} tag - a recover_bad_* repair of a truncated source can legitimately `
+                    + 'report a shorter or absent duration', `${absent} - that is what a truncated or unfinalised transcode looks like`);
             }
         }
         // ====== END TRUNCATION CHECK ======
@@ -1373,13 +1369,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The same for audio_first's two flag values; its default_tagged lifts the single winningDefault instead (see compareAudioStreams).
         const AUDIO_FIRST_KEY = { original_tagged: 'original', descriptive_tagged: 'descriptive' };
         const audFirstKey = AUDIO_FIRST_KEY[audioFirst];
-        // Role precedence within a language, lowest first. Defined once per stream type and applied to both comparands: written inline it was the same
+        // Role precedence within a language, lowest first. Defined once per stream type and applied to both comparands - inlined, it would be the same
         // ternary chain twice, where a change to one copy silently makes the comparator asymmetric.
         const subtitleRoleRank = (s) => (s.commentary ? 4 : (s.descriptive ? 3 : (s.sdh ? 2 : (s.lyrics ? 1 : 0))));
         // Any other secondary role (isSecondaryTrack: M&E, karaoke) ranks LAST: neither carries dialogue a viewer would choose, and ranked as main a 5.1 mix
         // outsorted the 2.0 dialogue track and became the sole default every player auto-selects.
         const audioRoleRank = (s) => (s.commentary ? 2 : (s.descriptive ? 1 : (s.secondary ? 3 : 0)));
         const preferredLangKeys = orderLangTokens.map(langKey);   // normalised: en/eng/english/en-US and 639-2/B vs /T all rank together (langKey lowercases)
+        const getLangRank = (lang) => {
+            const idx = preferredLangKeys.indexOf(langKey(lang));
+            // The "not listed" sentinel must exceed every real index; a bare 999 would collide on a >999-entry order_language list (unbounded free text).
+            return idx === -1 ? preferredLangKeys.length : idx;
+        };
         // order_codec takes the canonical key (eac3atmos) or the spelling this plugin's own Input streams line prints (eac3-atmos): a display token maps
         // back to its key, so a codec copied from the log matches. Built from the shared CODEC_DISPLAY, so a new display name needs no second edit here.
         const codecKeyForDisplay = new Map(Object.entries(CODEC_DISPLAY).map(([key, shown]) => [shown, key]));
@@ -1404,12 +1405,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const qualCap = (qualityMode.enabled && qualityMode.dir === 'descending') ? qualityMode.cap : Infinity;
         const overCap = (s) => s.channels > chanCap || s.capBitrate > qualCap;
 
-        const getLangRank = (lang) => {
-            const idx = preferredLangKeys.indexOf(langKey(lang));
-            // The "not listed" sentinel must exceed every real index; a bare 999 would collide on a >999-entry order_language list (unbounded free text).
-            return idx === -1 ? preferredLangKeys.length : idx;
-        };
-
         // Audio ordering below audio_first, shared by the sort AND the winning-default pre-pass: language -> role -> order_codec -> the union cap partition
         // (over EITHER cap -> tail) -> channel (direction) -> quality (direction). Returns 0 when every key ties. The cap ONLY partitions; within each
         // partition channel/quality keep their requested direction, so a 'descending <=N' list stays fully descending - it just shifts which track leads.
@@ -1417,11 +1412,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const aRank = a.langRank;
             const bRank = b.langRank;
             if (aRank !== bRank) return aRank - bRank;
-            //A commentary stream could be descriptive but it would still be a commentary
+            // A commentary stream could be descriptive but it would still be a commentary
             const aRole = audioRoleRank(a);
             const bRole = audioRoleRank(b);
             if (aRole !== bRole) return aRole - bRole;
-            //order_codec tier: preferred codecs group above the rest
+            // order_codec tier: preferred codecs group above the rest
             if (codecFirstList.length > 0 && a.codecMatch !== b.codecMatch) return a.codecMatch ? -1 : 1;
             if (chanCap < Infinity || qualCap < Infinity) {
                 const aOver = overCap(a), bOver = overCap(b);
@@ -1526,7 +1521,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return compareAudioKeys(a, b);
         };
 
-        //Sort the streams: stream-type precedence, then the per-type comparator, then source-index order as the final tie-break.
+        // Sort the streams: stream-type precedence, then the per-type comparator, then source-index order as the final tie-break.
         sortRows.sort((a, b) => {
             const aOrder = TYPE_ORDER[a.type] ?? UNKNOWN_TYPE_ORDER;
             const bOrder = TYPE_ORDER[b.type] ?? UNKNOWN_TYPE_ORDER;
@@ -1540,12 +1535,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             else if (a.type === 'subtitle') cmp = compareSubtitleStreams(a, b);
             if (cmp !== 0) return cmp;
 
-            //Attachments and data get no comparator - their relative order doesn't matter
+            // Attachments and data get no comparator - their relative order doesn't matter
             return a.index - b.index;
         });
         // ====== END STREAM TABLE + SORT ======
 
-        // ====== JUNK TAG STRIP: PER-STREAM ======
+        // ====== JUNK TAG STRIP: KEYS + PER-STREAM ======
 
         // remove_junk_tags: strip encoder/muxer-provenance (+ optional descriptive) tags on the reorder remux. 'encoder' = pure provenance
         // (global encoded_by; per-stream encoder/encoded_by); 'descriptive' (superset) also drops iTunes/movie-TV container tags. Always kept:
@@ -1554,6 +1549,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Per-stream 'encoder' - including the Lavc tag an upstream re-encode stamps - is NOT re-added on a -c copy, so running last clears it
         // in the SAME remux (a first-in-stack plugin could only catch it a pass later). The one exception is muxerRegenerates below.
         const JUNK_PERSTREAM = new Set(['encoded_by', 'encoder']);   // only encoder-tier keys are safe per-stream (descriptive ones are functional, kept)
+        const JUNK_ENCODER_GLOBAL = new Set(['encoded_by']);
+        const JUNK_DESCRIPTIVE = new Set(['compilation', 'gapless_playback', 'hd_video', 'purchase_date', 'sort_name', 'sort_album', 'sort_album_artist',
+            'sort_artist', 'sort_composer', 'sort_show', 'genre', 'date', 'description', 'synopsis', 'show', 'episode_id', 'network', 'episode_sort',
+            'season_number', 'media_type', 'artist', 'album', 'album_artist', 'composer', 'grouping', 'lyrics', 'copyright', 'keywords', 'track', 'disc',
+            'itunmovi', 'itunextc',   // iTunMOVI (the cast/crew plist) and iTunEXTC (the rating) are freeform atoms the mov demuxer names verbatim
+            // ...and the Matroska tagging spec's own names for the same kind of tag, which ffprobe reports lowercased. The external IDs (imdb/tmdb/tvdb) are
+            // kept: a media server matches the file on them.
+            'date_released', 'date_recorded', 'date_encoded', 'date_tagged', 'summary', 'director', 'actor', 'performer', 'written_by', 'producer',
+            'content_type', 'law_rating', 'original_media_type']);
+        const isGlobalJunkKey = (lowerKey) => removeJunkTags !== 'disabled'
+            && (JUNK_ENCODER_GLOBAL.has(lowerKey) || (removeJunkTags === 'descriptive' && JUNK_DESCRIPTIVE.has(lowerKey)));
         // For MPEG-2 video at the XDCAM frame sizes (1280x720, 1440x1080, 1920x1080) with no encoder tag, the mov/mp4 muxer synthesises an 'XDCAM EX 1080p29'-
         // style stsd compressorname, and the mov demuxer reports it back as the stream's encoder tag (measured, jellyfin-ffmpeg 7.1.4). Clearing it is exactly
         // what makes the muxer write it, so the next pass would build the identical preset and Tdarr's identical-preset guard would error the file. It is muxer
@@ -1563,21 +1569,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Per-stream encoder/encoded_by clears for the stream at OUTPUT index outIdx - the post-sort position -metadata:s:<index> targets, not the source
         // ffprobe index. Present-only, so a clean stream adds nothing and never forces a mux on its own. escMeta guards the probe-derived key.
         const junkStreamClears = (ffstream, outIdx) => {
-            if (junkTagsMode === 'disabled') return '';
+            if (removeJunkTags === 'disabled') return '';
             let meta = '';
             for (const k of Object.keys(ffstream.tags || {}))
                 if (JUNK_PERSTREAM.has(k.toLowerCase()) && !muxerRegenerates(ffstream, k)) meta += ` -metadata:s:${outIdx} "${escMeta(k)}="`;
             return meta;
         };
-        // ====== END JUNK TAG STRIP: PER-STREAM ======
-
-        // ====== OUTPUT MAP + SOLE-DEFAULT FLAG ======
-        //Set orderChanged if the sort moved a stream, and build the map; also normalise the audio default flag so exactly one audio track — the first in sorted
-        //order — is default, matching what the ordering rules chose. Additive +default/-default preserves forced/commentary/etc; subtitle/video untouched.
-        let ffmpegMap = '';
-        let dispositionArgs = '';
+        // The strip's two accumulators: the per-stream clears are added in the output-map loop below, the global ones after it.
         let junkArgs = '';
         let junkLog = '';
+        // ====== END JUNK TAG STRIP: KEYS + PER-STREAM ======
+
+        // ====== OUTPUT MAP + SOLE-DEFAULT FLAG ======
+        // Set orderChanged if the sort moved a stream, and build the map; also normalise the audio default flag so exactly one audio track — the first in
+        // sorted order — is default, matching what the ordering rules chose. Additive +default/-default keeps forced/commentary/etc.; subtitle/video untouched.
+        let ffmpegMap = '';
+        let dispositionArgs = '';
         let orderChanged = false;
         let audioIndex = -1;
 
@@ -1589,11 +1596,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const canPersistDefault = isMatroskaFamily(dstContainer) || isMp4Family(dstContainer);
         let defaultFlagSkipped = false;
 
-        // Two kinds of stream are left out of the map, so outIdx - the output position every per-stream write keys on - counts only the streams actually
-        // mapped: a data track the container cannot copy (mp4UncopyableStreams), and a stream ffmpeg cannot identify at all - ffprobe omits its codec_type
-        // (an MPEG-TS private-section PID, stream_type 0x05, as DVB recordings carry) and ffmpeg refuses an explicit map of it ("Cannot map stream ...
-        // unsupported type", exit 234 on jellyfin-ffmpeg 7.1.4), so mapping it would fail every remux this plugin emits for the file. Neither forces a remux
-        // on its own: the order test reads only the mapped streams, so a leftover is dropped only from a remux some other change already called for.
+        // Two kinds of stream are left out of the map, so outIdx - the output position the per-stream -metadata writes key on - counts only the streams
+        // actually mapped: a data track the container cannot copy (mp4UncopyableStreams), and a stream ffmpeg cannot identify at all - ffprobe omits its
+        // codec_type (an MPEG-TS private-section PID, stream_type 0x05, as DVB recordings carry) and ffmpeg refuses an explicit map of it ("Cannot map
+        // stream ... unsupported type", exit 234 on jellyfin-ffmpeg 7.1.4), so mapping it would fail every remux this plugin emits for the file. Neither
+        // forces a remux on its own: the order test reads only the mapped streams, so a leftover is dropped only from a remux some other change already
+        // called for. The -disposition:a: writes key on the audio-relative audioIndex instead, which neither kind can move: neither is ever an audio stream.
         const uncopyable = mp4UncopyableStreams(dstContainer, file.ffProbeData.streams);
         const unidentified = sortRows.filter((r) => TYPE_ORDER[r.type] === undefined);
         const leftOutOfMap = (r) => uncopyable.some((s) => s.index === r.index) || unidentified.includes(r);
@@ -1601,64 +1609,54 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let outIdx = -1;
         let lastPos = -1;
         for (let i = 0; i < sortRows.length; i++) {
-            if (leftOutOfMap(sortRows[i])) continue;
+            const row = sortRows[i];
+            if (leftOutOfMap(row)) continue;
             // Compare each mapped stream's ORIGINAL array position, not its absolute ffprobe index, against the one mapped before it, so a file already in the
             // desired order but with non-contiguous indices (e.g. 0,1,3 after an upstream drop) isn't remuxed pointlessly. -map uses the absolute index below.
-            if (sortRows[i].origPos < lastPos) orderChanged = true;
-            lastPos = sortRows[i].origPos;
+            if (row.origPos < lastPos) orderChanged = true;
+            lastPos = row.origPos;
             outIdx++;
-            ffmpegMap += ` -map 0:${sortRows[i].index}`;
+            ffmpegMap += ` -map 0:${row.index}`;
 
             // remove_junk_tags (per-stream): clear this stream's encoder tags, keyed on its OUTPUT index (see junkStreamClears).
-            const streamJunk = junkStreamClears(sortRows[i].stream, outIdx);
+            const streamJunk = junkStreamClears(row.stream, outIdx);
             if (streamJunk) {
                 junkArgs += streamJunk;
-                junkLog += `☐${streamTag(sortRows[i].index)}[remove_junk_tags=${junkTagsMode}] Remove encoder tag(s) from ${sortRows[i].type} stream\n`;
+                junkLog += `☐${streamTag(row.index)}[remove_junk_tags=${removeJunkTags}] Remove encoder tag(s) from ${row.type} stream\n`;
             }
 
-            if (sortRows[i].type === 'audio') {
+            if (row.type === 'audio') {
                 audioIndex++;
                 const wantDefault = audioIndex === 0;
                 if (!canPersistDefault) {
                     // Container can't keep the flag - suppress the write (else it loops); remember one skip so the ☒ note below fires exactly once.
-                    if (sortRows[i].default !== wantDefault) defaultFlagSkipped = true;
+                    if (row.default !== wantDefault) defaultFlagSkipped = true;
                 } else {
-                    if (wantDefault && !sortRows[i].default)
+                    if (wantDefault && !row.default)
                         dispositionArgs += ` -disposition:a:${audioIndex} +default`;
-                    else if (!wantDefault && sortRows[i].default)
+                    else if (!wantDefault && row.default)
                         dispositionArgs += ` -disposition:a:${audioIndex} -default`;
                     // Reflect the normalized flag in the Expected results summary (summariseStream reads disposition.default);
                     // shallow-clone so the source probe object is untouched.
-                    if (sortRows[i].default !== wantDefault)
-                        sortRows[i].stream = { ...sortRows[i].stream, disposition: { ...sortRows[i].stream.disposition, default: wantDefault ? 1 : 0 } };
+                    if (row.default !== wantDefault)
+                        row.stream = { ...row.stream, disposition: { ...row.stream.disposition, default: wantDefault ? 1 : 0 } };
                 }
             }
         }
         // ====== END OUTPUT MAP + SOLE-DEFAULT FLAG ======
 
         // ====== JUNK TAG STRIP: GLOBAL ======
-        const JUNK_ENCODER_GLOBAL = new Set(['encoded_by']);
-        const JUNK_DESCRIPTIVE = new Set(['compilation', 'gapless_playback', 'hd_video', 'purchase_date', 'sort_name', 'sort_album', 'sort_album_artist',
-            'sort_artist', 'sort_composer', 'sort_show', 'genre', 'date', 'description', 'synopsis', 'show', 'episode_id', 'network', 'episode_sort',
-            'season_number', 'media_type', 'artist', 'album', 'album_artist', 'composer', 'grouping', 'lyrics', 'copyright', 'keywords', 'track', 'disc',
-            'itunmovi', 'itunextc',   // iTunMOVI (the cast/crew plist) and iTunEXTC (the rating) are freeform atoms the mov demuxer names verbatim
-            // ...and the Matroska tagging spec's own names for the same kind of tag, which ffprobe reports lowercased. The external IDs (imdb/tmdb/tvdb) are
-            // kept: a media server matches the file on them.
-            'date_released', 'date_recorded', 'date_encoded', 'date_tagged', 'summary', 'director', 'actor', 'performer', 'written_by', 'producer',
-            'content_type', 'law_rating', 'original_media_type']);
-        const isGlobalJunkKey = (lowerKey) => junkTagsMode !== 'disabled'
-            && (JUNK_ENCODER_GLOBAL.has(lowerKey) || (junkTagsMode === 'descriptive' && JUNK_DESCRIPTIVE.has(lowerKey)));
         // remove_junk_tags (global): clear the provenance / descriptive container tags present, matched case-insensitively. escMeta guards the key. Each
         // clear is also recorded in globalWrites, for mp4TagPlan - keyed by a name read off the media, hence no prototype for one to collide with.
         const globalWrites = Object.create(null);
-        if (junkTagsMode !== 'disabled')
+        if (removeJunkTags !== 'disabled')
             for (const k of Object.keys(file.ffProbeData.format?.tags || {})) {
                 const lk = k.toLowerCase();
                 if (lk === 'title' || lk === 'comment' || lk === 'creation_time' || lk.startsWith('awk_')) continue;
                 if (isGlobalJunkKey(lk)) {
                     junkArgs += ` -metadata "${escMeta(k)}="`;
                     globalWrites[k] = '';
-                    junkLog += `☐[remove_junk_tags=${junkTagsMode}] Remove ${k} tag from file\n`;
+                    junkLog += `☐[remove_junk_tags=${removeJunkTags}] Remove ${k} tag from file\n`;
                 }
             }
         // ====== END JUNK TAG STRIP: GLOBAL ======
@@ -1700,9 +1698,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // method_mp4_faststart: front-load the mp4 moov atom. A plain ride-along isn't enough (we skip when order is already correct), so force a one-time
         // remux when faststart is on, the output is an mp4-family container, and moovBeforeMdat (fail-safe, defined just above) reports it isn't fronted
         // yet - so this settles after one pass and never loops.
-        const isMp4 = isMp4Family(dstContainer);
-        const faststartOn = methodFaststart === 'force';
-        const needsFront = faststartOn && isMp4 && !moovBeforeMdat(file.file, otherArguments);
+        const mp4Family = isMp4Family(dstContainer);
+        const faststartOn = methodMp4Faststart === 'force';
+        const needsFront = faststartOn && mp4Family && !moovBeforeMdat(file.file, otherArguments);
         // ====== END MOOV / FASTSTART PROBE ======
 
         // ====== DECIDE + REPORT ======
@@ -1747,7 +1745,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Logged whenever the moov actually moves, not only when faststart is the sole reason for the pass: +faststart rides every remux this plugin emits
         // (see mp4MovflagsArg below), so a reorder or a disposition fix front-loads the file just as surely, and a ☐ line marks a change about to be made.
         if (needsFront)
-            response.infoLog += `☐[method_mp4_faststart=${methodFaststart}] Front-load the mp4 moov atom on this remux\n`;
+            response.infoLog += `☐[method_mp4_faststart=${methodMp4Faststart}] Front-load the mp4 moov atom on this remux\n`;
         // ====== END DECIDE + REPORT ======
         // ====== PRESET ASSEMBLY ======
 
@@ -1755,7 +1753,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // mp4TagPlan sets it exactly when one is there - dropping it would re-trigger that plugin's work - and +faststart rides along when
         // method_mp4_faststart is on. A reorder maps every stream the container can copy, cover art included (mp4UncopyableStreams excepted).
         const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, globalWrites);
-        const movflags = [tagPlan.flag ? 'use_metadata_tags' : '', isMp4 && faststartOn ? '+faststart' : ''].join('');
+        const movflags = [tagPlan.flag ? 'use_metadata_tags' : '', mp4Family && faststartOn ? '+faststart' : ''].join('');
         const mp4MovflagsArg = movflags ? ` -movflags ${movflags}` : '';
         // The -strict level this mp4/mov -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses
         // without it. It reads the RAW ffprobe streams, never sortRows (see its header); this plugin only reorders, and the streams it leaves out
@@ -1773,7 +1771,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return response;
         // ====== END PRESET ASSEMBLY ======
     } catch (err) {
-        failUnexpected(err);   // AwkFailFile → rethrow unchanged; anything else → annotate + fail the file with the full infoLog
+        failUnexpected(err);
     }
 };
 
