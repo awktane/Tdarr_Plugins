@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.62',
+    Version: '4.999.63',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -3328,6 +3328,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     skipDone += noChannelCountSkip(ffstream.index, `method_loudnorm=${methodLoudnorm}`, NO_CHANNEL_COUNT_CODEC);
                     continue;
                 }
+                // Cache check, before any target is resolved (the collect loop above tests it in the same place): this stream isn't being touched by anything
+                // else this run, so if it already carries a tag matching the CURRENT preset, its content hasn't changed since we last measured/corrected it
+                // against this exact target - trust it, skipping the measurement subprocess and any guard refusal, which would report a change nothing needs.
+                // A stale tag from a DIFFERENT preset (or no tag at all) falls through to a fresh measurement below.
+                if (loudnormTagMatchesPreset(ffstream)) continue;
                 const ffstreamCodec = codecNameOf(ffstream) || 'unknown';
                 const { targetCodec, keepCodec, configuredCodec, isStereo } = leftoverTarget(ffstream, channels);
                 if (targetCodec === null) {
@@ -3346,11 +3351,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
                 const targetCodecFamily = aacFamily(targetCodec);
-
-                // Cache check: this stream isn't being touched by anything else this run, so if it already carries a tag matching the CURRENT preset,
-                // its content hasn't changed since we last measured/corrected it against this exact target - trust it and skip the measurement
-                // subprocess entirely. A stale tag from a DIFFERENT preset (or no tag at all) falls through to a fresh measurement below.
-                if (loudnormTagMatchesPreset(ffstream)) continue;
 
                 // Any opus target on a non-opus source - whether codec_force's scope put codec_surround=opus here, or an unencodable source fell through to it:
                 // if libopus CAN'T encode this track's layout, a bare -c:a libopus would abort the whole ffmpeg job. Relabel losslessly when possible (chained
