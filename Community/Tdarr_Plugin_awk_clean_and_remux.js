@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.65',
+    Version: '4.999.66',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -386,9 +386,10 @@ const langNameIndex = (() => {
         const idx = Object.create(null);
         const dn = new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' });
         const add = (code) => { const name = dn.of(code); if (name) idx[name.toLowerCase()] = code; };
-        for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {
+        const A = 'a'.charCodeAt(0); const Z = 'z'.charCodeAt(0);   // every code is lowercase a-z
+        for (let a = A; a <= Z; a++) for (let b = A; b <= Z; b++) {
             if (!three) { add(String.fromCharCode(a, b)); continue; }
-            for (let c = 97; c <= 122; c++) add(String.fromCharCode(a, b, c));
+            for (let c = A; c <= Z; c++) add(String.fromCharCode(a, b, c));
         }
         return idx;
     };
@@ -1665,20 +1666,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // own end a copy's last cue may stop and still count as the whole of it: a complete export ends where the stream does, to the centisecond.
     const SIDECAR_HASH_MAX = 64 * 1024 * 1024;
     const CUE_SPAN_SLACK_S = 1;
+    // -=-=-= hmsSeconds  [clean_and_remux, sub_worker] =-=-=-
+    // A [H:]MM:SS[.,]fff stamp in seconds - a cue's timing (srt's decimal comma folded to a point) or a Matroska DURATION statistics tag, a missing one
+    // reading 0. clean_and_remux reads a subtitle's DURATION with it too, so a bundle's last cue and the stream's own end are parsed by one rule.
+    const hmsSeconds = (stamp) => String(stamp || '').trim().replace(',', '.').split(':').reduce((acc, part) => acc * 60 + Number(part), 0);
     // -=-=-= cueSpan  [clean_and_remux, sub_worker] =-=-=-
     // How many cues decoded subtitle text holds and where the LAST one ends, in seconds: { cues, end }. Whether a sidecar already on disk is the whole
     // subtitle or only its start - a run that FAILS partway (an ffmpeg error, not a kill) still finalises every output, so its sidecar is well-formed and
-    // simply stops early, which no size or parse test can see, while a user's edit keeps the timeline. srt/vtt cues are their '-->' timing lines; ass/ssa
-    // cues their Dialogue lines, whose End is the third field in both formats. Untrusted text up to SIDECAR_HASH_MAX, so it is cut into lines first and
-    // each line tested with an anchored or literal-led pattern - nothing here can backtrack across lines (hasNoCues says what an unanchored ^\s* costs).
+    // simply stops early, which no size or parse test can see, while a user's edit keeps the timeline. srt/vtt cues are their '-->' timing lines; ass/ssa cues
+    // their Dialogue lines, whose End is the third field in both formats. Untrusted text up to SIDECAR_HASH_MAX, so it is cut into lines first and each line
+    // tested with an anchored or literal-led pattern - nothing here can backtrack across lines (sub_worker's hasNoCues says what an unanchored ^\s* costs).
     const cueSpan = (text, ext) => {
         const ass = ext === 'ass' || ext === 'ssa';
-        const secs = (stamp) => stamp.trim().replace(',', '.').split(':').reduce((acc, part) => acc * 60 + Number(part), 0);
         let cues = 0; let end = 0;
         for (const line of String(text).split(/\r\n|[\n\r\u2028\u2029]/)) {
             const m = ass ? /^[^\S\r\n\u2028\u2029]*Dialogue\s*:[^,]*,[^,]*,([^,]*),/i.exec(line) : /-->[ \t]*((?:\d+:)?\d{1,2}:\d{1,2}[.,]\d{1,3})/.exec(line);
             if (!m) continue;
-            const t = secs(m[1]);
+            const t = hmsSeconds(m[1]);
             if (!Number.isFinite(t)) continue;
             cues += 1;
             if (t > end) end = t;
@@ -1943,14 +1947,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // #region SHARED helpers (1 section: recovered marker vocabulary)
     // ===== SHARED [clean_and_remux, stream_ordering]: recovered marker vocabulary =====
     // -=-=-= RECOVERED_TAG  [clean_and_remux, stream_ordering] =-=-=-
-    // The format-level tag clean_and_remux stamps on every recover_bad_* remux, and the ONE cross-plugin marker whose spelling is executable code in two
-    // files (awk_cc is already shared; awk_video, awk_loudnorm and awk_sub_worker are each single-plugin). clean_and_remux reads it back to stay idempotent;
-    // stream_ordering reads it to soften BOTH truncation verdicts from a failFile quarantine to a warning that accepts the file for review, because a
-    // recover_bad_* repair of a truncated source legitimately reports a shorter or absent duration - so a reader that stopped matching would quarantine
-    // every salvaged file in a loop the user cannot break (fixed tolerance, no relaxing input). SHARED for the reason the closed-caption handoff gives: a
-    // writer and a reader whose vocabularies drift fail SILENTLY. Only the KEY needs guarding - the read is getTagCI (case-insensitive) and tests only
-    // non-emptiness and equality with the library original's value, so no VALUE format can drift. Interpolate it into the log lines that NAME the tag too,
-    // or a rename here leaves user-facing text pointing at a key nothing writes any more.
+    // The format-level tag clean_and_remux stamps on every recover_bad_* remux, and the ONE cross-plugin marker whose spelling is executable
+    // code in two files (awk_cc is already shared; awk_video, awk_loudnorm and awk_sub_worker are each single-plugin). clean_and_remux reads it
+    // back to stay idempotent; stream_ordering reads it to soften BOTH truncation verdicts from a failFile quarantine to a warning that accepts
+    // the file for review, because a recover_bad_* repair of a truncated source legitimately reports a shorter or absent duration - so a reader
+    // that stopped matching would quarantine every salvaged file in a loop the user cannot break (fixed tolerance, no relaxing input). SHARED
+    // because a writer and a reader whose vocabularies drift fail SILENTLY. Only the KEY needs guarding - the read is getTagCI
+    // (case-insensitive) and tests only non-emptiness and equality with the library original's value, so no VALUE format can drift. Interpolate
+    // it into the log lines that NAME the tag too, or a rename here leaves user-facing text pointing at a key nothing writes any more.
     const RECOVERED_TAG = 'awk_recovered';
     // ===== END SHARED: recovered marker vocabulary =====
     // #endregion
@@ -2347,8 +2351,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Where a subtitle stream ENDS, in seconds, or 0 when no probe says: ffprobe's own duration (mp4), else Matroska's per-track DURATION statistics
         // tag (written by both ffmpeg and mkvmerge, as H:MM:SS.nnnnnnnnn), else mediaInfo's. The yardstick an existing bundle's last cue is held to.
         const subtitleEndSec = (ffstream) => {
-            const hms = (v) => String(v || '').split(':').reduce((acc, part) => acc * 60 + Number(part), 0);
-            for (const v of [ffstream.duration, hms(getTagCI(ffstream.tags || {}, 'DURATION')), mediaInfoFor(ffstream)?.Duration]) {
+            for (const v of [ffstream.duration, hmsSeconds(getTagCI(ffstream.tags || {}, 'DURATION')), mediaInfoFor(ffstream)?.Duration]) {
                 const n = Number(v);
                 if (Number.isFinite(n) && n > 0) return n;
             }

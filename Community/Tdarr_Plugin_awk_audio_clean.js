@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.65',
+    Version: '4.999.66',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -464,9 +464,10 @@ const langNameIndex = (() => {
         const idx = Object.create(null);
         const dn = new Intl.DisplayNames(['en'], { type: 'language', fallback: 'none' });
         const add = (code) => { const name = dn.of(code); if (name) idx[name.toLowerCase()] = code; };
-        for (let a = 97; a <= 122; a++) for (let b = 97; b <= 122; b++) {
+        const A = 'a'.charCodeAt(0); const Z = 'z'.charCodeAt(0);   // every code is lowercase a-z
+        for (let a = A; a <= Z; a++) for (let b = A; b <= Z; b++) {
             if (!three) { add(String.fromCharCode(a, b)); continue; }
-            for (let c = 97; c <= 122; c++) add(String.fromCharCode(a, b, c));
+            for (let c = A; c <= Z; c++) add(String.fromCharCode(a, b, c));
         }
         return idx;
     };
