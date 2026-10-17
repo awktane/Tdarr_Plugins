@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.57',
+    Version: '4.999.58',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -2607,9 +2607,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const timeout = Math.min(LOUDNORM_ANALYSIS_MAX_TIMEOUT_MS, loudnormAnalysisTimeoutMs * batch.length);
                 const result = spawnSync(ffmpegPathOf(otherArguments), args, { timeout, maxBuffer: LOUDNORM_ANALYSIS_MAX_BYTES, encoding: 'utf-8' });
                 const err = String(result.stderr || '');
-                const starts = batch.map((idx, k) => err.indexOf(`[loudnorm@r${k} @ `));
-                // Each block is read only between its own name and the next one, so a neighbour's block can never answer for it.
-                const found = starts.map((s) => (s < 0 ? null : loudnormStatsIn(err.slice(s, Math.min(...starts.filter((t) => t > s), err.length)))));
+                // Each track's stats come only from ITS OWN teardown report: the instance name at the start of a line, the JSON opening on the next. The
+                // stream dumps echo every title and global tag at the same INFO level and land between the reports (an output whose track is shorter than
+                // loudnorm's ~3 s lookahead dumps at EOF, after a sibling has reported), but a dump indents every value and re-indents after an embedded
+                // newline, so no tag can put a marker or a brace at the start of a line. Read any looser way - from the first mention of the name, or the
+                // last block after it - a title carrying the marker text and a forged block was taken as a track's stats on jellyfin 7.1.4, passed
+                // LOUDNORM_MEASURED_SHAPE, and set a +29 LU correction. \r?\n so a stderr written with CRLF line ends (Windows text mode) still matches.
+                const found = batch.map((idx, k) => {
+                    let stats = null;
+                    for (const m of err.matchAll(new RegExp(`^\\[loudnorm@r${k} @ [^\\]\\r\\n]*\\] *\\r?\\n(\\{[^{}]*\\})`, 'gm'))) {
+                        try { const parsed = JSON.parse(m[1]); if (parsed && 'input_i' in parsed) stats = parsed; } catch (e) { /* not the JSON block */ }
+                    }
+                    return stats;
+                });
                 const why = result.error ? (result.error.code === 'ETIMEDOUT' ? 'it ran past its timeout' : `ffmpeg could not start (${result.error.message})`)
                     : result.signal ? `ffmpeg was killed (signal ${result.signal})` : result.status !== 0 ? `ffmpeg exited with status ${result.status}`
                         : found.some((s) => !s) ? 'a track reported no loudness' : '';
