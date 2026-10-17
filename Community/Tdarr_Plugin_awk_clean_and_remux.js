@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.62',
+    Version: '4.999.63',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -320,6 +320,8 @@ const details = () => ({
                 keeps reading past detected errors instead of failing. Drops no frames.
                 \\naggressive: also -fflags +discardcorrupt, which drops packets flagged corrupt. Expect small video or audio blips wherever the damage is.
                 \\nRecovery re-runs only when you change one of the recover_bad_* settings, then settles - it will not reprocess the file on every pass.
+                \\nOn an mp4, m4v or mov output the recovery stamp stays on the file for good, and keeping it makes every later remux write the file's tags
+                as QuickTime metadata keys, which taggers and Apple players cannot read. Recover into mkv to keep them readable.
                 \\nA repaired file can come out INCOMPLETE (a truncated source is salvaged to its true, shorter length), which stream_ordering accepts with a
                 warning in the job that repairs it, rather than failing it (a later job checks its length in full again). Review such a file in Tdarr and
                 confirm it plays through before approving - do not auto-approve a recovery queue, or an invisibly short result is kept silently.`,
@@ -343,7 +345,8 @@ const details = () => ({
                 Touches no frame data.
                 \\naggressive: also -fflags +igndts, which ignores the source DTS and rebuilds the timeline outright - this is what fixes "Non-monotonous
                 DTS". It can produce odd results, so only reach for it if light did not help.
-                \\nRe-runs only on a recover_bad_* change, as for recover_bad_data. Container-forced timestamp fixes apply regardless, for the whole
+                \\nRe-runs only on a recover_bad_* change, as for recover_bad_data, and on an mp4-family output its stamp costs the file its readable tags the
+                same way. Container-forced timestamp fixes apply regardless, for the whole
                 MPEG-TS family (ts/m2ts/mts/m2t/tp/trp/tod), the whole MPEG-PS family (mpg/mpeg/vob/evo/m2p/vro/mod), and avi.
                 \\nA repaired file can come out INCOMPLETE (a truncated source is salvaged to its true, shorter length), which stream_ordering accepts with a
                 warning in the job that repairs it, rather than failing it (a later job checks its length in full again). Review such a file in Tdarr and
@@ -733,12 +736,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return isMp4Family(c) && (c === 'mov' || plan.flag) ? kept.filter((s) => hasDisposition(s, 'attached_pic')) : [];
     };
     // -=-=-= mp4TagPlanLog [all five] =-=-=-
-    // What the plan costs, as log lines: the custom keys a flagless mux leaves behind, and each cover mp4CoversLost names (same `kept` argument).
+    // What the plan costs, as log lines: the native tags the flag rewrites, the custom keys a flagless mux leaves behind, and each cover mp4CoversLost
+    // names (same `kept` argument). The rewrite is said on every mux that keeps a marker: nothing else names it, so a library recovered into mp4 lost
+    // its readable tags in silence, and the marker is permanent.
     const mp4TagPlanLog = (plan, container, kept = []) => {
         const c = String(container || '').toLowerCase();
         const TAG_KEY_LOG_MAX = 40;   // several keys share one line, and a key is a name rather than free text, so each echo is kept short
         const names = (keys) => keys.map((k) => logSafe(k, TAG_KEY_LOG_MAX)).join(', ');
         let log = '';
+        if (plan.flag) {
+            log += `☒Keeping the ${names(plan.markers)} marker in .${c} writes every tag as a QuickTime metadata key, which taggers and Apple players`
+                + ' cannot read (Matroska keeps both)\n';
+        }
         if (plan.dropped.length) {
             log += `☐Not carrying ${names(plan.dropped)} - .${c} has no standard tag for ${plan.dropped.length === 1 ? 'it' : 'them'}`
                 + `, and keeping one would rewrite every other tag in a form taggers cannot read${c === 'mov' ? '' : ' and drop any cover art'}\n`;
