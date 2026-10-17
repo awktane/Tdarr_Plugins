@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.57',
+    Version: '4.999.58',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -513,7 +513,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         dub:              { streams:['audio'],                    keywords: ['dub','dubbed', 'dubbing', 'doublage', 'doblaje', 'doblado', 'dublado', 'dublagem',
                                 'doppiaggio', 'doppiato', 'dubbad', 'dubbet'],                                                  tag: 'Dub'         },
         original:         { streams:['audio'],                    keywords: ['original'],                                              tag: 'Original'    },
-        clean_effects:    { streams:['audio'],                    keywords: ['music and effects','music & effects','m&e','m and e'],   tag: null          },
+        clean_effects:    { streams:['audio'],                    keywords: ['music and effects','music & effects','m&e','m and e'],   tag: 'M&E'         },
         karaoke:          { streams:['audio'],                    keywords: ['karaoke'],                                               tag: 'Karaoke'     },
         default:          { streams:['audio','subtitle','video'], keywords: ['default'],                                               tag: null          },
         attached_pic:     { streams:['video'],                    keywords: [],                                                        tag: null          },
@@ -522,8 +522,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // -=-=-= roleTextLower [all five] =-=-=-
     // Role-signal text unioned from BOTH probes - a title/description/handler can live in ffprobe OR mediaInfo but not both. Memoized
-    // by stream object (WeakMap, per-run closure) because hasDisposition calls it repeatedly per stream. Both description reads go
-    // through getTagCI, and neither casing is a guess: matroska UPPER-CASES tag keys on write, so the ffprobe side comes back
+    // by stream object (WeakMap, per-run closure) because hasDisposition calls it repeatedly per stream. The handler and both description reads go
+    // through getTagCI, and neither casing is a guess: matroska UPPER-CASES tag keys on write, so the ffprobe side comes back HANDLER_NAME and
     // DESCRIPTION; and MediaInfo defines Comment/Description as GENERAL-only parameters, so a per-TRACK value never appears top-level
     // - it lands in the track's 'extra' bag under whatever spelling the container used. A fixed-case top-level read matches neither. NFC first, so a
     // title stored decomposed (an o followed by a combining diaeresis) matches the precomposed keyword it reads as.
@@ -531,7 +531,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const roleTextLower = (s) => {
         if (roleTextCache.has(s)) return roleTextCache.get(s);
         const mi = mediaInfoFor(s);
-        const text = [s.tags?.title, getTagCI(s.tags, 'description'), s.tags?.handler_name,
+        const text = [s.tags?.title, getTagCI(s.tags, 'description'), getTagCI(s.tags, 'handler_name'),
             mi?.Title, getTagCI(mi?.extra, 'description')].filter(Boolean).join(' ').trim().normalize('NFC').toLowerCase();
         roleTextCache.set(s, text);
         return text;
@@ -2026,10 +2026,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Matroska has no captions/lyrics flag, MP4/MOV no original/lyrics flag, and `-disposition +karaoke` reads back 0 from both - a +flag for those is
     // silently dropped by the muxer. captions is the SDH synonym of hearing_impaired (which persists in both containers), so hearing_impaired is promoted
     // in its place; a role with no storable flag is skipped - its title keyword still drives the classifiers, summary and sort order, so nothing is lost
-    // but a non-persisting write. The set lists only flags with no storable target: lyrics/karaoke (neither container), original (mp4 only). clean_effects
-    // is never promoted at all (it has no title label) and persists in neither container either - measured. `keys` narrows the roles considered; by
-    // default every role the stream carries.
-    const unstorableDisp = { mkv: new Set(['lyrics', 'karaoke']), mp4: new Set(['original', 'lyrics', 'karaoke']) };
+    // but a non-persisting write. The set lists only flags with no storable target: lyrics/karaoke/clean_effects (neither container - clean_effects
+    // measured on jellyfin-ffmpeg 7.1.4, `+clean_effects` reads back 0 from both, which is why its title label is the role's only durable carrier),
+    // original (mp4 only). `keys` narrows the roles considered; by default every role the stream carries.
+    const unstorableDisp = { mkv: new Set(['lyrics', 'karaoke', 'clean_effects']), mp4: new Set(['original', 'lyrics', 'karaoke', 'clean_effects']) };
     const promoteTarget = (key) => (key === 'captions' ? 'hearing_impaired' : key);   // canonicalise the SDH synonym to the container-portable flag
     const dispositionsToPromote = (s, type, keys = dispKeysFor(type).filter((k) => hasDisposition(s, k))) => {
         const out = []; const seen = new Set();
