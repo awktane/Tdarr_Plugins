@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.66',
+    Version: '4.999.67',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -36,8 +36,8 @@ const details = () => ({
             type: 'string',
             defaultValue: '',
             inputUI: { type: 'text' },
-            tooltip: `Languages to keep at full quality (surround). These follow downmix_to_six, downmix_to_stereo and codec_force, and are the only tracks
-                the guards protect. Blank (default) treats every language as surround.
+            tooltip: `Languages to keep at full quality (surround). These follow downmix_to_six, downmix_to_stereo and codec_force. Blank (default) treats
+                every language as surround.
                 \\nOne form is enough - en, eng, or English all match the same language, region variants like en-US included. A track with no language tag
                 counts as "und".
                 \\nA language in neither this list nor language_stereo is "unlisted" and follows language_unlisted. A language in BOTH lists is treated as
@@ -159,8 +159,9 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['disabled', 'replace', 'add'],
             },
-            tooltip: `Create a 5.1 track for a language that has none, built from the best higher-channel track it does have - restricted to
-                language_surround's languages if you set that list, and never taken from a secondary (commentary, descriptive, M&E, karaoke) track.
+            tooltip: `Create a 5.1 track for a language that has none, built from the best higher-channel track it does have. The source is always a
+                genuine track kept at surround - one in language_surround, or an unlisted one while language_unlisted=surround (the default) - and never
+                a secondary (commentary, descriptive, M&E, karaoke) track.
                 \\nNothing is created when the language already has a 5.1 track, or has no higher-channel track to build one from.
                 \\n=====
                 \\nActions
@@ -269,8 +270,8 @@ const details = () => ({
                 It defers to downmix_to_stereo and the stereo tier (language_stereo, language_unlisted=stereo, downmix_secondary=stereo) when they already
                 convert the track, and falls back to keep rather than create a duplicate stereo. A track guard_quality protects keeps its channels: the
                 stereo is added beside it, and the track stays in its source codec.
-                \\nThis only arises when codec_surround is opus and the track's layout is one libopus cannot encode - 2.1, 4.0, 4.1, 6.0, 7.0 or
-                7.1(wide); AC3, EAC3 and AAC accept every layout. It is reached either because codec_force is sending the track to opus, or because
+                \\nThis only arises when codec_surround is opus and the track's layout is one libopus cannot encode, such as 2.1, 3.1, 4.0, 4.1,
+                6.0, 7.0 or 7.1(wide); AC3, EAC3 and AAC accept every layout. It is reached either because codec_force is sending the track to opus, or because
                 method_loudnorm has to re-encode a kept track whose own codec ffmpeg cannot encode, such as a DTS core, and it converges to codec_surround.
                 \\nA layout that merely needs relabelling (5.0(side) to 5.0, 6.1(back) to 6.1) is ALWAYS relabelled losslessly, whatever this is set to.`,
         },
@@ -1635,7 +1636,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // codecFamilyOf, not the raw codec_name: the ladder is keyed by family, so a container spelling (aac_latm in a broadcast .ts) would miss it and
         // print 'unknown bitrate' for a track whose family the ladder covers perfectly well. The displayed CODEC name stays raw at the call sites.
         const tb = targetTable(codecFamilyOf(s), resolveChannels(s));
-        return tb > 0 ? `~${tb / 1000} kb/s` : 'unknown bitrate';
+        return tb > 0 ? `~${kbpsToken(tb)}` : 'unknown bitrate';
     };
 
     // Per-codec ceiling (bps) so a lossless or very-high-bitrate source (e.g. TrueHD ~4 Mbps) can't drag the transcode target absurdly high. AC3/EAC3 cap
@@ -1742,24 +1743,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // an empty set, so we degrade to native aac (which every build has) rather than emit an encoder that would hard-fail the file. Kill-switch for a wedged
     // `ffmpeg -encoders` probe: the query is near-instant, so this only fires if the spawned process hangs (never in normal use).
     const ENCODERS_PROBE_TIMEOUT_MS = 20000;
-    let _encoderSet;
-    let _aacVbrFallbackWarned = false;
+    let encoderSet;
+    let aacVbrFallbackWarned = false;
+    const { spawnSync } = require('child_process');   // the one spawn binding every probe below shares
     const hasEncoder = (name) => {
-        if (_encoderSet === undefined) {
+        if (encoderSet === undefined) {
             const cap = otherArguments && otherArguments.__awkCap;
             if (cap && Array.isArray(cap.encoders)) {
-                _encoderSet = new Set(cap.encoders);
+                encoderSet = new Set(cap.encoders);
             } else {
-                _encoderSet = new Set();
+                encoderSet = new Set();
                 try {
-                    const { spawnSync } = require('child_process');
                     const r = spawnSync(ffmpegPathOf(otherArguments), ['-hide_banner', '-encoders'],
                         { encoding: 'utf8', timeout: ENCODERS_PROBE_TIMEOUT_MS });
-                    _encoderSet = parseFfmpegEncoders(r && r.stdout);
+                    encoderSet = parseFfmpegEncoders(r && r.stdout);
                 } catch (e) { /* leave empty → native aac fallback, which every build has */ }
             }
         }
-        return _encoderSet.has(name);
+        return encoderSet.has(name);
     };
 
     // Encoder + rate args + log label for an aac_vbr stereo track, picking the best VBR AAC encoder THIS node has. The low-info test (an already-lean
@@ -1782,8 +1783,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         // Both fallbacks warn at most once per file: the encoder is a node fact, so a per-track line would repeat it for every stereo track on the run.
         const warnFallbackOnce = (msg) => {
-            if (_aacVbrFallbackWarned) return;
-            _aacVbrFallbackWarned = true;
+            if (aacVbrFallbackWarned) return;
+            aacVbrFallbackWarned = true;
             response.infoLog += `☒[codec_stereo=aac_vbr] ${msg}\n`;
         };
         if (hasEncoder('aac_at')) {
@@ -1798,18 +1799,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { encoder: 'aac', args: encoderArgsBps('aac', idx, bps), approxRate: `${bps / 1000}k`, label: 'native aac' };
     };
 
-
-    // Resolve whether a source stream is lossless using the shared resolveCodecName resolution (same one audioQuality uses). Stored per-stream as awkLossless
-    // to avoid repeating the resolution at emission. Read by guard_lossless (its guardBlocks skip + the "never drop the last lossless copy" dedup rule), by the
-    // dedup sort's trustedRate ranking, and as the source-lossless flag that suppresses resolveBitrate's source-bitrate floor on the codec_force / loudnorm
-    // encode paths - a lossless bitrate (4 Mbps TrueHD) is no comparable quantity for a perceptual encode and would pin the output at the codec ceiling for no
-    // audible gain (downmix paths pass no source bitrate, so are unaffected).
-    const isLosslessSource = (stream) => codecInfo[resolveCodecName(stream)]?.lossless === true;
-
-    // Resolve whether a source stream carries object-audio metadata (Atmos / DTS:X / MPEG-H / AC-4) that ffmpeg cannot reconstruct on re-encode - keyed off the
-    // codecInfo objectAudio flag via the same resolveCodecName resolution. Stored per-stream as awkObjectAudio. Read by guard_object_audio (an
-    // independent third guard) and used as a dedup tie-breaker so an object-audio track is preferred over an otherwise-equal plain one.
-    const isObjectAudioSource = (stream) => codecInfo[resolveCodecName(stream)]?.objectAudio === true;
 
     // #region SHARED helpers (3 sections: special language code … language token failure)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: special language code =====
@@ -2001,6 +1990,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const secondaryRole = (stream) => (isCommentary(stream) ? 'commentary'
             : isDescriptive(stream) ? 'audio description'
                 : hasDisposition(stream, 'clean_effects') ? 'M&E' : 'karaoke');
+        // Resolve whether a source stream is lossless using the shared resolveCodecName resolution (same one audioQuality uses). Stored per-stream as
+        // awkLossless to avoid repeating the resolution at emission. Read by guard_lossless (its guardBlocks skip + the "never drop the last lossless
+        // copy" dedup rule), by the dedup sort's trustedRate ranking, and as the source-lossless flag that suppresses resolveBitrate's source-bitrate
+        // floor on the codec_force / loudnorm encode paths - a lossless bitrate (4 Mbps TrueHD) is no comparable quantity for a perceptual encode and
+        // would pin the output at the codec ceiling for no audible gain (downmix paths pass no source bitrate, so are unaffected).
+        const isLosslessSource = (stream) => codecInfo[resolveCodecName(stream)]?.lossless === true;
+        // Resolve whether a source stream carries object-audio metadata (Atmos / DTS:X / MPEG-H / AC-4) that ffmpeg cannot reconstruct on re-encode - keyed
+        // off the codecInfo objectAudio flag via the same resolveCodecName resolution. Stored per-stream as awkObjectAudio. Read by guard_object_audio (an
+        // independent third guard) and used as a dedup tie-breaker so an object-audio track is preferred over an otherwise-equal plain one.
+        const isObjectAudioSource = (stream) => codecInfo[resolveCodecName(stream)]?.objectAudio === true;
 
         // Dormancy - see the language_surround tooltip for the full rationale. This boolean is the gate: true only when a genuine (non-secondary) track sits
         // in a language the user asked for (language_surround or language_stereo). Secondary tracks never count toward presence - they follow
@@ -2061,24 +2060,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Clamp at the echo sites, never in the shared langKey - the key itself is the match/dedup identity and must stay byte-exact.
         const langTok = logSafe;
 
-        // candidateStreams: the pool for workStreams. A track earns a place when there is genuinely something to do with it - it is a genuine surround track
-        // (the only kind eligible for downmix_to_six/downmix_to_stereo), or its tier is 'stereo' (the in-place stereo downmix), or codec_force is set, which
-        // must be able to standardize the codec of EVERY track including commentary and unlisted-language ones (e.g. codec_force='all' must touch them all).
-        // Anything with nothing to do is dropped from the pool. ('delete'-tier tracks may remain here harmlessly - workStreams filters removedIndices below.)
-        let candidateStreams = audioStreams;
-        if (codecForce === 'disabled')
-            candidateStreams = candidateStreams.filter(stream => stream.awkTier === 'stereo'
-                || (!stream.awkSecondaryTrack && stream.awkTier === 'surround'));
-
         // guard_lossless/guard_quality/guard_object_audio block a destructive operation only when it would irreversibly lose detail the destination can't
-        // hold (a fully independent set, not a fallback chain - see the tooltips). Protection is earned PER OPERATION: each decision site calls
-        // guardBlocks with its own real target codec/channels - a layout remix with the 2ch stereo it emits, not the opus it can't. Only a genuine
-        // tier-'surround' track is protectable (never a secondary, nor one already sent to stereo/delete); a dormant language setting leaves a foreign-only
-        // track at 'surround', so it stays protectable. guard_quality decides the channel-drop rule and the margin math: 'strict' protects on ANY predicted
-        // score drop, 'enabled' (default) only when the drop EXCEEDS QUALITY_MARGIN. Comparable swaps pass (640k eac3 -> 640k ac3 = 5pt; 1509k DTS 5.1 ->
-        // 640k ac3 = 7pt); flattening a premium master is kept (Atmos -> ac3 = 8pt, DTS-HD -> ac3 = 10pt). QUALITY_MARGIN = 7 is the DTS(91)-vs-ac3(84)
-        // base-score gap, so DTS core -> ac3 sits exactly at the margin on the pass side (a drop must STRICTLY exceed it to protect) - preserving the
-        // force-DTS-to-ac3 behaviour.
+        // hold (a fully independent set, not a fallback chain - see the tooltips). Protection is earned PER OPERATION: each decision site calls guardBlocks
+        // with its own real target codec/channels - a layout remix with the 2ch stereo it emits, not the opus it can't. Only a genuine tier-'surround' track
+        // is protectable (never a secondary, nor one already sent to stereo/delete); a dormant language setting leaves a foreign-only track at 'surround', so
+        // it stays protectable. guard_quality decides the channel-drop rule and the margin math: 'strict' protects on ANY predicted score drop, 'enabled'
+        // (default) only when the drop EXCEEDS QUALITY_MARGIN. Comparable swaps pass (640k eac3 -> 640k ac3 = 5pt; 1509k DTS 5.1 -> 640k ac3 = 7pt);
+        // flattening a premium master is kept (Atmos -> ac3 = 8pt, DTS-HD -> ac3 = 10pt). QUALITY_MARGIN = 7 is the DTS(91)-vs-ac3(84) base-score gap, so DTS
+        // core -> ac3 sits exactly at the margin on the pass side (a drop must STRICTLY exceed it to protect) - preserving the force-DTS-to-ac3 behaviour.
         const QUALITY_MARGIN = 7;
         // The three-guard parenthetical shared by the codec_force and loudnorm "would lose detail" skip lines, defined once so the two cannot word-drift.
         const guardTriple = () => `guard_lossless=${guardLossless}, guard_quality=${guardQuality}, guard_object_audio=${guardObjectAudio}`;
@@ -2140,7 +2129,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //   'multi-stereo'/'multi-stereo-error' - (lang, surround-vs-stereo role): one best surround plus one best stereo per language.
         //       Exceptions, active only while the matching downmix option is enabled: downmix_to_six carves the 5-6ch band into its own role and
         //       downmix_to_stereo carves exactly-2ch into its own, so a downmix-created/pre-existing 5.1 or 2.0 is never removed in favour of a 7.1/mono.
-        //       Both use the same channel bands as existing6chLangs/existing2chLangs, so dedup cannot disagree with the downmix creation guards - a
+        //       Both use the same channel bands as existingSixLangs/existingStereoLangs, so dedup cannot disagree with the downmix creation guards - a
         //       disagreement would be an infinite create/remove loop between the two options.
         // Dedup runs across ALL audio streams regardless of the language settings (a duplicate in a non-preferred language is still a duplicate).
         // dedupeGuardBlock keeps a duplicate whose removal would lose detail the survivor can't hold (a last lossless copy, a higher-channel track), and
@@ -2366,7 +2355,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // downmix touches is truly dropped. Must NOT gate this on guardBlocks: a guarded replace flips to 'add', which keeps the source
                 // — dropping it here would delete it before that add runs (a data-loss regression). surround tier: downmix_to_stereo=replace
                 // (any >2ch) or downmix_to_six=replace (>6ch → 5.1); stereo tier: the in-place downmix. The per-language one-shot
-                // (created2chLangs/six) is dynamic and can't be predicted here; a pre-empted downmix lands the track in the loop keep fallback.
+                // (created*Langs) is dynamic and can't be predicted here; a pre-empted downmix lands the track in the loop keep fallback.
                 const stereoPath = s.awkTier === 'stereo';                                   // the in-place stereo downmix converts it anyway
                 const surroundPath = !s.awkSecondaryTrack && s.awkTier === 'surround';   // only a genuine surround track reaches downmix_to_*
                 if (stereoPath || (surroundPath && (downmixToStereo === 'replace' || (ch > 6 && downmixToSix === 'replace')))) continue;
@@ -2438,6 +2427,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return false;
         };
 
+        // candidateStreams: the pool for workStreams. A track earns a place when there is genuinely something to do with it - it is a genuine surround track
+        // (the only kind eligible for downmix_to_six/downmix_to_stereo), or its tier is 'stereo' (the in-place stereo downmix), or codec_force is set, which
+        // must be able to standardize the codec of EVERY track including commentary and unlisted-language ones (e.g. codec_force='all' must touch them all).
+        // Anything with nothing to do is dropped from the pool ('delete'-tier tracks may remain harmlessly - workStreams filters removedIndices).
+        const candidateStreams = codecForce === 'disabled'
+            ? audioStreams.filter(stream => stream.awkTier === 'stereo' || (!stream.awkSecondaryTrack && stream.awkTier === 'surround'))
+            : audioStreams;
         // workStreams: surviving candidates that still need codec work (downmix or force codec).
         const workStreams = candidateStreams
             .filter(s => !removedIndices.has(s.index))
@@ -2494,6 +2490,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     outputAudioIdxMap.set(stream.index, totalOutputAudioBeforeNew++);
             }
         }
+        // Seed extraArguments with removal exclusions before any codec args.
+        if (removedIndices.size > 0) {
+            for (const idx of removedIndices)
+                extraArguments += ` -map -0:${idx}`;
+            convert = true;
+        }
         // ====== END AUDIO INDEX MAPS ======
 
 
@@ -2503,31 +2505,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // leave a stale entry). Keyed by awkRegionKey - the IDENTITY key dedup grouped on, region-distinct only under method_dedup_region=distinct, never the
         // folded match key. Channels 2 = stereo; >4 && <=6 = any 5-6ch primary (5.0/5.1, and the rare 4.1, also 5 channels) but not 4.0 (4ch) or 7.1 (8ch).
         const survivingPrimaryAudio = audioStreams.filter(s => !removedIndices.has(s.index) && !s.awkSecondaryTrack && s.awkTier === 'surround');
-        const existing2chLangs = new Set(survivingPrimaryAudio.filter(s => inStereoBand(s.channels)).map(s => s.awkRegionKey));
-        const existing6chLangs = new Set(survivingPrimaryAudio.filter(s => inSixBand(s.channels)).map(s => s.awkRegionKey));
-
-        // Seed extraArguments with removal exclusions before any codec args.
-        if (removedIndices.size > 0) {
-            for (const idx of removedIndices)
-                extraArguments += ` -map -0:${idx}`;
-            convert = true;
-        }
+        const existingStereoLangs = new Set(survivingPrimaryAudio.filter(s => inStereoBand(s.channels)).map(s => s.awkRegionKey));
+        const existingSixLangs = new Set(survivingPrimaryAudio.filter(s => inSixBand(s.channels)).map(s => s.awkRegionKey));
 
         // New streams added via -map are numbered after all surviving original audio streams.
         let newStreamOutputIdx = totalOutputAudioBeforeNew;
 
         // Create at most one 6ch and one 2ch downmix per language, sourced from that language's best (first, highest-channel/quality) track.
-        const created6chLangs = new Set();
-        const created2chLangs = new Set();
+        const createdSixLangs = new Set();
+        const createdStereoLangs = new Set();
         // "This language already has one" - pre-existing on the file (existing*Langs) OR created earlier this run by a downmix or a remix (created*Langs).
         // ONE definition each, because every site that creates a 6ch or a stereo has to ask the same question: a second same-language track would be a
         // duplicate that dedup only collapses on the NEXT queue pass, or never if dedup is disabled. Both sets are read at call time, so a registration made
         // later in the loop is visible to every later caller.
-        const hasSixForLang = (k) => existing6chLangs.has(k) || created6chLangs.has(k);
-        const hasStereoForLang = (k) => existing2chLangs.has(k) || created2chLangs.has(k);
+        const hasSixForLang = (k) => existingSixLangs.has(k) || createdSixLangs.has(k);
+        const hasStereoForLang = (k) => existingStereoLangs.has(k) || createdStereoLangs.has(k);
         // "This remix must stand down" - ONE spelling of the deferral both remix sites ask about (codec_force, and the loudnorm convergence): no lossless
         // relabel exists, method_layout_err=remix, and the language already has a GENUINE-track stereo, so remixing would only mint a duplicate. Secondary
-        // tracks are excluded on the same rule replace2ch's registerLang states from the other side: the language's stereo slot belongs to main tracks, so a
+        // tracks are excluded on the same rule replaceStereo's registerLang states from the other side: the language's stereo slot belongs to main tracks, so a
         // commentary neither claims it nor is blocked by it. Without that exclusion a secondary is deferred forever - secondaries are never deduplicated, so
         // the duplicate this rule avoids can never be collapsed, and downmix_secondary=stereo already makes one stereo per secondary beside the main one.
         // Takes the ffstream rather than a key so both sites read the same fields off the same object.
@@ -2540,7 +2535,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const { ok, relabel } = opusLayoutFor(s, channels);
             return !ok && !relabel && !remixDefersToExistingStereo(s, relabel) && !containerRefusesAudio(codecStereo);
         };
+        // ====== END DOWNMIX BOOKKEEPING ======
 
+        // ====== OUTPUT TRACKING ======
         // Tracks which OUTPUT audio indices have already received a -c:a:N assignment so we don't emit conflicting codec directives for the same stream.
         const modifiedAudioIdx = new Set();
 
@@ -2548,7 +2545,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // channels, bps} for in-place transcodes/downmixes. appendedAudio: streams added via -map 0:a:N (downmix 'add'), appended after all originals.
         const outputAudioOverride = new Map();
         const appendedAudio = [];
-        // ====== END DOWNMIX BOOKKEEPING ======
+        // ====== END OUTPUT TRACKING ======
 
 
         // ====== LOUDNORM ======
@@ -2565,6 +2562,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const LOUDNORM_TOLERANCE_LU = 1;
         // Shape of a measured value: minus/digits/dot only, the %.2f form the real binary emits ('-21.75', '0.00', '-70.00'). Tested on String(val).
         const LOUDNORM_MEASURED_SHAPE = /^-?\d+(?:\.\d+)?$/;
+        const LOUDNORM_FIELD_LOG_MAX = 40;   // a real measurement is a few characters; anything longer is already the evidence
 
         // Synchronous analysis-only ffmpeg spawn measuring one stream's EBU R128 loudness. Returns { stats } (input_i/input_tp/input_lra/input_thresh/
         // target_offset) or { error } - every failure is reported, never thrown, so the caller decides how to fail the file. The loudnorm JSON logs at
@@ -2604,7 +2602,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const measureLoudness = (srcAudioIdx, preFilter, preset) => {
             const prefetched = loudnormPrefetched.get(loudnormKey(srcAudioIdx, preFilter));
             if (prefetched) return prefetched;
-            const { spawnSync } = require('child_process');
             const args = ['-nostats', '-hide_banner', '-i', file.file, '-map', `0:a:${srcAudioIdx}`, '-af', loudnormAnalysisFilter(preFilter, preset),
                 '-f', 'null', '-'];
             const result = spawnSync(ffmpegPathOf(otherArguments), args,
@@ -2623,16 +2620,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
 
         // Distinct tracks measured by ONE ffmpeg instead of one each: a -map/-af/null output per track, every loudnorm named loudnorm@rN so its block is
-        // tied back by name - the outputs print in no stable order. Measured 2026-10-13 on jellyfin 7.1.4 against a real 737 s TrueHD 7.1 + ac3 + eac3 +
-        // ac3 remux: four tracks took 150-187 s against 299-363 s one by one, from local disk and SMB alike, with byte-identical stats - the outputs
-        // decode and filter in parallel and the file is read once. The SAME track measured twice (a 7.1 and its stereo fold) gained nothing (100-143 s
-        // against 108-144 s), so the downmix / codec_force / remix sites keep one pass each and only the leftovers loop - distinct tracks, all known
-        // before it emits - is batched. A batch that fails in any way measures nothing: each track then takes its own pass, which names the culprit.
-        // Its kill-switch is the sequential total, one per-track budget each under the same cap. LOUDNORM_BATCH_MAX bounds the parallel filter
-        // instances (~217 MB each) to ~1.7 GB.
+        // tied back by name - the outputs print in no stable order. Measured 2026-10-13 on jellyfin 7.1.4 against a real 737 s TrueHD 7.1 + ac3 + eac3 + ac3
+        // remux: four tracks took 150-187 s against 299-363 s one by one, from local disk and SMB alike, with byte-identical stats - the outputs decode and
+        // filter in parallel and the file is read once. The SAME track measured twice (a 7.1 and its stereo fold) gained nothing (100-143 s against 108-144
+        // s), so the downmix / codec_force / remix sites keep one pass each and only the leftovers loop - distinct tracks, all known before it emits - is
+        // batched. A batch that fails in any way measures nothing: each track then takes its own pass, which names the culprit. Its kill-switch is the
+        // sequential total, one per-track budget each under the same cap. LOUDNORM_BATCH_MAX bounds the parallel filter instances (~217 MB each) to ~1.7 GB.
         const LOUDNORM_BATCH_MAX = 8;
         const prefetchLoudness = (srcAudioIdxs, preset) => {
-            const { spawnSync } = require('child_process');
             for (let at = 0; srcAudioIdxs.length - at >= 2; at += LOUDNORM_BATCH_MAX) {
                 const batch = srcAudioIdxs.slice(at, at + LOUDNORM_BATCH_MAX);
                 const args = ['-nostats', '-hide_banner', '-i', file.file];
@@ -2709,7 +2704,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 ['input_thresh', stats.input_thresh], ['target_offset', stats.target_offset]])
                 if (!LOUDNORM_MEASURED_SHAPE.test(String(val)) || !Number.isFinite(Number(val)))
                     failWithBuffers(`${streamTag(streamIndex)}[method_loudnorm=${methodLoudnorm}] malformed loudnorm measurement JSON from the analysis pass `
-                        + `(${field}=${logSafe(String(val), 40)}) - the file may be corrupt or carry crafted metadata; leave method_loudnorm=disabled for it`);
+                        + `(${field}=${logSafe(String(val), LOUDNORM_FIELD_LOG_MAX)}) - the file may be corrupt or carry crafted metadata; leave `
+                        + 'method_loudnorm=disabled for it');
             // loudnorm honours linear=true only while the measured LRA fits the target and linear gain keeps the peak under TP; otherwise it falls back to
             // dynamic mode, which OUTPUTS 192 kHz, and the encoder then picks the supported rate nearest that - native aac (and libfdk_aac, which lists the
             // same rates) take 96 kHz, which many TV and hardware decoders refuse. Measured on jellyfin-ffmpeg 7.1.4: a 48 kHz source at measured_LRA 17
@@ -2805,9 +2801,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             const bps = resolveBitrate(codecStereo, 2);
             return {
-                frag: `${audioEncoder(codecStereo)}${encoderArgsBps(codecStereo, idx, bps)}`, logCodec: codecStereo, rate: `${bps / 1000} kb/s`, label: '',
+                frag: `${audioEncoder(codecStereo)}${encoderArgsBps(codecStereo, idx, bps)}`, logCodec: codecStereo, rate: kbpsToken(bps), label: '',
                 record: { codec: codecStereo, channels: 2, bps },
             };
+        };
+
+        // The 5.1 twin of stereoEnc, for codecSurround (always a fixed rate): the -c:a fragment, the log rate and the output-summary record.
+        const sixEnc = (idx) => {
+            const bps = resolveBitrate(codecSurround, 6);
+            return { frag: `${audioEncoder(codecSurround)}${encoderArgsBps(codecSurround, idx, bps)}`, rate: kbpsToken(bps),
+                record: { codec: codecSurround, channels: 6, bps } };
         };
 
         // Lo/Ro stereo downmix matrices, keyed by EXACT layout, never channel count: several standard layouts share a count but order their channels
@@ -2928,7 +2931,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // 6ch (5.1) channel/filter snippet for a new or replaced 5.1 track, mirroring stereoArg for the surround case: the explicit 5.1 fold (foldFilter -
         // aformat=channel_layouts=5.1 is the matrix -ac 6 uses) ahead of the limiter and of loudnorm's analysis/correction, for the same -ac ordering trap
-        // stereoArg documents. Shared by append6ch and the in-place downmix_to_six 'replace' branch so the two can't drift.
+        // stereoArg documents. Shared by appendSix and the in-place downmix_to_six 'replace' branch so the two can't drift.
         const sixArg = (idx, srcStream) => {
             const fold = foldFilter('5.1', null);
             if (methodLoudnorm === 'disabled') return { arg: ` -filter:a:${idx} "${fold}"`, measured: false, changed: false };
@@ -2951,24 +2954,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // survives in the output: encoder+bitrate+loudnorm, the -c:a/filter/title/-metadata emit, the appendedAudio record, created*Langs registration, and the
         // newStreamOutputIdx/convert bookkeeping. Shared by the downmix_to_six/_stereo 'add' branches AND the layout-drop derivatives so the append sites
         // can't drift. srcCodecStr is the source's display codec at each site; logSuffix carries the layout-drop "(source dropped ...)" note. An appended track
-        // is an unconditional lossy re-encode, so loudnorm always rides it (no guardBlocks - see the callers). append2ch also serves a guarded layout remix:
+        // is an unconditional lossy re-encode, so loudnorm always rides it (no guardBlocks - see the callers). appendStereo also serves a guarded layout remix:
         // `tag` then names the settings behind the add, and `measuredTwo` is the stereoArg that remix already ran to decide whether to add at all.
-        const append6ch = (srcStream, srcAudioIdx, srcCodecStr, srcRateStr, regionKeyVal, logSuffix) => {
+        const appendSix = (srcStream, srcAudioIdx, srcCodecStr, srcRateStr, regionKeyVal, logSuffix) => {
             const newTitle = escMeta(buildTitle(srcStream, '5.1'));
-            const dstBps = resolveBitrate(codecSurround, 6);
-            const dstBitArg = encoderArgsBps(codecSurround, newStreamOutputIdx, dstBps);
+            const enc = sixEnc(newStreamOutputIdx);
             const six = sixArg(newStreamOutputIdx, srcStream);
             workDone += `☐${streamTag(srcStream.index)}[downmix_to_six=${downmixToSix}]${loudnormRideTag(six.changed)} Adding ${codecSurround} 6ch @ `
-                + `${dstBps / 1000} kb/s from ${srcCodecStr} ${srcStream.channels}ch @ ${srcRateStr}${logSuffix}\n`;
-            extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${audioEncoder(codecSurround)}${dstBitArg}${six.arg}`
+                + `${enc.rate} from ${srcCodecStr} ${srcStream.channels}ch @ ${srcRateStr}${logSuffix}\n`;
+            extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${enc.frag}${six.arg}`
                 + `${loudnormRideStamp(newStreamOutputIdx, six.measured, srcStream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
             extraArguments += langMetaArg(newStreamOutputIdx, langForWrite(srcStream));
             newStreamOutputIdx++;
-            appendedAudio.push({ srcStream, codec: codecSurround, channels: 6, bps: dstBps });
-            created6chLangs.add(regionKeyVal);
+            appendedAudio.push({ srcStream, ...enc.record });
+            createdSixLangs.add(regionKeyVal);
             convert = true;
         };
-        const append2ch = (srcStream, srcAudioIdx, srcCodecStr, srcRateStr, regionKeyVal, logSuffix, { tag, measuredTwo } = {}) => {
+        const appendStereo = (srcStream, srcAudioIdx, srcCodecStr, srcRateStr, regionKeyVal, logSuffix, { tag, measuredTwo } = {}) => {
             const newTitle = escMeta(buildTitle(srcStream, '2.0'));
             const enc = stereoEnc(newStreamOutputIdx);
             const two = measuredTwo || stereoArg(newStreamOutputIdx, srcStream);
@@ -2980,23 +2982,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             extraArguments += langMetaArg(newStreamOutputIdx, langForWrite(srcStream));
             newStreamOutputIdx++;
             appendedAudio.push({ srcStream, ...enc.record });
-            created2chLangs.add(regionKeyVal);
+            createdStereoLangs.add(regionKeyVal);
             convert = true;
         };
 
-        // The IN-PLACE twin of append2ch: replace this track with a stereo instead of adding one beside it. Four branches reach it (stereo tier,
+        // The IN-PLACE twin of appendStereo: replace this track with a stereo instead of adding one beside it. Four branches reach it (stereo tier,
         // downmix_to_stereo 'replace', the codec_force opus remix, the loudnorm-leftovers remix) - four copies 300 lines apart would drift. registerLang
-        // claims the language's stereo slot (created2chLangs): every caller passes it for a GENUINE track, none for a secondary one - a commentary must
+        // claims the language's stereo slot (createdStereoLangs): every caller passes it for a GENUINE track, none for a secondary one - a commentary must
         // never occupy the main-language slot, and an unclaimed slot costs the language's surround master at the post-loop consumers (a guard_original
         // track flattened to stereo beside the copy already made from its sibling). Each caller keeps its own workDone line and terminal flag: codec_force
         // sets `forced`, which funnels into convert further down, so setting convert here would change what that branch means.
-        const replace2ch = (srcStream, idx, enc, two, registerLang) => {
-            extraArguments += ` -c:a:${idx} ${enc.frag}${two.arg}${loudnormRideStamp(idx, two.measured, srcStream)}`
-                + ` -metadata:s:a:${idx} "title=${escMeta(buildTitle(srcStream, '2.0'))}"`;
-            extraArguments += langMetaArg(idx, langForWrite(srcStream));
+        // The commit every IN-PLACE re-encode makes: the -c:a:N fragment, the output index marked modified (so the leftovers loop never emits a second
+        // -c:a:N for it - ffmpeg honours the last, and the earlier operation would silently vanish) and its predicted output recorded.
+        const replaceInPlace = (idx, frag, record) => {
+            extraArguments += ` -c:a:${idx} ${frag}`;
             modifiedAudioIdx.add(idx);
-            outputAudioOverride.set(idx, enc.record);
-            if (registerLang) created2chLangs.add(registerLang);
+            outputAudioOverride.set(idx, record);
+        };
+        const replaceStereo = (srcStream, idx, enc, two, registerLang) => {
+            replaceInPlace(idx, `${enc.frag}${two.arg}${loudnormRideStamp(idx, two.measured, srcStream)}`
+                + ` -metadata:s:a:${idx} "title=${escMeta(buildTitle(srcStream, '2.0'))}"`, enc.record);
+            extraArguments += langMetaArg(idx, langForWrite(srcStream));
+            if (registerLang) createdStereoLangs.add(registerLang);
         };
         // ====== END ENCODE ARG BUILDERS ======
 
@@ -3049,7 +3056,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     workDone += `☐${streamTag(ffstream.index)}[${tierTag}]${loudnormRideTag(two.changed)} Transcoding ${ffstreamCodec} ${ffstreamChannels}ch `
                         + `@ ${srcRateStr} → ${enc.logCodec} stereo @ ${enc.rate} (${enc.label ? `${enc.label}, ` : ''}`
                         + `${ffstream.awkSecondaryTrack ? 'secondary' : 'stereo tier'})\n`;
-                    replace2ch(ffstream, outputAudioIdx, enc, two, ffstream.awkSecondaryTrack ? '' : ffstreamRegionKey);
+                    replaceStereo(ffstream, outputAudioIdx, enc, two, ffstream.awkSecondaryTrack ? '' : ffstreamRegionKey);
                     convert = true;
                 }
                 // ====== END STEREO TIER: DOWNMIX IN PLACE ======
@@ -3066,24 +3073,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const sixMode = (downmixToSix === 'replace' && guardBlocks(ffstream, codecSurround, 6, ffstreamChannels)) ? 'add' : downmixToSix;
 
                     if (sixMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
-                        // The add path builds its own title inside append6ch, so the title (like the bitrate) is resolved only on the branch that emits it.
+                        // The add path builds its own title inside appendSix, so the title (like the bitrate) is resolved only on the branch that emits it.
                         const newTitle = escMeta(buildTitle(ffstream, '5.1'));
-                        const dstBps = resolveBitrate(codecSurround, 6);
-                        const dstBitArg = encoderArgsBps(codecSurround, outputAudioIdx, dstBps);
+                        const enc = sixEnc(outputAudioIdx);
                         // guardBlocks already passed for sixMode==='replace' (loudnorm rides on that guarantee - see stereoArg above); sixArg builds the
                         // 5.1 fold snippet (foldFilter).
                         const six = sixArg(outputAudioIdx, ffstream);
                         workDone += `☐${streamTag(ffstream.index)}[downmix_to_six=${downmixToSix}]${loudnormRideTag(six.changed)} Transcoding `
-                            + `${ffstreamCodec} ${ffstreamChannels}ch @ ${srcRateStr} → ${codecSurround} 6ch @ ${dstBps / 1000} kb/s\n`;
-                        extraArguments += ` -c:a:${outputAudioIdx} ${audioEncoder(codecSurround)}${dstBitArg}${six.arg}`
-                            + `${loudnormRideStamp(outputAudioIdx, six.measured, ffstream)} -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`;
+                            + `${ffstreamCodec} ${ffstreamChannels}ch @ ${srcRateStr} → ${codecSurround} 6ch @ ${enc.rate}\n`;
+                        replaceInPlace(outputAudioIdx, `${enc.frag}${six.arg}${loudnormRideStamp(outputAudioIdx, six.measured, ffstream)}`
+                            + ` -metadata:s:a:${outputAudioIdx} "title=${newTitle}"`, enc.record);
                         extraArguments += langMetaArg(outputAudioIdx, writeLang);
-                        modifiedAudioIdx.add(outputAudioIdx);
-                        outputAudioOverride.set(outputAudioIdx, { codec: codecSurround, channels: 6, bps: dstBps });
-                        created6chLangs.add(ffstreamRegionKey);
+                        createdSixLangs.add(ffstreamRegionKey);
                         convert = true;
                     } else if (sixMode === 'add') {
-                        append6ch(ffstream, srcAudioIdx, ffstreamCodec, srcRateStr, ffstreamRegionKey, '');
+                        appendSix(ffstream, srcAudioIdx, ffstreamCodec, srcRateStr, ffstreamRegionKey, '');
                     }
                 }
                 // ====== END DOWNMIX TO 6 CHANNELS ======
@@ -3100,19 +3104,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         + `${wallText(codecStereo)}; ${wallRemedy('codec_stereo')}\n`;
                     walledOps += 1;
                 } else if (downmixToStereo !== 'disabled' && ffstreamChannels > 2 && !hasStereoForLang(ffstreamRegionKey)) {
-                    const twoMode = (downmixToStereo === 'replace' && guardBlocks(ffstream, codecStereo, 2, ffstreamChannels)) ? 'add' : downmixToStereo;
+                    const stereoMode = (downmixToStereo === 'replace' && guardBlocks(ffstream, codecStereo, 2, ffstreamChannels)) ? 'add' : downmixToStereo;
 
-                    if (twoMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
+                    if (stereoMode === 'replace' && !modifiedAudioIdx.has(outputAudioIdx)) {
                         // Downmix source is surround; its bitrate describes N channels not 2, so stereoEnc uses the 2ch target (as in the stereo tier above).
                         const enc = stereoEnc(outputAudioIdx);
                         const two = stereoArg(outputAudioIdx, ffstream);
                         workDone += `☐${streamTag(ffstream.index)}[downmix_to_stereo=${downmixToStereo}]${loudnormRideTag(two.changed)} Transcoding `
                             + `${ffstreamCodec} ${ffstreamChannels}ch @ ${srcRateStr} → ${enc.logCodec} stereo @ ${enc.rate}`
                             + `${enc.label ? ` (${enc.label})` : ''}\n`;
-                        replace2ch(ffstream, outputAudioIdx, enc, two, ffstreamRegionKey);
+                        replaceStereo(ffstream, outputAudioIdx, enc, two, ffstreamRegionKey);
                         convert = true;
-                    } else if (twoMode === 'add' || (twoMode === 'replace' && modifiedAudioIdx.has(outputAudioIdx))) {
-                        append2ch(ffstream, srcAudioIdx, ffstreamCodec, srcRateStr, ffstreamRegionKey, '');
+                    } else if (stereoMode === 'add' || (stereoMode === 'replace' && modifiedAudioIdx.has(outputAudioIdx))) {
+                        appendStereo(ffstream, srcAudioIdx, ffstreamCodec, srcRateStr, ffstreamRegionKey, '');
                     }
                 }
 
@@ -3189,7 +3193,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // The remix drops channels, so it is judged against the stereo it emits, not the opus it can't: a track guard_quality protects
                             // keeps its channels and source codec, and the codec_stereo stereo is ADDED beside it - a downmix 'replace' becoming 'add'. The
                             // added stereo takes the language's stereo slot, so the next run's remix defers to it and the file settles.
-                            append2ch(ffstream, srcAudioIdx, ffstreamCodec, srcRateStr, ffstreamRegionKey,
+                            appendStereo(ffstream, srcAudioIdx, ffstreamCodec, srcRateStr, ffstreamRegionKey,
                                 ` (${layoutName}, opus-incompatible; the source is kept as ${ffstreamCodec})`,
                                 { tag: `[method_layout_err=${methodLayoutErr}][guard_quality=${guardQuality}]` });
                             forced = true;
@@ -3202,8 +3206,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             workDone += `☐${streamTag(ffstream.index)}[method_layout_err=${methodLayoutErr}]${loudnormRideTag(two.changed)} Remixing `
                                 + `${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} (${layoutName}, opus-incompatible) → ${enc.logCodec} stereo @ `
                                 + `${enc.rate}${enc.label ? ` (${enc.label})` : ''}\n`;
-                            // registers the remix-created stereo so a later same-language downmix / remix defers to it
-                            replace2ch(ffstream, outputAudioIdx, enc, two, ffstream.awkSecondaryTrack ? '' : ffstreamRegionKey);
+                            replaceStereo(ffstream, outputAudioIdx, enc, two, ffstream.awkSecondaryTrack ? '' : ffstreamRegionKey);
                             forced = true;
                         } else if (targetCodec === 'aac_vbr') {
                             // aac_vbr stereo force: aacVbrArgsIdx picks this node's best VBR AAC encoder, at its leaner tier for a low-bitrate source.
@@ -3214,10 +3217,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             const aacVbrLoud = loudnormFilterArg(outputAudioIdx, srcAudioIdx, ffstream.index);
                             workDone += `☐${streamTag(ffstream.index)}[codec_force=${codecForce}]${loudnormRideTag(aacVbrLoud.changed)} Transcoding `
                                 + `${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → aac ${forceChannels}ch @ ${approxRate} (${label})\n`;
-                            extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args}${aacVbrLoud.arg}`
-                                + `${loudnormRideStamp(outputAudioIdx, aacVbrLoud.measured, ffstream)}`;
-                            modifiedAudioIdx.add(outputAudioIdx);
-                            outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels: forceChannels, bps: 0, approxRate });
+                            replaceInPlace(outputAudioIdx, `${encoder}${args}${aacVbrLoud.arg}`
+                                + `${loudnormRideStamp(outputAudioIdx, aacVbrLoud.measured, ffstream)}`,
+                                { codec: 'aac', channels: forceChannels, bps: 0, approxRate });
                             forced = true;
                         } else {
                             // Same channel count, codec swap - optionally a LOSSLESS opus relabel (5.0(side)→5.0 via channelmap, keeps all channels).
@@ -3233,11 +3235,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             const dstBitArg = encoderArgsBps(targetCodec, outputAudioIdx, dstBps);
                             workDone += `☐${streamTag(ffstream.index)}[codec_force=${codecForce}]${loudnormRideTag(forceLoud.changed)} Transcoding `
                                 + `${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → ${targetCodec} ${forceChannels}ch @ `
-                                + `${dstBps / 1000} kb/s${note}\n`;
-                            extraArguments += ` -c:a:${outputAudioIdx} ${audioEncoder(targetCodec)}${dstBitArg}${forceLoud.arg}`
-                                + `${loudnormRideStamp(outputAudioIdx, forceLoud.measured, ffstream)}`;
-                            modifiedAudioIdx.add(outputAudioIdx);
-                            outputAudioOverride.set(outputAudioIdx, { codec: targetCodec, channels: forceChannels, bps: dstBps });
+                                + `${kbpsToken(dstBps)}${note}\n`;
+                            replaceInPlace(outputAudioIdx, `${audioEncoder(targetCodec)}${dstBitArg}${forceLoud.arg}`
+                                + `${loudnormRideStamp(outputAudioIdx, forceLoud.measured, ffstream)}`,
+                                { codec: targetCodec, channels: forceChannels, bps: dstBps });
                             forced = true;
                         }
                         if (forced) convert = true;
@@ -3251,7 +3252,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // A source the layout-drop pre-pass removed (un-writable opus surround, method_layout_err=drop) may have been the sole source its language's downmix
         // would have derived from. The source is correctly gone, but the derivative the user configured must still be created - from the ORIGINAL input stream
         // via -map 0:a:N, appended like any downmix add. Only create it when the language didn't otherwise get one this run (created*Langs) or already have one
-        // among survivors (existing*Langs), so a redundant dropped source produces nothing. Each derivative goes through append6ch/append2ch, so its title,
+        // among survivors (existing*Langs), so a redundant dropped source produces nothing. Each derivative goes through appendSix/appendStereo, so its title,
         // codec, fold and loudnorm match the add branches; the new tracks are opus-safe (stereo -> codec_stereo; the 5.1 fold yields a 5.1 layout).
         for (const s of layoutDroppedDeriveSources) {
             const regionKey = s.awkRegionKey;
@@ -3261,11 +3262,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const srcCodec = codecNameOf(s) || 'unknown';
             // 5.1 derivative from a >6ch source (downmix_to_six), when the language still lacks one.
             if (s.channels > 6 && downmixToSix !== 'disabled' && !hasSixForLang(regionKey)) {
-                append6ch(s, srcAudioIdx, srcCodec, srcRateStr, regionKey, " (source dropped - libopus can't encode its layout)");
+                appendSix(s, srcAudioIdx, srcCodec, srcRateStr, regionKey, " (source dropped - libopus can't encode its layout)");
             }
             // Stereo derivative (downmix_to_stereo), when the language still lacks one.
             if (downmixToStereo !== 'disabled' && !hasStereoForLang(regionKey)) {
-                append2ch(s, srcAudioIdx, srcCodec, srcRateStr, regionKey, " (source dropped - libopus can't encode its layout)");
+                appendStereo(s, srcAudioIdx, srcCodec, srcRateStr, regionKey, " (source dropped - libopus can't encode its layout)");
             }
         }
         // ====== END LAYOUT-DROP DOWNMIX DERIVATIVES ======
@@ -3301,12 +3302,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     && !(folds && aacFamily(c) === 'opus' ? guardRefusesAnyEncode(ffstream) : guardBlocks(ffstream, c, channels, channels));
                 const wantCodec = forceCovers(isStereo, channels) ? configuredCodec : keepCodec;
                 let targetCodec = reachable(wantCodec) ? wantCodec : (reachable(keepCodec) ? keepCodec : null);
-                const opusWalled = (c) => {
+                const opusLayoutBlocked = (c) => {
                     if (aacFamily(c) !== 'opus' || channels <= 2 || ffstreamCodec === 'opus') return false;
                     const { ok, relabel } = opusLayoutFor(ffstream, channels);
                     return !ok && !relabel && !folds;
                 };
-                if (targetCodec !== null && targetCodec !== keepCodec && opusWalled(targetCodec) && reachable(keepCodec) && !opusWalled(keepCodec)) {
+                if (targetCodec !== null && targetCodec !== keepCodec && opusLayoutBlocked(targetCodec) && reachable(keepCodec)
+                    && !opusLayoutBlocked(keepCodec)) {
                     targetCodec = keepCodec;
                 }
                 return { targetCodec, keepCodec, configuredCodec, isStereo };
@@ -3402,7 +3404,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                                 continue;
                             }
                             if (guarded) {
-                                append2ch(ffstream, srcAudioIdx, ffstreamCodec, srcRateToken(ffstream), ffstream.awkRegionKey,
+                                appendStereo(ffstream, srcAudioIdx, ffstreamCodec, srcRateToken(ffstream), ffstream.awkRegionKey,
                                     ` (libopus can't encode its ${lay || `${channels}ch`} layout; the source is kept un-normalized as ${ffstreamCodec})`,
                                     { tag: `[method_layout_err=${methodLayoutErr}][guard_quality=${guardQuality}]`, measuredTwo: two });
                                 continue;
@@ -3411,8 +3413,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${ffstreamCodec} ${channels}ch → `
                                 + `${enc.logCodec} stereo @ ${enc.rate} (${enc.label ? `${enc.label}; ` : ''}remixed - libopus can't encode a `
                                 + `${lay || `${channels}ch`} layout)\n`;
-                            // registers the remix-created stereo so a later same-language downmix / remix defers to it
-                            replace2ch(ffstream, outputAudioIdx, enc, two, ffstream.awkSecondaryTrack ? '' : ffstream.awkRegionKey);
+                            replaceStereo(ffstream, outputAudioIdx, enc, two, ffstream.awkSecondaryTrack ? '' : ffstream.awkRegionKey);
                             convert = true;
                             continue;
                         } else {
@@ -3444,9 +3445,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const { encoder, args, approxRate, label } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true, channels);
                     workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${ffstreamCodec} ${channels}ch → aac `
                         + `${channels}ch @ ${approxRate} (${label})\n`;
-                    extraArguments += ` -c:a:${outputAudioIdx} ${encoder}${args} -filter:a:${outputAudioIdx} "${filter}"${loudnormStampArg(outputAudioIdx)}`;
-                    modifiedAudioIdx.add(outputAudioIdx);
-                    outputAudioOverride.set(outputAudioIdx, { codec: 'aac', channels, bps: 0, approxRate });
+                    replaceInPlace(outputAudioIdx, `${encoder}${args} -filter:a:${outputAudioIdx} "${filter}"${loudnormStampArg(outputAudioIdx)}`,
+                        { codec: 'aac', channels, bps: 0, approxRate });
                 } else {
                     // Format in == format out (the plain loudnorm case, and codec_force aimed at the codec the track already uses): match the source rate
                     // rather than re-deriving a ladder target, which would re-encode a 192k mono aac at the 160k aac ceiling and build in a loss nobody
@@ -3458,11 +3458,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const srcRateStr = srcRateToken(ffstream);
                     const note = sameFormat ? (matchedBps ? ' (source rate matched)' : '') : ` (converged from ${ffstreamCodec})`;
                     workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${ffstreamCodec} ${channels}ch @ ${srcRateStr} → `
-                        + `${targetCodec} ${channels}ch @ ${dstBps / 1000} kb/s${note}\n`;
-                    extraArguments += ` -c:a:${outputAudioIdx} ${audioEncoder(targetCodec)}${dstBitArg} -filter:a:${outputAudioIdx} "${filter}"`
-                        + `${loudnormStampArg(outputAudioIdx)}`;
-                    modifiedAudioIdx.add(outputAudioIdx);
-                    outputAudioOverride.set(outputAudioIdx, { codec: targetCodec, channels, bps: dstBps });
+                        + `${targetCodec} ${channels}ch @ ${kbpsToken(dstBps)}${note}\n`;
+                    replaceInPlace(outputAudioIdx, `${audioEncoder(targetCodec)}${dstBitArg} -filter:a:${outputAudioIdx} "${filter}"`
+                        + `${loudnormStampArg(outputAudioIdx)}`, { codec: targetCodec, channels, bps: dstBps });
                 }
                 convert = true;
             }
@@ -3535,7 +3533,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return response;
     } catch (err) {
         flushBuffers();        // an unexpected bug must not swallow the diagnostics either - see failWithBuffers above
-        failUnexpected(err);   // AwkFailFile → rethrow unchanged; anything else → annotate + fail the file with the full infoLog
+        failUnexpected(err);
     }
 };
 module.exports.details = details;
