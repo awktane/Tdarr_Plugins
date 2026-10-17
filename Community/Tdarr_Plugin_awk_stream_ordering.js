@@ -18,7 +18,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same
         job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. A
         later job on that file is checked in full again. This check is always on and has no setting.\n`,
-    Version: '4.999.40',
+    Version: '4.999.41',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -301,7 +301,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (18 sections: stream codec type … mp4 strict compliance arg)
+    // #region SHARED helpers (19 sections: stream codec type … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -650,6 +650,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const noMuxerSkipLine = (container) => `☒A .${container} file has no ffmpeg muxer that can write it back - left untouched; remux it to mkv or mp4 first`
         + ' (clean_and_remux does that)\n';
     // ===== END SHARED: output muxer =====
+    // ===== SHARED [audio_clean, stream_ordering]: mka cover-art refusal =====
+    // -=-=-= mkaCarriesCoverArt + mkaCoverArtSkipLine  [audio_clean, stream_ordering] =-=-=-
+    // An .mka with cover art is left untouched by audio_clean and stream_ordering alike. Production ffprobe (jellyfin 7.1.4) reports Matroska's image
+    // attachment as an attached_pic VIDEO stream - video/mjpeg, avg_frame_rate 0/0, probed last - and no ffmpeg remux keeps it an attachment: -c copy
+    // writes it back as a real V_MJPEG video TRACK (measured with and without -disposition attached_pic), after which Tdarr reads the music file as a
+    // video and clean_and_remux renames it to .mkv. So any video-typed stream in an .mka is cover art, and both plugins refuse it with the same words.
+    const mkaCarriesCoverArt = (container, streams) => container === 'mka' && (streams || []).some((s) => codecTypeOf(s) === 'video');
+    const mkaCoverArtSkipLine = '☒[mka] This .mka carries cover art, and any remux would turn it into a video track - left untouched\n';
+    // ===== END SHARED: mka cover-art refusal =====
 
     // ===== SHARED [audio_clean, stream_ordering]: audio codec scoring =====
     // -=-=-= codecInfo  [audio_clean, stream_ordering] =-=-=-
@@ -1194,18 +1203,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // and a multi-track .mka still wants order_language/order_codec and the sole-default normalisation. mka ONLY, and the reason is cover art. Every other
     // audio container carries it as an attached_pic VIDEO stream, which TYPE_ORDER ranks 0: it would be hoisted above the music to become track 0, and a music
     // file whose first track is a JPEG reads as a video to taggers and media servers. Excluding them is what lets the comparator stay untouched, so none of
-    // this can reach a video file. An .mka is no exception once it HAS cover art: production ffprobe (jellyfin 7.1.4) reports Matroska's image attachment the
-    // same way - video/mjpeg, attached_pic, avg_frame_rate 0/0, probed last - and no ffmpeg remux keeps it an attachment: -c copy writes it back as a real
-    // V_MJPEG video TRACK (measured with and without -disposition attached_pic), which Tdarr then classifies as a video and clean_and_remux renames to .mkv. So
-    // an .mka with any video-typed stream is left untouched, and says why.
+    // this can reach a video file. An .mka is no exception once it HAS cover art, which no ffmpeg remux keeps as an attachment (mkaCarriesCoverArt has the
+    // measurement), so an .mka with any video-typed stream is left untouched, and says why.
     if (file.fileMedium !== 'video' && !(file.fileMedium === 'audio' && dstContainer === 'mka')) {
         if (file.fileMedium === 'audio')
             return skip(`☑[${dstContainer || 'none'}] Audio-only file - only mka is reordered, since every other audio container carries cover art as a `
                 + 'video stream that would be ordered ahead of the audio\n');
         return skip('☑File is not a video\n');
     }
-    if (file.fileMedium === 'audio' && (file.ffProbeData?.streams || []).some((s) => codecTypeOf(s) === 'video')) {
-        return skip('☒[mka] This .mka carries cover art, and any remux would turn it into a video track - left untouched\n');
+    if (file.fileMedium === 'audio' && mkaCarriesCoverArt(dstContainer, file.ffProbeData?.streams)) {
+        return skip(mkaCoverArtSkipLine);
     }
     if (outputMuxerArg(dstContainer) === null) return skip(noMuxerSkipLine(dstContainer));   // an extension no muxer writes back (outputMuxerArg)
 

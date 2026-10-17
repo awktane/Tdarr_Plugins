@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.63',
+    Version: '4.999.64',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -546,7 +546,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (19 sections: stream codec type … mp4 strict compliance arg)
+    // #region SHARED helpers (20 sections: stream codec type … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -895,6 +895,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const noMuxerSkipLine = (container) => `☒A .${container} file has no ffmpeg muxer that can write it back - left untouched; remux it to mkv or mp4 first`
         + ' (clean_and_remux does that)\n';
     // ===== END SHARED: output muxer =====
+    // ===== SHARED [audio_clean, stream_ordering]: mka cover-art refusal =====
+    // -=-=-= mkaCarriesCoverArt + mkaCoverArtSkipLine  [audio_clean, stream_ordering] =-=-=-
+    // An .mka with cover art is left untouched by audio_clean and stream_ordering alike. Production ffprobe (jellyfin 7.1.4) reports Matroska's image
+    // attachment as an attached_pic VIDEO stream - video/mjpeg, avg_frame_rate 0/0, probed last - and no ffmpeg remux keeps it an attachment: -c copy
+    // writes it back as a real V_MJPEG video TRACK (measured with and without -disposition attached_pic), after which Tdarr reads the music file as a
+    // video and clean_and_remux renames it to .mkv. So any video-typed stream in an .mka is cover art, and both plugins refuse it with the same words.
+    const mkaCarriesCoverArt = (container, streams) => container === 'mka' && (streams || []).some((s) => codecTypeOf(s) === 'video');
+    const mkaCoverArtSkipLine = '☒[mka] This .mka carries cover art, and any remux would turn it into a video track - left untouched\n';
+    // ===== END SHARED: mka cover-art refusal =====
     // ===== SHARED [audio_clean, stream_ordering]: audio codec scoring =====
     // -=-=-= codecInfo  [audio_clean, stream_ordering] =-=-=-
     // Codec quality weights + bitrate thresholds for picking the best track (audioQuality). Three row shapes, each field one job:
@@ -1953,11 +1962,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 + `${AUDIO_MEDIUM_CONTAINERS.join('/')} hold several audio streams of any codec\n`);
         return skip('☑File is not a video\n');
     }
-    // An .mka with cover art is left alone: production ffprobe (jellyfin 7.1.4) reports Matroska's image attachment as an attached_pic VIDEO stream, and no
-    // ffmpeg remux keeps it an attachment - -c copy writes it back as a real V_MJPEG video track (measured with and without -disposition attached_pic),
-    // after which Tdarr reads the music file as a video and clean_and_remux renames it to .mkv. stream_ordering leaves it alone for the same reason.
-    if (file.fileMedium === 'audio' && dstContainer === 'mka' && file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'video')) {
-        return skip('☒[mka] This .mka carries cover art, and any remux would turn it into a video track - left untouched\n');
+    // An .mka with cover art is left alone, as stream_ordering leaves it (mkaCarriesCoverArt has the measurement).
+    if (file.fileMedium === 'audio' && mkaCarriesCoverArt(dstContainer, file.ffProbeData.streams)) {
+        return skip(mkaCoverArtSkipLine);
     }
 
     if (outputMuxerArg(dstContainer) === null) return skip(noMuxerSkipLine(dstContainer));   // an extension no muxer writes back (outputMuxerArg)
