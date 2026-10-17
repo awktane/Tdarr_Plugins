@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.75',
+    Version: '3.999.76',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -3728,15 +3728,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const wantDisp = new Set(f.disp);
             if (cur?.disposition?.default === 1) wantDisp.add('default');
             const sameDisp = sameDispositions(curDisp, wantDisp);
-            if (curTitle === (f.title || '') && langKey(resolveLang(cur) || 'und') === langKey(f.lang || 'und') && sameDisp) continue;
-            const named = [logSafe(f.lang), logSafe(f.title), ...f.disp].filter(Boolean).join(' ');
+            // A name's 'und' is no opinion either: it only says the track had no language tag when extract named the sidecar. Read as an instruction it
+            // took back the language clean_and_remux's language_fill had since given the track, and the two plugins re-tagged it back and forth on every
+            // cycle - different presets, so Tdarr's repeat guard never stopped it. A name can set or change a real language, never erase one; zxx and mul
+            // stay instructions, since a user renames to those on purpose.
+            const nameLang = langKey(f.lang || 'und') === 'und' ? '' : f.lang;
+            const wantLang = nameLang || resolveLang(cur) || 'und';
+            if (curTitle === (f.title || '') && langKey(resolveLang(cur) || 'und') === langKey(wantLang) && sameDisp) continue;
+            const named = [logSafe(nameLang), logSafe(f.title), ...f.disp].filter(Boolean).join(' ');
             if (metadataMode !== 'sidecar') {
                 response.infoLog += `☒${streamTag(at)}[method_import_metadata=${metadataMode}] The sidecar name and the embedded track disagree on metadata `
                     + `- keeping the track's own (name: ${named})\n`;
                 continue;
             }
             const outIdx = keptSubs.findIndex((s) => s.index === at);   // position among the SURVIVING subtitle streams (see retagArgs)
-            retuneMeta += retagOne(outIdx, f.lang, f.title, [...wantDisp]);   // an empty Set spreads to an empty array, so the '0' sentinel still applies
+            retuneMeta += retagOne(outIdx, wantLang, f.title, [...wantDisp]);   // an empty Set spreads to an empty array, so the '0' sentinel still applies
             retunedAt.add(at);
             response.infoLog += `☐${streamTag(at)}[method_import_metadata=sidecar] Retagging the track already in the file from ${f.rel} (${
                 named || 'no language, title or flags'})\n`;
