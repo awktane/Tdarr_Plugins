@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.56',
+    Version: '3.999.57',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1879,9 +1879,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The screen-capture rows stop at those that reach a real library (Flash screencasts, Camtasia recordings, DOSBox and Fraps captures): tscc2 is TechSmith's
     // LOSSY second generation, and the remote-desktop family (rscc, mwsc, rasc, srgc, scpr, vmnc, mss1/mss2/msa1) is recorder-internal rather than a library
     // file, several of them lossy hybrids in any case.
+    // The uncompressed rows include the Avid Media Composer (avui, avrp), QuickTime (012v, yuv4) and capture-card (m101, frwu, targa_y216) layouts.
     const LOSSLESS_VIDEO_CODECS = ['ffv1', 'huffyuv', 'ffvhuff', 'hymt', 'magicyuv', 'utvideo', 'lagarith', 'sheervideo', 'prores', 'dnxhd', 'cfhd',
-        'cllc', 'zlib', 'mszh', 'jpeg2000', 'jpegls', 'qtrle', 'msrle', 'flashsv', 'flashsv2', 'tscc', 'zmbv', 'fraps',
-        'rawvideo', 'v210', 'v210x', 'v410', 'v408', 'v308', 'y41p', 'r210', 'r10k'];
+        'cllc', 'zlib', 'mszh', 'jpeg2000', 'jpegls', 'loco', 'vble', 'ylc', 'zerocodec',
+        'qtrle', 'msrle', 'flashsv', 'flashsv2', 'tscc', 'zmbv', 'fraps',
+        'rawvideo', 'v210', 'v210x', 'v410', 'v408', 'v308', 'y41p', 'r210', 'r10k', '012v', 'avrp', 'avui', 'bitpacked', 'yuv4', 'm101', 'frwu',
+        'targa_y216'];
 
     // Efficiency rank for shrink's never-downgrade rule: vp9~hevc and vp8~h264, so an efficient WebM/VP source isn't "upgraded" to a less-efficient
     // codec; a genuinely-legacy codec (mpeg2/vc1/xvid, absent here) ranks below every target via the `|| 0` fallback, so old-codec -> h264 stays a valid
