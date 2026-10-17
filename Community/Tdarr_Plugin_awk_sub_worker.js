@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.79',
+    Version: '3.999.80',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -692,12 +692,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const resolveStreamBitrate = (ffstream) => {
         const ffBitrate = Number(ffstream.bit_rate || 0);
         if (ffBitrate > 0) return ffBitrate;
-        const ffmedia = mediaInfoFor(ffstream);
-        if (!ffmedia) return 0;
-        const measured = Number(ffmedia.BitRate || 0) || Number(ffmedia.BitRate_Nominal || 0);
+        const mi = mediaInfoFor(ffstream);
+        if (!mi) return 0;
+        const measured = Number(mi.BitRate || 0) || Number(mi.BitRate_Nominal || 0);
         if (measured > 0) return measured;
-        const size = Number(ffmedia.StreamSize || 0);
-        const dur = Number(ffmedia.Duration || 0);
+        const size = Number(mi.StreamSize || 0);
+        const dur = Number(mi.Duration || 0);
         if (size > 0 && dur > 0) {
             const bps = Math.round((size * 8) / dur);
             // clamp to a plausible audio range so a stray unit (ms Duration, etc.) or corrupt size can't inject garbage
@@ -725,10 +725,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const resolveChannels = (ffstream) => {
         const ff = Number(ffstream.channels || 0);
         if (ff > 0) return ff;
-        const ffmedia = mediaInfoFor(ffstream);
-        const miChannels = Number(ffmedia?.Channels || 0);
+        const mi = mediaInfoFor(ffstream);
+        const miChannels = Number(mi?.Channels || 0);
         if (miChannels > 0) return miChannels;
-        return channelsFromLayout(resolveChannelLayout(ffstream, ffmedia));
+        return channelsFromLayout(resolveChannelLayout(ffstream, mi));
     };
 
     // -=-=-= enrichStream [all five] =-=-=-
@@ -929,8 +929,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // the -c copy plugins' `-strict unofficial` (mp4StrictArg) and the summariseStream dv token. video_clean's guard_dv ENCODE routing deliberately uses
     // the NARROWER dvSignal instead - libx265 -dolbyvision hard-requires a real RPU (see the note there). Pass the stream's paired mediaInfo
     // (mediaInfoFor(stream)); a single-probe false negative would silently lose the boxes.
-    const isDolbyVisionVideo = (ffstream, ffmedia) => DV_FOURCC_RE.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
-        || String(ffmedia?.HDR_Format || ffmedia?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
+    const isDolbyVisionVideo = (ffstream, mi) => DV_FOURCC_RE.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
+        || String(mi?.HDR_Format || mi?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : [])
             .some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
@@ -3439,7 +3439,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (unmappedMode === 'text_file') {
                 // No directory access at all here, so the list IS the discovery: each name is fetched from the server by path, and so is the list itself
                 // (see downloadLibraryFile for why it has to sit at a name we can compute).
-                        const listDest = serverSidePath(path.join(libDir, subtitleListName));
+                const listDest = serverSidePath(path.join(libDir, subtitleListName));
                 if (!listDest) {
                     failFile(`[method_unmapped=text_file] No path translator maps ${libDir} back to the server, so ${subtitleListName} cannot be `
                         + 'fetched');

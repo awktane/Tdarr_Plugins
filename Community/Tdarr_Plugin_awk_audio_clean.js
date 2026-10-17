@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.64',
+    Version: '4.999.65',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1096,12 +1096,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const resolveStreamBitrate = (ffstream) => {
         const ffBitrate = Number(ffstream.bit_rate || 0);
         if (ffBitrate > 0) return ffBitrate;
-        const ffmedia = mediaInfoFor(ffstream);
-        if (!ffmedia) return 0;
-        const measured = Number(ffmedia.BitRate || 0) || Number(ffmedia.BitRate_Nominal || 0);
+        const mi = mediaInfoFor(ffstream);
+        if (!mi) return 0;
+        const measured = Number(mi.BitRate || 0) || Number(mi.BitRate_Nominal || 0);
         if (measured > 0) return measured;
-        const size = Number(ffmedia.StreamSize || 0);
-        const dur = Number(ffmedia.Duration || 0);
+        const size = Number(mi.StreamSize || 0);
+        const dur = Number(mi.Duration || 0);
         if (size > 0 && dur > 0) {
             const bps = Math.round((size * 8) / dur);
             // clamp to a plausible audio range so a stray unit (ms Duration, etc.) or corrupt size can't inject garbage
@@ -1129,10 +1129,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const resolveChannels = (ffstream) => {
         const ff = Number(ffstream.channels || 0);
         if (ff > 0) return ff;
-        const ffmedia = mediaInfoFor(ffstream);
-        const miChannels = Number(ffmedia?.Channels || 0);
+        const mi = mediaInfoFor(ffstream);
+        const miChannels = Number(mi?.Channels || 0);
         if (miChannels > 0) return miChannels;
-        return channelsFromLayout(resolveChannelLayout(ffstream, ffmedia));
+        return channelsFromLayout(resolveChannelLayout(ffstream, mi));
     };
 
     // -=-=-= enrichStream [all five] =-=-=-
@@ -1385,8 +1385,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // the -c copy plugins' `-strict unofficial` (mp4StrictArg) and the summariseStream dv token. video_clean's guard_dv ENCODE routing deliberately uses
     // the NARROWER dvSignal instead - libx265 -dolbyvision hard-requires a real RPU (see the note there). Pass the stream's paired mediaInfo
     // (mediaInfoFor(stream)); a single-probe false negative would silently lose the boxes.
-    const isDolbyVisionVideo = (ffstream, ffmedia) => DV_FOURCC_RE.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
-        || String(ffmedia?.HDR_Format || ffmedia?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
+    const isDolbyVisionVideo = (ffstream, mi) => DV_FOURCC_RE.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
+        || String(mi?.HDR_Format || mi?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : [])
             .some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
@@ -2281,7 +2281,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // One place that answers "what does opus make of this layout?": the normalised layout string, whether libopus accepts it, its lossless relabel (null if
         // none) and that relabel's channelmap pre-filter ('' if none). The layout-drop pre-pass, the codec_force opus branch and the loudnorm
         // convergence-to-opus path each ask a different downstream question of the same verdict, so a new OPUS_RELABEL entry or a normalisation change lands in
-        // one spot instead of three.
+        // one spot instead of three. It reads ffprobe's channel_layout RAW, never the both-probe resolveChannelLayout: these tables are keyed on libavutil's
+        // spellings - the layout ffmpeg itself assigns on decode, which is what libopus sees - while MediaInfo spells the same 5.1(side) "L R C LFE Ls Rs"
+        // (Tdarr's mediainfo.js 0.2.0, measured 2026-10-17), which would miss every table and wall off a track libopus accepts. An absent layout takes
+        // opusAcceptsLayout's count-based default, and the count itself comes from resolveChannels.
         const opusLayoutFor = (stream, channels) => {
             const lay = (stream.channel_layout || '').toLowerCase().trim();
             const relabel = OPUS_RELABEL[lay] || null;
@@ -2883,8 +2886,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
 
         // Resolve a source stream to its canonical layout key, then to a verified pan matrix (or null). We normalize the ffmpeg channel_layout string
-        // (lowercased, trimmed). If the file reports no layout or an unrecognized one, we return null so the caller takes the plain aformat stereo fold
-        // (foldFilter).
+        // (lowercased, trimmed), read raw for the reason opusLayoutFor gives: CANON_LAYOUTS is keyed on libavutil's spellings. If the file reports no
+        // layout or an unrecognized one, we return null so the caller takes the plain aformat stereo fold (foldFilter).
         const downmixMatrix = (srcStream) => {
             const layoutFull = (srcStream?.channel_layout || '').toLowerCase().trim();
             if (!layoutFull) return null;
@@ -3509,10 +3512,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags);
             const mp4KeepTags = tagPlan.flag ? ' -movflags use_metadata_tags' : '';
             const uncopyable = mp4UncopyableStreams(dstContainer, file.ffProbeData.streams);
-            const keptStreams = file.ffProbeData.streams.filter((s) => !removedIndices.has(s.index) && !uncopyable.includes(s));
-            response.infoLog += mp4UncopyableLog(dstContainer, uncopyable, file.ffProbeData.streams) + mp4TagPlanLog(tagPlan, dstContainer, keptStreams);
+            const mapped = file.ffProbeData.streams.filter((s) => !removedIndices.has(s.index) && !uncopyable.includes(s));
+            response.infoLog += mp4UncopyableLog(dstContainer, uncopyable, file.ffProbeData.streams) + mp4TagPlanLog(tagPlan, dstContainer, mapped);
             const goneData = mp4LostData(uncopyable, file.ffProbeData.streams);
-            for (const s of [...goneData, ...mp4CoversLost(tagPlan, dstContainer, keptStreams)]) leftOut.add(s.index);
+            for (const s of [...goneData, ...mp4CoversLost(tagPlan, dstContainer, mapped)]) leftOut.add(s.index);
             // The -strict level this mp4/mov -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses
             // without it. The second list is what this run actually COPIES - a track removedIndices drops, or an in-place transcode replaces (recorded in
             // outputAudioOverride, keyed by output audio index), is left out, so a TrueHD track on its way out never asks for a flag the output cannot need.

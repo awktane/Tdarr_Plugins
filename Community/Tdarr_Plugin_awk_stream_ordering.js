@@ -18,7 +18,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same
         job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. A
         later job on that file is checked in full again. This check is always on and has no setting.\n`,
-    Version: '4.999.41',
+    Version: '4.999.42',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -852,12 +852,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const resolveStreamBitrate = (ffstream) => {
         const ffBitrate = Number(ffstream.bit_rate || 0);
         if (ffBitrate > 0) return ffBitrate;
-        const ffmedia = mediaInfoFor(ffstream);
-        if (!ffmedia) return 0;
-        const measured = Number(ffmedia.BitRate || 0) || Number(ffmedia.BitRate_Nominal || 0);
+        const mi = mediaInfoFor(ffstream);
+        if (!mi) return 0;
+        const measured = Number(mi.BitRate || 0) || Number(mi.BitRate_Nominal || 0);
         if (measured > 0) return measured;
-        const size = Number(ffmedia.StreamSize || 0);
-        const dur = Number(ffmedia.Duration || 0);
+        const size = Number(mi.StreamSize || 0);
+        const dur = Number(mi.Duration || 0);
         if (size > 0 && dur > 0) {
             const bps = Math.round((size * 8) / dur);
             // clamp to a plausible audio range so a stray unit (ms Duration, etc.) or corrupt size can't inject garbage
@@ -885,10 +885,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const resolveChannels = (ffstream) => {
         const ff = Number(ffstream.channels || 0);
         if (ff > 0) return ff;
-        const ffmedia = mediaInfoFor(ffstream);
-        const miChannels = Number(ffmedia?.Channels || 0);
+        const mi = mediaInfoFor(ffstream);
+        const miChannels = Number(mi?.Channels || 0);
         if (miChannels > 0) return miChannels;
-        return channelsFromLayout(resolveChannelLayout(ffstream, ffmedia));
+        return channelsFromLayout(resolveChannelLayout(ffstream, mi));
     };
 
     // -=-=-= enrichStream [all five] =-=-=-
@@ -1116,8 +1116,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // the -c copy plugins' `-strict unofficial` (mp4StrictArg) and the summariseStream dv token. video_clean's guard_dv ENCODE routing deliberately uses
     // the NARROWER dvSignal instead - libx265 -dolbyvision hard-requires a real RPU (see the note there). Pass the stream's paired mediaInfo
     // (mediaInfoFor(stream)); a single-probe false negative would silently lose the boxes.
-    const isDolbyVisionVideo = (ffstream, ffmedia) => DV_FOURCC_RE.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
-        || String(ffmedia?.HDR_Format || ffmedia?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
+    const isDolbyVisionVideo = (ffstream, mi) => DV_FOURCC_RE.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
+        || String(mi?.HDR_Format || mi?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : [])
             .some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====

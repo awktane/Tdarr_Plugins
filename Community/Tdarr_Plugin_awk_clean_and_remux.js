@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.63',
+    Version: '4.999.64',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -785,12 +785,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const resolveStreamBitrate = (ffstream) => {
         const ffBitrate = Number(ffstream.bit_rate || 0);
         if (ffBitrate > 0) return ffBitrate;
-        const ffmedia = mediaInfoFor(ffstream);
-        if (!ffmedia) return 0;
-        const measured = Number(ffmedia.BitRate || 0) || Number(ffmedia.BitRate_Nominal || 0);
+        const mi = mediaInfoFor(ffstream);
+        if (!mi) return 0;
+        const measured = Number(mi.BitRate || 0) || Number(mi.BitRate_Nominal || 0);
         if (measured > 0) return measured;
-        const size = Number(ffmedia.StreamSize || 0);
-        const dur = Number(ffmedia.Duration || 0);
+        const size = Number(mi.StreamSize || 0);
+        const dur = Number(mi.Duration || 0);
         if (size > 0 && dur > 0) {
             const bps = Math.round((size * 8) / dur);
             // clamp to a plausible audio range so a stray unit (ms Duration, etc.) or corrupt size can't inject garbage
@@ -818,10 +818,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const resolveChannels = (ffstream) => {
         const ff = Number(ffstream.channels || 0);
         if (ff > 0) return ff;
-        const ffmedia = mediaInfoFor(ffstream);
-        const miChannels = Number(ffmedia?.Channels || 0);
+        const mi = mediaInfoFor(ffstream);
+        const miChannels = Number(mi?.Channels || 0);
         if (miChannels > 0) return miChannels;
-        return channelsFromLayout(resolveChannelLayout(ffstream, ffmedia));
+        return channelsFromLayout(resolveChannelLayout(ffstream, mi));
     };
 
     // -=-=-= enrichStream [all five] =-=-=-
@@ -1015,8 +1015,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // the -c copy plugins' `-strict unofficial` (mp4StrictArg) and the summariseStream dv token. video_clean's guard_dv ENCODE routing deliberately uses
     // the NARROWER dvSignal instead - libx265 -dolbyvision hard-requires a real RPU (see the note there). Pass the stream's paired mediaInfo
     // (mediaInfoFor(stream)); a single-probe false negative would silently lose the boxes.
-    const isDolbyVisionVideo = (ffstream, ffmedia) => DV_FOURCC_RE.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
-        || String(ffmedia?.HDR_Format || ffmedia?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
+    const isDolbyVisionVideo = (ffstream, mi) => DV_FOURCC_RE.test((ffstream?.codec_tag_string || '').toLowerCase().trim())
+        || String(mi?.HDR_Format || mi?.HDR_Format_Compatibility || '').toLowerCase().includes('dolby vision')
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : [])
             .some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
@@ -1072,8 +1072,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Input validation - every type:'string' input is checked; the free-text ones (language_fill, language_sub) against the language recogniser
     // (knownLangToken below), since a typo silently changes which streams survive. type:'boolean' inputs are coerced by loadDefaultValues, so a guard on
-    // them would be dead code. container goes first, before the dstContainer parse, so an empty value fails cleanly rather than as a raw TypeError.
-    if (!inputs.container || inputs.container === '')
+    // them would be dead code. container goes first, before the dstContainer parse: loadDefaultValues defaults only an undefined or '' value, so a saved
+    // null or false still arrives here, and fails cleanly rather than as a raw TypeError.
+    if (!inputs.container)
         failFile(`[container=${inputs.container || ''}] not configured, check your settings`);
 
     const srcContainer = String(file.container || '').toLowerCase().trim();
@@ -2494,7 +2495,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         for (let i = 0; i < streams.length; i++) {
             const ffstream = streams[i];
-            const ffmedia = mediaInfoFor(ffstream);
+            const mi = mediaInfoFor(ffstream);
             const ffstreamCodec = codecNameOf(ffstream);
             const ffstreamType = codecTypeOf(ffstream);
 
@@ -2604,7 +2605,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     workDone += `☐${streamTag(ffstream.index)}${titleCauses.length ? `[${titleCauses.join('][')}]` : ''} Change title (${typeWord})`
                         + ` "${logSafe(streamTitle)}" -> "${logSafe(newStreamTitle)}"\n`;
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "title=${escMeta(newStreamTitle)}"`;
-                } else if (ffmedia && !(ffstream.tags?.title) && mediaTitleClean !== '' && dstContainer !== 'mp4') {
+                } else if (mi && !(ffstream.tags?.title) && mediaTitleClean !== '' && dstContainer !== 'mp4') {
                     workDone += `☐${streamTag(ffstream.index)} Set title (${typeWord}) from mediaInfo "${logSafe(newStreamTitle)}" (no ffprobe title tag)\n`;
                     metadataCommand += ` -metadata:s:${typeLetter}:${idx} "title=${escMeta(newStreamTitle)}"`;
                 }
@@ -2883,7 +2884,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // to plain HEVC (verified: the output ffprobes as "Invalid data found"), undoing what video_clean's guard_dv protects.
                 // Detect DV both-probe (fourcc / mediaInfo HDR_Format / ffprobe side_data) and leave its tag untouched. (video_clean
                 // re-encodes, so it makes the finer dvh1-vs-hvc1 choice; here the safe action on a mere remux is to not retag DV at all.)
-                const isDolbyVision = isDolbyVisionVideo(ffstream, ffmedia);
+                const isDolbyVision = isDolbyVisionVideo(ffstream, mi);
 
                 // HEVC in mp4 must carry the hvc1 fourcc or Apple/QuickTime won't decode it - a plain remux writes hev1.
                 // Tag the retained HEVC video stream when the output is mp4 and it isn't already hvc1 (and isn't Dolby
