@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.72',
+    Version: '3.999.73',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1593,6 +1593,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const encTitle = collides && encRaw ? `${pctEncode(encRaw.slice(0, 1), NEVER_SAFE)}${encRaw.slice(1)}` : encRaw;
         return `${dot}${videoBase}.s${s.index}${encTitle ? `.${encTitle}` : ''}${pre}.${lang}${disp}${mark}.${ext}`;
     };
+    // A name with its hidden-marker dot taken off, or null when it is not named after this video. The marker is a dot BEYOND the video's own: a
+    // dot-prefixed video ('.Pilot.mkv') keeps its dot in videoBase, so its loose sidecar '.Pilot.s2.eng.srt' carries no marker, and stripping a leading
+    // dot unconditionally left 'Pilot.s2.eng.srt', which no longer starts with the video's name - every sidecar extract wrote was then unreadable, and
+    // with remove_source the subtitle survived only in a file import skipped without a word.
+    const ownSidecarBare = (name) => (name.startsWith(`${videoBase}.`) ? name : (name.startsWith(`.${videoBase}.`) ? name.slice(1) : null));
     const parseSidecar = (name) => {
         const extMatch = name.match(SIDECAR_EXT_RE);
         if (!extMatch) return null;
@@ -1603,12 +1608,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // A bundle is written only by us, always dot-prefixed and always with the s<index> anchor (required below), so an unrelated .mks dropped
         // beside the video is left alone rather than muxed in blind.
         if (bundle && !name.startsWith('.')) return null;
-        // The leading dot is stripped for EVERY sidecar, not just bundles, so the rest parses identically either way. A hidden text sidecar is a real
+        // The hidden-marker dot is taken off EVERY sidecar, not just bundles, so the rest parses identically either way. A hidden text sidecar is a real
         // arrival, not junk: clean_and_remux exports image subtitles dot-prefixed for external OCR, and the OCR comes back as ".<video>.s<n>.<lang>.srt"
         // with that dot intact - refusing it here stranded the user's OCR work in the library forever. Hiding a sidecar from media servers says nothing
         // about whether we should read it, and an unrelated hidden file is still rejected below by the videoBase and language-token requirements.
-        const bare = name.startsWith('.') ? name.slice(1) : name;
-        if (!bare.startsWith(`${videoBase}.`)) return null;
+        const bare = ownSidecarBare(name);
+        if (bare === null) return null;
         const mid = bare.slice(videoBase.length + 1, bare.length - extMatch[0].length);
         const toks = mid.split('.');
         if (!toks.length) return null;
@@ -2568,7 +2573,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!f.bundle) return '';
             if (hashes === undefined) hashes = embeddedTextHashes(embedded);
             const b = bundleContent(f);
-            if (b && b.sha1 && hashes) return bundleInFile(f, hashes.values()) && (b.fonts === 0 || anyFont) ? 'its subtitle is in the file' : '';
+            // A bundle whose subtitle WAS read out fails closed the same way: with the file's probe failed (hashes null) its content cannot be compared, and
+            // the resemblance is exactly what that forced failure would hand the unlink to. Only a bundle that cannot be read out falls back to metadata.
+            if (b && b.sha1) return hashes && bundleInFile(f, hashes.values()) && (b.fonts === 0 || anyFont) ? 'its subtitle is in the file' : '';
             return metadataMatchesEmbedded(f, embedded, anyFont, mp4Target) ? 'the file carries a matching subtitle' : '';
         };
         let deleted = 0; let log = '';
@@ -2727,8 +2734,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Hidden on import, visible on extract. On import the sidecar is staging - the next pass muxes it in and remove_source deletes it - so a media server
         // must not offer it in the gap between the two; on extract it IS the deliverable and belongs in plain sight beside the video. Named once, out here,
         // because the import mux needs the same name later to recognise the staging file going in, long after the plan has stopped having anything to say.
-        const ccName = (ccMode === 'enabled' && ccVideo)
-            ? `${action === 'import' ? '.' : ''}${sidecarBasename(ccPseudoStream(ccVideo.index), false)}` : '';
+        // On import the visible spelling is the caption sidecar too: an extract that kept the bitstream copy (remove_source=false) leaves exactly that, and
+        // each import-side caption decision - the memo, the scope exemption, the untrusted gate, the strip request - must hold whichever copy goes in.
+        const ccNameBare = (ccMode === 'enabled' && ccVideo) ? sidecarBasename(ccPseudoStream(ccVideo.index), false) : '';
+        const ccName = ccNameBare && `${action === 'import' ? '.' : ''}${ccNameBare}`;
+        const isCcSidecar = (rel) => !!ccName && (rel === ccName || (action === 'import' && rel === ccNameBare));
         // A caption sidecar ccPlan found already in the library on a LOCAL view: read it, and either answer the plan outright (every plan carries `job`)
         // or, having removed an unfinished or empty one, return { leftoverNote } so ccPlan reads the captions again. Out of ccPlan so its decode gate reads
         // as a list; it runs only from there, with its early returns and the unlink in their original order.
@@ -2848,25 +2858,36 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // one that was never read: A53 side data is present whether or not anyone was speaking, so an empty channel looks exactly like a
             // full one to the probe. A cue-less sidecar is deleted and the finding recorded, so no later pass repeats the decode. On the API
             // route an unconfirmed answer stops here: a job would upload over whatever is there, and the captions stay put for a later pass.
-            const remote = readViaApi() ? sidecarExistsRemote(remoteDest) : null;
-            if (remote && remote.state === 'unknown') {
-                return { job: null, note: `☒[embedded_cc=enabled] Could not confirm whether ${name} is already in the library (${remote.why}) - `
-                    + 'not overwriting it; the captions stay in the video for a later pass\n' };
-            }
-            // A symbolic link at the name (isSymlinkAt) is neither read as the memo nor written through, and is kept out of the import below like any
-            // untrusted sidecar. Only a local view can see one; the API route asks the server, which cannot say.
-            if (!remote && isSymlinkAt(full)) {
-                return { job: null, untrusted: true, note: `☒[embedded_cc=enabled] ${name} in the library is a symbolic link - not reading or writing`
-                    + ' through it, since it could point anywhere; remove it and requeue, the captions stay in the video\n' };
-            }
+            // On import the extract-written visible spelling is looked for after the staging name and judged the same way (see ccName); a read it calls
+            // for still writes the staging name. Returns a whole plan, a { leftoverNote }, or null when that spelling is absent.
+            const lookFor = (at, atFull, atDest) => {
+                const remote = readViaApi() ? sidecarExistsRemote(atDest) : null;
+                if (remote && remote.state === 'unknown') {
+                    return { job: null, note: `☒[embedded_cc=enabled] Could not confirm whether ${at} is already in the library (${remote.why}) - `
+                        + 'not overwriting it; the captions stay in the video for a later pass\n' };
+                }
+                // A symbolic link at the name (isSymlinkAt) is neither read as the memo nor written through, and is kept out of the import below like any
+                // untrusted sidecar. Only a local view can see one; the API route asks the server, which cannot say.
+                if (!remote && isSymlinkAt(atFull)) {
+                    return { job: null, untrusted: true, note: `☒[embedded_cc=enabled] ${at} in the library is a symbolic link - not reading or writing`
+                        + ' through it, since it could point anywhere; remove it and requeue, the captions stay in the video\n' };
+                }
+                const existing = remote ? (remote.state === 'present' ? 'remote' : '')
+                    : ((() => { try { return fs.existsSync(atFull) ? 'local' : ''; } catch (e) { return ''; } })());
+                if (existing === 'remote')
+                    return { job: null, staged: true, stagedName: at, note: `☑[embedded_cc=enabled] Caption sidecar already in the library: ${at}\n` };
+                if (existing !== 'local') return null;
+                const verdict = judgeLocalCaptionSidecar(atFull, at, ccTokens, atDest);
+                return verdict.job ? { ...verdict, job: { ...verdict.job, name, full, remoteDest } } : verdict;
+            };
+            const spellings = [[name, full, remoteDest]];
+            if (action === 'import') spellings.push([ccNameBare, path.join(workLibDir(), ccNameBare), placeViaApi() ? serverDestFor(ccNameBare) : '']);
             let leftoverNote = '';
-            const existing = remote ? (remote.state === 'present' ? 'remote' : '')
-                : ((() => { try { return fs.existsSync(full) ? 'local' : ''; } catch (e) { return ''; } })());
-            if (existing === 'remote') return { job: null, staged: true, note: `☑[embedded_cc=enabled] Caption sidecar already in the library: ${name}\n` };
-            if (existing === 'local') {
-                const verdict = judgeLocalCaptionSidecar(full, name, ccTokens, remoteDest);
-                if ('job' in verdict) return verdict;
-                leftoverNote = verdict.leftoverNote;
+            for (const [at, atFull, atDest] of spellings) {
+                const found = lookFor(at, atFull, atDest);
+                if (!found) continue;
+                if ('job' in found) return found;
+                leftoverNote += found.leftoverNote;
             }
             // Nothing memoised, so pay for the cheap check. Only `true` from the library scan is information - it reports false both for a file with no
             // captions and for one its scanner could not parse - so a false still goes to the probe, and an 'unknown' probe leaves the file alone.
@@ -2885,6 +2906,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Whether the caption staging sidecar is in the library RIGHT NOW - either ccPlan's existence probe found it there, or this pass uploads it below.
         // Only the text_file import route reads it, because that route has no directory to scan and cannot put the name into the user's list.
         let ccStaged = ccPlan.staged === true;
+        const ccStagedName = ccPlan.stagedName || ccName;   // the spelling ccPlan found in the library, for the text_file fetch
         // The read memo the API placement route owes the import's -c copy pass when the import does not consume the staged caption sidecar.
         let ccApiRead = '';
         // An in-plugin caption read is known to have finished, so an empty first read goes straight to field 2 (see ccPlan) before it counts as empty. One
@@ -3316,9 +3338,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // otherwise the language must be in only_languages (or the filter is off); and a styled bundle cannot go into an mp4-family
         // target that has no font attachments. Pulled out so the marker-hostile refusal can be decided from the listed names BEFORE the
         // text_file route downloads them, and so that refusal and the found-filter below can never drift on what counts as importable.
-        const subLangInScope = (f) => (ccName && f.rel === ccName) || !langFilter || langFilter.has(langKey(f.lang));
+        const subLangInScope = (f) => isCcSidecar(f.rel) || !langFilter || langFilter.has(langKey(f.lang));
         // The caption staging sidecar ccPlan found unfinished and could not remove: never imported, so nothing is muxed or stripped on a prefix.
-        const ccUntrusted = (f) => ccPlan.untrusted === true && ccName && f.rel === ccName;
+        const ccUntrusted = (f) => ccPlan.untrusted === true && isCcSidecar(f.rel);
         const subBundleFits = (f) => !(f.bundle && isMp4);
         // The WebM muxer stores WebVTT subtitles only, and no attachments: a -c copy of anything else (srt, ass/ssa, a bundle's ass and fonts) exits 234 at
         // header write on every requeue. Converting would flatten ASS styling and break the content identity remove_source deletes on, so it is refused.
@@ -3455,8 +3477,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // So fetch it by name, on an answer this pass has already paid for: it was uploaded above, or ccPlan's probe found it in the library. Without
                 // this the round trip stalls for good - uploaded, never fetched, never muxed, and awk_cc=imported, which the run needs to converge, never
                 // written, while every later pass reports the sidecar is already there and does nothing.
-                if (listedRels && ccStaged && ccName && !listedRels.includes(ccName))
-                    listedRels = listedRels.concat(fetchListedSidecars([ccName], importedSet));
+                if (listedRels && ccStaged && ccStagedName && !listedRels.includes(ccStagedName))
+                    listedRels = listedRels.concat(fetchListedSidecars([ccStagedName], importedSet));
             }
         }
 
@@ -3487,10 +3509,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // every run, forever, would be noise. Our own bundles are dot-prefixed too, but they parse and never reach this line.
             // A hidden TEXT sidecar named after THIS video is the exception: that is the OCR coming back, it is importable now, so a name that still fails to
             // parse is a genuine mistake (a bad language token, a lost s<index>) and saying nothing would strand the work the user just did.
-            if (relBase.startsWith('.') && !(IMPORT_EXTS.includes(relExt) && relBase.slice(1).startsWith(`${videoBase}.`))) continue;
+            const ownBare = ownSidecarBare(relBase);
+            const hidden = ownBare !== null ? ownBare !== relBase : relBase.startsWith('.');
+            if (hidden && !(IMPORT_EXTS.includes(relExt) && ownBare !== null)) continue;
             // Only a file named after THIS video is ours to report. A season folder holds every episode's sidecars, and each of those fails to parse here by
             // design (wrong video base), so naming them would print every other episode's subtitles as a warning on every run.
-            if (!relBase.replace(/^\./, '').startsWith(`${videoBase}.`)) continue;
+            if (ownBare === null) continue;
             if (NAMED_ONLY_EXTS.includes(relExt)) {
                 response.infoLog += `☒Not importing ${logSafe(rel)} - .${relExt} subtitles cannot be imported as they are; convert it to .srt to import it\n`;
             } else if (IMPORT_EXTS.includes(relExt) || relExt === STYLED_BUNDLE.ext) {
@@ -3714,11 +3738,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!surviving) return false;
             return f.bundle ? bundleInFile(f, surviving.values()) === false : !sidecarMatch(f, isMp4, surviving.values());
         };
+        // The marker is written whole, so a removal the guard upholds survives only while its entry does: every marker rebuilt below carries goneRels, or
+        // the first pass with other work to do (a new sidecar, a retune, a dedup drop) would erase it and the next pass would import the subtitle again.
+        const goneRels = [];
         for (let k = toMux.length - 1; k >= 0; k -= 1) {
             const f = toMux[k];
             if (!goneSinceImport(f)) continue;
             toMux.splice(k, 1);
-            response.infoLog += f.rel === ccName
+            goneRels.push(...f.members.map((m) => m.rel));
+            response.infoLog += isCcSidecar(f.rel)
                 ? `☒[embedded_cc=enabled] The closed captions imported from ${logSafe(f.rel)} have since been removed from the file (by another plugin's `
                     + 'subtitle filter, or by hand) - not importing them again; that hidden sidecar now holds the only copy\n'
                 : `☒${logSafe(f.rel)} was imported by an earlier pass and has since been removed from the file (by another plugin's subtitle filter, or by `
@@ -3756,7 +3784,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // settled (alreadyEmbedded), exactly as the mux path below does for the same reason: dropped from the marker, it is no longer skipped and the
             // next pass imports it again as a duplicate track. A .mks bundle has no other way back - an archive is not comparable text, so its content can
             // never re-settle it and the marker entry is the whole record. Nothing is unlinked in this branch, so every entry added here still exists.
-            const markList = [...new Set([...stranded, ...found.filter(alreadyEmbedded).map((f) => f.rel)])];
+            const markList = [...new Set([...stranded, ...found.filter(alreadyEmbedded).map((f) => f.rel), ...goneRels])];
             // The only route left, so it is taken rather than offered: a lossless copy of the whole file is emitted purely to reach the post-processing stage
             // above. Making this a setting would only work for someone who already knew the trap existed, and by then they have been caught by it: asking for
             // the sidecars to be deleted IS asking for whatever it takes. It cannot repeat - one extra pass per file, ever - because the marker stamped here
@@ -3825,7 +3853,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // the post-processing pass later deletes simply stops being found, and a marker entry naming a file that no longer exists - or one the file no
             // longer carries - is harmless either way, since the entry only counts while the confirmation agrees with it.
             const priorStillPresent = found.filter(alreadyEmbedded).map((f) => f.rel);
-            const markList = [...new Set([...consumed, ...priorStillPresent])];
+            const markList = [...new Set([...consumed, ...priorStillPresent, ...goneRels])];
             // The caption staging sidecar going in is what ends the caption round trip, and recording that is REQUIRED for the run to converge, not
             // a nicety: remove_source deletes the staging file once it is embedded, so without this token the next pass would find captions in the
             // bitstream and no sidecar, decode them out again, and repeat forever. Keyed on the name because by now the plan has nothing to say -
@@ -3835,7 +3863,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // request for video_clean's next re-encode. `imported` is kept alongside `strip` rather than replaced by it, because that token is the
             // memo that stops this plugin decoding the captions out all over again; only the pair says both things at once.
             let ccStrip = '';
-            if (ccName && consumed.includes(ccName)) {
+            if (consumed.some(isCcSidecar)) {
                 const ccAdd = [CC_TOKENS.imported];
                 if (removeSource) {
                     if (ccStripAllowed()) {
