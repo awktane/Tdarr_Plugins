@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.58',
+    Version: '4.999.59',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -2067,9 +2067,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const title = String(s.tags?.title || mediaTitleFor(s) || '').toLowerCase();
         if (!handler && !title) return { roles: [], viaTitle: false, viaHandler: false };
         const surviving = survivingRoleText(s, newTitle);
+        // One role can live under two keys (captions is the SDH synonym of hearing_impaired - promoteTarget), so it survives when the surviving text
+        // matches ANY key of its class: a 'CC' title rebuilt to 'SDH' still carries the role, and promoting a flag for it would be an unrequested write.
+        const survives = (k) => dispKeysFor(type).some((j) => promoteTarget(j) === promoteTarget(k) && matchesKeyword(surviving, dispositionTypes[j].keywords));
         const roles = dispKeysFor(type).filter((k) => k !== 'default' && s.disposition?.[promoteTarget(k)] !== 1
             && (matchesKeyword(handler, dispositionTypes[k].keywords) || matchesKeyword(title, dispositionTypes[k].keywords))
-            && !matchesKeyword(surviving, dispositionTypes[k].keywords));
+            && !survives(k));
         return { roles, viaTitle: roles.some((k) => matchesKeyword(title, dispositionTypes[k].keywords)),
             viaHandler: roles.some((k) => matchesKeyword(handler, dispositionTypes[k].keywords)) };
     };
@@ -2287,7 +2290,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // flags the remux promotes and the role text that survives it. handlerRolesLost: '[s N] Role' entries no flag in the target can hold, on ONE line.
         const clearedRolePrediction = new Map();
         const handlerRolesLost = [];
-        const titleRolesLost = [];   // the same, for roles a busy title being blanked was the last carrier of
+        const titleRolesLost = [];   // the same, for roles the title this command changes was the last carrier of - { entry, cause }
         // Drop one input stream. The three writes are NOT independent: removedIndices is the sole input to the "Expected results" summary filter and to the
         // orphaned-font survivor test, so a drop site that maps a stream out without recording it makes the summary advertise a stream the command deletes.
         // Per-branch extras (a stream-index decrement, the continue) stay at the call site.
@@ -2475,6 +2478,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 continue;
             }
 
+            // A stream ffmpeg cannot identify (ffprobe omits codec_type - an MPEG-TS private-section PID, stream_type 0x05, as DVB recordings carry) cannot be
+            // copied at all: ffmpeg refuses to map it ("Cannot map stream ... unsupported type"), so keeping it fails every remux of the file in any container.
+            // The "never remove what we can't identify" rule (attachmentKind) yields here as it does for an attachment mp4 cannot carry. Measured on
+            // jellyfin-ffmpeg 7.1.4: `-map 0` exits 234 on such a file, `-map 0 -map -0:N` exits 0.
+            if (!['video', 'audio', 'subtitle', 'attachment', 'data'].includes(ffstreamType)) {
+                workDone += `☐${streamTag(ffstream.index)} Remove a stream ffmpeg cannot identify - it cannot be copied`
+                    + ` (${ffstreamType || 'unknown'}-${ffstreamCodec || 'none'})\n`;
+                dropStream(ffstream.index);
+                continue;
+            }
+
             // The stream's own title, handler laundered out - see the shared mediaTitleFor.
             const mediaTitleClean = mediaTitleFor(ffstream);
             const streamTitle = (ffstream.tags?.title || mediaTitleClean || '');
@@ -2486,25 +2500,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // tag_disposition off - it preserves what the file already says rather than adding anything. Where tag_disposition covers the type it has
             // promoted every role already, and a second -disposition for one stream would override the first. A role no flag in the target can hold is lost
             // with its carrier, and said so once for the whole file (handlerRolesLost / titleRolesLost) rather than per stream. Runs once the title this
-            // command writes is decided, since that title is what survives.
-            const preserveClearedRoles = (typeLetter, idx, typeWord, newTitle, handlerCleared) => {
+            // command writes is decided, since that title is what survives. titleCauses names the settings that changed the title, so a line blames the
+            // setting the user actually set - a busy-title clear reads as cleared, any other change as rewritten.
+            const preserveClearedRoles = (typeLetter, idx, typeWord, newTitle, titleCauses, handlerCleared) => {
                 const { roles, viaTitle, viaHandler } = clearedOnlyRoles(ffstream, typeWord, newTitle, handlerCleared);
                 if (!roles.length) return;
+                const titleCause = viaTitle ? titleCauses.join('][') : '';
                 const covered = appliesToType(tagDisposition, typeWord);
                 const promoted = covered ? dispositionsToPromote(ffstream, typeWord) : dispositionsToPromote(ffstream, typeWord, roles);
                 if (!covered && promoted.length) {
                     const handlerFate = dstContainer === 'mkv' ? 'cleared' : 'replaced';
-                    const from = viaTitle && viaHandler ? `the title and handler_name before they are cleared`
-                        : (viaTitle ? 'the title before it is cleared' : `handler_name before it is ${handlerFate}`);
-                    const cause = [viaTitle && 'remove_busytitle=true', viaHandler && `container=${dstContainer}`].filter(Boolean).join('][');
-                    workDone += `☐${streamTag(ffstream.index)}[${cause}] Set disposition (${typeWord}) from ${from} - `
+                    const titleFate = titleCauses.includes('remove_busytitle=true') ? 'cleared' : 'rewritten';
+                    const from = viaTitle && viaHandler ? `the title and handler_name before they are ${titleFate === 'cleared' ? 'cleared' : 'changed'}`
+                        : (viaTitle ? `the title before it is ${titleFate}` : `handler_name before it is ${handlerFate}`);
+                    const cause = [titleCause, viaHandler && `container=${dstContainer}`].filter(Boolean).join('][');
+                    workDone += `☐${streamTag(ffstream.index)}${cause ? `[${cause}]` : ''} Set disposition (${typeWord}) from ${from} - `
                         + `${promoted.map((k) => dispositionTypes[k].tag).join(' ')}\n`;
                     metadataCommand += ` -disposition:${typeLetter}:${idx} ${promoted.map((k) => `+${k}`).join('')}`;
                 }
                 const lost = [...new Set(roles.map(promoteTarget))].filter((k) => !promoted.includes(k));
                 if (lost.length) {
                     const entry = `${streamTag(ffstream.index)} ${lost.map((k) => dispositionTypes[k].tag || k).join(' ')}`;
-                    (viaTitle ? titleRolesLost : handlerRolesLost).push(entry);
+                    if (viaTitle) titleRolesLost.push({ entry, cause: titleCause });
+                    else handlerRolesLost.push(entry);
                 }
                 clearedRolePrediction.set(ffstream.index, { adds: promoted, roleText: survivingRoleText(ffstream, newTitle) });
             };
@@ -2754,7 +2772,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 emitTitleMeta('s', subtitleOutOrdinal, 'subtitle', streamTitle, newStreamTitle, titleCauses);
 
-                preserveClearedRoles('s', subtitleOutOrdinal, 'subtitle', newStreamTitle,
+                preserveClearedRoles('s', subtitleOutOrdinal, 'subtitle', newStreamTitle, titleCauses,
                     emitHandlerMeta('s', subtitleOutOrdinal, 'subtitle', 'SubtitleHandler'));
 
                 emitCommentRemoval('s', subtitleOutOrdinal, 'subtitle');
@@ -2812,7 +2830,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 emitTitleMeta('a', audioOutOrdinal, 'audio', streamTitle, newStreamTitle, titleCauses);
 
-                preserveClearedRoles('a', audioOutOrdinal, 'audio', newStreamTitle, emitHandlerMeta('a', audioOutOrdinal, 'audio', 'SoundHandler'));
+                preserveClearedRoles('a', audioOutOrdinal, 'audio', newStreamTitle, titleCauses,
+                    emitHandlerMeta('a', audioOutOrdinal, 'audio', 'SoundHandler'));
 
                 emitCommentRemoval('a', audioOutOrdinal, 'audio');
 
@@ -2895,15 +2914,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 convert = true;
             }
 
-            //Any other stream type (e.g. an unrecognised attachment classified as 'other') is left untouched - remove it with a separate plugin if needed.
+            //An unrecognised attachment classified as 'other' is left untouched in mkv - remove it with a separate plugin if needed.
         }
         if (handlerRolesLost.length) {
             workDone += `☒[container=${dstContainer}] handler_name is being ${dstContainer === 'mkv' ? 'cleared' : 'replaced'} and was the only place these `
                 + `roles lived, with no ${dstContainer} flag to hold them - lost: ${handlerRolesLost.join(', ')}\n`;
         }
-        if (titleRolesLost.length) {
-            workDone += `☒[remove_busytitle=true] A busy title being cleared was the only place these roles lived, with no ${dstContainer} flag to hold them `
-                + `- lost: ${titleRolesLost.join(', ')}\n`;
+        // One line per combination of settings that changed a title, naming them.
+        for (const cause of [...new Set(titleRolesLost.map((r) => r.cause))]) {
+            const what = cause.includes('remove_busytitle=true') ? 'A busy title being cleared' : 'A title being rewritten';
+            workDone += `☒${cause ? `[${cause}] ` : ''}${what} was the only place these roles lived, with no ${dstContainer} flag to hold them `
+                + `- lost: ${titleRolesLost.filter((r) => r.cause === cause).map((r) => r.entry).join(', ')}\n`;
         }
 
         // Resolve deferred font attachments now that subtitle removals are final: embedded fonts are only consumed by styled subtitles (ASS/SSA), so keep
@@ -2958,8 +2979,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             convert = true;
         }
 
-        if((removeBusytitle === true) && tooManyPeriods(file.ffProbeData.format?.tags?.title ?? '')) {
-            workDone += `☐[remove_busytitle=true] Remove title from file "${logSafe((file.ffProbeData.format?.tags?.title ?? '').trim())}"\n`;
+        // Case-insensitive for the same reason: a global title held in a matroska Tags element arrives as TITLE, and it replaces the Segment Info title in
+        // ffmpeg's dictionary, so a file carrying both forms reports TITLE alone. The `title=` write below clears both forms.
+        const fileTitle = getTagCI(file.ffProbeData.format?.tags, 'title') ?? '';
+        if((removeBusytitle === true) && tooManyPeriods(fileTitle)) {
+            workDone += `☐[remove_busytitle=true] Remove title from file "${logSafe(String(fileTitle).trim())}"\n`;
             extraArguments += ` -metadata "title="`;
             globalWrites.title = '';
             convert = true;
