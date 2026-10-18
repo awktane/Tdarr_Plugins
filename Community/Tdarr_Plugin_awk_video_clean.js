@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.61',
+    Version: '3.999.62',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1377,11 +1377,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // `floor` is the fraction of that peak the encoder still reaches squeezed to a single frame thread (measured via frame-threads=1 / -x264-params threads=1 /
     // -svtav1-params lp=1). The plugin emits NONE of those knobs - the floor exists only to give the refusal a bound no node's core count or preset choice can
     // undercut. Each depth is measured rather than derived: the 10-bit/8-bit ratio differs per encoder (borrowing libx265's mis-predicts libsvtav1 by 24%).
-    // The four hardware rows carry their 10-bit measurement only and reuse it at 8 bits, over-stating an 8-bit hardware encode by roughly a fifth - harmless in
-    // practice, since a hardware encode peaks at 664-1409 MB, far below any realistic node limit, so the over-stated figure normally only hardens a warning. It
-    // is NOT structurally exempt from the refusal: with no `floor` row the multiplier is 1, so the floor equals the FULL estimate times the preset and content
-    // terms - a stricter bound than any CPU row's, and a small enough cgroup still refuses. `threadScaled` marks the one encoder whose per-frame-thread
-    // cost was measured; the rest carry no thread term, which under-states them on a big node - see MEM_FRAME_THREADS.
+    // The hardware rows carry one depth's measurement and reuse it at the other: four measured at 10 bits, over-stating an 8-bit
+    // hardware encode by roughly a fifth, and h264_amf at 8 bits - harmless in practice, since a hardware encode peaks at 430-1409 MB,
+    // far below any realistic node limit, so the over-stated figure normally only hardens a warning. It is NOT structurally exempt from
+    // the refusal: with no `floor` row the multiplier is 1, so the floor equals the FULL estimate times the preset and content terms -
+    // a stricter bound than any CPU row's, and a small enough cgroup still refuses. `threadScaled` marks the one encoder whose
+    // per-frame-thread cost was measured; the rest carry no thread term, which under-states them on a big node - see MEM_FRAME_THREADS.
     const MEM_ENCODER = {
         libx265:           { base10: 163, kEnc10: 292, base8: 97,  kEnc8: 186, floor: 0.968, threadScaled: true },
         libx264:           { base10: 79,  kEnc10: 245, base8: 79,  kEnc8: 245, floor: 0.808 },   // H.264 output is always 8-bit; the 10-bit pair never resolves
@@ -1394,10 +1395,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Fitted on a Mac, the only platform that has VideoToolbox. Legitimate there despite macOS memory compression because these rows land at 0.7-0.9
         // GB, below the regime where it distorts a reading, and they reproduced across two independent runs (4K 862 then 860 MB; 1080p 690 both times).
         hevc_videotoolbox: { base10: 252, kEnc10: 27,  base8: 252, kEnc8: 27 },
+        // Measured 2026-10-17 on amdwin, the fleet's one AMD node: its chip has h264_amf only, which also fails at 2160p, so the pair is 1080p and 720p
+        // output (458 and 430 MB) off one 4K HEVC 10-bit source, as Windows peak working set - which on that 4-core box tracked the Linux-fitted CPU rows
+        // within 5% (libx265 +2%, libx264 -5%). An 8-bit measurement, reused at 10 bits.
+        h264_amf:          { base10: 27,  kEnc10: 24,  base8: 27,  kEnc8: 24 },
     };
     // Which measured row stands in for a family's other codecs. Justified by measurement, not convenience: h264_nvenc at 4K 8-bit came within 5% of
-    // hevc_nvenc, so the FAMILY dominates the codec. The three CPU encoders are each measured directly and need no stand-in.
-    const MEM_ENCODER_BY_FAMILY = { nvenc: 'hevc_nvenc', qsv: 'hevc_qsv', vaapi: 'hevc_vaapi', videotoolbox: 'hevc_videotoolbox' };
+    // hevc_nvenc, so the FAMILY dominates the codec. The three CPU encoders are each measured directly and need no stand-in. amf's stand-in runs the other
+    // way - the h264 row speaks for hevc_amf and av1_amf - because no fleet node can run either; memprobe's enc:hwfamily row tests it on one that can.
+    const MEM_ENCODER_BY_FAMILY = { nvenc: 'hevc_nvenc', qsv: 'hevc_qsv', vaapi: 'hevc_vaapi', videotoolbox: 'hevc_videotoolbox', amf: 'h264_amf' };
     // Decode-side peak, MB per megapixel of the SOURCE frame, per source codec and per whether -thread_type slice is on the command (see MEM_SLICE_CODECS).
     // A 6.0x spread across codecs, so a single constant would be wrong in both directions. ProRes is the priciest decoder and AV1 the priciest one the flag
     // cannot help, which compounds with libsvtav1 being the hungriest encoder: AV1 -> AV1 is the most memory-expensive path this plugin can take.
