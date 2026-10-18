@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.63',
+    Version: '3.999.64',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1377,10 +1377,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // `floor` is the fraction of that peak the encoder still reaches squeezed to a single frame thread (measured via frame-threads=1 / -x264-params threads=1 /
     // -svtav1-params lp=1). The plugin emits NONE of those knobs - the floor exists only to give the refusal a bound no node's core count or preset choice can
     // undercut. Each depth is measured rather than derived: the 10-bit/8-bit ratio differs per encoder (borrowing libx265's mis-predicts libsvtav1 by 24%).
-    // The hardware rows carry one depth's measurement and reuse it at the other: four measured at 10 bits, over-stating an 8-bit hardware
-    // encode by roughly a fifth, and h264_amf at 8 bits - harmless in practice, since a hardware encode peaks at 430-1409 MB, far below any
-    // realistic node limit, so the over-stated figure normally only hardens a warning. It is NOT structurally exempt from the refusal: with
-    // no `floor` row the multiplier is 1, so the floor equals the FULL estimate times the preset and content terms - a stricter bound than
+    // The hardware rows carry one depth's measurement and reuse it at the other: the hevc rows measured at 10 bits, over-stating an 8-bit
+    // hardware encode by roughly a fifth, and the h264 rows at 8 bits - harmless in practice, since a hardware encode peaks at 0.4-2.0 GB, well
+    // below a realistic node limit, so the over-stated figure normally only hardens a warning. It is NOT structurally exempt from the refusal:
+    // with no `floor` row the multiplier is 1, so the floor equals the FULL estimate times the preset and content terms - a stricter bound than
     // any CPU row's, and a small enough cgroup still refuses. `perCore` is what each visible core past MEM_FIT_CORES adds, MB per output
     // megapixel - see the THREADS block below. `preset` is an encoder's own measured method_speed ratios, which replace MEM_PRESET's for it.
     const MEM_ENCODER = {
@@ -1391,21 +1391,31 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // the ceiling (4.02-4.07 GB at any thread count, depth or preset), which reads as an encoder whose memory ignores all three; unclamped it peaks at
         // 5.0 GB at slow and moves with each.
         libsvtav1:         { base10: 223, kEnc10: 535, base8: 155, kEnc8: 421, floor: 0.682, perCore: 18.3, preset: { slow: 1, medium: 0.921, fast: 0.697 } },
-        hevc_nvenc:        { base10: 113, kEnc10: 108, base8: 113, kEnc8: 108 },
+        // nvenc measured 2026-10-18 on the 20-core nvenc node decoding on NVDEC, as the plugin does: kEnc from 2160p/1080p output pairs off a 4K HEVC 10-bit
+        // and a 4K H.264 source (99.7 and 102.6 MB/Mpix); base 113 is where the measured sum is split from MEM_DECODER's nvdec. h264_nvenc ran 42% above
+        // hevc_nvenc at 4K, so it carries its own row.
+        hevc_nvenc:        { base10: 113, kEnc10: 101, base8: 113, kEnc8: 101 },
+        h264_nvenc:        { base10: 135, kEnc10: 171, base8: 135, kEnc8: 171 },
         hevc_qsv:          { base10: 76,  kEnc10: 51,  base8: 76,  kEnc8: 51 },
+        // h264_qsv measured 2026-10-18 on the 4-core Intel node as 2160p and 1080p output (572 and 461 MB) off a 4K HEVC 10-bit source: 36% under hevc_qsv.
+        h264_qsv:          { base10: 41,  kEnc10: 18,  base8: 41,  kEnc8: 18 },
         hevc_vaapi:        { base10: 80,  kEnc10: 23,  base8: 80,  kEnc8: 23 },
-        // Fitted on a Mac, the only platform that has VideoToolbox. Legitimate there despite macOS memory compression because these rows land at 0.7-0.9
-        // GB, below the regime where it distorts a reading, and they reproduced across two independent runs (4K 862 then 860 MB; 1080p 690 both times).
-        hevc_videotoolbox: { base10: 252, kEnc10: 27,  base8: 252, kEnc8: 27 },
+        // Fitted on a Mac, the only platform that has VideoToolbox, at the 4-core fit point - the 8-core Mac's extra decoder threads are
+        // the THREADS term's - by least squares over 2160p/1080p encodes of a 4K HEVC 10-bit and a 4K H.264 source, every reading within
+        // 6% (2026-10-18). Legitimate there despite macOS memory compression because these rows land at 0.4-0.9 GB, below the regime
+        // where it distorts a reading, and they reproduced across independent runs (4K 870, 862 and 860 MB; 1080p 693, 690 and 690).
+        hevc_videotoolbox: { base10: 58,  kEnc10: 29,  base8: 58,  kEnc8: 29 },
         // Measured 2026-10-17 on amdwin, the fleet's one AMD node: its chip has h264_amf only, which also fails at 2160p, so the pair is 1080p and 720p
         // output (458 and 430 MB) off one 4K HEVC 10-bit source, as Windows peak working set - which on that 4-core box tracked the Linux-fitted CPU rows
         // within 5% (libx265 +2%, libx264 -5%). An 8-bit measurement, reused at 10 bits.
         h264_amf:          { base10: 27,  kEnc10: 24,  base8: 27,  kEnc8: 24 },
     };
-    // Which measured row stands in for a family's other codecs. Justified by measurement, not convenience: h264_nvenc at 4K 8-bit came within 5% of
-    // hevc_nvenc, so the FAMILY dominates the codec. The three CPU encoders are each measured directly and need no stand-in. amf's stand-in runs the other
-    // way - the h264 row speaks for hevc_amf and av1_amf - because no fleet node can run either; memprobe's enc:hwfamily row tests it on one that can.
-    const MEM_ENCODER_BY_FAMILY = { nvenc: 'hevc_nvenc', qsv: 'hevc_qsv', vaapi: 'hevc_vaapi', videotoolbox: 'hevc_videotoolbox', amf: 'h264_amf' };
+    // Which measured row stands in for a family's codecs that have none of their own. Measured 2026-10-18 at 4K against each family's hevc row:
+    // h264_videotoolbox came within 3% and shares it, while h264_qsv ran 36% under and h264_nvenc 42% over, so each carries its own. A stand-in
+    // therefore serves only the codecs with no measurement of their own - av1_qsv, av1_nvenc, h264_vaapi, av1_vaapi, hevc_amf and av1_amf - and
+    // where a family has two measured rows it is the larger, since an unmeasured codec is better over- than under-stated. The three CPU encoders
+    // are each measured directly and need no stand-in. memprobe's enc:hwfamily rows test a stand-in on any node that can run its codec.
+    const MEM_ENCODER_BY_FAMILY = { nvenc: 'h264_nvenc', qsv: 'hevc_qsv', vaapi: 'hevc_vaapi', videotoolbox: 'hevc_videotoolbox', amf: 'h264_amf' };
     // Decode-side peak, MB per megapixel of the SOURCE frame, per source codec and per whether -thread_type slice is on the command (see MEM_SLICE_CODECS).
     // A 6.0x spread across codecs, so a single constant would be wrong in both directions. ProRes is the priciest decoder and AV1 the priciest one the flag
     // cannot help, which compounds with libsvtav1 being the hungriest encoder: AV1 -> AV1 is the most memory-expensive path this plugin can take.
@@ -1418,12 +1428,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //     figure is never read.
     // Every other row was re-derived from a full Linux refit on the same date, so they are one consistent set rather than a patchwork of eras. Two of them
     // moved a long way - mpeg2video -32% and vp9 -21% - which matters less than it looks: both are cheap decoders whose term is small either way.
+    // `nvdec` is the same codec decoded on NVDEC, which an nvenc encode runs wherever nvdecPreset supports the codec. Measured 2026-10-18 on the 20-core
+    // nvenc node as hevc_nvenc encodes at 2, 5 and 16 decoder threads (linear, R^2 0.996-0.997) and at 2160p and 1080p output. Both sources were 4K, so a
+    // row's nvdec figure and hevc_nvenc's base share one measured sum, split at that base. An NVDEC codec with no figure here keeps its software one: for
+    // h264, the one codec measured both ways, that is 2% under the NVDEC peak on a 4-core node and above it from 6 cores up.
     const MEM_DECODER = {
         mpeg2video: { def: 7.1,  slice: 7.1,  perThread: 0 },
         vp9:        { def: 14.3, slice: 8.2,  perThread: 1.7 },
-        h264:       { def: 24.9, slice: 11.9, perThread: 2.8 },
+        h264:       { def: 24.9, slice: 11.9, perThread: 2.8, nvdec: { def: 27.6, perThread: 1.2 } },
         hevc8:      { def: 31.8, slice: 15.9, perThread: 3.7 },
-        hevc10:     { def: 46.0, slice: 25.9, perThread: 5.2 },
+        hevc10:     { def: 46.0, slice: 25.9, perThread: 5.2, nvdec: { def: 33.2, perThread: 2.3 } },
         av1:        { def: 46.6, slice: 46.6, perThread: 2.0, threadsOverCores: 0 },   // libdav1d takes cores threads, not cores + 1
         prores:     { def: 62.4, slice: 62.4, perThread: 6.4 },
     };
@@ -1449,7 +1463,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // real: on the 20-core node every peak row read 26-166% over the model, on the 4-core one within 5%.
     //   * Decode - MEM_DECODER's perThread, MB per extra decoder thread per SOURCE megapixel. libavcodec's frame-threaded decoders take cores + 1 threads and
     //     libdav1d takes cores (threadsOverCores), capped at 16. Slice threading adds nothing per thread, so a slice decode carries no term. A hardware encode
-    //     decodes frame-threaded on the CPU, and its whole growth with cores was this term (+43 MB a thread at 4K, the same as the decode on its own).
+    //     decodes frame-threaded on the CPU, and its whole growth with cores was this term (+43 MB a thread at 4K, the same as the decode on its own) - except
+    //     nvenc's, which decodes on NVDEC where the codec allows and grows by MEM_DECODER's nvdec perThread instead (10-19 MB a thread at 4K).
     //   * Encode - MEM_ENCODER's perCore, MB per extra visible core per OUTPUT megapixel. libx264 runs 1.5 threads a core at 9.7 each; x265's pool runs one a
     //     core at 5.4, its frame-thread steps included; libsvtav1's memory is not a clean function of its lp setting, so its figure is fitted between the
     //     default-threaded runs of the 4- and 20-core nodes.
@@ -1479,7 +1494,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // preset), not a safety allowance, so content variance rides on top of it rather than being absorbed by it - a floor fitted on the cheaper content
     // under-states the true floor and therefore fails to refuse an encode that will OOM. The warning path is deliberately left unmargined; over-warning is
     // cheap, and MEM_HEADROOM_FRACTION above is already generous. Two limits on the evidence, stated rather than implied: the delta was measured on a CPU
-    // libx265 encode, so applying it to a HARDWARE encoder extrapolates - harmless, because a hw peak of 664-1409 MB sits far below any real cgroup ceiling,
+    // libx265 encode, so applying it to a HARDWARE encoder extrapolates - harmless, because 5% of a 0.4-2.0 GB hardware peak is at most 100 MB,
     // but untested; and it is one anime-vs-live pair. NOTE this cannot be re-measured on the Mac: five runs of one identical input there spread 26%
     // (1255-1583 MB, drifting upward) because macOS reports a compressed footprint under pressure.
     const MEM_CONTENT_MARGIN = 1.05;
@@ -1618,7 +1633,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // measured row: a fabricated number could refuse a file that would have encoded perfectly well, and there is no input a user could set to override it.
     // Both row lookups above go through tableGet, which is why a crafted codec or encoder name cannot resolve to an inherited Object.prototype member.
     const memoryEstimate = ({ family, encoderName, srcCodec, srcIs10, srcW, srcH, dispH, outH, want10, speedName, cores,
-        sliceOn, tonemapOn, deintOn, floor }) => {
+        sliceOn, nvdecSource, tonemapOn, deintOn, floor }) => {
         const row = memEncoderRow(encoderName, family);
         if (!row) return null;
         const srcMpix = (Number(srcW) * Number(srcH)) / 1e6;
@@ -1627,16 +1642,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!Number.isFinite(srcMpix) || srcMpix <= 0 || !(Number(dispH) > 0) || !(Number(outH) > 0)) return null;
         const outMpix = srcMpix * ((Number(outH) / Number(dispH)) ** 2);
         const dec = memDecoderRow(srcCodec, srcIs10);
-        // An unmeasured source codec contributes no decode term rather than a guessed one - it under-states the peak, which under-warns and under-refuses.
-        const kDec = dec ? (sliceOn ? dec.slice : dec.def) : 0;
+        // An unmeasured source codec contributes no decode term rather than a guessed one - it under-states the peak, which under-warns and under-refuses. An
+        // nvenc encode decodes on NVDEC wherever the source codec allows (nvdecSource), costed by the row's nvdec figure where it has one, and -thread_type
+        // slice rides a CPU encode only, so a hardware alternative quoted beside one is costed frame-threaded.
+        const nvdec = family === 'nvenc' && nvdecSource && dec && dec.nvdec ? dec.nvdec : null;
+        const slice = sliceOn && family === 'cpu';
+        const kDec = nvdec ? nvdec.def : dec ? (slice ? dec.slice : dec.def) : 0;
         const mb = (want10 ? row.base10 : row.base8) + kDec * srcMpix + (want10 ? row.kEnc10 : row.kEnc8) * outMpix;
         // A row's own `preset` ratios replace MEM_PRESET's in the floor as well as in the expected peak: a borrowed fastest-preset discount puts the bound
         // above or below what that encoder can really be squeezed to, and above it the refusal fails a file that would have fit.
         const presets = row.preset || MEM_PRESET;
         if (floor) return mb * (row.floor || 1) * presets.fast * MEM_CONTENT_MARGIN;
         const cpu = memCpuCount(cores);
-        const decodeThreadMb = dec && !sliceOn && dec.perThread
-            ? Math.max(0, memDecodeThreads(dec, cpu) - memDecodeThreads(dec, MEM_FIT_CORES)) * dec.perThread * srcMpix : 0;
+        const perThread = nvdec ? nvdec.perThread : (dec && !slice ? dec.perThread : 0);
+        const decodeThreadMb = perThread ? Math.max(0, memDecodeThreads(dec, cpu) - memDecodeThreads(dec, MEM_FIT_CORES)) * perThread * srcMpix : 0;
         const coreMb = row.perCore ? Math.max(0, Math.min(cpu, MEM_MAX_CORES) - MEM_FIT_CORES) * row.perCore * outMpix : 0;
         return (mb + decodeThreadMb + coreMb + memFilterSurcharge(tonemapOn, deintOn)) * (presets[speedName] || 1);
     };
@@ -2512,8 +2531,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const memoryVerdictInner = (sel, selUnforced, sliceOn) => {
             const budget = memNodeBudget(otherArguments);
             if (!budget || budget.scope === 'unknown') return;
+            // Whether an nvenc encode of this file decodes on NVDEC, by the same nvdecPreset call buildVideoArgs makes. A tonemap run is costed as the software
+            // decode its GPU island runs (the backend is resolved after this check); for hevc10, the HDR codec with an NVDEC figure, that is the larger.
+            const nvdecSource = !tonemap && require('../methods/nvdecPreset').getNvdecHwaccelPreset(file, { softwareFrames: true }) !== '';
             const common = { family: sel.family, encoderName: sel.encoderName, srcCodec: srcCodecName, srcIs10, srcW: srcWidth, srcH: srcHeight,
-                dispH: dispHeight, outH: outHeight, want10: want10Bit, speedName: speed, cores: budget.cores, sliceOn };
+                dispH: dispHeight, outH: outHeight, want10: want10Bit, speedName: speed, cores: budget.cores, sliceOn, nvdecSource };
             const expectOf = (over) => memoryEstimate({ ...common, ...over, tonemapOn: tonemap, deintOn: !!resolveDeintFilter() });
             const floorMb = memoryEstimate({ ...common, floor: true });
             const expectMb = expectOf({});
@@ -2668,7 +2690,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     + 'bitstream copy\n';
             sel.notes.forEach((n) => { response.infoLog += n; });
             // Slice decoding is worth emitting only where it saves something and only on a CPU encode: on a hardware route the slower slice decode could in
-            // principle starve a 100+ fps encoder, and a hardware encode peaks low enough (664-1409 MB) that it rarely approaches a limit anyway.
+            // principle starve a 100+ fps encoder, and a hardware encode peaks low enough (0.4-2.0 GB) that it rarely approaches a limit anyway.
             const sliceDecode = sel.family === 'cpu' && MEM_SLICE_CODECS.includes(srcCodecName);
             // Before resolveTonemapBackend, which spawns a real ffmpeg probe: a refusal here must not first pay for a probe whose answer it will never use.
             memoryVerdict(sel, selUnforced, sliceDecode);
