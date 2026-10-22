@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.67',
+    Version: '4.999.68',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1424,7 +1424,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: ffmpeg path =====
     // #endregion
 
-    // #region SHARED helpers (4 sections: ffmpeg metadata escaping … track title)
+    // #region SHARED helpers (5 sections: ffmpeg metadata escaping … track title)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
     // -=-=-= escMeta [all five] =-=-=-
     // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array for child_process.spawn, so shell metacharacters
@@ -1438,6 +1438,35 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .replace(/"/g, "'")                // double-quote → single-quote (safe inside the quoted value)
         .replace(/<io>/gi, '(io)');        // preset split marker → inert text (a value may never carry a second marker)
     // ===== END SHARED: ffmpeg metadata escaping =====
+
+    // ===== SHARED [audio_clean, video_clean]: statistics tag clearing =====
+    // -=-=-= STATS_TAG_RE / staleStatsArgs / staleStatsNote  [audio_clean, video_clean] =-=-=-
+    // mkvmerge's per-track statistics (and mkvpropedit's recount) describe the bytes of THAT track. ffmpeg copies a mapped stream's tags onto its output, so a
+    // stream this plugin RE-ENCODES would carry the source's figures - a 0.91 Mbps encode advertised to Plex/Jellyfin/MediaInfo as 48 Mbps (measured) - and
+    // MediaInfo's bitrate on mkv IS that tag (or, for the one track left without tags, the file size minus the others'). So the encode itself clears them:
+    // the Matroska muxer drops a key set to empty, and ffmpeg rewrites DURATION, which stays. A copied stream keeps them, since they are true of it. Only keys
+    // the source carries are emitted, spelled as it spells them (a -<lang> suffix included), so a stream without statistics changes nothing, and the pattern
+    // admits only [A-Za-z0-9_-], so no key can break the preset's quoting.
+    const STATS_TAG_RE = new RegExp('^(BPS|NUMBER_OF_FRAMES|NUMBER_OF_BYTES|_STATISTICS_TAGS|_STATISTICS_WRITING_APP|_STATISTICS_WRITING_DATE_UTC)'
+        + '(-[A-Za-z0-9_]+)?$', 'i');
+    const staleStatsArgs = (spec, srcStream) => Object.keys((srcStream && srcStream.tags) || {}).filter((k) => STATS_TAG_RE.test(k))
+        .map((k) => ` -metadata:s:${spec} "${k}="`).join('');
+    // The one line for a file whose re-encoded streams lost their statistics. None when they were mkvpropedit's own: Tdarr's "Run mkvpropedit on files before
+    // running plugins" is then on and recounts them on every scan. Until they are recounted MediaInfo shows nothing for a cleared audio or subtitle track and
+    // estimates a cleared video track from the file bytes left over (measured +57% / -12% against the packet sum, with and without 16 font attachments).
+    const staleStatsNote = (srcStreams) => {
+        const cleared = srcStreams.filter((s) => staleStatsArgs('x', s) !== '');
+        const writer = (s) => {
+            const k = Object.keys(s.tags || {}).find((x) => /^_STATISTICS_WRITING_APP(-[A-Za-z0-9_]+)?$/i.test(x));
+            return k ? s.tags[k] : '';
+        };
+        if (!cleared.length || cleared.some((s) => /^mkvpropedit/i.test(String(writer(s))))) return '';
+        const n = cleared.length;
+        return `☒Cleared the copied bitrate/size statistics on ${n} re-encoded stream${n === 1 ? '' : 's'} - until they are recounted`
+            + ' MediaInfo shows no bitrate for a cleared audio or subtitle track and estimates a cleared video track\'s from the leftover file bytes; Tdarr\'s'
+            + ' "Run mkvpropedit on files before running plugins" (Options, Worker Behavior) recounts them on every scan\n';
+    };
+    // ===== END SHARED: statistics tag clearing =====
 
     // ===== SHARED [audio_clean, video_clean]: ffmpeg encoder probe =====
     // -=-=-= parseFfmpegEncoders  [audio_clean, video_clean] =-=-=-
@@ -2545,6 +2574,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // channels, bps} for in-place transcodes/downmixes. appendedAudio: streams added via -map 0:a:N (downmix 'add'), appended after all originals.
         const outputAudioOverride = new Map();
         const appendedAudio = [];
+        // The source streams whose re-encoded output this run cleared of their copied statistics (staleStatsArgs), for staleStatsNote's one line.
+        const statsCleared = [];
         // ====== END OUTPUT TRACKING ======
 
 
@@ -2748,6 +2779,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // With no measurement riding along, a track this run RE-ENCODES or DERIVES must not keep a stamp its source carried: ffmpeg copies a mapped stream's
         // tags to its output, so the new audio would claim a measurement nothing made of it, and a later loudnorm run trusts the stamp and skips the track
         // for good, saying nothing. Matroska only - it is the one container that keeps the per-stream tag at all.
+        // A re-encoded or derived stream's copied statistics, cleared on the same Matroska-only gate as the loudnorm stamp (see staleStatsArgs).
+        const clearStatsArgs = (idx, src) => {
+            if (!loudnormTagPersists) return '';
+            const args = staleStatsArgs(`a:${idx}`, src);
+            if (args) statsCleared.push(src);
+            return args;
+        };
         const loudnormRideStamp = (idx, measured, src) => (measured ? loudnormStampArg(idx)
             : (loudnormTagPersists && readLoudnormTag(src || {}) ? ` -metadata:s:a:${idx} "${LOUDNORM_TAG}="` : ''));
         // The within-tolerance no-op: no re-encode is needed, but the measurement is still worth caching. The caller keeps the loudnormTagPersists/measured
@@ -2963,7 +3001,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             workDone += `☐${streamTag(srcStream.index)}[downmix_to_six=${downmixToSix}]${loudnormRideTag(six.changed)} Adding ${codecSurround} 6ch @ `
                 + `${enc.rate} from ${srcCodecStr} ${srcStream.channels}ch @ ${srcRateStr}${logSuffix}\n`;
             extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${enc.frag}${six.arg}`
-                + `${loudnormRideStamp(newStreamOutputIdx, six.measured, srcStream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                + `${loudnormRideStamp(newStreamOutputIdx, six.measured, srcStream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`
+                + clearStatsArgs(newStreamOutputIdx, srcStream);
             extraArguments += langMetaArg(newStreamOutputIdx, langForWrite(srcStream));
             newStreamOutputIdx++;
             appendedAudio.push({ srcStream, ...enc.record });
@@ -2978,7 +3017,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 + `${enc.logCodec} stereo @ ${enc.rate}${enc.label ? ` (${enc.label})` : ''} from ${srcCodecStr} ${srcStream.channels}ch @ ${srcRateStr}`
                 + `${logSuffix}\n`;
             extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${enc.frag}${two.arg}`
-                + `${loudnormRideStamp(newStreamOutputIdx, two.measured, srcStream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`;
+                + `${loudnormRideStamp(newStreamOutputIdx, two.measured, srcStream)} -metadata:s:a:${newStreamOutputIdx} "title=${newTitle}"`
+                + clearStatsArgs(newStreamOutputIdx, srcStream);
             extraArguments += langMetaArg(newStreamOutputIdx, langForWrite(srcStream));
             newStreamOutputIdx++;
             appendedAudio.push({ srcStream, ...enc.record });
@@ -2995,7 +3035,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The commit every IN-PLACE re-encode makes: the -c:a:N fragment, the output index marked modified (so the leftovers loop never emits a second
         // -c:a:N for it - ffmpeg honours the last, and the earlier operation would silently vanish) and its predicted output recorded.
         const replaceInPlace = (idx, frag, record) => {
-            extraArguments += ` -c:a:${idx} ${frag}`;
+            // The source this output index re-encodes, found here rather than passed in, so every in-place caller (six today) clears its statistics.
+            const src = file.ffProbeData.streams.find((s) => outputAudioIdxMap.get(s.index) === idx);
+            extraArguments += ` -c:a:${idx} ${frag}${src ? clearStatsArgs(idx, src) : ''}`;
             modifiedAudioIdx.add(idx);
             outputAudioOverride.set(idx, record);
         };
@@ -3476,10 +3518,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // setting removed them - a data track the container cannot copy (mp4UncopyableStreams) and a cover it cannot store (mp4CoversLost). Filled in when the
         // preset is built and read here, so the summary never promises one.
         const leftOut = new Set();
+        // An ENCODED appended track after the file's attachment streams fails the Matroska mux ('Received a packet for an attachment stream', exit 234,
+        // measured on jellyfin 7.1.4 with one font), so attachments are mapped after the appended tracks, and summarised there. They are not audio, so every
+        // a:N index holds.
+        const attachLast = appendedAudio.length > 0 && isMatroskaFamily(dstContainer)
+            && file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'attachment');
         const buildOutputSummary = () => {
             const tokens = [];
             for (const s of file.ffProbeData.streams) {
-                if (leftOut.has(s.index)) continue;
+                if (leftOut.has(s.index) || (attachLast && codecTypeOf(s) === 'attachment')) continue;
                 const enriched = enrichStream(s);
                 if (codecTypeOf(s) === 'audio') {
                     if (removedIndices.has(s.index)) continue;
@@ -3496,6 +3543,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             for (const a of appendedAudio) {
                 tokens.push(summariseStream(a.srcStream, { codec: a.codec, channels: a.channels, bps: a.bps, rate: a.approxRate }));
+            }
+            if (attachLast) {
+                for (const s of file.ffProbeData.streams.filter((x) => codecTypeOf(x) === 'attachment' && !leftOut.has(x.index))) {
+                    tokens.push(summariseStream(enrichStream(s)));
+                }
             }
             return tokens.join('');
         };
@@ -3522,8 +3574,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 .filter((s) => !removedIndices.has(s.index) && !outputAudioOverride.has(outputAudioIdxMap.get(s.index)));
             const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams, copiedStreams);
             const uncopyableDrops = uncopyable.map((s) => ` -map -0:${s.index}`).join('');
-            response.preset += `<io>-map 0${uncopyableDrops} -c copy${extraArguments}${strictArg}${globalOutputOpt}${mp4KeepTags}`
-                + outputMuxerArg(dstContainer);
+            response.preset += `<io>-map 0${uncopyableDrops}${attachLast ? ' -map -0:t' : ''} -c copy${extraArguments}${attachLast ? ' -map 0:t?' : ''}`
+                + `${strictArg}${globalOutputOpt}${mp4KeepTags}${outputMuxerArg(dstContainer)}`;
+            response.infoLog += staleStatsNote(statsCleared);
             response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;
             response.processFile = true;
         } else {
