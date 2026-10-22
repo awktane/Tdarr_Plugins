@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.64',
+    Version: '3.999.65',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1028,8 +1028,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ====== ENCODER CAPABILITY + SELECTION ======
     // Inputs are set once per LIBRARY and shipped identically to every node, so a video encoder can't be a stored setting on a mixed fleet - it is
     // resolved at runtime, per node, with a CAPABILITY QUERY (not a trial-encode ladder): ask ffmpeg what the build supports, intersect with a cheap
-    // zero-encode hardware-presence check, and fall back to one confirming probe only for the genuinely-ambiguous cases (QSV/AMF, where no cheap signal
-    // proves the right GPU is there, and any AV1 hardware encode, where presence can't prove the GPU is new enough: Arc / RTX-40xx / RDNA3).
+    // zero-encode hardware-presence check, and fall back to one confirming probe only for the genuinely-ambiguous cases (VAAPI/QSV/AMF, whose presence
+    // signal cannot prove a GPU that encodes this codec - see presenceOf - and any AV1 hardware encode, where presence can't prove the GPU is new enough:
+    // Arc / RTX-40xx / RDNA3).
 
     // Per-node subprocess probe timeouts (ms). The -encoders capability listing is a static parse and nvidia-smi a quick presence poll, so both are short;
     // each confirm probe actually spawns ffmpeg to encode/tonemap one synthetic frame, so it gets the longest budget.
@@ -1120,14 +1121,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     // Cheap zero-encode presence verdict for a family on this platform: 'yes' (usable), 'no' (definitely not), or 'probe' (can't tell cheaply - confirm
-    // with one encode). videotoolbox = Mac only; nvenc = nvidia-smi; vaapi on Linux = /dev/dri (vendor-agnostic). QSV and AMF can never be confirmed
-    // cheaply: Windows offers no signal at all, and on Linux /dev/dri only proves a GPU exists, not an Intel one QSV can drive (AMD shares renderD128).
+    // with one encode). videotoolbox = Mac only; nvenc = nvidia-smi. VAAPI, QSV and AMF can never be confirmed cheaply: Windows offers no signal at all,
+    // and on Linux /dev/dri only proves a GPU exists - not one that can encode this codec (no HEVC encoder on an AMD GPU before Polaris or an Intel iGPU
+    // before Skylake: an A8-7410's VCE 2.0 exposes renderD128 and fails every hevc_vaapi encode), nor an Intel one QSV can drive (AMD shares renderD128).
     const presenceOf = (family, cap, platform) => {
         switch (family) {
             case 'cpu': return 'yes';
             case 'videotoolbox': return platform === 'darwin' ? 'yes' : 'no';
             case 'nvenc': return cap.nvidia ? 'yes' : 'no';
-            case 'vaapi': return cap.dri ? 'yes' : 'no';
+            case 'vaapi': return cap.dri ? 'probe' : 'no';
             case 'qsv': return platform === 'linux' ? (cap.dri ? 'probe' : 'no') : 'probe';
             case 'amf': return 'probe';
             default: return 'no';
@@ -2548,7 +2550,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const refuse = budget.scope === 'container' && floorMb * MEM_BYTES_PER_MB > limit + budget.swapBytes;
             const tight = expectMb * MEM_BYTES_PER_MB > MEM_HEADROOM_FRACTION * freeBytes;
             // Which hardware encoder a guard gave up, and which guard did it. guard_captions is free (selUnforced holds the pre-force answer); guard_dv forced
-            // the CPU inside selectEncoder itself, so its counterfactual costs one extra -encoders/nvidia-smi probe - bought only for a file already flagged.
+            // the CPU inside selectEncoder itself, so its counterfactual re-runs the whole pick - the -encoders/nvidia-smi query plus any confirm encode a
+            // VAAPI/QSV/AMF or AV1 candidate needs - bought only for a file already flagged.
             let hwAlt = null;
             let forcedBy = '';
             if (sel.family === 'cpu' && (refuse || tight)) {
