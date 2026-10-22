@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.66',
+    Version: '3.999.67',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1716,7 +1716,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // then labelled progressive is unrecoverable. Only the FILTER is CPU - method_encoder still picks the hardware encoder and it still does the encode.
         if (deintFilter) vf.push(deintFilter);
         // The downscale then leads the rest of the chain, in every family and with or without a tonemap, so it is emitted once here rather than per branch.
-        if (willDownscale) vf.push(`scale=-2:${outHeight}`);
+        // accurate_rnd because on x86 an 8-bit planar scale without it takes a low-precision path arm64 lacks (up to 2 code values off C), so one file scaled
+        // differently on every node; with it x86 gives the Mac's exact pixels (80 of 80 on four x86 machines, 2026-10-12) at no measurable encode cost
+        // (0.97-1.03x). bitexact gives the same pixels but is FFmpeg's regression switch, kept for measuring. A 10-bit -> 8-bit conversion with no resize is
+        // node-identical under every flag (measured 2026-10-21), so the format conversion needs none.
+        if (willDownscale) vf.push(`scale=-2:${outHeight}:flags=bicubic+accurate_rnd`);
 
         if (family === 'nvenc') {
             inputSide = useGpuTm ? tmDevice : nvencDecodeArgs(file, srcCodec);
