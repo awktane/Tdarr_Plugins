@@ -18,7 +18,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same
         job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. A
         later job on that file is checked in full again. This check is always on and has no setting.\n`,
-    Version: '4.999.44',
+    Version: '4.999.45',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -1218,16 +1218,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (outputMuxerArg(dstContainer) === null) return skip(noMuxerSkipLine(dstContainer));   // an extension no muxer writes back (outputMuxerArg)
 
     // #region SHARED helpers (1 section: recovered marker vocabulary)
-    // ===== SHARED [clean_and_remux, stream_ordering]: recovered marker vocabulary =====
-    // -=-=-= RECOVERED_TAG  [clean_and_remux, stream_ordering] =-=-=-
-    // The format-level tag clean_and_remux stamps on every recover_bad_* remux, and the ONE cross-plugin marker whose spelling is executable
-    // code in two files (awk_cc is already shared; awk_video, awk_loudnorm and awk_sub_worker are each single-plugin). clean_and_remux reads it
-    // back to stay idempotent; stream_ordering reads it to soften BOTH truncation verdicts from a failFile quarantine to a warning that accepts
-    // the file for review, because a recover_bad_* repair of a truncated source legitimately reports a shorter or absent duration - so a reader
-    // that stopped matching would quarantine every salvaged file in a loop the user cannot break (fixed tolerance, no relaxing input). SHARED
-    // because a writer and a reader whose vocabularies drift fail SILENTLY. Only the KEY needs guarding - the read is getTagCI
-    // (case-insensitive) and tests only non-emptiness and equality with the library original's value, so no VALUE format can drift. Interpolate
-    // it into the log lines that NAME the tag too, or a rename here leaves user-facing text pointing at a key nothing writes any more.
+    // ===== SHARED [clean_and_remux, stream_ordering, video_clean]: recovered marker vocabulary =====
+    // -=-=-= RECOVERED_TAG  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // The format-level tag clean_and_remux stamps on every recover_bad_* remux, and a cross-plugin marker whose spelling is executable code in three files
+    // (awk_cc has its own shared section; awk_video, awk_vq, awk_loudnorm and awk_sub_worker are each single-plugin). clean_and_remux reads it back to stay
+    // idempotent; stream_ordering reads it to soften BOTH truncation verdicts from a failFile quarantine to a warning that accepts the file for review,
+    // because a recover_bad_* repair of a truncated source legitimately reports a shorter or absent duration - so a reader that stopped matching would
+    // quarantine every salvaged file in a loop the user cannot break (fixed tolerance, no relaxing input); video_clean reads it to keep a job whose recovery
+    // repaired the video out of guard_shrink_savings' size verdict, whose restore would bring the unrepaired original back. SHARED because a writer and a
+    // reader whose vocabularies drift fail SILENTLY. Only the KEY needs guarding - every read is getTagCI (case-insensitive) and tests only non-emptiness
+    // and equality with the library original's value, so no VALUE format can drift. Interpolate it into the log lines that NAME the tag too, or a rename
+    // here leaves user-facing text pointing at a key nothing writes any more.
     const RECOVERED_TAG = 'awk_recovered';
     // ===== END SHARED: recovered marker vocabulary =====
     // #endregion

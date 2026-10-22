@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.82',
+    Version: '3.999.83',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1031,14 +1031,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // #endregion
 
     // #region SHARED helpers (6 sections: preset path safety … language display name)
-    // ===== SHARED [clean_and_remux, sub_worker]: preset path safety =====
-    // -=-=-= pathIsPresetSafe  [clean_and_remux, sub_worker] =-=-=-
+    // ===== SHARED [clean_and_remux, sub_worker, video_clean]: preset path safety =====
+    // -=-=-= pathIsPresetSafe  [clean_and_remux, sub_worker, video_clean] =-=-=-
     // True when a real on-disk path can be embedded in a preset's quoted "${path}" token. Tdarr never shells out, but its worker tokenises each preset
     // half with a quote-aware parser before spawning ffmpeg, so a " anywhere in the path closes the wrapper mid-token and everything after it becomes
     // fresh argv entries (a raw control character breaks the token just as badly). The literal <io> is refused for a second reason: it is the preset's own
     // input/output split marker, and Tdarr reads only the first two parts, so a path carrying one silently DELETES every argument after it. The name parts
-    // WE generate are sanitised at their source, but the library DIRECTORY is a real path that has to stay literal - it can only be checked, never
-    // rewritten - so a caller that fails this test refuses that one sidecar with a ☒ line rather than emit the token.
+    // WE generate are sanitised at their source, but a library path has to stay literal - it can only be checked, never rewritten - so a caller that
+    // fails this test refuses that one output (a sidecar, or video_clean's restore from the library original) with a ☒ line rather than emit the token.
     const pathIsPresetSafe = (p) => !/["\x00-\x1f\x7f]/.test(String(p)) && !/<io>/i.test(String(p));
     // ===== END SHARED: preset path safety =====
 
@@ -2407,8 +2407,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // vocabularies drift fail SILENTLY, leaving the captions in the file twice. Deliberately not the awk_sub_worker marker - that is a list of sidecar PATHS
     // whose reader matches entries against paths, so a flag word pushed in there would be read as a filename.
     //   strip    - the captions are out (a sidecar or a subtitle track holds them) but the bitstream copy is still there; drop it on the next re-encode.
-    //   removed  - the captions are out AND the bitstream copy went with them in that same pass, so nothing is left to find, to probe for, or to remove.
-    //              The request/fact pair with `strip`: one asks a later plugin to act, the other tells every later pass there is nothing left to act on.
+    //   removed  - the captions are out AND the bitstream copy went with them in that same pass, so nothing is left to remove. The request/fact pair
+    //              with `strip`: one asks a later plugin to act, the other tells every later pass there is nothing left to act on. It changes no encode
+    //              command - video_clean probes and carries captions as on an untagged file - so the tag carried onto a video that still holds captions (an
+    //              outside tool's re-encode keeps global tags) cannot drop them.
     //   none     - the caption channel was decoded and carried no caption text at all, so no later pass need pay for that decode again. Written only
     //              once BOTH fields have been read empty: a broadcast carrying its captions in field 2 behind a padded field 1 reads empty on the default
     //              decode, and a later re-encode told `none` drops captions nothing ever captured.
@@ -3254,12 +3256,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (((ccPlan.job && ccPlaced) || ccPlan.stripOwed) && removeSource && !ccRecord.has(CC_TOKENS.none)) {
                 if (ccStripAllowed()) {
                     ccStrip = ccStripArg(removedIndices);
-                    // The one outcome we are CERTAIN about: recording `removed` spares video_clean a caption probe for a fact this pass has already
-                    // proved. Declining the memo costs only a repeated probe, never data, so unlike the request below a marker-hostile container needs
-                    // no warning - it just goes unrecorded.
+                    // The one outcome we are CERTAIN about. Recording `removed` ends this plugin's round trip for these captions, and tells video_clean
+                    // the video bitstream changed in this job, so its guard_shrink_savings never restores the captioned original over it. Declining the
+                    // memo costs only a repeated read, never data, so unlike the request below a marker-hostile container needs no warning - it just
+                    // goes unrecorded.
                     if (canRecord) ccRecord.add(CC_TOKENS.removed);
                     response.infoLog += `☐${streamTag(ccVideo.index)}[remove_source=true] Removing the closed captions from the video bitstream${
-                        canRecord ? ' and recording it so no later pass re-checks' : ''}\n`;
+                        canRecord ? ' and recording it, so sub_worker does not read them out again' : ''}\n`;
                 } else if (canRecord) {
                     ccRecord.add(CC_TOKENS.strip);
                     response.infoLog += ccDeferNote(ccVideo.index);
@@ -3918,7 +3921,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (removeSource) {
                     if (ccStripAllowed()) {
                         ccStrip = ccStripArg(removedIndices);
-                        // Same certainty as on extract; `imported` alone would leave video_clean probing a bitstream this pass just cleared.
+                        // Same certainty as on extract: `removed` also tells video_clean the video bitstream changed in this job.
                         ccAdd.push(CC_TOKENS.removed);
                         response.infoLog += `☐${streamTag(ccVideo.index)}[remove_source=true] Removing the closed captions from the video bitstream\n`;
                     } else {

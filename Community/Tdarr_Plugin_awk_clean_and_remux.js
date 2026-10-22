@@ -28,7 +28,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.67',
+    Version: '4.999.68',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1467,14 +1467,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const subDroppedRegardlessOfLanguage = (codec) => subFormatDropped(codec) || imageSubDropped(codec) || styledSubExported(codec);
 
     // #region SHARED helpers (2 sections: preset path safety … font attachment test)
-    // ===== SHARED [clean_and_remux, sub_worker]: preset path safety =====
-    // -=-=-= pathIsPresetSafe  [clean_and_remux, sub_worker] =-=-=-
+    // ===== SHARED [clean_and_remux, sub_worker, video_clean]: preset path safety =====
+    // -=-=-= pathIsPresetSafe  [clean_and_remux, sub_worker, video_clean] =-=-=-
     // True when a real on-disk path can be embedded in a preset's quoted "${path}" token. Tdarr never shells out, but its worker tokenises each preset
     // half with a quote-aware parser before spawning ffmpeg, so a " anywhere in the path closes the wrapper mid-token and everything after it becomes
     // fresh argv entries (a raw control character breaks the token just as badly). The literal <io> is refused for a second reason: it is the preset's own
     // input/output split marker, and Tdarr reads only the first two parts, so a path carrying one silently DELETES every argument after it. The name parts
-    // WE generate are sanitised at their source, but the library DIRECTORY is a real path that has to stay literal - it can only be checked, never
-    // rewritten - so a caller that fails this test refuses that one sidecar with a ☒ line rather than emit the token.
+    // WE generate are sanitised at their source, but a library path has to stay literal - it can only be checked, never rewritten - so a caller that
+    // fails this test refuses that one output (a sidecar, or video_clean's restore from the library original) with a ☒ line rather than emit the token.
     const pathIsPresetSafe = (p) => !/["\x00-\x1f\x7f]/.test(String(p)) && !/<io>/i.test(String(p));
     // ===== END SHARED: preset path safety =====
 
@@ -1944,16 +1944,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     // #region SHARED helpers (1 section: recovered marker vocabulary)
-    // ===== SHARED [clean_and_remux, stream_ordering]: recovered marker vocabulary =====
-    // -=-=-= RECOVERED_TAG  [clean_and_remux, stream_ordering] =-=-=-
-    // The format-level tag clean_and_remux stamps on every recover_bad_* remux, and the ONE cross-plugin marker whose spelling is executable
-    // code in two files (awk_cc is already shared; awk_video, awk_loudnorm and awk_sub_worker are each single-plugin). clean_and_remux reads it
-    // back to stay idempotent; stream_ordering reads it to soften BOTH truncation verdicts from a failFile quarantine to a warning that accepts
-    // the file for review, because a recover_bad_* repair of a truncated source legitimately reports a shorter or absent duration - so a reader
-    // that stopped matching would quarantine every salvaged file in a loop the user cannot break (fixed tolerance, no relaxing input). SHARED
-    // because a writer and a reader whose vocabularies drift fail SILENTLY. Only the KEY needs guarding - the read is getTagCI
-    // (case-insensitive) and tests only non-emptiness and equality with the library original's value, so no VALUE format can drift. Interpolate
-    // it into the log lines that NAME the tag too, or a rename here leaves user-facing text pointing at a key nothing writes any more.
+    // ===== SHARED [clean_and_remux, stream_ordering, video_clean]: recovered marker vocabulary =====
+    // -=-=-= RECOVERED_TAG  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // The format-level tag clean_and_remux stamps on every recover_bad_* remux, and a cross-plugin marker whose spelling is executable code in three files
+    // (awk_cc has its own shared section; awk_video, awk_vq, awk_loudnorm and awk_sub_worker are each single-plugin). clean_and_remux reads it back to stay
+    // idempotent; stream_ordering reads it to soften BOTH truncation verdicts from a failFile quarantine to a warning that accepts the file for review,
+    // because a recover_bad_* repair of a truncated source legitimately reports a shorter or absent duration - so a reader that stopped matching would
+    // quarantine every salvaged file in a loop the user cannot break (fixed tolerance, no relaxing input); video_clean reads it to keep a job whose recovery
+    // repaired the video out of guard_shrink_savings' size verdict, whose restore would bring the unrepaired original back. SHARED because a writer and a
+    // reader whose vocabularies drift fail SILENTLY. Only the KEY needs guarding - every read is getTagCI (case-insensitive) and tests only non-emptiness
+    // and equality with the library original's value, so no VALUE format can drift. Interpolate it into the log lines that NAME the tag too, or a rename
+    // here leaves user-facing text pointing at a key nothing writes any more.
     const RECOVERED_TAG = 'awk_recovered';
     // ===== END SHARED: recovered marker vocabulary =====
     // #endregion
@@ -1969,8 +1970,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // vocabularies drift fail SILENTLY, leaving the captions in the file twice. Deliberately not the awk_sub_worker marker - that is a list of sidecar PATHS
     // whose reader matches entries against paths, so a flag word pushed in there would be read as a filename.
     //   strip    - the captions are out (a sidecar or a subtitle track holds them) but the bitstream copy is still there; drop it on the next re-encode.
-    //   removed  - the captions are out AND the bitstream copy went with them in that same pass, so nothing is left to find, to probe for, or to remove.
-    //              The request/fact pair with `strip`: one asks a later plugin to act, the other tells every later pass there is nothing left to act on.
+    //   removed  - the captions are out AND the bitstream copy went with them in that same pass, so nothing is left to remove. The request/fact pair
+    //              with `strip`: one asks a later plugin to act, the other tells every later pass there is nothing left to act on. It changes no encode
+    //              command - video_clean probes and carries captions as on an untagged file - so the tag carried onto a video that still holds captions (an
+    //              outside tool's re-encode keeps global tags) cannot drop them.
     //   none     - the caption channel was decoded and carried no caption text at all, so no later pass need pay for that decode again. Written only
     //              once BOTH fields have been read empty: a broadcast carrying its captions in field 2 behind a padded field 1 reads empty on the default
     //              decode, and a later re-encode told `none` drops captions nothing ever captured.

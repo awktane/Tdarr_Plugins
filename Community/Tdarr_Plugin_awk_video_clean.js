@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.69',
+    Version: '3.999.70',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -242,8 +242,9 @@ const details = () => ({
                 libx264 for an H.264 target, libx265 for HEVC, which is slower than the GPU. Under node_strict, which never uses the CPU, a file that only
                 the CPU could keep them for errors instead. AV1 has no caption-carrying CPU encoder, so an AV1 target that lands on a dropping encoder is
                 warned about and continues rather than silently changing your codec.
-                \\nCaptions are better handled by lifting them into a real subtitle track - run sub_worker BEFORE this plugin. Once it has, this guard
-                steps aside and the leftover bitstream copy is removed on the next re-encode, so you do not end up with the same captions twice.
+                \\nCaptions are better handled by lifting them into a real subtitle track - run sub_worker BEFORE this plugin. Once it has, the leftover
+                bitstream copy is removed on the next re-encode, so you do not end up with the same captions twice. Where sub_worker already removed that
+                copy itself, this guard still checks the file, so captions an outside tool put back are kept.
                 \\nThe check costs one bounded ffprobe read per candidate file, a few seconds whether the file is a clip or a feature, and is skipped
                 entirely when the answer could not change anything - when the chosen encoder already carries captions (named under disabled above).
                 \\nA caption channel that is present but carries no text still counts as captions here, since telling the two apart needs a full decode.
@@ -330,6 +331,28 @@ const details = () => ({
                 \\nnormalize ignores this entirely, a compatibility conversion having to run whatever the size. Four things are exempt even under shrink:
                 a downscale, tonemap_sdr, the lossless strip_dynamic copy and interlace repair. The first three cannot grow a file; the repair can, since a
                 shot-on-video source comes back at double the frame rate.`,
+        },
+        {
+            name: 'guard_shrink_savings',
+            type: 'string',
+            defaultValue: '1',
+            inputUI: { type: 'text' },
+            tooltip: `Applies to action=shrink ONLY: put the original video stream back when a size re-encode saved less than this percentage. 0 disables the
+                guard, and 100 puts back every re-encode it judges.
+                \\nWhat it measures: the video stream alone - its bytes over its own running time, before and after - so audio work in the same job can
+                neither hide a re-encode that saved nothing nor take credit for one.
+                \\nWhen: on the next pass after a shrink encode in the same job, a codec change included. The verdict needs this plugin to run again on
+                that pass, as a classic plugin stack does; a Tdarr Flow runs a classic plugin once, so there the encode is kept unjudged.
+                \\nNever judged on size: a downscale, tonemap_sdr, an interlace repair, a strip of the dynamic HDR layer, an encode carrying out or following
+                sub_worker's caption removal, a job in which clean_and_remux repaired the file, and every normalize encode. Nor is an encode whose original
+                can never be put back - one that is not Matroska or MP4 (TS, M2TS, AVI, MPEG-PS), or that this container cannot hold: it is kept.
+                \\nCost: a read of the new file's video packets and usually the original's (about 30 s for 16 GB on a local disk, minutes over a share),
+                then one more copy pass of the whole file to record the verdict or put the video back.
+                \\nA revert puts the original video stream back, keeps every other stream and every other plugin's changes, and records the verdict in an
+                awk_vq tag, so the file is not tried again at the same settings. Changing this value retries a reverted file only where the saving it
+                recorded could pass the new value: raising it re-encodes nothing, and 0 retries every reverted encode that saved something and keeps it
+                unjudged. A kept file is never retried.
+                \\nExample:\\n25`,
         },
     ],
 });
@@ -1070,13 +1093,38 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // otherArguments.__awkCap. Wherever it is present NOTHING spawns: a missing key reads as no answer, never as a reason to probe the real node.
     const injectedCap = otherArguments && otherArguments.__awkCap;
 
-    // #region SHARED helpers (1 section: ffmpeg path)
+    // #region SHARED helpers (3 sections: ffmpeg path … preset path safety)
     // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: ffmpeg path =====
     // -=-=-= ffmpegPathOf  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
     // The node's ffmpeg: Tdarr hands a classic plugin otherArguments.ffmpegPath, and the bare name - a PATH lookup - stands in when it supplied none.
     // Every spawn in the four plugins that run ffmpeg resolves the binary here, so a change to how it is found reaches all of them at once.
     const ffmpegPathOf = (otherArgs) => String(otherArgs?.ffmpegPath || 'ffmpeg');
     // ===== END SHARED: ffmpeg path =====
+
+    // ===== SHARED [clean_and_remux, stream_ordering, video_clean]: recovered marker vocabulary =====
+    // -=-=-= RECOVERED_TAG  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // The format-level tag clean_and_remux stamps on every recover_bad_* remux, and a cross-plugin marker whose spelling is executable code in three files
+    // (awk_cc has its own shared section; awk_video, awk_vq, awk_loudnorm and awk_sub_worker are each single-plugin). clean_and_remux reads it back to stay
+    // idempotent; stream_ordering reads it to soften BOTH truncation verdicts from a failFile quarantine to a warning that accepts the file for review,
+    // because a recover_bad_* repair of a truncated source legitimately reports a shorter or absent duration - so a reader that stopped matching would
+    // quarantine every salvaged file in a loop the user cannot break (fixed tolerance, no relaxing input); video_clean reads it to keep a job whose recovery
+    // repaired the video out of guard_shrink_savings' size verdict, whose restore would bring the unrepaired original back. SHARED because a writer and a
+    // reader whose vocabularies drift fail SILENTLY. Only the KEY needs guarding - every read is getTagCI (case-insensitive) and tests only non-emptiness
+    // and equality with the library original's value, so no VALUE format can drift. Interpolate it into the log lines that NAME the tag too, or a rename
+    // here leaves user-facing text pointing at a key nothing writes any more.
+    const RECOVERED_TAG = 'awk_recovered';
+    // ===== END SHARED: recovered marker vocabulary =====
+
+    // ===== SHARED [clean_and_remux, sub_worker, video_clean]: preset path safety =====
+    // -=-=-= pathIsPresetSafe  [clean_and_remux, sub_worker, video_clean] =-=-=-
+    // True when a real on-disk path can be embedded in a preset's quoted "${path}" token. Tdarr never shells out, but its worker tokenises each preset
+    // half with a quote-aware parser before spawning ffmpeg, so a " anywhere in the path closes the wrapper mid-token and everything after it becomes
+    // fresh argv entries (a raw control character breaks the token just as badly). The literal <io> is refused for a second reason: it is the preset's own
+    // input/output split marker, and Tdarr reads only the first two parts, so a path carrying one silently DELETES every argument after it. The name parts
+    // WE generate are sanitised at their source, but a library path has to stay literal - it can only be checked, never rewritten - so a caller that
+    // fails this test refuses that one output (a sidecar, or video_clean's restore from the library original) with a ☒ line rather than emit the token.
+    const pathIsPresetSafe = (p) => !/["\x00-\x1f\x7f]/.test(String(p)) && !/<io>/i.test(String(p));
+    // ===== END SHARED: preset path safety =====
     // #endregion
 
     // Read a table by a key that came from a PROBE or a user string, never from a validated dropdown. `TABLE[key] || fallback` cannot tell an ABSENT key from
@@ -2415,8 +2463,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // vocabularies drift fail SILENTLY, leaving the captions in the file twice. Deliberately not the awk_sub_worker marker - that is a list of sidecar PATHS
     // whose reader matches entries against paths, so a flag word pushed in there would be read as a filename.
     //   strip    - the captions are out (a sidecar or a subtitle track holds them) but the bitstream copy is still there; drop it on the next re-encode.
-    //   removed  - the captions are out AND the bitstream copy went with them in that same pass, so nothing is left to find, to probe for, or to remove.
-    //              The request/fact pair with `strip`: one asks a later plugin to act, the other tells every later pass there is nothing left to act on.
+    //   removed  - the captions are out AND the bitstream copy went with them in that same pass, so nothing is left to remove. The request/fact pair
+    //              with `strip`: one asks a later plugin to act, the other tells every later pass there is nothing left to act on. It changes no encode
+    //              command - video_clean probes and carries captions as on an untagged file - so the tag carried onto a video that still holds captions (an
+    //              outside tool's re-encode keeps global tags) cannot drop them.
     //   none     - the caption channel was decoded and carried no caption text at all, so no later pass need pay for that decode again. Written only
     //              once BOTH fields have been read empty: a broadcast carrying its captions in field 2 behind a padded field 1 reads empty on the default
     //              decode, and a later re-encode told `none` drops captions nothing ever captured.
@@ -2464,6 +2514,130 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ====== END SOURCE-CODEC POLICY ======
 
+    // ====== SHRINK SAVINGS MEASUREMENT ======
+    // guard_shrink_savings' verdict state lives in the container-global VQ_TAG, written and read only by this plugin's own passes. Grammar (one value,
+    // ':'-separated - videoSigCore and the threshold text carry no ':'):
+    //   encoded:<core>:<T>              - a pure size-pass encode was emitted at these settings and waits for its verdict on the next pass.
+    //   keep:<pct>:<core>:<T>:<fp>      - judged and kept; <pct> a signed whole percent, or na where no verdict could be read (that pass's log says why).
+    //   reject:<pct>:<core>:<T>:<fp>    - judged and reverted by the restore mux.
+    // <fp> = <id8>.<dig>, the fingerprint of the video stream the pass leaves behind: videoId8, then videoDigest's 8 hex, or n where its window held no
+    // non-keyframe packet, or x where the read failed. Any other value, or a keep/reject with other than five fields, parses as absent.
+    const VQ_TAG = 'awk_vq';
+    // The packet-sum reads share ONE budget per verdict, sized for the largest original on a share (about 530 MB/s locally, so 30 min covers about 950
+    // GB, about 200 GB at 110 MB/s): a cycle can never block the worker for twice that. Its output is ~29 B per packet, so 64 MiB covers ~10 h at 60 fps.
+    const PACKET_SUM_TIMEOUT_MS = 30 * 60 * 1000;
+    const PACKET_SUM_MAX_BYTES = 64 * 1024 * 1024;
+    // The fingerprint reads the first 120 packets (~10 KB of output): 0.02-0.11 s locally, 0.30-0.47 s cold over SMB, measured 2026-10-22.
+    const FINGERPRINT_PACKETS = 120;
+    const FINGERPRINT_TIMEOUT_MS = 20000;
+    const FINGERPRINT_MAX_BYTES = 1024 * 1024;
+    const MATROSKA_DEMUXER = 'matroska,webm';
+    const MP4_DEMUXER = 'mov,mp4,m4a,3gp,3g2,mj2';
+    // The A/V offset a restore may add, in seconds: inside the ~40 ms at which an audio lead becomes detectable (EBU R37 / ITU-R BT.1359).
+    const ANCHOR_TOLERANCE_S = 0.010;
+
+    const parseVq = (raw) => {
+        const f = String(raw || '').trim().split(':');
+        if (f[0] === 'encoded' && f.length === 3 && f[1] && f[2]) return { state: 'encoded', core: f[1], t: f[2] };
+        if ((f[0] !== 'keep' && f[0] !== 'reject') || f.length !== 5 || !f[2] || !f[3] || !f[4]) return null;
+        const pct = /^-?\d+$/.test(f[1]) ? Number(f[1]) : (f[0] === 'keep' && f[1] === 'na' ? null : undefined);
+        return pct === undefined ? null : { state: f[0], pct, core: f[2], t: f[3], fp: f[4] };
+    };
+    // A stamp's <fp> split into its id8 and dig; a value that does not match is no fingerprint at all.
+    const VQ_FP_RE = /^([0-9a-f]{8})\.([0-9a-f]{8}|n|x)$/;
+    // The fingerprint's free half, from ffProbeData alone: what the stream IS (codec, profile, size, pixel format).
+    const videoId8 = (s) => require('crypto').createHash('sha1').update(`${s.codec_name}|${s.profile ?? ''}|${s.width}x${s.height}|${s.pix_fmt}`)
+        .digest('hex').slice(0, 8);
+    const fracOf = (v) => { const m = /^(\d+)\/(\d+)$/.exec(String(v || '').trim()); return m && Number(m[2]) > 0 ? Number(m[1]) / Number(m[2]) : 0; };
+    // A Matroska DURATION tag ('00:45:00.000000000') in seconds; NaN when it does not read as one.
+    const hmsSeconds = (v) => {
+        const m = /^(\d+):(\d+):(\d+(?:\.\d+)?)$/.exec(String(v || '').trim());
+        return m ? Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]) : NaN;
+    };
+    // Each spelling of a Matroska statistics key on a stream ('NUMBER_OF_BYTES', 'NUMBER_OF_BYTES-eng'), with its suffix, so the tags read beside it
+    // are the same writer's: a stale DURATION-eng can sit next to a fresh DURATION (interlaced_1080i_h264_2997.mkv: 60.06 s against 6.006 s).
+    const statsKeysOf = (tags, base) => Object.keys(tags || {}).map((k) => new RegExp(`^${base}(-[A-Za-z0-9_]+)?$`, 'i').exec(k))
+        .filter(Boolean).map((m) => ({ value: String(tags[m[0]] ?? '').trim(), suffix: m[1] || '' }));
+    // Which file a read is about, for the harness's injected answers: the library original, or this pass's working file.
+    const isOriginalPath = (p) => !!p && p === otherArguments?.originalLibraryFile?.file;
+
+    // Video payload bytes of one stream and its span (max(pts + duration) - min(pts), in that stream's time_base) from one packet read -> { bytes, packets,
+    // spanS }, or { why } naming the failure. The default writer, never csv or compact: both append an empty field to a packet carrying side data, so every
+    // MPEG-TS/PS packet reads '182602,' (22 of 125 corpus files broke, against 0 of 125 this way, with identical sums). A packet flagged D (discard) is
+    // left out of both sums: an mp4/mov trimmed by an edit list (an -ss stream copy, a LosslessCut or phone trim) still hands ffprobe the samples ahead of
+    // the edit, which no decode shows - a 9.40 s cut read 12.00 s and an encode that grew the video read as unmeasurable, and was kept. The harness answers
+    // from __awkCap.packetSum.{cache,original} and never spawns: { bytes, spanS }, or { stdout } - a packet read's own output, put through the same parse; a
+    // missing key reads as a failed read.
+    const packetSum = (filePath, ffprobePath, streamIndex, timeBase, timeoutMs) => {
+        const tb = fracOf(timeBase);
+        // ffprobe prints each packet's pts, duration, size and flags (K, D, C or _ each) on four lines, in that order whatever order -show_entries names.
+        const parse = (stdout) => {
+            const body = String(stdout || '').trim();
+            const lines = body ? body.split(/\r?\n/) : [];
+            if (!lines.length || lines.length % 4) return { why: 'ffprobe failed' };
+            let bytes = 0;
+            let packets = 0;
+            let lo = Infinity;
+            let hi = -Infinity;
+            for (let i = 0; i < lines.length; i += 4) {
+                const [pts, dur, size] = lines.slice(i, i + 3).map((l) => (/^-?\d+$/.test(l.trim()) ? Number(l) : NaN));
+                if (!Number.isFinite(pts) || !Number.isFinite(dur) || !Number.isFinite(size)) return { why: 'ffprobe failed' };
+                if (!lines[i + 3].includes('D')) {
+                    bytes += size;
+                    packets += 1;
+                    lo = Math.min(lo, pts);
+                    hi = Math.max(hi, pts + dur);
+                }
+            }
+            return bytes > 0 ? { bytes, packets, spanS: (hi - lo) * tb } : { why: 'ffprobe failed' };
+        };
+        if (injectedCap) {
+            const v = (injectedCap.packetSum || {})[isOriginalPath(filePath) ? 'original' : 'cache'];
+            if (v && typeof v.stdout === 'string') return tb > 0 ? parse(v.stdout) : { why: 'the stream states no time base' };
+            return v && !v.why && Number(v.bytes) > 0 && Number(v.spanS) > 0
+                ? { bytes: Number(v.bytes), packets: Number(v.packets) || 0, spanS: Number(v.spanS) } : { why: (v && v.why) || 'ffprobe failed' };
+        }
+        if (timeoutMs <= 0) return { why: 'timed out' };
+        if (!ffprobePath) return { why: 'no ffprobe beside ffmpeg on this node' };
+        if (!(tb > 0)) return { why: 'the stream states no time base' };
+        try {
+            const r = childProcess.spawnSync(ffprobePath, ['-v', 'error', '-select_streams', String(streamIndex), '-show_entries',
+                'packet=pts,duration,size,flags', '-of', 'default=nw=1:nk=1', filePath],
+            { encoding: 'utf8', maxBuffer: PACKET_SUM_MAX_BYTES, timeout: timeoutMs, killSignal: 'SIGKILL' });
+            if (r && r.error && r.error.code === 'ETIMEDOUT') return { why: 'timed out' };
+            return parse(r && !r.error && r.status === 0 ? r.stdout : '');
+        } catch (e) { return { why: 'ffprobe failed' }; }
+    };
+    // The fingerprint's content half: the first 8 hex of sha1 over the MD5 data hashes of the NON-keyframe packets among the stream's first 120 -> 8 hex,
+    // '' when that window holds none (an all-intra source: the 16 GB ProRes sample gave 0), null when the read failed or read nothing. Keyframes are left out
+    // because mkvmerge rewrites them (+2463 B on the first, measured) while every other packet stays byte-identical: the digest was identical through
+    // ffmpeg -c copy, mkv<->mp4, mkvmerge, mkvpropedit and MP4Box, and different on every re-encode, a same-settings second generation included. The ABSOLUTE
+    // index of the isCoverArt-aware primary, never v:0, which would hash a poster ahead of the video. The harness answers from
+    // __awkCap.videoDigest.{working,original}; a missing key reads as a failed read.
+    const videoDigest = (filePath, ffprobePath, absIndex, timeoutMs) => {
+        if (injectedCap) {
+            const v = (injectedCap.videoDigest || {})[isOriginalPath(filePath) ? 'original' : 'working'];
+            return typeof v === 'string' && (v === '' || /^[0-9a-f]{8}$/.test(v)) ? v : null;
+        }
+        if (!ffprobePath) return null;
+        try {
+            const r = childProcess.spawnSync(ffprobePath, ['-v', 'error', '-select_streams', String(absIndex), '-read_intervals', `%+#${FINGERPRINT_PACKETS}`,
+                '-show_entries', 'packet=flags,data_hash', '-show_data_hash', 'MD5', '-of', 'default=nw=1:nk=1', filePath],
+            { encoding: 'utf8', maxBuffer: FINGERPRINT_MAX_BYTES, timeout: timeoutMs, killSignal: 'SIGKILL' });
+            const body = r && !r.error && r.status === 0 ? String(r.stdout || '').trim() : '';
+            const lines = body ? body.split(/\r?\n/) : [];
+            if (!lines.length || lines.length % 2) return null;
+            const hashes = [];
+            for (let i = 0; i < lines.length; i += 2) {
+                const hash = lines[i + 1].trim();
+                if (!/^MD5:[0-9a-f]{32}$/.test(hash)) return null;
+                if (!lines[i].trim().startsWith('K')) hashes.push(hash);
+            }
+            return hashes.length ? require('crypto').createHash('sha1').update(hashes.join('\n')).digest('hex').slice(0, 8) : '';
+        } catch (e) { return null; }
+    };
+    // ====== END SHRINK SAVINGS MEASUREMENT ======
+
     // ====== PER-FILE FLOW ======
     // validate -> classify source video -> decide -> select encoder per node -> build preset. Video-only by design (audio and subtitles are always
     // copied) so it composes with the other awk plugins.
@@ -2485,9 +2659,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const guardDvOpt = ddValue(inputs.guard_dv, 'enabled');
     const guardLosslessOpt = ddValue(inputs.guard_lossless, 'enabled');
 
-    // The free-text NUMERIC inputs (the four quality_* tiers, guard_shrink_bitrate and guard_encode_hours) are the only user-typed values this plugin
-    // echoes back, so they go through logSafe like every free-text echo (see its header): failFile's message becomes the file's stored error, and
-    // loadDefaultValues only trims.
+    // The free-text NUMERIC inputs (the four quality_* tiers, guard_shrink_bitrate, guard_shrink_savings and guard_encode_hours) are the only user-typed
+    // values this plugin echoes back, so they go through logSafe like every free-text echo (see its header): failFile's message becomes the file's stored
+    // error, and loadDefaultValues only trims.
     const parseQuality = (v, name) => {
         const n = Number(String(v).trim());
         if (!Number.isFinite(n) || n < 0 || n > QUALITY_MAX)
@@ -2513,6 +2687,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 + ' (0 = no limit), check your settings');
         return n;
     })();
+    // A percentage, fractional allowed; 0 = off. savingsText, the parsed number's own text, is the threshold awk_vq records and every line names, so only a
+    // changed NUMBER reads as a new setting: '25.0', '025' and '+25' are all 25.
+    const guardShrinkSavings = (() => {
+        const n = Number(String(inputs.guard_shrink_savings).trim());
+        if (!Number.isFinite(n) || n < 0 || n > 100)
+            failFile(`[guard_shrink_savings=${logSafe(inputs.guard_shrink_savings)}] must be a percentage from 0 to 100 (0 = off), check your settings`);
+        return n;
+    })();
+    const savingsText = String(guardShrinkSavings);
 
     // Every dropdown's accepted set, as ONE table driving the shared checkDropdowns loop. The shape matters beyond the line count: CLAUDE.md's retired-option
     // policy says a value the dropdown no longer offers must STOP the file, and input_surface_diff.js has to locate each dropdown's validator to report an
@@ -3034,8 +3217,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const ccTokens = ccTokensOf(file.ffProbeData.format?.tags);
         const ccExported = ccTokens.includes(CC_TOKENS.strip);    // sub_worker took them out, but could not remove the bitstream copy under its -c copy pass
         const ccChannelEmpty = ccTokens.includes(CC_TOKENS.none); // sub_worker decoded the channel and it carried no caption text at all
-        const ccAlreadyGone = ccTokens.includes(CC_TOKENS.removed); // sub_worker read them out AND filtered the bitstream copy away in that same -c copy pass
-        const dropCaptions = ccExported || ccChannelEmpty || ccAlreadyGone;
+        // `removed` (sub_worker filtered the bitstream copy away in its own -c copy pass) is a memo, so it changes no encode command: on a true tag -a53cc 0
+        // removes nothing and neither does a missing -a53cc 1, while a FALSE one - an outside tool's re-encode carries the global tag onto a video that still
+        // has its captions - would drop them on every encoder. guard_captions treats such a file as untagged, and says so where its probe finds captions.
+        const ccAlreadyGone = ccTokens.includes(CC_TOKENS.removed);
+        const dropCaptions = ccExported || ccChannelEmpty;
         // Only `true` is information. Tdarr's optional caption scan reads false both for a file that genuinely has none and for one its bundled CCExtractor
         // could not parse (measured: every mp4, and MPEG-2 inside Matroska), so a false still has to be probed. Memoized to at most one probe per file - that
         // cost is the whole reason the check is skipped wherever the answer could not change the outcome.
@@ -3049,6 +3235,43 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 injectedCap && injectedCap.captions !== 'probe' ? injectedCap.captions === true : undefined);
             ccVerdict = { present: r === true, unknown: r === 'unknown', via: 'a bitstream scan' };
             return ccVerdict;
+        };
+
+        // guard_shrink_savings judges against the library original Tdarr hands every classic plugin. With none to compare the guard is inert, so no pass
+        // writes a pending marker that no verdict could ever read.
+        const fmtTags = file.ffProbeData.format?.tags || {};
+        const origLib = otherArguments?.originalLibraryFile;
+        const origProbe = Array.isArray(origLib?.ffProbeData?.streams) ? origLib.ffProbeData : null;
+        const savingsLive = guardShrinkSavings > 0 && !!origProbe;
+        const savingsTag = `[guard_shrink_savings=${savingsText}]`;
+        const origPath = String(origLib?.file || '');
+        const origPrimary = origProbe ? origProbe.streams.find((s) => codecTypeOf(s) === 'video' && !isCoverArt(s)) : undefined;
+        const origFormat = String(origProbe?.format?.format_name || '');
+        // A recover_bad_* repair in this job rewrote the video stream: the working file's stamp differs from the original's.
+        const recoveredHere = !!origProbe && getTagCI(fmtTags, RECOVERED_TAG).trim() !== getTagCI(origProbe.format?.tags, RECOVERED_TAG).trim();
+        // Why an encode is not a pure size pass, worded for its line ('' when it is one). The encode decides this itself, from its own triggers: on the next
+        // pass every transform re-reads as done (already capped, SDR, progressive, static), and a restore would put back the original bitstream - the
+        // captions sub_worker asked to have removed, or removed itself earlier in this job (`removed` here and not on the original), or what a recovery
+        // repaired, included.
+        const sizeExemptWhy = () => (willDownscale ? `downscales to ${outHeight}p` : tonemap ? 'tonemaps to SDR' : deinterlaceNeeded() ? 'deinterlaces'
+            : effHdrMode === 'strip_dynamic' && isDynamicHdr ? 'strips the dynamic HDR' : ccExported ? 'removes the closed captions sub_worker asked for'
+                : ccAlreadyGone && !ccTokensOf(origProbe?.format?.tags).includes(CC_TOKENS.removed) ? 'follows sub_worker\'s caption removal'
+                    : recoveredHere ? 'follows clean_and_remux\'s recovery' : '');
+        // The restore refusals the two probes and the original's path decide alone ('' when none applies). The encode's own pass reads them too: an encode
+        // whose original can never be put back is not judged at all, and the verdict re-checks them as a backstop.
+        const staticRefusal = () => {
+            if (!origPrimary) return 'the original has no video stream';
+            // The restore reads the original with no input flags - outside the Matroska and MP4 demuxers, the case clean_and_remux's container-forced
+            // -fflags +genpts / -avoid_negative_ts exists for. Measured 2026-10-22: an AVI, or an MPEG-PS whose packets lack pts, exits 234 ("Can't write
+            // packet with unknown timestamp") on every requeue; a TS or PS that does read back is rebased on its own start, so a video offset from the audio
+            // collapses to 0 (522 ms on a TS, 539 ms on a PS) and is fenced that way. +genpts fixes the AVI exit but not the TS/PS sync (ffmpeg anchors a
+            // TS/PS input on the streams it maps). The probed demuxer decides, never the extension.
+            if (origFormat !== MATROSKA_DEMUXER && origFormat !== MP4_DEMUXER)
+                return `the original is ${logSafe(origFormat || 'of an unknown format', 40)}, which cannot be read back in step with this file's other streams`;
+            if (!pathIsPresetSafe(origPath)) return 'the original\'s path holds a character a preset cannot carry';
+            if (containerRefusesCopy(dstContainer, codecNameOf(origPrimary)))
+                return `a .${dstContainer} file cannot hold the original's ${codecNameOf(origPrimary)} video`;
+            return '';
         };
 
         // What scale=-2 will emit beside outHeight, in the same DISPLAY orientation (ffmpeg autorotates ahead of the filter chain): the operating point
@@ -3181,18 +3404,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return summariseStream(outStream);
         };
 
-        // The caption-removal line, ahead of the encoder notes. `removed` is a memo, not a request - sub_worker took the captions out AND filtered the
-        // bitstream copy away in its own pass - so it gets a ☑ no-op line rather than the ☐ one, which would announce a queued removal against a file that
-        // has carried no captions since. The line is still worth emitting: it is what says why the caption probe was skipped, a decode this run did not have
-        // to pay for. dropCaptions keeps including ccAlreadyGone either way, because the -a53cc 0 it drives is the right command - a harmless no-op against
-        // a bitstream holding no A53.
-        const ccDropLine = () => {
-            if (ccExported || ccChannelEmpty)
-                return `☐${pTag} Dropping the embedded closed captions - sub_worker `
-                    + `${ccExported ? 'exported them to a subtitle, and keeping both would show them twice'
-                        : 'found the caption channel carries no text'}\n`;
-            return ccAlreadyGone ? `☑${pTag} No embedded closed captions to carry - sub_worker already took them out and cleared the bitstream copy\n` : '';
-        };
+        // The caption-removal line, ahead of the encoder notes.
+        const ccDropLine = () => (dropCaptions ? `☐${pTag} Dropping the embedded closed captions - sub_worker `
+            + `${ccExported ? 'exported them to a subtitle, and keeping both would show them twice' : 'found the caption channel carries no text'}\n` : '');
 
         // The source frame rate where two readings agree, times what the interlace repair does to it; 0 otherwise. It bounds only how long a CPU test
         // encode may show no output before it is too slow for guard_encode_hours - the estimate itself is read from media time, because a declared rate can
@@ -3253,6 +3467,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
             const captionLines = [];
             let captionGate = guardCaptions && !dropCaptions ? 'open' : 'off';   // open -> not probed yet; survive -> skip every dropper
+            let ccContradicted = false;   // awk_cc says `removed`, and the probe found the captions this encode now keeps
             let ccVia = '';
             let displaced = null;   // the dropper guard_captions skipped first
             let chosen = null;
@@ -3381,6 +3596,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     captionGate = 'survive';
                     ccVia = cc.via;
                     displaced = c;
+                    if (ccAlreadyGone) {
+                        ccContradicted = true;
+                        captionLines.push(`☒${pTag}[guard_captions=enabled] ${CC_TAG} says sub_worker removed the closed captions, but the video still carries`
+                            + ' them - keeping them\n');
+                    }
                     return true;
                 } else captionGate = 'off';
                 return false;
@@ -3448,7 +3668,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         : `☐${pTag}[guard_captions=enabled] Closed captions found by ${ccVia} - skipping ${displaced.label}, which would drop them,`
                             + ` for ${chosen.c.label}, which keeps them\n`);
                 return { sel: { family: chosen.c.family, encoderName: chosen.c.encoderName }, enc: chosen.enc, tonemapBackend: chosen.tm, tmWhy: chosen.tmWhy,
-                    captionForced: !!displaced && chosen.c.family === 'cpu', captionLines, notes, memLines: chosen.mem.lines };
+                    captionForced: !!displaced && chosen.c.family === 'cpu', ccContradicted, captionLines, notes, memLines: chosen.mem.lines };
             }
 
             // Nothing passed. guard_dv's forced CPU is never a node_strict fallback - Dolby Vision never strict-errors (encoderPlan) - so its failure ends
@@ -3517,7 +3737,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return null;
         };
         // Build the transcode preset (encoder resolved per node), ending on the predicted output summary.
-        const emitTranscode = (encodeTag, { videoSig, priorSig }) => {
+        const emitTranscode = (encodeTag, { videoSig, videoSigCore, priorSig }) => {
             if (preserveDv)
                 response.infoLog += `☐${pTag}[guard_dv=enabled] ${dvLabel} - keeping the DV RPU through the re-encode (libx265)\n`;
             // libx265 carries only the RPU through a re-encode; any other dynamic layer on the same file is lost, and every other path that loses one says so.
@@ -3556,7 +3776,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (ccExported) {
                 const retired = [...new Set(ccTokens.map((t) => (t === CC_TOKENS.strip ? CC_TOKENS.removed : t)))];
                 globalWrites[CC_TAG] = escMeta(retired.join(','));
+            } else if (pick.ccContradicted) {
+                // A false `removed` memo goes: the captions it says are gone are in this encode's output. Every other token stays.
+                globalWrites[CC_TAG] = escMeta(ccTokens.filter((t) => t !== CC_TOKENS.removed).join(','));
             }
+            // A pure size pass asks to be judged on the next pass (SHRINK SAVINGS VERDICT); every other encode clears a verdict the source carries, which
+            // described the video this encode replaces.
+            const exemptWhy = sizeExemptWhy();
+            // An original that can never be put back leaves nothing to judge, so the encode writes no marker and says why here, not one pass later.
+            const unrestorable = savingsLive && action === 'shrink' && !exemptWhy ? staticRefusal() : '';
+            const judged = savingsLive && action === 'shrink' && writeFence && !exemptWhy && !unrestorable;
+            if (judged) globalWrites[VQ_TAG] = escMeta(`encoded:${videoSigCore}:${savingsText}`);
+            else if (getTagCI(fmtTags, VQ_TAG).trim() !== '') globalWrites[VQ_TAG] = '';
             // Every container-global write is one globalWrites entry (each value escMeta'd as it goes in), emitted here in the order it was set, so the
             // map mp4TagPlan reads and the -metadata the muxer gets cannot disagree.
             for (const [k, v] of Object.entries(globalWrites)) out += ` -metadata "${k}=${v}"`;
@@ -3573,6 +3804,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         + ` ${deintParity()} field order) - keeping every field as its own frame, so the output runs at double the frame rate\n`;
             } else response.infoLog += deintVerdictLine();
             if (clearStats) response.infoLog += staleStatsNote([primary]);
+            if (savingsLive && action === 'shrink' && exemptWhy)
+                response.infoLog += `☐${pTag}${savingsTag} This encode also ${exemptWhy} - it is not judged on size\n`;
+            else if (unrestorable) {
+                response.infoLog += `☐${pTag}${savingsTag} This encode is not judged on size - the original video stream cannot be put back`
+                    + ` (${unrestorable})\n`;
+            }
             response.infoLog += `☐${pTag}${encodeTag} Transcoding video @ ${sel.encoderName} q${Math.round(qNorm)}\n`;
             response.infoLog += expectedResultsLine(predictTranscodedVideoToken());
             return response;
@@ -3593,20 +3830,326 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // real profile-8.1 RPU: dvhe/p8/L6 in, dvh1/p8/L6 out, record intact; see awk-ffmpeg-test's build-facts.md). The fixed point is pinned by the scenario
         // assertion video-clean-a-preserved-dv-output-still-matches-its-own-fence, so a detection drift fails there rather than silently re-encoding a library
         // once per queue pass.
-        if (realTranscode()) {
-            const videoSigCore = escMeta([action, targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, want10Bit ? '10' : '8', `s${speed}`,
-                ...(effHdrMode === 'tonemap_sdr' ? ['sdr'] : []), ...(effHdrMode === 'strip_dynamic' ? ['strip'] : []), ...(preserveDv ? ['dv'] : []),
-                ...(deinterlaceLive ? ['deint'] : [])].join('-'));
-            const videoSig = `${videoSigCore}-v${escMeta(details().Version)}`;
-            const priorSig = getTagCI(file.ffProbeData.format?.tags || {}, VIDEO_FENCE_TAG).trim();
-            // core only; the stored -v<version> suffix is forensic, not part of the fence
-            const alreadyFenced = priorSig !== '' && priorSig.replace(/-v[^-]*$/, '') === videoSigCore;
-            if (alreadyFenced) {
-                return skip(`☑${pTag}[action=${action}] Already processed by ${VIDEO_FENCE_TAG} at this exact setting (${videoSig})`
-                    + ` - left untouched\n`);
+        const videoSigCore = escMeta([action, targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, want10Bit ? '10' : '8', `s${speed}`,
+            ...(effHdrMode === 'tonemap_sdr' ? ['sdr'] : []), ...(effHdrMode === 'strip_dynamic' ? ['strip'] : []), ...(preserveDv ? ['dv'] : []),
+            ...(deinterlaceLive ? ['deint'] : [])].join('-'));
+        // The guard_shrink_savings verdict this file carries (SHRINK SAVINGS MEASUREMENT has the grammar). A reject at another threshold no longer fences
+        // it where the saving it recorded could pass the new one: the setting that did not work is no longer the user's setting. The stamp's whole percent
+        // is the saving rounded DOWN (a growth too), so the saving lies in [pct, pct + 1) and below the old threshold, and it could pass a new threshold T
+        // exactly when T is under both: a raised threshold changes nothing and re-encodes nothing, and 0 retries only an encode that saved something. A keep
+        // never unfences - the library file IS the kept encode, and re-encoding it would be generational.
+        const vqNow = parseVq(getTagCI(fmtTags, VQ_TAG));
+        const vqRetry = !!vqNow && vqNow.state === 'reject' && vqNow.core === videoSigCore && vqNow.t !== savingsText && vqNow.pct !== null
+            && guardShrinkSavings < vqNow.pct + 1 && !(Number(vqNow.t) <= guardShrinkSavings);
+        // The ffprobe the verdict's reads and the fence's fingerprint check use, located once and only when one of them runs ('' under the harness, whose
+        // reads are injected).
+        let ffprobeMemo = null;
+        const savingsFfprobe = () => {
+            if (ffprobeMemo === null) ffprobeMemo = injectedCap ? '' : deriveFfprobePath(ffmpegPathOf(otherArguments));
+            return ffprobeMemo;
+        };
+
+        // Validating a fence that matches this run's settings. The awk tags survive an outside tool's re-encode (plain ffmpeg keeps every global tag, and
+        // mkvmerge keeps them through a track swap), so a fence can describe a video stream that is no longer there. Only an INHERITED fence is checked - the
+        // library original's own, or any fence when there is no original: one this job wrote on an earlier cycle is this plugin's fresh output, and a check
+        // that ever misread it would re-encode with the same arguments, which Tdarr's identical-arguments guard errors. On an inherited fence a misread costs
+        // at most one re-encode in a later job, and a judged shrink stamps that re-encode with a fingerprint the free checks never overrule.
+        // Which job wrote a fence: the encode appends +j<8 hex of Tdarr's job id> to the forensic -v<version> suffix (outside the match). A token equal to this
+        // job's marks this job's own fence even when its text equals the original's (a re-encode at an unchanged version); with no token on either side
+        // (a fence from before the token, or a runner that passes no job) the full-string comparison with the original decides.
+        const jobToken = otherArguments?.job?.jobId
+            ? require('crypto').createHash('sha1').update(String(otherArguments.job.jobId)).digest('hex').slice(0, 8) : '';
+        const priorSig = getTagCI(fmtTags, VIDEO_FENCE_TAG).trim();
+        const fenceJob = (/\+j([0-9a-f]{8})$/.exec(priorSig) || [])[1] || '';
+        const fenceInherited = fenceJob && jobToken ? fenceJob !== jobToken
+            : !origProbe || priorSig === getTagCI(origProbe.format?.tags, VIDEO_FENCE_TAG).trim();
+        // The crf the CPU encoder takes at this setting - nativeQuality, the function the encode itself uses, clamp included.
+        const cpuCrf = Number(/-crf (\d+)/.exec(nativeQuality(targetCodecName, 'cpu', qNorm))[1]);
+        // The crf an x264/x265 encode recorded in its settings line (mediaInfo Encoded_Library_Settings), when its library is the target codec's CPU encoder,
+        // else null: libsvtav1 and every hardware encoder write no line (VideoToolbox measured), so their output is unknown, never contradicting. Measured: our
+        // libx265 encode at q24 reads crf=24.0, an outside crf-30 x265 re-encode crf=30.0, an x264 one crf=20.0.
+        const X26X_LIBRARY = { hevc: 'x265', h264: 'x264' };
+        const x26xSettings = () => {
+            const lib = tableGet(X26X_LIBRARY, targetCodecName, '');
+            const m = /(?:^|[ /])crf=([\d.]+)/.exec(String(mi?.Encoded_Library_Settings || ''));
+            const name = String(mi?.Encoded_Library_Name || String(mi?.Encoded_Library || '').trim().split(/\s+/)[0]).trim().toLowerCase();
+            return lib && m && name === lib && Number.isFinite(Number(m[1])) ? { lib, crf: Number(m[1]) } : null;
+        };
+        // A keep or reject stamped at this setting vouches for the stream its pass left behind (SHRINK SAVINGS MEASUREMENT has the fingerprint), and
+        // outranks the free checks: a restore puts the original under the fence on purpose, and its codec or height can contradict the fence's tokens.
+        // Returns null when no stamp vouches, '' when it holds, or why it does not. The id8 is free; an 8-hex digest costs one bounded read, and a read
+        // that fails proves nothing - it never undoes a fence. A stored n or x (an all-intra window, or a stamping read that failed) leaves identity only, and
+        // so does sub_worker's later caption removal, which rewrites the H.264 packets (measured) without making the verdict false.
+        const vqFingerprintStale = () => {
+            const fp = vqNow && vqNow.state !== 'encoded' && vqNow.core === videoSigCore ? VQ_FP_RE.exec(vqNow.fp) : null;
+            if (!fp) return null;
+            if (fp[1] !== videoId8(primary)) return 'its format';
+            if (!/^[0-9a-f]{8}$/.test(fp[2]) || ccAlreadyGone) return '';
+            const dig = videoDigest(file.file, savingsFfprobe(), primary.index, FINGERPRINT_TIMEOUT_MS);
+            return dig !== null && dig !== fp[2] ? 'its content' : '';
+        };
+        // The free checks, for a fence no stamp vouches for (normalize and exempt encodes, guard_shrink_savings=0, every fence older than awk_vq): each reads
+        // a fact the fence claims and the stream contradicts, with zero spawns, and an absent fact is unknown, never stale. Not checked: interlace (a decode
+        // verdict, not metadata) and sdr (no real tonemap encode has yet been read as SDR on both probes). Returns [claimed, found] or null.
+        // The height check reads only a fence 3.28.0 or later wrote: h<N> has meant "fits a 16:9 box N tall, in display orientation" only since then (before,
+        // the cap was on the height alone, and before 3.12.0 on the coded height), and older fences were left to stand on purpose - a 2592x1080 scope film
+        // fenced h1080 by 3.27.0 fails today's box without anything having touched it. A fence with no version that parses is not height-checked.
+        const fenceVersion = (/-v(\d+)\.(\d+)\.(\d+)(?:\+j[0-9a-f]{8})?$/.exec(priorSig) || []).slice(1).map(Number);
+        const fenceBoxed = fenceVersion.length === 3 && (fenceVersion[0] !== 3 ? fenceVersion[0] > 3 : fenceVersion[1] >= 28);
+        const fenceContradiction = () => {
+            const found = `${srcCodecName || 'unknown'}${dispWidth > 0 && dispHeight > 0 ? ` ${dispWidth}x${dispHeight}` : ''}`;
+            if (srcCodecName && srcCodecName !== targetCodecName) return [targetCodecName, found];
+            if (willDownscale && fenceBoxed) return [`${targetCodecName} within ${maxH}p`, found];   // no longer inside the fence's own h<N> box
+            const x = x26xSettings();
+            return x && Math.abs(x.crf - cpuCrf) > 0.5 ? [`${targetCodecName} at crf ${cpuCrf}`, `an ${x.lib} encode at crf ${x.crf}`] : null;
+        };
+        // '' when the fence holds, else what contradicts it, worded for the stale line (and for the implicit fence's line, where that still skips).
+        const fenceStaleWhy = () => {
+            const why = vqFingerprintStale();
+            if (why !== null) {
+                return why ? `${VQ_TAG} recorded this video stream when it was ${vqNow.state === 'keep' ? 'kept' : 'restored'}, and the video now differs`
+                    + ` (${why})` : '';
             }
+            const c = fenceContradiction();
+            return c ? `${VIDEO_FENCE_TAG} says this file was encoded to ${c[0]}, but the video is ${c[1]}` : '';
+        };
+
+        // ====== SHRINK SAVINGS VERDICT ======
+        // guard_shrink_savings, on the pass after this job's size-pass encode (its awk_vq=encoded:<core>:<T>). It sits ahead of realTranscode(), which can
+        // spawn idet, so an encode left under guard_shrink_bitrate's floor is still judged. Only a marker this job wrote is judged (ownMarker below). First
+        // match: a sibling that changed the video BITSTREAM in this job, a restore that cannot be done safely, or a bitrate that cannot be read keeps the
+        // encode unjudged (keep:na); otherwise the measured saving keeps it or restores the original video stream. Every verdict pass replaces encoded:, so
+        // the next pass reaches the fence and skips.
+        // Only a marker THIS job wrote is pending: its fence carries this job's token, or - with no token on either side - the library original does not
+        // carry the same marker. A Tdarr Flow runs a classic plugin once per job (pluginCycle 0, then the next flow node), so its encode reaches the library
+        // still marked, and a later job would compare that file with itself and restore it onto itself as a reject:0. Such an encode stays as it is: one
+        // line, no measurement, no stamp (a tag-only remux would only record "unjudged", and its fingerprint would vouch for whatever video the file then
+        // held), and the fence below treats the marker as no verdict.
+        const vqPending = savingsLive && !!vqNow && vqNow.state === 'encoded' && vqNow.core === videoSigCore;
+        const ownMarker = vqPending && (fenceJob && jobToken ? fenceJob === jobToken
+            : getTagCI(fmtTags, VQ_TAG).trim() !== getTagCI(origProbe?.format?.tags, VQ_TAG).trim());
+        if (vqPending && !ownMarker) {
+            response.infoLog += `☒${pTag}${savingsTag} The re-encode in this file was never judged on size - the pass after it did not run in the job that`
+                + ' made it (a Tdarr Flow runs a classic plugin once); left as it is\n';
+        }
+        if (vqPending && ownMarker) {
+            // The original's own mediaInfo, joined by mediaInfoFor's rule (StreamOrder = the stream's index, never Menu): mediaInfoFor reads THIS file's.
+            const origTracks = Array.isArray(origLib.mediaInfo?.track) ? origLib.mediaInfo.track : [];
+            const origMi = origPrimary && origTracks.find((t) => t['@type'] !== 'Menu' && Number(t.StreamOrder) === origPrimary.index);
+            const origFps = origPrimary ? fracOf(origPrimary.avg_frame_rate) : 0;
+            // The first audio stream of this file with a counterpart in the original - the same codec, language and channel count - as { cache, origs },
+            // origs being EVERY original stream with that key, or null. The job may have dropped one of several same-key tracks, and which one survived
+            // cannot be told from the probes, so the anchor below must hold against all of them. Audio only - a subtitle sub_worker round-tripped through a
+            // sidecar comes back on another timeline - and an audio_clean re-encode that changed the channel count never pairs.
+            const sharedAudio = () => {
+                const keyOf = (s) => `${codecNameOf(s)}|${getTagCI(s.tags, 'language').trim().toLowerCase()}|${s.channels ?? ''}`;
+                const audioOf = (streams) => streams.filter((s) => codecTypeOf(s) === 'audio');
+                const origAudio = audioOf(origProbe.streams);
+                for (const s of audioOf(file.ffProbeData.streams)) {
+                    const origs = origAudio.filter((x) => keyOf(x) === keyOf(s));
+                    if (origs.length) return { cache: s, origs };
+                }
+                return null;
+            };
+            const ffprobePath = savingsFfprobe();
+            const fingerprintOf = (s, filePath) => {
+                const dig = videoDigest(filePath, ffprobePath, s.index, FINGERPRINT_TIMEOUT_MS);
+                return `${videoId8(s)}.${dig === null ? 'x' : dig || 'n'}`;
+            };
+            const stamp = (state, pct, fp) => escMeta(`${state}:${pct}:${videoSigCore}:${savingsText}:${fp}`);
+            const line = (sym, text) => `${sym}${pTag}${savingsTag} ${text}\n`;
+            // The KEEP pass: a tag-only remux of this file, whose arguments differ from every encode's and every restore's, so Tdarr's identical-arguments
+            // guard cannot trip. reason is the verdict's own line.
+            const keepPass = (pct, reason) => {
+                const value = stamp('keep', pct, fingerprintOf(primary, file.file));
+                response.infoLog += reason
+                    + line('☐', `Recording the verdict in ${VQ_TAG} with a tag-only remux, so later passes read it instead of measuring`);
+                sealPreset('', `-map 0 -c copy${outputDrops}${strictArg} -metadata "${VQ_TAG}=${value}"`, { [VQ_TAG]: value });
+                response.infoLog += expectedResultsLine(summariseStream(enrichStream(primary)));
+                return response;
+            };
+
+            // A sibling that rewrote the video bitstream in this job: sub_worker's caption removal (filter_units, stamped `removed`) or a recovery. A restore
+            // copies the LIBRARY original's video while -map_metadata 0 keeps the tags saying that work is done - measured on cea608_embedded_sei.mp4, frames
+            // carrying captions were original 4, this file 0, restored 4, under AWK_CC=removed - and nothing re-checks, so the captions would show twice for
+            // good. A size verdict never undoes a transform the user asked for. The encode's own pass already exempts one that came before it (sizeExemptWhy),
+            // so this is the backstop for one between the encode and its verdict, worded without claiming which came first.
+            const ccRemovedHere = ccTokens.includes(CC_TOKENS.removed) && !ccTokensOf(origProbe.format?.tags).includes(CC_TOKENS.removed);
+            if (ccRemovedHere || recoveredHere) {
+                return keepPass('na', line('☑', `${ccRemovedHere ? 'sub_worker\'s caption removal' : 'clean_and_remux\'s recovery'} changed the video in this`
+                    + ' job - not judged on size'));
+            }
+            // Every restore-safety refusal is decided from the two probes, the path and the file on disk, so it runs before the measurement: a restore that
+            // cannot be done never pays for the original's packet-sum. staticRefusal's share was already read on the encode's own pass, so it is a backstop.
+            const refusal = (() => {
+                const fixed = staticRefusal();
+                if (fixed) return fixed;
+                // ffmpeg rebases each input on its OWN format start, so once the job has dropped the original's earliest-starting stream (audio_clean first,
+                // a timed poster track) this file was re-zeroed and the original was not, and the restored video lands off this file's other streams by
+                // exactly that rebasing. Read on a stream both files share (sharedAudio), it leaves the encode's own start delay out, and anything past
+                // ANCHOR_TOLERANCE_S is refused: an mkv whose dropped audio led the kept streams by 70 ms restored 70 ms out of step at 24 fps, inside the
+                // two frames the video's own delta used to allow. With no stream to share, the video's delta stands in, within one frame (an encode's
+                // own reorder delay measured ~21 ms at 24 fps).
+                const startOf = (v) => (v === undefined || v === null || String(v).trim() === '' ? NaN : Number(v));
+                const sinceStart = (s, format) => startOf(s.start_time) - startOf(format?.start_time);
+                const offMs = (d) => `the video would land ${Math.round(Math.abs(d) * 1000)} ms off the other streams' timing`;
+                const shared = sharedAudio();
+                if (shared) {
+                    for (const orig of shared.origs) {
+                        const rebase = sinceStart(shared.cache, file.ffProbeData.format) - sinceStart(orig, origProbe.format);
+                        if (!Number.isFinite(rebase)) return 'a start time is missing, so the streams cannot be shown to stay in step';
+                        if (Math.abs(rebase) > ANCHOR_TOLERANCE_S) return offMs(rebase);
+                    }
+                } else {
+                    const shift = sinceStart(primary, file.ffProbeData.format) - sinceStart(origPrimary, origProbe.format);
+                    if (!Number.isFinite(shift) || !(origFps > 0))
+                        return 'a start time or the frame rate is missing, so the streams cannot be shown to stay in step';
+                    if (Math.abs(shift) > Math.max(ANCHOR_TOLERANCE_S, 1 / origFps)) return offMs(shift);
+                }
+                try { fs.accessSync(origPath, fs.constants.R_OK); } catch (e) { return 'the original file cannot be read on this node'; }
+                // A different size on disk: the library file was replaced during the job (a Sonarr/Radarr upgrade), and the restore would put another
+                // release's video beside this one's audio.
+                let onDisk = NaN;
+                try { onDisk = fs.statSync(origPath).size; } catch (e) { /* unreadable size reads as changed */ }
+                if (onDisk !== Number(origProbe.format?.size)) return 'the library file has changed since this job began - it was probably replaced';
+                return '';
+            })();
+            if (refusal) {
+                return keepPass('na', line('☒', `Not judged on size - the original video stream cannot be put back safely (${refusal}) - keeping the new`
+                    + ' encode'));
+            }
+            // The same quantity on both sides: the primary's payload bytes over that stream's OWN span, never format.duration - the end of the longest
+            // track, which moves whenever the job changes a track that set it (a 30.03 s video beside a dropped 40 s commentary read -1.66% where the video
+            // saved 23.62%, and reverted). This file is always packet-summed: local, fresh, exactly what the encode wrote. The original is read EXACT, else
+            // cheaply where a cheap reading may only keep, else packet-summed; a read that fails keeps the encode, never reverts it.
+            const measured = (() => {
+                const deadline = Date.now() + PACKET_SUM_TIMEOUT_MS;
+                const cache = packetSum(file.file, ffprobePath, primary.index, primary.time_base, deadline - Date.now());
+                if (cache.why) return { side: 'new', why: cache.why };
+                const cacheBps = (cache.bytes * 8) / cache.spanS;
+                const bySpan = (bytes, spanS) => ({ bps: (bytes * 8) / spanS, spanS });
+                // Snapped to a millionth of a percent, so float noise a hair under an exact figure (39.999999999999 for 40) can neither miss a threshold it
+                // meets nor round down to the wrong whole percent.
+                const savingsAgainst = (orig) => ({ cacheBps, origBps: orig.bps, savings: Math.round((1 - cacheBps / orig.bps) * 1e8) / 1e6 });
+                // Spans further apart than this are not a like-for-like full-length re-encode (a truncated output, a timestamp anomaly).
+                const spansAgree = (spanS) => Math.abs(spanS - cache.spanS) <= Math.max(0.01 * spanS, origFps > 0 ? 2 / origFps : 0);
+                const tagOf = (k) => getTagCI(origPrimary.tags, k).trim();
+                const fileBytes = Number(origProbe.format?.size);
+                // A writer's NUMBER_OF_BYTES with the same writer's DURATION, from the keys of one suffix.
+                const statsReading = (appTest) => statsKeysOf(origPrimary.tags, 'NUMBER_OF_BYTES')
+                    .filter(({ suffix }) => appTest(tagOf(`_STATISTICS_WRITING_APP${suffix}`)))
+                    .map(({ value, suffix }) => ({ bytes: /^\d+$/.test(value) ? Number(value) : 0, spanS: hmsSeconds(tagOf(`DURATION${suffix}`)) }))
+                    .find((x) => x.bytes > 0 && x.spanS > 0);
+                // EXACT, Matroska only: the statistics trusted where their _STATISTICS_WRITING_APP equals the file's writing app - mediaInfo's General
+                // Encoded_Application, since ffprobe exposes only the muxing library. An mkvpropedit recount or an ffmpeg re-encode's copied tag fails it;
+                // NUMBER_OF_BYTES equalled the packet-sum on all 12 corpus mkvs that pass (mkvmerge v7.8-v92, MakeMKV 1.15.1). It decides both ways.
+                const writingApp = String((origTracks.find((t) => t['@type'] === 'General') || {}).Encoded_Application || '').trim();
+                const exact = origFormat === MATROSKA_DEMUXER && writingApp ? statsReading((app) => app === writingApp) : undefined;
+                // CHEAP, keep-only. mp4: ffprobe's bit_rate, already bytes over the stream's own duration (the packet-sum on 43 of 45 corpus mp4s), unless it
+                // implies more bytes than the file holds - a fragmented mp4's sidx-derived figure (164.6 MB in a 149.9 MB file) read a 0% copy as a keep.
+                // Matroska: only an mkvpropedit recount (exact on all 6 corpus files) within the file size. Never mediaInfo's BitRate on Matroska: there it IS
+                // the statistics tag, or the file size minus the other streams', and an ffmpeg re-encode keeps the source's BPS (48 Mbps on a 2.1 Mbps
+                // stream, measured), so an encode that GREW the video read as an 85% saving.
+                let cheap = null;
+                if (origFormat === MP4_DEMUXER) {
+                    const bps = Number(origPrimary.bit_rate);
+                    const spanS = Number(origPrimary.duration);
+                    if (bps > 0 && spanS > 0 && (bps * spanS) / 8 <= fileBytes) cheap = { bps, spanS };
+                } else if (origFormat === MATROSKA_DEMUXER) {
+                    const recount = statsReading((app) => /^mkvpropedit/i.test(app));
+                    if (recount && recount.bytes <= fileBytes) cheap = bySpan(recount.bytes, recount.spanS);
+                }
+                let orig = exact ? bySpan(exact.bytes, exact.spanS) : null;
+                if (!orig && cheap && spansAgree(cheap.spanS) && savingsAgainst(cheap).savings >= guardShrinkSavings) return savingsAgainst(cheap);
+                if (!orig) {
+                    const read = packetSum(origPath, ffprobePath, origPrimary.index, origPrimary.time_base, deadline - Date.now());
+                    if (read.why) return { side: 'original', why: read.why };
+                    orig = bySpan(read.bytes, read.spanS);
+                }
+                if (!spansAgree(orig.spanS))
+                    return { side: 'new', why: `the video spans differ, ${cache.spanS.toFixed(2)} s against ${orig.spanS.toFixed(2)} s` };
+                return savingsAgainst(orig);
+            })();
+            if (measured.why) {
+                return keepPass('na', line('☒', `Could not measure the ${measured.side} video stream's bitrate (${measured.why}) - keeping the new encode`));
+            }
+            // The whole percent the stamp records is the saving rounded DOWN, a growth included (0.6% saved is 0, 0.4% grown is -1), so it never reads as
+            // meeting a threshold it missed and the retry rule can bound the saving exactly. The lines show a saving rounded down and a growth rounded up to
+            // the threshold's own decimal places, one at least (0.6% at 1 is 0.6, 1.45% at 1.4 is 1.4, 0.04% grown is 0.1).
+            const micro = Math.round(measured.savings * 1e6);
+            const places = 10 ** Math.min(6, Math.max(1, (savingsText.split('.')[1] || '').length));
+            const pct = Math.floor(micro / 1e6) || 0;
+            const shown = (micro < 0 ? -Math.ceil(-micro * places / 1e6) : Math.floor(micro * places / 1e6)) / places || 0;
+            const rates = `${Math.round(measured.cacheBps / 1000)} kb/s against ${Math.round(measured.origBps / 1000)} kb/s`;
+            if (measured.savings >= guardShrinkSavings)
+                return keepPass(pct, line('☑', `The new video stream is ${shown}% smaller than the original's (${rates}) - keeping it`));
+
+            // The restore: the original's primary back in, by ABSOLUTE index on both sides (on a cover-art-first source v:0 is the poster, and a relative map
+            // restores the JPEG with exit 0); every other stream and every global tag of this file kept - it is the first input, so -map_metadata 0 keeps
+            // awk_video - and its chapters stated, since ffmpeg's default takes them from the first input that HAS any (a file whose chapters were removed
+            // got the original's back). Cover art is never copied back. The restored stream keeps the original's own stream tags (ffmpeg takes them from the
+            // input stream), so clean_and_remux redoes its video-stream edits on the next pass.
+            const origCodec = codecNameOf(origPrimary);
+            let restoreStrict = mp4StrictArg(dstContainer, file.ffProbeData.streams.filter((s) => s !== primary));
+            // Dolby Vision read off the original's own mediaInfo track: the shared helpers default to mediaInfoFor, which joins THIS file's track at the
+            // original's index, so a DV signal only the original's mediaInfo carries would lose -strict unofficial, and with it the dvcC box.
+            if (!restoreStrict && isMp4Family(dstContainer) && isDolbyVisionVideo(origPrimary, origMi)) restoreStrict = ' -strict unofficial';
+            // The restored stream's QuickTime fourcc. A Dolby Vision HEVC original the mp4 demuxer read keeps its own dvhe/dvh1 on -c copy; from any other
+            // container it takes dvh1, the one tag that keeps its dvcC box in mp4 (none writes hev1 and hvc1 drops the box - neither probe then sees DV,
+            // measured). An HEVC stream whose hvcC holds no parameter-set arrays (extradata of 23 bytes or less: they ride in-band) keeps its own tag too -
+            // hvc1 forced onto one exits 0 but writes a file ffprobe cannot open ("No start code is found"), measured on the profile 5 and 8.1 samples.
+            // Everything else takes qtVideoTag, the fourcc clean_and_remux's own retag gives the same stream, so the restore never re-triggers that remux.
+            const origExtradata = Number(origPrimary.extradata_size);
+            const restoreTag = isQtVideoContainer(dstContainer) && origCodec === 'hevc' && isDolbyVisionVideo(origPrimary, origMi)
+                ? (origFormat === MP4_DEMUXER ? '' : ' -tag:v:0 dvh1')
+                : origCodec === 'hevc' && origExtradata > 0 && origExtradata <= 23 ? '' : qtVideoTag(origCodec);
+            const value = stamp('reject', pct, fingerprintOf(origPrimary, origPath));
+            const verdict = shown < 0 ? `The re-encode grew the video by ${-shown}%` : `The re-encode saved only ${shown}%`;
+            response.infoLog += line('☐', `${verdict} (${rates}) - restoring the original video stream and keeping every other stream; this file is not`
+                + ' re-encoded again at these settings');
+            sealPreset('', `-i "${origPath}" -map 1:${origPrimary.index} -map 0 -map -0:${primary.index}${outputDrops} -map_chapters 0 -c copy`
+                + `${restoreTag}${restoreStrict} -metadata "${VQ_TAG}=${value}"`, { [VQ_TAG]: value });
+            // The restored stream maps first, and its token is summarised detached (index -1): summariseStream joins mediaInfo by index, and THIS file's
+            // track at the original's index can be another stream entirely (the audio, on a cover-art-first original).
+            response.infoLog += `☑Expected results: ${summariseStream({ ...origPrimary, index: -1 })}${mapped.filter((s) => s !== primary)
+                .map((s) => summariseStream(enrichStream(s))).join('')}\n`;
+            return response;
+        }
+        // A verdict this file already carries at this setting, said only where the fence below then skips the file - never ahead of a stale line. The
+        // threshold is named only where it differs from today's (a keep, or a reject the new value could not pass). The fence's retry says its own line.
+        const vqReadLine = (() => {
+            if (!(savingsLive && vqNow && vqNow.state !== 'encoded' && vqNow.core === videoSigCore && !vqRetry)) return '';
+            if (vqNow.pct === null) {
+                return `☑${pTag}${savingsTag} The re-encode was kept on an earlier pass without a size verdict (that pass's log says why)\n`;
+            }
+            const saved = vqNow.pct < 0 ? 'grew the video' : `saved ${vqNow.pct}%`;
+            const at = vqNow.t === savingsText ? '' : `, at guard_shrink_savings=${logSafe(vqNow.t, 16)}`;
+            return `☑${pTag}${savingsTag} The re-encode was ${vqNow.state === 'keep' ? 'kept' : 'reverted'} on an earlier pass (it ${saved}${at})\n`;
+        })();
+        // ====== END SHRINK SAVINGS VERDICT ======
+        if (realTranscode()) {
+            const videoSigShown = `${videoSigCore}-v${escMeta(details().Version)}`;
+            const videoSig = `${videoSigShown}${jobToken ? `+j${jobToken}` : ''}`;
+            // core only; the stored -v<version>[+j<job>] suffix is forensic, not part of the fence
+            const fenceMatches = priorSig !== '' && priorSig.replace(/-v[^-]*$/, '') === videoSigCore;
+            if (fenceMatches && vqRetry) {
+                response.infoLog += `☑${pTag}${savingsTag} The re-encode was reverted at guard_shrink_savings=${logSafe(vqNow.t, 16)} on an earlier pass`
+                    + ` (it ${vqNow.pct < 0 ? 'grew the video' : `saved ${vqNow.pct}%`}), which the new setting allows - processing the file`
+                    + ' again\n';
+            }
+            // An inherited fence that no longer describes the video counts as absent - here, and for the implicit fence below - and the encode below writes a
+            // fresh one. Its line is held until the run knows it encodes, so the implicit fence can say the same fact without "processing it again".
+            let staleWhy = '';
+            if (fenceMatches && !vqRetry) {
+                staleWhy = fenceInherited ? fenceStaleWhy() : '';
+                if (!staleWhy) {
+                    return skip(`${vqReadLine}☑${pTag}[action=${action}] Already processed by ${VIDEO_FENCE_TAG} at this exact setting (${videoSigShown})`
+                        + ` - left untouched\n`);
+                }
+            }
+            const staleLine = staleWhy ? `☒${pTag} ${staleWhy} - an outside tool changed it; processing it again\n` : '';
             if (containerRefusesTarget(dstContainer, targetCodecName)) {
-                return skip(`☒${pTag}[codec=${codec}][container=${dstContainer}] A .${dstContainer} file cannot hold ${targetCodecName} `
+                return skip(`${staleLine}☒${pTag}[codec=${codec}][container=${dstContainer}] A .${dstContainer} file cannot hold ${targetCodecName} `
                     + 'video (ffmpeg refuses it, or writes a file that no longer reads back as it) - left untouched; remux it to mkv or mp4 first '
                     + '(clean_and_remux does that), or choose a codec it holds\n');
             }
@@ -3616,6 +4159,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // reads it interlaced. So the file fails instead, untouched: a timeout clears on a requeue, and a file the probe can never read is the user's
             // call to encode as-is with deinterlace=disabled. With no other trigger nothing is encoded, and deintVerdictLine reports it left as-is.
             if (deinterlaceLive && idet().kind === 'unknown') {
+                response.infoLog += staleLine;
                 failFile(`${pTag}[deinterlace=${deinterlaceOpt}] Could not read an interlace verdict from this file${idetUnreadTail(idet())}`
                     + ' - not encoding, since combing encoded now could never be repaired; requeue, or set deinterlace=disabled to encode it as-is');
             }
@@ -3626,8 +4170,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 tonemap && 'tonemap_sdr',
                 deinterlaceNeeded() && (idet().kind === 'telecine' ? 'film-restore' : 'deinterlace'),
             ].filter(Boolean);
+            // The implicit fence. A plain mp4 remux, MP4Box or HandBrake drops awk_video, and a second encode at the same settings measured 15.9% smaller in
+            // video bytes, which guard_shrink_savings at its default would keep - a generational loss. So a same-codec size pass with nothing else to do (a
+            // wanted dynamic-HDR strip, or sub_worker's pending caption strip, still runs) is skipped where the x264/x265 settings line already records this
+            // run's crf - with no fence, or a stale one (an outside re-encode at this crf, a lossless cut of our own encode). Zero spawns, nothing written;
+            // hardware and AV1 output carry no settings line, so they are not caught.
+            if (reasonTags.length === 0 && (priorSig === '' || staleWhy) && action === 'shrink' && !ccExported
+                && !(effHdrMode === 'strip_dynamic' && isDynamicHdr)) {
+                const x = x26xSettings();
+                if (x && Math.abs(x.crf - cpuCrf) <= 0.5) {
+                    return skip(staleWhy ? `☑${pTag}[action=shrink] ${staleWhy}, but it is already an ${x.lib} encode at crf ${x.crf} - the quality this run`
+                        + ' would use; left untouched\n'
+                        : `☑${pTag}[action=shrink] Already an ${x.lib} encode at crf ${x.crf} - the quality this run would use - with no ${VIDEO_FENCE_TAG}`
+                            + ' tag (a remux or another tool dropped it); left untouched\n');
+                }
+            }
             if (reasonTags.length === 0) reasonTags.push('shrink');   // a same-codec shrink with no other visible transform
-            return emitTranscode(`[${reasonTags.join('][')}]`, { videoSig, priorSig });
+            response.infoLog += staleLine;
+            return emitTranscode(`[${reasonTags.join('][')}]`, { videoSig, videoSigCore, priorSig });
         }
 
         // No real transcode: a lossless strip, a bitrate skip, or a benign no-op. Reaching here means realTranscode()
