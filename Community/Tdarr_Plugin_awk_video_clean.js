@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.65',
+    Version: '3.999.66',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1430,10 +1430,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //     figure is never read.
     // Every other row was re-derived from a full Linux refit on the same date, so they are one consistent set rather than a patchwork of eras. Two of them
     // moved a long way - mpeg2video -32% and vp9 -21% - which matters less than it looks: both are cheap decoders whose term is small either way.
-    // `nvdec` is the same codec decoded on NVDEC, which an nvenc encode runs wherever nvdecPreset supports the codec. Measured 2026-10-18 on the 20-core
-    // nvenc node as hevc_nvenc encodes at 2, 5 and 16 decoder threads (linear, R^2 0.996-0.997) and at 2160p and 1080p output. Both sources were 4K, so a
-    // row's nvdec figure and hevc_nvenc's base share one measured sum, split at that base. An NVDEC codec with no figure here keeps its software one: for
-    // h264, the one codec measured both ways, that is 2% under the NVDEC peak on a 4-core node and above it from 6 cores up.
+    // `nvdec` is the same codec decoded on NVDEC, which an nvenc encode runs wherever nvencDecodeArgs allows it (nvdecPreset's list minus
+    // NVDEC_UNSAFE_CODECS). Measured 2026-10-18 on the 20-core nvenc node as hevc_nvenc encodes at 2, 5 and 16 decoder threads (linear, R^2 0.996-0.997)
+    // and at 2160p and 1080p output. Both sources were 4K, so a row's nvdec figure and hevc_nvenc's base share one measured sum, split at that base. An
+    // NVDEC codec with no figure here keeps its software one: for h264, the one codec measured both ways, that is 2% under the NVDEC peak on a 4-core node
+    // and above it from 6 cores up.
     const MEM_DECODER = {
         mpeg2video: { def: 7.1,  slice: 7.1,  perThread: 0 },
         vp9:        { def: 14.3, slice: 8.2,  perThread: 1.7 },
@@ -1667,13 +1668,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ====== VIDEO ARGUMENT ASSEMBLY ======
 
+    // Source codecs an nvenc encode decodes in SOFTWARE although upstream nvdecPreset lists them for NVDEC. MPEG-4 Part 2: the CUDA decode corrupted 2 of 16
+    // DivX/Xvid files (ASP with B-frames) with no decode error, measured 2026-10-13 on an RTX 3080 with jellyfin-ffmpeg 7.1.4 - nvenc encodes of them read
+    // 13.7 and 16.6 dB XPSNR against 40.6 and 39.8 from a software decode, and came out SMALLER, so no size check notices. The other 14 decoded normally, so
+    // it cannot be told apart per file. The encode stays on the GPU; only the decode moves. awk-ffmpeg-test's memprobe reads this table for its NVDEC mirror.
+    const NVDEC_UNSAFE_CODECS = ['mpeg4'];
+    // The decode-side flags of an nvenc encode: '-hwaccel cuda' (system-memory frames) where NVDEC may decode the primary video, else '' (software).
+    // buildVideoArgs emits it and the memory model costs it, so the two cannot disagree about which decode runs. The unsafe test reads BOTH this plugin's
+    // primary (primaryCodec) and nvdecPreset's, because they can differ: nvdecPreset skips only attached_pic, so a timed-thumbnail or still-image track
+    // ahead of the real video makes it judge that track, while -hwaccel (no stream specifier) reaches the one video stream actually decoded.
+    const nvencDecodeArgs = (file, primaryCodec) => {
+        const { getNvdecHwaccelPreset, getPrimaryVideoCodec } = require('../methods/nvdecPreset');
+        return [primaryCodec, getPrimaryVideoCodec(file)].some((c) => NVDEC_UNSAFE_CODECS.includes(c)) ? ''
+            : getNvdecHwaccelPreset(file, { softwareFrames: true });
+    };
+
     // Build the video-encode arguments for the chosen encoder: decode-side (input) flags + the output -c:v block (encoder, quality, speed, pixel format, the
     // video filter chain, QuickTime fourCC). Returns { inputSide, videoOut }. Source colour metadata carries through automatically - no explicit colour flags
     // (see the HDR-detection block below). Decode stays on software frames (nvenc via the shared nvdecPreset helper) so one CPU scale filter and -pix_fmt path
     // work uniformly across families; VAAPI is the exception - it needs its frames uploaded, so it carries an explicit device + format,hwupload filter.
-    const buildVideoArgs = ({ family, encoderName, targetCodec, qNorm, speed, want10Bit, willDownscale, outHeight, dstContainer, file, tonemap,
+    const buildVideoArgs = ({ family, encoderName, targetCodec, qNorm, speed, want10Bit, willDownscale, outHeight, dstContainer, file, srcCodec, tonemap,
         tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter, dropCaptions, sliceDecode }) => {
-        const { getNvdecHwaccelPreset, getNvenc10BitFormatArg } = require('../methods/nvdecPreset');
+        const { getNvenc10BitFormatArg } = require('../methods/nvdecPreset');
         const qualityArg = nativeQuality(targetCodec, family, qNorm);
         const speedArg = nativeSpeed(targetCodec, family, speed);
         let inputSide = '';
@@ -1703,8 +1719,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (willDownscale) vf.push(`scale=-2:${outHeight}`);
 
         if (family === 'nvenc') {
-            // '-hwaccel cuda' (system-memory frames) or '' for software decode
-            inputSide = useGpuTm ? tmDevice : getNvdecHwaccelPreset(file, { softwareFrames: true });
+            inputSide = useGpuTm ? tmDevice : nvencDecodeArgs(file, srcCodec);
             pushTonemap();
             parts.push(useGpuTm ? `-pix_fmt ${want10Bit ? 'p010le' : 'yuv420p'}`
                 : (want10Bit ? getNvenc10BitFormatArg(file, { softwareFrames: true }).trim() : '-pix_fmt yuv420p'));
@@ -2533,9 +2548,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const memoryVerdictInner = (sel, selUnforced, sliceOn) => {
             const budget = memNodeBudget(otherArguments);
             if (!budget || budget.scope === 'unknown') return;
-            // Whether an nvenc encode of this file decodes on NVDEC, by the same nvdecPreset call buildVideoArgs makes. A tonemap run is costed as the software
-            // decode its GPU island runs (the backend is resolved after this check); for hevc10, the HDR codec with an NVDEC figure, that is the larger.
-            const nvdecSource = !tonemap && require('../methods/nvdecPreset').getNvdecHwaccelPreset(file, { softwareFrames: true }) !== '';
+            // Whether an nvenc encode of this file decodes on NVDEC, by the same call buildVideoArgs makes (nvencDecodeArgs). A tonemap run is costed as
+            // the software decode its GPU island runs (the backend is resolved after this check); for hevc10, the HDR codec with an NVDEC figure, that is
+            // the larger.
+            const nvdecSource = !tonemap && nvencDecodeArgs(file, srcCodecName) !== '';
             const common = { family: sel.family, encoderName: sel.encoderName, srcCodec: srcCodecName, srcIs10, srcW: srcWidth, srcH: srcHeight,
                 dispH: dispHeight, outH: outHeight, want10: want10Bit, speedName: speed, cores: budget.cores, sliceOn, nvdecSource };
             const expectOf = (over) => memoryEstimate({ ...common, ...over, tonemapOn: tonemap, deintOn: !!resolveDeintFilter() });
@@ -2714,7 +2730,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // output needs the dvh1 tag - hvc1 drops the DV box entirely; a stream WITH a base keeps hvc1.
             const preserveDvNoBase = preserveDv && (dvNoBaseLayer || (!!dovi && dovi.compatId === 0));
             const enc = buildVideoArgs({ family: sel.family, encoderName: sel.encoderName, targetCodec: targetCodecName, qNorm, speed, want10Bit, willDownscale,
-                outHeight, dstContainer, file, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter: resolveDeintFilter(),
+                outHeight, dstContainer, file, srcCodec: srcCodecName, tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase,
+                deintFilter: resolveDeintFilter(),
                 dropCaptions, sliceDecode });
             // The fence is written wherever it is free, and skipped where it is not: under normalize it is never load-bearing (see the fence comment), while in
             // the mp4 family keeping it takes -movflags use_metadata_tags, which costs every native tag its readable form and the cover art (mp4TagPlan). A
