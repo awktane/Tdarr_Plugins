@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.71',
+    Version: '3.999.72',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -709,22 +709,96 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const isMp4ChapterTrack = (s) => String(file?.ffProbeData?.format?.format_name || '').split(',').some(isMp4Family)
         && codecTypeOf(s) === 'data' && ['text', 'tx3g'].includes(String(s.codec_tag_string || '').toLowerCase())
         && ((file?.mediaInfo?.track || []).some((t) => t?.['@type'] === 'Menu') || Number(s.nb_frames) > 0);
-    // -=-=-= isMp4RebuiltTimecode [all five] =-=-=-
-    // A tmcd timecode track the mp4/mov muxer puts back when a remux leaves it out: it writes one from the video stream's own timecode tag (measured
-    // 2026-10-01 and 2026-10-22: 01:00:00:00 in and out), so the output reads exactly as the copy would have. With no such tag the timecode is gone.
-    const isMp4RebuiltTimecode = (s, streams) => codecTypeOf(s) === 'data' && String(s.codec_tag_string || '').toLowerCase() === 'tmcd'
-        && (streams || []).some((v) => codecTypeOf(v) === 'video' && getTagCI(v.tags, 'timecode').trim() !== '');
+    // -=-=-= isTmcdTrack (+ mp4GlobalTimecodeKey, MP4_TIMECODE, mp4TimecodeAccepted, mp4VideoTimecode, mp4TimedVideo) [all five] =-=-=-
+    // A tmcd timecode track, and a video stream the mp4/mov muxer writes one for. The muxer reads the file's global timecode whenever the file has that tag,
+    // even an empty one, and the stream's own only otherwise (a global 02:00:00:00 beside a video 01:00:00:00 writes 02:00:00:00; a global 'garbage' beside a
+    // valid video tag writes none) - mp4VideoTimecode, the string a video's tmcd is written from. It parses that string as libavutil's
+    // av_timecode_init_from_string does, sscanf "%d:%d:%d%c%d" (MP4_TIMECODE): blanks may lead each number and a sign may lead it, no field is range-checked
+    // (99 frames, -01 or 25 hours all write a track), trailing text is ignored, and any separator before the frames but ':' means drop-frame. Then it times the
+    // track by the stream's frame rate rounded to whole fps: below 1 fps it writes none (a cover's 0/0, a 1/3 fps stream - but a PNG-codec video or an attached
+    // picture at 25/1 gets one), nor for drop-frame at a rate that does not round to a multiple of 30 (29.97, 30, 59.94 and 60 take it; 23.976, 24, 25 and 50
+    // do not). Each stream it accepts gets a tmcd of its own (two videos under a global timecode, two). Measured 2026-10-23 on jellyfin 7.1.4;
+    // awk-ffmpeg-test's fmtprobe create:tmcd* rows re-measure it.
+    const isTmcdTrack = (s) => codecTypeOf(s) === 'data' && String(s.codec_tag_string || '').toLowerCase() === 'tmcd';
+    const mp4GlobalTimecodeKey = () => Object.keys(file?.ffProbeData?.format?.tags || {}).find((k) => k.toLowerCase() === 'timecode');
+    const MP4_TIMECODE = /^[ \t\n\v\f\r]*[+-]?\d+:[ \t\n\v\f\r]*[+-]?\d+:[ \t\n\v\f\r]*[+-]?\d+(\D)[ \t\n\v\f\r]*[+-]?\d+/;
+    const mp4TimecodeAccepted = (timecode, rate) => {
+        const sep = (MP4_TIMECODE.exec(String(timecode ?? '')) || [])[1];
+        const [num, den] = String(rate || '').split('/').map(Number);
+        const fps = num > 0 && den > 0 ? Math.floor((num + Math.floor(den / 2)) / den) : 0;
+        return sep !== undefined && fps >= 1 && (sep === ':' || fps % 30 === 0);
+    };
+    const mp4VideoTimecode = (v) => {
+        const key = mp4GlobalTimecodeKey();
+        return key === undefined ? getTagCI(v.tags, 'timecode') : String(file.ffProbeData.format.tags[key] ?? '');
+    };
+    const mp4TimedVideo = (v) => codecTypeOf(v) === 'video' && mp4TimecodeAccepted(mp4VideoTimecode(v), v.avg_frame_rate);
+    // -=-=-= isMp4RebuiltTimecode (+ mp4TimecodeCount, mp4RebuiltTimecodes) [all five] =-=-=-
+    // A tmcd timecode track the mp4/mov muxer puts back when a remux leaves it out, so the output reads exactly as the copy would have (measured 2026-10-01
+    // and 2026-10-22: 01:00:00:00 in and out). That holds for a tmcd the video track does not reference (no 'tref') too: the video then shows no timecode
+    // tag, but the mov demuxer puts the track's timecode in the global tags, and the muxer writes the track back from those (measured 2026-10-23 on an mp4
+    // and a mov with the reference removed). It writes one per mp4TimedVideo stream the output maps and none beside a copied tmcd (mov) - mp4TimecodeCount,
+    // over `kept`, the streams as the output writes them - and writes each from its video's mp4VideoTimecode, never from a source track. So the source
+    // tmcds left out of the map that come back (mp4RebuiltTimecodes) are, one per kept timed video, a tmcd whose own timecode tag is the one that video is
+    // written with, then the first left in file order for each video none matches; the rest are lost. A PNG-codec video stored first at 05:00:00:00 beside
+    // an h264 at 01:00:00:00, each with its own tmcd, keeps the h264's when the PNG is dropped, and so does a ProRes proxy in a .mov (measured 2026-10-23;
+    // fmtprobe create:tmcd-cap and create:tmcd-pair). Under a global timecode every video asks for that one, so a tmcd it does not match comes back
+    // carrying the file's timecode, as its line says.
+    const mp4TimecodeCount = (kept) => (kept.some(isTmcdTrack) ? 0 : kept.filter(mp4TimedVideo).length);
+    const mp4RebuiltTimecodes = (kept) => {
+        const left = (file?.ffProbeData?.streams || []).filter((x) => isTmcdTrack(x) && !kept.some((k) => k.index === x.index));
+        const paired = [];
+        let unpaired = 0;
+        for (const v of mp4TimecodeCount(kept) ? kept.filter(mp4TimedVideo) : []) {
+            const at = left.findIndex((x) => getTagCI(x.tags, 'timecode') === mp4VideoTimecode(v));
+            if (at < 0) unpaired += 1;
+            else paired.push(...left.splice(at, 1));
+        }
+        return [...paired, ...left.slice(0, unpaired)];
+    };
+    const isMp4RebuiltTimecode = (s, kept) => isTmcdTrack(s) && mp4RebuiltTimecodes(kept).some((x) => x.index === s.index);
+    // -=-=-= mp4CreatedTracks (+ MP4_CHAPTER_KEY, MP4_CHAPTER_TIME) [all five] =-=-=-
+    // The tracks an mp4-family mux writes that no source stream stands behind, as the next pass's ffprobe reports them, so an Expected results line matches
+    // the next Input streams line: a chapter track (data, bin_data, 'text') when the file has chapters but no source chapter track (isMp4ChapterTrack), and a
+    // tmcd (data, no codec name, 'tmcd') for each one mp4TimecodeCount counts in `kept` beyond the source tmcds it rebuilds. Index -1, so no mediaInfo track
+    // joins either. mp4 and mov write both, as do .m4v and .m4a under the -f mp4 outputMuxerArg forces (the ipod muxer an .m4v selects by extension writes no
+    // tmcd), and a copied tmcd (mov) stops the muxer writing any. The muxer writes the chapter track from chapter TITLES, empty ones included: a list with none
+    // writes a Nero list alone. Tdarr probes without -show_chapters, so they are read off mediaInfo's Menu, which keys each chapter by its start time
+    // (_00_01_23_456), spells an untitled Matroska chapter as that time (MP4_CHAPTER_TIME) and lists an empty title not at all, while the mov demuxer gives
+    // every Nero entry a title. So a track is promised for a key whose value is not its own start time, for any key in a file the mov demuxer reads, and for a
+    // Menu naming no field (every title empty, Nero or Matroska). A Matroska chapter titled exactly its own start time reads as untitled (one tagged with a
+    // language reads 'en:...'), and a zero-entry Nero list as an empty one - though ffmpeg writes a list only for a file with chapters. An MPEG-TS program Menu
+    // and a QuickTime chapter track's own Menu name fields and key no chapter, so neither counts. Measured 2026-10-23 on jellyfin 7.1.4 and mediainfo.js 0.2.0;
+    // awk-ffmpeg-test's fmtprobe create:* and miprobe mi:menu* rows re-measure it. Summary only: nothing is mapped or counted as work.
+    const MP4_CHAPTER_KEY = /^_(\d{2})_(\d{2})_(\d{2})_(\d{3})$/;
+    const MP4_CHAPTER_TIME = '$1:$2:$3.$4';
+    const mp4CreatedTracks = (container, kept) => {
+        if (!isMp4Family(container)) return [];
+        const streams = file?.ffProbeData?.streams || [];
+        const movDemuxed = String(file?.ffProbeData?.format?.format_name || '').split(',').some(isMp4Family);
+        const titled = (t) => Object.keys(t).every((k) => ['@type', '@typeorder', ''].includes(k)) || Object.entries(t.extra || {})
+            .some(([k, v]) => MP4_CHAPTER_KEY.test(k) && (movDemuxed || String(v) !== k.replace(MP4_CHAPTER_KEY, MP4_CHAPTER_TIME)));
+        const chapters = !streams.some(isMp4ChapterTrack) && (file?.mediaInfo?.track || []).some((t) => t?.['@type'] === 'Menu' && titled(t));
+        const rebuilt = mp4RebuiltTimecodes(kept).length;
+        return [...(chapters ? [{ index: -1, codec_type: 'data', codec_name: 'bin_data', codec_tag_string: 'text' }] : []),
+            ...Array.from({ length: mp4TimecodeCount(kept) - rebuilt }, () => ({ index: -1, codec_type: 'data', codec_tag_string: 'tmcd' }))];
+    };
     // -=-=-= mp4RebuiltLine (+ mp4RebuiltLast) [all five] =-=-=-
     // A track left out of the map that the muxer rebuilds (isMp4ChapterTrack, isMp4RebuiltTimecode) is still in the output, so its line is a ☑. The muxer
     // writes such tracks after every mapped stream, the chapter track first and then each tmcd (measured 2026-10-22), so an Expected results line lists
-    // them last in that order: mp4RebuiltLast moves the items of `list` (anything carrying a source index) that are among `rebuilt` to the end.
+    // them last in that order: mp4RebuiltLast moves the items of `list` (anything carrying a source index) that are among `rebuilt` to the end, and slots the
+    // `created` tracks (mp4CreatedTracks) in by the same rule - a chapter track ahead of every tmcd, each tmcd last - each made a list item by `wrap`.
     const mp4RebuiltLine = (s, container) => {
-        const [what, from] = isMp4ChapterTrack(s) ? ['chapter', 'the chapters'] : ['tmcd timecode', "the video track's timecode"];
+        const timecode = mp4GlobalTimecodeKey() !== undefined ? "the file's timecode" : "the video track's timecode";
+        const [what, from] = isMp4ChapterTrack(s) ? ['chapter', 'the chapters'] : ['tmcd timecode', timecode];
         return `☑${streamTag(s.index)} Keeping the ${what} track - the .${String(container).toLowerCase()} muxer rebuilds it from ${from}\n`;
     };
-    const mp4RebuiltLast = (list, rebuilt) => {
+    const mp4RebuiltLast = (list, rebuilt, created = [], wrap = (s) => s) => {
         const rank = (x) => { const s = rebuilt.find((r) => r.index === x.index); return !s ? 0 : isMp4ChapterTrack(s) ? 1 : 2; };
-        return [...list].sort((a, b) => rank(a) - rank(b));
+        const out = [...list].sort((a, b) => rank(a) - rank(b));
+        const firstTmcd = out.findIndex((x) => rank(x) === 2);
+        out.splice(firstTmcd < 0 ? out.length : firstTmcd, 0, ...created.filter((s) => !isTmcdTrack(s)).map(wrap));
+        return [...out, ...created.filter(isTmcdTrack).map(wrap)];
     };
     // ===== END SHARED: mp4-family container =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: matroska-family container =====
@@ -737,8 +811,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -=-=-= mp4UncopyableStreams (+ mp4LostData, mp4UncopyableLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // The data streams an mp4-family -c copy cannot carry as they are, which each remux here leaves out of its map. One is a stream ffprobe names no codec
     // for - in practice a camera's tmcd timecode track - in mp4/m4v/m4a: the mp4 muxer refuses it outright ("Could not find tag for codec none", exit 234 on
-    // jellyfin 7.1.4) and takes the whole command down, so a -map 0 copy of such a file fails on every requeue. Its timecode survives where the video
-    // stream carries one (isMp4RebuiltTimecode). mov copies the track as-is and is left alone. The other is the chapter track, in mov too, which the muxer
+    // jellyfin 7.1.4) and takes the whole command down, so a -map 0 copy of such a file fails on every requeue. Its timecode survives where the muxer
+    // rebuilds it (isMp4RebuiltTimecode). mov copies the track as-is and is left alone. The other is the chapter track, in mov too, which the muxer
     // always rebuilds from the chapters (see isMp4ChapterTrack). clean_and_remux removes every such stream the muxer would not put back, so in the designed
     // stack only a run without it meets a lost one. The log line names each stream left out and says what carries over.
     const mp4UncopyableStreams = (container, streams) => {
@@ -747,13 +821,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return (streams || []).filter((s) => noCodec(s) || (isMp4Family(c) && isMp4ChapterTrack(s)));
     };
     // The dropped streams whose data really leaves the output - all of them but a track the muxer rebuilds - so an Expected results line never promises one.
-    const mp4LostData = (dropped, streams) => dropped.filter((s) => !isMp4ChapterTrack(s) && !isMp4RebuiltTimecode(s, streams));
-    const mp4UncopyableLog = (container, dropped, streams) => dropped.map((s) => {
-        if (!mp4LostData([s], streams).length) return mp4RebuiltLine(s, container);
+    // `kept` is what the output maps (see isMp4RebuiltTimecode); a tmcd lost while the muxer still writes others is one past its one-per-video count.
+    const mp4LostData = (dropped, kept) => dropped.filter((s) => !isMp4ChapterTrack(s) && !isMp4RebuiltTimecode(s, kept));
+    const mp4UncopyableLog = (container, dropped, kept) => dropped.map((s) => {
+        if (!mp4LostData([s], kept).length) return mp4RebuiltLine(s, container);
         const tmcd = String(s.codec_tag_string || '').toLowerCase() === 'tmcd';
         const what = tmcd ? 'tmcd timecode' : 'unidentified data';
+        const why = mp4TimecodeCount(kept) ? 'the muxer rebuilds only one per video the output keeps'
+            : 'the file has no timecode the muxer can rebuild it from';
         return `☐${streamTag(s.index)} Leaving out the ${what} track - .${String(container).toLowerCase()} cannot copy a stream with no codec`
-            + `${tmcd ? ', and with no timecode on the video track it is lost' : ''}\n`;
+            + `${tmcd ? `, and ${why}, so it is lost` : ''}\n`;
     }).join('');
     // ===== END SHARED: mp4 uncopyable streams =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: output muxer =====
@@ -2862,25 +2939,34 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const coverArtLog = coverArtStreams
             .map((s) => `☐${streamTag(s.index)} Remove cover-art/thumbnail (video-${codecNameOf(s) || 'unknown'})\n`)
             .join('');
-        const dropLog = coverArtLog + mp4UncopyableLog(dstContainer, uncopyable, file.ffProbeData.streams);
         // Apple/QuickTime fourCC for a COPIED stream (QT_VIDEO_TAG), gated on isQtVideoContainer rather than isMp4Family (see its definition).
         const qtVideoTag = (cn) => (isQtVideoContainer(dstContainer)
             ? tableGet(QT_VIDEO_TAG, cn, '') : '');
-        // input streams minus dropped cover-art video and any uncopyable data track the muxer does not rebuild, with the ones it does rebuild last
-        const goneData = mp4LostData(uncopyable, file.ffProbeData.streams);
-        const mapped = mp4RebuiltLast(file.ffProbeData.streams.filter((s) => !(isCoverArt(s) && codecTypeOf(s) === 'video') && !goneData.includes(s)),
-            uncopyable);
-        // The output summary, built once for both exits (the lossless strip and the transcode). Only the primary video's token differs between them, so it is
-        // the one argument; every other stream is summarised from its own enriched form, exactly as the input summary does.
-        const expectedResultsLine = (primaryToken) => `☑Expected results: ${mapped
+        // The streams an exit's output maps, the primary as that exit writes it (`written`): the source stream on a copy, the encode at its own frame rate on
+        // a transcode (encodeRate), the original's stream on a restore. The mp4 muxer times a tmcd by the video it receives (mp4TimedVideo) and writes one
+        // per video it maps, so the drop lines and the summary are built from these.
+        const keptFor = (written) => file.ffProbeData.streams.filter((s) => !coverArtStreams.includes(s) && !uncopyable.includes(s))
+            .map((s) => (s === primary ? written : s));
+        const dropLog = (written) => coverArtLog + mp4UncopyableLog(dstContainer, uncopyable, keptFor(written));
+        // input streams minus dropped cover-art video and any uncopyable data track the muxer does not rebuild, with the ones it does rebuild last and the
+        // ones it creates (mp4CreatedTracks) where it writes them
+        const mappedFor = (written) => {
+            const kept = keptFor(written);
+            const goneData = mp4LostData(uncopyable, kept);
+            return mp4RebuiltLast(file.ffProbeData.streams.filter((s) => !coverArtStreams.includes(s) && !goneData.includes(s)), uncopyable,
+                mp4CreatedTracks(dstContainer, kept));
+        };
+        // The output summary, built the same way for every exit. Only the primary video's token differs between them, so it is the first argument; every
+        // other stream is summarised from its own enriched form, exactly as the input summary does.
+        const expectedResultsLine = (primaryToken, written = primary) => `☑Expected results: ${mappedFor(written)
             .map((s) => (s === primary ? primaryToken : summariseStream(enrichStream(s)))).join('')}\n`;
         // Both presets end the same way: the mp4 tag plan (and the -movflags it may need), the muxer, the preset itself, and the drop / tag-plan log
         // lines. writes is the transcode's globalWrites; the strip writes no global tag of its own.
-        const sealPreset = (inputSide, out, writes) => {
+        const sealPreset = (inputSide, out, writes, written = primary) => {
             const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, writes);
             response.preset = `${inputSide}<io>${out}${tagPlan.flag ? ' -movflags use_metadata_tags' : ''}${globalOutputOpt}${outputMuxerArg(dstContainer)}`;
             response.processFile = true;
-            response.infoLog += dropLog + mp4TagPlanLog(tagPlan, dstContainer);
+            response.infoLog += dropLog(written) + mp4TagPlanLog(tagPlan, dstContainer);
         };
         // A predicted output stream that has lost its dynamic HDR layer must not still read 'dv' or 'hdr10+', so both predictions (the lossless strip and the
         // transcode) clear every carrier summariseStream's dynamic tests read: the dvhe/dvh1 fourcc, the DOVI side-data record, and the mediaInfo HDR_Format
@@ -3075,6 +3161,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             : (idet().kind === 'telecine'
                 ? 'fieldmatch,bwdif=mode=send_frame:deint=interlaced,decimate'   // rebuild the original frames; bwdif only touches what fieldmatch left combed
                 : `bwdif=mode=send_field:parity=${deintParity()}:deint=all`));
+        // What the repair does to the frame rate, as [times, over]: send_field emits a frame per field, fieldmatch+decimate keeps 4 frames of every 5.
+        const deintRateScale = () => {
+            const deint = resolveDeintFilter();
+            return deint.startsWith('bwdif=mode=send_field') ? [2, 1] : deint.startsWith('fieldmatch') ? [4, 5] : [1, 1];
+        };
+        // The encode's frame rate, in ffprobe's spelling. The muxer times a tmcd by it (mp4TimedVideo), so the repair can decide whether the output keeps
+        // one: a 29.97 drop-frame timecode keeps its tmcd at send_field's 59.94 and loses it at fieldmatch's 23.976 (measured 2026-10-23, jellyfin 7.1.4).
+        // What the repair scales is the rate ffmpeg feeds the encode, not the avg_frame_rate a copy keeps: av_guess_frame_rate takes r_frame_rate, or
+        // avg_frame_rate where avg is under 70 fps and r over 210 (FFmpeg 7.1 libavformat/avformat.c). Measured 2026-10-23 on VFR mp4s with a drop-frame
+        // tmcd: r 29.97 beside avg 18.1 keeps it, r 240 beside avg 24.3 loses it. For H.264, MPEG-1/2 and VC-1 it then takes the codec's own declared rate
+        // where that is under 0.7 of the one chosen and avg strays over 10% from it (r 120 beside avg 24.3 encoded at its SPS's 29.97). Neither probe
+        // reports that rate, so such a file is read at r, which misjudges the tmcd only where the two rates fall on opposite sides of mp4TimecodeAccepted.
+        // awk-ffmpeg-test's fmtprobe create:tmcd-encrate re-measures it.
+        const encodeRate = () => {
+            const avg = fracOf(primary.avg_frame_rate);
+            const rate = String((avg > 0 && avg < 70 && fracOf(primary.r_frame_rate) > 210 ? primary.avg_frame_rate : primary.r_frame_rate) || '').trim();
+            const m = /^(\d+)\/(\d+)$/.exec(rate);
+            const [times, over] = deintRateScale();
+            return m && times !== over ? `${Number(m[1]) * times}/${Number(m[2]) * over}` : rate;
+        };
         // The two verdict REPORTS - "I looked and there was no combing", "I could not read one at all". They claim no work, so unlike the ☐ repair lines they
         // are safe to emit on a file nothing else happens to; the setting costs a decode, so what it found is information the user paid for. Reads the MEMO,
         // never idet(), so asking for the line can never itself provoke the decode: where a guard settled the file without the verdict there is nothing to
@@ -3438,18 +3544,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // The source frame rate where two readings agree, times what the interlace repair does to it; 0 otherwise. It bounds only how long a CPU test
         // encode may show no output before it is too slow for guard_encode_hours - the estimate itself is read from media time, because a declared rate can
-        // be far off (a screen capture declaring 100/1 measured 12.2 fps, which would make every slow encoder look hopeless).
+        // be far off (a screen capture declaring 100/1 measured 12.2 fps, which would make every slow encoder look hopeless). It counts frames, so it reads
+        // avg_frame_rate, never encodeRate's declared rate: an encode into a container that allows variable frame rates passes every frame through.
         const corroboratedFps = () => {
-            const frac = (s) => { const m = /^(\d+)\/(\d+)$/.exec(String(s || '')); return m && Number(m[2]) > 0 ? Number(m[1]) / Number(m[2]) : 0; };
-            const avg = frac(primary.avg_frame_rate);
+            const avg = fracOf(primary.avg_frame_rate);
             if (!(avg > 0)) return 0;
             const dur = Number(file.ffProbeData.format?.duration) || 0;
             const nb = Number(primary.nb_frames);
             const agree = (String(primary.avg_frame_rate) === String(primary.r_frame_rate) && avg <= 60)
                 || (isMp4Family(dstContainer) && nb > 0 && dur > 0 && Math.abs(nb - dur * avg) <= 0.05 * dur * avg);
             if (!agree) return 0;
-            const deint = resolveDeintFilter();
-            return avg * (deint.startsWith('bwdif=mode=send_field') ? 2 : deint.startsWith('fieldmatch') ? 4 / 5 : 1);
+            const [times, over] = deintRateScale();
+            return avg * (times / over);
         };
 
         // The encoder this run uses. Walks encoderPlan's candidates in order - per candidate a memory check, the guard_captions gate, the tonemap backend,
@@ -3819,7 +3925,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Every container-global write is one globalWrites entry (each value escMeta'd as it goes in), emitted here in the order it was set, so the
             // map mp4TagPlan reads and the -metadata the muxer gets cannot disagree.
             for (const [k, v] of Object.entries(globalWrites)) out += ` -metadata "${k}=${v}"`;
-            sealPreset(enc.inputSide, out, globalWrites);
+            const encoded = { ...primary, avg_frame_rate: encodeRate() };
+            sealPreset(enc.inputSide, out, globalWrites, encoded);
             // The interlace repair's own ☐ line lands HERE, with the preset, for the reason coverArtLog states: every guard between the detection and this
             // point can still end the run with nothing emitted, and a ☐ line means a change about to be MADE. It also makes the frame-rate change legible on
             // the files it happens to, and its absence legible on the film-originated ones where it never applies.
@@ -3839,7 +3946,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     + ` (${unrestorable})\n`;
             }
             response.infoLog += `☐${pTag}${encodeTag} Transcoding video @ ${sel.encoderName} q${Math.round(qNorm)}\n`;
-            response.infoLog += expectedResultsLine(predictTranscodedVideoToken());
+            response.infoLog += expectedResultsLine(predictTranscodedVideoToken(), encoded);
             return response;
         };
         // ====== END TRANSCODE EMIT ======
@@ -4135,11 +4242,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const verdict = shown < 0 ? `The re-encode grew the video by ${-shown}%` : `The re-encode saved only ${shown}%`;
             response.infoLog += line('☐', `${verdict} (${rates}) - restoring the original video stream and keeping every other stream; this file is not`
                 + ' re-encoded again at these settings');
+            const restored = { ...origPrimary, index: primary.index };   // in the primary's place, as keptFor expects
             sealPreset('', `-i "${origPath}" -map 1:${origPrimary.index} -map 0 -map -0:${primary.index}${outputDrops} -map_chapters 0 -c copy`
-                + `${restoreTag}${restoreStrict} -metadata "${VQ_TAG}=${value}"`, { [VQ_TAG]: value });
+                + `${restoreTag}${restoreStrict} -metadata "${VQ_TAG}=${value}"`, { [VQ_TAG]: value }, restored);
             // The restored stream maps first, and its token is summarised detached (index -1): summariseStream joins mediaInfo by index, and THIS file's
             // track at the original's index can be another stream entirely (the audio, on a cover-art-first original).
-            response.infoLog += `☑Expected results: ${summariseStream({ ...origPrimary, index: -1 })}${mapped.filter((s) => s !== primary)
+            response.infoLog += `☑Expected results: ${summariseStream({ ...origPrimary, index: -1 })}${mappedFor(restored).filter((s) => s !== primary)
                 .map((s) => summariseStream(enrichStream(s))).join('')}\n`;
             return response;
         }
