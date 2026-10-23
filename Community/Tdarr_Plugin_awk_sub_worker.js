@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.84',
+    Version: '3.999.85',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -106,8 +106,9 @@ const details = () => ({
                 \\n=====
                 \\ndisabled (default): leave them alone.
                 \\nenabled: read the captions out and hand them to action - extract writes a sidecar beside the video, import turns them into an embedded
-                subtitle track (over two passes where the node writes the library directly, one to read and one to mux). Either way they arrive tagged
-                undetermined language and flagged SDH, because
+                subtitle track (over two passes where the node writes the library directly, one to read and one to mux). The read pass leaves the captions
+                in a hidden sidecar beside the video, which - like any imported sidecar - only this plugin's post-processing pass deletes (see
+                remove_source). Either way they arrive tagged undetermined language and flagged SDH, because
                 CEA-608 carries no language of its own and anything else would be a guess; clean_and_remux can fill the language in later.
                 \\nCost: reading captions DECODES the video, roughly 3x faster than playback on 4K, so it is far more expensive than an ordinary subtitle
                 extract, which only copies. It is paid only on a file a cheap up-front check says has captions, and only once - the verdict is remembered

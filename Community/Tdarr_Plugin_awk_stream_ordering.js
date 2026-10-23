@@ -18,7 +18,7 @@ const details = () => ({
         unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same
         job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual review rather than failed. A
         later job on that file is checked in full again. This check is always on and has no setting.\n`,
-    Version: '4.999.46',
+    Version: '4.999.47',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -1303,11 +1303,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // The join must require @type 'Video' as well as the StreamOrder match: MPEG-TS gives its video track the two-part StreamOrder "0-0"
             // (Number() -> NaN, so it never matches) while its MENU track reports a bare "0", and without the type test the guard silently compares a
             // menu/chapter track's duration instead of the video's.
-            { name: 'the mediaInfo video-track duration',
+            { name: 'the mediaInfo video-track duration', perTrack: true,
                 read: (probed) => { const v = durVideoStream(probed); if (!v) return 0;
                     return durOrZero(((probed?.mediaInfo?.track || []).find(t => t['@type'] === 'Video'
                         && Number(t.StreamOrder) === v.index) || {}).Duration); } },
-            { name: 'the ffprobe video-stream duration', read: (probed) => { const v = durVideoStream(probed);
+            { name: 'the ffprobe video-stream duration', perTrack: true, read: (probed) => { const v = durVideoStream(probed);
                 return durOrZero(v?.duration) || durOrZero(durTagSeconds(getTagCI(v?.tags, 'DURATION'))); } },
             { name: 'the container duration', read: (probed) => durOrZero(probed?.ffProbeData?.format?.duration), needsSameStreams: true },
         ];
@@ -1319,6 +1319,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // last, so it is the stage that sees that pair. Failing it would quarantine a correctly repaired file and send the user hunting an OOM kill that
         // never happened. An over-length alarm, if ever wanted, needs its own branch and its own wording - none of the text below is true of it.
         const DURATION_TOLERANCE_PCT = 1;
+        // A track cannot outlast the container holding it, so a perTrack reading longer than its own file's container duration is a stale statistics
+        // tag, not a length: mkvmerge writes DURATION per track, a later cut by another tool copies it unchanged, and MediaInfo 23.07 reports the tag as
+        // the track's Duration. Tdarr refreshes those tags only when its server-wide "Run mkvpropedit on files before running plugins" is on - off by
+        // default - so on a default install the ORIGINAL routinely carries them, and a faithful -c copy reorder (whose tags ffmpeg writes fresh) was
+        // failed as truncated against a 43-minute tag on a 30 s file, on every retry. Such a reading counts as no signal and the next one decides. It
+        // cannot make a healthy file fail: on the original side it only shortens the yardstick, and on the new side the stale reading it discards was
+        // the one that could have hidden a real truncation. A file with no container duration keeps every reading - there is nothing to bound it by.
+        const boundedByContainer = (probed, d) => {
+            const c = durOrZero(probed?.ffProbeData?.format?.duration);
+            return c && d > c * (1 + DURATION_TOLERANCE_PCT / 100) ? 0 : d;
+        };
         // The two sentences the verdicts hand the operator, declared once because each is written by both a short-duration and a no-duration branch
         // and they are a CONTRACT with the user, not incidental wording: one tells them where to look for the cause, the other what not to do with a
         // recovery queue. A drift between the two copies of either reads as two different situations. The ` (compared using ...)` suffix is not part
@@ -1336,8 +1347,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let oldAny = 0;
             let newAny = 0;
             for (const sig of DURATION_SIGNALS) {
-                const oldDur = sig.read(originalFile);
-                const newDur = sig.read(file);
+                const oldDur = sig.perTrack ? boundedByContainer(originalFile, sig.read(originalFile)) : sig.read(originalFile);
+                const newDur = sig.perTrack ? boundedByContainer(file, sig.read(file)) : sig.read(file);
                 // ANY resolved duration proves that side HAS a duration, so every signal feeds oldAny/newAny - otherwise the no-duration
                 // verdict below fires on a healthy audio-cleaned file whose only resolvable signal is the container's. The needsSameStreams
                 // caveat concerns duration SHRINKAGE (a dropped track longer than the video legitimately shortens the container maximum),
@@ -1671,6 +1682,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
             }
         }
+        // ffmpeg flags a stream default ON ITS OWN when an output carries no -disposition at all: the first stream of every type with two or more streams
+        // and none flagged default (fftools set_dispositions; a single manual -disposition anywhere switches the rule off for the whole file). A reorder
+        // that only moved streams therefore made a French forced subtitle the default subtitle of an English show - default on none of its four
+        // subtitles before, on the first sorted one after (jellyfin-ffmpeg 7.1.4). So where that rule would fire and nothing above wrote a disposition,
+        // the preset restates output stream 0's own flags: an exact no-op that makes the dispositions manual. It rides only on a remux this plugin emits
+        // for its own reasons - it never enters the skip test below, or every in-order file with undefaulted subtitles would be remuxed on every pass.
+        let autoDefaultPin = '';
+        const typeCount = {};
+        const typeHasDefault = {};
+        for (const r of mappedRows) {
+            typeCount[r.type] = (typeCount[r.type] || 0) + 1;
+            if (r.stream?.disposition?.default === 1) typeHasDefault[r.type] = true;
+        }
+        if (canPersistDefault && dispositionArgs === '' && mappedRows.length
+            && Object.keys(typeCount).some((t) => typeCount[t] > 1 && !typeHasDefault[t])) {
+            const flags = Object.entries(mappedRows[0].stream?.disposition || {}).filter(([, v]) => v === 1).map(([k]) => k).join('+');
+            autoDefaultPin = ` -disposition:0 ${flags || '0'}`;
+        }
         // ====== END OUTPUT MAP + SOLE-DEFAULT FLAG ======
 
         // ====== JUNK TAG STRIP: GLOBAL ======
@@ -1787,7 +1816,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // without it. It reads the RAW ffprobe streams, never sortRows (see its header); this plugin only reorders, and the streams it leaves out
         // (mp4UncopyableStreams) are data tracks that can trigger neither -strict reason, so the copied-subset argument stays at its default.
         const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams);
-        response.preset = `<io>${ffmpegMap} -c copy${dispositionArgs}${junkArgs}${strictArg}${globalOutputOpt}${mp4MovflagsArg}${outputMuxerArg(dstContainer)}`;
+        response.preset = `<io>${ffmpegMap} -c copy${dispositionArgs}${autoDefaultPin}${junkArgs}${strictArg}${globalOutputOpt}${mp4MovflagsArg}`
+            + `${outputMuxerArg(dstContainer)}`;
         const mapped = file.ffProbeData.streams.filter((s) => !uncopyable.includes(s));
         response.infoLog += mp4UncopyableLog(dstContainer, uncopyable, file.ffProbeData.streams) + mp4TagPlanLog(tagPlan, dstContainer, mapped)
             + unidentified.map((r) => `☐${streamTag(r.index)} Leaving out a stream ffmpeg cannot identify - it cannot be copied`
