@@ -7,7 +7,9 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Prepares the file for any next steps including remuxing to mp4/mkv\n\n
-                     -Identify and remove data streams and image/cover-art streams (by codec, or by attached_pic/still_image/timed_thumbnails disposition)\n\n
+                     -Identify and remove data streams and image/cover-art streams (by codec, or by attached_pic/still_image/timed_thumbnails disposition).
+                         An mp4 output keeps its chapter track and a tmcd timecode track, which the mp4 muxer rebuilds from the chapters and from the
+                         video's timecode\n\n
                      -Optionally removes any subtitle tracks that are not in the specified language(s)
                          via language_sub (audio language filtering is audio_clean's job)\n\n
                      -Standardises the stored language tag per container (tag_language / method_tag_language) and fills
@@ -28,7 +30,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.68',
+    Version: '4.999.69',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -759,6 +761,39 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 + 'cannot write cover art beside them\n';
         }
         return log;
+    };
+    // -=-=-= isMp4ChapterTrack [all five] =-=-=-
+    // An mp4-family file's chapter track. ffmpeg's mov demuxer reads the chapters out of the text track a 'chap' reference names and reports that track as a
+    // DATA stream (bin_data, one sample per chapter) under the track's own fourcc: 'text' where ffmpeg wrote it, 'tx3g' where GPAC/MP4Box did. The mp4/mov
+    // muxer writes the chapters back as a fresh 'text' track of that shape on every -c copy. So no remux into the mp4 family removes it, and mapping it is
+    // worse: mp4/m4v/m4a write the copy as a second, junk 'gpmd' data track beside the rebuilt one (one more on every pass), and mov refuses it ("Tag text
+    // incompatible with output codec id", exit 183) - measured for both fourccs on jellyfin 7.1.4, 2026-10-22. Every plugin writing an mp4-family output
+    // therefore leaves it out of its maps, and clean_and_remux never counts that as work: a removal the muxer undoes emits the same preset every pass, which
+    // Tdarr errors. clean_and_remux's remux into Matroska removes it like any data stream - Matroska stores none, and carries the chapters natively. The
+    // fourcc list stays closed: every other data track is copied, so a GoPro 'gpmd' telemetry track in a chaptered file survives, and a 'tx3g' track no
+    // chapter reference names is demuxed as a mov_text subtitle, never as data. The demuxer is read from format_name, never the extension. Tdarr probes
+    // without -show_chapters, so the chapters are known from mediaInfo, which lists them as Menu tracks, or from the track's own nb_frames, the chapter count
+    // ffmpeg reads (equal at 1, 3, 4, 7 and 20 chapters), which still answers when mediaInfo did not scan the file. A chapter-fourcc data track with neither
+    // holds no chapter the muxer could rebuild, so it is removed like any other data stream. awk-ffmpeg-test's fmtprobe rebuild:* rows re-measure all of it.
+    const isMp4ChapterTrack = (s) => String(file?.ffProbeData?.format?.format_name || '').split(',').some(isMp4Family)
+        && codecTypeOf(s) === 'data' && ['text', 'tx3g'].includes(String(s.codec_tag_string || '').toLowerCase())
+        && ((file?.mediaInfo?.track || []).some((t) => t?.['@type'] === 'Menu') || Number(s.nb_frames) > 0);
+    // -=-=-= isMp4RebuiltTimecode [all five] =-=-=-
+    // A tmcd timecode track the mp4/mov muxer puts back when a remux leaves it out: it writes one from the video stream's own timecode tag (measured
+    // 2026-10-01 and 2026-10-22: 01:00:00:00 in and out), so the output reads exactly as the copy would have. With no such tag the timecode is gone.
+    const isMp4RebuiltTimecode = (s, streams) => codecTypeOf(s) === 'data' && String(s.codec_tag_string || '').toLowerCase() === 'tmcd'
+        && (streams || []).some((v) => codecTypeOf(v) === 'video' && getTagCI(v.tags, 'timecode').trim() !== '');
+    // -=-=-= mp4RebuiltLine (+ mp4RebuiltLast) [all five] =-=-=-
+    // A track left out of the map that the muxer rebuilds (isMp4ChapterTrack, isMp4RebuiltTimecode) is still in the output, so its line is a ☑. The muxer
+    // writes such tracks after every mapped stream, the chapter track first and then each tmcd (measured 2026-10-22), so an Expected results line lists
+    // them last in that order: mp4RebuiltLast moves the items of `list` (anything carrying a source index) that are among `rebuilt` to the end.
+    const mp4RebuiltLine = (s, container) => {
+        const [what, from] = isMp4ChapterTrack(s) ? ['chapter', 'the chapters'] : ['tmcd timecode', "the video track's timecode"];
+        return `☑${streamTag(s.index)} Keeping the ${what} track - the .${String(container).toLowerCase()} muxer rebuilds it from ${from}\n`;
+    };
+    const mp4RebuiltLast = (list, rebuilt) => {
+        const rank = (x) => { const s = rebuilt.find((r) => r.index === x.index); return !s ? 0 : isMp4ChapterTrack(s) ? 1 : 2; };
+        return [...list].sort((a, b) => rank(a) - rank(b));
     };
     // ===== END SHARED: mp4-family container =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream / language / preset helpers =====
@@ -2319,6 +2354,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // dropped via -map -0:ffstream.index. subCodecOverride: input stream position -> converted subtitle codec ('srt' / 'mov_text').
         const removedIndices = new Set();
         const subCodecOverride = new Map();
+        const muxerRebuilt = [];   // streams left out of the map that the mp4 muxer writes back (see the data branch) - summarised last, where it writes them
         // clearedRolePrediction: input stream position -> { adds, roleText } for a stream whose cleared carrier held a role (see clearedOnlyRoles) - the
         // flags the remux promotes and the role text that survives it. handlerRolesLost: '[s N] Role' entries no flag in the target can hold, on ONE line.
         const clearedRolePrediction = new Map();
@@ -2923,6 +2959,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
             } else if ((ffstreamType === 'data') || DATA_CODECS.includes(ffstreamCodec)) {
+                // A track the mp4 muxer writes back on its own - the chapter track (isMp4ChapterTrack), or a tmcd timecode it rebuilds from the video
+                // stream's timecode tag (isMp4RebuiltTimecode) - is left out of an mp4 output's map without counting as work, and not recorded in
+                // removedIndices: the output holds it again, so the Expected results line keeps it, last (see mp4RebuiltLast). Its line goes straight to the
+                // log, since a file with nothing else to do never flushes workDone.
+                if (isMp4Family(dstContainer) && (isMp4ChapterTrack(ffstream) || isMp4RebuiltTimecode(ffstream, streams))) {
+                    response.infoLog += mp4RebuiltLine(ffstream, dstContainer);
+                    extraArguments += ` -map -0:${ffstream.index}`;
+                    muxerRebuilt.push(ffstream);
+                    continue;
+                }
                 workDone += `☐${streamTag(ffstream.index)} Remove data stream (${ffstreamType}-${ffstreamCodec})\n`;
                 dropStream(ffstream.index);
                 continue;
@@ -3143,10 +3189,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return out;
             };
             // Predicted output: re-renders the input streams with the mutations this summary tracks - removedIndices filtering,
-            // subCodecOverride (converted subtitle codec) and predictClearedRoles. It does NOT reflect queued language fills /
-            // tag_language standardization: those emit only a -metadata:s:...language= arg and never mutate the ffprobe object
-            // summariseStream reads, so a track whose blank/looser tag will be rewritten still shows its pre-change lang token here.
-            const outSummary = streams
+            // subCodecOverride (converted subtitle codec), predictClearedRoles, and the tracks the muxer rebuilds moved last (mp4RebuiltLast). It does NOT
+            // reflect queued language fills / tag_language standardization: those emit only a -metadata:s:...language= arg and never mutate the ffprobe
+            // object summariseStream reads, so a track whose blank/looser tag will be rewritten still shows its pre-change lang token here.
+            const outSummary = mp4RebuiltLast(streams, muxerRebuilt)
                 .map(s => ({ s: enrichStream(s), idx: s.index }))
                 .filter(({ idx }) => !removedIndices.has(idx))
                 .map(({ s, idx }) => (subCodecOverride.has(idx) ? { ...s, codec_name: subCodecOverride.get(idx) } : s))

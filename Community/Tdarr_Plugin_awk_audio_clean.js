@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.68',
+    Version: '4.999.69',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -839,6 +839,39 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return log;
     };
+    // -=-=-= isMp4ChapterTrack [all five] =-=-=-
+    // An mp4-family file's chapter track. ffmpeg's mov demuxer reads the chapters out of the text track a 'chap' reference names and reports that track as a
+    // DATA stream (bin_data, one sample per chapter) under the track's own fourcc: 'text' where ffmpeg wrote it, 'tx3g' where GPAC/MP4Box did. The mp4/mov
+    // muxer writes the chapters back as a fresh 'text' track of that shape on every -c copy. So no remux into the mp4 family removes it, and mapping it is
+    // worse: mp4/m4v/m4a write the copy as a second, junk 'gpmd' data track beside the rebuilt one (one more on every pass), and mov refuses it ("Tag text
+    // incompatible with output codec id", exit 183) - measured for both fourccs on jellyfin 7.1.4, 2026-10-22. Every plugin writing an mp4-family output
+    // therefore leaves it out of its maps, and clean_and_remux never counts that as work: a removal the muxer undoes emits the same preset every pass, which
+    // Tdarr errors. clean_and_remux's remux into Matroska removes it like any data stream - Matroska stores none, and carries the chapters natively. The
+    // fourcc list stays closed: every other data track is copied, so a GoPro 'gpmd' telemetry track in a chaptered file survives, and a 'tx3g' track no
+    // chapter reference names is demuxed as a mov_text subtitle, never as data. The demuxer is read from format_name, never the extension. Tdarr probes
+    // without -show_chapters, so the chapters are known from mediaInfo, which lists them as Menu tracks, or from the track's own nb_frames, the chapter count
+    // ffmpeg reads (equal at 1, 3, 4, 7 and 20 chapters), which still answers when mediaInfo did not scan the file. A chapter-fourcc data track with neither
+    // holds no chapter the muxer could rebuild, so it is removed like any other data stream. awk-ffmpeg-test's fmtprobe rebuild:* rows re-measure all of it.
+    const isMp4ChapterTrack = (s) => String(file?.ffProbeData?.format?.format_name || '').split(',').some(isMp4Family)
+        && codecTypeOf(s) === 'data' && ['text', 'tx3g'].includes(String(s.codec_tag_string || '').toLowerCase())
+        && ((file?.mediaInfo?.track || []).some((t) => t?.['@type'] === 'Menu') || Number(s.nb_frames) > 0);
+    // -=-=-= isMp4RebuiltTimecode [all five] =-=-=-
+    // A tmcd timecode track the mp4/mov muxer puts back when a remux leaves it out: it writes one from the video stream's own timecode tag (measured
+    // 2026-10-01 and 2026-10-22: 01:00:00:00 in and out), so the output reads exactly as the copy would have. With no such tag the timecode is gone.
+    const isMp4RebuiltTimecode = (s, streams) => codecTypeOf(s) === 'data' && String(s.codec_tag_string || '').toLowerCase() === 'tmcd'
+        && (streams || []).some((v) => codecTypeOf(v) === 'video' && getTagCI(v.tags, 'timecode').trim() !== '');
+    // -=-=-= mp4RebuiltLine (+ mp4RebuiltLast) [all five] =-=-=-
+    // A track left out of the map that the muxer rebuilds (isMp4ChapterTrack, isMp4RebuiltTimecode) is still in the output, so its line is a ☑. The muxer
+    // writes such tracks after every mapped stream, the chapter track first and then each tmcd (measured 2026-10-22), so an Expected results line lists
+    // them last in that order: mp4RebuiltLast moves the items of `list` (anything carrying a source index) that are among `rebuilt` to the end.
+    const mp4RebuiltLine = (s, container) => {
+        const [what, from] = isMp4ChapterTrack(s) ? ['chapter', 'the chapters'] : ['tmcd timecode', "the video track's timecode"];
+        return `☑${streamTag(s.index)} Keeping the ${what} track - the .${String(container).toLowerCase()} muxer rebuilds it from ${from}\n`;
+    };
+    const mp4RebuiltLast = (list, rebuilt) => {
+        const rank = (x) => { const s = rebuilt.find((r) => r.index === x.index); return !s ? 0 : isMp4ChapterTrack(s) ? 1 : 2; };
+        return [...list].sort((a, b) => rank(a) - rank(b));
+    };
     // ===== END SHARED: mp4-family container =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: matroska-family container =====
     // -=-=-= isMatroskaFamily  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -847,33 +880,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const isMatroskaFamily = (container) => ['mkv', 'mka', 'mks', 'webm'].includes(String(container || '').toLowerCase());
     // ===== END SHARED: matroska-family container =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 uncopyable streams =====
-    // -=-=-= mp4UncopyableStreams (+ mp4RebuiltTimecodes, mp4LostData, mp4UncopyableLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
-    // The data streams an mp4/m4v/m4a -c copy cannot carry: one ffprobe names no codec for - in practice a camera's tmcd timecode track. The mp4 muxer refuses
-    // it outright ("Could not find tag for codec none", exit 234 on jellyfin 7.1.4) and takes the whole command down, so a -map 0 copy of such a file fails on
-    // every requeue; each remux here leaves the stream out instead. A timecode survives that: the muxer rebuilds the tmcd track from the video stream's own
-    // timecode tag (measured 2026-10-01: 01:00:00:00 in and out). mov copies the track as-is and is left alone, and clean_and_remux drops every data stream
-    // itself, so in the designed stack only a run without it meets one. The log line names each stream left out and says whether its timecode carries over.
-    const mp4UncopyableStreams = (container, streams) => (['mp4', 'm4v', 'm4a'].includes(String(container || '').toLowerCase())
-        ? (streams || []).filter((s) => codecTypeOf(s) === 'data' && ['', 'unknown', 'none'].includes(codecNameOf(s))) : []);
-    // The dropped tmcd tracks the muxer puts back - one rebuilt from the video stream's timecode tag reads exactly as the copy would have, so an Expected
-    // results line keeps it; with no such tag the timecode is gone.
-    const mp4RebuiltTimecodes = (dropped, streams) => ((streams || []).some((s) => codecTypeOf(s) === 'video' && getTagCI(s.tags, 'timecode').trim() !== '')
-        ? dropped.filter((s) => String(s.codec_tag_string || '').toLowerCase() === 'tmcd') : []);
-    // The dropped streams whose data really leaves the output - all of them but a tmcd the muxer rebuilds - so an Expected results line never promises one.
-    const mp4LostData = (dropped, streams) => {
-        const rebuilt = mp4RebuiltTimecodes(dropped, streams);
-        return dropped.filter((s) => !rebuilt.includes(s));
+    // -=-=-= mp4UncopyableStreams (+ mp4LostData, mp4UncopyableLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The data streams an mp4-family -c copy cannot carry as they are, which each remux here leaves out of its map. One is a stream ffprobe names no codec
+    // for - in practice a camera's tmcd timecode track - in mp4/m4v/m4a: the mp4 muxer refuses it outright ("Could not find tag for codec none", exit 234 on
+    // jellyfin 7.1.4) and takes the whole command down, so a -map 0 copy of such a file fails on every requeue. Its timecode survives where the video
+    // stream carries one (isMp4RebuiltTimecode). mov copies the track as-is and is left alone. The other is the chapter track, in mov too, which the muxer
+    // always rebuilds from the chapters (see isMp4ChapterTrack). clean_and_remux removes every such stream the muxer would not put back, so in the designed
+    // stack only a run without it meets a lost one. The log line names each stream left out and says what carries over.
+    const mp4UncopyableStreams = (container, streams) => {
+        const c = String(container || '').toLowerCase();
+        const noCodec = (s) => ['mp4', 'm4v', 'm4a'].includes(c) && codecTypeOf(s) === 'data' && ['', 'unknown', 'none'].includes(codecNameOf(s));
+        return (streams || []).filter((s) => noCodec(s) || (isMp4Family(c) && isMp4ChapterTrack(s)));
     };
-    const mp4UncopyableLog = (container, dropped, streams) => {
-        const rebuilt = mp4RebuiltTimecodes(dropped, streams);
-        return dropped.map((s) => {
-            const tmcd = String(s.codec_tag_string || '').toLowerCase() === 'tmcd';
-            const timecode = !tmcd ? '' : rebuilt.includes(s) ? ', and its timecode is rebuilt from the video track'
-                : ', and with no timecode on the video track it is lost';
-            const what = tmcd ? 'tmcd timecode' : 'unidentified data';
-            return `☐${streamTag(s.index)} Leaving out the ${what} track - .${String(container).toLowerCase()} cannot copy a stream with no codec${timecode}\n`;
-        }).join('');
-    };
+    // The dropped streams whose data really leaves the output - all of them but a track the muxer rebuilds - so an Expected results line never promises one.
+    const mp4LostData = (dropped, streams) => dropped.filter((s) => !isMp4ChapterTrack(s) && !isMp4RebuiltTimecode(s, streams));
+    const mp4UncopyableLog = (container, dropped, streams) => dropped.map((s) => {
+        if (!mp4LostData([s], streams).length) return mp4RebuiltLine(s, container);
+        const tmcd = String(s.codec_tag_string || '').toLowerCase() === 'tmcd';
+        const what = tmcd ? 'tmcd timecode' : 'unidentified data';
+        return `☐${streamTag(s.index)} Leaving out the ${what} track - .${String(container).toLowerCase()} cannot copy a stream with no codec`
+            + `${tmcd ? ', and with no timecode on the video track it is lost' : ''}\n`;
+    }).join('');
     // ===== END SHARED: mp4 uncopyable streams =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: output muxer =====
     // -=-=-= OUTPUT_MUXER_BY_EXT (+ outputMuxerArg, noMuxerSkipLine)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
@@ -3516,15 +3543,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // copied stereo track) show their bitrate correctly. A re-encoded track is summarised through summariseStream's output descriptor, which prints an
         // aac_vbr override's approximate rate (~192k) and drops the source-only markers a fresh encode cannot carry. Streams the output will not hold though no
         // setting removed them - a data track the container cannot copy (mp4UncopyableStreams) and a cover it cannot store (mp4CoversLost). Filled in when the
-        // preset is built and read here, so the summary never promises one.
+        // preset is built and read here, so the summary never promises one; a track the muxer rebuilds (unmapped, still in the output) is listed last.
         const leftOut = new Set();
+        const unmapped = [];
         // An ENCODED appended track after the file's attachment streams fails the Matroska mux ('Received a packet for an attachment stream', exit 234,
         // measured on jellyfin 7.1.4 with one font), so attachments are mapped after the appended tracks, and summarised there. They are not audio, so every
         // a:N index holds.
         const attachLast = appendedAudio.length > 0 && isMatroskaFamily(dstContainer)
             && file.ffProbeData.streams.some((s) => codecTypeOf(s) === 'attachment');
         const buildOutputSummary = () => {
-            const tokens = [];
+            const tokens = [];   // { index, token } - the source index lets mp4RebuiltLast find a rebuilt track; an appended one has none (-1)
             for (const s of file.ffProbeData.streams) {
                 if (leftOut.has(s.index) || (attachLast && codecTypeOf(s) === 'attachment')) continue;
                 const enriched = enrichStream(s);
@@ -3534,22 +3562,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (ov) {
                         // One path for every override: summariseStream builds the output token from the encode's own codec/channels/rate, so a VBR
                         // override's approximate rate ('~192k', carried in approxRate) prints through the same builder as a fixed-bitrate one.
-                        tokens.push(summariseStream(enriched, { codec: ov.codec, channels: ov.channels, bps: ov.bps, rate: ov.approxRate }));
+                        const out = { codec: ov.codec, channels: ov.channels, bps: ov.bps, rate: ov.approxRate };
+                        tokens.push({ index: s.index, token: summariseStream(enriched, out) });
                     } else {
-                        tokens.push(summariseStream(enriched));
+                        tokens.push({ index: s.index, token: summariseStream(enriched) });
                     }
                 } else
-                    tokens.push(summariseStream(enriched));
+                    tokens.push({ index: s.index, token: summariseStream(enriched) });
             }
             for (const a of appendedAudio) {
-                tokens.push(summariseStream(a.srcStream, { codec: a.codec, channels: a.channels, bps: a.bps, rate: a.approxRate }));
+                tokens.push({ index: -1, token: summariseStream(a.srcStream, { codec: a.codec, channels: a.channels, bps: a.bps, rate: a.approxRate }) });
             }
             if (attachLast) {
                 for (const s of file.ffProbeData.streams.filter((x) => codecTypeOf(x) === 'attachment' && !leftOut.has(x.index))) {
-                    tokens.push(summariseStream(enrichStream(s)));
+                    tokens.push({ index: s.index, token: summariseStream(enrichStream(s)) });
                 }
             }
-            return tokens.join('');
+            return mp4RebuiltLast(tokens, unmapped).map((t) => t.token).join('');
         };
 
         response.infoLog += workDone + skipDone;
@@ -3567,6 +3596,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += mp4UncopyableLog(dstContainer, uncopyable, file.ffProbeData.streams) + mp4TagPlanLog(tagPlan, dstContainer, mapped);
             const goneData = mp4LostData(uncopyable, file.ffProbeData.streams);
             for (const s of [...goneData, ...mp4CoversLost(tagPlan, dstContainer, mapped)]) leftOut.add(s.index);
+            unmapped.push(...uncopyable);
             // The -strict level this mp4/mov -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses
             // without it. The second list is what this run actually COPIES - a track removedIndices drops, or an in-place transcode replaces (recorded in
             // outputAudioOverride, keyed by output audio index), is left out, so a TrueHD track on its way out never asks for a flag the output cannot need.
