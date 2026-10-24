@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.72',
+    Version: '3.999.73',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -709,30 +709,70 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const isMp4ChapterTrack = (s) => String(file?.ffProbeData?.format?.format_name || '').split(',').some(isMp4Family)
         && codecTypeOf(s) === 'data' && ['text', 'tx3g'].includes(String(s.codec_tag_string || '').toLowerCase())
         && ((file?.mediaInfo?.track || []).some((t) => t?.['@type'] === 'Menu') || Number(s.nb_frames) > 0);
+    // -=-=-= mp4TimecodeFps (+ MP4_TMCD_MAX_FPS) [all five] =-=-=-
+    // The whole fps the mp4/mov muxer times a tmcd by: the rate rounded to nearest as its ROUNDED_DIV does (255.4 is 255, 255.5 is 256), or 0 for a rate
+    // without a positive numerator and denominator. Above MP4_TMCD_MAX_FPS the muxer refuses at the trailer a tmcd it has already created (mp4TimecodeArgs).
+    const MP4_TMCD_MAX_FPS = 255;
+    const mp4TimecodeFps = (rate) => {
+        const [num, den] = String(rate || '').split('/').map(Number);
+        return num > 0 && den > 0 ? Math.floor((num + Math.floor(den / 2)) / den) : 0;
+    };
     // -=-=-= isTmcdTrack (+ mp4GlobalTimecodeKey, MP4_TIMECODE, mp4TimecodeAccepted, mp4VideoTimecode, mp4TimedVideo) [all five] =-=-=-
     // A tmcd timecode track, and a video stream the mp4/mov muxer writes one for. The muxer reads the file's global timecode whenever the file has that tag,
     // even an empty one, and the stream's own only otherwise (a global 02:00:00:00 beside a video 01:00:00:00 writes 02:00:00:00; a global 'garbage' beside a
     // valid video tag writes none) - mp4VideoTimecode, the string a video's tmcd is written from. It parses that string as libavutil's
     // av_timecode_init_from_string does, sscanf "%d:%d:%d%c%d" (MP4_TIMECODE): blanks may lead each number and a sign may lead it, no field is range-checked
     // (99 frames, -01 or 25 hours all write a track), trailing text is ignored, and any separator before the frames but ':' means drop-frame. Then it times the
-    // track by the stream's frame rate rounded to whole fps: below 1 fps it writes none (a cover's 0/0, a 1/3 fps stream - but a PNG-codec video or an attached
-    // picture at 25/1 gets one), nor for drop-frame at a rate that does not round to a multiple of 30 (29.97, 30, 59.94 and 60 take it; 23.976, 24, 25 and 50
-    // do not). Each stream it accepts gets a tmcd of its own (two videos under a global timecode, two). Measured 2026-10-23 on jellyfin 7.1.4;
+    // track by the stream's frame rate in whole fps (mp4TimecodeFps): below 1 fps it writes none (a cover's 0/0, a 1/3 fps stream - but a PNG-codec video or
+    // an attached picture at 25/1 gets one), nor for drop-frame at a rate that does not round to a multiple of 30 (29.97, 30, 59.94 and 60 take it; 23.976,
+    // 24, 25 and 50 do not), and above 255 none is written either: mp4TimecodeArgs stops the one that would fail the mux (`cap`, which mp4OverfastVideo
+    // lifts). Each stream it accepts gets a tmcd of its own (two videos under a global timecode, two). Measured 2026-10-23 on jellyfin 7.1.4;
     // awk-ffmpeg-test's fmtprobe create:tmcd* rows re-measure it.
     const isTmcdTrack = (s) => codecTypeOf(s) === 'data' && String(s.codec_tag_string || '').toLowerCase() === 'tmcd';
     const mp4GlobalTimecodeKey = () => Object.keys(file?.ffProbeData?.format?.tags || {}).find((k) => k.toLowerCase() === 'timecode');
     const MP4_TIMECODE = /^[ \t\n\v\f\r]*[+-]?\d+:[ \t\n\v\f\r]*[+-]?\d+:[ \t\n\v\f\r]*[+-]?\d+(\D)[ \t\n\v\f\r]*[+-]?\d+/;
-    const mp4TimecodeAccepted = (timecode, rate) => {
+    const mp4TimecodeAccepted = (timecode, rate, cap = MP4_TMCD_MAX_FPS) => {
         const sep = (MP4_TIMECODE.exec(String(timecode ?? '')) || [])[1];
-        const [num, den] = String(rate || '').split('/').map(Number);
-        const fps = num > 0 && den > 0 ? Math.floor((num + Math.floor(den / 2)) / den) : 0;
-        return sep !== undefined && fps >= 1 && (sep === ':' || fps % 30 === 0);
+        const fps = mp4TimecodeFps(rate);
+        return sep !== undefined && fps >= 1 && fps <= cap && (sep === ':' || fps % 30 === 0);
     };
     const mp4VideoTimecode = (v) => {
         const key = mp4GlobalTimecodeKey();
         return key === undefined ? getTagCI(v.tags, 'timecode') : String(file.ffProbeData.format.tags[key] ?? '');
     };
     const mp4TimedVideo = (v) => codecTypeOf(v) === 'video' && mp4TimecodeAccepted(mp4VideoTimecode(v), v.avg_frame_rate);
+    // -=-=-= mp4TimecodeArgs (+ mp4OverfastVideo, mp4OverfastFor, mp4TimecodeLog) [all five] =-=-=-
+    // The output-side args that keep a video the muxer cannot time a tmcd for from failing the whole mp4-family mux. Above 255 fps it still creates the track,
+    // then refuses it at the trailer ("fps 300 is too large", exit 234), so the file errors on every requeue - mp4OverfastVideo, judged on `kept`, the streams
+    // as the output writes them in output order (a copy at its avg_frame_rate, an encode at the rate it writes or, marked rateUpTo, the most it can). Where no
+    // other kept video gets a tmcd, -write_tmcd 0 turns the muxer's tmcd creation off: it loses nothing more and keeps a global timecode that use_metadata_tags
+    // stores. Where one does, that switch would take its tmcd too, so only the fast video's timecode is cleared, by its place among the output's video streams;
+    // a global timecode beats every video's own, so it is cleared as well and restated on each other video, which then writes exactly the tmcd it would have. A
+    // copied tmcd (mov) stops the muxer creating any and is timed by its own sample description, so it needs nothing. Measured 2026-10-23 on jellyfin 7.1.4 in
+    // mp4, mov and -f mp4: 255/1 and 1277/5 write a tmcd, 511/2, 256/1 and 300/1 fail, and each remedy exits 0 (fmtprobe create:tmcd-fps re-measures it).
+    // mp4TimecodeLog names each fast video, whose timecode is lost, and mp4OverfastFor the fast video whose timecode a source tmcd carries. A rateUpTo encode
+    // may run slower than that bound (video_clean's encodeRateUpTo says why), and the remedy applies all the same, because a missing one fails the mux where a
+    // needless one only loses a timecode; its lines name the rate as an upper bound.
+    const mp4OverfastVideo = (v) => codecTypeOf(v) === 'video' && mp4TimecodeAccepted(mp4VideoTimecode(v), v.avg_frame_rate, Infinity)
+        && mp4TimecodeFps(v.avg_frame_rate) > MP4_TMCD_MAX_FPS;
+    const mp4OverfastFor = (s, kept) => kept.find((v) => mp4OverfastVideo(v) && mp4VideoTimecode(v) === getTagCI(s.tags, 'timecode'));
+    const mp4TimecodeArgs = (container, kept) => {
+        if (!isMp4Family(container) || kept.some(isTmcdTrack)) return '';
+        const videos = kept.filter((s) => codecTypeOf(s) === 'video');
+        const fast = videos.filter(mp4OverfastVideo);
+        if (!fast.length) return '';
+        if (!videos.some(mp4TimedVideo)) return ' -write_tmcd 0';
+        const key = mp4GlobalTimecodeKey();
+        const global = key === undefined ? null : escMeta(file.ffProbeData.format.tags[key]);
+        return (global === null ? '' : ' -metadata timecode=') + videos.map((v, n) => (fast.includes(v) ? ` -metadata:s:v:${n} timecode=`
+            : global === null ? '' : ` -metadata:s:v:${n} "timecode=${global}"`)).join('');
+    };
+    const mp4TimecodeLog = (container, kept) => (mp4TimecodeArgs(container, kept) ? kept.filter(mp4OverfastVideo) : []).map((v) => {
+        const [c, fps] = [String(container).toLowerCase(), mp4TimecodeFps(v.avg_frame_rate)];
+        const why = v.rateUpTo ? `it can run at up to ${fps} fps, and the .${c} muxer cannot time one above ${MP4_TMCD_MAX_FPS}`
+            : `the .${c} muxer cannot time one at ${fps} fps (${MP4_TMCD_MAX_FPS} at most)`;
+        return `☐${streamTag(v.index)} Writing no tmcd timecode track for this video - ${why}, so its timecode is lost\n`;
+    }).join('');
     // -=-=-= isMp4RebuiltTimecode (+ mp4TimecodeCount, mp4RebuiltTimecodes) [all five] =-=-=-
     // A tmcd timecode track the mp4/mov muxer puts back when a remux leaves it out, so the output reads exactly as the copy would have (measured 2026-10-01
     // and 2026-10-22: 01:00:00:00 in and out). That holds for a tmcd the video track does not reference (no 'tref') too: the video then shows no timecode
@@ -821,14 +861,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return (streams || []).filter((s) => noCodec(s) || (isMp4Family(c) && isMp4ChapterTrack(s)));
     };
     // The dropped streams whose data really leaves the output - all of them but a track the muxer rebuilds - so an Expected results line never promises one.
-    // `kept` is what the output maps (see isMp4RebuiltTimecode); a tmcd lost while the muxer still writes others is one past its one-per-video count.
+    // `kept` is what the output maps (see isMp4RebuiltTimecode); a tmcd carrying the timecode of a video the muxer cannot time is lost for that reason
+    // (mp4OverfastFor), and one lost while the muxer still writes others is one past its one-per-video count.
     const mp4LostData = (dropped, kept) => dropped.filter((s) => !isMp4ChapterTrack(s) && !isMp4RebuiltTimecode(s, kept));
     const mp4UncopyableLog = (container, dropped, kept) => dropped.map((s) => {
         if (!mp4LostData([s], kept).length) return mp4RebuiltLine(s, container);
         const tmcd = String(s.codec_tag_string || '').toLowerCase() === 'tmcd';
         const what = tmcd ? 'tmcd timecode' : 'unidentified data';
-        const why = mp4TimecodeCount(kept) ? 'the muxer rebuilds only one per video the output keeps'
-            : 'the file has no timecode the muxer can rebuild it from';
+        const fast = mp4OverfastFor(s, kept);
+        const why = fast ? `the muxer cannot time one for a video ${fast.rateUpTo ? 'that can run ' : ''}above ${MP4_TMCD_MAX_FPS} fps`
+            : mp4TimecodeCount(kept) ? 'the muxer rebuilds only one per video the output keeps' : 'the file has no timecode the muxer can rebuild it from';
         return `☐${streamTag(s.index)} Leaving out the ${what} track - .${String(container).toLowerCase()} cannot copy a stream with no codec`
             + `${tmcd ? `, and ${why}, so it is lost` : ''}\n`;
     }).join('');
@@ -2944,7 +2986,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             ? tableGet(QT_VIDEO_TAG, cn, '') : '');
         // The streams an exit's output maps, the primary as that exit writes it (`written`): the source stream on a copy, the encode at its own frame rate on
         // a transcode (encodeRate), the original's stream on a restore. The mp4 muxer times a tmcd by the video it receives (mp4TimedVideo) and writes one
-        // per video it maps, so the drop lines and the summary are built from these.
+        // per video it maps, so the drop lines, the summary and mp4TimecodeArgs are built from these. Their videos are in output order on every exit: the
+        // primary is the first video that is not cover art, and a restore maps the original's first.
         const keptFor = (written) => file.ffProbeData.streams.filter((s) => !coverArtStreams.includes(s) && !uncopyable.includes(s))
             .map((s) => (s === primary ? written : s));
         const dropLog = (written) => coverArtLog + mp4UncopyableLog(dstContainer, uncopyable, keptFor(written));
@@ -2964,9 +3007,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // lines. writes is the transcode's globalWrites; the strip writes no global tag of its own.
         const sealPreset = (inputSide, out, writes, written = primary) => {
             const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, writes);
-            response.preset = `${inputSide}<io>${out}${tagPlan.flag ? ' -movflags use_metadata_tags' : ''}${globalOutputOpt}${outputMuxerArg(dstContainer)}`;
+            const kept = keptFor(written);
+            response.preset = `${inputSide}<io>${out}${mp4TimecodeArgs(dstContainer, kept)}${tagPlan.flag ? ' -movflags use_metadata_tags' : ''}`
+                + `${globalOutputOpt}${outputMuxerArg(dstContainer)}`;
             response.processFile = true;
-            response.infoLog += dropLog(written) + mp4TagPlanLog(tagPlan, dstContainer);
+            response.infoLog += dropLog(written) + mp4TimecodeLog(dstContainer, kept) + mp4TagPlanLog(tagPlan, dstContainer);
         };
         // A predicted output stream that has lost its dynamic HDR layer must not still read 'dv' or 'hdr10+', so both predictions (the lossless strip and the
         // transcode) clear every carrier summariseStream's dynamic tests read: the dvhe/dvh1 fourcc, the DOVI side-data record, and the mediaInfo HDR_Format
@@ -3166,20 +3211,37 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const deint = resolveDeintFilter();
             return deint.startsWith('bwdif=mode=send_field') ? [2, 1] : deint.startsWith('fieldmatch') ? [4, 5] : [1, 1];
         };
-        // The encode's frame rate, in ffprobe's spelling. The muxer times a tmcd by it (mp4TimedVideo), so the repair can decide whether the output keeps
-        // one: a 29.97 drop-frame timecode keeps its tmcd at send_field's 59.94 and loses it at fieldmatch's 23.976 (measured 2026-10-23, jellyfin 7.1.4).
-        // What the repair scales is the rate ffmpeg feeds the encode, not the avg_frame_rate a copy keeps: av_guess_frame_rate takes r_frame_rate, or
-        // avg_frame_rate where avg is under 70 fps and r over 210 (FFmpeg 7.1 libavformat/avformat.c). Measured 2026-10-23 on VFR mp4s with a drop-frame
-        // tmcd: r 29.97 beside avg 18.1 keeps it, r 240 beside avg 24.3 loses it. For H.264, MPEG-1/2 and VC-1 it then takes the codec's own declared rate
-        // where that is under 0.7 of the one chosen and avg strays over 10% from it (r 120 beside avg 24.3 encoded at its SPS's 29.97). Neither probe
-        // reports that rate, so such a file is read at r, which misjudges the tmcd only where the two rates fall on opposite sides of mp4TimecodeAccepted.
-        // awk-ffmpeg-test's fmtprobe create:tmcd-encrate re-measures it.
+        // The encode's frame rate, in ffprobe's spelling. The muxer times a tmcd by it (mp4TimedVideo), so the repair can decide whether the output keeps one:
+        // a 29.97 drop-frame timecode keeps its tmcd at send_field's 59.94 and loses it at fieldmatch's 23.976 (measured 2026-10-23, jellyfin 7.1.4). What the
+        // repair scales is the rate ffmpeg feeds the encode, not the avg_frame_rate a copy keeps: av_guess_frame_rate takes r_frame_rate, or avg_frame_rate
+        // where avg is under 70 fps and r over 210 (FFmpeg 7.1 libavformat/avformat.c). Measured 2026-10-23 on VFR mp4s with a drop-frame tmcd: r 29.97 beside
+        // avg 18.1 keeps it, r 240 beside avg 24.3 loses it. For H.264, MPEG-1/2 and VC-1 it may then take the codec's own declared rate instead
+        // (encodeRateUpTo). awk-ffmpeg-test's fmtprobe create:tmcd-encrate re-measures it.
         const encodeRate = () => {
             const avg = fracOf(primary.avg_frame_rate);
             const rate = String((avg > 0 && avg < 70 && fracOf(primary.r_frame_rate) > 210 ? primary.avg_frame_rate : primary.r_frame_rate) || '').trim();
             const m = /^(\d+)\/(\d+)$/.exec(rate);
             const [times, over] = deintRateScale();
             return m && times !== over ? `${Number(m[1]) * times}/${Number(m[2]) * over}` : rate;
+        };
+        // Whether encodeRate is only the most the encode can run at - the band where av_guess_frame_rate takes the codec's own declared rate instead, wherever
+        // that is valid and under 0.7 of r: an H.264, MPEG-1/2 or VC-1 source (AV_CODEC_PROP_FIELDS) whose avg strays over 10% from r, tested as avformat.c
+        // does (avg/r in one division, so an avg of 0/0 is NaN and never qualifies). Measured 2026-10-23 on jellyfin 7.1.4: an h264 at r 300 whose SPS declares
+        // 200 encodes at 200 beside avg 265 and at 300 beside avg 270 (exactly 10%). Nothing the plugin is given settles that rate, so none is read. ffprobe
+        // never prints it. mediainfo.js 0.2.0 shows an H.264 SPS rate only where fixed_frame_rate_flag is set, and a VC-1 declaring 120 not at all; for
+        // MPEG-1/2 it shows the rate of the LAST sequence header it parsed (MediaInfoLib File_Mpegv), while ffmpeg's comes from the headers its stream analysis
+        // reads - for MPEG-2 the first decoded picture's (mpeg12dec.c mpeg_decode_postinit), for MPEG-1 the last one its parser met in the packets
+        // find_stream_info reads (about 40 on these mp4s), unset where that one carries a forbidden code - so an MPEG-2 whose first 12 frames declare 240 and
+        // the rest 25, and an MPEG-1 whose first 4 headers carry code 0 and the rest 25, read 25.000 there and encode at r 300. Nor does MPEG-2's highest
+        // declaration (60 x 4 = 240) bound it: an mp4 with no sequence header in its first 1500 frames or its esds decodes no picture inside find_stream_info's
+        // 5 s, so ffmpeg's rate stays unset and an MPEG-2 at r 400 encodes at 400 (measured 2026-10-23 with mediainfo.js 0.2.0 and jellyfin 7.1.4). So above
+        // 255 fps the remedy (mp4TimecodeArgs) applies though the encode may run slower and could have kept its tmcd: a missing one fails the mux on every
+        // requeue, a needless one only loses a timecode. The lines name the rate as an upper bound (rateUpTo). Where encodeRate takes avg it is under 70 fps,
+        // and the mark is never read.
+        const encodeRateUpTo = () => {
+            const [an, ad] = String(primary.avg_frame_rate || '').split('/').map(Number);
+            const [rn, rd] = String(primary.r_frame_rate || '').split('/').map(Number);
+            return ['h264', 'mpeg1video', 'mpeg2video', 'vc1'].includes(srcCodecName) && Math.abs(1 - (an * rd) / (ad * rn)) > 0.1;
         };
         // The two verdict REPORTS - "I looked and there was no combing", "I could not read one at all". They claim no work, so unlike the ☐ repair lines they
         // are safe to emit on a file nothing else happens to; the setting costs a decode, so what it found is information the user paid for. Reads the MEMO,
@@ -3925,7 +3987,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Every container-global write is one globalWrites entry (each value escMeta'd as it goes in), emitted here in the order it was set, so the
             // map mp4TagPlan reads and the -metadata the muxer gets cannot disagree.
             for (const [k, v] of Object.entries(globalWrites)) out += ` -metadata "${k}=${v}"`;
-            const encoded = { ...primary, avg_frame_rate: encodeRate() };
+            const encoded = { ...primary, avg_frame_rate: encodeRate(), rateUpTo: encodeRateUpTo() };
             sealPreset(enc.inputSide, out, globalWrites, encoded);
             // The interlace repair's own ☐ line lands HERE, with the preset, for the reason coverArtLog states: every guard between the detection and this
             // point can still end the run with nothing emitted, and a ☐ line means a change about to be MADE. It also makes the frame-rate change legible on

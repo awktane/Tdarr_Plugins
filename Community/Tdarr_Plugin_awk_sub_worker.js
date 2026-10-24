@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.86',
+    Version: '3.999.87',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -617,30 +617,70 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const isMp4ChapterTrack = (s) => String(file?.ffProbeData?.format?.format_name || '').split(',').some(isMp4Family)
         && codecTypeOf(s) === 'data' && ['text', 'tx3g'].includes(String(s.codec_tag_string || '').toLowerCase())
         && ((file?.mediaInfo?.track || []).some((t) => t?.['@type'] === 'Menu') || Number(s.nb_frames) > 0);
+    // -=-=-= mp4TimecodeFps (+ MP4_TMCD_MAX_FPS) [all five] =-=-=-
+    // The whole fps the mp4/mov muxer times a tmcd by: the rate rounded to nearest as its ROUNDED_DIV does (255.4 is 255, 255.5 is 256), or 0 for a rate
+    // without a positive numerator and denominator. Above MP4_TMCD_MAX_FPS the muxer refuses at the trailer a tmcd it has already created (mp4TimecodeArgs).
+    const MP4_TMCD_MAX_FPS = 255;
+    const mp4TimecodeFps = (rate) => {
+        const [num, den] = String(rate || '').split('/').map(Number);
+        return num > 0 && den > 0 ? Math.floor((num + Math.floor(den / 2)) / den) : 0;
+    };
     // -=-=-= isTmcdTrack (+ mp4GlobalTimecodeKey, MP4_TIMECODE, mp4TimecodeAccepted, mp4VideoTimecode, mp4TimedVideo) [all five] =-=-=-
     // A tmcd timecode track, and a video stream the mp4/mov muxer writes one for. The muxer reads the file's global timecode whenever the file has that tag,
     // even an empty one, and the stream's own only otherwise (a global 02:00:00:00 beside a video 01:00:00:00 writes 02:00:00:00; a global 'garbage' beside a
     // valid video tag writes none) - mp4VideoTimecode, the string a video's tmcd is written from. It parses that string as libavutil's
     // av_timecode_init_from_string does, sscanf "%d:%d:%d%c%d" (MP4_TIMECODE): blanks may lead each number and a sign may lead it, no field is range-checked
     // (99 frames, -01 or 25 hours all write a track), trailing text is ignored, and any separator before the frames but ':' means drop-frame. Then it times the
-    // track by the stream's frame rate rounded to whole fps: below 1 fps it writes none (a cover's 0/0, a 1/3 fps stream - but a PNG-codec video or an attached
-    // picture at 25/1 gets one), nor for drop-frame at a rate that does not round to a multiple of 30 (29.97, 30, 59.94 and 60 take it; 23.976, 24, 25 and 50
-    // do not). Each stream it accepts gets a tmcd of its own (two videos under a global timecode, two). Measured 2026-10-23 on jellyfin 7.1.4;
+    // track by the stream's frame rate in whole fps (mp4TimecodeFps): below 1 fps it writes none (a cover's 0/0, a 1/3 fps stream - but a PNG-codec video or
+    // an attached picture at 25/1 gets one), nor for drop-frame at a rate that does not round to a multiple of 30 (29.97, 30, 59.94 and 60 take it; 23.976,
+    // 24, 25 and 50 do not), and above 255 none is written either: mp4TimecodeArgs stops the one that would fail the mux (`cap`, which mp4OverfastVideo
+    // lifts). Each stream it accepts gets a tmcd of its own (two videos under a global timecode, two). Measured 2026-10-23 on jellyfin 7.1.4;
     // awk-ffmpeg-test's fmtprobe create:tmcd* rows re-measure it.
     const isTmcdTrack = (s) => codecTypeOf(s) === 'data' && String(s.codec_tag_string || '').toLowerCase() === 'tmcd';
     const mp4GlobalTimecodeKey = () => Object.keys(file?.ffProbeData?.format?.tags || {}).find((k) => k.toLowerCase() === 'timecode');
     const MP4_TIMECODE = /^[ \t\n\v\f\r]*[+-]?\d+:[ \t\n\v\f\r]*[+-]?\d+:[ \t\n\v\f\r]*[+-]?\d+(\D)[ \t\n\v\f\r]*[+-]?\d+/;
-    const mp4TimecodeAccepted = (timecode, rate) => {
+    const mp4TimecodeAccepted = (timecode, rate, cap = MP4_TMCD_MAX_FPS) => {
         const sep = (MP4_TIMECODE.exec(String(timecode ?? '')) || [])[1];
-        const [num, den] = String(rate || '').split('/').map(Number);
-        const fps = num > 0 && den > 0 ? Math.floor((num + Math.floor(den / 2)) / den) : 0;
-        return sep !== undefined && fps >= 1 && (sep === ':' || fps % 30 === 0);
+        const fps = mp4TimecodeFps(rate);
+        return sep !== undefined && fps >= 1 && fps <= cap && (sep === ':' || fps % 30 === 0);
     };
     const mp4VideoTimecode = (v) => {
         const key = mp4GlobalTimecodeKey();
         return key === undefined ? getTagCI(v.tags, 'timecode') : String(file.ffProbeData.format.tags[key] ?? '');
     };
     const mp4TimedVideo = (v) => codecTypeOf(v) === 'video' && mp4TimecodeAccepted(mp4VideoTimecode(v), v.avg_frame_rate);
+    // -=-=-= mp4TimecodeArgs (+ mp4OverfastVideo, mp4OverfastFor, mp4TimecodeLog) [all five] =-=-=-
+    // The output-side args that keep a video the muxer cannot time a tmcd for from failing the whole mp4-family mux. Above 255 fps it still creates the track,
+    // then refuses it at the trailer ("fps 300 is too large", exit 234), so the file errors on every requeue - mp4OverfastVideo, judged on `kept`, the streams
+    // as the output writes them in output order (a copy at its avg_frame_rate, an encode at the rate it writes or, marked rateUpTo, the most it can). Where no
+    // other kept video gets a tmcd, -write_tmcd 0 turns the muxer's tmcd creation off: it loses nothing more and keeps a global timecode that use_metadata_tags
+    // stores. Where one does, that switch would take its tmcd too, so only the fast video's timecode is cleared, by its place among the output's video streams;
+    // a global timecode beats every video's own, so it is cleared as well and restated on each other video, which then writes exactly the tmcd it would have. A
+    // copied tmcd (mov) stops the muxer creating any and is timed by its own sample description, so it needs nothing. Measured 2026-10-23 on jellyfin 7.1.4 in
+    // mp4, mov and -f mp4: 255/1 and 1277/5 write a tmcd, 511/2, 256/1 and 300/1 fail, and each remedy exits 0 (fmtprobe create:tmcd-fps re-measures it).
+    // mp4TimecodeLog names each fast video, whose timecode is lost, and mp4OverfastFor the fast video whose timecode a source tmcd carries. A rateUpTo encode
+    // may run slower than that bound (video_clean's encodeRateUpTo says why), and the remedy applies all the same, because a missing one fails the mux where a
+    // needless one only loses a timecode; its lines name the rate as an upper bound.
+    const mp4OverfastVideo = (v) => codecTypeOf(v) === 'video' && mp4TimecodeAccepted(mp4VideoTimecode(v), v.avg_frame_rate, Infinity)
+        && mp4TimecodeFps(v.avg_frame_rate) > MP4_TMCD_MAX_FPS;
+    const mp4OverfastFor = (s, kept) => kept.find((v) => mp4OverfastVideo(v) && mp4VideoTimecode(v) === getTagCI(s.tags, 'timecode'));
+    const mp4TimecodeArgs = (container, kept) => {
+        if (!isMp4Family(container) || kept.some(isTmcdTrack)) return '';
+        const videos = kept.filter((s) => codecTypeOf(s) === 'video');
+        const fast = videos.filter(mp4OverfastVideo);
+        if (!fast.length) return '';
+        if (!videos.some(mp4TimedVideo)) return ' -write_tmcd 0';
+        const key = mp4GlobalTimecodeKey();
+        const global = key === undefined ? null : escMeta(file.ffProbeData.format.tags[key]);
+        return (global === null ? '' : ' -metadata timecode=') + videos.map((v, n) => (fast.includes(v) ? ` -metadata:s:v:${n} timecode=`
+            : global === null ? '' : ` -metadata:s:v:${n} "timecode=${global}"`)).join('');
+    };
+    const mp4TimecodeLog = (container, kept) => (mp4TimecodeArgs(container, kept) ? kept.filter(mp4OverfastVideo) : []).map((v) => {
+        const [c, fps] = [String(container).toLowerCase(), mp4TimecodeFps(v.avg_frame_rate)];
+        const why = v.rateUpTo ? `it can run at up to ${fps} fps, and the .${c} muxer cannot time one above ${MP4_TMCD_MAX_FPS}`
+            : `the .${c} muxer cannot time one at ${fps} fps (${MP4_TMCD_MAX_FPS} at most)`;
+        return `☐${streamTag(v.index)} Writing no tmcd timecode track for this video - ${why}, so its timecode is lost\n`;
+    }).join('');
     // -=-=-= isMp4RebuiltTimecode (+ mp4TimecodeCount, mp4RebuiltTimecodes) [all five] =-=-=-
     // A tmcd timecode track the mp4/mov muxer puts back when a remux leaves it out, so the output reads exactly as the copy would have (measured 2026-10-01
     // and 2026-10-22: 01:00:00:00 in and out). That holds for a tmcd the video track does not reference (no 'tref') too: the video then shows no timecode
@@ -729,14 +769,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return (streams || []).filter((s) => noCodec(s) || (isMp4Family(c) && isMp4ChapterTrack(s)));
     };
     // The dropped streams whose data really leaves the output - all of them but a track the muxer rebuilds - so an Expected results line never promises one.
-    // `kept` is what the output maps (see isMp4RebuiltTimecode); a tmcd lost while the muxer still writes others is one past its one-per-video count.
+    // `kept` is what the output maps (see isMp4RebuiltTimecode); a tmcd carrying the timecode of a video the muxer cannot time is lost for that reason
+    // (mp4OverfastFor), and one lost while the muxer still writes others is one past its one-per-video count.
     const mp4LostData = (dropped, kept) => dropped.filter((s) => !isMp4ChapterTrack(s) && !isMp4RebuiltTimecode(s, kept));
     const mp4UncopyableLog = (container, dropped, kept) => dropped.map((s) => {
         if (!mp4LostData([s], kept).length) return mp4RebuiltLine(s, container);
         const tmcd = String(s.codec_tag_string || '').toLowerCase() === 'tmcd';
         const what = tmcd ? 'tmcd timecode' : 'unidentified data';
-        const why = mp4TimecodeCount(kept) ? 'the muxer rebuilds only one per video the output keeps'
-            : 'the file has no timecode the muxer can rebuild it from';
+        const fast = mp4OverfastFor(s, kept);
+        const why = fast ? `the muxer cannot time one for a video ${fast.rateUpTo ? 'that can run ' : ''}above ${MP4_TMCD_MAX_FPS} fps`
+            : mp4TimecodeCount(kept) ? 'the muxer rebuilds only one per video the output keeps' : 'the file has no timecode the muxer can rebuild it from';
         return `☐${streamTag(s.index)} Leaving out the ${what} track - .${String(container).toLowerCase()} cannot copy a stream with no codec`
             + `${tmcd ? `, and ${why}, so it is lost` : ''}\n`;
     }).join('');
@@ -2800,14 +2842,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // and the copied-subset argument stays at its default; that includes any cover art, which is why every mapped stream is offered to the cover check.
         // The drops come last: a negative -map undoes the earlier `-map 0` for just that stream.
         const uncopyable = mp4UncopyableStreams(dstContainer, streams);
-        const mapped = streams.filter((s) => !uncopyable.includes(s));
-        let full = out + dropMaps(uncopyable.map((s) => s.index)) + mp4StrictArg(dstContainer, streams);
+        const mapped = streams.filter((s) => !uncopyable.includes(s));   // every video in source order, the order mp4TimecodeArgs keys on
+        let full = out + dropMaps(uncopyable.map((s) => s.index)) + mp4StrictArg(dstContainer, streams) + mp4TimecodeArgs(dstContainer, mapped);
         const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, globalWrites);
         if (tagPlan.flag) full += ' -movflags use_metadata_tags';
         full += globalOutputOpt + outputMuxerArg(dstContainer);
         response.preset = `<io>${full}`;
         response.processFile = true;
-        response.infoLog += mp4UncopyableLog(dstContainer, uncopyable, mapped) + mp4TagPlanLog(tagPlan, dstContainer, mapped);
+        response.infoLog += mp4UncopyableLog(dstContainer, uncopyable, mapped) + mp4TagPlanLog(tagPlan, dstContainer, mapped)
+            + mp4TimecodeLog(dstContainer, mapped);
         const goneData = mp4LostData(uncopyable, mapped);
         for (const s of [...goneData, ...mp4CoversLost(tagPlan, dstContainer, mapped)]) leftOut.add(s.index);
         unmapped.push(...uncopyable);
