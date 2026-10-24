@@ -7,9 +7,9 @@ const details = () => ({
     Type: 'Any',
     Operation: 'Transcode',
     Description: `Prepares the file for any next steps including remuxing to mp4/mkv\n\n
-                     -Identify and remove data streams and image/cover-art streams (by codec, or by attached_pic/still_image/timed_thumbnails disposition).
-                         An mp4 output keeps its chapter track and a tmcd timecode track, which the mp4 muxer rebuilds from the chapters and from the
-                         video's timecode\n\n
+                     -Identify and remove data streams and image/cover-art streams (by codec, by attached_pic/still_image/timed_thumbnails disposition, or
+                         by the image mimetype a Matroska cover attachment keeps once an earlier remux wrote it out as a video track). An mp4 output keeps
+                         its chapter track and a tmcd timecode track, which the mp4 muxer rebuilds from the chapters and from the video's timecode\n\n
                      -Optionally removes any subtitle tracks that are not in the specified language(s)
                          via language_sub (audio language filtering is audio_clean's job)\n\n
                      -Standardises the stored language tag per container (tag_language / method_tag_language) and fills
@@ -30,7 +30,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.71',
+    Version: '4.999.72',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -471,7 +471,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (13 sections: stream codec type … ffmpeg metadata escaping)
+    // #region SHARED helpers (15 sections: stream codec type … ffmpeg metadata escaping)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -601,16 +601,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: image / cover-art codecs =====
     // -=-=-= IMAGE_CODECS / isCoverArt [all five] =-=-=-
-    // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last;
-    // summariseStream flags them /cover. Two codecs that LOOK like they belong are deliberately ABSENT, for one reason: they are also real
-    // moving-picture codecs. mjpeg/mjpegb is camcorder/AVI-era footage, and jpeg2000 is the DCP / IMF / broadcast-mezzanine codec - listing
-    // either drops genuine video as cover art, while neither is ever WRITTEN as cover art (mkv attaches image/jpeg or image/png; the mp4 covr
-    // atom encodes only JPEG or PNG). Real cover art in those codecs still matches via the disposition clause below - mp4 marks it attached_pic
-    // and mkv carries it as an ATTACHMENT, not a video stream - so a dispositionless mjpeg/jpeg2000 video stream reads as real video, the
-    // fail-safe direction. nb_frames cannot substitute for the disposition test: in mkv it is N/A for real MJPEG video AND for cover art.
+    // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last; summariseStream
+    // flags them /cover. Two codecs that LOOK like they belong are deliberately ABSENT, for one reason: they are also real moving-picture codecs. mjpeg/mjpegb
+    // is camcorder/AVI-era footage, and jpeg2000 is the DCP / IMF / broadcast-mezzanine codec - listing either drops genuine video as cover art, while
+    // neither is ever WRITTEN as cover art (mkv attaches image/jpeg or image/png; the mp4 covr atom encodes only JPEG or PNG). Real cover art in those
+    // codecs still matches via the disposition clause below - mp4 marks it attached_pic, and ffprobe reports an mkv image attachment as an attached_pic
+    // video stream - so a dispositionless mjpeg/jpeg2000 video stream reads as real video, the fail-safe direction. nb_frames cannot substitute for the
+    // disposition test: in mkv it is N/A for real MJPEG video AND for cover art. A Matroska image attachment that a plain -map 0 -c copy has written out as a
+    // one-frame video track carries no flag, and in mjpeg no image codec either, but it keeps the attachment's filename and mimetype tags (image/jpeg,
+    // image/png; measured 2026-10-23 on jellyfin 7.1.4). No real video track carries an image mimetype, so the mimetype clause names it cover art.
     const IMAGE_CODECS = ['png', 'apng', 'gif', 'bmp', 'webp', 'tiff', 'qoi'];
     const isCoverArt = (s) => IMAGE_CODECS.includes(codecNameOf(s))
-        || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails');
+        || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails')
+        || (codecTypeOf(s) === 'video' && /^image\//i.test(getTagCI(s.tags, 'mimetype')));
     // ===== END SHARED: image / cover-art codecs =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: codec name resolution =====
@@ -730,13 +733,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .filter((k) => !/^awk_/i.test(k) && !native.includes(k.toLowerCase()) && !MP4_REGENERATED_TAGS.includes(k.toLowerCase()));
         return { flag: markers.length > 0, markers, dropped };
     };
-    // -=-=-= mp4CoversLost [all five] =-=-=-
-    // The attached covers among `kept` (the streams a plugin maps into the output) that the container will not store: every one in mov (the QuickTime flavour
-    // writes no covr at all, flag or not), and in mp4/m4v/m4a the ones use_metadata_tags costs. The plugins that drop cover art themselves pass none; the
-    // others leave these out of their Expected results line too, so the summary and the warning agree.
+    // -=-=-= isMp4Cover (+ mp4CoversLost) [all five] =-=-=-
+    // A cover the mp4/mov muxer stores as an iTunes covr atom rather than as a track: a video stream whose ONLY disposition is attached_pic, the muxer's own
+    // test - one with another flag beside it (attached_pic+default) is written as a one-frame video track instead, in mov too, and read back as plain video.
+    // The mov demuxer reports a covr cover after every track, the chapter and tmcd tracks the muxer writes included, wherever it was mapped; ffmpeg writes the
+    // atom after every track, and only a file whose udta precedes its tracks (another tool's layout) reports its cover first. Measured 2026-10-23 on jellyfin
+    // 7.1.4 in mp4, m4v (the ipod muxer and -f mp4) and mov, with one cover and two. mp4CoversLost is the covers among `kept` (the streams a plugin maps into
+    // the output) the container will not store: every one in mov (the QuickTime flavour writes no covr at all, flag or not), and in mp4/m4v/m4a the ones
+    // use_metadata_tags costs. The plugins that drop cover art themselves pass none; the others leave these out of their Expected results line too, so the
+    // summary and the warning agree.
+    const isMp4Cover = (s) => codecTypeOf(s) === 'video' && s.disposition?.attached_pic === 1
+        && Object.entries(s.disposition).every(([k, v]) => k === 'attached_pic' || v !== 1);
     const mp4CoversLost = (plan, container, kept = []) => {
         const c = String(container || '').toLowerCase();
-        return isMp4Family(c) && (c === 'mov' || plan.flag) ? kept.filter((s) => hasDisposition(s, 'attached_pic')) : [];
+        return isMp4Family(c) && (c === 'mov' || plan.flag) ? kept.filter(isMp4Cover) : [];
     };
     // -=-=-= mp4TagPlanLog [all five] =-=-=-
     // What the plan costs, as log lines: the native tags the flag rewrites, the custom keys a flagless mux leaves behind, and each cover mp4CoversLost
@@ -896,20 +906,63 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // A track left out of the map that the muxer rebuilds (isMp4ChapterTrack, isMp4RebuiltTimecode) is still in the output, so its line is a ☑. The muxer
     // writes such tracks after every mapped stream, the chapter track first and then each tmcd (measured 2026-10-22), so an Expected results line lists
     // them last in that order: mp4RebuiltLast moves the items of `list` (anything carrying a source index) that are among `rebuilt` to the end, and slots the
-    // `created` tracks (mp4CreatedTracks) in by the same rule - a chapter track ahead of every tmcd, each tmcd last - each made a list item by `wrap`.
+    // `created` tracks (mp4CreatedTracks) in by the same rule - a chapter track ahead of every tmcd, each tmcd last - each made a list item by `wrap`. Into an
+    // mp4-family `container` a kept cover (isMp4Cover, judged on the source stream at the item's index) goes after all of them, where the next pass reads it.
     const mp4RebuiltLine = (s, container) => {
         const timecode = mp4GlobalTimecodeKey() !== undefined ? "the file's timecode" : "the video track's timecode";
         const [what, from] = isMp4ChapterTrack(s) ? ['chapter', 'the chapters'] : ['tmcd timecode', timecode];
         return `☑${streamTag(s.index)} Keeping the ${what} track - the .${String(container).toLowerCase()} muxer rebuilds it from ${from}\n`;
     };
-    const mp4RebuiltLast = (list, rebuilt, created = [], wrap = (s) => s) => {
+    const mp4RebuiltLast = (container, list, rebuilt, created = [], wrap = (s) => s) => {
+        const cover = (x) => isMp4Family(container) && isMp4Cover((file?.ffProbeData?.streams || []).find((s) => s.index === x.index));
         const rank = (x) => { const s = rebuilt.find((r) => r.index === x.index); return !s ? 0 : isMp4ChapterTrack(s) ? 1 : 2; };
-        const out = [...list].sort((a, b) => rank(a) - rank(b));
+        const out = list.filter((x) => !cover(x)).sort((a, b) => rank(a) - rank(b));
         const firstTmcd = out.findIndex((x) => rank(x) === 2);
         out.splice(firstTmcd < 0 ? out.length : firstTmcd, 0, ...created.filter((s) => !isTmcdTrack(s)).map(wrap));
-        return [...out, ...created.filter(isTmcdTrack).map(wrap)];
+        return [...out, ...created.filter(isTmcdTrack).map(wrap), ...list.filter(cover)];
     };
     // ===== END SHARED: mp4-family container =====
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: matroska-family container =====
+    // -=-=-= isMatroskaFamily [all five] =-=-=-
+    // The Matroska family: mkv, its audio (mka) and subtitle (mks) spellings, and WebM, the Matroska subset. All of them store arbitrary tags and flags
+    // natively, so each "does this survive a remux" test starts here - and each consumer keeps its own measurement of the property it relies on.
+    const isMatroskaFamily = (container) => ['mkv', 'mka', 'mks', 'webm'].includes(String(container || '').toLowerCase());
+    // ===== END SHARED: matroska-family container =====
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: read-back dispositions =====
+    // -=-=-= carriesDisposition (+ readBackDispositions) [all five] =-=-=-
+    // The dispositions an output is read back with, as its Expected results line shows them: `list` is the line's items in output order, `streamOf` reads an
+    // item's stream, `withStream` makes an item of a changed copy, and `manual` says whether the output's command writes any -disposition at all
+    // (carriesDisposition). Summary only - no plugin overrides these flags, and only an audio or subtitle token prints a default one. Three writers set a flag
+    // no plugin asks for (measured 2026-10-23 on jellyfin 7.1.4; the FFmpeg 7.1 source agrees - fftools set_dispositions, movenc enable_tracks):
+    //  - ffmpeg itself, on an output whose command carries no -disposition: the first stream of each type that has two or more, none of them default, is made
+    //    default - an attached_pic stream counted but never chosen, and one -disposition anywhere switches it off for the whole output. Matroska (mkv and
+    //    webm measured) and the mp4 family store the flag; MPEG-TS and AVI read every stream back undefaulted, so nothing is shown there.
+    //  - the mov muxer, into the mp4 family: the first video, audio and subtitle track of a type none of whose tracks is default is enabled - a lone track too,
+    //    whatever -disposition says - and the mov demuxer reads an enabled track as default. A cover (isMp4Cover) is no track, and a chapter or tmcd track the
+    //    muxer writes is never enabled. Measured on an mkv's undefaulted subtitles, a lone audio written with -disposition 0, and an mp4 whose default
+    //    subtitle is dropped, whose next subtitle then reads default.
+    //  - the mov muxer again: every video stream but a cover is written as an ordinary track and read back with no attached_pic, still_image or
+    //    timed_thumbnails flag (attached_pic+default, attached_pic+timed_thumbnails - a QuickTime chapter-image track - still_image and timed_thumbnails
+    //    alike, in mjpeg and png), so there only an image codec still reads as cover art.
+    const carriesDisposition = (args) => /(^|\s)-disposition[:\s]/.test(String(args || ''));
+    const readBackDispositions = (container, list, manual, streamOf = (x) => x, withStream = (x, s) => s) => {
+        const mp4 = isMp4Family(container);
+        if (!mp4 && !isMatroskaFamily(container)) return list;
+        const flagged = (x, flags) => withStream(x, { ...streamOf(x), disposition: { ...(streamOf(x).disposition || {}), ...flags } });
+        const out = [...list];
+        for (const type of ['video', 'audio', 'subtitle']) {
+            const ofType = out.filter((x) => codecTypeOf(streamOf(x)) === type);
+            if (ofType.some((x) => streamOf(x).disposition?.default === 1)) continue;
+            const pick = (!manual && ofType.length > 1 ? ofType.find((x) => streamOf(x).disposition?.attached_pic !== 1) : undefined)
+                || (mp4 ? ofType.find((x) => !isMp4Cover(streamOf(x))) : undefined);
+            if (pick) out[out.indexOf(pick)] = flagged(pick, { default: 1 });
+        }
+        if (!mp4) return out;
+        const COVER_FLAGS = ['attached_pic', 'still_image', 'timed_thumbnails'];
+        return out.map((x) => (codecTypeOf(streamOf(x)) === 'video' && !isMp4Cover(streamOf(x)) && COVER_FLAGS.some((k) => streamOf(x).disposition?.[k] === 1)
+            ? flagged(x, Object.fromEntries(COVER_FLAGS.map((k) => [k, 0]))) : x));
+    };
+    // ===== END SHARED: read-back dispositions =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream / language / preset helpers =====
     // -=-=-= mediaInfoFor [all five] =-=-=-
     // The single join point between the two probes: the mediaInfo track whose StreamOrder equals the ffprobe index; undefined when absent. Deliberately
@@ -1207,10 +1260,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // #endregion
 
     // #region SHARED helpers (1 section: ffmpeg path)
-    // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: ffmpeg path =====
-    // -=-=-= ffmpegPathOf  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
-    // The node's ffmpeg: Tdarr hands a classic plugin otherArguments.ffmpegPath, and the bare name - a PATH lookup - stands in when it supplied none.
-    // Every spawn in the four plugins that run ffmpeg resolves the binary here, so a change to how it is found reaches all of them at once.
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg path =====
+    // -=-=-= ffmpegPathOf [all five] =-=-=-
+    // The node's ffmpeg: Tdarr hands a classic plugin otherArguments.ffmpegPath, and the bare name - a PATH lookup - stands in when it supplied none. Every
+    // ffmpeg spawn in the five plugins resolves the binary here, so a change to how it is found reaches all of them at once.
     const ffmpegPathOf = (otherArgs) => String(otherArgs?.ffmpegPath || 'ffmpeg');
     // ===== END SHARED: ffmpeg path =====
     // #endregion
@@ -1616,14 +1669,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const subDroppedRegardlessOfLanguage = (codec) => subFormatDropped(codec) || imageSubDropped(codec) || styledSubExported(codec);
 
     // #region SHARED helpers (2 sections: preset path safety … font attachment test)
-    // ===== SHARED [clean_and_remux, sub_worker, video_clean]: preset path safety =====
-    // -=-=-= pathIsPresetSafe  [clean_and_remux, sub_worker, video_clean] =-=-=-
-    // True when a real on-disk path can be embedded in a preset's quoted "${path}" token. Tdarr never shells out, but its worker tokenises each preset
-    // half with a quote-aware parser before spawning ffmpeg, so a " anywhere in the path closes the wrapper mid-token and everything after it becomes
-    // fresh argv entries (a raw control character breaks the token just as badly). The literal <io> is refused for a second reason: it is the preset's own
-    // input/output split marker, and Tdarr reads only the first two parts, so a path carrying one silently DELETES every argument after it. The name parts
-    // WE generate are sanitised at their source, but a library path has to stay literal - it can only be checked, never rewritten - so a caller that
-    // fails this test refuses that one output (a sidecar, or video_clean's restore from the library original) with a ☒ line rather than emit the token.
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: preset path safety =====
+    // -=-=-= pathIsPresetSafe [all five] =-=-=-
+    // True when a real on-disk path can be embedded in a preset's quoted "${path}" token. Tdarr never shells out, but its worker tokenises each preset half
+    // with a quote-aware parser before spawning ffmpeg, so a " anywhere in the path closes the wrapper mid-token and everything after it becomes fresh argv
+    // entries (a raw control character breaks the token just as badly). The literal <io> is refused for a second reason: it is the preset's own input/output
+    // split marker, and Tdarr reads only the first two parts, so a path carrying one silently DELETES every argument after it. The name parts WE generate are
+    // sanitised at their source, but a library or work-directory path has to stay literal - it can only be checked, never rewritten - so a caller that fails
+    // this test refuses that one output (a sidecar, a cover's staged copy for -attach, or video_clean's restore from the library original) with a ☒ line rather
+    // than emit the token.
     const pathIsPresetSafe = (p) => !/["\x00-\x1f\x7f]/.test(String(p)) && !/<io>/i.test(String(p));
     // ===== END SHARED: preset path safety =====
 
@@ -3316,13 +3370,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return out;
             };
             // Predicted output: re-renders the input streams with the mutations this summary tracks - removedIndices filtering, subCodecOverride (converted
-            // subtitle codec), predictClearedRoles, and the tracks the muxer rebuilds or creates, where it writes them (mp4RebuiltLast, mp4CreatedTracks). It
+            // subtitle codec), predictClearedRoles, the tracks the muxer rebuilds or creates, where it writes them (mp4RebuiltLast, mp4CreatedTracks), and the
+            // flags the output is read back with (readBackDispositions, ahead of predictClearedRoles, whose copy is the one roleTextLower is seeded for). It
             // does NOT reflect queued language fills / tag_language standardization: those emit only a -metadata:s:...language= arg and never mutate the
             // ffprobe object summariseStream reads, so a track whose blank/looser tag will be rewritten still shows its pre-change lang token here.
-            const outSummary = mp4RebuiltLast(streams, muxerRebuilt, mp4CreatedTracks(dstContainer, mappedStreams))
+            const shown = mp4RebuiltLast(dstContainer, streams, muxerRebuilt, mp4CreatedTracks(dstContainer, mappedStreams))
                 .map(s => ({ s: enrichStream(s), idx: s.index }))
                 .filter(({ idx }) => !removedIndices.has(idx))
-                .map(({ s, idx }) => (subCodecOverride.has(idx) ? { ...s, codec_name: subCodecOverride.get(idx) } : s))
+                .map(({ s, idx }) => (subCodecOverride.has(idx) ? { ...s, codec_name: subCodecOverride.get(idx) } : s));
+            const outSummary = readBackDispositions(dstContainer, shown, carriesDisposition(response.preset))
                 .map(predictClearedRoles)
                 .map((s) => summariseStream(s)).join('');
             response.infoLog += `☑Expected results: ${outSummary}\n`;

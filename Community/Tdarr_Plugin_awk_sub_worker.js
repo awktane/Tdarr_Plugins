@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.87',
+    Version: '3.999.88',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -287,7 +287,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (17 sections: file-failure helpers … ffmpeg metadata escaping)
+    // #region SHARED helpers (19 sections: file-failure helpers … ffmpeg metadata escaping)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: file-failure helpers =====
     // -=-=-= AwkFailFile / failFile / failUnexpected [all five] =-=-=-
     // Fail the whole file (Tdarr's error queue) carrying the full infoLog: a returned processFile:false is Tdarr's "no work / skip" signal, NOT a failure -
@@ -440,16 +440,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: image / cover-art codecs =====
     // -=-=-= IMAGE_CODECS / isCoverArt [all five] =-=-=-
-    // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last;
-    // summariseStream flags them /cover. Two codecs that LOOK like they belong are deliberately ABSENT, for one reason: they are also real
-    // moving-picture codecs. mjpeg/mjpegb is camcorder/AVI-era footage, and jpeg2000 is the DCP / IMF / broadcast-mezzanine codec - listing
-    // either drops genuine video as cover art, while neither is ever WRITTEN as cover art (mkv attaches image/jpeg or image/png; the mp4 covr
-    // atom encodes only JPEG or PNG). Real cover art in those codecs still matches via the disposition clause below - mp4 marks it attached_pic
-    // and mkv carries it as an ATTACHMENT, not a video stream - so a dispositionless mjpeg/jpeg2000 video stream reads as real video, the
-    // fail-safe direction. nb_frames cannot substitute for the disposition test: in mkv it is N/A for real MJPEG video AND for cover art.
+    // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last; summariseStream
+    // flags them /cover. Two codecs that LOOK like they belong are deliberately ABSENT, for one reason: they are also real moving-picture codecs. mjpeg/mjpegb
+    // is camcorder/AVI-era footage, and jpeg2000 is the DCP / IMF / broadcast-mezzanine codec - listing either drops genuine video as cover art, while
+    // neither is ever WRITTEN as cover art (mkv attaches image/jpeg or image/png; the mp4 covr atom encodes only JPEG or PNG). Real cover art in those
+    // codecs still matches via the disposition clause below - mp4 marks it attached_pic, and ffprobe reports an mkv image attachment as an attached_pic
+    // video stream - so a dispositionless mjpeg/jpeg2000 video stream reads as real video, the fail-safe direction. nb_frames cannot substitute for the
+    // disposition test: in mkv it is N/A for real MJPEG video AND for cover art. A Matroska image attachment that a plain -map 0 -c copy has written out as a
+    // one-frame video track carries no flag, and in mjpeg no image codec either, but it keeps the attachment's filename and mimetype tags (image/jpeg,
+    // image/png; measured 2026-10-23 on jellyfin 7.1.4). No real video track carries an image mimetype, so the mimetype clause names it cover art.
     const IMAGE_CODECS = ['png', 'apng', 'gif', 'bmp', 'webp', 'tiff', 'qoi'];
     const isCoverArt = (s) => IMAGE_CODECS.includes(codecNameOf(s))
-        || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails');
+        || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails')
+        || (codecTypeOf(s) === 'video' && /^image\//i.test(getTagCI(s.tags, 'mimetype')));
     // ===== END SHARED: image / cover-art codecs =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: codec name resolution =====
@@ -569,13 +572,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .filter((k) => !/^awk_/i.test(k) && !native.includes(k.toLowerCase()) && !MP4_REGENERATED_TAGS.includes(k.toLowerCase()));
         return { flag: markers.length > 0, markers, dropped };
     };
-    // -=-=-= mp4CoversLost [all five] =-=-=-
-    // The attached covers among `kept` (the streams a plugin maps into the output) that the container will not store: every one in mov (the QuickTime flavour
-    // writes no covr at all, flag or not), and in mp4/m4v/m4a the ones use_metadata_tags costs. The plugins that drop cover art themselves pass none; the
-    // others leave these out of their Expected results line too, so the summary and the warning agree.
+    // -=-=-= isMp4Cover (+ mp4CoversLost) [all five] =-=-=-
+    // A cover the mp4/mov muxer stores as an iTunes covr atom rather than as a track: a video stream whose ONLY disposition is attached_pic, the muxer's own
+    // test - one with another flag beside it (attached_pic+default) is written as a one-frame video track instead, in mov too, and read back as plain video.
+    // The mov demuxer reports a covr cover after every track, the chapter and tmcd tracks the muxer writes included, wherever it was mapped; ffmpeg writes the
+    // atom after every track, and only a file whose udta precedes its tracks (another tool's layout) reports its cover first. Measured 2026-10-23 on jellyfin
+    // 7.1.4 in mp4, m4v (the ipod muxer and -f mp4) and mov, with one cover and two. mp4CoversLost is the covers among `kept` (the streams a plugin maps into
+    // the output) the container will not store: every one in mov (the QuickTime flavour writes no covr at all, flag or not), and in mp4/m4v/m4a the ones
+    // use_metadata_tags costs. The plugins that drop cover art themselves pass none; the others leave these out of their Expected results line too, so the
+    // summary and the warning agree.
+    const isMp4Cover = (s) => codecTypeOf(s) === 'video' && s.disposition?.attached_pic === 1
+        && Object.entries(s.disposition).every(([k, v]) => k === 'attached_pic' || v !== 1);
     const mp4CoversLost = (plan, container, kept = []) => {
         const c = String(container || '').toLowerCase();
-        return isMp4Family(c) && (c === 'mov' || plan.flag) ? kept.filter((s) => hasDisposition(s, 'attached_pic')) : [];
+        return isMp4Family(c) && (c === 'mov' || plan.flag) ? kept.filter(isMp4Cover) : [];
     };
     // -=-=-= mp4TagPlanLog [all five] =-=-=-
     // What the plan costs, as log lines: the native tags the flag rewrites, the custom keys a flagless mux leaves behind, and each cover mp4CoversLost
@@ -735,26 +745,203 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // A track left out of the map that the muxer rebuilds (isMp4ChapterTrack, isMp4RebuiltTimecode) is still in the output, so its line is a ☑. The muxer
     // writes such tracks after every mapped stream, the chapter track first and then each tmcd (measured 2026-10-22), so an Expected results line lists
     // them last in that order: mp4RebuiltLast moves the items of `list` (anything carrying a source index) that are among `rebuilt` to the end, and slots the
-    // `created` tracks (mp4CreatedTracks) in by the same rule - a chapter track ahead of every tmcd, each tmcd last - each made a list item by `wrap`.
+    // `created` tracks (mp4CreatedTracks) in by the same rule - a chapter track ahead of every tmcd, each tmcd last - each made a list item by `wrap`. Into an
+    // mp4-family `container` a kept cover (isMp4Cover, judged on the source stream at the item's index) goes after all of them, where the next pass reads it.
     const mp4RebuiltLine = (s, container) => {
         const timecode = mp4GlobalTimecodeKey() !== undefined ? "the file's timecode" : "the video track's timecode";
         const [what, from] = isMp4ChapterTrack(s) ? ['chapter', 'the chapters'] : ['tmcd timecode', timecode];
         return `☑${streamTag(s.index)} Keeping the ${what} track - the .${String(container).toLowerCase()} muxer rebuilds it from ${from}\n`;
     };
-    const mp4RebuiltLast = (list, rebuilt, created = [], wrap = (s) => s) => {
+    const mp4RebuiltLast = (container, list, rebuilt, created = [], wrap = (s) => s) => {
+        const cover = (x) => isMp4Family(container) && isMp4Cover((file?.ffProbeData?.streams || []).find((s) => s.index === x.index));
         const rank = (x) => { const s = rebuilt.find((r) => r.index === x.index); return !s ? 0 : isMp4ChapterTrack(s) ? 1 : 2; };
-        const out = [...list].sort((a, b) => rank(a) - rank(b));
+        const out = list.filter((x) => !cover(x)).sort((a, b) => rank(a) - rank(b));
         const firstTmcd = out.findIndex((x) => rank(x) === 2);
         out.splice(firstTmcd < 0 ? out.length : firstTmcd, 0, ...created.filter((s) => !isTmcdTrack(s)).map(wrap));
-        return [...out, ...created.filter(isTmcdTrack).map(wrap)];
+        return [...out, ...created.filter(isTmcdTrack).map(wrap), ...list.filter(cover)];
     };
     // ===== END SHARED: mp4-family container =====
-    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: matroska-family container =====
-    // -=-=-= isMatroskaFamily  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: matroska-family container =====
+    // -=-=-= isMatroskaFamily [all five] =-=-=-
     // The Matroska family: mkv, its audio (mka) and subtitle (mks) spellings, and WebM, the Matroska subset. All of them store arbitrary tags and flags
     // natively, so each "does this survive a remux" test starts here - and each consumer keeps its own measurement of the property it relies on.
     const isMatroskaFamily = (container) => ['mkv', 'mka', 'mks', 'webm'].includes(String(container || '').toLowerCase());
     // ===== END SHARED: matroska-family container =====
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: read-back dispositions =====
+    // -=-=-= carriesDisposition (+ readBackDispositions) [all five] =-=-=-
+    // The dispositions an output is read back with, as its Expected results line shows them: `list` is the line's items in output order, `streamOf` reads an
+    // item's stream, `withStream` makes an item of a changed copy, and `manual` says whether the output's command writes any -disposition at all
+    // (carriesDisposition). Summary only - no plugin overrides these flags, and only an audio or subtitle token prints a default one. Three writers set a flag
+    // no plugin asks for (measured 2026-10-23 on jellyfin 7.1.4; the FFmpeg 7.1 source agrees - fftools set_dispositions, movenc enable_tracks):
+    //  - ffmpeg itself, on an output whose command carries no -disposition: the first stream of each type that has two or more, none of them default, is made
+    //    default - an attached_pic stream counted but never chosen, and one -disposition anywhere switches it off for the whole output. Matroska (mkv and
+    //    webm measured) and the mp4 family store the flag; MPEG-TS and AVI read every stream back undefaulted, so nothing is shown there.
+    //  - the mov muxer, into the mp4 family: the first video, audio and subtitle track of a type none of whose tracks is default is enabled - a lone track too,
+    //    whatever -disposition says - and the mov demuxer reads an enabled track as default. A cover (isMp4Cover) is no track, and a chapter or tmcd track the
+    //    muxer writes is never enabled. Measured on an mkv's undefaulted subtitles, a lone audio written with -disposition 0, and an mp4 whose default
+    //    subtitle is dropped, whose next subtitle then reads default.
+    //  - the mov muxer again: every video stream but a cover is written as an ordinary track and read back with no attached_pic, still_image or
+    //    timed_thumbnails flag (attached_pic+default, attached_pic+timed_thumbnails - a QuickTime chapter-image track - still_image and timed_thumbnails
+    //    alike, in mjpeg and png), so there only an image codec still reads as cover art.
+    const carriesDisposition = (args) => /(^|\s)-disposition[:\s]/.test(String(args || ''));
+    const readBackDispositions = (container, list, manual, streamOf = (x) => x, withStream = (x, s) => s) => {
+        const mp4 = isMp4Family(container);
+        if (!mp4 && !isMatroskaFamily(container)) return list;
+        const flagged = (x, flags) => withStream(x, { ...streamOf(x), disposition: { ...(streamOf(x).disposition || {}), ...flags } });
+        const out = [...list];
+        for (const type of ['video', 'audio', 'subtitle']) {
+            const ofType = out.filter((x) => codecTypeOf(streamOf(x)) === type);
+            if (ofType.some((x) => streamOf(x).disposition?.default === 1)) continue;
+            const pick = (!manual && ofType.length > 1 ? ofType.find((x) => streamOf(x).disposition?.attached_pic !== 1) : undefined)
+                || (mp4 ? ofType.find((x) => !isMp4Cover(streamOf(x))) : undefined);
+            if (pick) out[out.indexOf(pick)] = flagged(pick, { default: 1 });
+        }
+        if (!mp4) return out;
+        const COVER_FLAGS = ['attached_pic', 'still_image', 'timed_thumbnails'];
+        return out.map((x) => (codecTypeOf(streamOf(x)) === 'video' && !isMp4Cover(streamOf(x)) && COVER_FLAGS.some((k) => streamOf(x).disposition?.[k] === 1)
+            ? flagged(x, Object.fromEntries(COVER_FLAGS.map((k) => [k, 0]))) : x));
+    };
+    // ===== END SHARED: read-back dispositions =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker]: matroska cover keep =====
+    // -=-=-= matroskaCovers (+ its staging, -attach and log helpers)  [audio_clean, stream_ordering, sub_worker] =-=-=-
+    // A Matroska cover is an image attachment the demuxer reports as an attached_pic video stream (only for an image/gif, image/jpeg, image/png or image/tiff
+    // mimetype - any other image is an ordinary attachment that -map 0 copies byte-identical), and a -map 0 -c copy writes it back as a one-frame video track
+    // (V_MJPEG; V_MS/VFW/FOURCC for png, V_QUICKTIME for gif) that has lost attached_pic and probes at 30000/1, with -disposition attached_pic or without. Only
+    // -attach writes an attachment, and it reads a FILE, so a remux these plugins make for another reason copies each cover's bytes out first, leaves the
+    // stream out of its map and attaches the file again. Measured 2026-10-24 on jellyfin 7.1.4 (jpeg, png, gif and tiff; fonts before, between and after it;
+    // one cover and two; mkvmerge- and mkvpropedit-written): its picture comes back byte-identical, with its filename, mimetype and description as escMeta
+    // writes them (a double quote becomes ', a backslash /, <io> (io), a control character a space - the keep line names a changed one), read back as
+    // attached_pic after every track and every copied attachment, in -attach order. The cover is never itself a reason to remux, and one that cannot be kept is
+    // dropped with a line, never a failed file: an -attach of a missing or empty file, or an attachment left without a mimetype, takes the whole remux down
+    // (exit 254, 183, 234), so only a copy that exited 0 with a non-empty file is attached. A track an earlier plain copy made of a cover keeps the
+    // attachment's mimetype tag (see isCoverArt); the same remux turns it back into an attachment, and copies it as the track it is when it cannot. .webm
+    // stores no attachments (its muxer ignores -attach), so there the cover is dropped.
+    const COVER_EXT_BY_CODEC = { mjpeg: 'jpg', png: 'png', gif: 'gif', tiff: 'tiff' };
+    const COVER_MIME_BY_CODEC = { mjpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', tiff: 'image/tiff' };
+    const matroskaCovers = (container, streams) => (isMatroskaFamily(container) ? (streams || []).filter((s) => codecTypeOf(s) === 'video'
+        && (s.disposition?.attached_pic === 1 || (!!COVER_EXT_BY_CODEC[codecNameOf(s)] && /^image\//i.test(getTagCI(s.tags, 'mimetype'))))) : []);
+    // This job's work directory. Tdarr hands a classic plugin a cacheFilePath inside its tdarr-workDir2-<jobId> folder (a Flow, inside a per-run
+    // subfolder of it), creates the folder before any plugin runs, and deletes it recursively once no job holds the id - the server's cache cleaner every
+    // 60 s, an unmapped node's own every 20 s, on the third sighting - or on a skip or reset verdict. A staged retry or review resumes the SAME folder,
+    // possibly on another node, which is why every staged file is unlinked and copied out again on each pass. '' for any other path: a file left in the
+    // cache root is cleaned by nobody, and one left beside the video is read by a media server.
+    const coverWorkDir = (otherArgs) => {
+        const dir = require('path').dirname(String(otherArgs?.cacheFilePath || '.'));
+        return /(^|[\\/])tdarr-workDir2-[^\\/]+([\\/]|$)/.test(dir) ? dir : '';
+    };
+    // The copy-out reads as little of the file as it can, since the demuxer stops only once every used stream has refused a packet and a one-packet stream
+    // never does: from the start, ffmpeg reads the whole file (1.1 GB measured). -sseof -1 re-queues every attached picture (a seek does), so an
+    // attached_pic cover arrives first and about 3 MB is read - when the file has Cues; a cue-less or truncated file is read whole all the same. A track's
+    // only packet sits in the first cluster, after any attachments, so a cover track, and an attached_pic cover whose seek run failed, are read through
+    // ffmpeg's subfile protocol capped at COVER_BOUNDED_READ_BYTES (a cap that cuts the attachments fails the run, exit 251; 151 MB of fonts ahead of the
+    // first cluster measured). An mkvpropedit-appended cover sits past any cap, which is why the seek run goes first. Each run is killed with SIGKILL:
+    // ffmpeg ignores one SIGTERM once it has started, reads on to the end and exits 255. -c copy -f rawvideo writes the packet verbatim (the image2 muxer
+    // rewrites a gif); -copyinkf keeps a packet not flagged key (a gif track's). Fixed names keep a classic pass that repeats its predecessor's arguments
+    // visible to Tdarr's identical-arguments guard.
+    const COVER_SEEK_TIMEOUT_MS = 10000;
+    const COVER_BOUNDED_READ_BYTES = 268435456;
+    const COVER_BOUNDED_TIMEOUT_MS = 60000;
+    const copyCoversOut = (items, inputPath, otherArgs, seek) => {
+        const fs = require('fs');
+        const res = [];
+        const go = items.filter((it) => {
+            try { fs.unlinkSync(it.file); } catch (e) { if (e.code !== 'ENOENT') { res.push({ it, why: 'stage' }); return false; } }
+            return true;
+        });
+        if (!go.length) return res;
+        const input = seek ? inputPath : `subfile,,start,0,end,${COVER_BOUNDED_READ_BYTES},,:${inputPath}`;
+        const args = ['-hide_banner', '-nostdin', '-v', 'error', '-y', ...(seek ? ['-sseof', '-1'] : []), '-i', input];
+        for (const it of go) args.push('-map', `0:${it.s.index}`, '-c', 'copy', '-copyinkf', '-frames:v', '1', '-f', 'rawvideo', it.file);
+        let r = null;
+        try {
+            r = require('child_process').spawnSync(ffmpegPathOf(otherArgs), args, { stdio: 'ignore', killSignal: 'SIGKILL',
+                timeout: seek ? COVER_SEEK_TIMEOUT_MS : COVER_BOUNDED_TIMEOUT_MS });
+        } catch (e) { /* read as a failed copy below */ }
+        const timedOut = r?.error?.code === 'ETIMEDOUT';
+        const detail = typeof r?.status === 'number' ? `exit ${r.status}` : String(r?.error?.code || r?.signal || 'not run');
+        for (const it of go) {
+            let size = 0;
+            try { size = fs.statSync(it.file).size; } catch (e) { /* not written */ }
+            if (r?.status === 0 && size > 0) res.push({ it });
+            else res.push({ it, why: timedOut ? 'timeout' : 'extract', detail: timedOut ? '' : (r?.status === 0 ? 'nothing written' : detail) });
+        }
+        return res;
+    };
+    // Stages the covers of a Matroska-family remux: `kept` are attached again (matroskaCoverArgs), `dropped` and `asTrack` (a cover track that stays one)
+    // carry the reason, and `leaveOut` is every input stream the map must leave out. No ownership test on the folder: on a CIFS or root-squashed NFS cache
+    // every file reads as the mount's owner, and a retry may resume on another node; lstat refuses a symlink, and anyone who can write the work directory
+    // can already replace the cache file Tdarr promotes.
+    const stageMatroskaCovers = (container, covers, inputPath, otherArgs, streams) => {
+        const path = require('path');
+        const fs = require('fs');
+        const res = { kept: [], dropped: [], asTrack: [], leaveOut: [] };
+        const fail = (it, why, detail = '') => (it.track ? res.asTrack : res.dropped).push({ s: it.s, why, detail });
+        const dir = coverWorkDir(otherArgs);
+        const stageDir = dir ? `${dir}/awk_cover` : '';
+        const todo = covers.map((s) => {
+            const codec = codecNameOf(s);
+            const ext = COVER_EXT_BY_CODEC[codec] || 'img';
+            const base = `awk_cover_s${s.index}.${ext}`;
+            const mime = String(getTagCI(s.tags, 'mimetype') || '');
+            return { s, base, track: s.disposition?.attached_pic !== 1, file: stageDir ? `${stageDir}/${base}` : '',
+                mime: /^image\/[\w.+-]+$/i.test(mime) ? mime : (COVER_MIME_BY_CODEC[codec] || 'image/jpeg'),
+                name: String(getTagCI(s.tags, 'filename') || '') || `cover.${ext}`, title: String(getTagCI(s.tags, 'title') || '') };
+        }).filter((it) => {
+            const why = String(container).toLowerCase() === 'webm' ? 'webm' : (!dir ? 'nowork' : (!pathIsPresetSafe(it.file) ? 'unsafe'
+                : ((streams || []).some((x) => x !== it.s && String(getTagCI(x.tags, 'filename')).toLowerCase() === it.base) ? 'name' : '')));
+            if (why) fail(it, why, why === 'nowork' ? logSafe(otherArgs?.cacheFilePath ? path.dirname(String(otherArgs.cacheFilePath)) : 'none') : '');
+            return !why;
+        });
+        if (todo.length) {
+            try { fs.mkdirSync(stageDir); } catch (e) { /* EEXIST from an earlier pass of this job; anything else fails the lstat */ }
+            let usable = false;
+            try { usable = fs.lstatSync(stageDir).isDirectory(); } catch (e) { /* missing */ }
+            if (!usable) todo.forEach((it) => fail(it, 'stage'));
+            else {
+                const seekRun = copyCoversOut(todo.filter((it) => !it.track), inputPath, otherArgs, true);
+                const retry = seekRun.filter((r) => r.why && r.why !== 'stage').map((r) => r.it);
+                const boundedRun = copyCoversOut([...todo.filter((it) => it.track), ...retry], inputPath, otherArgs, false);
+                for (const r of [...seekRun.filter((x) => !x.why || x.why === 'stage'), ...boundedRun]) {
+                    if (r.why) fail(r.it, r.why, r.detail);
+                    else res.kept.push(r.it);
+                }
+            }
+        }
+        res.kept.sort((a, b) => a.s.index - b.s.index);
+        res.leaveOut = [...res.kept.map((it) => it.s), ...res.dropped.map((d) => d.s)];
+        return res;
+    };
+    // The output-side arguments that attach the kept covers again. Each is addressed by the name -attach gives it - the text after the last '/' of its
+    // path on every platform (ffmpeg_mux_init.c), which is why the staged path is joined with '/' and passed verbatim (a backslash is a filename character
+    // on POSIX) - so no count of the attachments mapped ahead of it can be off: a wrong t:N index tags a FONT and leaves the cover without a mimetype
+    // (measured, exit 234). The m: value is read up to the next ':' with quotes and backslashes as escapes and compared exactly (fftools/cmdutils.c
+    // stream_specifier_parse/match), so the staged base must never hold one - why it is awk_cover_s<index>.<ext>, not the cover's own name. The writes
+    // apply in order, and every filename write comes last: one made first renames the stream before its mimetype write can find it.
+    const matroskaCoverArgs = (kept) => {
+        const at = (it) => ` -metadata:s:m:filename:${it.base}`;
+        return kept.map((it) => ` -attach "${it.file}"`).join('')
+            + kept.map((it) => `${at(it)} "mimetype=${escMeta(it.mime)}"${it.title ? `${at(it)} "title=${escMeta(it.title)}"` : ''}`).join('')
+            + kept.map((it) => `${at(it)} "filename=${escMeta(it.name)}"`).join('');
+    };
+    // A kept cover as the next pass reads it back: an attached_pic stream, listed after every track and every copied attachment.
+    const keptCoverStream = (it) => ({ ...it.s, disposition: { attached_pic: 1 },
+        tags: { filename: escMeta(it.name), mimetype: escMeta(it.mime), ...(it.title ? { title: escMeta(it.title) } : {}) } });
+    const COVER_LOST_WHY = {
+        webm: '.webm stores no attachments',
+        nowork: 'Tdarr\'s cache path is not inside a tdarr-workDir2- job folder, so there is nowhere to stage it for -attach',
+        unsafe: 'the work directory\'s path holds a character a preset cannot carry',
+        name: 'its staging name is already an attachment\'s in this file',
+        stage: 'the work directory has no usable awk_cover folder to stage it in',
+        extract: 'ffmpeg could not copy it out to attach it again',
+        timeout: `copying it out was stopped after ${COVER_BOUNDED_TIMEOUT_MS / 1000} s`,
+    };
+    const coverShownName = (it) => (logSafe(escMeta(it.name)) === logSafe(it.name) ? logSafe(it.name)
+        : `${logSafe(it.name)}, written as ${logSafe(escMeta(it.name))}`);
+    const matroskaCoverLog = (staged) => staged.kept.map((it) => `☐${streamTag(it.s.index)} ${it.track ? 'Turning the cover-art track back into'
+        : 'Copying out the cover art to keep it as'} an attachment (${coverShownName(it)}) - read back after every track and attachment\n`).join('')
+        + [...staged.dropped.map((d) => ['Cover art dropped', d]), ...staged.asTrack.map((d) => ['The cover-art track stays a video track', d])]
+            .map(([what, d]) => `☒${streamTag(d.s.index)} ${what} - ${COVER_LOST_WHY[d.why]}${d.detail ? ` (${d.detail})` : ''}\n`).join('');
+    // ===== END SHARED: matroska cover keep =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 uncopyable streams =====
     // -=-=-= mp4UncopyableStreams (+ mp4LostData, mp4UncopyableLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // The data streams an mp4-family -c copy cannot carry as they are, which each remux here leaves out of its map. One is a stream ffprobe names no codec
@@ -1120,10 +1307,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // #endregion
 
     // #region SHARED helpers (1 section: ffmpeg path)
-    // ===== SHARED [audio_clean, clean_and_remux, sub_worker, video_clean]: ffmpeg path =====
-    // -=-=-= ffmpegPathOf  [audio_clean, clean_and_remux, sub_worker, video_clean] =-=-=-
-    // The node's ffmpeg: Tdarr hands a classic plugin otherArguments.ffmpegPath, and the bare name - a PATH lookup - stands in when it supplied none.
-    // Every spawn in the four plugins that run ffmpeg resolves the binary here, so a change to how it is found reaches all of them at once.
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg path =====
+    // -=-=-= ffmpegPathOf [all five] =-=-=-
+    // The node's ffmpeg: Tdarr hands a classic plugin otherArguments.ffmpegPath, and the bare name - a PATH lookup - stands in when it supplied none. Every
+    // ffmpeg spawn in the five plugins resolves the binary here, so a change to how it is found reaches all of them at once.
     const ffmpegPathOf = (otherArgs) => String(otherArgs?.ffmpegPath || 'ffmpeg');
     // ===== END SHARED: ffmpeg path =====
     // #endregion
@@ -1178,14 +1365,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // #endregion
 
     // #region SHARED helpers (6 sections: preset path safety … language display name)
-    // ===== SHARED [clean_and_remux, sub_worker, video_clean]: preset path safety =====
-    // -=-=-= pathIsPresetSafe  [clean_and_remux, sub_worker, video_clean] =-=-=-
-    // True when a real on-disk path can be embedded in a preset's quoted "${path}" token. Tdarr never shells out, but its worker tokenises each preset
-    // half with a quote-aware parser before spawning ffmpeg, so a " anywhere in the path closes the wrapper mid-token and everything after it becomes
-    // fresh argv entries (a raw control character breaks the token just as badly). The literal <io> is refused for a second reason: it is the preset's own
-    // input/output split marker, and Tdarr reads only the first two parts, so a path carrying one silently DELETES every argument after it. The name parts
-    // WE generate are sanitised at their source, but a library path has to stay literal - it can only be checked, never rewritten - so a caller that
-    // fails this test refuses that one output (a sidecar, or video_clean's restore from the library original) with a ☒ line rather than emit the token.
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: preset path safety =====
+    // -=-=-= pathIsPresetSafe [all five] =-=-=-
+    // True when a real on-disk path can be embedded in a preset's quoted "${path}" token. Tdarr never shells out, but its worker tokenises each preset half
+    // with a quote-aware parser before spawning ffmpeg, so a " anywhere in the path closes the wrapper mid-token and everything after it becomes fresh argv
+    // entries (a raw control character breaks the token just as badly). The literal <io> is refused for a second reason: it is the preset's own input/output
+    // split marker, and Tdarr reads only the first two parts, so a path carrying one silently DELETES every argument after it. The name parts WE generate are
+    // sanitised at their source, but a library or work-directory path has to stay literal - it can only be checked, never rewritten - so a caller that fails
+    // this test refuses that one output (a sidecar, a cover's staged copy for -attach, or video_clean's restore from the library original) with a ☒ line rather
+    // than emit the token.
     const pathIsPresetSafe = (p) => !/["\x00-\x1f\x7f]/.test(String(p)) && !/<io>/i.test(String(p));
     // ===== END SHARED: preset path safety =====
 
@@ -2825,6 +3013,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const globalWrites = {};
     const leftOut = new Set();   // indexes of the streams the committed preset's container will not hold - see outputView
     const unmapped = [];         // the streams the committed preset leaves out of its map - see outputView
+    let manualDisposition = false;   // whether the committed preset writes any -disposition (carriesDisposition) - see outputView
+    const keptCovers = [];           // the Matroska covers the committed preset attaches again from a staged copy (stageMatroskaCovers) - see outputView
     const dropMaps = (indices) => [...indices].map((i) => ` -map -0:${i}`).join('');   // a negative map per dropped input index, in the order given
     const globalMetaArg = (key, value) => {
         globalWrites[key] = value;
@@ -2840,27 +3030,35 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The -strict level either -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses without it.
         // Only subtitle streams - and, on a bundled extract, their font attachments - are ever added or dropped here, so every audio/video stream is copied
         // and the copied-subset argument stays at its default; that includes any cover art, which is why every mapped stream is offered to the cover check.
-        // The drops come last: a negative -map undoes the earlier `-map 0` for just that stream.
+        // The drops come last: a negative -map undoes the earlier `-map 0` for just that stream - an uncopyable data track, and a Matroska cover the main
+        // output attaches again from a staged copy or drops (stageMatroskaCovers, which runs only for a remux this run makes for its own reasons); the
+        // -attach arguments close the main output's option group, after any sidecar output ahead of it in `out`.
         const uncopyable = mp4UncopyableStreams(dstContainer, streams);
-        const mapped = streams.filter((s) => !uncopyable.includes(s));   // every video in source order, the order mp4TimecodeArgs keys on
-        let full = out + dropMaps(uncopyable.map((s) => s.index)) + mp4StrictArg(dstContainer, streams) + mp4TimecodeArgs(dstContainer, mapped);
+        const staged = stageMatroskaCovers(dstContainer, matroskaCovers(dstContainer, streams), file.file, otherArguments, streams);
+        keptCovers.push(...staged.kept);
+        const mapped = streams.filter((s) => !uncopyable.includes(s) && !staged.leaveOut.includes(s));   // every video in source order, for mp4TimecodeArgs
+        let full = out + dropMaps([...uncopyable, ...staged.leaveOut].map((s) => s.index)) + mp4StrictArg(dstContainer, streams)
+            + mp4TimecodeArgs(dstContainer, mapped) + matroskaCoverArgs(staged.kept);
         const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, globalWrites);
         if (tagPlan.flag) full += ' -movflags use_metadata_tags';
         full += globalOutputOpt + outputMuxerArg(dstContainer);
         response.preset = `<io>${full}`;
         response.processFile = true;
-        response.infoLog += mp4UncopyableLog(dstContainer, uncopyable, mapped) + mp4TagPlanLog(tagPlan, dstContainer, mapped)
-            + mp4TimecodeLog(dstContainer, mapped);
+        manualDisposition = carriesDisposition(full);
+        response.infoLog += mp4UncopyableLog(dstContainer, uncopyable, mapped) + matroskaCoverLog(staged)
+            + mp4TagPlanLog(tagPlan, dstContainer, mapped) + mp4TimecodeLog(dstContainer, mapped);
         const goneData = mp4LostData(uncopyable, mapped);
-        for (const s of [...goneData, ...mp4CoversLost(tagPlan, dstContainer, mapped)]) leftOut.add(s.index);
+        for (const s of [...goneData, ...mp4CoversLost(tagPlan, dstContainer, mapped), ...staged.leaveOut]) leftOut.add(s.index);
         unmapped.push(...uncopyable);
     };
     // The stream list as the committed output will actually hold it, in its order - every Expected results line goes through this, so a stream the container
-    // cannot hold is not promised under the line that reports it left out, and a track the muxer rebuilds or creates (mp4CreatedTracks) is listed after the
-    // imported subtitles.
+    // cannot hold is not promised under the line that reports it left out, a track the muxer rebuilds or creates (mp4CreatedTracks) is listed after the
+    // imported subtitles and a kept cover after those (mp4RebuiltLast), and the flags are the ones the output is read back with (readBackDispositions). A
+    // Matroska cover attached again goes after all of it, attachments included - an attachment stream in the command, outside ffmpeg's default rule.
     const outputView = (list) => {
         const shown = list.filter((s) => !leftOut.has(s.index));
-        return mp4RebuiltLast(shown, unmapped, mp4CreatedTracks(dstContainer, shown.filter((s) => !unmapped.includes(s))));
+        return readBackDispositions(dstContainer, mp4RebuiltLast(dstContainer, shown, unmapped,
+            mp4CreatedTracks(dstContainer, shown.filter((s) => !unmapped.includes(s)))), manualDisposition).concat(keptCovers.map(keptCoverStream));
     };
     // Every commit ends the same way: the preset, then the Expected results line - right only once commitPreset has filled leftOut - then the response.
     const commitWithExpected = (out, list) => {
