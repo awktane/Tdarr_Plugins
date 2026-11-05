@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.89',
+    Version: '3.999.90',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -5282,20 +5282,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         const nothingToMux = !toMux.length && !retuneMeta && !removedIndices.size;
 
-        // Sidecars that were only ever redundant, with nothing to mux alongside them: no transcode to wait on, so the deletion happens now rather than in
-        // post-processing - safe because anything reaching here had its content in the file BEFORE this flow started, so it is in the accepted library
-        // copy however the flow ends (a marker-listed member is handled below). Requires a WRITABLE library view, which placeViaApi() is the negation of:
-        // a read-only mount refuses the unlink, and without any mount workLibDir() is the node-local mirror - under text_file the sidecars there are this
-        // run's own downloaded scratch copies, so unlinking them reports a deletion that never touched the library. Nor can any other route delete
-        // directly (the file API has no delete; with nothing to mux there is no acceptance and no server-side pass), so the placeViaApi() branch buys the
-        // server pass instead of claiming a deletion it did not perform. Both cleanup shortcuts below must be the EXACT negation of the mux branch's
-        // trigger (toMux || retuneMeta || removedIndices) - a queued embedded-dedup drop is work on the FILE, and returning here would discard it
+        // Sidecars that were only ever redundant, with nothing to mux alongside them. Both cleanup shortcuts below must be the EXACT negation of the mux
+        // branch's trigger (toMux || retuneMeta || removedIndices) - a queued embedded-dedup drop is work on the FILE, and returning here would discard it
         // silently. A sidecar whose import stripped something stays whichever route would remove it (deletionLoss) - said once, here, for both.
         const deletable = (nothingToMux && removeSource) ? alreadyInFile.filter((f) => {
             const loss = deletionLoss(f, f.matchedBy, isMp4);
             if (loss) for (const m of f.members) response.infoLog += keepForLossLine(m.rel, loss);
             return !loss;
         }) : alreadyInFile;
+        // Deleting them needs a WRITABLE library view, which placeViaApi() is the negation of: a read-only mount refuses the unlink, and without any mount
+        // workLibDir() is the node-local mirror - under text_file the sidecars there are this run's own downloaded scratch copies, so unlinking them reports a
+        // deletion that never touched the library. Nor can any other route delete directly (the file API has no delete; with nothing to mux there is no
+        // acceptance and no server-side pass), so the placeViaApi() branch buys the server pass instead of claiming a deletion it did not perform.
         if (nothingToMux && deletable.length && removeSource && placeViaApi()) {
             const stranded = deletable.flatMap((f) => f.members.map((m) => m.rel));
             // Forcing twice for the same sidecar is worse than not forcing at all: Tdarr ERRORS a file whose consecutive passes emit identical arguments
@@ -5316,13 +5314,35 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // The only route left, so it is taken rather than offered: a lossless copy of the whole file is emitted purely to reach the post-processing stage
             // above. Making this a setting would only work for someone who already knew the trap existed, and by then they have been caught by it: asking for
             // the sidecars to be deleted IS asking for whatever it takes. It cannot repeat - one extra pass per file, ever - because the marker stamped here
-            // lists them, so the next pass filters them out through alreadyEmbedded, whether or not the deletion that follows actually succeeded.
+            // lists them, so the next pass finds them marked (settled, or stopped at the check above), whether or not the deletion that follows succeeded.
             response.infoLog += '☒[remove_source=true] Every sidecar is already in the file and this node cannot delete them from the library - '
                 + 'remuxing losslessly, since only an accepted transcode gives the server a pass in which to do it\n';
             for (const rel of stranded) response.infoLog += `☐[remove_source=true] Queued for removal once accepted: ${rel}\n`;
             return commitWithExpected(` -map 0 -c copy${globalMetaArg(SUB_MARKER_TAG, encodeMarkerEntries(markerFor(markList)))}`, streams);
         }
+        // Deleting them also needs the file this pass read, the one the content check above hashed, to BE the library file: the text is then in the library
+        // when the sidecar goes, so a job that is rejected, cancelled or failed cannot lose it. A plugin after this one in the same job that drops the track
+        // still can, since an accepted job's output replaces the library copy; the documented order runs clean_and_remux, the stack's subtitle filter, first,
+        // which avoids that. The pass reads the library file on a classic job's first pass and in a Flow before any step has written an output - Tdarr's
+        // worker tells the library file from its own cache files by this same path comparison. A caller that names no library file reads file.file as the
+        // library, as libFilePath does.
+        const readsLibraryFile = String(file._id || file.file || libFilePath || '') === libFilePath;
         if (nothingToMux && deletable.length && removeSource) {
+            // A pass that reads the job's own output deletes nothing and writes nothing. A sidecar the marker lists was queued by an earlier pass, and
+            // post-processing deletes it once the job is accepted. Any other stays on disk until a pass reads the library file: leaving it loses nothing,
+            // and since this plugin lists everything it imports, in an awk stack its text was in the library before the job. A remux to list it is not worth
+            // its price - a pass over the whole file and, on an mp4-family file, -movflags use_metadata_tags for the marker, which drops any cover art and
+            // writes every iTunes tag as a QuickTime key that Apple players cannot read.
+            if (!readsLibraryFile) {
+                for (const rel of deletable.flatMap((f) => f.members.map((m) => m.rel))) {
+                    response.infoLog += importedSet.has(rel)
+                        ? `☑[remove_source=true] Already queued for removal by an earlier pass: ${logSafe(rel)} - post-processing deletes it once the job is `
+                            + 'accepted (a Flow has none, so there it stays on disk)\n'
+                        : `☒[remove_source=true] Leaving ${logSafe(rel)} on disk - this pass reads the job's own output, not the library file, so it cannot `
+                            + 'tell the library holds the text; a pass that reads the library file deletes it\n';
+                }
+                return endImport('☑Nothing to import - every sidecar was already in the file\n');
+            }
             let gone = 0; const removedRels = new Set();
             for (const rel of deletable.flatMap((f) => f.members.map((m) => m.rel))) {
                 try {
