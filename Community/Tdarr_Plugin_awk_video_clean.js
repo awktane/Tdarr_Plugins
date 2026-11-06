@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.75',
+    Version: '3.999.76',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -243,13 +243,14 @@ const details = () => ({
                 the CPU could keep them for errors instead. AV1 has no caption-carrying CPU encoder, so an AV1 target that lands on a dropping encoder is
                 warned about and continues rather than silently changing your codec.
                 \\nCaptions are better handled by lifting them into a real subtitle track - run sub_worker BEFORE this plugin. Once it has, the leftover
-                bitstream copy is removed on the next re-encode, so you do not end up with the same captions twice. Where sub_worker already removed that
-                copy itself, this guard still checks the file, so captions an outside tool put back are kept.
+                bitstream copy is removed on the next re-encode, so you do not end up with the same captions twice - unless the video was replaced since
+                they were read, in which case the request is withdrawn first and sub_worker reads the new video's captions. Where sub_worker already
+                removed that copy itself, this guard still checks the file, so captions an outside tool put back are kept.
                 \\nThe check costs one bounded ffprobe read per candidate file, a few seconds whether the file is a clip or a feature, and is skipped
                 entirely when the answer could not change anything - when the chosen encoder already carries captions (named under disabled above).
-                \\nA caption channel that is present but carries no text still counts as captions here, since telling the two apart needs a full decode.
-                That costs a needless CPU encode, never data. Running sub_worker's embedded_cc over the file settles it permanently: it records what it
-                found, and this guard then stops re-checking that file.`,
+                \\nA caption channel that is present but carries no text still counts as captions here, since telling the two apart needs a full decode -
+                and sub_worker finding no text does not switch this guard off, because ffmpeg reads no CEA-708 text at all and a CEA-708 service would
+                then be lost. That costs a needless CPU encode, never data.`,
         },
         {
             name: 'guard_dv',
@@ -3106,15 +3107,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         // Embedded closed captions (A53 SEI in the bitstream) survive a re-encode only where the encoder re-emits them, which is a per-(codec, family) fact -
-        // A53_CAP holds the hardware-confirmed map and its five classes. dropCaptions means sub_worker already lifted them into a sidecar or proved the channel
-        // empty, so the bitstream copy must go or a player shows them twice. So: on a keep-by-default or unreliable encoder, suppress when dropping (vaapi
-        // loses a53_cc from its sei set, everyone else takes -a53cc 0); on libx265, enable when keeping; and h264_videotoolbox always gets -a53cc 0 because
-        // inserting A53 crashes it - it cannot keep captions at all, which is why guard_captions force-picks libx264 when a caption-bearing file targets H.264
-        // on a Mac.
+        // A53_CAP holds the hardware-confirmed map and its five classes. dropCaptions means sub_worker already lifted them into a sidecar, so the bitstream
+        // copy must go or a player shows them twice. So: on a keep-by-default or unreliable encoder, suppress when dropping (vaapi loses a53_cc from its sei
+        // set, everyone else takes -a53cc 0); on libx265, say which either way (its default is off on this build, stated rather than relied on); and
+        // h264_videotoolbox always gets -a53cc 0 because inserting A53 crashes it - it cannot keep captions at all, which is why guard_captions force-picks
+        // libx264 when a caption-bearing file targets H.264 on a Mac.
         const a53cap = a53ClassOf(targetCodec, family);
         if (a53cap === 'error') parts.push('-a53cc 0');
         else if ((a53cap === 'keep' || a53cap === 'unreliable') && dropCaptions) parts.push(family === 'vaapi' ? '-sei -a53_cc' : '-a53cc 0');
-        else if (a53cap === 'optin' && !dropCaptions) parts.push('-a53cc 1');
+        else if (a53cap === 'optin') parts.push(dropCaptions ? '-a53cc 0' : '-a53cc 1');
         // hvc1 = Apple/QuickTime HEVC-in-mp4 (primary only); a no-base DV (e.g. profile 5) needs dvh1 or the DV box is dropped. The encode path tags hevc
         // ONLY - see QT_VIDEO_TAG for why it and the copy path differ
         if (targetCodec === 'hevc' && isQtVideoContainer(dstContainer)) parts.push(preserveDvNoBase ? '-tag:v:0 dvh1' : '-tag:v:0 hvc1');
@@ -3197,7 +3198,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ====== END INTERLACE DETECTION ======
 
-    // #region SHARED helpers (2 sections: closed-caption probe … closed-caption handoff)
+    // #region SHARED helpers (3 sections: closed-caption probe … video fingerprint)
     // ===== SHARED [sub_worker, video_clean]: closed-caption probe =====
     // -=-=-= A53 probe constants / deriveFfprobePath / probeA53Captions  [sub_worker, video_clean] =-=-=-
     // Closed captions are not a stream. They ride INSIDE the video bitstream as A53/EIA-608 SEI, so no stream list mentions them and nothing short of a
@@ -3242,14 +3243,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     // Does the primary video stream carry A53 caption side data? Returns true / false / 'unknown' - and 'unknown' is NOT 'no': it means the probe could not
-    // run, so a caller stays fail-safe rather than concluding the file is caption-free. `cap` is the test-injected verdict (__awkCap.captions): supplying it
-    // short-circuits the spawn entirely, which is how the harness stays free of real binaries.
-    const probeA53Captions = (filePath, ffprobePath, cap) => {
+    // run, so a caller stays fail-safe rather than concluding the file is caption-free. absIndex is the primary's ABSOLUTE index, never v:0: Matroska keeps
+    // a cover as a plain video track, which can sit ahead of the video (measured on a cover-first mkv: 0 A53 frames on v:0, 4 on the video's own index); an
+    // absent index is 'unknown'. `cap` is the test-injected verdict (__awkCap.captions): supplying it short-circuits the spawn entirely, which is how the
+    // harness stays free of real binaries.
+    const probeA53Captions = (filePath, ffprobePath, absIndex, cap) => {
         if (cap === true || cap === false) return cap;
-        if (!filePath || !ffprobePath) return 'unknown';
+        if (!filePath || !ffprobePath || !Number.isInteger(absIndex)) return 'unknown';
         try {
             const { spawnSync } = require('child_process');
-            const args = ['-v', 'error', '-select_streams', 'v:0', '-read_intervals', `%+#${A53_PROBE_FRAMES}`,
+            const args = ['-v', 'error', '-select_streams', String(absIndex), '-read_intervals', `%+#${A53_PROBE_FRAMES}`,
                 '-show_frames', '-show_entries', 'frame=side_data_list', '-of', 'default=nw=1', filePath];
             const r = spawnSync(ffprobePath, args, { encoding: 'utf8', timeout: A53_PROBE_TIMEOUT_MS, maxBuffer: A53_PROBE_MAX_BYTES });
             if (!r || r.status !== 0) return 'unknown';
@@ -3272,23 +3275,108 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //   removed  - the captions are out AND the bitstream copy went with them in that same pass: the fact paired with the `strip` request, telling every
     //              later pass there is nothing left to act on. It changes no encode command - video_clean probes and carries captions as on an untagged
     //              file - so the tag carried onto a video that still holds captions (an outside tool's re-encode keeps global tags) cannot drop them.
-    //   none     - the caption channel was decoded and carried no caption text at all, so no later pass need pay for that decode again. Written only
-    //              once BOTH fields have been read empty: a broadcast carrying its captions in field 2 behind a padded field 1 reads empty on the default
-    //              decode, and a later re-encode told `none` drops captions nothing ever captured.
-    //   decoded  - a full read of the caption channel finished (field auto-selected); decoded2 - a read of field 2 finished. sub_worker's own progress
-    //              memos, stamped by the pass that runs the read: an empty sidecar with neither behind it was left by an interrupted read, not by an
-    //              empty channel. Every other reader ignores them.
-    //   imported - the captions are already embedded as a real subtitle track, so sub_worker must not read them out a second time.
+    //   none     - both caption fields were read and neither decoded to CEA-608 text, so no later pass need pay for that decode again. sub_worker's own
+    //              memo: video_clean ignores it, because ffmpeg reads only CEA-608 and a CEA-708-only service reads empty on both fields (cea708_dtv.mpg,
+    //              89+12 valid 708 triplets), so dropping the caption data on `none` would destroy a service nothing can extract.
+    //   decoded  - a read of field 1 finished; decoded2 - a read of field 2 finished. sub_worker reads both, and counts field 1 as read under decoded2 alone
+    //              too (an earlier build read field 2 into the field-1 name after an empty first read). Its own progress memos, stamped by the pass that
+    //              runs the read: an empty sidecar with neither behind it was left by an interrupted read, not by an empty channel. Every other reader
+    //              ignores them.
+    //   fp:<id8>.<dig> - the video field 1 was read from (the video fingerprint section). An fp with no read token beside it is a read video_clean
+    //              withdrew because the video changed under its request, so sub_worker reads the captions of the video that is there.
+    //   imported - the captions are already embedded as a real subtitle track, so sub_worker must not read them out a second time. On Matroska each
+    //              track sub_worker imports also carries awk_cc=imported in its own tags (the imported caption track section).
     const CC_TOKENS = { strip: 'strip', removed: 'removed', none: 'none', decoded: 'decoded', decoded2: 'decoded2', imported: 'imported' };
     // The value is a COMMA LIST and every reader splits it, because the states genuinely combine: an imported round trip that could not strip in its own pass
-    // records `imported,strip` - and `imported,removed` where it could. An empty channel records `none` ALONE - it never owes a strip. A writer therefore
-    // EXTENDS the tag rather than replacing it with one token - a whole-value overwrite would erase a pending request instead of deferring it. A REQUEST is
-    // retired by whoever SERVES it, and only then: video_clean rewrites `strip` to `removed` on the encode that carries the removal out. Without that the tag
-    // only ever grows, and a satisfied request is indistinguishable from a fresh one - a file that later regains captions (a re-muxed capture, an external tool
-    // re-inserting A53 SEI) has them dropped by a request answered encodes ago. `none` and `imported` are never retired: memos about the file, not requests,
-    // they stay true for its life.
+    // records `imported,strip` - and `imported,removed` where it could. An empty channel records `none` - it never owes a strip. A writer therefore EXTENDS
+    // the tag rather than replacing it with one token - a whole-value overwrite would erase a pending request instead of deferring it. A REQUEST is retired
+    // by whoever SERVES it, and only then: sub_worker's in-pass strip or video_clean's encode rewrites `strip` to `removed`, taking the fp with it. Without
+    // that the tag only ever grows, and a satisfied request is indistinguishable from a fresh one - a file that later regains captions (a re-muxed capture,
+    // an external tool re-inserting A53 SEI) has them dropped by a request answered encodes ago. `none` and `imported` are never retired: memos about the
+    // file, not requests, they stay true for its life - bar video_clean's clear of a request whose caption track is gone, which keeps only the fp.
     const ccTokensOf = (tags) => getTagCI(tags || {}, CC_TAG).toLowerCase().split(',').map((t) => t.trim()).filter(Boolean);
     // ===== END SHARED: closed-caption handoff =====
+
+    // ===== SHARED [sub_worker, video_clean]: video fingerprint =====
+    // -=-=-= FINGERPRINT_* / VQ_FP_RE / videoId8 / isOriginalPath / videoDigest / fpText  [sub_worker, video_clean] =-=-=-
+    // A fingerprint names one video stream as <id8>.<dig>: videoId8, then videoDigest's 8 hex, or n where its window held no non-keyframe packet, or x where
+    // the read failed. video_clean stamps one on a size verdict (awk_vq) and checks a caption request against one; sub_worker binds a caption read to one.
+    // The read takes the first 120 packets (~10 KB of output): 0.02-0.11 s locally, 0.30-0.47 s cold over SMB, measured 2026-10-22.
+    const FINGERPRINT_PACKETS = 120;
+    const FINGERPRINT_TIMEOUT_MS = 20000;
+    const FINGERPRINT_MAX_BYTES = 1024 * 1024;
+    // A stored fingerprint split into its id8 and dig; a value that does not match is no fingerprint at all.
+    const VQ_FP_RE = /^([0-9a-f]{8})\.([0-9a-f]{8}|n|x)$/;
+    // The fingerprint's free half, from ffProbeData alone: what the stream IS (codec, profile, size, pixel format).
+    const videoId8 = (s) => require('crypto').createHash('sha1').update(`${s.codec_name}|${s.profile ?? ''}|${s.width}x${s.height}|${s.pix_fmt}`)
+        .digest('hex').slice(0, 8);
+    // Which file a read is about, for the harness's injected answers: the library original, or this pass's working file.
+    const isOriginalPath = (p) => !!p && p === otherArguments?.originalLibraryFile?.file;
+    // The fingerprint's content half: the first 8 hex of sha1 over the MD5 data hashes of the NON-keyframe packets among the stream's first 120 -> 8 hex,
+    // '' when that window holds none (an all-intra source: the 16 GB ProRes sample gave 0), null when the read failed or read nothing. Keyframes are left out
+    // because mkvmerge rewrites them (+2463 B on the first, measured) while every other packet stays byte-identical: the digest was identical through
+    // ffmpeg -c copy, mkv<->mp4, mkvmerge, mkvpropedit and MP4Box, and different on every re-encode, a same-settings second generation included. The ABSOLUTE
+    // index of the isCoverArt-aware primary, never v:0, which would hash a poster ahead of the video. The harness answers from
+    // __awkCap.videoDigest.{working,original} and never spawns; a missing key reads as a failed read.
+    const videoDigest = (filePath, ffprobePath, absIndex, timeoutMs) => {
+        const cap = otherArguments && otherArguments.__awkCap;
+        if (cap) {
+            const v = (cap.videoDigest || {})[isOriginalPath(filePath) ? 'original' : 'working'];
+            return typeof v === 'string' && (v === '' || /^[0-9a-f]{8}$/.test(v)) ? v : null;
+        }
+        if (!ffprobePath) return null;
+        try {
+            const r = require('child_process').spawnSync(ffprobePath, ['-v', 'error', '-select_streams', String(absIndex), '-read_intervals',
+                `%+#${FINGERPRINT_PACKETS}`, '-show_entries', 'packet=flags,data_hash', '-show_data_hash', 'MD5', '-of', 'default=nw=1:nk=1', filePath],
+            { encoding: 'utf8', maxBuffer: FINGERPRINT_MAX_BYTES, timeout: timeoutMs, killSignal: 'SIGKILL' });
+            const body = r && !r.error && r.status === 0 ? String(r.stdout || '').trim() : '';
+            const lines = body ? body.split(/\r?\n/) : [];
+            if (!lines.length || lines.length % 2) return null;
+            const hashes = [];
+            for (let i = 0; i < lines.length; i += 2) {
+                const hash = lines[i + 1].trim();
+                if (!/^MD5:[0-9a-f]{32}$/.test(hash)) return null;
+                if (!lines[i].trim().startsWith('K')) hashes.push(hash);
+            }
+            return hashes.length ? require('crypto').createHash('sha1').update(hashes.join('\n')).digest('hex').slice(0, 8) : '';
+        } catch (e) { return null; }
+    };
+    // A fingerprint's text: the stream's id8, then its digest, n or x.
+    const fpText = (s, dig) => `${videoId8(s)}.${dig === null ? 'x' : dig || 'n'}`;
+    // -=-=-= CC_FP_PREFIX / ccFpOf / ccFpStaleWhy  [sub_worker, video_clean] =-=-=-
+    // The awk_cc token that binds a caption read to the video it was read from: fp:<fingerprint>. ccFpOf gives the fingerprint of the first one, or ''.
+    const CC_FP_PREFIX = 'fp:';
+    const ccFpOf = (tokens) => (tokens.find((t) => t.startsWith(CC_FP_PREFIX)) || '').slice(CC_FP_PREFIX.length);
+    // Why a caption read's fingerprint no longer describes `stream` ('' while it does), asked before a step that deletes captions on that read's word. Only
+    // an INHERITED fp is checked: one the library original does not carry was written in this job, on the video this job holds, and is trusted with no
+    // read. No fp (a read from before the binding) is trusted, and an n or x fingerprint is checked on its identity only. `digest` is a thunk, so a
+    // changed id8 spends nothing. A digest that cannot be read counts as stale, the opposite of the awk_vq fence on purpose: a wrongly trusted read
+    // deletes captions, a wrongly doubted one costs one re-read.
+    const ccFpStaleWhy = (tokens, origTokens, stream, digest) => {
+        const fp = ccFpOf(tokens);
+        if (!fp || fp !== ccFpOf(origTokens)) return '';
+        const m = VQ_FP_RE.exec(fp);
+        if (!m) return 'its fingerprint token is unreadable';
+        if (m[1] !== videoId8(stream)) return 'its format changed';
+        if (!/^[0-9a-f]{8}$/.test(m[2])) return '';
+        const dig = digest();
+        return dig === null ? 'the fingerprint read failed' : dig !== m[2] ? 'its content changed' : '';
+    };
+    // ===== END SHARED: video fingerprint =====
+    // #endregion
+
+    // #region SHARED helpers (1 section: imported caption track)
+    // ===== SHARED [clean_and_remux, video_clean]: imported caption track =====
+    // -=-=-= importedCaptionTracks  [clean_and_remux, video_clean] =-=-=-
+    // The subtitle tracks holding the closed captions sub_worker imported - the only copy left IN the video once the bitstream copy is stripped or owed a
+    // strip. A track sub_worker imported into Matroska carries awk_cc=imported in its own tags, which stays true after language_fill gives it a language.
+    // Beside the marked ones, under the file's global `imported` memo, every non-image subtitle that is hearing impaired and und or untagged counts too:
+    // the shape sub_worker writes them in (CEA-608 carries no language), and the only sign an mp4 (which keeps no track tag) or an import from before the
+    // mark carries. isImage(codec) names the image subtitle codecs the caller leaves out.
+    const importedCaptionTracks = (streams, tokens, isImage) => (streams || []).filter((s) => codecTypeOf(s) === 'subtitle' && !isImage(codecNameOf(s))
+        && (ccTokensOf(s.tags).includes(CC_TOKENS.imported)
+            || (tokens.includes(CC_TOKENS.imported) && s.disposition?.hearing_impaired === 1 && ['', 'und'].includes(resolveLang(s)))));
+    // ===== END SHARED: imported caption track =====
     // #endregion
 
     // ====== SOURCE-CODEC POLICY (guard_lossless, shrink never-downgrade) ======
@@ -3324,17 +3412,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //   encoded:<core>:<T>              - a pure size-pass encode was emitted at these settings and waits for its verdict on the next pass.
     //   keep:<pct>:<core>:<T>:<fp>      - judged and kept; <pct> a signed whole percent, or na where no verdict could be read (that pass's log says why).
     //   reject:<pct>:<core>:<T>:<fp>    - judged and reverted by the restore mux.
-    // <fp> = <id8>.<dig>, the fingerprint of the video stream the pass leaves behind: videoId8, then videoDigest's 8 hex, or n where its window held no
-    // non-keyframe packet, or x where the read failed. Any other value, or a keep/reject with other than five fields, parses as absent.
+    // <fp> = the fingerprint of the video stream the pass leaves behind (the video fingerprint section). Any other value, or a keep/reject with other than
+    // five fields, parses as absent.
     const VQ_TAG = 'awk_vq';
     // The packet-sum reads share ONE budget per verdict, sized for the largest original on a share (about 530 MB/s locally, so 30 min covers about 950
     // GB, about 200 GB at 110 MB/s): a cycle can never block the worker for twice that. Its output is ~29 B per packet, so 64 MiB covers ~10 h at 60 fps.
     const PACKET_SUM_TIMEOUT_MS = 30 * 60 * 1000;
     const PACKET_SUM_MAX_BYTES = 64 * 1024 * 1024;
-    // The fingerprint reads the first 120 packets (~10 KB of output): 0.02-0.11 s locally, 0.30-0.47 s cold over SMB, measured 2026-10-22.
-    const FINGERPRINT_PACKETS = 120;
-    const FINGERPRINT_TIMEOUT_MS = 20000;
-    const FINGERPRINT_MAX_BYTES = 1024 * 1024;
     const MATROSKA_DEMUXER = 'matroska,webm';
     const MP4_DEMUXER = 'mov,mp4,m4a,3gp,3g2,mj2';
     // The A/V offset a restore may add, in seconds: inside the ~40 ms at which an audio lead becomes detectable (EBU R37 / ITU-R BT.1359).
@@ -3347,11 +3431,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const pct = /^-?\d+$/.test(f[1]) ? Number(f[1]) : (f[0] === 'keep' && f[1] === 'na' ? null : undefined);
         return pct === undefined ? null : { state: f[0], pct, core: f[2], t: f[3], fp: f[4] };
     };
-    // A stamp's <fp> split into its id8 and dig; a value that does not match is no fingerprint at all.
-    const VQ_FP_RE = /^([0-9a-f]{8})\.([0-9a-f]{8}|n|x)$/;
-    // The fingerprint's free half, from ffProbeData alone: what the stream IS (codec, profile, size, pixel format).
-    const videoId8 = (s) => require('crypto').createHash('sha1').update(`${s.codec_name}|${s.profile ?? ''}|${s.width}x${s.height}|${s.pix_fmt}`)
-        .digest('hex').slice(0, 8);
     const fracOf = (v) => { const m = /^(\d+)\/(\d+)$/.exec(String(v || '').trim()); return m && Number(m[2]) > 0 ? Number(m[1]) / Number(m[2]) : 0; };
     // A Matroska DURATION tag ('00:45:00.000000000') in seconds; NaN when it does not read as one.
     const hmsSeconds = (v) => {
@@ -3362,8 +3441,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // are the same writer's: a stale DURATION-eng can sit next to a fresh DURATION (interlaced_1080i_h264_2997.mkv: 60.06 s against 6.006 s).
     const statsKeysOf = (tags, base) => Object.keys(tags || {}).map((k) => new RegExp(`^${base}(-[A-Za-z0-9_]+)?$`, 'i').exec(k))
         .filter(Boolean).map((m) => ({ value: String(tags[m[0]] ?? '').trim(), suffix: m[1] || '' }));
-    // Which file a read is about, for the harness's injected answers: the library original, or this pass's working file.
-    const isOriginalPath = (p) => !!p && p === otherArguments?.originalLibraryFile?.file;
 
     // Video payload bytes of one stream and its span (max(pts + duration) - min(pts), in that stream's time_base) from one packet read -> { bytes, packets,
     // spanS }, or { why } naming the failure. The default writer, never csv or compact: both append an empty field to a packet carrying side data, so every
@@ -3411,34 +3488,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (r && r.error && r.error.code === 'ETIMEDOUT') return { why: 'timed out' };
             return parse(r && !r.error && r.status === 0 ? r.stdout : '');
         } catch (e) { return { why: 'ffprobe failed' }; }
-    };
-    // The fingerprint's content half: the first 8 hex of sha1 over the MD5 data hashes of the NON-keyframe packets among the stream's first 120 -> 8 hex,
-    // '' when that window holds none (an all-intra source: the 16 GB ProRes sample gave 0), null when the read failed or read nothing. Keyframes are left out
-    // because mkvmerge rewrites them (+2463 B on the first, measured) while every other packet stays byte-identical: the digest was identical through
-    // ffmpeg -c copy, mkv<->mp4, mkvmerge, mkvpropedit and MP4Box, and different on every re-encode, a same-settings second generation included. The ABSOLUTE
-    // index of the isCoverArt-aware primary, never v:0, which would hash a poster ahead of the video. The harness answers from
-    // __awkCap.videoDigest.{working,original}; a missing key reads as a failed read.
-    const videoDigest = (filePath, ffprobePath, absIndex, timeoutMs) => {
-        if (injectedCap) {
-            const v = (injectedCap.videoDigest || {})[isOriginalPath(filePath) ? 'original' : 'working'];
-            return typeof v === 'string' && (v === '' || /^[0-9a-f]{8}$/.test(v)) ? v : null;
-        }
-        if (!ffprobePath) return null;
-        try {
-            const r = childProcess.spawnSync(ffprobePath, ['-v', 'error', '-select_streams', String(absIndex), '-read_intervals', `%+#${FINGERPRINT_PACKETS}`,
-                '-show_entries', 'packet=flags,data_hash', '-show_data_hash', 'MD5', '-of', 'default=nw=1:nk=1', filePath],
-            { encoding: 'utf8', maxBuffer: FINGERPRINT_MAX_BYTES, timeout: timeoutMs, killSignal: 'SIGKILL' });
-            const body = r && !r.error && r.status === 0 ? String(r.stdout || '').trim() : '';
-            const lines = body ? body.split(/\r?\n/) : [];
-            if (!lines.length || lines.length % 2) return null;
-            const hashes = [];
-            for (let i = 0; i < lines.length; i += 2) {
-                const hash = lines[i + 1].trim();
-                if (!/^MD5:[0-9a-f]{32}$/.test(hash)) return null;
-                if (!lines[i].trim().startsWith('K')) hashes.push(hash);
-            }
-            return hashes.length ? require('crypto').createHash('sha1').update(hashes.join('\n')).digest('hex').slice(0, 8) : '';
-        } catch (e) { return null; }
     };
     // ====== END SHRINK SAVINGS MEASUREMENT ======
 
@@ -4075,12 +4124,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // not go on quietly meaning nothing here); it is a comma list - `imported,strip` arrives from a round trip that could not strip in its own pass.
         const ccTokens = ccTokensOf(file.ffProbeData.format?.tags);
         const ccExported = ccTokens.includes(CC_TOKENS.strip);    // sub_worker took them out, but could not remove the bitstream copy under its -c copy pass
-        const ccChannelEmpty = ccTokens.includes(CC_TOKENS.none); // sub_worker decoded the channel and it carried no caption text at all
         // `removed` (sub_worker filtered the bitstream copy away in its own -c copy pass) is a memo, so it changes no encode command: on a true tag -a53cc 0
         // removes nothing and neither does a missing -a53cc 1, while a FALSE one - an outside tool's re-encode carries the global tag onto a video that still
         // has its captions - would drop them on every encoder. guard_captions treats such a file as untagged, and says so where its probe finds captions.
         const ccAlreadyGone = ccTokens.includes(CC_TOKENS.removed);
-        const dropCaptions = ccExported || ccChannelEmpty;
+        // `none` is not read here: it is sub_worker's memo that no CEA-608 text was found, and a CEA-708 service reads exactly so (the handoff section).
+        const dropCaptions = ccExported;
         // Only `true` is information. Tdarr's optional caption scan reads false both for a file that genuinely has none and for one its bundled CCExtractor
         // could not parse (measured: every mp4, and MPEG-2 inside Matroska), so a false still has to be probed. Memoized to at most one probe per file - that
         // cost is the whole reason the check is skipped wherever the answer could not change the outcome.
@@ -4090,7 +4139,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (file.hasClosedCaptions === true) { ccVerdict = { present: true, via: 'the library caption scan' }; return ccVerdict; }
             // A synthetic node (injectedCap): a missing key reads as "no captions", never as a real probe - bar 'probe', which runs the real one for the
             // harness to answer, so it can count the probe and give the 'unknown' an unreadable probe gives. A real node carries no injectedCap.
-            const r = probeA53Captions(file.file, deriveFfprobePath(ffmpegPathOf(otherArguments)),
+            const r = probeA53Captions(file.file, deriveFfprobePath(ffmpegPathOf(otherArguments)), primary.index,
                 injectedCap && injectedCap.captions !== 'probe' ? injectedCap.captions === true : undefined);
             ccVerdict = { present: r === true, unknown: r === 'unknown', via: 'a bitstream scan' };
             return ccVerdict;
@@ -4264,8 +4313,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
 
         // The caption-removal line, ahead of the encoder notes.
-        const ccDropLine = () => (dropCaptions ? `☐${pTag} Dropping the embedded closed captions - sub_worker `
-            + `${ccExported ? 'exported them to a subtitle, and keeping both would show them twice' : 'found the caption channel carries no text'}\n` : '');
+        const ccDropLine = () => (dropCaptions ? `☐${pTag} Dropping the embedded closed captions - sub_worker exported them to a subtitle, and keeping both`
+            + ' would show them twice\n' : '');
 
         // The source frame rate where two readings agree, times what the interlace repair does to it; 0 otherwise. It bounds only how long a CPU test
         // encode may show no output before it is too slow for guard_encode_hours - the estimate itself is read from media time, because a declared rate can
@@ -4629,11 +4678,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const clearStats = isMatroskaFamily(dstContainer);
             if (clearStats) out += staleStatsArgs('v:0', primary);
             // Retire the request this encode just served. ccExported implies dropCaptions, and buildVideoArgs suppresses A53 on every encoder that can emit it
-            // under dropCaptions ('keep' and 'unreliable' in A53_CAP) while the rest drop it unaided, so the output provably carries no captions - `removed` is
-            // the accurate successor to `strip`, and it is the token that stops any later pass paying a caption probe. Only fires when a request was actually
-            // present.
+            // under dropCaptions ('keep', 'unreliable' and 'optin' in A53_CAP) while the rest drop it unaided, so the output provably carries no captions -
+            // `removed` is the accurate successor to `strip`, and it is the token that stops any later pass paying a caption probe. The read's fingerprint goes
+            // with the request: it describes a video this encode replaces. Only fires when a request was actually present.
             if (ccExported) {
-                const retired = [...new Set(ccTokens.map((t) => (t === CC_TOKENS.strip ? CC_TOKENS.removed : t)))];
+                const retired = [...new Set(ccTokens.filter((t) => !t.startsWith(CC_FP_PREFIX)).map((t) => (t === CC_TOKENS.strip ? CC_TOKENS.removed : t)))];
                 globalWrites[CC_TAG] = escMeta(retired.join(','));
             } else if (pick.ccContradicted) {
                 // A false `removed` memo goes: the captions it says are gone are in this encode's output. Every other token stays.
@@ -4674,6 +4723,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += expectedResultsLine(predictTranscodedVideoToken(), encoded);
             return response;
         };
+        // The pass that withdraws a caption request whose read may belong to another video (ccStripStaleWhy): a tag-only remux keeping only the stale
+        // fingerprint - the `strip`, both read tokens and `imported` all go - which is the "withdrawn" shape sub_worker reads to move the old sidecar aside
+        // and read the captions of the video that is there. Nothing is encoded and no awk_vq or awk_video is written; its arguments differ from every
+        // encode, restore and keep pass.
+        const emitCcClear = (why) => {
+            response.infoLog += `☒${pTag} awk_cc asks to drop the closed captions sub_worker exported, but the caption read behind it may belong to another`
+                + ` video (${why}) - withdrawing the request so the captions are read again before any encode\n`;
+            const v = escMeta(`${CC_FP_PREFIX}${ccFpOf(ccTokens)}`);
+            sealPreset('', `-map 0 -c copy${outputDrops}${strictArg} -metadata "${CC_TAG}=${v}"`, { [CC_TAG]: v });
+            response.infoLog += expectedResultsLine(summariseStream(enrichStream(primary)));
+            return response;
+        };
         // ====== END TRANSCODE EMIT ======
 
         // Idempotency fence: a settings fingerprint in the container-global awk_video tag. Essential for shrink, whose constant-quality same-codec re-encode
@@ -4706,6 +4767,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const savingsFfprobe = () => {
             if (ffprobeMemo === null) ffprobeMemo = injectedCap ? '' : deriveFfprobePath(ffmpegPathOf(otherArguments));
             return ffprobeMemo;
+        };
+        // videoDigest, read at most once per file and stream, so a pass that checks a fence and a caption request pays one spawn.
+        const digestMemo = new Map();
+        const digestOf = (filePath, absIndex) => {
+            const key = `${absIndex}|${filePath}`;
+            if (!digestMemo.has(key)) digestMemo.set(key, videoDigest(filePath, savingsFfprobe(), absIndex, FINGERPRINT_TIMEOUT_MS));
+            return digestMemo.get(key);
+        };
+        // Why sub_worker's pending `strip` may belong to another video ('' when it is honoured), memoised: asked once, right before the encode that would
+        // serve it (after every skip and refusal, before the test encodes). A request beside the caption track sub_worker imported is honoured with no read
+        // - the captions are in this file as that track. Otherwise the read's inherited fingerprint is checked against the primary (ccFpStaleWhy, where a
+        // failed read counts as stale).
+        let ccStaleMemo = null;
+        const ccStripStaleWhy = () => {
+            if (ccStaleMemo !== null) return ccStaleMemo;
+            ccStaleMemo = !ccExported ? ''
+                : ccTokens.includes(CC_TOKENS.imported) && importedCaptionTracks(file.ffProbeData.streams, ccTokens, () => false).length ? ''
+                    : ccFpStaleWhy(ccTokens, ccTokensOf(origProbe?.format?.tags), primary, () => digestOf(file.file, primary.index));
+            return ccStaleMemo;
         };
 
         // Validating a fence that matches this run's settings. The awk tags survive an outside tool's re-encode (plain ffmpeg keeps every global tag, and
@@ -4744,7 +4824,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!fp) return null;
             if (fp[1] !== videoId8(primary)) return 'its format';
             if (!/^[0-9a-f]{8}$/.test(fp[2]) || ccAlreadyGone) return '';
-            const dig = videoDigest(file.file, savingsFfprobe(), primary.index, FINGERPRINT_TIMEOUT_MS);
+            const dig = digestOf(file.file, primary.index);
             return dig !== null && dig !== fp[2] ? 'its content' : '';
         };
         // The free checks, for a fence no stamp vouches for (normalize and exempt encodes, guard_shrink_savings=0, every fence older than awk_vq): each reads
@@ -4811,10 +4891,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return null;
             };
             const ffprobePath = savingsFfprobe();
-            const fingerprintOf = (s, filePath) => {
-                const dig = videoDigest(filePath, ffprobePath, s.index, FINGERPRINT_TIMEOUT_MS);
-                return `${videoId8(s)}.${dig === null ? 'x' : dig || 'n'}`;
-            };
+            const fingerprintOf = (s, filePath) => fpText(s, digestOf(filePath, s.index));
             const stamp = (state, pct, fp) => escMeta(`${state}:${pct}:${videoSigCore}:${savingsText}:${fp}`);
             const line = (sym, text) => `${sym}${pTag}${savingsTag} ${text}\n`;
             // The KEEP pass: a tag-only remux of this file, whose arguments differ from every encode's and every restore's, so Tdarr's identical-arguments
@@ -5047,6 +5124,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
             }
             if (reasonTags.length === 0) reasonTags.push('shrink');   // a same-codec shrink with no other visible transform
+            const ccStale = ccStripStaleWhy();
+            if (ccStale) return emitCcClear(ccStale);
             response.infoLog += staleLine;
             return emitTranscode(`[${reasonTags.join('][')}]`, { videoSig, videoSigCore, priorSig });
         }

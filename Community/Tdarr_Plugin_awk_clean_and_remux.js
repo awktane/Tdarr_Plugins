@@ -30,7 +30,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.73',
+    Version: '4.999.74',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -2722,7 +2722,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: recovered marker vocabulary =====
     // #endregion
 
-    // #region SHARED helpers (1 section: closed-caption handoff)
+    // #region SHARED helpers (2 sections: closed-caption handoff … imported caption track)
     // ===== SHARED [clean_and_remux, sub_worker, video_clean]: closed-caption handoff =====
     // -=-=-= CC_TAG / CC_TOKENS / ccTokensOf  [clean_and_remux, sub_worker, video_clean] =-=-=-
     // The cross-plugin channel for embedded closed captions. They live in the video BITSTREAM rather than in a stream list, so sub_worker can read them out
@@ -2737,33 +2737,47 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //   removed  - the captions are out AND the bitstream copy went with them in that same pass: the fact paired with the `strip` request, telling every
     //              later pass there is nothing left to act on. It changes no encode command - video_clean probes and carries captions as on an untagged
     //              file - so the tag carried onto a video that still holds captions (an outside tool's re-encode keeps global tags) cannot drop them.
-    //   none     - the caption channel was decoded and carried no caption text at all, so no later pass need pay for that decode again. Written only
-    //              once BOTH fields have been read empty: a broadcast carrying its captions in field 2 behind a padded field 1 reads empty on the default
-    //              decode, and a later re-encode told `none` drops captions nothing ever captured.
-    //   decoded  - a full read of the caption channel finished (field auto-selected); decoded2 - a read of field 2 finished. sub_worker's own progress
-    //              memos, stamped by the pass that runs the read: an empty sidecar with neither behind it was left by an interrupted read, not by an
-    //              empty channel. Every other reader ignores them.
-    //   imported - the captions are already embedded as a real subtitle track, so sub_worker must not read them out a second time.
+    //   none     - both caption fields were read and neither decoded to CEA-608 text, so no later pass need pay for that decode again. sub_worker's own
+    //              memo: video_clean ignores it, because ffmpeg reads only CEA-608 and a CEA-708-only service reads empty on both fields (cea708_dtv.mpg,
+    //              89+12 valid 708 triplets), so dropping the caption data on `none` would destroy a service nothing can extract.
+    //   decoded  - a read of field 1 finished; decoded2 - a read of field 2 finished. sub_worker reads both, and counts field 1 as read under decoded2 alone
+    //              too (an earlier build read field 2 into the field-1 name after an empty first read). Its own progress memos, stamped by the pass that
+    //              runs the read: an empty sidecar with neither behind it was left by an interrupted read, not by an empty channel. Every other reader
+    //              ignores them.
+    //   fp:<id8>.<dig> - the video field 1 was read from (the video fingerprint section). An fp with no read token beside it is a read video_clean
+    //              withdrew because the video changed under its request, so sub_worker reads the captions of the video that is there.
+    //   imported - the captions are already embedded as a real subtitle track, so sub_worker must not read them out a second time. On Matroska each
+    //              track sub_worker imports also carries awk_cc=imported in its own tags (the imported caption track section).
     const CC_TOKENS = { strip: 'strip', removed: 'removed', none: 'none', decoded: 'decoded', decoded2: 'decoded2', imported: 'imported' };
     // The value is a COMMA LIST and every reader splits it, because the states genuinely combine: an imported round trip that could not strip in its own pass
-    // records `imported,strip` - and `imported,removed` where it could. An empty channel records `none` ALONE - it never owes a strip. A writer therefore
-    // EXTENDS the tag rather than replacing it with one token - a whole-value overwrite would erase a pending request instead of deferring it. A REQUEST is
-    // retired by whoever SERVES it, and only then: video_clean rewrites `strip` to `removed` on the encode that carries the removal out. Without that the tag
-    // only ever grows, and a satisfied request is indistinguishable from a fresh one - a file that later regains captions (a re-muxed capture, an external tool
-    // re-inserting A53 SEI) has them dropped by a request answered encodes ago. `none` and `imported` are never retired: memos about the file, not requests,
-    // they stay true for its life.
+    // records `imported,strip` - and `imported,removed` where it could. An empty channel records `none` - it never owes a strip. A writer therefore EXTENDS
+    // the tag rather than replacing it with one token - a whole-value overwrite would erase a pending request instead of deferring it. A REQUEST is retired
+    // by whoever SERVES it, and only then: sub_worker's in-pass strip or video_clean's encode rewrites `strip` to `removed`, taking the fp with it. Without
+    // that the tag only ever grows, and a satisfied request is indistinguishable from a fresh one - a file that later regains captions (a re-muxed capture,
+    // an external tool re-inserting A53 SEI) has them dropped by a request answered encodes ago. `none` and `imported` are never retired: memos about the
+    // file, not requests, they stay true for its life - bar video_clean's clear of a request whose caption track is gone, which keeps only the fp.
     const ccTokensOf = (tags) => getTagCI(tags || {}, CC_TAG).toLowerCase().split(',').map((t) => t.trim()).filter(Boolean);
     // ===== END SHARED: closed-caption handoff =====
+
+    // ===== SHARED [clean_and_remux, video_clean]: imported caption track =====
+    // -=-=-= importedCaptionTracks  [clean_and_remux, video_clean] =-=-=-
+    // The subtitle tracks holding the closed captions sub_worker imported - the only copy left IN the video once the bitstream copy is stripped or owed a
+    // strip. A track sub_worker imported into Matroska carries awk_cc=imported in its own tags, which stays true after language_fill gives it a language.
+    // Beside the marked ones, under the file's global `imported` memo, every non-image subtitle that is hearing impaired and und or untagged counts too:
+    // the shape sub_worker writes them in (CEA-608 carries no language), and the only sign an mp4 (which keeps no track tag) or an import from before the
+    // mark carries. isImage(codec) names the image subtitle codecs the caller leaves out.
+    const importedCaptionTracks = (streams, tokens, isImage) => (streams || []).filter((s) => codecTypeOf(s) === 'subtitle' && !isImage(codecNameOf(s))
+        && (ccTokensOf(s.tags).includes(CC_TOKENS.imported)
+            || (tokens.includes(CC_TOKENS.imported) && s.disposition?.hearing_impaired === 1 && ['', 'und'].includes(resolveLang(s)))));
+    // ===== END SHARED: imported caption track =====
     // #endregion
 
-    // The closed captions sub_worker imported (embedded_cc): a text subtitle it writes as und + hearing_impaired - CEA-608 carries no language - under the
-    // awk_cc 'imported' memo, which also stops sub_worker ever reading them out again. The bitstream copy is stripped or owed a strip, so this track is the
-    // only copy left IN the video: dropping it leaves the captions at most in sub_worker's hidden staging sidecar - kept while the import job is still
-    // running (sub_worker does not re-import a track removed after its import), deleted once an accepted import is confirmed - which neither filter below
-    // may do without saying so.
-    const ccImported = ccTokensOf(file.ffProbeData.format?.tags).includes(CC_TOKENS.imported);
-    const isImportedCaptionTrack = (s) => ccImported && codecTypeOf(s) === 'subtitle' && !isImageSub(codecNameOf(s))
-        && s.disposition?.hearing_impaired === 1 && ['', 'und'].includes(resolveLang(s));
+    // The closed-caption tracks sub_worker imported (the imported caption track section): dropping one leaves the captions at most in sub_worker's hidden
+    // staging sidecar - kept while the import job is still running (sub_worker does not re-import a track removed after its import), deleted once an
+    // accepted import is confirmed - which neither filter below may do without saying so.
+    const ccImportedTracks = new Set(importedCaptionTracks(file.ffProbeData.streams, ccTokensOf(file.ffProbeData.format?.tags), isImageSub)
+        .map((s) => s.index));
+    const isImportedCaptionTrack = (s) => ccImportedTracks.has(s.index);
 
     // The both-probe channel layout (resolveChannelLayout), lowercased, so tag_title can name the layout even when ffprobe omits channel_layout.
     const channelLayoutStr = (ffstream) => resolveChannelLayout(ffstream).toLowerCase();
