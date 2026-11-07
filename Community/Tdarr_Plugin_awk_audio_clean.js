@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.73',
+    Version: '4.999.74',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -4294,6 +4294,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // buildLoudnormFilter at its own emit point); this loop only handles the leftovers.
         if (methodLoudnorm !== 'disabled') {
             const preset = LOUDNORM_PRESETS[methodLoudnorm];
+            // An aac track with no ffprobe channel_layout carries an AAC program config element (PCE): ffmpeg's native aac writes 3.1, quad(side), 4.1,
+            // 5.0(side), 5.1(side), 6.0, hexagonal, 6.1, 7.0, 7.1(wide), octagonal and their (front)/(back)/(wide-side) twins that way, so every ffmpeg aac
+            // 5.1 made from ac3/eac3/dts has one. ffmpeg decodes it in the layout's own channel order but unlabelled, and only MediaInfo reads which layout
+            // it is. These are Tdarr's mediainfo.js 0.2.0 spellings (ChannelLayout, which carries the element order, then ChannelPositions) of the PCE
+            // jellyfin-ffmpeg 7.1.4 writes for each layout, measured 2026-11-06. No entry for 6.0 and hexagonal, which spell alike though their PCEs
+            // differ, nor for 6.0(front), which ffmpeg decodes with its two front pairs swapped. A Map, so probe text never reads a prototype member.
+            const AAC_PCE_LAYOUTS = new Map([
+                ['L R Ls Rs / Front: L R, Side: L R', 'quad(side)'],
+                ['L R C LFE / Front: L C R, LFE', '3.1'],
+                ['L R C Ls Rs / Front: L C R, Side: L R', '5.0(side)'],
+                ['L R C Cb Cb / Front: L C R, Side: C, Back: C', '4.1'],
+                ['L R C Cb Lb Rb / Front: L C R, Side: C, Back: L R', '5.1(side)'],
+                ['L R C Cb Lb Rb Cb / Front: L C R, Side: C, Back: L C R', '6.1'],   // ffmpeg writes 6.1(back) and 6.1(front) as this same PCE
+                ['L R C Ls Rs Lb Rb / Front: L C R, Side: L R, Back: L R', '7.0'],   // and 7.0(front) as this one
+                ['L R C Cb ? ? ? ? / Front: L C R, Side: C, Back: 4', '7.1(wide)'],  // and 7.1(wide-side) as this one
+                ['L R C Ls Rs Lb Rb Cb / Front: L C R, Side: L R, Back: L C R', 'octagonal'],
+            ]);
+            const aacPceLayoutOf = (s) => { const mi = mediaInfoFor(s); return AAC_PCE_LAYOUTS.get(`${mi?.ChannelLayout} / ${mi?.ChannelPositions}`) || ''; };
             // WHICH codec a leftover's re-encode lands on. Two candidates, in preference order: keepCodec - the codec the track already has, whenever this
             // plugin can encode it (what a track outside codec_force's scope gets - forceCovers false, e.g. codec_force=disabled - and the only option for
             // a source outside our encodable domain: a kept DTS core, an MP3); configuredCodec - codec_stereo/codec_surround, when codec_force's scope
@@ -4455,6 +4473,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
 
+                // Native aac refuses an unlabelled layout (exit 234, the job fails), so a correction kept in aac on a PCE track (AAC_PCE_LAYOUTS) needs its
+                // layout named. One MediaInfo does not identify is left as it is: a guessed layout re-encodes cleanly but puts channels on the wrong speakers.
+                const unnamedPce = targetCodec === 'aac' && codecFamilyOf(ffstream) === 'aac' && channels > 2
+                    && (!ffstream.channel_layout || ffstream.channel_layout === 'unknown');
+                const pceLayout = unnamedPce ? aacPceLayoutOf(ffstream) : '';
+                if (unnamedPce && !pceLayout) {
+                    const positions = mediaInfoFor(ffstream)?.ChannelPositions;
+                    skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - ffmpeg's aac encoder refuses this track's `
+                        + `unnamed ${channels}ch layout and ${positions ? `MediaInfo's "${logSafe(positions, 60)}" does not identify it`
+                            : 'MediaInfo reports no channel positions'}, so no layout is guessed; left as ${ffstreamCodec} ${channels}ch\n`;
+                    continue;
+                }
+
                 if (targetCodec === 'aac_vbr') {
                     const { encoder, args, approxRate, label } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true, channels);
                     workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${ffstreamCodec} ${channels}ch → aac `
@@ -4470,11 +4501,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const dstBps = matchedBps || resolveBitrate(targetCodec, channels, srcBitrate, ffstream.awkLossless, ffstream.awkQuality);
                     const dstBitArg = encoderArgsBps(targetCodec, outputAudioIdx, dstBps);
                     const srcRateStr = srcRateToken(ffstream);
-                    const note = sameFormat ? (matchedBps ? ' (source rate matched)' : '') : ` (converged from ${ffstreamCodec})`;
+                    const notes = [sameFormat ? (matchedBps ? 'source rate matched' : '') : `converged from ${ffstreamCodec}`,
+                        pceLayout ? `its unnamed layout read as ${pceLayout} from MediaInfo` : ''].filter(Boolean);
                     workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${ffstreamCodec} ${channels}ch @ ${srcRateStr} → `
-                        + `${targetCodec} ${channels}ch @ ${kbpsToken(dstBps)}${note}\n`;
-                    replaceInPlace(outputAudioIdx, `${audioEncoder(targetCodec)}${dstBitArg} -filter:a:${outputAudioIdx} "${filter}"`
-                        + `${loudnormStampArg(outputAudioIdx)}`, { codec: targetCodec, channels, bps: dstBps });
+                        + `${targetCodec} ${channels}ch @ ${kbpsToken(dstBps)}${notes.length ? ` (${notes.join('; ')})` : ''}\n`;
+                    // The PCE relabel goes ahead of the correction. Measured 2026-11-06 on jellyfin-ffmpeg 7.1.4, one tone per speaker, on every
+                    // AAC_PCE_LAYOUTS layout: channelmap renames without mixing, so the encoder writes back a byte-identical AudioSpecificConfig with every
+                    // channel's content at its position, and the loudness it measures is unchanged (the analysis needs no relabel). Rejected: -ac N
+                    // relabels to the count's default, which moves or loses a speaker on 3.1, quad(side), 4.1, 6.0, hexagonal, 7.0, 7.1(wide) and octagonal
+                    // (a 6.0 back centre becomes an LFE the encoder band-limits away), and -ch_layout behind the correction's aresample remixes from that
+                    // default (quad(side) loses a side channel).
+                    replaceInPlace(outputAudioIdx, `${audioEncoder(targetCodec)}${dstBitArg} -filter:a:${outputAudioIdx} `
+                        + `"${pceLayout ? `channelmap=channel_layout=${pceLayout},` : ''}${filter}"${loudnormStampArg(outputAudioIdx)}`,
+                        { codec: targetCodec, channels, bps: dstBps });
                 }
                 convert = true;
             }
