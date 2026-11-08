@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.76',
+    Version: '3.999.77',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -324,9 +324,10 @@ const details = () => ({
             type: 'string',
             defaultValue: '1000',
             inputUI: { type: 'text' },
-            tooltip: `Applies to action=shrink ONLY: skip the size re-encode when the source video bitrate is already below this, in kbps. 0 disables the
-                guard. The default of 1000 leaves genuinely lean sources alone and rarely triggers, most content sitting well above 1000 kbps at any
-                resolution.
+            tooltip: `Applies to action=shrink ONLY: skip the size re-encode when the source video bitrate is already below this, in kbps. On Matroska and
+                mp4 files that start at zero and whose video fills the timeline (nearly all), when the video reports no bitrate of its own, or a higher
+                one than the whole file, the whole file's bitrate is used, because it bounds the video's. 0 disables the guard. The default of 1000 leaves
+                genuinely lean sources alone and rarely triggers, most content sitting well above 1000 kbps at any resolution.
                 \\nWhy: shrink works at constant quality, which cannot predict the output size, so re-encoding an already-lean source can GROW it. This
                 floor prevents that.
                 \\nnormalize ignores this entirely, a compatibility conversion having to run whatever the size. Four things are exempt even under shrink:
@@ -3491,6 +3492,41 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ====== END SHRINK SAVINGS MEASUREMENT ======
 
+    // Does a video fill its file's timeline? It looks for the stream's packets in three 10 s windows centred at start + 25, 50 and 75% of the duration -> ''
+    // when every window holds one, otherwise why the whole file's rate cannot stand for the video's. One ffprobe read of the stream by its ABSOLUTE index
+    // (never v:0, which a poster can lead), its three windows in one -read_intervals list (the same verdict as three reads on 71 files), the default writer as
+    // packetSum's. It reads the bytes in the windows (0.03-0.7 s locally on files up to 60 Mb/s, 3.3 s at 460 Mb/s; 0.4-2.0 s cold over SMB at 10-59 Mb/s),
+    // except on a Matroska with no Cues index, where ffprobe scans from the start to the last window (about 1.4 s per GB locally, cold); the timeout bounds
+    // both (production ffprobe 7.1.4, 2026-11-07). A window is judged by pts alone: each interval seeks back to the keyframe before its start, so a window
+    // inside a gap still returns packets, all of them outside it. The harness answers from __awkCap.timelineRead and never spawns: { stdout }, a read's own
+    // output put through the same parse, { why }, or a function given the argv and spawn options that returns one of those; a missing key reads as a failed
+    // read.
+    const TIMELINE_READ_TIMEOUT_MS = 20000;
+    const TIMELINE_READ_MAX_BYTES = 1024 * 1024;
+    const timelineGapWhy = (filePath, absIndex, start, duration) => {
+        if (!(duration > 0)) return 'its timeline could not be checked (it states no duration)';
+        const wins = [0.25, 0.5, 0.75].map((f) => start + f * duration).map((t) => [t - 5, t + 5]);
+        const args = ['-v', 'error', '-select_streams', String(absIndex), '-read_intervals', wins.map(([a, b]) => `${a.toFixed(3)}%${b.toFixed(3)}`).join(','),
+            '-show_entries', 'packet=pts_time', '-of', 'default=nw=1:nk=1', filePath];
+        const opts = { encoding: 'utf8', maxBuffer: TIMELINE_READ_MAX_BYTES, timeout: TIMELINE_READ_TIMEOUT_MS, killSignal: 'SIGKILL' };
+        let read = null;
+        if (injectedCap) {
+            const v = injectedCap.timelineRead;
+            read = typeof v === 'function' ? v(args.slice(), { ...opts }) : v;
+        } else {
+            const ffprobePath = deriveFfprobePath(ffmpegPathOf(otherArguments));
+            if (!ffprobePath) return 'its timeline could not be checked (no ffprobe beside ffmpeg on this node)';
+            try {
+                const r = childProcess.spawnSync(ffprobePath, args, opts);
+                if (r && r.error && r.error.code === 'ETIMEDOUT') read = { why: 'timed out' };
+                else if (r && !r.error && r.status === 0) read = { stdout: r.stdout };
+            } catch (e) { read = null; }
+        }
+        if (!read || typeof read.stdout !== 'string') return `its timeline could not be checked (${(read && read.why) || 'ffprobe failed'})`;
+        const pts = read.stdout.split(/\r?\n/).map((l) => l.trim()).filter((l) => /^-?\d+(\.\d+)?$/.test(l)).map(Number);
+        return wins.every(([a, b]) => pts.some((p) => p >= a && p <= b)) ? '' : 'its video leaves gaps in the timeline';
+    };
+
     // ====== PER-FILE FLOW ======
     // validate -> classify source video -> decide -> select encoder per node -> build preset. Video-only by design (audio and subtitles are always
     // copied) so it composes with the other awk plugins.
@@ -4054,10 +4090,42 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // guard_shrink_bitrate gates SHRINK's efficiency re-encode only (a CQ re-encode of an already-lean file can grow it). normalize is compatibility-driven
         // - it must convert regardless of size - and downscale / tonemap / interlace repair / the lossless strip are exempt in both actions, as transforms
         // the user asked for in their own right (the repair is the one that CAN still grow the file: a shot-on-video source comes back at double frame rate).
-        let belowFloorKbps = 0;
+        let belowFloorLine = '';
         if (action === 'shrink' && codecTrigger && guardShrinkKbps > 0) {
-            const vkbps = Math.round((resolveStreamBitrate(primary) || 0) / 1000);
-            if (vkbps > 0 && vkbps < guardShrinkKbps) { codecTrigger = false; belowFloorKbps = vkbps; }
+            const ownBps = resolveStreamBitrate(primary) || 0;
+            // ffprobe's file rate is size over the stated duration. A file that starts well after zero may have kept another recording's clock (a -copyts
+            // remux, a segment-muxer part), so its stated end or its gaps can make the rate read low, and a ts/ps duration is estimated from first and last
+            // timestamps. So the rate is read only on Matroska and mp4 files (markerPersists) starting within 1 s of zero, a missing start counting as zero
+            // (ffmpeg's ts clock starts at 1.4 s; rebased files start within 0.12 s); elsewhere the video's own rate decides.
+            const fmt = file.ffProbeData.format || {};
+            const fileBps = markerPersists(dstContainer) && !(Number(fmt.start_time) > 1) ? Number(fmt.bit_rate) || 0 : 0;
+            // The video's bytes are a share of the file's over the same span, so the whole file's rate bounds the video's: it decides when the video
+            // reports no rate of its own, or a higher one.
+            let fileDecides = fileBps > 0 && (ownBps === 0 || fileBps < ownBps);
+            // A timeline that starts at zero can still hold gaps (a concat-demuxer join, a -copyts -start_at_zero remux, a plain remux of a file that kept
+            // one), so before the whole file's rate decides a skip the video's packets are looked for at three points (timelineGapWhy); an empty window or a
+            // failed read leaves the decision to the video's own rate. Any single gap longer than a quarter of the timeline plus 10 s holds one window; a
+            // shorter gap, or several, can all fall between the windows and leave the reading diluted, and a still longer than 10 s can read as a gap, which
+            // only falls back to the own rate.
+            const fileKbps = Math.round(fileBps / 1000);
+            if (fileDecides && fileKbps > 0 && fileKbps < guardShrinkKbps) {
+                const gapWhy = timelineGapWhy(file.file, primary.index, Number(fmt.start_time) || 0, Number(fmt.duration));
+                if (gapWhy) {
+                    fileDecides = false;
+                    response.infoLog += `☒${pTag}[guard_shrink_bitrate=${guardShrinkKbps}] The whole file runs at ${fileKbps}k, but ${gapWhy}, so the video's`
+                        + ' own rate decides\n';
+                }
+            }
+            const vkbps = Math.round((fileDecides ? fileBps : ownBps) / 1000);
+            if (vkbps > 0 && vkbps < guardShrinkKbps) {
+                codecTrigger = false;
+                belowFloorLine = fileDecides
+                    ? `☑${pTag}[guard_shrink_bitrate=${guardShrinkKbps}] The whole file runs at ${vkbps}k, below the ${guardShrinkKbps}k floor, so its video`
+                        + ` does too (${ownBps ? `it reports ${Math.round(ownBps / 1000)}k of its own` : 'it reports no bitrate of its own'})`
+                        + ' - already efficient, left untouched\n'
+                    : `☑${pTag}[guard_shrink_bitrate=${guardShrinkKbps}] Source video bitrate ${vkbps}k is below the ${guardShrinkKbps}k floor`
+                        + ' - already efficient, left untouched\n';
+            }
         }
         // A same-codec size pass has ONE stop - the awk_video fence below - and a container that cannot store the tag has nowhere to keep it: the next pass
         // recomputes the identical fingerprint, finds nothing, and re-emits a byte-identical preset, which Tdarr refuses as an infinite transcode loop and
@@ -5140,10 +5208,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // for a target with no encoder.
         if (fenceUnstorable)
             return skip(`☑${pTag}[action=shrink] Nothing else to do for this file\n`);
-        if (belowFloorKbps > 0) {
-            return skip(`☑${pTag}[guard_shrink_bitrate=${guardShrinkKbps}] Source video bitrate ${belowFloorKbps}k is below the `
-                + `${guardShrinkKbps}k floor - already efficient, left untouched\n`);
-        }
+        if (belowFloorLine)
+            return skip(belowFloorLine);
         // Only a target with no encoder gets here under shrink: an encodable one always fires a size pass above (an upgrade, or a fenced same-codec pass),
         // and the two things that decline it - the bitrate floor and an unstorable fence - have each returned with their own line already.
         if (action === 'shrink') {
