@@ -30,7 +30,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.74',
+    Version: '4.999.75',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -50,7 +50,8 @@ const details = () => ({
                 \\nmp4: also removes hdmv_pgs_subtitle and dvb_subtitle, plus arib_caption and hdmv_text_subtitle. dvd_subtitle (VobSub) survives -
                 mp4 stores it as mp4s - so remove_imagesubs alone decides its fate.
                 Text subtitles (subrip, srt, ass, ssa, webvtt, text, eia_608) become mov_text - except a STYLED ass/ssa, which is
-                exported as a font bundle rather than flattened. HEVC video is tagged hvc1 so Apple and QuickTime can play it.
+                exported as a font bundle rather than flattened.
+                HEVC video is tagged hvc1 - dvh1 for Dolby Vision Profile 5 - so Apple and QuickTime can play it.
                 A track name is kept in the track handler, the one place mp4 keeps it through a remux.`,
         },
         {
@@ -474,7 +475,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (15 sections: stream codec type … ffmpeg metadata escaping)
+    // #region SHARED helpers (16 sections: stream codec type … ffmpeg metadata escaping)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -1269,6 +1270,93 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s))) ? ' -strict unofficial' : '';
     };
     // ===== END SHARED: mp4 strict compliance arg =====
+    // ===== SHARED [clean_and_remux, video_clean]: hevc copy fourcc =====
+    // -=-=-= isQtVideoContainer  [clean_and_remux, video_clean] =-=-=-
+    // QuickTime VIDEO containers - the gate for every QuickTime fourCC emit (hvc1/dvh1/av01/avc1), on both the encode and the copy path; the two
+    // non-QuickTime fourCCs (video_clean's avi RIFF retag, hevcCopyPlan's Matroska dvhe) key on their own container tests. Deliberately mp4/m4v/mov WITHOUT
+    // m4a: isMp4Family includes m4a and is right for the -movflags use_metadata_tags decision, but not for tagging a video stream.
+    const isQtVideoContainer = (container) => ['mp4', 'm4v', 'mov'].includes(container);
+    // -=-=-= HVCC_HEADER_BYTES  [clean_and_remux, video_clean] =-=-=-
+    // An hvcC is 23 fixed bytes plus one array per parameter-set type, so only an extradata_size above 23 holds the VPS/SPS/PPS; at 23 they ride in-band,
+    // in the samples (Dolby's own P5 and P8.1 mp4s, every mkv made from them, GPAC's xps_inband). ffprobe prints the size whenever there is extradata, and
+    // Tdarr 3.04's scan removes only the `extradata` hex (tdarr_core remove_ffprobe_extradata), so the size reaches a plugin.
+    const HVCC_HEADER_BYTES = 23;
+    // -=-=-= doviRecord (+ dvNeedsDvFourcc)  [clean_and_remux, video_clean] =-=-=-
+    // The stream's Dolby Vision configuration record as ffprobe reports it, or undefined.
+    const doviRecord = (s) => (Array.isArray(s?.side_data_list) ? s.side_data_list : [])
+        .find((sd) => /dovi configuration record/i.test(String(sd?.side_data_type || '')));
+    // A record naming no compatible base (compatibility id 0: Profile 5). jellyfin's muxers write a compat-0 record's box only under a dvh1/dvhe fourcc or no
+    // tag at all (its ff_isom_validate_dovi_config), so under hev1 or hvc1 the stream silently becomes plain HEVC whose IPT colour every player shows wrong.
+    // Every other compat id is checked against the stream's colour instead, under any fourcc.
+    const dvNeedsDvFourcc = (s) => String(doviRecord(s)?.dv_bl_signal_compatibility_id) === '0';
+    // -=-=-= dvRecordSurvivesCopy  [clean_and_remux, video_clean] =-=-=-
+    // Whether a -c copy keeps the stream's Dolby Vision record (true with none), the fourcc aside: jellyfin's muxers check the base layer's pixel format and
+    // colour against the compat id (its ff_isom_validate_dovi_config) and drop a record that fails under ANY fourcc, mkv to mkv included, so any remux costs
+    // such a stream its Dolby Vision. Matched the copy on all 17 measured sources (P5, P7, P8.1, P8.2, P8.4, P20 from Dolby, ffmpeg, mkvmerge, MP4Box and an
+    // iPhone-style mov). Compat 0's fourcc condition is dvNeedsDvFourcc's. Read by clean_and_remux's convert gate and hevcCopyPlan's Matroska arm.
+    const dvRecordSurvivesCopy = (s) => {
+        const id = String(doviRecord(s)?.dv_bl_signal_compatibility_id ?? '');
+        const p10 = s.pix_fmt === 'yuv420p10le';
+        const hdr = (trc) => p10 && s.color_transfer === trc && s.color_primaries === 'bt2020' && s.color_space === 'bt2020nc' && s.color_range === 'tv';
+        return id === '0' ? p10 : id === '1' || id === '6' ? hdr('smpte2084') : id === '2' ? s.pix_fmt === 'yuv420p' : id === '4' ? hdr('arib-std-b67') : true;
+    };
+    // -=-=-= firstKeyParamSets  [clean_and_remux, video_clean] =-=-=-
+    // Whether the first KEYFRAME of an HEVC stream carries VPS, SPS and PPS: true / false / null (not read). It is the packet the mov muxer builds an hvcC
+    // from once hevc_mp4toannexb has emptied the extradata - a -c copy drops every packet before the first keyframe, and this read is a -c copy too, so it
+    // sees that same packet. One packet as Annex B on stdout: 19-84 ms on the samples, the 4K Dolby Vision ones included.
+    const HEVC_PS_NAL_TYPES = [32, 33, 34];
+    const FIRST_KEY_TIMEOUT_MS = 60000;
+    const FIRST_KEY_MAX_BYTES = 64 * 1024 * 1024;
+    const firstKeyParamSets = (ffmpegPath, filePath, absIndex) => {
+        try {
+            const r = require('child_process').spawnSync(ffmpegPath, ['-hide_banner', '-v', 'error', '-i', filePath, '-map', `0:${absIndex}`, '-c', 'copy',
+                '-frames:v', '1', '-f', 'hevc', '-'], { timeout: FIRST_KEY_TIMEOUT_MS, maxBuffer: FIRST_KEY_MAX_BYTES, killSignal: 'SIGKILL' });
+            if (!r || r.error || r.status !== 0 || !Buffer.isBuffer(r.stdout) || !r.stdout.length) return null;
+            const b = r.stdout;
+            const seen = new Set();
+            for (let i = 0; i + 3 < b.length; i += 1) {
+                if (b[i] === 0 && b[i + 1] === 0 && b[i + 2] === 1) { seen.add((b[i + 3] >> 1) & 0x3f); i += 2; }
+            }
+            return HEVC_PS_NAL_TYPES.every((t) => seen.has(t));
+        } catch (e) { return null; }
+    };
+    // -=-=-= hevcCopyPlan  [clean_and_remux, video_clean] =-=-=-
+    // The one fourcc plan for an HEVC stream COPIED into another file: clean_and_remux's remux and video_clean's shrink restore both apply it, so neither
+    // re-triggers the other. `tag` is the fourcc the copy carries - the source's own from the mp4 demuxer, '' from any other (ffprobe reports Matroska's as
+    // [0][0][0][0]). Returns { state: ok|retag|rebuild|stuck, want, have, keep, ps, args }, args on output video ordinal `ord`.
+    const hevcCopyPlan = (s, tag, ord, ffmpegPath, filePath, container) => {
+        const have = String(tag || '').toLowerCase().trim();
+        // Matroska stores no fourcc but checks the one a copy carries: it refuses dvh1 (exit 183), and keeps a compat-0 record only under a Dolby Vision tag
+        // (hev1 and hvc1 drop it). dvhe passes both, measured on P5 and P8.1 mp4s. A record above profile 10 (P20), which Matroska stores under no tag, or one
+        // no copy keeps (dvRecordSurvivesCopy) takes no tag: a dvh1 is left for the muxer to refuse, so the file keeps its Dolby Vision, and a hev1/hvc1 goes
+        // in as it comes, its record lost under any tag. Any other container takes the copy as it comes.
+        if (!isQtVideoContainer(container)) {
+            const dvhe = isMatroskaFamily(container) && !(Number(doviRecord(s)?.dv_profile) > 10) && dvRecordSurvivesCopy(s)
+                && (have === 'dvh1' || (['hev1', 'hvc1'].includes(have) && dvNeedsDvFourcc(s)));
+            return { state: dvhe ? 'retag' : 'ok', want: 'dvhe', have, args: dvhe ? ` -tag:v:${ord} dvhe` : '' };
+        }
+        // Apple's AVFoundation decodes HEVC only as hvc1 or dvh1 over an hvcC holding the parameter sets (hev1 and dvhe failed on every sample, a complete
+        // hvcC included). The fourcc is dvh1 for dvNeedsDvFourcc, else hvc1, and a dvh1 stream with a complete hvcC keeps it: Apple decodes dvh1 with or
+        // without its box, and video_clean's encode writes it. .mov always takes hvc1: its muxer refuses dvh1 (exit 183) and writes no Dolby Vision box under
+        // any fourcc, and a dvh1 copied in untagged comes out hev1.
+        const want = container !== 'mov' && dvNeedsDvFourcc(s) ? 'dvh1' : 'hvc1';
+        const tagOk = have === want || (have === 'dvh1' && container !== 'mov');
+        // With no size, a stream already under an accepted tag counts as complete - hvc1 over an hvcC without parameter sets cannot be read at all - and any
+        // other is read first: a rebuild of a complete hvcC only adds them to its keyframes, and the next pass finds the tag and stops.
+        const size = Number(s?.extradata_size);
+        if (size > HVCC_HEADER_BYTES || (!(size > 0) && tagOk)) {
+            return { state: tagOk ? 'ok' : 'retag', want, have, args: tagOk ? '' : ` -tag:v:${ord} ${want}` };
+        }
+        // The filter empties a 23-byte hvcC, so the muxer builds a complete one from the first keyframe and every packet comes out byte-identical. The tag
+        // alone exits 0 but writes an EMPTY hvcC - movenc demands every parameter-set array under hvc1 and ignores its own failure - so nothing can open it.
+        const ps = firstKeyParamSets(ffmpegPath, filePath, s.index);
+        if (ps === true) return { state: 'rebuild', want, have, ps, args: ` -bsf:v:${ord} hevc_mp4toannexb -tag:v:${ord} ${want}` };
+        // Stuck: no -c copy gives it an hvcC Apple decodes (or the read failed, and a later pass reads again), so it keeps a fourcc that stays readable - its
+        // own, or dvhe for a compat-0 stream arriving without a Dolby Vision fourcc, the one that keeps its box.
+        const dvhe = want === 'dvh1' && !DV_FOURCC_RE.test(have);
+        return { state: 'stuck', want, have, ps, keep: dvhe ? 'dvhe' : have || 'hev1', args: dvhe ? ` -tag:v:${ord} dvhe` : '' };
+    };
+    // ===== END SHARED: hevc copy fourcc =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
     // -=-=-= escMeta [all five] =-=-=-
@@ -3085,7 +3173,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let sidecarOut = '';   // remove_imagesubs=export: accumulates the per-image-sub sidecar outputs, prepended to the main output in the preset below.
                                // Stays empty on an unmapped node, where placeSidecars below uploads the exports instead of riding them on the remux.
         let convert = false;
-        // The N in -metadata:s:<t>:N, -c:s:N and the hvc1 -tag:v:N. Start at -1 so the increment in each branch yields 0 for the first stream of that type.
+        // The N in -metadata:s:<t>:N, -c:s:N and -bsf:v:N/-tag:v:N. Start at -1 so the increment in each branch yields 0 for the first stream of that type.
         // subtitle and video are decremented again when their stream is dropped, so the survivors stay contiguous; audio needs no decrement, because the one
         // path that drops audio (method_unmuxable=drop) removes the stream BEFORE the type branches increment anything.
         let subtitleOutOrdinal = -1;
@@ -3268,7 +3356,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const mappedVideos = streams.filter((s) => codecTypeOf(s) === 'video' && !unmuxableDrops.has(s.index) && !isCoverArt(s));
         for (let i = 0; i < streams.length; i++) {
             const ffstream = streams[i];
-            const mi = mediaInfoFor(ffstream);
             const ffstreamCodec = codecNameOf(ffstream);
             const ffstreamType = codecTypeOf(ffstream);
 
@@ -3719,21 +3806,33 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // Standardise the video language tag (tag_language): video carries the same mdhd language field, so e.g. a 2-letter code is dropped by mp4.
                 emitLangMeta('v', videoOutOrdinal, 'video', false);
 
-                // A Dolby Vision HEVC stream carries a dvhe/dvh1 (etc.) fourcc / a DOVI configuration record, NOT hvc1 - and this is a -c
-                // copy path, so its own tag is already correct. Forcing hvc1 onto it drops the DV configuration box and demotes the file
-                // to plain HEVC (verified: the output ffprobes as "Invalid data found"), undoing what video_clean's guard_dv protects.
-                // Detect DV both-probe (fourcc / mediaInfo HDR_Format / ffprobe side_data) and leave its tag untouched. (video_clean
-                // re-encodes, so it makes the finer dvh1-vs-hvc1 choice; here the safe action on a mere remux is to not retag DV at all.)
-                const isDolbyVision = isDolbyVisionVideo(ffstream, mi);
-
-                // HEVC in mp4 must carry the hvc1 fourcc or Apple/QuickTime won't decode it - a plain remux writes hev1.
-                // Tag the retained HEVC video stream when the output is mp4 and it isn't already hvc1 (and isn't Dolby
-                // Vision): this converges after one heal (an already-hvc1 file is a no-op, never a perpetual remux).
-                if (dstContainer === 'mp4' && ffstreamCodec === 'hevc' && !isDolbyVision && (ffstream.codec_tag_string || '').toLowerCase() !== 'hvc1') {
-                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Tag video as hvc1 - HEVC-in-mp4 needs the hvc1 fourcc`
-                        + ' for Apple/QuickTime playback\n';
-                    extraArguments += ` -tag:v:${videoOutOrdinal} hvc1`;
-                    convert = true;
+                // HEVC takes hevcCopyPlan's fourcc. A stream no remux can fix says so straight to the log, since a file with nothing else to do never flushes
+                // workDone. A record no copy keeps (dvRecordSurvivesCopy) is lost by any remux, so the fourcc alone never starts one for it: its args ride a
+                // remux something else starts, and otherwise the file keeps its Dolby Vision as it is.
+                if (ffstreamCodec === 'hevc') {
+                    const plan = hevcCopyPlan(ffstream, isMp4Family(srcContainer) ? ffstream.codec_tag_string : '', videoOutOrdinal,
+                        ffmpegPathOf(otherArguments), String(file._id || file.file || ''), dstContainer);
+                    const at = `${streamTag(ffstream.index)}[container=${dstContainer}]`;
+                    const why = plan.want === 'dvhe' ? 'Matroska stores no fourcc but refuses dvh1, and keeps a Profile 5 Dolby Vision box only under a'
+                        + ' Dolby Vision fourcc' : plan.want === 'dvh1' ? 'Dolby Vision with no compatible base keeps its Dolby Vision box in mp4 only as'
+                        + ' dvh1, the fourcc Apple/QuickTime play it under' : 'HEVC-in-mp4 needs the hvc1 fourcc for Apple/QuickTime playback';
+                    if (plan.state === 'retag') workDone += `☐${at} Tag video as ${plan.want} - ${why}\n`;
+                    if (plan.state === 'rebuild') {
+                        workDone += `☐${at} Tag video as ${plan.want} and move its in-band parameter sets into the hvcC box - ${why}, with the parameter sets`
+                            + ' in that box\n';
+                    }
+                    if (plan.state === 'stuck' && plan.args) {
+                        const read = plan.ps === false ? 'carries no parameter sets' : 'could not be read on this pass';
+                        workDone += `☐${at} Tag video as dvhe - its first keyframe ${read}, so it cannot take the dvh1 Apple/QuickTime need; dvhe keeps its`
+                            + ' Dolby Vision box\n';
+                    } else if (plan.state === 'stuck') {
+                        const verb = plan.keep === plan.have ? 'stays' : 'gets';
+                        response.infoLog += plan.ps === false
+                            ? `☒${at} Video ${verb} ${plan.keep} - its first keyframe carries no parameter sets, so no remux can build the complete hvcC`
+                                + ` box Apple/QuickTime need under ${plan.want}; other players are unaffected\n`
+                            : `☒${at} Video ${verb} ${plan.keep} for now - its first keyframe could not be read; a later pass reads it again\n`;
+                    }
+                    if (plan.args) { extraArguments += plan.args; if (dvRecordSurvivesCopy(ffstream)) convert = true; }
                 }
 
                 emitCommentRemoval('v', videoOutOrdinal, 'video');
