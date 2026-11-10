@@ -36,7 +36,7 @@ const details = () => ({
                 import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
                 \\nRuns standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before stream_ordering (last). If the file has embedded
                 closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that destroys them.`,
-    Version: '3.999.91',
+    Version: '3.999.92',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1022,6 +1022,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const noMuxerSkipLine = (container) => `☒A .${container} file has no ffmpeg muxer that can write it back - left untouched; remux it to mkv or mp4 first`
         + ' (clean_and_remux does that)\n';
+    // -=-=-= movLosesDvBox (+ movDvLossLine, movDvReadBack)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Whether a write into `container` takes this video stream's Dolby Vision box away. The mov muxer (MODE_MOV) writes no dvcC/dvvC box under any fourcc
+    // (0 of 96 readable .mov outputs, jellyfin 7.1.4), so -strict unofficial does not help: an iPhone Profile 8.4 .mov remuxed into .mov reads back as
+    // plain HLG HEVC. `-f mp4` is no escape, as the mp4 muxer refuses that file's mebx tracks. clean_and_remux writes only mkv or mp4, so the box survives
+    // when it runs first. A fourcc-only signal (a dvhe .mov) counts too: its record is gone either way. Cover art is never the subject.
+    // awk-ffmpeg-test's dvbox:p5-fourcc row measures it (its mov-annexb-hvc1 cell): that cell turning present means .mov can carry the box and this is stale.
+    const movLosesDvBox = (container, s) => container === 'mov' && codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s));
+    // One warning per video stream a write into `container` takes a box from ('' when none does), on the pass that writes it; `act` names a write that is
+    // not a remux. `streams` is the list the output maps, each written stream as the caller reads it.
+    const movDvLossLine = (container, streams, act = 'remux') => streams.filter((s) => movLosesDvBox(container, s))
+        .map((s) => `☒${streamTag(s.index)} Dolby Vision is lost in this ${act} - ffmpeg cannot write its box into a .mov; run clean_and_remux first to move`
+            + ' the file to mp4 or mkv\n').join('');
+    // Stream s as the next pass reads it once a .mov write has taken the box, for an Expected results token: the DOVI record gone and mediaInfo detached
+    // (index -1, summariseStream joins by index), its transfer kept so the hdr token stands. The fourcc is left: a dvhe stream keeps dvhe through a copy and
+    // still reads dv.
+    const movDvReadBack = (container, s) => (movLosesDvBox(container, s) ? { ...s, side_data_list: [], color_transfer: videoTransferOf(s), index: -1 } : s);
     // ===== END SHARED: output muxer =====
     // ===== SHARED [sub_worker, video_clean]: marker persistence =====
     // -=-=-= markerPersists  [sub_worker, video_clean] =-=-=-
@@ -4082,7 +4098,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         manualDisposition = carriesDisposition(full);
         response.infoLog += mp4UncopyableLog(dstContainer, uncopyable, mapped) + matroskaCoverLog(staged)
             + mp4TagPlanLog(tagPlan, dstContainer, mapped) + mp4TimecodeLog(dstContainer, mapped)
-            + mp4NameCarryLog(dstContainer, list.filter((s) => mapped.includes(s)), titleWritten);
+            + mp4NameCarryLog(dstContainer, list.filter((s) => mapped.includes(s)), titleWritten) + movDvLossLine(dstContainer, mapped);
         const goneData = mp4LostData(uncopyable, mapped);
         for (const s of [...goneData, ...mp4CoversLost(tagPlan, dstContainer, mapped), ...staged.leaveOut]) leftOut.add(s.index);
         unmapped.push(...uncopyable);
@@ -4102,7 +4118,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Every commit ends the same way: the preset, then the Expected results line - right only once commitPreset has filled leftOut - then the response.
     const commitWithExpected = (out, list, asWritten) => {
         commitPreset(out, list);
-        response.infoLog += `☑Expected results: ${summariseAll(outputView(list, asWritten))}\n`;
+        response.infoLog += `☑Expected results: ${summariseAll(outputView(list, asWritten).map((s) => movDvReadBack(dstContainer, s)))}\n`;
         return response;
     };
 

@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.78',
+    Version: '3.999.79',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -968,6 +968,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const noMuxerSkipLine = (container) => `☒A .${container} file has no ffmpeg muxer that can write it back - left untouched; remux it to mkv or mp4 first`
         + ' (clean_and_remux does that)\n';
+    // -=-=-= movLosesDvBox (+ movDvLossLine, movDvReadBack)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Whether a write into `container` takes this video stream's Dolby Vision box away. The mov muxer (MODE_MOV) writes no dvcC/dvvC box under any fourcc
+    // (0 of 96 readable .mov outputs, jellyfin 7.1.4), so -strict unofficial does not help: an iPhone Profile 8.4 .mov remuxed into .mov reads back as
+    // plain HLG HEVC. `-f mp4` is no escape, as the mp4 muxer refuses that file's mebx tracks. clean_and_remux writes only mkv or mp4, so the box survives
+    // when it runs first. A fourcc-only signal (a dvhe .mov) counts too: its record is gone either way. Cover art is never the subject.
+    // awk-ffmpeg-test's dvbox:p5-fourcc row measures it (its mov-annexb-hvc1 cell): that cell turning present means .mov can carry the box and this is stale.
+    const movLosesDvBox = (container, s) => container === 'mov' && codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s));
+    // One warning per video stream a write into `container` takes a box from ('' when none does), on the pass that writes it; `act` names a write that is
+    // not a remux. `streams` is the list the output maps, each written stream as the caller reads it.
+    const movDvLossLine = (container, streams, act = 'remux') => streams.filter((s) => movLosesDvBox(container, s))
+        .map((s) => `☒${streamTag(s.index)} Dolby Vision is lost in this ${act} - ffmpeg cannot write its box into a .mov; run clean_and_remux first to move`
+            + ' the file to mp4 or mkv\n').join('');
+    // Stream s as the next pass reads it once a .mov write has taken the box, for an Expected results token: the DOVI record gone and mediaInfo detached
+    // (index -1, summariseStream joins by index), its transfer kept so the hdr token stands. The fourcc is left: a dvhe stream keeps dvhe through a copy and
+    // still reads dv.
+    const movDvReadBack = (container, s) => (movLosesDvBox(container, s) ? { ...s, side_data_list: [], color_transfer: videoTransferOf(s), index: -1 } : s);
     // ===== END SHARED: output muxer =====
     // ===== SHARED [sub_worker, video_clean]: marker persistence =====
     // -=-=-= markerPersists  [sub_worker, video_clean] =-=-=-
@@ -3834,18 +3850,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // them, so it is the first argument; every other stream is summarised as it reads back (carriedFor), through enrichStream as the input summary is.
         const expectedResultsLine = (primaryToken, written = primary) => {
             const carried = carriedFor(written);
-            return `☑Expected results: ${mappedFor(written).map((s) => (isPrimary(s) ? primaryToken : summariseStream(enrichStream(carried(s))))).join('')}\n`;
+            return `☑Expected results: ${mappedFor(written).map((s) => (isPrimary(s) ? primaryToken
+                : summariseStream(movDvReadBack(dstContainer, enrichStream(carried(s)))))).join('')}\n`;
         };
         // The ending every exit's preset shares: the mp4 tag plan, timecode and name-carry args, muxer, and the log lines for these and the drops. writes holds
         // the global tags the exit sets (the transcode's globalWrites, a verdict's VQ_TAG; none on the strip); written is the primary as keptFor takes it.
-        const sealPreset = (inputSide, out, writes, written = primary) => {
+        // dropsDv says the exit itself takes the primary's Dolby Vision away (a strip, an encode that carries no RPU), so no .mov box of its is lost; act is
+        // what movDvLossLine calls this write.
+        const sealPreset = (inputSide, out, writes, written = primary, { dropsDv = false, act = 'remux' } = {}) => {
             const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, writes);
             const kept = keptFor(written);
             response.infoLog += mp4NameCarryLog(dstContainer, kept);
             response.preset = `${inputSide}<io>${out}${mp4TimecodeArgs(dstContainer, kept)}${mp4NameCarryArgs(dstContainer, kept)}`
                 + `${tagPlan.flag ? ' -movflags use_metadata_tags' : ''}${globalOutputOpt}${outputMuxerArg(dstContainer)}`;
             response.processFile = true;
-            response.infoLog += dropLog(written) + mp4TimecodeLog(dstContainer, kept) + mp4TagPlanLog(tagPlan, dstContainer);
+            response.infoLog += dropLog(written) + mp4TimecodeLog(dstContainer, kept) + mp4TagPlanLog(tagPlan, dstContainer)
+                + movDvLossLine(dstContainer, kept.filter((s) => !dropsDv || s !== written), act);
         };
         // A predicted output stream that has lost its dynamic HDR layer must not still read 'dv' or 'hdr10+', so both predictions (the lossless strip and the
         // transcode) clear every carrier summariseStream's dynamic tests read: the dvhe/dvh1 fourcc, the DOVI side-data record, and the mediaInfo HDR_Format
@@ -3880,7 +3900,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += `☐${pTag}[hdr_mode=strip_dynamic] Stripping ${stripped} losslessly (-c:v copy, base HDR10 retained)`
                 + `${leftover}\n`;
             // No input-side args; sealPreset keeps sibling plugins' GLOBAL awk_* markers through an mp4/mov copy, as on the transcode path.
-            sealPreset('', `-map 0 -c copy -bsf:v:0 ${bsf}${outputDrops}${qtVideoTag(srcCodecName)}${riffTag} -c:a copy -c:s copy${strictArg}`);
+            sealPreset('', `-map 0 -c copy -bsf:v:0 ${bsf}${outputDrops}${qtVideoTag(srcCodecName)}${riffTag} -c:a copy -c:s copy${strictArg}`, undefined,
+                primary, { dropsDv: stripDv });
             // The strip removes exactly the layer the 'dv'/'hdr10+' token names (see clearDynamicHdrCarriers), leaving the HDR10/HLG base's own transfer,
             // inferred off HDR_Format when neither probe reported one. Everything else about the stream is untouched, since this path is a -c:v copy.
             const strippedVideo = clearDynamicHdrCarriers({ ...primary });
@@ -4455,8 +4476,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Unless guard_dv carried it, the re-encode DISCARDS the dynamic HDR layer (DV RPU and HDR10+ SEI alike - no encoder this plugin drives
             // carries either), so the prediction clears its carriers (see clearDynamicHdrCarriers). The surviving HDR10/HLG base still shows 'hdr' from the
             // stream's own transfer - or, when neither probe reported one, from the curve inferred off HDR_Format and stamped here (same reason
-            // tonemapSetparams stamps the island). A tonemap already landed bt709 above and must keep it, so the stamp skips that case.
-            if (isDynamicHdr && !preserveDv) {
+            // tonemapSetparams stamps the island). A tonemap already landed bt709 above and must keep it, so the stamp skips that case. A guard_dv encode into
+            // .mov carries the RPU but no box (movLosesDvBox), so the next pass reads it like a discarded layer.
+            if (isDynamicHdr && (!preserveDv || dstContainer === 'mov')) {
                 clearDynamicHdrCarriers(outStream);
                 if (!tonemap && !HDR_TRANSFERS.includes(srcXfer)) outStream.color_transfer = inferredHdrCurve;
             }
@@ -4851,7 +4873,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // map mp4TagPlan reads and the -metadata the muxer gets cannot disagree.
             for (const [k, v] of Object.entries(globalWrites)) out += ` -metadata "${k}=${v}"`;
             const encoded = { ...primary, avg_frame_rate: encodeRate(), rateUpTo: encodeRateUpTo() };
-            sealPreset(enc.inputSide, out, globalWrites, encoded);
+            sealPreset(enc.inputSide, out, globalWrites, encoded, { dropsDv: !preserveDv, act: 'encode' });
             // The interlace repair's own ☐ line lands HERE, with the preset, for the reason coverArtLog states: every guard between the detection and this
             // point can still end the run with nothing emitted, and a ☐ line means a change about to be MADE. It also makes the frame-rate change legible on
             // the files it happens to, and its absence legible on the film-originated ones where it never applies.
@@ -4883,7 +4905,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 + ` video (${why}) - withdrawing the request so the captions are read again before any encode\n`;
             const v = escMeta(`${CC_FP_PREFIX}${ccFpOf(ccTokens)}`);
             sealPreset('', `-map 0 -c copy${outputDrops}${strictArg} -metadata "${CC_TAG}=${v}"`, { [CC_TAG]: v });
-            response.infoLog += expectedResultsLine(summariseStream(enrichStream(primary)));
+            response.infoLog += expectedResultsLine(summariseStream(movDvReadBack(dstContainer, enrichStream(primary))));
             return response;
         };
         // ====== END TRANSCODE EMIT ======
@@ -5052,7 +5074,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.infoLog += reason
                     + line('☐', `Recording the verdict in ${VQ_TAG} with a tag-only remux, so later passes read it instead of measuring`);
                 sealPreset('', `-map 0 -c copy${outputDrops}${strictArg} -metadata "${VQ_TAG}=${value}"`, { [VQ_TAG]: value });
-                response.infoLog += expectedResultsLine(summariseStream(enrichStream(primary)));
+                response.infoLog += expectedResultsLine(summariseStream(movDvReadBack(dstContainer, enrichStream(primary))));
                 return response;
             };
 
@@ -5198,8 +5220,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // The restored stream maps first, and its token is summarised detached (index -1): summariseStream joins mediaInfo by index, and THIS file's
             // track at the original's index can be another stream entirely (the audio, on a cover-art-first original).
             const carried = carriedFor(restored);
-            response.infoLog += `☑Expected results: ${summariseStream({ ...origPrimary, index: -1 })}${mappedFor(restored).filter((s) => !isPrimary(s))
-                .map((s) => summariseStream(enrichStream(carried(s)))).join('')}\n`;
+            response.infoLog += `☑Expected results: ${summariseStream(movDvReadBack(dstContainer, { ...origPrimary, index: -1 }))}${mappedFor(restored)
+                .filter((s) => !isPrimary(s)).map((s) => summariseStream(movDvReadBack(dstContainer, enrichStream(carried(s))))).join('')}\n`;
             return response;
         }
         // A verdict this file already carries at this setting, said only where the fence below then skips the file - never ahead of a stale line. The
