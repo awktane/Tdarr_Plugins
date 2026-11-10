@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.79',
+    Version: '3.999.80',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -58,8 +58,9 @@ const details = () => ({
                 \\nhevc (H.265): the recommended target - roughly half the bitrate of H.264 at the same quality.
                 \\nh264 (AVC): a COMPATIBILITY target only, and a larger file, for old or weak devices that cannot do HEVC. Forced to 8-bit, since 10-bit
                 H.264 breaks device support. HDR10 plays poorly in H.264, so prefer hevc for an HDR source.
-                \\nav1: the most efficient, but slow on CPU. Hardware AV1 needs a very new GPU (Intel Arc, RTX 40-series, RDNA3); otherwise the libsvtav1
-                software encoder does it.
+                \\nav1: the most efficient, but slow on CPU. Hardware AV1 is used on NVIDIA (RTX 40-series) and Intel (Arc, through QSV); AMD's AV1 encoder and
+                AV1 through VAAPI are not used yet, their quality setting being unmeasured, so those nodes - and every node without AV1 hardware - use the
+                libsvtav1 software encoder.
                 \\nDolby Vision needs HEVC: with guard_dv enabled, a DV source that is already HEVC stays HEVC whatever you set here, because only libx265
                 carries the DV RPU and only from an HEVC source.`,
         },
@@ -86,8 +87,11 @@ const details = () => ({
                 missing lines are interpolated and every half-picture becomes a frame of its own: 1080i60 comes out as 60fps, keeping all the motion the
                 file actually holds. Material shot on FILM and padded out for broadcast (nearly every film DVD, much anime) still contains its original
                 frames intact, so those are rebuilt exactly and come back at their own 24fps with nothing invented.
-                \\nShot-on-video output therefore costs roughly a third more bitrate and half again the encode time; film-originated and already-progressive
-                video are unaffected, so on a mixed library this touches only a small slice of it.`,
+                \\nShot-on-video output therefore costs roughly a third more bitrate and half again the encode time; film-originated video keeps its own
+                frame rate at no such cost. Already-progressive video is left as it is - turning this on re-encodes a file this plugin already encoded only
+                when it turns out to be interlaced - so on a mixed library this touches only a small slice of it. Telling the two apart costs a decode of a
+                few hundred frames (about 5 s at 4K on an idle machine) on most files each time they are processed while this is enabled, including files
+                then left alone.`,
         },
         {
             name: 'downscale',
@@ -171,10 +175,11 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['source', '8', '10'],
             },
-            tooltip: `Output bit depth. A PARAMETER, not a trigger: it shapes a re-encode some OTHER input fired and never causes one by itself, a
-                bit-depth change alone being imperceptible and not worth a lossy pass.
+            tooltip: `Output bit depth. Under normalize it is a PARAMETER, not a trigger: it shapes a re-encode some OTHER input fired and never causes one
+                by itself, a bit-depth change alone being imperceptible and not worth a lossy pass. Under shrink a file this plugin already shrank IS encoded
+                again when this asks for a depth other than the one it was shrunk at - another lossy generation, so pick the depth before shrinking.
                 \\nsource (default, recommended): match the source - 10-bit stays 10-bit, 8-bit stays 8-bit.
-                \\n8 or 10 force the depth when a re-encode is already happening. H.264 is always 8-bit regardless, and Dolby Vision is always 10-bit, so
+                \\n8 or 10 force the depth when a re-encode is happening. H.264 is always 8-bit regardless, and Dolby Vision is always 10-bit, so
                 guard_dv keeps 10-bit even if you set 8.`,
         },
         {
@@ -197,8 +202,9 @@ const details = () => ({
                 \\nnode (default, recommended): follow the node's own "GPU worker hardware type". Set to a specific encoder it uses that, otherwise
                 falling back to software; set to "any" it test-encodes every GPU encoder the node has on each file, logs each result, and uses the first
                 that passes in this node's order, else software. That order is fixed per platform, not ranked by quality: nvenc, qsv, vaapi (once per Intel
-                or AMD render node), amf on Linux; nvenc, qsv, amf on Windows. CPU workers always use software. So each node uses the encoder you assigned
-                it - push jobs onto an idle iGPU (qsv), say, and keep a discrete GPU free.
+                or AMD render node), amf on Linux; nvenc, qsv, amf on Windows; videotoolbox on an Apple Silicon Mac. An AV1 target skips vaapi and amf (see
+                codec), and an Intel Mac uses software, VideoToolbox's quality mode needing Apple Silicon. CPU workers always use software. So each node uses
+                the encoder you assigned it - push jobs onto an idle iGPU (qsv), say, and keep a discrete GPU free.
                 \\nnode_strict: as node, but ERROR the file rather than use the software encoder - for a node whose CPU is reserved for other work, or when
                 a GPU job must never land on the CPU quietly. On an "any" node a GPU encoder that fails its test encode, is busy, or would drop closed
                 captions that guard_captions is keeping hands the file to the next GPU encoder, and the file errors only when none is left; on a node set to
@@ -218,7 +224,9 @@ const details = () => ({
             },
             tooltip: `Encoder speed against efficiency. A slower setting spends more CPU or GPU time to reach a smaller file at the same quality.
                 \\nMaps to each encoder's own preset (libx265 slow/medium/fast, libsvtav1 4/6/8, NVENC p7/p5/p3, QSV veryslow/medium/veryfast, and so on).
-                VAAPI and VideoToolbox have no comparable control and ignore this.`,
+                VAAPI and VideoToolbox have no comparable control and ignore this.
+                \\nIt shapes only a new encode, so changing it never re-encodes a file this plugin already encoded - except, under shrink, a file whose
+                re-encode guard_shrink_savings put back, which still holds its original video and is tried again at the new speed.`,
         },
         {
             name: 'guard_captions',
@@ -353,7 +361,12 @@ const details = () => ({
                 \\nA revert puts the original video stream back, keeps every other stream and every other plugin's changes, and records the verdict in an
                 awk_vq tag, so the file is not tried again at the same settings. Changing this value retries a reverted file only where the saving it
                 recorded could pass the new value: raising it re-encodes nothing, and 0 retries every reverted encode that saved something and keeps it
-                unjudged. A kept file is never retried.
+                unjudged. Changing this value never retries a kept file.
+                \\nAnother setting re-encodes a kept file only where it changes what the video would become - codec, the quality for its height,
+                method_bitdepth, guard_dv on Dolby Vision, or a downscale, tonemap_sdr, dynamic-HDR strip or interlace repair the file actually needs. One
+                that would change nothing is passed over, since the encode would only add a lossy generation: method_speed, a downscale box the file
+                already fits, an hdr_mode with nothing to act on, and deinterlace on progressive video. A reverted file is passed over the same way, except
+                that a new method_speed tries it again.
                 \\nExample:\\n25`,
         },
     ],
@@ -2056,7 +2069,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // resolved at runtime, per node, with a CAPABILITY QUERY (not a trial-encode ladder): ask ffmpeg what the build supports, intersect with a cheap
     // zero-encode hardware-presence check, and fall back to one confirming probe only for the genuinely-ambiguous cases (VAAPI/QSV/AMF, whose presence
     // signal cannot prove a GPU that encodes this codec - see presenceOf - and any AV1 hardware encode, where presence can't prove the GPU is new enough:
-    // Arc / RTX-40xx / RDNA3).
+    // Arc / RTX-40xx).
 
     // Per-node subprocess probe timeouts (ms). The -encoders capability listing is a static parse and nvidia-smi a quick presence poll, so both are short;
     // each confirm probe actually spawns ffmpeg to encode/tonemap one synthetic frame, so it gets the longest budget.
@@ -2066,8 +2079,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Priority order of hardware families to try per OS (best/most-common first); CPU is the fallback behind them, except under node_strict on a GPU worker.
     // Mac is videotoolbox-only by design: on macOS ALL hardware encoding (Apple Silicon media engine, Intel Quick Sync, an AMD dGPU/eGPU) is routed through
-    // VideoToolbox - there is no working nvenc/qsv/vaapi/amf path on macOS and the darwin ffmpeg build ships none of them. (rkmpp is a valid node
-    // hardware type but Rockchip ARM only, so it is unsupported here; see selectEncoder's `families` comment for what such a node lands on.)
+    // VideoToolbox - there is no working nvenc/qsv/vaapi/amf path on macOS and the darwin ffmpeg build ships none of them - and it is used only on Apple
+    // Silicon (encoderPlan says why). (rkmpp is a valid node hardware type but Rockchip ARM only, so it is unsupported here; see selectEncoder's `families`
+    // comment for what such a node lands on.)
     const HW_FAMILIES = {
         darwin: ['videotoolbox'],
         win32: ['nvenc', 'qsv', 'amf'],
@@ -2076,11 +2090,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The render node an injected capability that says dri but lists no render nodes stands for (encoderPlan): one Intel renderD128. On a real node each
     // vaapi candidate carries its own device, which the confirm probe and the emitted command both name.
     const VAAPI_DEVICE = '/dev/dri/renderD128';
-    // ffmpeg encoder name per (target codec, family). null = that family has no encoder for that codec (e.g. no AV1 videotoolbox).
+    // ffmpeg encoder name per (target codec, family). null = this plugin encodes that codec on no encoder of that family (AV1: none on videotoolbox).
+    // av1_vaapi and av1_amf (Linux and Windows builds) stay unused until their quality mapping is measured, as the shared AV1 emit (nativeQuality) does
+    // not fit them: av1_vaapi defines no qp, so -qp is ignored and the encode runs at the encoder's default, qindex 25 of 255 - a very large file; av1_amf's
+    // qp_i/qp_p run 0-255 and it has no qp_b (FFmpeg release/7.1 vaapi_encode_av1.c and amfenc_av1.c, read 2026-11-09; jellyfin 7.1.4-3's amf patch leaves
+    // the AV1 qp options alone). An option another encoder in the build defines is a warning, not an error (jellyfin 7.1.4: hevc_videotoolbox -qp 31 exits
+    // 0), so the test encode could not catch either.
     const ENCODER_NAME = {
         hevc: { nvenc: 'hevc_nvenc', qsv: 'hevc_qsv', vaapi: 'hevc_vaapi', videotoolbox: 'hevc_videotoolbox', amf: 'hevc_amf', cpu: 'libx265' },
         h264: { nvenc: 'h264_nvenc', qsv: 'h264_qsv', vaapi: 'h264_vaapi', videotoolbox: 'h264_videotoolbox', amf: 'h264_amf', cpu: 'libx264' },
-        av1: { nvenc: 'av1_nvenc', qsv: 'av1_qsv', vaapi: 'av1_vaapi', videotoolbox: null, amf: 'av1_amf', cpu: 'libsvtav1' },
+        av1: { nvenc: 'av1_nvenc', qsv: 'av1_qsv', vaapi: null, videotoolbox: null, amf: null, cpu: 'libsvtav1' },
     };
     // The codecs this plugin has an encoder for, derived from the table above so a new target cannot be added to one and missed in the other
     // (codec=source keeps the source codec only when it is one of these). Membership only, so key order is immaterial.
@@ -2221,7 +2240,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Only auto/node/node_strict are worker-type-aware; a CPU worker (and Dolby Vision, handled by forceCpu) takes CPU and never strict-errors.
         const strict = encoderOpt === 'node_strict';
         const isNodeMode = encoderOpt === 'node' || strict;
-        const hwList = [...(HW_FAMILIES[platform] || [])];
+        // VideoToolbox gets a constant-quality -q:v (nativeQuality), which FFmpeg's encoder accepts only when built for Apple Silicon (videotoolboxenc.c
+        // vtenc_qscale_enabled = !TARGET_OS_IPHONE && TARGET_CPU_ARM64, release/7.1; jellyfin's videotoolbox patches leave it alone): on an Intel Mac every
+        // VideoToolbox test encode would fail, and under node_strict every file would error. Read from the source, not measured - the fleet has no Intel
+        // Mac; the arm64 build does not even carry the refusal's message. A synthetic node (injectedCap) is Apple Silicon unless it names an arch.
+        const vtUnusable = platform === 'darwin' && (injectedCap ? injectedCap.arch || 'arm64' : os.arch()) !== 'arm64';
+        const hwList = (HW_FAMILIES[platform] || []).filter((f) => !(f === 'videotoolbox' && vtUnusable));
+        if (vtUnusable && isGpuWorker && encoderOpt !== 'cpu' && !forceCpu)
+            notes.push(`☒[method_encoder=${encoderOpt}] VideoToolbox is not used on an Intel Mac - its quality mode needs Apple Silicon\n`);
         const nodeHw = isNodeMode ? String((otherArguments && otherArguments.nodeHardwareType) || '').toLowerCase().trim() : '';
         const nodeIsSpecific = !!nodeHw && nodeHw !== '-';
         // Emit the ☒ "falling back to CPU" note for a family, but only when THIS NODE'S hardware type is what pinned it - method_encoder=node/node_strict on
@@ -2261,8 +2287,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             for (const family of families) {
                 if (family === 'cpu') return;   // reached the fallback
                 const encoderName = ENCODER_NAME[targetCodec][family];
-                if (!encoderName) {   // e.g. AV1 has no videotoolbox encoder
-                    pushFallbackNote(family, `no ${targetCodec} encoder for this family`);
+                if (!encoderName) {   // ENCODER_NAME's nulls: AV1 on videotoolbox, vaapi and amf
+                    pushFallbackNote(family, `this plugin does not encode ${targetCodec} on ${family}`);
                     continue;
                 }
                 if (!cap.encoders.has(encoderName)) {   // ffmpeg build doesn't ship it (e.g. no nvenc in the Mac build)
@@ -2737,7 +2763,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // visual quality sits at a higher number there. HW flag syntax mirrors the proven community plugins (Migz nvenc -cq:v, Boosh qsv
     // -global_quality, vaapi -qp, amf -qp_i/-qp_p). VideoToolbox's -q:v is an inverted 1-100 scale (higher = better), opposite the
     // low-is-better HEVC-CRF q; this linear fit maps CRF onto it (intercept = -q:v at CRF 0, pre-clamp; slope = -q:v units dropped per +1 CRF).
-    // QUALITY_MAX: the widest scale any emit uses (AV1's, on every AV1 encoder; HEVC/H.264 targets clamp to 51 below), and parseQuality bounds input by it.
+    // QUALITY_MAX: the widest scale any emit uses (AV1's, on libsvtav1 and av1_nvenc; HEVC/H.264 targets clamp to 51 below), and parseQuality bounds
+    // input by it.
     const QUALITY_MAX = 63;
     const AV1_Q_OFFSET = 8;
     const VT_Q_INTERCEPT = 118;
@@ -2745,8 +2772,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const nativeQuality = (targetCodec, family, qNorm) => {
         let q = Math.round(qNorm);
         // Clamp to each scale's real range so an out-of-range quality input can't emit a CRF/QP ffmpeg rejects (e.g. libx265 -crf 52
-        // errors). An AV1 target goes 0-63 on every AV1 encoder (libsvtav1 CQ, av1_nvenc -cq, av1_qsv/vaapi/amf qp); every HEVC/H.264
-        // emit - libx264/libx265 -crf, nvenc -cq, qsv -global_quality, vaapi/amf -qp - caps at ~0-51. videotoolbox remaps q anyway.
+        // errors). An AV1 target goes 0-63 on libsvtav1 -crf and av1_nvenc -cq; av1_qsv's ICQ clips global_quality to 1-51 inside FFmpeg (release/7.1
+        // qsvenc.c), so a quality setting above 43 (51 once AV1_Q_OFFSET is added) lands at 51 there, and the offset is unmeasured on av1_qsv. vaapi and
+        // amf encode no AV1 (ENCODER_NAME). Every HEVC/H.264 emit - libx264/libx265 -crf, nvenc -cq, qsv -global_quality, vaapi/amf -qp - caps at ~0-51.
+        // videotoolbox remaps q anyway.
         if (targetCodec === 'av1') q = Math.max(0, Math.min(QUALITY_MAX, q + AV1_Q_OFFSET));
         else q = Math.max(0, Math.min(51, q));
         switch (family) {
@@ -2862,7 +2891,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // Which measured row stands in for a family's codecs that have none of their own. Measured 2026-10-18 at 4K against each family's hevc row:
     // h264_videotoolbox came within 3% and shares it, while h264_qsv ran 36% under and h264_nvenc 42% over, so each carries its own. A stand-in
-    // therefore serves only the codecs with no measurement of their own - av1_qsv, av1_nvenc, h264_vaapi, av1_vaapi, hevc_amf and av1_amf - and
+    // therefore serves only the codecs with no measurement of their own - av1_qsv, av1_nvenc, h264_vaapi and hevc_amf - and
     // where a family has two measured rows it is the larger, since an unmeasured codec is better over- than under-stated. The three CPU encoders
     // are each measured directly and need no stand-in. memprobe's enc:hwfamily rows test a stand-in on any node that can run its codec.
     const MEM_ENCODER_BY_FAMILY = { nvenc: 'h264_nvenc', qsv: 'hevc_qsv', vaapi: 'hevc_vaapi', videotoolbox: 'hevc_videotoolbox', amf: 'h264_amf' };
@@ -2925,6 +2954,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // Source codecs where -thread_type slice pays. Measured saving at 4K: h264 126 MB, hevc 115-163 MB, vp9 55 MB - and exactly ZERO for av1 (libdav1d ignores
     // the flag) and mpeg2, so the flag is emitted only where it buys something. See buildVideoArgs for why it may only ever ride the INPUT side.
+    // The memory is bought with decode speed where a frame has one slice (x264's default), which slice threads cannot split: 3 s of single-slice 4K H.264
+    // decoded in 1.31 s against 0.37 s frame-threaded, and a libx264 -preset fast transcode of it ran 13% longer (3.75 s against 3.32 s; M1, jellyfin 7.1.4,
+    // 2026-10-28) - at the default method_speed=slow the encoder dominates and no cost showed. Kept on every CPU encode all the same: the 4 GB node budget
+    // is the constraint that fails a file, and the time only stretches a fast encode of a 4K source.
     const MEM_SLICE_CODECS = ['h264', 'hevc', 'vp9'];
     const MEM_BYTES_PER_MB = 1048576;
     const MEM_BYTES_PER_GB = 1024 ** 3;
@@ -4024,10 +4057,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // tries the three metadata triggers first, so deciding WHETHER to encode never needs this decode; once an encode is happening with the setting live,
         // the verdict is always read, because it picks the repair filter. The verdict is deliberately NOT persisted across passes (no awk_idet tag, no one-time
         // tag-only mux the way sub_worker records awk_cc=none): tags have proven unreliable to carry across muxes and other plugins, and the only cost of
-        // re-deciding is that one decode - paid only when a progressive file with deinterlace=enabled re-cycles and nothing cheaper triggers an encode - too
-        // low to justify cross-pass persistence machinery or the whole-file remux write it would force on files that never transcode. Nothing may read
-        // idetMemo's value except through idet() - and deintVerdictLine, which reads the memo raw by design so emitting the verdict can never itself provoke
-        // the decode (see its comment).
+        // re-deciding is that one decode - paid only when a progressive file with deinterlace=enabled re-cycles and nothing cheaper triggers an encode, or its
+        // awk_video fence was written without deint (coreHolds) - too low to justify cross-pass persistence machinery or the whole-file remux write it would
+        // force on files that never transcode. Nothing may read idetMemo's value except through idet() - and deintVerdictLine, which reads the memo raw by
+        // design so emitting the verdict can never itself provoke the decode (see its comment).
         let idetMemo = null;
         const idet = () => {
             if (idetMemo) return idetMemo;
@@ -4116,20 +4149,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // everything wider than 16:9 by exactly (source AR / 16:9) - a 4096x1716 scope master answered a 1080 cap with 2578x1080, 34% MORE
         // pixels than 1080p, and a 2048x858 DCI 2K master sailed through untouched because 858 <= 1080. Both measured on the production binary.
         const maxH = downscaleOpt === 'disabled' ? 0 : Number(downscaleOpt);
-        const maxW = Math.round(maxH * 16 / 9);
         // Only a HEIGHT is ever needed to express the box: scale=-2:N derives the width from the coded aspect, so fitting the frame collapses to the
-        // smaller of the cap and the height at which the frame is exactly maxW wide. Rounded DOWN to even - 4:2:0 needs an even height, and rounding up
-        // would breach the box. dispWidth is the CODED width (rotation-adjusted), deliberately NOT SAR-corrected, because scale=-2:N derives its width
-        // from coded dimensions too: a display-corrected test would predict a width the filter does not emit. Verified this changes no answer for the real
-        // anamorphic cases (1440x1080 SAR 4:3, 720x576 SAR 64:45 land identically either way). A dispWidth of 0 - no width from either probe - degrades to
-        // height-only fitting rather than refusing, since widthBound then contributes nothing. That ternary is not dead code to be tidied away: without it
-        // the division yields Infinity, which happens to reach the same capHeight today, and nothing would catch a later edit that stopped it doing so.
+        // smaller of the cap and the height at which the frame is exactly the box's width (16/9 of its height) wide. Rounded DOWN to even - 4:2:0 needs an
+        // even height, and rounding up would breach the box. dispWidth is the CODED width (rotation-adjusted), deliberately NOT SAR-corrected, because
+        // scale=-2:N derives its width from coded dimensions too: a display-corrected test would predict a width the filter does not emit. Verified this
+        // changes no answer for the real anamorphic cases (1440x1080 SAR 4:3, 720x576 SAR 64:45 land identically either way). A dispWidth of 0 - no width
+        // from either probe - degrades to height-only fitting rather than refusing, since the width bound then contributes nothing. That ternary is not
+        // dead code to be tidied away: without it the division yields Infinity, which happens to reach the same height today, and nothing would catch a
+        // later edit that stopped it doing so.
         const evenFloor = (n) => Math.max(2, Math.floor(n / 2) * 2);
-        const widthBound = dispWidth > 0 ? evenFloor(maxW * dispHeight / dispWidth) : dispHeight;
-        const capHeight = Math.min(maxH, widthBound);
-        // capHeight < dispHeight, not dispHeight > maxH: a wide-but-short source is already inside the box (854x480 under a 720 cap bounds at 718,
-        // above its own 480) and must not read as needing work.
-        const willDownscale = maxH > 0 && capHeight < dispHeight;
+        // The height this file lands at inside a 16:9 box h tall - its own height where it already fits. The awk_video fence asks it of a fence's box too.
+        const boxHeight = (h) => Math.min(h, dispWidth > 0 ? evenFloor(Math.round(h * 16 / 9) * dispHeight / dispWidth) : dispHeight);
+        // < dispHeight, not dispHeight > h: a wide-but-short source is already inside the box (854x480 under a 720 cap bounds at 718, above its own 480)
+        // and must not read as needing work.
+        const scalesInto = (h) => h > 0 && boxHeight(h) < dispHeight;
+        const capHeight = boxHeight(maxH);
+        const willDownscale = scalesInto(maxH);
         const outHeight = willDownscale ? capHeight : dispHeight;
         const qualityForHeight = (h) => ({ sd: qualitySd, p720: quality720, p1080: quality1080, p4k: quality4k }[heightTier(h)]);
         const qNorm = qualityForHeight(outHeight);
@@ -4932,7 +4967,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // exactly when T is under both: a raised threshold changes nothing and re-encodes nothing, and 0 retries only an encode that saved something. A keep
         // never unfences - the library file IS the kept encode, and re-encoding it would be generational.
         const vqNow = parseVq(getTagCI(fmtTags, VQ_TAG));
-        const vqRetry = !!vqNow && vqNow.state === 'reject' && vqNow.core === videoSigCore && vqNow.t !== savingsText && vqNow.pct !== null
+        // The box and speed tokens, spelled from downscale's and method_speed's options (h0 is downscale=disabled), so the codec token h264 never reads as a
+        // box. One missing here fails safe, as a re-encode.
+        const FENCE_BOX_RE = /^h(?:0|2160|1440|1080|720)$/;
+        const FENCE_SPEED_RE = /^s(?:slow|medium|fast)$/;
+        // A fence or verdict written at OTHER settings still holds when every token that differs is a no-op on this file: an encode for it would only add a
+        // lossy generation to a kept file, or repeat the encode a reverted one rejected. h<N> passes where neither box scales the file. sdr, strip and deint
+        // pass when their setting is now off, or when it is on and the file gives it nothing to do: no HDR to tonemap, no dynamic layer to strip, idet reading
+        // the file progressive (a decode, spent only when deint differs). Dropping one is a no-op over a reverted original too, because sizeExemptWhy never
+        // judges - so never reverts - an encode that tonemapped, stripped or deinterlaced: a reject's core can carry sdr, strip or deint only where it did
+        // nothing. The speed shapes only a new encode, so it passes except over a reverted original, where a new speed is a new try. action, codec, q, bit
+        // depth and dv never pass: a new action asks for different work, and the other four re-read as what produced them (the fence comment above). Nothing
+        // is rewritten, so the stored fence keeps its own tokens and every later pass decides the same way. A per-file fence (tokens only for what applied)
+        // would not converge: a repaired, tonemapped or downscaled output re-reads as progressive, SDR or inside the box.
+        const tokenIsNoop = (t) => (FENCE_BOX_RE.test(t) ? !scalesInto(Number(t.slice(1)))
+            : FENCE_SPEED_RE.test(t) ? vqNow?.state !== 'reject'
+                : t === 'sdr' ? !tonemap
+                    : t === 'strip' ? !(effHdrMode === 'strip_dynamic' && isDynamicHdr)
+                        : t === 'deint' && (!deinterlaceLive || idet().kind === 'progressive'));
+        // The tokens a stored core and this run's do not share, both ways.
+        const coreDiff = (core) => {
+            const mine = videoSigCore.split('-');
+            const theirs = String(core || '').split('-');
+            return [...mine.filter((t) => !theirs.includes(t)), ...theirs.filter((t) => !mine.includes(t))];
+        };
+        const coreHolds = (core) => core === videoSigCore || coreDiff(core).every(tokenIsNoop);
+        const vqRetry = !!vqNow && vqNow.state === 'reject' && coreHolds(vqNow.core) && vqNow.t !== savingsText && vqNow.pct !== null
             && guardShrinkSavings < vqNow.pct + 1 && !(Number(vqNow.t) <= guardShrinkSavings);
         // The ffprobe the verdict's reads and the fence's fingerprint check use, located once and only when one of them runs ('' under the harness, whose
         // reads are injected).
@@ -4993,7 +5053,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // that fails proves nothing - it never undoes a fence. A stored n or x (an all-intra window, or a stamping read that failed) leaves identity only, and
         // so does sub_worker's later caption removal, which rewrites the H.264 packets (measured) without making the verdict false.
         const vqFingerprintStale = () => {
-            const fp = vqNow && vqNow.state !== 'encoded' && vqNow.core === videoSigCore ? VQ_FP_RE.exec(vqNow.fp) : null;
+            const fp = vqNow && vqNow.state !== 'encoded' && coreHolds(vqNow.core) ? VQ_FP_RE.exec(vqNow.fp) : null;
             if (!fp) return null;
             if (fp[1] !== videoId8(primary)) return 'its format';
             if (!/^[0-9a-f]{8}$/.test(fp[2]) || ccAlreadyGone) return '';
@@ -5037,7 +5097,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // still marked, and a later job would compare that file with itself and restore it onto itself as a reject:0. Such an encode stays as it is: one
         // line, no measurement, no stamp (a tag-only remux would only record "unjudged", and its fingerprint would vouch for whatever video the file then
         // held), and the fence below treats the marker as no verdict.
-        const vqPending = savingsLive && !!vqNow && vqNow.state === 'encoded' && vqNow.core === videoSigCore;
+        const vqPending = savingsLive && !!vqNow && vqNow.state === 'encoded' && coreHolds(vqNow.core);
         const ownMarker = vqPending && (fenceJob && jobToken ? fenceJob === jobToken
             : getTagCI(fmtTags, VQ_TAG).trim() !== getTagCI(origProbe?.format?.tags, VQ_TAG).trim());
         if (vqPending && !ownMarker) {
@@ -5227,7 +5287,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // A verdict this file already carries at this setting, said only where the fence below then skips the file - never ahead of a stale line. The
         // threshold is named only where it differs from today's (a keep, or a reject the new value could not pass). The fence's retry says its own line.
         const vqReadLine = (() => {
-            if (!(savingsLive && vqNow && vqNow.state !== 'encoded' && vqNow.core === videoSigCore && !vqRetry)) return '';
+            if (!(savingsLive && vqNow && vqNow.state !== 'encoded' && coreHolds(vqNow.core) && !vqRetry)) return '';
             if (vqNow.pct === null) {
                 return `☑${pTag}${savingsTag} The re-encode was kept on an earlier pass without a size verdict (that pass's log says why)\n`;
             }
@@ -5240,7 +5300,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const videoSigShown = `${videoSigCore}-v${escMeta(details().Version)}`;
             const videoSig = `${videoSigShown}${jobToken ? `+j${jobToken}` : ''}`;
             // core only; the stored -v<version>[+j<job>] suffix is forensic, not part of the fence
-            const fenceMatches = priorSig !== '' && priorSig.replace(/-v[^-]*$/, '') === videoSigCore;
+            const priorCore = priorSig.replace(/-v[^-]*$/, '');
+            const fenceMatches = priorSig !== '' && coreHolds(priorCore);
             if (fenceMatches && vqRetry) {
                 response.infoLog += `☑${pTag}${savingsTag} The re-encode was reverted at guard_shrink_savings=${logSafe(vqNow.t, 16)} on an earlier pass`
                     + ` (it ${vqNow.pct < 0 ? 'grew the video' : `saved ${vqNow.pct}%`}), which the new setting allows - processing the file`
@@ -5252,8 +5313,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (fenceMatches && !vqRetry) {
                 staleWhy = fenceInherited ? fenceStaleWhy() : '';
                 if (!staleWhy) {
-                    return skip(`${vqReadLine}☑${pTag}[action=${action}] Already processed by ${VIDEO_FENCE_TAG} at this exact setting (${videoSigShown})`
-                        + ` - left untouched\n`);
+                    // The inputs behind the tokens coreHolds let pass, named as the user set them, so the line says what changed and was not acted on.
+                    const passed = [...new Set(coreDiff(priorCore).map((t) => (FENCE_BOX_RE.test(t) ? `downscale=${downscaleOpt}`
+                        : FENCE_SPEED_RE.test(t) ? `method_speed=${speed}` : t === 'deint' ? `deinterlace=${deinterlaceOpt}` : `hdr_mode=${hdrMode}`)))];
+                    const shown = logSafe(priorSig.replace(/\+j[0-9a-f]{8}$/, ''), 120);
+                    const only = vqNow?.state === 'reject' ? 'repeat the encode that was put back' : 'add a lossy generation';
+                    return skip(`${vqReadLine}${deintVerdictLine()}☑${pTag}[action=${action}] Already processed by ${VIDEO_FENCE_TAG} ${passed.length
+                        ? `(${shown}); re-encoding it for ${passed.join(', ')} would only ${only}` : `at this exact setting (${videoSigShown})`}`
+                        + ' - left untouched\n');
                 }
             }
             const staleLine = staleWhy ? `☒${pTag} ${staleWhy} - an outside tool changed it; processing it again\n` : '';
