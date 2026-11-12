@@ -43,7 +43,7 @@ const details = () => ({
                 stream_ordering (last). If the file has embedded closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that
                 destroys them. Extract with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since
                 the sidecars would land beside the source, where the output never sees them.`,
-    Version: '3.999.94',
+    Version: '3.999.97',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -280,6 +280,13 @@ const langKey = (x) => {
     if (s.length >= 4) { const code = langNameIndex(s); if (code) s = code; }   // spelled-out English name -> its code
     try { return shortLang(String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase()); } catch (e) { return s; }
 };
+// -=-=-= langMatchKey  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+// The key a user's language LIST is matched on, list side and track side alike: langKey plus the one macrolanguage fold ICU does not make. ICU keeps
+// Norwegian Bokmål (nb, nob) and Nynorsk (nn, nno) apart from Norwegian (no, nor) - measured on Tdarr's bundled Node 24.22.1, ICU 78.3 - so a list naming
+// Norwegian missed both, and nb-NO is the common streaming tag. List matching only: a tag WRITTEN, and one track compared with another (dedup, the
+// one-downmix-per-language sets, sidecar identity, language counts), stay on langKey and keep the two written standards apart - folded into langKey,
+// tag_language rewrote nob and nno to nor on an mkv -> mp4 conversion (measured).
+const langMatchKey = (x) => { const k = langKey(x); return (k === 'nb' || k === 'nn') ? 'no' : k; };
 // ===== END SHARED: language matching =====
 // #endregion
 
@@ -610,6 +617,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .filter((k) => !/^awk_/i.test(k) && !native.includes(k.toLowerCase()) && !MP4_REGENERATED_TAGS.includes(k.toLowerCase()));
         return { flag: markers.length > 0, markers, dropped };
     };
+    // -=-=-= mp4MovflagsArg [all five] =-=-=-
+    // The one -movflags an mp4-family output carries, built in one place because a later -movflags without a leading + replaces the earlier value:
+    // use_metadata_tags where mp4TagPlan asks for it, and +faststart, which writes the moov - the file's index - ahead of the media, so a player starts and
+    // seeks on progressive download or remote direct play without fetching the tail first. Every mp4-family write the other four plugins make front-loads,
+    // so a file one of them remuxed reaches stream_ordering fronted and its method_mp4_faststart has no remux of its own to force; stream_ordering passes
+    // `faststart` false for that input's strip, and only it ever remuxes for the flag alone. It moves the moov and nothing else (packets, tags, chapters, tmcd
+    // tracks, covers and Dolby Vision boxes read back identical; mediaInfo's IsStreamable turns Yes) by writing the whole file once more at the end of the
+    // mux: 0.2-1.2x a plain -c copy remux's wall time (CPU-saturated to idle M1, 291 MB to 2.5 GB, jellyfin 7.1.4, 2026-11-09).
+    const mp4MovflagsArg = (container, plan, faststart = true) => {
+        const flags = `${plan.flag ? 'use_metadata_tags' : ''}${faststart && isMp4Family(container) ? '+faststart' : ''}`;
+        return flags ? ` -movflags ${flags}` : '';
+    };
     // -=-=-= isMp4Cover (+ mp4CoversLost) [all five] =-=-=-
     // A cover the mp4/mov muxer stores as an iTunes covr atom rather than as a track: a video stream whose ONLY disposition is attached_pic, the muxer's own
     // test - one with another flag beside it (attached_pic+default) is written as a one-frame video track instead, in mov too, and read back as plain video.
@@ -840,10 +859,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!mp4) return out;
         // The mov muxer writes every video stream but a cover as an ordinary track, read back with no attached_pic, still_image or timed_thumbnails flag
         // (attached_pic+default, attached_pic+timed_thumbnails - a QuickTime chapter-image track - still_image and timed_thumbnails alike, in mjpeg and png),
-        // so there only an image codec still reads as cover art.
+        // so there only an image codec still reads as cover art. It stores no original flag either: a copied one and a +original write both read back 0
+        // (audio and subtitle, mp4, m4v and mov; measured 2026-11-09 on jellyfin 7.1.4), so the role survives only as a title keyword.
         const COVER_FLAGS = ['attached_pic', 'still_image', 'timed_thumbnails'];
-        return out.map((x) => (codecTypeOf(streamOf(x)) === 'video' && !isMp4Cover(streamOf(x)) && COVER_FLAGS.some((k) => streamOf(x).disposition?.[k] === 1)
-            ? flagged(x, Object.fromEntries(COVER_FLAGS.map((k) => [k, 0]))) : x));
+        return out.map((x) => {
+            const d = streamOf(x).disposition || {};
+            const cover = codecTypeOf(streamOf(x)) === 'video' && !isMp4Cover(streamOf(x)) && COVER_FLAGS.some((k) => d[k] === 1);
+            if (!cover && d.original !== 1) return x;
+            return flagged(x, { ...(cover ? Object.fromEntries(COVER_FLAGS.map((k) => [k, 0])) : {}), ...(d.original === 1 ? { original: 0 } : {}) });
+        });
     };
     // ===== END SHARED: read-back dispositions =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker]: matroska cover keep =====
@@ -852,9 +876,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // mimetype - any other image is an ordinary attachment that -map 0 copies byte-identical), and a -map 0 -c copy writes it back as a one-frame video track
     // (V_MJPEG; V_MS/VFW/FOURCC for png, V_QUICKTIME for gif) that has lost attached_pic and probes at 30000/1, with -disposition attached_pic or without. Only
     // -attach writes an attachment, and it reads a FILE, so a remux these plugins make for another reason copies each cover's bytes out first, leaves the
-    // stream out of its map and attaches the file again. The cover is never itself a reason to remux, and one that cannot be kept is dropped with a line, never
-    // a failed file. A track an earlier plain copy made of a cover keeps the attachment's mimetype tag (see isCoverArt), so it is found too: the same remux
-    // turns it back into an attachment, and copies it as the track it is when it cannot.
+    // stream out of its map and attaches the file again. The cover is never itself a reason to remux, and one that cannot be attached again is copied as a
+    // video track instead, with a line, never a failed file. A track a plain copy made of a cover keeps the attachment's mimetype tag (see isCoverArt), so it
+    // is found too: the next remux that can stage it turns it back into an attachment. An attached one is dropped only on .webm, which stores neither, or
+    // when its picture does not read as an image (see stageMatroskaCovers).
     const COVER_EXT_BY_CODEC = { mjpeg: 'jpg', png: 'png', gif: 'gif', tiff: 'tiff' };
     const COVER_MIME_BY_CODEC = { mjpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', tiff: 'image/tiff' };
     const matroskaCovers = (container, streams) => (isMatroskaFamily(container) ? (streams || []).filter((s) => codecTypeOf(s) === 'video'
@@ -907,16 +932,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return res;
     };
-    // Stages the covers of a Matroska-family remux: `kept` are attached again (matroskaCoverArgs), `dropped` and `asTrack` (a cover track that stays one)
-    // carry the reason, and `leaveOut` is every input stream the map must leave out. No ownership test on the folder: on a CIFS or root-squashed NFS cache
-    // every file reads as the mount's owner, and a retry may resume on another node; lstat refuses a symlink, and anyone who can write the work directory
-    // can already replace the cache file Tdarr promotes. .webm stores no attachments (its muxer ignores -attach), so there no cover is attached again: an
-    // attached_pic one is dropped, and a cover track is copied as the track it is.
+    // Stages the covers of a Matroska-family remux: `kept` are attached again (matroskaCoverArgs), `asTrack` (every other cover, copied as a video track -
+    // `track` says it was one already) and `dropped` carry the reason, and `leaveOut` is every input stream the map must leave out. No ownership test on the
+    // folder: on a CIFS or root-squashed NFS cache every file reads as the mount's owner, and a retry may resume on another node; lstat refuses a symlink, and
+    // anyone who can write the work directory can already replace the cache file Tdarr promotes. .webm stores no attachments (its muxer ignores -attach), so
+    // there no cover is attached again: an attached_pic one is dropped, and a cover track is copied as the track it is.
     const stageMatroskaCovers = (container, covers, inputPath, otherArgs, streams) => {
         const path = require('path');
         const fs = require('fs');
         const res = { kept: [], dropped: [], asTrack: [], leaveOut: [] };
-        const fail = (it, why, detail = '') => (it.track ? res.asTrack : res.dropped).push({ s: it.s, why, detail });
+        // An attached picture that does not parse as its mimetype's codec (a PNG or WebP labelled image/jpeg, a truncated JPEG) probes at 0x0, and copied as a
+        // track it takes the whole Matroska mux down ('dimensions not set', exit 234; measured 2026-11-09 on jellyfin 7.1.4), so only one with dimensions
+        // can stay a track; the other is dropped for that reason.
+        const fail = (it, why, detail = '') => {
+            if (it.track || (why !== 'webm' && Number(it.s.width) > 0 && Number(it.s.height) > 0)) res.asTrack.push({ s: it.s, why, detail, track: it.track });
+            else res.dropped.push(why === 'webm' ? { s: it.s, why, detail } : { s: it.s, why: 'unreadable', detail: '' });
+        };
         const dir = coverWorkDir(otherArgs);
         const stageDir = dir ? `${dir}/awk_cover` : '';
         const todo = covers.map((s) => {
@@ -975,15 +1006,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         nowork: 'Tdarr\'s cache path is not inside a tdarr-workDir2- job folder, so there is nowhere to stage it for -attach',
         unsafe: 'the work directory\'s path holds a character a preset cannot carry',
         name: 'its staging name is already an attachment\'s in this file',
+        unreadable: 'its picture does not read as the image its mimetype names, and as a track it would fail the whole remux',
         stage: 'the work directory has no usable awk_cover folder to stage it in',
         extract: 'ffmpeg could not copy it out to attach it again',
         timeout: `copying it out was stopped after ${COVER_BOUNDED_TIMEOUT_MS / 1000} s`,
+    };
+    // Where Matroska reads a cover copied as a track (stageMatroskaCovers' asTrack) back: after the tracks ahead of it in the command and before every
+    // attachment, since the demuxer reports every track first - so an attached one that -map 0 copies from among the attachments comes back ahead of them
+    // (measured 2026-11-09 on jellyfin 7.1.4: font then cover in, cover then font out). `list` is an Expected results list in command order.
+    const coverTracksAsRead = (list, asTrack, streamOf = (x) => x) => {
+        const moved = new Set(asTrack.map((d) => d.s.index));
+        const out = [];
+        for (const x of list) {
+            let at = out.length;
+            while (moved.has(streamOf(x).index) && at > 0 && codecTypeOf(streamOf(out[at - 1])) === 'attachment') at -= 1;
+            out.splice(at, 0, x);
+        }
+        return out;
     };
     const coverShownName = (it) => (logSafe(escMeta(it.name)) === logSafe(it.name) ? logSafe(it.name)
         : `${logSafe(it.name)}, written as ${logSafe(escMeta(it.name))}`);
     const matroskaCoverLog = (staged) => staged.kept.map((it) => `☐${streamTag(it.s.index)} ${it.track ? 'Turning the cover-art track back into'
         : 'Copying out the cover art to keep it as'} an attachment (${coverShownName(it)}) - read back after every track and attachment\n`).join('')
-        + [...staged.dropped.map((d) => ['Cover art dropped', d]), ...staged.asTrack.map((d) => ['The cover-art track stays a video track', d])]
+        + [...staged.dropped.map((d) => ['Cover art dropped', d]), ...staged.asTrack.map((d) => [d.track ? 'The cover-art track stays a video track'
+            : 'Cover art kept as a video track until a later remux can attach it again', d])]
             .map(([what, d]) => `☒${streamTag(d.s.index)} ${what} - ${COVER_LOST_WHY[d.why]}${d.detail ? ` (${d.detail})` : ''}\n`).join('');
     // ===== END SHARED: matroska cover keep =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 uncopyable streams =====
@@ -3983,15 +4029,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // A language token that is not a language FAILS the file. only_languages scopes which subtitles are touched at all, so a typo ('eng,fer') silently matches
     // nothing and every subtitle in that language is quietly left out of the extract - the user gets a clean run that did none of the work they asked for, with
     // no way to tell it apart from a file that genuinely had no such subtitle. Stopping is the far cheaper failure. The und/mul/zxx/mis/qaa-qtz allowance is
-    // load-bearing, NOT laxness: the filter is compared against langKey(resolveLang(s) || 'und'), so scoping on 'und' is how untagged subtitles are selected.
+    // load-bearing, NOT laxness: the filter is compared against langMatchKey(resolveLang(s) || 'und'), so scoping on 'und' is how untagged subtitles are
+    // selected.
     const onlyLangRaw = splitList(inputs.only_languages);
     checkLangLists([['only_languages', onlyLangRaw]]);
 
     const streams = (file.ffProbeData && file.ffProbeData.streams) || [];   // [] only in post-processing, which reads the file through probeCurrentFile instead
     // Built from the array validated just above, so the token set that PASSED is provably the one the filter executes - two independent parses of one input
-    // would let a hardening of either drift out of the other. Folded through langKey (so en/eng/English match); null, never an empty Set, means "no filter",
-    // which is what both consumers test for.
-    const langFilter = onlyLangRaw.length ? new Set(onlyLangRaw.map(langKey)) : null;
+    // would let a hardening of either drift out of the other. Folded through langMatchKey (en/eng/English match, and Norwegian matches Bokmål and Nynorsk);
+    // null, never an empty Set, means "no filter", which is what both consumers test for.
+    const langFilter = onlyLangRaw.length ? new Set(onlyLangRaw.map(langMatchKey)) : null;
     // One setting, both directions: remove the source copy once its content is confirmed at the destination - the embedded track after an extract, the
     // sidecar file after an import. Each direction keeps its own verification; this only ever answers whether removal was asked for.
     const removeSource = String(inputs.remove_source) === 'true';
@@ -4177,6 +4224,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const unmapped = [];         // the streams the committed preset leaves out of its map - see outputView
     let manualDisposition = false;   // whether the committed preset writes any -disposition (carriesDisposition) - see outputView
     const keptCovers = [];           // the Matroska covers the committed preset attaches again from a staged copy (stageMatroskaCovers) - see outputView
+    const coverTracks = [];          // the covers the committed preset copies as tracks (stageMatroskaCovers' asTrack) - see outputView
     let carried = (s) => s;          // a name the committed preset's carry moves into the handler alone, read back as that handler - see outputView
     let ccStripAt = null;            // { index, removed } of a caption strip the committed preset makes - see ccStripArg
     const dropMaps = (indices) => [...indices].map((i) => ` -map -0:${i}`).join('');   // a negative map per dropped input index, in the order given
@@ -4200,11 +4248,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return ` -metadata "${key}=${value}"`;
     };
     // Commit a built output-side arg string as the run: leave out any data track the container cannot copy (mp4UncopyableStreams), append the DV strict flag,
-    // then -movflags use_metadata_tags where mp4TagPlan asks for it, then the universal output options - and set response.processFile, Tdarr's go/no-go switch,
-    // so calling this IS the commit point for the whole run. Shared by the extract and import branches so their tails can't drift. Without that flag an
-    // mp4-family mux drops every custom global tag, so it is what keeps a sibling's awk_* marker (awk_video/awk_recovered) through a -c copy and lands this
-    // plugin's own awk_sub_worker and awk_cc at all - without it an mp4 marker silently vanishes and the next pass re-imports every sidecar it should have
-    // skipped. list is the main output's stream list in its order (source streams less every removal, imports appended), which the name carry reads.
+    // then the one -movflags (mp4MovflagsArg), then the universal output options - and set response.processFile, Tdarr's go/no-go switch, so calling this
+    // IS the commit point for the whole run. Shared by the extract and import branches so their tails can't drift. Without the use_metadata_tags in that
+    // -movflags an mp4-family mux drops every custom global tag, so it is what keeps a sibling's awk_* marker (awk_video/awk_recovered) through a -c copy
+    // and lands this plugin's own awk_sub_worker and awk_cc at all - without it an mp4 marker silently vanishes and the next pass re-imports every sidecar
+    // it should have skipped. list is the main output's stream list in its order (source streams less every removal, imports appended), which the name
+    // carry reads.
     const commitPreset = (out, list = streams) => {
         // The -strict level either -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses without it.
         // Only subtitle streams - and, on a bundled extract, their font attachments - are ever added or dropped here, so every audio/video stream is copied
@@ -4216,6 +4265,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const uncopyable = mp4UncopyableStreams(dstContainer, streams);
         const staged = stageMatroskaCovers(dstContainer, matroskaCovers(dstContainer, streams), file.file, otherArguments, streams);
         keptCovers.push(...staged.kept);
+        coverTracks.push(...staged.asTrack);
         const mapped = streams.filter((s) => !uncopyable.includes(s) && !staged.leaveOut.includes(s));   // every video in source order, for mp4TimecodeArgs
         const outGone = [...uncopyable, ...staged.leaveOut].map((s) => s.index);
         let full = out + dropMaps(outGone) + (ccStripAt ? ccStripArg(ccStripAt.index, new Set([...ccStripAt.removed, ...outGone])) : '')
@@ -4224,7 +4274,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             + matroskaCoverArgs(staged.kept);
         carried = mp4NameCarryView(dstContainer, list.filter((s) => mapped.includes(s)), titleWritten);
         const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, globalWrites);
-        if (tagPlan.flag) full += ' -movflags use_metadata_tags';
+        full += mp4MovflagsArg(dstContainer, tagPlan);
         full += globalOutputOpt + outputMuxerArg(dstContainer);
         response.preset = `<io>${full}`;
         response.processFile = true;
@@ -4244,8 +4294,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // carry moves into the handler alone reads back as that handler (mp4NameCarryView, by source index, so after readBackDispositions' copies).
     const outputView = (list, asWritten = (s) => s) => {
         const shown = list.filter((s) => !leftOut.has(s.index));
-        return readBackDispositions(dstContainer, mp4RebuiltLast(dstContainer, shown, unmapped,
-            mp4CreatedTracks(dstContainer, shown.filter((s) => !unmapped.includes(s)))).map(asWritten), manualDisposition).map(carried)
+        return readBackDispositions(dstContainer, coverTracksAsRead(mp4RebuiltLast(dstContainer, shown, unmapped,
+            mp4CreatedTracks(dstContainer, shown.filter((s) => !unmapped.includes(s)))), coverTracks).map(asWritten), manualDisposition).map(carried)
             .concat(keptCovers.map(keptCoverStream));
     };
     // Every commit ends the same way: the preset, then the Expected results line - right only once commitPreset has filled leftOut - then the response.
@@ -4725,7 +4775,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             dupes.dropIdx.forEach((i) => droppedDuplicates.add(i));
             const eligible = streams.filter((s) => codecTypeOf(s) === 'subtitle' && isTextSub(s)
                 && !dupes.dropIdx.includes(s.index)
-                && !(langFilter && !langFilter.has(langKey(resolveLang(s) || 'und'))));
+                && !(langFilter && !langFilter.has(langMatchKey(resolveLang(s) || 'und'))));
             // A DEFERRED caption strip is work of its own: the sidecar landed on an earlier pass, so there is no job and nothing to extract, yet the
             // bitstream copy still has to come out. Bailing here would leave the captions in the video forever, with the sidecar beside it.
             if (!eligible.length && !dupes.dropIdx.length && !ccPlan.job && !ccPlan.stripOwed) return skip('☑No text subtitles to extract\n');
@@ -5309,7 +5359,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The caption staging sidecar is OUR intermediate, not a subtitle the user chose to scope: captions carry no language of their own, so it is tagged
         // 'und', in nobody's only_languages list, and dropping it would strand the caption round trip (the full-video decode paid, the hidden sidecar written,
         // nothing importing it, awk_cc=imported never stamped, every later pass decoding again). Extract exempts embedded_cc from its own filter.
-        const subLangInScope = (f) => isCcSidecar(f.rel) || !langFilter || langFilter.has(langKey(f.lang));
+        const subLangInScope = (f) => isCcSidecar(f.rel) || !langFilter || langFilter.has(langMatchKey(f.lang));
         // A caption sidecar ccPlan declined (one it could not read, check, move aside or remove, or one read from another video): never imported, so
         // nothing is muxed or stripped on it.
         const ccUntrusted = (f) => ccPlan.untrusted === true && isCcSidecar(f.rel);

@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.80',
+    Version: '3.999.82',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -696,6 +696,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .filter((k) => !/^awk_/i.test(k) && !native.includes(k.toLowerCase()) && !MP4_REGENERATED_TAGS.includes(k.toLowerCase()));
         return { flag: markers.length > 0, markers, dropped };
     };
+    // -=-=-= mp4MovflagsArg [all five] =-=-=-
+    // The one -movflags an mp4-family output carries, built in one place because a later -movflags without a leading + replaces the earlier value:
+    // use_metadata_tags where mp4TagPlan asks for it, and +faststart, which writes the moov - the file's index - ahead of the media, so a player starts and
+    // seeks on progressive download or remote direct play without fetching the tail first. Every mp4-family write the other four plugins make front-loads,
+    // so a file one of them remuxed reaches stream_ordering fronted and its method_mp4_faststart has no remux of its own to force; stream_ordering passes
+    // `faststart` false for that input's strip, and only it ever remuxes for the flag alone. It moves the moov and nothing else (packets, tags, chapters, tmcd
+    // tracks, covers and Dolby Vision boxes read back identical; mediaInfo's IsStreamable turns Yes) by writing the whole file once more at the end of the
+    // mux: 0.2-1.2x a plain -c copy remux's wall time (CPU-saturated to idle M1, 291 MB to 2.5 GB, jellyfin 7.1.4, 2026-11-09).
+    const mp4MovflagsArg = (container, plan, faststart = true) => {
+        const flags = `${plan.flag ? 'use_metadata_tags' : ''}${faststart && isMp4Family(container) ? '+faststart' : ''}`;
+        return flags ? ` -movflags ${flags}` : '';
+    };
     // -=-=-= isMp4Cover (+ mp4CoversLost) [all five] =-=-=-
     // A cover the mp4/mov muxer stores as an iTunes covr atom rather than as a track: a video stream whose ONLY disposition is attached_pic, the muxer's own
     // test - one with another flag beside it (attached_pic+default) is written as a one-frame video track instead, in mov too, and read back as plain video.
@@ -926,10 +938,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!mp4) return out;
         // The mov muxer writes every video stream but a cover as an ordinary track, read back with no attached_pic, still_image or timed_thumbnails flag
         // (attached_pic+default, attached_pic+timed_thumbnails - a QuickTime chapter-image track - still_image and timed_thumbnails alike, in mjpeg and png),
-        // so there only an image codec still reads as cover art.
+        // so there only an image codec still reads as cover art. It stores no original flag either: a copied one and a +original write both read back 0
+        // (audio and subtitle, mp4, m4v and mov; measured 2026-11-09 on jellyfin 7.1.4), so the role survives only as a title keyword.
         const COVER_FLAGS = ['attached_pic', 'still_image', 'timed_thumbnails'];
-        return out.map((x) => (codecTypeOf(streamOf(x)) === 'video' && !isMp4Cover(streamOf(x)) && COVER_FLAGS.some((k) => streamOf(x).disposition?.[k] === 1)
-            ? flagged(x, Object.fromEntries(COVER_FLAGS.map((k) => [k, 0]))) : x));
+        return out.map((x) => {
+            const d = streamOf(x).disposition || {};
+            const cover = codecTypeOf(streamOf(x)) === 'video' && !isMp4Cover(streamOf(x)) && COVER_FLAGS.some((k) => d[k] === 1);
+            if (!cover && d.original !== 1) return x;
+            return flagged(x, { ...(cover ? Object.fromEntries(COVER_FLAGS.map((k) => [k, 0])) : {}), ...(d.original === 1 ? { original: 0 } : {}) });
+        });
     };
     // ===== END SHARED: read-back dispositions =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 uncopyable streams =====
@@ -1235,7 +1252,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: stream / language / preset helpers =====
     // #endregion
 
-    // #region SHARED helpers (8 sections: ffmpeg metadata escaping … hevc copy fourcc)
+    // #region SHARED helpers (9 sections: ffmpeg metadata escaping … hevc copy fourcc)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
     // -=-=-= escMeta [all five] =-=-=-
     // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array for child_process.spawn, so shell metacharacters
@@ -1907,6 +1924,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : [])
             .some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
+    // ===== SHARED [clean_and_remux, stream_ordering, video_clean]: dolby vision record =====
+    // -=-=-= doviRecord  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // The stream's Dolby Vision configuration record as ffprobe reports it, or undefined.
+    const doviRecord = (s) => (Array.isArray(s?.side_data_list) ? s.side_data_list : [])
+        .find((sd) => /dovi configuration record/i.test(String(sd?.side_data_type || '')));
+    // -=-=-= dvRecordSurvivesCopy  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // Whether a -c copy keeps the stream's Dolby Vision record (true with none), the fourcc aside: jellyfin's muxers check the base layer's pixel format and
+    // colour against the compat id (its ff_isom_validate_dovi_config) and drop a record that fails under ANY fourcc, mkv to mkv included, so any remux costs
+    // such a stream its Dolby Vision. Matched the copy on all 17 measured sources (P5, P7, P8.1, P8.2, P8.4, P20 from Dolby, ffmpeg, mkvmerge, MP4Box and an
+    // iPhone-style mov). Compat 0's fourcc condition is dvNeedsDvFourcc's (hevc copy fourcc). Read by clean_and_remux's convert gate, hevcCopyPlan's
+    // Matroska arm and stream_ordering's faststart hold.
+    const dvRecordSurvivesCopy = (s) => {
+        const id = String(doviRecord(s)?.dv_bl_signal_compatibility_id ?? '');
+        const p10 = s.pix_fmt === 'yuv420p10le';
+        const hdr = (trc) => p10 && s.color_transfer === trc && s.color_primaries === 'bt2020' && s.color_space === 'bt2020nc' && s.color_range === 'tv';
+        return id === '0' ? p10 : id === '1' || id === '6' ? hdr('smpte2084') : id === '2' ? s.pix_fmt === 'yuv420p' : id === '4' ? hdr('arib-std-b67') : true;
+    };
+    // ===== END SHARED: dolby vision record =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
     // -=-=-= mp4StrictArg [all five] =-=-=-
     // The ' -strict <level>' an mp4/mov -c copy needs, or '' when it needs none. Two independent reasons share one flag, because `experimental` is a strict
@@ -1938,25 +1973,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // in the samples (Dolby's own P5 and P8.1 mp4s, every mkv made from them, GPAC's xps_inband). ffprobe prints the size whenever there is extradata, and
     // Tdarr 3.04's scan removes only the `extradata` hex (tdarr_core remove_ffprobe_extradata), so the size reaches a plugin.
     const HVCC_HEADER_BYTES = 23;
-    // -=-=-= doviRecord (+ dvNeedsDvFourcc)  [clean_and_remux, video_clean] =-=-=-
-    // The stream's Dolby Vision configuration record as ffprobe reports it, or undefined.
-    const doviRecord = (s) => (Array.isArray(s?.side_data_list) ? s.side_data_list : [])
-        .find((sd) => /dovi configuration record/i.test(String(sd?.side_data_type || '')));
+    // -=-=-= dvNeedsDvFourcc  [clean_and_remux, video_clean] =-=-=-
     // A record naming no compatible base (compatibility id 0: Profile 5). jellyfin's muxers write a compat-0 record's box only under a dvh1/dvhe fourcc or no
     // tag at all (its ff_isom_validate_dovi_config), so under hev1 or hvc1 the stream silently becomes plain HEVC whose IPT colour every player shows wrong.
     // Every other compat id is checked against the stream's colour instead, under any fourcc.
     const dvNeedsDvFourcc = (s) => String(doviRecord(s)?.dv_bl_signal_compatibility_id) === '0';
-    // -=-=-= dvRecordSurvivesCopy  [clean_and_remux, video_clean] =-=-=-
-    // Whether a -c copy keeps the stream's Dolby Vision record (true with none), the fourcc aside: jellyfin's muxers check the base layer's pixel format and
-    // colour against the compat id (its ff_isom_validate_dovi_config) and drop a record that fails under ANY fourcc, mkv to mkv included, so any remux costs
-    // such a stream its Dolby Vision. Matched the copy on all 17 measured sources (P5, P7, P8.1, P8.2, P8.4, P20 from Dolby, ffmpeg, mkvmerge, MP4Box and an
-    // iPhone-style mov). Compat 0's fourcc condition is dvNeedsDvFourcc's. Read by clean_and_remux's convert gate and hevcCopyPlan's Matroska arm.
-    const dvRecordSurvivesCopy = (s) => {
-        const id = String(doviRecord(s)?.dv_bl_signal_compatibility_id ?? '');
-        const p10 = s.pix_fmt === 'yuv420p10le';
-        const hdr = (trc) => p10 && s.color_transfer === trc && s.color_primaries === 'bt2020' && s.color_space === 'bt2020nc' && s.color_range === 'tv';
-        return id === '0' ? p10 : id === '1' || id === '6' ? hdr('smpte2084') : id === '2' ? s.pix_fmt === 'yuv420p' : id === '4' ? hdr('arib-std-b67') : true;
-    };
     // -=-=-= firstKeyParamSets  [clean_and_remux, video_clean] =-=-=-
     // Whether the first KEYFRAME of an HEVC stream carries VPS, SPS and PPS: true / false / null (not read). It is the packet the mov muxer builds an hvcC
     // from once hevc_mp4toannexb has emptied the extradata - a -c copy drops every packet before the first keyframe, and this read is a -c copy too, so it
@@ -3895,7 +3916,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const kept = keptFor(written);
             response.infoLog += mp4NameCarryLog(dstContainer, kept);
             response.preset = `${inputSide}<io>${out}${mp4TimecodeArgs(dstContainer, kept)}${mp4NameCarryArgs(dstContainer, kept)}`
-                + `${tagPlan.flag ? ' -movflags use_metadata_tags' : ''}${globalOutputOpt}${outputMuxerArg(dstContainer)}`;
+                + `${mp4MovflagsArg(dstContainer, tagPlan)}${globalOutputOpt}${outputMuxerArg(dstContainer)}`;
             response.processFile = true;
             response.infoLog += dropLog(written) + mp4TimecodeLog(dstContainer, kept) + mp4TagPlanLog(tagPlan, dstContainer)
                 + movDvLossLine(dstContainer, kept.filter((s) => !dropsDv || s !== written), act);

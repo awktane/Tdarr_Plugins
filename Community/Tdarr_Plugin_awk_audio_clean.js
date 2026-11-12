@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.76',
+    Version: '4.999.81',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -36,10 +36,12 @@ const details = () => ({
             type: 'string',
             defaultValue: '',
             inputUI: { type: 'text' },
-            tooltip: `Languages to keep at full quality (surround). These follow downmix_to_six, downmix_to_stereo and codec_force. Blank (default) treats
-                every language as surround.
-                \\nOne form is enough - en, eng, or English all match the same language, region variants like en-US included. A track with no language tag
-                counts as "und".
+            tooltip: `Languages to keep at full quality (surround). These follow downmix_to_six, downmix_to_stereo and codec_force. Blank (default) names
+                no language. With language_stereo blank too, every language stays at surround. Once language_stereo names the language of a main (not
+                secondary) track in the file, every language neither list names is unlisted and follows language_unlisted instead - still surround at its
+                default, but downmixed or removed if that is set to stereo or delete.
+                \\nOne form is enough - en, eng, or English all match the same language, region variants like en-US included, and Norwegian (no, nor)
+                matches Bokmål (nb, nob) and Nynorsk (nn, nno). A track with no language tag counts as "und".
                 \\nA language in neither this list nor language_stereo is "unlisted" and follows language_unlisted. A language in BOTH lists is treated as
                 surround, so this list wins.
                 \\nCommentary, descriptive, M&E and karaoke tracks are secondary whatever their language - they follow downmix_secondary, not these lists.
@@ -495,6 +497,13 @@ const langKey = (x) => {
     if (s.length >= 4) { const code = langNameIndex(s); if (code) s = code; }   // spelled-out English name -> its code
     try { return shortLang(String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase()); } catch (e) { return s; }
 };
+// -=-=-= langMatchKey  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+// The key a user's language LIST is matched on, list side and track side alike: langKey plus the one macrolanguage fold ICU does not make. ICU keeps
+// Norwegian Bokmål (nb, nob) and Nynorsk (nn, nno) apart from Norwegian (no, nor) - measured on Tdarr's bundled Node 24.22.1, ICU 78.3 - so a list naming
+// Norwegian missed both, and nb-NO is the common streaming tag. List matching only: a tag WRITTEN, and one track compared with another (dedup, the
+// one-downmix-per-language sets, sidecar identity, language counts), stay on langKey and keep the two written standards apart - folded into langKey,
+// tag_language rewrote nob and nno to nor on an mkv -> mp4 conversion (measured).
+const langMatchKey = (x) => { const k = langKey(x); return (k === 'nb' || k === 'nn') ? 'no' : k; };
 // ===== END SHARED: language matching =====
 // #endregion
 
@@ -693,7 +702,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // A secondary audio track is any commentary, visually-impaired/descriptive, music-and-effects (clean_effects) or karaoke track, by flag or title keyword
     // through the shared classifiers (lyrics is a subtitle-only role). None carries the dialogue a viewer picks a film's audio by, so none speaks for a
     // language: audio_clean keeps them out of the language tiers and the dedup groups, clean_and_remux's guard_audio_language does not count their
-    // languages, and stream_ordering never ranks one above a main track. One definition, so the three cannot disagree about which tracks those are.
+    // languages, and stream_ordering ranks one below every main track of its language - unless audio_first lifts it: descriptive_tagged lifts every
+    // descriptive track, original_tagged an original-flagged one - and gives it the sole default flag only when the file has no main track, or
+    // audio_first=descriptive_tagged leads with the description. One definition, so the three cannot disagree about which tracks those are.
     const isSecondaryTrack = (stream) => isCommentary(stream) || isDescriptive(stream)
         || hasDisposition(stream, 'clean_effects') || hasDisposition(stream, 'karaoke');
     // ===== END SHARED: secondary audio role =====
@@ -831,6 +842,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const dropped = markers.length ? [] : kept.map(([k]) => k)
             .filter((k) => !/^awk_/i.test(k) && !native.includes(k.toLowerCase()) && !MP4_REGENERATED_TAGS.includes(k.toLowerCase()));
         return { flag: markers.length > 0, markers, dropped };
+    };
+    // -=-=-= mp4MovflagsArg [all five] =-=-=-
+    // The one -movflags an mp4-family output carries, built in one place because a later -movflags without a leading + replaces the earlier value:
+    // use_metadata_tags where mp4TagPlan asks for it, and +faststart, which writes the moov - the file's index - ahead of the media, so a player starts and
+    // seeks on progressive download or remote direct play without fetching the tail first. Every mp4-family write the other four plugins make front-loads,
+    // so a file one of them remuxed reaches stream_ordering fronted and its method_mp4_faststart has no remux of its own to force; stream_ordering passes
+    // `faststart` false for that input's strip, and only it ever remuxes for the flag alone. It moves the moov and nothing else (packets, tags, chapters, tmcd
+    // tracks, covers and Dolby Vision boxes read back identical; mediaInfo's IsStreamable turns Yes) by writing the whole file once more at the end of the
+    // mux: 0.2-1.2x a plain -c copy remux's wall time (CPU-saturated to idle M1, 291 MB to 2.5 GB, jellyfin 7.1.4, 2026-11-09).
+    const mp4MovflagsArg = (container, plan, faststart = true) => {
+        const flags = `${plan.flag ? 'use_metadata_tags' : ''}${faststart && isMp4Family(container) ? '+faststart' : ''}`;
+        return flags ? ` -movflags ${flags}` : '';
     };
     // -=-=-= isMp4Cover (+ mp4CoversLost) [all five] =-=-=-
     // A cover the mp4/mov muxer stores as an iTunes covr atom rather than as a track: a video stream whose ONLY disposition is attached_pic, the muxer's own
@@ -1062,10 +1085,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!mp4) return out;
         // The mov muxer writes every video stream but a cover as an ordinary track, read back with no attached_pic, still_image or timed_thumbnails flag
         // (attached_pic+default, attached_pic+timed_thumbnails - a QuickTime chapter-image track - still_image and timed_thumbnails alike, in mjpeg and png),
-        // so there only an image codec still reads as cover art.
+        // so there only an image codec still reads as cover art. It stores no original flag either: a copied one and a +original write both read back 0
+        // (audio and subtitle, mp4, m4v and mov; measured 2026-11-09 on jellyfin 7.1.4), so the role survives only as a title keyword.
         const COVER_FLAGS = ['attached_pic', 'still_image', 'timed_thumbnails'];
-        return out.map((x) => (codecTypeOf(streamOf(x)) === 'video' && !isMp4Cover(streamOf(x)) && COVER_FLAGS.some((k) => streamOf(x).disposition?.[k] === 1)
-            ? flagged(x, Object.fromEntries(COVER_FLAGS.map((k) => [k, 0]))) : x));
+        return out.map((x) => {
+            const d = streamOf(x).disposition || {};
+            const cover = codecTypeOf(streamOf(x)) === 'video' && !isMp4Cover(streamOf(x)) && COVER_FLAGS.some((k) => d[k] === 1);
+            if (!cover && d.original !== 1) return x;
+            return flagged(x, { ...(cover ? Object.fromEntries(COVER_FLAGS.map((k) => [k, 0])) : {}), ...(d.original === 1 ? { original: 0 } : {}) });
+        });
     };
     // ===== END SHARED: read-back dispositions =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: preset path safety =====
@@ -1085,9 +1113,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // mimetype - any other image is an ordinary attachment that -map 0 copies byte-identical), and a -map 0 -c copy writes it back as a one-frame video track
     // (V_MJPEG; V_MS/VFW/FOURCC for png, V_QUICKTIME for gif) that has lost attached_pic and probes at 30000/1, with -disposition attached_pic or without. Only
     // -attach writes an attachment, and it reads a FILE, so a remux these plugins make for another reason copies each cover's bytes out first, leaves the
-    // stream out of its map and attaches the file again. The cover is never itself a reason to remux, and one that cannot be kept is dropped with a line, never
-    // a failed file. A track an earlier plain copy made of a cover keeps the attachment's mimetype tag (see isCoverArt), so it is found too: the same remux
-    // turns it back into an attachment, and copies it as the track it is when it cannot.
+    // stream out of its map and attaches the file again. The cover is never itself a reason to remux, and one that cannot be attached again is copied as a
+    // video track instead, with a line, never a failed file. A track a plain copy made of a cover keeps the attachment's mimetype tag (see isCoverArt), so it
+    // is found too: the next remux that can stage it turns it back into an attachment. An attached one is dropped only on .webm, which stores neither, or
+    // when its picture does not read as an image (see stageMatroskaCovers).
     const COVER_EXT_BY_CODEC = { mjpeg: 'jpg', png: 'png', gif: 'gif', tiff: 'tiff' };
     const COVER_MIME_BY_CODEC = { mjpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', tiff: 'image/tiff' };
     const matroskaCovers = (container, streams) => (isMatroskaFamily(container) ? (streams || []).filter((s) => codecTypeOf(s) === 'video'
@@ -1140,16 +1169,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return res;
     };
-    // Stages the covers of a Matroska-family remux: `kept` are attached again (matroskaCoverArgs), `dropped` and `asTrack` (a cover track that stays one)
-    // carry the reason, and `leaveOut` is every input stream the map must leave out. No ownership test on the folder: on a CIFS or root-squashed NFS cache
-    // every file reads as the mount's owner, and a retry may resume on another node; lstat refuses a symlink, and anyone who can write the work directory
-    // can already replace the cache file Tdarr promotes. .webm stores no attachments (its muxer ignores -attach), so there no cover is attached again: an
-    // attached_pic one is dropped, and a cover track is copied as the track it is.
+    // Stages the covers of a Matroska-family remux: `kept` are attached again (matroskaCoverArgs), `asTrack` (every other cover, copied as a video track -
+    // `track` says it was one already) and `dropped` carry the reason, and `leaveOut` is every input stream the map must leave out. No ownership test on the
+    // folder: on a CIFS or root-squashed NFS cache every file reads as the mount's owner, and a retry may resume on another node; lstat refuses a symlink, and
+    // anyone who can write the work directory can already replace the cache file Tdarr promotes. .webm stores no attachments (its muxer ignores -attach), so
+    // there no cover is attached again: an attached_pic one is dropped, and a cover track is copied as the track it is.
     const stageMatroskaCovers = (container, covers, inputPath, otherArgs, streams) => {
         const path = require('path');
         const fs = require('fs');
         const res = { kept: [], dropped: [], asTrack: [], leaveOut: [] };
-        const fail = (it, why, detail = '') => (it.track ? res.asTrack : res.dropped).push({ s: it.s, why, detail });
+        // An attached picture that does not parse as its mimetype's codec (a PNG or WebP labelled image/jpeg, a truncated JPEG) probes at 0x0, and copied as a
+        // track it takes the whole Matroska mux down ('dimensions not set', exit 234; measured 2026-11-09 on jellyfin 7.1.4), so only one with dimensions
+        // can stay a track; the other is dropped for that reason.
+        const fail = (it, why, detail = '') => {
+            if (it.track || (why !== 'webm' && Number(it.s.width) > 0 && Number(it.s.height) > 0)) res.asTrack.push({ s: it.s, why, detail, track: it.track });
+            else res.dropped.push(why === 'webm' ? { s: it.s, why, detail } : { s: it.s, why: 'unreadable', detail: '' });
+        };
         const dir = coverWorkDir(otherArgs);
         const stageDir = dir ? `${dir}/awk_cover` : '';
         const todo = covers.map((s) => {
@@ -1208,15 +1243,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         nowork: 'Tdarr\'s cache path is not inside a tdarr-workDir2- job folder, so there is nowhere to stage it for -attach',
         unsafe: 'the work directory\'s path holds a character a preset cannot carry',
         name: 'its staging name is already an attachment\'s in this file',
+        unreadable: 'its picture does not read as the image its mimetype names, and as a track it would fail the whole remux',
         stage: 'the work directory has no usable awk_cover folder to stage it in',
         extract: 'ffmpeg could not copy it out to attach it again',
         timeout: `copying it out was stopped after ${COVER_BOUNDED_TIMEOUT_MS / 1000} s`,
+    };
+    // Where Matroska reads a cover copied as a track (stageMatroskaCovers' asTrack) back: after the tracks ahead of it in the command and before every
+    // attachment, since the demuxer reports every track first - so an attached one that -map 0 copies from among the attachments comes back ahead of them
+    // (measured 2026-11-09 on jellyfin 7.1.4: font then cover in, cover then font out). `list` is an Expected results list in command order.
+    const coverTracksAsRead = (list, asTrack, streamOf = (x) => x) => {
+        const moved = new Set(asTrack.map((d) => d.s.index));
+        const out = [];
+        for (const x of list) {
+            let at = out.length;
+            while (moved.has(streamOf(x).index) && at > 0 && codecTypeOf(streamOf(out[at - 1])) === 'attachment') at -= 1;
+            out.splice(at, 0, x);
+        }
+        return out;
     };
     const coverShownName = (it) => (logSafe(escMeta(it.name)) === logSafe(it.name) ? logSafe(it.name)
         : `${logSafe(it.name)}, written as ${logSafe(escMeta(it.name))}`);
     const matroskaCoverLog = (staged) => staged.kept.map((it) => `☐${streamTag(it.s.index)} ${it.track ? 'Turning the cover-art track back into'
         : 'Copying out the cover art to keep it as'} an attachment (${coverShownName(it)}) - read back after every track and attachment\n`).join('')
-        + [...staged.dropped.map((d) => ['Cover art dropped', d]), ...staged.asTrack.map((d) => ['The cover-art track stays a video track', d])]
+        + [...staged.dropped.map((d) => ['Cover art dropped', d]), ...staged.asTrack.map((d) => [d.track ? 'The cover-art track stays a video track'
+            : 'Cover art kept as a video track until a later remux can attach it again', d])]
             .map(([what, d]) => `☒${streamTag(d.s.index)} ${what} - ${COVER_LOST_WHY[d.why]}${d.detail ? ` (${d.detail})` : ''}\n`).join('');
     // ===== END SHARED: matroska cover keep =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 uncopyable streams =====
@@ -1291,9 +1341,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // image attachment as an attached_pic VIDEO stream - video/mjpeg, avg_frame_rate 0/0, probed last - so any video-typed stream in one is cover art. A
     // plain -c copy would write it back as a real V_MJPEG video TRACK, after which Tdarr reads the music file as a video and clean_and_remux renames it to
     // .mkv; a remux by these plugins keeps it an attachment only by copying the image out and attaching it again (matroskaCovers), which needs Tdarr's work
-    // directory and an extra ffmpeg run and drops the cover when either fails. A music file's cover is its one picture, so neither plugin puts it through
-    // that, and both refuse the file with the same words. An .mka Tdarr reads as a video - one carrying an earlier plain copy's cover TRACK - is not refused:
-    // it takes the video path, where a remux made anyway turns the track back into an attachment.
+    // directory and an extra ffmpeg run, and copies it as that video track when either fails. A music file's cover is its one picture, so neither plugin
+    // puts it through that, and both refuse the file with the same words. An .mka Tdarr reads as a video - one carrying an earlier plain copy's cover TRACK -
+    // is not refused: it takes the video path, where a remux made anyway turns the track back into an attachment.
     const mkaCarriesCoverArt = (container, streams) => container === 'mka' && (streams || []).some((s) => codecTypeOf(s) === 'video');
     const mkaCoverArtSkipLine = '☒[mka] This .mka carries cover art - left untouched, so a remux can never lose it\n';
     // ===== END SHARED: mka cover-art refusal =====
@@ -1748,9 +1798,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ===== SHARED [audio_clean, clean_and_remux]: language list match =====
     // -=-=-= langListMatch  [audio_clean, clean_and_remux] =-=-=-
-    // True when a stream's language matches any entry in a pre-normalised key list (keys = userList.map(langKey), computed once per run). Only these two
-    // plugins match a stream language against a user list; stream_ordering/sub_worker use langKey directly (indexOf / Set), so they carry langKey, not this.
-    const langListMatch = (streamLang, keys) => keys.includes(langKey(streamLang));
+    // True when a stream's language matches any entry in a pre-normalised key list (keys = userList.map(langMatchKey), computed once per run). Only these
+    // two plugins match through a key list; stream_ordering/sub_worker call langMatchKey directly (indexOf / Set), so they carry it, not this.
+    const langListMatch = (streamLang, keys) => keys.includes(langMatchKey(streamLang));
     // ===== END SHARED: language list match =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: language display name =====
@@ -2866,9 +2916,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // against their option sets by the table below; the two free-text language lists have no option set, so their tokens go through the language RECOGNISER
     // instead, right after the table. Every check fails the file on a bad value.
     const langStereo = splitList(inputs.language_stereo).map(lang => lang.toLowerCase());
-    const langStereoKeys = langStereo.map(langKey);         // normalised comparison keys (folds en/eng/english/en-US and 639-2/B vs /T)
+    const langStereoKeys = langStereo.map(langMatchKey);    // normalised comparison keys (folds en/eng/english/en-US, 639-2/B vs /T, nb/nn -> no)
     const langSurround = splitList(inputs.language_surround).map(lang => lang.toLowerCase());
-    const langSurroundKeys = langSurround.map(langKey);
+    const langSurroundKeys = langSurround.map(langMatchKey);
     const langUnlisted = ddValue(inputs.language_unlisted, 'surround');
     const codecForce = ddValue(inputs.codec_force, 'disabled');
     const codecStereo = ddValue(inputs.codec_stereo, 'aac');
@@ -3002,8 +3052,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // audio_clean-local IDENTITY key: like langKey but KEEPS the region/script subtag, so pt-BR and pt-PT are DISTINCT identities
         // (both survive dedup, each gets its own downmix) while eng/en/English/en-US still fold their BASE (eng==en, but en !=
-        // en-US). Used ONLY for dedup grouping and the one-downmix-per-language sets; all matching/filtering stays on the folded
-        // langKey. Non-language/untagged/malformed tokens fall back to langKey, so 'und' stays 'und' and the dedup exemption holds.
+        // en-US). Used ONLY for dedup grouping and the one-downmix-per-language sets; list matching stays on langMatchKey. Non-language/untagged/malformed
+        // tokens fall back to langKey, so 'und' stays 'und' and the dedup exemption holds.
         const langIdentityKey = (x) => {
             let s = String(x || '').trim().toLowerCase().replace(/[_.]/g, '-');
             if (!s) return '';
@@ -3040,9 +3090,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //Annotate each track with its secondary-role flag, language/dedup keys, tier, quality score, and the lossless/object-audio/matrix-surround flags
         audioStreams = audioStreams.map(stream => {
             const fullLang = resolveLang(stream) || 'und';
-            const cleanLang = langKey(fullLang);              // folded MATCH key (en/eng/english/en-US/pt-BR collapse): drives matching, tier, priority
+            const cleanLang = langKey(fullLang);              // folded key (en/eng/english/en-US/pt-BR collapse): the track's language for dedup and logs
+            const matchLang = langMatchKey(fullLang);         // the LIST key (also folds nb/nn into no): tier and priority
             // Dedup / one-downmix-per-language grouping key. method_dedup_region=distinct keeps the region/script subtag (pt-BR !=
-            // pt-PT, en-US != en); the default 'fold' reuses the folded match key so every regional variant collapses to one language.
+            // pt-PT, en-US != en); the default 'fold' reuses the folded langKey so every regional variant collapses to one language.
             const regionKey = methodDedupRegion === 'distinct' ? langIdentityKey(fullLang) : cleanLang;
             // Enrich with mediaInfo bitrate before audioQuality scoring so that formats like DTS-HD MA (which ffprobe can't read a bitrate for in MP4/M4V
             // containers) score and display correctly.
@@ -3056,8 +3107,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // role one, so an 'original' commentary still follows downmix_secondary.
             let tier;
             if (secondary) tier = downmixSecondary;
-            else if (langSurroundKeys.includes(cleanLang)) tier = 'surround';    // a language in BOTH lists is surround - this list wins the overlap
-            else if (langStereoKeys.includes(cleanLang)) tier = 'stereo';
+            else if (langSurroundKeys.includes(matchLang)) tier = 'surround';    // a language in BOTH lists is surround - this list wins the overlap
+            else if (langStereoKeys.includes(matchLang)) tier = 'stereo';
             else if (!hasWantedLang) tier = 'surround';                          // dormant - nothing the user asked for is present, so keep everything
             else if (guardOriginal === 'enabled' && hasDisposition(stream, 'original')) tier = 'surround';
             else tier = langUnlisted;
@@ -3065,6 +3116,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 awkSecondaryTrack: secondary,
                 awkTier: tier,
                 awkLangKey: cleanLang,
+                awkMatchKey: matchLang,
                 awkRegionKey: regionKey,
                 // Channel count as a testable NUMBER, 0 = no probe measured one. Read by the per-stream guards that must tell UNMEASURABLE from small -
                 // dedup, codec_force, loudnorm - which is what the 0 sentinel is for. The ambient `.channels` comparisons elsewhere (existing2ch/6chLangs,
@@ -3320,6 +3372,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Both are floored by countSurvivingAudio() > 1: no delete may ever leave the file with no audio. The channel clause is dropped when no probe
         // measured a count - enrichStream's fallback lands `undefined` for exactly those streams, and an unguarded interpolation renders "undefinedch".
         const delToken = (s) => `${codecDisplayName(s)}${s.channels > 0 ? ` ${s.channels}ch` : ''} ${langTok(s.awkLangKey)}`;
+        // The setting that put a track on a non-surround tier, so a log line names the input the user would go and change.
+        const tierTagOf = (s) => (s.awkSecondaryTrack ? `downmix_secondary=${downmixSecondary}`
+            : (langStereoKeys.includes(s.awkMatchKey) ? 'language_stereo' : `language_unlisted=${langUnlisted}`));
         // Language deletes resolve FIRST, BEFORE the layout-drop pre-pass: a track that is both unlisted and opus-hostile is then reported as the language
         // delete it is, and the pre-pass measures its never-empty floor against the survivors the user actually asked to keep. Reversed, a lone wanted-language
         // track with a hostile layout is dropped and the floor then spares the unlisted one - leaving the file holding only the language the user deleted.
@@ -3465,12 +3520,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .filter(s => !noCodecWorkNeeded(s));
 
         workStreams.sort((a, b) => {
-            // language priority: the languages the user most wants (language_surround), in the order they listed them. awkLangKey is the normalised key
+            // language priority: the languages the user most wants (language_surround), in the order they listed them. awkMatchKey is the normalised key
             // and langSurroundKeys the normalised user list, so en/eng/english all rank together. A stereo-tier or unlisted language ranks last.
             // The unlisted sentinel is the list LENGTH (past every real 0..length-1 index), so it can't collide with a real index on a huge free-text list -
             // matching stream_ordering's getLangRank.
-            const aLang = langSurroundKeys.indexOf(a.awkLangKey);
-            const bLang = langSurroundKeys.indexOf(b.awkLangKey);
+            const aLang = langSurroundKeys.indexOf(a.awkMatchKey);
+            const bLang = langSurroundKeys.indexOf(b.awkMatchKey);
 
             const aRank = aLang === -1 ? langSurroundKeys.length : aLang;
             const bRank = bLang === -1 ? langSurroundKeys.length : bLang;
@@ -4193,9 +4248,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // secondary track left at downmix_secondary=surround falls through untouched here (codec_force/method_loudnorm may still act on it further
                 // down). guard_lossless/guard_quality/guard_object_audio never protect a secondary or a non-surround-tier track (guardBlocks short-circuits
                 // false for them), so there is no guarded-source case here: the stereo tier always transcodes in place.
-                // Thread the setting that actually put this track on the stereo tier, so the log names the input the user would go change.
-                const tierTag = ffstream.awkSecondaryTrack ? `downmix_secondary=${downmixSecondary}`
-                    : (langStereoKeys.includes(ffstream.awkLangKey) ? 'language_stereo' : `language_unlisted=${langUnlisted}`);
+                const tierTag = tierTagOf(ffstream);
                 if (ffstream.awkTier === 'stereo' && !(ffstreamChannels > 0) && !modifiedAudioIdx.has(outputAudioIdx)) {
                     skipDone += noChannelCountSkip(ffstream.index, tierTag, "can't tell whether it needs the stereo downmix");
                 } else if (ffstream.awkTier === 'stereo' && ffstreamChannels > 2 && !modifiedAudioIdx.has(outputAudioIdx)
@@ -4692,6 +4745,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The Matroska covers the remux attaches again from a staged copy (stageMatroskaCovers), listed after everything else, attachments included - they
         // are attachment streams in the command, so they take no part in ffmpeg's default rule and come after readBackDispositions.
         let keptCovers = [];
+        // The covers the remux copies as tracks (stageMatroskaCovers' asTrack), placed where Matroska reads them back (coverTracksAsRead).
+        let coverTracks = [];
         // A source track as the remux leaves it when this run does not title it: a name the carry moves into the handler alone reads back as that handler
         // (mp4NameCarryView). Set where the preset is built, from the same mapped list and skip set as the carry.
         let carried = (s) => s;
@@ -4733,7 +4788,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
             }
             const mappedStreams = file.ffProbeData.streams.filter((s) => !removedIndices.has(s.index) && !unmapped.includes(s));
-            const ordered = mp4RebuiltLast(dstContainer, items, unmapped, mp4CreatedTracks(dstContainer, mappedStreams), (s) => ({ index: -1, stream: s }));
+            const ordered = coverTracksAsRead(mp4RebuiltLast(dstContainer, items, unmapped, mp4CreatedTracks(dstContainer, mappedStreams),
+                (s) => ({ index: -1, stream: s })), coverTracks, (t) => t.stream);
             return readBackDispositions(dstContainer, ordered, carriesDisposition(response.preset), (t) => t.stream, (t, s) => ({ ...t, stream: s }))
                 .map((t) => (t.index >= 0 ? { ...t, stream: carried(t.stream) } : t))
                 .concat(keptCovers.map((it) => ({ stream: keptCoverStream(it) })))
@@ -4748,11 +4804,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // use_metadata_tags, so mp4TagPlan sets it exactly when one is there; this plugin writes no global tag of its own. (Per-stream custom tags like
             // awk_loudnorm are NOT rescued by the flag, verified against the real mov muxer - why loudnorm caches on Matroska only; see loudnormTagPersists.)
             const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags);
-            const mp4KeepTags = tagPlan.flag ? ' -movflags use_metadata_tags' : '';
             const uncopyable = mp4UncopyableStreams(dstContainer, file.ffProbeData.streams);
             const staged = stageMatroskaCovers(dstContainer, matroskaCovers(dstContainer, file.ffProbeData.streams), file.file, otherArguments,
                 file.ffProbeData.streams);
             keptCovers = staged.kept;
+            coverTracks = staged.asTrack;
             // Every stream but a removed audio track, an uncopyable data track or a Matroska cover the remux attaches again or drops (stageMatroskaCovers,
             // which runs only for this remux) reaches the output, mp4 cover art included, the source's tracks in their own order; an appended downmix maps
             // after every one of them (attachLast maps the attachments after it), so the per-type order mp4TimecodeArgs and mp4NameCarryArgs key on holds.
@@ -4777,7 +4833,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const mapDrops = [...uncopyable, ...staged.leaveOut].map((s) => ` -map -0:${s.index}`).join('');
             response.preset += `<io>-map 0${mapDrops}${attachLast ? ' -map -0:t' : ''} -c copy${mp4NameCarryArgs(dstContainer, mapped, titleWrittenSrc)}`
                 + `${extraArguments}${attachLast ? ' -map 0:t?' : ''}${strictArg}${mp4TimecodeArgs(dstContainer, mapped)}`
-                + `${matroskaCoverArgs(staged.kept)}${globalOutputOpt}${mp4KeepTags}${outputMuxerArg(dstContainer)}`;
+                + `${matroskaCoverArgs(staged.kept)}${globalOutputOpt}${mp4MovflagsArg(dstContainer, tagPlan)}${outputMuxerArg(dstContainer)}`;
             response.infoLog += staleStatsNote(statsCleared);
             response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;
             response.processFile = true;

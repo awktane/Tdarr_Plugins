@@ -30,7 +30,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.75',
+    Version: '4.999.80',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -52,7 +52,8 @@ const details = () => ({
                 Text subtitles (subrip, srt, ass, ssa, webvtt, text, eia_608) become mov_text - except a STYLED ass/ssa, which is
                 exported as a font bundle rather than flattened.
                 HEVC video is tagged hvc1 - dvh1 for Dolby Vision Profile 5 - so Apple and QuickTime can play it.
-                A track name is kept in the track handler, the one place mp4 keeps it through a remux.`,
+                A track name is kept in the track handler, the one place mp4 keeps it through a remux. mp4 stores no original flag, so an audio track
+                flagged original gets "Original" added to its name.`,
         },
         {
             name: 'language_fill',
@@ -62,8 +63,9 @@ const details = () => ({
             tooltip: `Force this language onto audio and subtitle tracks that carry no language tag, or are tagged "und". Blank (default) leaves them as
                 they are.
                 \\nTakes precedence over language_sub when a track's language is blank or und.
-                \\nOne form is enough - en, eng, English or a BCP-47 tag like pt-BR all work; the form actually written follows method_tag_language and the
-                output container, so type the one that carries what you mean (only pt-BR keeps the region). Codes: https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes
+                \\nOne form is enough - en, eng, English or a BCP-47 tag like pt-BR all work; the form written follows method_tag_language and the output
+                container (eng into mkv and mp4 by default). A region such as pt-BR is kept only with method_tag_language=bcp47, or with tag_language=disabled,
+                on mkv - otherwise it is written as the language alone (por). Codes: https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes
                 \\nIt must be a REAL language: the special codes und, mul, zxx, mis and qaa-qtz are refused here, because they store as nothing and would
                 change which tracks survive without ever tagging one. To keep untagged tracks instead, leave this blank and list und in language_sub.
                 \\nExample:\\neng`,
@@ -117,7 +119,8 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\ndisabled (default): leave dispositions alone.
-                \\naudio: surface Commentary, Descriptive, Dub and Original on audio tracks.
+                \\naudio: surface Commentary, Descriptive, Dub and Original on audio tracks. mp4 stores no Original flag, so there that role stays in the
+                title.
                 \\nsubtitle: surface Commentary, Descriptive, SDH, Forced and Lyrics on subtitle tracks.
                 \\nboth: apply to audio and subtitle tracks.
                 \\nPair it with tag_title so title-only keywords reach the flags before the title is rebuilt. The default flag is untouched here - track
@@ -138,8 +141,8 @@ const details = () => ({
                 \\n=====
                 \\ninvalid (default): fix only the tags that are non-standard or would not survive the output container - spelled-out names, wrong case,
                 and 2-letter or region codes headed for mp4. Tags that already store cleanly (eng, or en/fre into mkv) are left alone.
-                \\nstrict: rewrite every language tag to the method_tag_language standard, valid ones included - en becomes eng, and fre/fra fold to your
-                chosen form.
+                \\nstrict: rewrite every language tag to the method_tag_language standard, valid ones included - by default en becomes eng, and fre/fra
+                fold to the container's form.
                 \\ndisabled: never change an existing language tag.
                 \\nWhy it matters: mp4 cannot store a 2-letter code and silently drops the language on remux, so an "en" track would come out with no
                 language at all. Undetermined and non-language codes (und, mul, zxx, mis) are always left untouched.`,
@@ -247,19 +250,20 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['container', '639-2/t', '639-2/b', 'bcp47'],
             },
-            tooltip: `Which language-code standard tag_language writes. Only takes effect while tag_language is not disabled, and you can still type any
-                form you like in the language lists regardless.
+            tooltip: `Which language-code standard is written: by tag_language when it rewrites a tag, and by language_fill in every tag_language mode (under
+                disabled, a fill's region is kept on mkv - see language_fill). You can still type any form you like in the language lists regardless.
                 \\n=====
                 \\nActions
                 \\n=====
-                \\ncontainer (default): give each container its native form - 2-letter (en, fr) for mkv, 3-letter terminologic (eng, fra) for mp4. The
-                most spec-accurate per container.
-                \\n639-2/t: terminologic 3-letter codes everywhere - fra, deu, zho. Matches mp4's mdhd box, and 3-letter is the common mkv convention too.
+                \\ncontainer (default): give each container the form its language field is specified to hold - 3-letter bibliographic (eng, fre, ger)
+                for mkv, as MKVToolNix writes it, and 3-letter terminologic (eng, fra, deu) for mp4's mdhd box.
+                \\n639-2/t: terminologic 3-letter codes everywhere - fra, deu, zho.
                 \\n639-2/b ("mkv classic"): bibliographic 3-letter codes everywhere - fre, ger, chi.
-                \\nbcp47: like container on mp4, but on mkv keeps the full BCP-47 tag - a region subtag such as pt-BR or es-419, or a script subtag such
-                as zh-Hans. mp4 cannot store a region, so there it still folds to 3-letter (por).
-                \\nThis mainly affects the ~20 languages that have two 3-letter codes (French fre/fra, German ger/deu), plus the 2-vs-3-letter choice. By
-                convention mkv uses ISO-639-2/B and mp4's mdhd box uses ISO-639-2/T, though both containers accept either.`,
+                \\nbcp47: like container on mp4, but on mkv writes the BCP-47 form - 2-letter (en, fr), keeping a region subtag such as pt-BR or es-419,
+                or a script subtag such as zh-Hans. ffmpeg stores it in mkv's ISO 639-2 language field, as it has no way to write the BCP-47 one, so
+                ffmpeg-based players such as Jellyfin, and MediaInfo, read pt-BR back, while MKVToolNix reads it as por. mp4 cannot store a region, so
+                there it still folds to 3-letter (por).
+                \\nThis mainly affects the ~20 languages that have two 3-letter codes (French fre/fra, German ger/deu), plus the 2-vs-3-letter choice.`,
         },
         {
             name: 'method_unmuxable',
@@ -302,7 +306,8 @@ const details = () => ({
                 \\ndisabled (default): no check. audio_clean handles whatever it finds.
                 \\nenabled: abort the file to the error queue when it carries MORE THAN ONE audio language among its genuine tracks (not commentary,
                 audio description, M&E or karaoke) and NO audio track is marked original - either the ffmpeg 'original' disposition flag or an
-                "original" keyword in the title or handler. Mark the original track and requeue; audio_clean's guard_original can then protect it.
+                "original" keyword in the title or handler. Mark the original track and requeue; audio_clean's guard_original can then protect it. mp4
+                cannot store the flag, so container=mp4 adds "Original" to the name of a track flagged original, where the role survives.
                 \\nWhy it is worth catching early: audio_clean is what keeps or drops audio by language, but it can only trust a track marked original -
                 it has no way to tell which of several untagged languages is the real one.
                 \\nLanguages are compared folded, so en/eng/English/en-US count as one, and an untagged track counts as whatever language_fill would give
@@ -417,6 +422,13 @@ const langKey = (x) => {
     if (s.length >= 4) { const code = langNameIndex(s); if (code) s = code; }   // spelled-out English name -> its code
     try { return shortLang(String(Intl.getCanonicalLocales(s)[0] || s).toLowerCase()); } catch (e) { return s; }
 };
+// -=-=-= langMatchKey  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
+// The key a user's language LIST is matched on, list side and track side alike: langKey plus the one macrolanguage fold ICU does not make. ICU keeps
+// Norwegian Bokmål (nb, nob) and Nynorsk (nn, nno) apart from Norwegian (no, nor) - measured on Tdarr's bundled Node 24.22.1, ICU 78.3 - so a list naming
+// Norwegian missed both, and nb-NO is the common streaming tag. List matching only: a tag WRITTEN, and one track compared with another (dedup, the
+// one-downmix-per-language sets, sidecar identity, language counts), stay on langKey and keep the two written standards apart - folded into langKey,
+// tag_language rewrote nob and nno to nor on an mkv -> mp4 conversion (measured).
+const langMatchKey = (x) => { const k = langKey(x); return (k === 'nb' || k === 'nn') ? 'no' : k; };
 // ===== END SHARED: language matching =====
 // #endregion
 
@@ -475,7 +487,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (16 sections: stream codec type … ffmpeg metadata escaping)
+    // #region SHARED helpers (18 sections: stream codec type … ffmpeg metadata escaping)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -615,7 +627,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // A secondary audio track is any commentary, visually-impaired/descriptive, music-and-effects (clean_effects) or karaoke track, by flag or title keyword
     // through the shared classifiers (lyrics is a subtitle-only role). None carries the dialogue a viewer picks a film's audio by, so none speaks for a
     // language: audio_clean keeps them out of the language tiers and the dedup groups, clean_and_remux's guard_audio_language does not count their
-    // languages, and stream_ordering never ranks one above a main track. One definition, so the three cannot disagree about which tracks those are.
+    // languages, and stream_ordering ranks one below every main track of its language - unless audio_first lifts it: descriptive_tagged lifts every
+    // descriptive track, original_tagged an original-flagged one - and gives it the sole default flag only when the file has no main track, or
+    // audio_first=descriptive_tagged leads with the description. One definition, so the three cannot disagree about which tracks those are.
     const isSecondaryTrack = (stream) => isCommentary(stream) || isDescriptive(stream)
         || hasDisposition(stream, 'clean_effects') || hasDisposition(stream, 'karaoke');
     // ===== END SHARED: secondary audio role =====
@@ -753,6 +767,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const dropped = markers.length ? [] : kept.map(([k]) => k)
             .filter((k) => !/^awk_/i.test(k) && !native.includes(k.toLowerCase()) && !MP4_REGENERATED_TAGS.includes(k.toLowerCase()));
         return { flag: markers.length > 0, markers, dropped };
+    };
+    // -=-=-= mp4MovflagsArg [all five] =-=-=-
+    // The one -movflags an mp4-family output carries, built in one place because a later -movflags without a leading + replaces the earlier value:
+    // use_metadata_tags where mp4TagPlan asks for it, and +faststart, which writes the moov - the file's index - ahead of the media, so a player starts and
+    // seeks on progressive download or remote direct play without fetching the tail first. Every mp4-family write the other four plugins make front-loads,
+    // so a file one of them remuxed reaches stream_ordering fronted and its method_mp4_faststart has no remux of its own to force; stream_ordering passes
+    // `faststart` false for that input's strip, and only it ever remuxes for the flag alone. It moves the moov and nothing else (packets, tags, chapters, tmcd
+    // tracks, covers and Dolby Vision boxes read back identical; mediaInfo's IsStreamable turns Yes) by writing the whole file once more at the end of the
+    // mux: 0.2-1.2x a plain -c copy remux's wall time (CPU-saturated to idle M1, 291 MB to 2.5 GB, jellyfin 7.1.4, 2026-11-09).
+    const mp4MovflagsArg = (container, plan, faststart = true) => {
+        const flags = `${plan.flag ? 'use_metadata_tags' : ''}${faststart && isMp4Family(container) ? '+faststart' : ''}`;
+        return flags ? ` -movflags ${flags}` : '';
     };
     // -=-=-= isMp4Cover (+ mp4CoversLost) [all five] =-=-=-
     // A cover the mp4/mov muxer stores as an iTunes covr atom rather than as a track: a video stream whose ONLY disposition is attached_pic, the muxer's own
@@ -954,6 +980,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // natively, so each "does this survive a remux" test starts here - and each consumer keeps its own measurement of the property it relies on.
     const isMatroskaFamily = (container) => ['mkv', 'mka', 'mks', 'webm'].includes(String(container || '').toLowerCase());
     // ===== END SHARED: matroska-family container =====
+    // ===== SHARED [clean_and_remux, stream_ordering]: mpeg ts/ps container =====
+    // -=-=-= isMpegTsPsFamily  [clean_and_remux, stream_ordering] =-=-=-
+    // The extensions ffmpeg demuxes as MPEG-TS (ts/m2ts/mts/m2t/tp/trp/tod) or MPEG-PS (mpg/mpeg/vob/evo/m2p/vro/mod/dat), grouped by DEMUXER FAMILY, not
+    // spelling: file.container is only the lowercased extension, and ffmpeg picks its demuxer by probing content. Broadcast timestamps in either family
+    // cannot be remuxed as they stand, so clean_and_remux regenerates them on every remux of one, and the duration such an original states can be far from
+    // what it holds (stream_ordering's truncation check). Not hypothetical: identical MPEG-PS bytes named .vob hard-fail a bare -c copy remux ("Can't write
+    // packet with unknown timestamp", exit -22) while the same bytes named .mpg are repaired - and vob/evo/m2ts are in Tdarr's DEFAULT containerFilter. The
+    // bar is every real spelling of the family, not Tdarr's defaults, all measured on the production build (.dat is a VCD's AVSEQnn.DAT); a new one goes
+    // here, in the family it demuxes as.
+    const isMpegTsPsFamily = (container) => ['ts', 'm2ts', 'mts', 'm2t', 'tp', 'trp', 'tod', 'mpg', 'mpeg', 'vob', 'evo', 'm2p', 'vro', 'mod', 'dat']
+        .includes(String(container || '').toLowerCase().trim());
+    // ===== END SHARED: mpeg ts/ps container =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: read-back dispositions =====
     // -=-=-= carriesDisposition (+ readBackDispositions) [all five] =-=-=-
     // Whether an output's command writes any -disposition at all (readBackDispositions' `manual`).
@@ -984,10 +1022,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!mp4) return out;
         // The mov muxer writes every video stream but a cover as an ordinary track, read back with no attached_pic, still_image or timed_thumbnails flag
         // (attached_pic+default, attached_pic+timed_thumbnails - a QuickTime chapter-image track - still_image and timed_thumbnails alike, in mjpeg and png),
-        // so there only an image codec still reads as cover art.
+        // so there only an image codec still reads as cover art. It stores no original flag either: a copied one and a +original write both read back 0
+        // (audio and subtitle, mp4, m4v and mov; measured 2026-11-09 on jellyfin 7.1.4), so the role survives only as a title keyword.
         const COVER_FLAGS = ['attached_pic', 'still_image', 'timed_thumbnails'];
-        return out.map((x) => (codecTypeOf(streamOf(x)) === 'video' && !isMp4Cover(streamOf(x)) && COVER_FLAGS.some((k) => streamOf(x).disposition?.[k] === 1)
-            ? flagged(x, Object.fromEntries(COVER_FLAGS.map((k) => [k, 0]))) : x));
+        return out.map((x) => {
+            const d = streamOf(x).disposition || {};
+            const cover = codecTypeOf(streamOf(x)) === 'video' && !isMp4Cover(streamOf(x)) && COVER_FLAGS.some((k) => d[k] === 1);
+            if (!cover && d.original !== 1) return x;
+            return flagged(x, { ...(cover ? Object.fromEntries(COVER_FLAGS.map((k) => [k, 0])) : {}), ...(d.original === 1 ? { original: 0 } : {}) });
+        });
     };
     // ===== END SHARED: read-back dispositions =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream / language / preset helpers =====
@@ -1229,9 +1272,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ===== SHARED [audio_clean, clean_and_remux]: language list match =====
     // -=-=-= langListMatch  [audio_clean, clean_and_remux] =-=-=-
-    // True when a stream's language matches any entry in a pre-normalised key list (keys = userList.map(langKey), computed once per run). Only these two
-    // plugins match a stream language against a user list; stream_ordering/sub_worker use langKey directly (indexOf / Set), so they carry langKey, not this.
-    const langListMatch = (streamLang, keys) => keys.includes(langKey(streamLang));
+    // True when a stream's language matches any entry in a pre-normalised key list (keys = userList.map(langMatchKey), computed once per run). Only these
+    // two plugins match through a key list; stream_ordering/sub_worker call langMatchKey directly (indexOf / Set), so they carry it, not this.
+    const langListMatch = (streamLang, keys) => keys.includes(langMatchKey(streamLang));
     // ===== END SHARED: language list match =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: dolby vision detection =====
@@ -1250,6 +1293,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : [])
             .some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
+    // ===== SHARED [clean_and_remux, stream_ordering, video_clean]: dolby vision record =====
+    // -=-=-= doviRecord  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // The stream's Dolby Vision configuration record as ffprobe reports it, or undefined.
+    const doviRecord = (s) => (Array.isArray(s?.side_data_list) ? s.side_data_list : [])
+        .find((sd) => /dovi configuration record/i.test(String(sd?.side_data_type || '')));
+    // -=-=-= dvRecordSurvivesCopy  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // Whether a -c copy keeps the stream's Dolby Vision record (true with none), the fourcc aside: jellyfin's muxers check the base layer's pixel format and
+    // colour against the compat id (its ff_isom_validate_dovi_config) and drop a record that fails under ANY fourcc, mkv to mkv included, so any remux costs
+    // such a stream its Dolby Vision. Matched the copy on all 17 measured sources (P5, P7, P8.1, P8.2, P8.4, P20 from Dolby, ffmpeg, mkvmerge, MP4Box and an
+    // iPhone-style mov). Compat 0's fourcc condition is dvNeedsDvFourcc's (hevc copy fourcc). Read by clean_and_remux's convert gate, hevcCopyPlan's
+    // Matroska arm and stream_ordering's faststart hold.
+    const dvRecordSurvivesCopy = (s) => {
+        const id = String(doviRecord(s)?.dv_bl_signal_compatibility_id ?? '');
+        const p10 = s.pix_fmt === 'yuv420p10le';
+        const hdr = (trc) => p10 && s.color_transfer === trc && s.color_primaries === 'bt2020' && s.color_space === 'bt2020nc' && s.color_range === 'tv';
+        return id === '0' ? p10 : id === '1' || id === '6' ? hdr('smpte2084') : id === '2' ? s.pix_fmt === 'yuv420p' : id === '4' ? hdr('arib-std-b67') : true;
+    };
+    // ===== END SHARED: dolby vision record =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
     // -=-=-= mp4StrictArg [all five] =-=-=-
     // The ' -strict <level>' an mp4/mov -c copy needs, or '' when it needs none. Two independent reasons share one flag, because `experimental` is a strict
@@ -1281,25 +1342,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // in the samples (Dolby's own P5 and P8.1 mp4s, every mkv made from them, GPAC's xps_inband). ffprobe prints the size whenever there is extradata, and
     // Tdarr 3.04's scan removes only the `extradata` hex (tdarr_core remove_ffprobe_extradata), so the size reaches a plugin.
     const HVCC_HEADER_BYTES = 23;
-    // -=-=-= doviRecord (+ dvNeedsDvFourcc)  [clean_and_remux, video_clean] =-=-=-
-    // The stream's Dolby Vision configuration record as ffprobe reports it, or undefined.
-    const doviRecord = (s) => (Array.isArray(s?.side_data_list) ? s.side_data_list : [])
-        .find((sd) => /dovi configuration record/i.test(String(sd?.side_data_type || '')));
+    // -=-=-= dvNeedsDvFourcc  [clean_and_remux, video_clean] =-=-=-
     // A record naming no compatible base (compatibility id 0: Profile 5). jellyfin's muxers write a compat-0 record's box only under a dvh1/dvhe fourcc or no
     // tag at all (its ff_isom_validate_dovi_config), so under hev1 or hvc1 the stream silently becomes plain HEVC whose IPT colour every player shows wrong.
     // Every other compat id is checked against the stream's colour instead, under any fourcc.
     const dvNeedsDvFourcc = (s) => String(doviRecord(s)?.dv_bl_signal_compatibility_id) === '0';
-    // -=-=-= dvRecordSurvivesCopy  [clean_and_remux, video_clean] =-=-=-
-    // Whether a -c copy keeps the stream's Dolby Vision record (true with none), the fourcc aside: jellyfin's muxers check the base layer's pixel format and
-    // colour against the compat id (its ff_isom_validate_dovi_config) and drop a record that fails under ANY fourcc, mkv to mkv included, so any remux costs
-    // such a stream its Dolby Vision. Matched the copy on all 17 measured sources (P5, P7, P8.1, P8.2, P8.4, P20 from Dolby, ffmpeg, mkvmerge, MP4Box and an
-    // iPhone-style mov). Compat 0's fourcc condition is dvNeedsDvFourcc's. Read by clean_and_remux's convert gate and hevcCopyPlan's Matroska arm.
-    const dvRecordSurvivesCopy = (s) => {
-        const id = String(doviRecord(s)?.dv_bl_signal_compatibility_id ?? '');
-        const p10 = s.pix_fmt === 'yuv420p10le';
-        const hdr = (trc) => p10 && s.color_transfer === trc && s.color_primaries === 'bt2020' && s.color_space === 'bt2020nc' && s.color_range === 'tv';
-        return id === '0' ? p10 : id === '1' || id === '6' ? hdr('smpte2084') : id === '2' ? s.pix_fmt === 'yuv420p' : id === '4' ? hdr('arib-std-b67') : true;
-    };
     // -=-=-= firstKeyParamSets  [clean_and_remux, video_clean] =-=-=-
     // Whether the first KEYFRAME of an HEVC stream carries VPS, SPS and PPS: true / false / null (not read). It is the packet the mov muxer builds an hvcC
     // from once hevc_mp4toannexb has emptied the extradata - a -c copy drops every packet before the first keyframe, and this read is a -c copy too, so it
@@ -1420,8 +1467,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     const fillLanguage = (inputs.language_fill ? inputs.language_fill.toLowerCase().trim() : '');
     const subLanguages = splitList(inputs.language_sub).map(lang => lang.toLowerCase());
-    // Pre-normalise the user language list to comparison keys once (langKey folds en/eng/english/en-US and 639-2/B vs /T) - the filter matches against these.
-    const subLangKeys = subLanguages.map(langKey);
+    // Pre-normalise the user language list to comparison keys once (langMatchKey folds en/eng/english/en-US, 639-2/B vs /T and nb/nn -> no) - the filter
+    // matches against these.
+    const subLangKeys = subLanguages.map(langMatchKey);
     const fillMode = ddValue(inputs.language_fill_mode, 'single-or-error');
     const removeSubSdh = ddValue(inputs.remove_sub_sdh, 'disabled');
     const tagLanguage = ddValue(inputs.tag_language, 'invalid');
@@ -1490,7 +1538,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     checkLangLists([['language_sub', subLanguages]]);
     // If fillLanguage is set it should be a subtitle that's kept. (There is no audio equivalent: audio_clean owns audio language, and it reads the tag
     // this plugin has already written rather than language_fill itself, so there is nothing here to cross-check against.)
-    if(fillLanguage && subLanguages.length > 0 && !subLangKeys.includes(langKey(fillLanguage)))
+    if(fillLanguage && subLanguages.length > 0 && !subLangKeys.includes(langMatchKey(fillLanguage)))
         failFile(`[language_fill=${logSafe(fillLanguage)}] not in language_sub - untagged subtitle streams would be removed;`
             + ' add it to language_sub or clear language_fill');
     // Every dropdown's accepted set, as ONE table driving the shared checkDropdowns loop. The shape matters beyond the line count:
@@ -1545,7 +1593,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Write-side helpers: this is the only plugin that WRITES container language tags via tag_language/language_fill; langKey/langListMatch
     // (matching) are shared, the ISO639_2_B/toCanonicalTag write-side logic below is clean_and_remux-only. Verified on this build: mp4's
     // mdhd stores only a lowercase 3-letter ISO 639-2 code (2-letter / uppercase / region are silently dropped, so a plain mkv->mp4 remux
-    // of an "en"-tagged stream loses its language), mkv stores any recognised code; und/mul/zxx/mis are never rewritten.
+    // of an "en"-tagged stream loses its language), mkv stores any code verbatim in its ISO 639-2 Language element (see toCanonicalTag); und/mul/zxx/mis
+    // are never rewritten.
     // The 20 languages whose 639-2/B (bibliographic) code differs from /T above, keyed by 639-1. method_tag_language=639-2/b uses these; /t uses the table.
     const ISO639_2_B = {
         sq:'alb',hy:'arm',eu:'baq',bo:'tib',my:'bur',zh:'chi',cs:'cze',nl:'dut',ka:'geo',de:'ger',el:'gre',is:'ice',mk:'mac',mi:'mao',ms:'may',
@@ -1572,10 +1621,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!t) return key;
             return wantB ? (ISO639_2_B[key] || t) : t;
         };
-        // mp4 can store only a 3-letter code, so both container-aware modes fold to 639-2/T there. On mkv, bcp47 keeps a region/script subtag (pt-BR) and
-        // container keeps the bare 2-letter BCP-47 form (region folded away). The remaining modes write one 3-letter form to either container.
+        // mp4 can store only a 3-letter code, so both container-aware modes write 639-2/T there. On mkv, container writes 639-2/B - what Matroska's
+        // Language element is specified to hold, and what mkvmerge writes - while bcp47 writes the BCP-47 form, keeping a region/script subtag (pt-BR).
+        // ffmpeg writes either into that same ISO 639-2 element and never the LanguageBCP47 one: ffprobe and MediaInfo read pt-BR back, mkvmerge reads
+        // it as por and a bare en as eng (measured 2026-11-09 on jellyfin 7.1.4 and mkvmerge 103.0). The other modes write one 3-letter form anywhere.
         if (methodTagLanguage === 'bcp47')     return dstContainer === 'mp4' ? threeLetter(false) : (canonicalRegionTag(x) || key);
-        if (methodTagLanguage === 'container') return dstContainer === 'mp4' ? threeLetter(false) : key;
+        if (methodTagLanguage === 'container') return threeLetter(dstContainer !== 'mp4');
         return threeLetter(methodTagLanguage === '639-2/b');
     };
     // True when an already-present tag stores cleanly in dstContainer AS a recognised code (drives tag_language=invalid: leave these, fix the rest).
@@ -1587,7 +1638,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // (invalid keeps the region and canonicalises it, strict enforces the method form). mp4 falls through and folds any region tag to 639-2/T.
         if (dstContainer !== 'mp4' && /[-_.]/.test(s)) return canonicalRegionTag(s) === s;
         if (s !== s.toLowerCase()) return false;                    // uppercase -> mp4 drops it / non-standard casing -> fix
-        return dstContainer === 'mp4' ? /^[a-z]{3}$/.test(s) : /^[a-z]{2,3}$/.test(s);   // mp4 needs lowercase 3-letter; mkv keeps a bare 2/3-letter code
+        // mp4 needs lowercase 3-letter. mkv keeps a bare 2/3-letter code: every reader takes a 2-letter one (mkvmerge reads en as eng), so only strict
+        // rewrites it into the container form.
+        return dstContainer === 'mp4' ? /^[a-z]{3}$/.test(s) : /^[a-z]{2,3}$/.test(s);
     };
     // A blank/und stream adopts language_fill when filling is allowed for that stream. fillLanguage is validated above to be a real language, so there is no
     // non-language case left to exclude here. Single predicate so the language the remove_sub_sdh pre-check filters on (resolveWorkLang) and the tag
@@ -1608,7 +1661,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (filled) {
             // A fill is a WRITE of a NEW tag, never a preserved user tag, so it is ALWAYS canonicalised - tag_language=disabled means "don't rewrite EXISTING
             // tags", not "write an unrecognised string into a blank one" (language_fill accepts a spelled-out "English", which Matroska's Language element
-            // cannot store as a code). mkv keeps a valid region/script subtag so a pt-BR fill survives (as the repair branch does); mp4 folds it away.
+            // cannot store as a code). Under disabled, mkv keeps a valid region/script subtag (pt-BR); every other mode, and mp4, writes the method's form.
             desired = (tagLanguage !== 'disabled' || dstContainer === 'mp4')
                 ? toCanonicalTag(fillLanguage)
                 : (canonicalRegionTag(fillLanguage) || toCanonicalTag(fillLanguage));
@@ -3785,10 +3838,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if(rebuilt !== newStreamTitle) { newStreamTitle = rebuilt; titleCauses.push(`tag_title=${tagTitle}`); }
                 }
 
+                // mp4 stores no original flag (readBackDispositions), so there the role lives on only as a title keyword - which every classifier reads
+                // too (hasDisposition), guard_audio_language and audio_clean's guard_original included. A flagged track whose written title lacks one gets
+                // it, in the role-suffix form canonicalAudioTitle writes, and Expected results read the role from that title (clearedRolePrediction). The
+                // title alone is tested: an mkv DESCRIPTION does not survive the remux into mp4 (measured 2026-11-09 on jellyfin 7.1.4).
+                const originalByTitle = dstContainer === 'mp4' && ffstream.disposition?.original === 1;
+                if (originalByTitle && !roleFieldsOf([newStreamTitle]).some((t) => matchesKeyword(t, dispositionTypes.original.keywords))) {
+                    newStreamTitle = newStreamTitle ? `${newStreamTitle} - Original` : 'Original';
+                    titleCauses.push(`container=${dstContainer}`);
+                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Naming the original-language role in the audio title - mp4 stores`
+                        + ' no original flag, so the title keyword is what keeps it\n';
+                }
+
                 emitTitleMeta('a', audioOutOrdinal, 'audio', streamTitle, newStreamTitle, titleCauses);
 
                 preserveClearedRoles('a', audioOutOrdinal, 'audio', newStreamTitle, titleCauses,
                     emitHandlerMeta('a', audioOutOrdinal, 'audio', 'SoundHandler', newStreamTitle));
+                if (originalByTitle && !clearedRolePrediction.has(ffstream.index)) {
+                    clearedRolePrediction.set(ffstream.index, { adds: appliesToType(tagDisposition, 'audio') ? dispositionsToPromote(ffstream, 'audio') : [],
+                        roleFields: survivingRoleFields(ffstream, newStreamTitle) });
+                }
 
                 emitCommentRemoval('a', audioOutOrdinal, 'audio');
 
@@ -4022,14 +4091,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             workDone += `☐[recover_bad_timestamps=${recoverTs}] Regenerating missing PTS and shifting negative start times to zero\n`;
         }
 
-        // Grouped by DEMUXER FAMILY, not extension spelling - ffmpeg picks its demuxer by probing content, while file.container is just the lowercased
-        // extension. mpegts = ts/m2ts/mts/m2t/tp/trp/tod · MPEG-PS = mpg/mpeg/vob/evo/m2p/vro/mod/dat · avi. Add a new spelling to the family it demuxes as.
-        // Not hypothetical: identical MPEG-PS bytes named .vob hard-fail a bare -c copy remux ("Can't write packet with unknown timestamp", exit -22)
-        // while the same bytes named .mpg are repaired here - and vob/evo/m2ts are in Tdarr's DEFAULT containerFilter, so a bare remux of those spellings
-        // happens with no setting changed. The bar is "every real spelling of the family", not Tdarr's defaults; all measured on the production build (.dat
-        // is a VCD's AVSEQnn.DAT).
-        if (['ts', 'm2ts', 'mts', 'm2t', 'tp', 'trp', 'tod',
-            'mpg', 'mpeg', 'vob', 'evo', 'm2p', 'vro', 'mod', 'dat', 'avi'].includes(srcContainer)) {   // container-forced timestamp fix (always applied)
+        // MPEG-TS and MPEG-PS by demuxer family (isMpegTsPsFamily has the spellings and the .vob measurement), and AVI.
+        if (isMpegTsPsFamily(srcContainer) || srcContainer === 'avi') {   // container-forced timestamp fix (always applied)
             const genptsAlreadySet = fflags.includes('genpts');
             if(!genptsAlreadySet)
                 fflags += '+genpts';
@@ -4089,7 +4152,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // flag costs the native tags their readable form (mp4TagPlan). This plugin runs first, so a marker it drops is gone before the plugin that
             // wrote it re-reads it (sub_worker's sidecar-delete would then find no marker). Cover art never reaches the output here, so none is passed.
             const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, globalWrites);
-            if (tagPlan.flag) extraArguments += ' -movflags use_metadata_tags';
+            extraArguments += mp4MovflagsArg(dstContainer, tagPlan);
             workDone += mp4TagPlanLog(tagPlan, dstContainer);
             // The ' -strict <level>' this remux needs, or '' (see mp4StrictArg): TrueHD already living in an mp4-family file and re-muxed back into one
             // would see the very remux the muxability gate allowed FAIL without it, and a Dolby Vision stream would lose its dvcC/dvvC boxes to a plain mp4
