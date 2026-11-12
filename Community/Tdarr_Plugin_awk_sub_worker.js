@@ -43,7 +43,7 @@ const details = () => ({
                 stream_ordering (last). If the file has embedded closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that
                 destroys them. Extract with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since
                 the sidecars would land beside the source, where the output never sees them.`,
-    Version: '3.999.93',
+    Version: '3.999.94',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -3153,10 +3153,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const cueTextKey = (text, ext) => crypto.createHash('sha1').update(cueTexts(text, ext).join('\n\n')).digest('hex');
     // How many cues show a viewer any text - the count a sidecar and what ffmpeg kept of it are compared on (deletionLoss). Tags (<i>, <font>) and {\...}
     // overrides are taken out first, and a cue left with nothing is not counted on either side: ffmpeg drops an empty srt cue on the way in, mov_text also
-    // one holding only tags, and keeps an empty ass Dialogue and an empty WebVTT cue (measured on 7.1.4) - none of which shows anything on screen. What an
-    // empty WebVTT cue costs in Matroska is the cues after it (deletionLoss). Each pattern stops at the next bracket of its own kind, so the scan stays
-    // linear on untrusted text.
+    // one holding only tags, it keeps an empty ass Dialogue (measured on 7.1.4), and the import leaves an empty WebVTT cue out of Matroska
+    // (VTT_EMPTY_CUE_DROP) - none of which shows anything on screen. Each pattern stops at the next bracket of its own kind, so the scan stays linear on
+    // untrusted text.
     const textCueCount = (text, ext) => cueTexts(text, ext).filter((t) => t.replace(/<[^<>]*>|\{[^{}]*\}/g, '').trim()).length;
+    // How many cues of WebVTT text ffmpeg's reader turns into a zero-byte packet, the ones VTT_EMPTY_CUE_DROP leaves out: a timing line with no text line
+    // after it - the next line empty or the end of the file, a line ending at CR, LF or CRLF. Measured on 7.1.4 with LF and CRLF, with and without a cue
+    // id or settings; a cue of spaces or &nbsp; is text to it and stays. A file whose lines end at CR alone is over-counted: that reader does not end a
+    // cue at a blank line made of CR alone, so it merges such cues into the one before.
+    const emptyVttCueCount = (text) => {
+        const lines = String(text).split(/\r\n|\r|\n/);
+        return lines.filter((line, i) => line.includes('-->') && !lines[i + 1]).length;
+    };
 
     // Does decoded subtitle text contain any actual CUES? Only srt writes a genuinely 0-byte file when it has nothing to say - webvtt still writes its WEBVTT
     // header and ass its whole [Script Info]/[V4+ Styles] preamble - so a size test alone would call an empty ass track populated. Both timed formats mark
@@ -3258,6 +3266,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     noCues: hasNoCues(text, f.ext),
                     loss: importLosses(text, f.ext),
                     cues: textCueCount(read.text, f.ext),
+                    // ffmpeg picks its WebVTT reader by CONTENT, whatever the name: WEBVTT after an optional UTF-8 BOM, then a space, tab, line break or
+                    // the end of the file (webvtt_probe, 7.1) - so a WebVTT saved as .srt is read, and counted, as one.
+                    emptyVttCues: /^WEBVTT(?:[ \t\r\n]|$)/.test(text.slice(text.charCodeAt(0) === 0xfeff ? 1 : 0, 8)) ? emptyVttCueCount(read.text) : 0,
                     unreadable,
                 };
             }
@@ -3389,6 +3400,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return cueLossCache.get(index) || null;
     };
 
+    // Every loose text sidecar goes into Matroska through this filter, which drops zero-byte packets - the empty WebVTT cues, which show nothing - and
+    // leaves every other byte alone: cue ids, settings and voice tags included. ffmpeg 7.1's Matroska muxer stores an empty cue as a block with nothing
+    // after its id and settings lines (two bytes, 0a0a, when it has neither), and its demuxer refuses that block and then skips the REST OF ITS CLUSTER on
+    // every stream read with it, the video and audio included (FFmpeg fixed the demuxer in 8.0, commit a79720e1; jellyfin 7.1.4 does not carry it).
+    // Measured on 7.1.4: a 6 s file read whole gave 62 of 150 video and 110 of 260 audio packets, and the next -map 0 remux kept only those; a per-stream
+    // read (-select_streams) still saw them all, so nothing that probes one stream shows it. A cue of spaces or &nbsp; is not empty and reads back fine.
+    // It goes on every text sidecar, not only a .vtt, because ffmpeg reads a file as WebVTT by its content (sidecarContent), whatever it is called; the srt
+    // and ass readers make no zero-byte packet, so on them it changes nothing (byte-identical tracks, measured). The drop option needs FFmpeg 5.0 or later,
+    // and an older ffmpeg fails the import loudly. mp4 converts to mov_text and needs nothing.
+    const VTT_EMPTY_CUE_DROP = 'noise=drop=not(size)';
+
     // A sidecar's identity as the IMPORT will store it: the sidecar alone, muxed into the target's container the way the import mux does it (copied into
     // Matroska, converted to mov_text for mp4) and extracted back through TEXT_SUB like every embedded track. Its own text cannot stand in for that: ffmpeg
     // re-serialises far more than subTextForHash undoes - trimmed spaces, sorted cues, rewritten timestamps, a dropped vtt header, ass Comment lines moved,
@@ -3396,7 +3418,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // sidecar. Re-serialised by ffmpeg itself, the two sides match by construction: on jellyfin-ffmpeg 7.1.4 this matched the real import's embedded copy
     // on all 34 shapes tried (17 srt/vtt/ass/ssa sidecars x mkv/mp4). The container step is required - decoding and re-encoding with none differed for
     // mov_text on 2 of them. Two short ffmpeg runs, memoised per target; null when either fails, and callers then have the sidecar's own text alone.
-    // roundTripCues keeps, per target, how many text-bearing cues came back (textCueCount), for deletionLoss.
+    // roundTripCues keeps, per target, how many text-bearing cues came back (textCueCount), for deletionLoss. Into Matroska the sidecar is copied through
+    // VTT_EMPTY_CUE_DROP, as the import copies it.
     const roundTripMemo = new Map(); const roundTripCues = new Map();
     const sidecarRoundTripHash = (f, mp4) => {
         const key = `${mp4 ? 'mp4' : 'mkv'}|${f.rel}`;
@@ -3413,7 +3436,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const out = path.join(dir, `rt.${enc.ext}`);
         try {
             let r = ff(['-sub_charenc', 'UTF-8', '-i', libPathOf(f.rel), '-map', '0:0', '-c:s', mp4 ? 'mov_text' : 'copy',
-                '-f', mp4 ? 'mp4' : 'matroska', mux]);
+                ...(mp4 ? [] : ['-bsf:s:0', VTT_EMPTY_CUE_DROP]), '-f', mp4 ? 'mp4' : 'matroska', mux]);
             if (!r.error && r.status === 0) r = ff(['-i', mux, '-map', '0:s:0', '-c:s', enc.enc, '-fs', String(SIDECAR_HASH_MAX + 1), out]);
             if (!r.error && r.status === 0 && fs.statSync(out).size <= SIDECAR_HASH_MAX) {
                 const back = fs.readFileSync(out);
@@ -3463,9 +3486,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // remove_source deletes a sidecar only when nothing is lost by it. A 'text' match proves the file holds the whole subtitle; a 'roundtrip' match only
     // that it holds what the import kept, so a sidecar the import strips stays, and this names what deleting it would cost ('' = safe to delete). The
     // round trip reads the sidecar as the import does, so a cue ffmpeg cannot read is missing from both sides of that match - the count of text-bearing
-    // cues is what shows it. Measured on 7.1.4, each short on both sides: a Windows-1252 cue (into mkv and mp4), every cue after a NUL, and into Matroska
-    // every WebVTT cue after an empty one in the same cluster - the muxer stores the empty cue as a 2-byte block and ffmpeg's Matroska demuxer skips the
-    // rest of that cluster, the file's video and audio with it (mp4 keeps them).
+    // cues is what shows it. Measured on 7.1.4, each short on both sides: a Windows-1252 cue (into mkv and mp4) and every cue after a NUL.
     const deletionLoss = (f, how, mp4) => {
         if (how !== 'roundtrip') return '';
         const own = sidecarContent(f);
@@ -5716,6 +5737,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!surviving) return false;
             return f.bundle ? bundleInFile(f, surviving.values()) === false : !sidecarMatch(f, isMp4, surviving.values());
         };
+        // A .vtt an EARLIER sub_worker imported into this Matroska file went in with its empty cues, as blocks ffmpeg 7.1 refuses (VTT_EMPTY_CUE_DROP): the
+        // cues after each one in its cluster were lost with the video and audio, so its track is short of the sidecar and the group arrives here, neither
+        // settled nor found in the file. Importing it again would add a second copy, and like any remux make the loss permanent where FFmpeg 8 can still
+        // repair it; calling it removed would be false. So it is named, with the check and the repair, and not imported - its marker entry is carried
+        // (priorStillPresent). The evidence costs no read of the video: the marker names it, its track is still there by metadata (alreadyEmbedded; one
+        // removed since is goneSinceImport's), its text is unchanged since that import by the marker's hash (an edit is a real arrival), and it holds an
+        // empty cue. An entry with no hash (a file version 3.46.0 imported) cannot tell an edit from the original, so that sidecar is imported as any
+        // arrival is. This version's own Matroska import leaves those cues out, so its track matches and never arrives here; a .vtt imported into mp4
+        // and converted to mkv afterwards does arrive, and gets the same line although that file lost nothing. Only a .vtt: a WebVTT under another name
+        // never matches its own track however it was imported (the round trip reads it back by its name's codec), so arriving here says nothing.
+        const cutByEarlierImport = (f) => f.ext === 'vtt' && isMatroskaFamily(dstContainer) && sidecarContent(f)?.emptyVttCues > 0
+            && f.members.every((m) => alreadyEmbedded(m) && unchangedSinceImport(m));
+        for (let k = toMux.length - 1; k >= 0; k -= 1) {
+            const f = toMux[k];
+            if (!cutByEarlierImport(f)) continue;
+            toMux.splice(k, 1);
+            const n = sidecarContent(f).emptyVttCues;
+            response.infoLog += `☒${logSafe(f.rel)} was imported into this file by an earlier sub_worker version with ${n} empty WebVTT cue${
+                n === 1 ? '' : 's'}, after each of which ffmpeg 7.1 skips a few seconds of the video and audio, and any remux makes that permanent - not`
+                + " importing it again, and the sidecar stays; while Tdarr's ffprobe (7.1), with -count_packets, reads fewer video packets with every"
+                + ' stream than with -select_streams v:0 alone, FFmpeg 8 or later still repairs it losslessly, until anything remuxes the file: ffmpeg -i'
+                + ` FILE -map 0 -c copy -bsf:s 'noise=drop=not(size)' FIXED.${dstContainer}\n`;
+        }
         // The marker is written whole, so a removal the guard upholds survives only while its entry does: every marker rebuilt below carries goneRels, or
         // the first pass with other work to do (a new sidecar, a retune, a dedup drop) would erase it and the next pass would import the subtitle again.
         const goneRels = [];
@@ -5851,6 +5895,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (f.disp.length) meta += ` -disposition:s:${outIdx} ${f.disp.join('+')}`;
                 else if (f.bundle) meta += ` -disposition:s:${outIdx} 0`;
                 if (isMp4) meta += ` -c:s:${outIdx} mov_text`;
+                // On the sidecar's own output slot, the one -metadata:s:s above names: ffmpeg ignores a -bsf specifier that matches no stream, silently.
+                const dropsEmptyCues = !f.bundle && isMatroskaFamily(dstContainer);
+                if (dropsEmptyCues) meta += ` -bsf:s:${outIdx} ${VTT_EMPTY_CUE_DROP}`;
                 // Report EVERY flag being restored, the pre-language ones included - they are the whole reason that slot exists, and a line naming only the
                 // roles would say "(chi forced)" while writing forced+original, or nothing at all for a sidecar carrying visual_impaired alone.
                 const flagsBack = f.dispTokens.concat(f.extraTokens || []);
@@ -5861,6 +5908,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (f.members.length > 1) response.infoLog += `☑[deduplicate=${dedupeMode}] Deduplicated ${f.members.length} byte-identical sidecars -> ${
                     f.rel} (${f.lang}${flagText})\n`;
                 response.infoLog += `☐Import ${f.rel} -> subtitle ${outIdx} (${f.lang}${flagText})${restoreFonts ? ' and its bundled font attachments' : ''}\n`;
+                const emptyCues = dropsEmptyCues ? sidecarContent(f)?.emptyVttCues : 0;
+                if (emptyCues) {
+                    response.infoLog += `☐Leaving ${emptyCues} empty cue${emptyCues === 1 ? '' : 's'} of ${logSafe(f.rel)} out of subtitle ${outIdx}`
+                        + ` - an empty WebVTT cue shows nothing, and in ${dstContainer} ffmpeg 7.1 skips the next few seconds of video and audio after one\n`;
+                }
             });
             // Consumed = every sidecar this pass accounted for, INCLUDING the ones already in the file. They are not muxed, but their content is provably
             // embedded, so listing them is what lets remove_source clear them alongside the rest once the transcode is accepted.
