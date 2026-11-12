@@ -19,14 +19,14 @@ const details = () => ({
         through a reorder remux, listed after every track and attachment, and a cover-art video track an earlier plain copy left is turned back into one;
         .webm stores no attachments, so there the remux leaves the cover out and the log says so. A file with nothing else to change keeps it untouched, and
         a .mov carrying cover art, which a .mov remux cannot write back, is not remuxed only to front-load it or strip its tags.\n\nBecause it runs last
-        it also checks the finished file's duration against the library original,
-        and FAILS (rather than accepts) a file that has come out more than 1% SHORT, or that reports no duration at all where the original had one - the
+        it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file that has come out
+        more than 1% and more than a second SHORT, or that reports no duration at all where the original had one - the
         signature of an out-of-memory-killed or unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's
         recover_bad_* repaired in the same job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual
         review rather than failed. The same goes for a broadcast .ts or .mpg capture remuxed to mkv or mp4 in the same job with its video copied, not
         re-encoded: a capture whose timestamps jump or reset states a longer length than it holds. A later job on that file is checked in full again. This
         check is always on and has no setting.\n`,
-    Version: '4.999.57',
+    Version: '4.999.58',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -197,8 +197,8 @@ const details = () => ({
                 first time a file arrives back-loaded (detected without decoding) - in a full awk stack, only a file no plugin before it remuxed. An
                 already-fronted file is left untouched, so this settles after one pass and never loops. A file whose Dolby Vision record no ffmpeg copy
                 keeps (one whose colour does not match its compatibility id) or whose cover art a remux would drop (any .mov - its muxer stores none) stays
-                back-loaded rather than be remuxed for this alone. A Profile 5 (compatibility id 0) record under the hev1 or hvc1 tag is not held back,
-                and that remux drops it.
+                back-loaded rather than be remuxed for this alone, and so does one with a Profile 5 (compatibility id 0) record under the hev1 or hvc1 tag,
+                which a copy keeps only under a Dolby Vision tag - clean_and_remux gives it one on a remux that also front-loads it.
                 \\nstrip: never front-load. A remux this plugin makes for another reason - reordering, the default flag or remove_junk_tags - writes the
                 moov atom at the END, the mov muxer's default, so a front-loaded file it remuxes comes out back-loaded; it never remuxes for this alone.
                 Only pick this if you never stream this library remotely.`,
@@ -328,7 +328,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (27 sections: stream codec type … mp4 strict compliance arg)
+    // #region SHARED helpers (28 sections: stream codec type … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -422,7 +422,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         roleFieldCache.set(s, fields);
         return fields;
     };
-    // -=-=-= keywordRegex / matchesKeyword [all five] =-=-=-
+    // -=-=-= ROLE_NEGATORS / keywordRegex / matchesKeyword [all five] =-=-=-
+    // A keyword naming a role the track lacks does not match: one with a negator word one to three non-alphanumerics before it ('English (Non-SDH)', 'No
+    // Commentary', 'ohne Kommentar' - the languages the keywords serve), or '-free'/'-less' after it ('commentary-free'). Read as the role, the Non-SDH
+    // subtitle is what remove_sub_sdh deletes and the main 'No Commentary' track what downmix_secondary=delete removes.
+    const ROLE_NEGATORS = ['non', 'no', 'not', 'without', 'ohne', 'sans', 'sin', 'sem', 'senza', 'zonder', 'bez', 'uten', 'utan', 'uden', 'ilman'];
     // The whole-token regex for a keyword list: a keyword matches only when not flanked by a letter/digit - '[sdh]', 'eng-sdh', 'sdh.' match, 'deafening' does
     // not - and an internal space matches any run of non-alphanumerics ('hearing impaired' == 'hearing_impaired'). It is case-sensitive, so the text must
     // already be lowercased. A pure function of the list, so memoized by keyword-array identity rather than recompiled per classifier call; the mov cut
@@ -439,7 +443,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const pattern = keywords
                 .map((k) => k.trim().split(/\s+/).map((token, i) => (i ? gapBefore(token) : '') + esc(token)).join(''))
                 .join('|');
-            re = new RegExp(`(?<![\\p{L}\\p{N}])(?:${pattern})(?![\\p{L}\\p{N}])`, 'u');
+            // The negator test (ROLE_NEGATORS) is bounded, so its lookbehind costs the same at every offset of a title nothing caps.
+            const negated = `(?<!(?<![\\p{L}\\p{N}])(?:${ROLE_NEGATORS.join('|')})[^\\p{L}\\p{N}]{1,3})`;
+            re = new RegExp(`(?<![\\p{L}\\p{N}])${negated}(?:${pattern})(?![\\p{L}\\p{N}])(?!-(?:free|less)(?![\\p{L}\\p{N}]))`, 'u');
             keywordRegexCache.set(keywords, re);
         }
         return re;
@@ -2133,6 +2139,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
     };
     // ===== END SHARED: track title carry =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mov language table =====
+    // -=-=-= MOV_LANG  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // mov is the exception to writing a language into the output container (mp4 stores only lowercase 3-letter /T, mkv keeps the raw spelling). The QuickTime
+    // muxer does not store the letters: mov_write_mdhd_tag looks the code up in ffmpeg's legacy Macintosh language table and writes 0x7fff ("unspecified") on
+    // a miss, which the demuxer then excludes - so the track reads back with NO language at all, exit 0 and no warning from either side. That table predates
+    // ISO 639-2/T and spells 15 of the 20 dual-spelling languages the /B way, so their /T spelling is precisely the one mov throws away (measured on
+    // jellyfin-ffmpeg 7.1.4: nld/deu/zho land 0x7fff, dut/ger/chi land a real code; 106 of the 184 codes to6392T can emit are dropped). It spells four of
+    // the others the /T way, so their /B spellings map back (fre -> fra, cze -> ces, rum -> ron, slo -> slk), and Maori has no row, as the table holds
+    // it under no code. Each row maps a spelling the muxer drops to the one it stores for the same language. Anyone extending this must re-measure against
+    // the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a safe source. mp4/m4v/m4a pack the letters directly and keep either
+    // spelling, which is why this is mov-only. Null-prototype so a container tag spelling an Object.prototype member ('constructor', '__proto__') misses the
+    // table instead of resolving an inherited function.
+    const MOV_LANG = Object.assign(Object.create(null), { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
+        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel', fre: 'fra', cze: 'ces', rum: 'ron', slo: 'slk' });
+    // -=-=-= movLangRespellArgs  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The language writes a remux into .mov owes the tracks it copies or re-encodes: a .mov another tool wrote can hold a spelling the table lacks
+    // (AVFoundation stores deu and nld), which the copy would lose, so each such language goes back in MOV_LANG's spelling and nothing else is touched (a
+    // census of 400 spellings on jellyfin-ffmpeg 7.1.4: the muxer drops every key and stores every value). Matched by the language itself - the output stream
+    // specifier m:language:<code> - so no output index is needed; a track whose language a run writes itself gets the same spelling (movLangCode).
+    const movLangRespellArgs = (container, streams) => (container !== 'mov' ? '' : [...new Set(streams.map((s) => getTagCI(s?.tags, 'language')))]
+        .filter((l) => MOV_LANG[l]).map((l) => ` -metadata:s:m:language:${l} language=${MOV_LANG[l]}`).join(''));
+    // ===== END SHARED: mov language table =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: free-text list split =====
     // -=-=-= splitList  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
@@ -2198,7 +2226,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Whether a -c copy keeps the stream's Dolby Vision record (true with none), the fourcc aside: jellyfin's muxers check the base layer's pixel format and
     // colour against the compat id (its ff_isom_validate_dovi_config) and drop a record that fails under ANY fourcc, mkv to mkv included, so any remux costs
     // such a stream its Dolby Vision. Matched the copy on all 17 measured sources (P5, P7, P8.1, P8.2, P8.4, P20 from Dolby, ffmpeg, mkvmerge, MP4Box and an
-    // iPhone-style mov). Compat 0's fourcc condition is dvNeedsDvFourcc's (hevc copy fourcc). Read by clean_and_remux's convert gate, hevcCopyPlan's
+    // iPhone-style mov). Compat 0's fourcc condition is dvNeedsDvFourcc's (below). Read by clean_and_remux's convert gate, hevcCopyPlan's
     // Matroska arm and stream_ordering's faststart hold.
     const dvRecordSurvivesCopy = (s) => {
         const id = String(doviRecord(s)?.dv_bl_signal_compatibility_id ?? '');
@@ -2206,6 +2234,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const hdr = (trc) => p10 && s.color_transfer === trc && s.color_primaries === 'bt2020' && s.color_space === 'bt2020nc' && s.color_range === 'tv';
         return id === '0' ? p10 : id === '1' || id === '6' ? hdr('smpte2084') : id === '2' ? s.pix_fmt === 'yuv420p' : id === '4' ? hdr('arib-std-b67') : true;
     };
+    // -=-=-= dvNeedsDvFourcc  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // A record naming no compatible base (compatibility id 0: Profile 5). jellyfin's muxers write a compat-0 record's box only under a dvh1/dvhe fourcc or no
+    // tag at all (its ff_isom_validate_dovi_config), so under hev1 or hvc1 the stream silently becomes plain HEVC whose IPT colour every player shows wrong.
+    // Every other compat id is checked against the stream's colour instead, under any fourcc.
+    const dvNeedsDvFourcc = (s) => String(doviRecord(s)?.dv_bl_signal_compatibility_id) === '0';
     // ===== END SHARED: dolby vision record =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
     // -=-=-= mp4StrictArg [all five] =-=-=-
@@ -2382,6 +2415,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // quarantine a correctly repaired file and send the user hunting an OOM kill that never happened. An over-length alarm, if ever wanted, needs its own
         // branch and its own wording - none of the text below is true of it. The SHORTER case a broken source produces is tsPsRemux below.
         const DURATION_TOLERANCE_PCT = 1;
+        // ...and the shortfall must also exceed one second. One frame is more than 1% of a clip under about 4 s at 24 fps, and a remux can lose one: a real
+        // HandBrake 3 s mp4 remuxed to mkv reads 98.6% of its length (jellyfin-ffmpeg 7.1.4, MediaInfoLib 23.07), which 1% alone fails on every requeue.
+        const DURATION_SHORTFALL_MIN_SEC = 1;
         // A track cannot outlast the container holding it, so a perTrack reading longer than its own file's container duration is a stale statistics
         // tag, not a length: mkvmerge writes DURATION per track, a later cut by another tool copies it unchanged, and MediaInfo 23.07 reports the tag as
         // the track's Duration. Tdarr refreshes those tags only when its server-wide "Run mkvpropedit on files before running plugins" is on - off by
@@ -2454,8 +2490,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
             if (verdict) {
                 const pct = (verdict.now / verdict.old) * 100;
-                if (pct < 100 - DURATION_TOLERANCE_PCT) {
-                    const shorter = `output duration ${verdict.now.toFixed(1)} s is ${pct.toFixed(1)}% of the original ${verdict.old.toFixed(1)} s`;
+                if (pct < 100 - DURATION_TOLERANCE_PCT && verdict.old - verdict.now > DURATION_SHORTFALL_MIN_SEC) {
+                    // Under 1% the share takes two significant digits, so a timestamp reset (20 s of a stated 95,253.7 s) does not print as 0.0%
+                    const pctText = pct < 1 ? pct.toPrecision(2) : pct.toFixed(1);
+                    const shorter = `output duration ${verdict.now.toFixed(1)} s is ${pctText}% of the original ${verdict.old.toFixed(1)} s`;
                     const compared = `(compared using ${verdict.name})`;
                     if (!recovered && tsPsRemux) {
                         response.infoLog += `☒${durTag}${shorter}, but the .${originalContainer} original was remuxed in this job with its video`
@@ -2875,11 +2913,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // method_mp4_faststart=force front-loads the mp4 moov atom. +faststart rides every remux this plugin emits (mp4MovflagsArg), but a file already in
         // order is skipped, so a back-loaded one (moovBeforeMdat, fail-safe, defined just above) forces a one-time remux of its own - it settles after one
         // pass and never loops. Not on a video whose Dolby Vision record no -c copy keeps (dvRecordSurvivesCopy): clean_and_remux holds such a file back from
-        // a remux for the same reason, so it arrives here back-loaded, and a remux made only to move the moov would cost it the record. A remux made for
-        // anything else still front-loads it.
+        // a remux for the same reason, so it arrives here back-loaded, and a remux made only to move the moov would cost it the record. Nor on a Profile 5
+        // record under a fourcc that is not Dolby Vision's (dvNeedsDvFourcc), which a copy keeps only under one: mainline ffmpeg's -c copy -strict unofficial
+        // writes such a file back-loaded under hev1 (measured on 9.0.2), and clean_and_remux retags it. A remux made for anything else still front-loads it.
         const faststartOn = methodMp4Faststart === 'force';
         const backLoaded = faststartOn && isMp4Family(dstContainer) && !moovBeforeMdat(file.file, otherArguments);
-        const frontHeldBy = backLoaded ? file.ffProbeData.streams.filter((s) => !dvRecordSurvivesCopy(s)) : [];
+        const wantsDvFourcc = (s) => dvNeedsDvFourcc(s) && !DV_FOURCC_RE.test(String(s.codec_tag_string || '').toLowerCase().trim());
+        const frontHeldBy = backLoaded ? file.ffProbeData.streams.filter((s) => !dvRecordSurvivesCopy(s) || wantsDvFourcc(s)) : [];
         const needsFront = backLoaded && !frontHeldBy.length;
         // ====== END MOOV / FASTSTART PROBE ======
 
@@ -2896,7 +2936,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // The lines a Dolby Vision hold (frontHeldBy) leads either skip below with, so a file force leaves back-loaded says why.
         const heldLines = frontHeldBy.map((s) => `☑${streamTag(s.index)}[method_mp4_faststart=${methodMp4Faststart}] Left as it is - a remux to front-load the`
-            + " moov atom would drop this video's Dolby Vision record, which no ffmpeg remux keeps\n").join('');
+            + ` moov atom would drop this video's Dolby Vision record, ${wantsDvFourcc(s) ? 'which a copy keeps only under a Dolby Vision fourcc'
+                : 'which no ffmpeg remux keeps'}\n`).join('');
         if (!orderChanged && dispositionArgs === '' && !needsFront && junkArgs === '') return skip(`${heldLines}☑Streams already in desired order\n`);
         // An mp4-family -c copy keeps a sibling's custom GLOBAL marker (clean_and_remux's awk_recovered, set upstream) only under use_metadata_tags, so
         // mp4TagPlan sets it exactly when one is there - dropping it would re-trigger that plugin's work.
@@ -2967,7 +3008,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // after every real video, and into the mp4 family after every track (isCovrRow).
         const outStreams = [...mappedRows, ...asTrackRows].map((r) => r.stream);
         response.infoLog += mp4NameCarryLog(dstContainer, outStreams);
-        response.preset = `<io>${ffmpegMap} -c copy${dispositionArgs}${autoDefaultPin}${junkArgs}${strictArg}${mp4TimecodeArgs(dstContainer, outStreams)}`
+        response.preset = `<io>${ffmpegMap} -c copy${dispositionArgs}${autoDefaultPin}${junkArgs}${movLangRespellArgs(dstContainer, outStreams)}${strictArg}`
+            + `${mp4TimecodeArgs(dstContainer, outStreams)}`
             + `${mp4NameCarryArgs(dstContainer, outStreams)}${matroskaCoverArgs(staged.kept)}${globalOutputOpt}`
             + `${mp4MovflagsArg(dstContainer, tagPlan, faststartOn)}${outputMuxerArg(dstContainer)}`;
         const mapped = file.ffProbeData.streams.filter((s) => !uncopyable.includes(s) && !staged.leaveOut.includes(s));

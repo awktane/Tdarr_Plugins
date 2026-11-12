@@ -43,7 +43,7 @@ const details = () => ({
                 stream_ordering (last). If the file has embedded closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that
                 destroys them. Extract with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since
                 the sidecars would land beside the source, where the output never sees them.`,
-    Version: '3.999.97',
+    Version: '3.999.98',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -54,13 +54,16 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['import', 'extract'] },
             tooltip: `Which direction to run. Either way remove_source decides whether the source copy is deleted once the content is confirmed at the
-                other end - it defaults to on, so by default a subtitle MOVES rather than being copied.
+                other end - it defaults to on, so by default a subtitle MOVES rather than being copied. Either way a file holding a subtitle track ffmpeg
+                names no codec for (a WebVTT track mkvmerge wrote) stops with a line naming it when the pass has something to write, since ffmpeg cannot
+                copy that track; a pass with nothing to write leaves the file alone.
                 \\n=====
                 \\nActions
                 \\n=====
                 \\nextract: pull embedded text subtitles out of the video into sidecar files beside it.
                 \\nimport: mux sidecar files sitting beside the video back into it. A sidecar ffmpeg cannot read whole (a legacy character set such as
-                Windows-1252) stays on disk with a line saying so; save it as UTF-8 to import it. A sidecar it imported that something later removed from
+                Windows-1252) stays on disk with a line saying so; save it as UTF-8 to import it. So does one it cannot read at all - an empty .srt or
+                .ass, or an srt whose cues have no numbers - while the others still go in. A sidecar it imported that something later removed from
                 the file - clean_and_remux's language_sub or remove_sub_sdh, say - is not imported again, and stays on disk; rename it to bring it back.
                 Matching only_languages to language_sub skips that one wasted import.`,
         },
@@ -155,7 +158,7 @@ const details = () => ({
                 sees - set false there.
                 \\ntrue (default) on IMPORT - delete each sidecar once its text is confirmed to be one of the embedded subtitles. A sidecar the import could
                 only store in part is kept, and the log says what was dropped: cues that did not make it into the file, a WebVTT's positioning, styling or
-                voice tags, or an ASS/SSA - or an srt's font and {\\an8} overrides - going into an mp4.
+                voice tags, or an ASS/SSA - or an srt's font and {\\an8} overrides, or the timing of cues that overlap - going into an mp4.
                 \\nfalse - keep both copies: nothing leaves the video on extract, and no sidecar is deleted on import.
                 \\nWhen import deletes: add this plugin to the stack ONCE. It declares no Stage, so Tdarr runs that same entry again after you accept the
                 transcode, and that pass deletes the sidecars the job embedded - deleting sooner would destroy the sidecars of a run you then reject. A second
@@ -184,7 +187,8 @@ const details = () => ({
                 \\nembedded (default) - leave the track as it is and report the difference. The safe choice with an older sidecar name: a name written
                 before a flag existed carries no token for it, and applying it would strip that flag off a track that has it.
                 \\nsidecar - the filename wins, so renaming a sidecar retunes the track already in the file - language, title and flags, including clearing
-                flags you took out of the name. Use it when you renamed a sidecar deliberately; it costs one remux of the file.`,
+                flags you took out of the name. A name with no title or no language keeps the track's own, so a name can set or change either but never
+                erase it. Use it when you renamed a sidecar deliberately; it costs one remux of the file.`,
         },
         {
             name: 'method_unmapped',
@@ -442,7 +446,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         roleFieldCache.set(s, fields);
         return fields;
     };
-    // -=-=-= keywordRegex / matchesKeyword [all five] =-=-=-
+    // -=-=-= ROLE_NEGATORS / keywordRegex / matchesKeyword [all five] =-=-=-
+    // A keyword naming a role the track lacks does not match: one with a negator word one to three non-alphanumerics before it ('English (Non-SDH)', 'No
+    // Commentary', 'ohne Kommentar' - the languages the keywords serve), or '-free'/'-less' after it ('commentary-free'). Read as the role, the Non-SDH
+    // subtitle is what remove_sub_sdh deletes and the main 'No Commentary' track what downmix_secondary=delete removes.
+    const ROLE_NEGATORS = ['non', 'no', 'not', 'without', 'ohne', 'sans', 'sin', 'sem', 'senza', 'zonder', 'bez', 'uten', 'utan', 'uden', 'ilman'];
     // The whole-token regex for a keyword list: a keyword matches only when not flanked by a letter/digit - '[sdh]', 'eng-sdh', 'sdh.' match, 'deafening' does
     // not - and an internal space matches any run of non-alphanumerics ('hearing impaired' == 'hearing_impaired'). It is case-sensitive, so the text must
     // already be lowercased. A pure function of the list, so memoized by keyword-array identity rather than recompiled per classifier call; the mov cut
@@ -459,7 +467,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const pattern = keywords
                 .map((k) => k.trim().split(/\s+/).map((token, i) => (i ? gapBefore(token) : '') + esc(token)).join(''))
                 .join('|');
-            re = new RegExp(`(?<![\\p{L}\\p{N}])(?:${pattern})(?![\\p{L}\\p{N}])`, 'u');
+            // The negator test (ROLE_NEGATORS) is bounded, so its lookbehind costs the same at every offset of a title nothing caps.
+            const negated = `(?<!(?<![\\p{L}\\p{N}])(?:${ROLE_NEGATORS.join('|')})[^\\p{L}\\p{N}]{1,3})`;
+            re = new RegExp(`(?<![\\p{L}\\p{N}])${negated}(?:${pattern})(?![\\p{L}\\p{N}])(?!-(?:free|less)(?![\\p{L}\\p{N}]))`, 'u');
             keywordRegexCache.set(keywords, re);
         }
         return re;
@@ -1760,7 +1770,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: iso639-1 to iso639-2 map =====
     // #endregion
 
-    // #region SHARED helpers (1 section: mov language remap)
+    // #region SHARED helpers (2 sections: mov language table … mov language remap)
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mov language table =====
+    // -=-=-= MOV_LANG  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // mov is the exception to writing a language into the output container (mp4 stores only lowercase 3-letter /T, mkv keeps the raw spelling). The QuickTime
+    // muxer does not store the letters: mov_write_mdhd_tag looks the code up in ffmpeg's legacy Macintosh language table and writes 0x7fff ("unspecified") on
+    // a miss, which the demuxer then excludes - so the track reads back with NO language at all, exit 0 and no warning from either side. That table predates
+    // ISO 639-2/T and spells 15 of the 20 dual-spelling languages the /B way, so their /T spelling is precisely the one mov throws away (measured on
+    // jellyfin-ffmpeg 7.1.4: nld/deu/zho land 0x7fff, dut/ger/chi land a real code; 106 of the 184 codes to6392T can emit are dropped). It spells four of
+    // the others the /T way, so their /B spellings map back (fre -> fra, cze -> ces, rum -> ron, slo -> slk), and Maori has no row, as the table holds
+    // it under no code. Each row maps a spelling the muxer drops to the one it stores for the same language. Anyone extending this must re-measure against
+    // the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a safe source. mp4/m4v/m4a pack the letters directly and keep either
+    // spelling, which is why this is mov-only. Null-prototype so a container tag spelling an Object.prototype member ('constructor', '__proto__') misses the
+    // table instead of resolving an inherited function.
+    const MOV_LANG = Object.assign(Object.create(null), { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
+        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel', fre: 'fra', cze: 'ces', rum: 'ron', slo: 'slk' });
+    // -=-=-= movLangRespellArgs  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The language writes a remux into .mov owes the tracks it copies or re-encodes: a .mov another tool wrote can hold a spelling the table lacks
+    // (AVFoundation stores deu and nld), which the copy would lose, so each such language goes back in MOV_LANG's spelling and nothing else is touched (a
+    // census of 400 spellings on jellyfin-ffmpeg 7.1.4: the muxer drops every key and stores every value). Matched by the language itself - the output stream
+    // specifier m:language:<code> - so no output index is needed; a track whose language a run writes itself gets the same spelling (movLangCode).
+    const movLangRespellArgs = (container, streams) => (container !== 'mov' ? '' : [...new Set(streams.map((s) => getTagCI(s?.tags, 'language')))]
+        .filter((l) => MOV_LANG[l]).map((l) => ` -metadata:s:m:language:${l} language=${MOV_LANG[l]}`).join(''));
+    // ===== END SHARED: mov language table =====
+
     // ===== SHARED [audio_clean, sub_worker]: mov language remap =====
     // -=-=-= to6392T  [audio_clean, sub_worker] =-=-=-
     // Fold a language token to a lowercase 3-letter ISO 639-2/T code: langKey folds spelled names and 639-2/B onto the 2-letter key, which ISO639_1_TO_2 maps
@@ -1768,19 +1801,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // sidecar import (mdhd stores only /T) and the mov remap below - and it is the fold MOV_LANG expects. Mirrors clean_and_remux's toCanonicalTag
     // threeLetter(false).
     const to6392T = (lang) => { const key = langKey(lang); if (!key || key.length !== 2) return lang; return ISO639_1_TO_2[key] || lang; };
-    // -=-=-= MOV_LANG (+ movLangCode)  [audio_clean, sub_worker] =-=-=-
-    // mov is the exception to writing a language into the output container (mp4 stores only lowercase 3-letter /T, mkv keeps the raw spelling). The QuickTime
-    // muxer does not store the letters: mov_write_mdhd_tag looks the code up in ffmpeg's legacy Macintosh language table and writes 0x7fff ("unspecified") on
-    // a miss, which the demuxer then excludes - so the track reads back with NO language at all, exit 0 and no warning from either side. That table predates
-    // ISO 639-2/T and spells 15 of the 20 dual-spelling languages the /B way, so to6392T's /T output is precisely the spelling mov throws away (measured on
-    // jellyfin-ffmpeg 7.1.4: nld/deu/zho land 0x7fff, dut/ger/chi land a real code; 106 of the 184 codes to6392T can emit are dropped). ces/ron/slk/fra are
-    // deliberately ABSENT - QuickTime spells those four the /T way and remapping them would break what works - and mri is absent because the table has no
-    // Maori under any code. Anyone extending this must re-measure against the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a
-    // safe source. mp4/m4v/m4a pack the letters directly and keep either spelling, which is why this is mov-only. movLangCode folds to /T then remaps:
-    // audio_clean on an audio language write, sub_worker on a subtitle language write. Null-prototype so a container tag spelling an Object.prototype member
-    // ('constructor', '__proto__') misses the table and falls through to the pass-through instead of resolving an inherited function.
-    const MOV_LANG = Object.assign(Object.create(null), { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
-        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel' });
+    // -=-=-= movLangCode  [audio_clean, sub_worker] =-=-=-
+    // A language a run writes into a .mov: folded to /T, then to the spelling the mov table stores (MOV_LANG) - audio_clean on an audio language write,
+    // sub_worker on a subtitle language write.
     const movLangCode = (lang) => { const t = to6392T(lang); return MOV_LANG[t] || t; };
     // ===== END SHARED: mov language remap =====
     // #endregion
@@ -3254,9 +3277,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // Whether decoded text holds a NUL beside other text: ffmpeg's text reader ends the subtitle at a NUL (measured on 7.1.4: one in an srt's second cue
     // imports the first cue alone) and cannot open UTF-16 without the mark, so such a file is never empty, never matched by its text, and never deleted
-    // or written over; under remove_source=true it is not taken by its name either, except at the current name on the file API, judged by size alone.
-    // Text of NULs and whitespace alone holds nothing, as a 0-byte file does, and is empty.
+    // or written over; under remove_source=true it is not taken by its name either. Text of NULs and whitespace alone holds nothing, as a 0-byte file does,
+    // and is empty.
     const unreadableText = (text) => text.includes('\0') && /[^\0\s]/.test(text);
+    // Whether any two cues of srt or vtt text overlap in time: each timing line's two stamps, sorted by start, every start tested against the latest end
+    // before it. One anchored pattern per line, as cueSpan reads them.
+    const cuesOverlap = (text) => {
+        const cues = [];
+        for (const line of String(text).split(/\r\n|\r|\n/)) {
+            const m = /^[ \t]*((?:\d+:)?\d{1,2}:\d{1,2}[.,]\d{1,3})[ \t]*-->[ \t]*((?:\d+:)?\d{1,2}:\d{1,2}[.,]\d{1,3})/.exec(line);
+            if (m) cues.push([hmsSeconds(m[1]), hmsSeconds(m[2])]);
+        }
+        cues.sort((a, b) => a[0] - b[0]);
+        let end = -Infinity;
+        return cues.some(([start, stop]) => { const over = start < end; end = Math.max(end, stop); return over; });
+    };
     // What importing a sidecar provably DROPS, so remove_source never deletes the only complete copy (deletionLoss). Measured on jellyfin-ffmpeg 7.1.4 by
     // muxing each shape into mkv and mp4 and extracting it back. Into Matroska an srt or ass/ssa survives whole - spaces, timestamp spelling, cue order,
     // tag case and Comment placement are re-serialised, nothing visible changes - but a WebVTT loses its cue settings (align/position/line), STYLE and
@@ -3282,6 +3317,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         let mp4 = any;
         if (!mp4) mp4 = ext === 'ass' ? 'its ASS styling' : ((/<font\b/i.test(text) || text.includes('{\\')) ? 'its font and positioning overrides' : '');
+        // mov_text shows one cue at a time, so each cue ends where the next one starts (measured on 7.1.4: a sign held from 0.5 to 4.0 s over two lines of
+        // speech came back ending at 1.0 s, its text and the cue count unchanged).
+        if (!mp4 && cuesOverlap(text)) mp4 = 'the timing of its overlapping cues';
         return { any, mp4 };
     };
 
@@ -3465,8 +3503,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // on all 34 shapes tried (17 srt/vtt/ass/ssa sidecars x mkv/mp4). The container step is required - decoding and re-encoding with none differed for
     // mov_text on 2 of them. Two short ffmpeg runs, memoised per target; null when either fails, and callers then have the sidecar's own text alone.
     // roundTripCues keeps, per target, how many text-bearing cues came back (textCueCount), for deletionLoss. Into Matroska the sidecar is copied through
-    // VTT_EMPTY_CUE_DROP, as the import copies it.
-    const roundTripMemo = new Map(); const roundTripCues = new Map();
+    // VTT_EMPTY_CUE_DROP, as the import copies it. roundTripRefused keeps the targets whose mux ffmpeg ran and refused (sidecarMuxRefused).
+    const roundTripMemo = new Map(); const roundTripCues = new Map(); const roundTripRefused = new Set();
     const sidecarRoundTripHash = (f, mp4) => {
         const key = `${mp4 ? 'mp4' : 'mkv'}|${f.rel}`;
         if (roundTripMemo.has(key)) return roundTripMemo.get(key);
@@ -3483,6 +3521,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         try {
             let r = ff(['-sub_charenc', 'UTF-8', '-i', libPathOf(f.rel), '-map', '0:0', '-c:s', mp4 ? 'mov_text' : 'copy',
                 ...(mp4 ? [] : ['-bsf:s:0', VTT_EMPTY_CUE_DROP]), '-f', mp4 ? 'mp4' : 'matroska', mux]);
+            if (!r.error && typeof r.status === 'number' && r.status !== 0) roundTripRefused.add(key);
             if (!r.error && r.status === 0) r = ff(['-i', mux, '-map', '0:s:0', '-c:s', enc.enc, '-fs', String(SIDECAR_HASH_MAX + 1), out]);
             if (!r.error && r.status === 0 && fs.statSync(out).size <= SIDECAR_HASH_MAX) {
                 const back = fs.readFileSync(out);
@@ -3492,6 +3531,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         } catch (e) { /* no round-trip identity - callers fall back to the sidecar's own text */ }
         try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
         return roundTripMemo.get(key);
+    };
+    // Whether ffmpeg ran the round trip's mux - the import's own mux of this sidecar, alone - and refused it, so importing it would fail the whole run: a
+    // file none of ffmpeg's subtitle readers opens (measured on 7.1.4, exit 183: a 0-byte or blank srt, a 0-byte ass, an srt whose cues have no numbers). A
+    // round trip that could not be made (no temp dir, a spawn error or timeout, a bundle) refuses nothing.
+    const sidecarMuxRefused = (f, mp4) => {
+        sidecarRoundTripHash(f, mp4);
+        return roundTripRefused.has(`${mp4 ? 'mp4' : 'mkv'}|${f.rel}`);
     };
     // A styled bundle's identity: the ASS inside it, read out the way embeddedTextHashes reads every embedded ass track. Import copies those packets in
     // unchanged (-map k:s:0, -c copy), so the bundle and its imported track hash alike by construction - the content test a bundle never had, which left
@@ -3547,19 +3593,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (an edit that kept the timeline - trusted, as it always was); 'aborted' when it is empty, cue-less, or a bundle ffmpeg cannot decode while the stream
     // has cues - what an interrupted run leaves (readBundleSubtitle); 'short' (+ end, streamEnd) when its cues stop more than CUE_SPAN_SLACK_S before the
     // stream's own - a run that failed partway still finalises its outputs, and an edit can cut the tail, so neither may take the only copy; 'unreadable'
-    // when its text holds a NUL beside other text (unreadableText); 'unknown' when either side could not be read, and the caller keeps its old answer.
-    const existingSidecarVerdict = (s, rel, bundle, subs) => {
+    // when its text holds a NUL beside other text (unreadableText); 'unknown' when either side could not be read, and the caller keeps its old answer. p is
+    // the file read: the library's, or a copy the file API route downloaded (existingSidecarVerdictRemote); rel names it, for its extension.
+    const existingSidecarVerdict = (s, rel, bundle, subs, p = libPathOf(rel)) => {
         const hashes = embeddedTextHashes(subs);
         const span = embeddedSpan.get(s.index);
         if (!hashes || !span) return { state: 'unknown' };
         const ext = bundle ? 'ass' : path.extname(rel).slice(1).toLowerCase();
         let buf = null;   // the copy's decoded text; null = a bundle ffmpeg could not decode
         if (bundle) {
-            const b = readBundleSubtitle(libPathOf(rel));
+            const b = readBundleSubtitle(p);
             if (b.state === 'unknown') return { state: 'unknown' };
             if (b.state === 'ok') ({ buf } = b);
         } else {
-            try { buf = Buffer.from(readTextCapped(libPathOf(rel), SIDECAR_HASH_MAX), 'utf8'); } catch (e) { return { state: 'unknown' }; }
+            try { buf = Buffer.from(readTextCapped(p, SIDECAR_HASH_MAX), 'utf8'); } catch (e) { return { state: 'unknown' }; }
             if (unreadableText(buf.toString('utf8'))) return { state: 'unreadable' };
         }
         const own = hashes.get(s.index);
@@ -3640,6 +3687,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         try { text = answer.state === 'present' && !bundle ? readTextCapped(local, SIDECAR_HASH_MAX) : ''; } catch (e) { text = ''; }
         if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ } }
         return { ...answer, empty, unreadable: unreadableText(text) };
+    };
+    // existingSidecarVerdict where the node has no library view: the file at rel fetched with the same cap into a private staging directory and judged
+    // there - 'unknown' when it cannot be fetched.
+    const existingSidecarVerdictRemote = (s, rel, bundle, subs) => {
+        let dir = '';
+        try { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'awk_subcue_')); } catch (e) { return { state: 'unknown' }; }
+        const local = path.join(dir, `c${path.extname(rel).replace(/[^.a-z0-9]/gi, '')}`);
+        const dest = serverDestFor(rel);
+        const got = dest ? downloadLibraryFile(dest, local, SIDECAR_HASH_MAX) : { ok: false };
+        const verdict = got.ok ? existingSidecarVerdict(s, rel, bundle, subs, local) : { state: 'unknown' };
+        try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
+        return verdict;
     };
     // Whether two of this video's sidecar names restore a track the same way on import - the same title, language and flags, whatever their index. Under
     // remove_source=true the file found by its text becomes the track's only copy, so one spelling the track as it was brought back its old title and
@@ -4166,7 +4225,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ====== SUBTITLE METADATA / RETAG ARGS ======
     // The one rule for writing a subtitle language into the output container: mp4 folds to /T (to6392T), mkv keeps the sidecar spelling (normSidecarLang),
-    // and mov goes through movLangCode - the shared 'mov language remap' section has the why. escMeta guards the value either way.
+    // and mov goes through movLangCode - MOV_LANG in the shared 'mov language table' section has the why. escMeta guards the value either way.
     const langMetaValue = (l) => escMeta(dstContainer === 'mov' ? movLangCode(l) : isMp4 ? to6392T(l) : normSidecarLang(l));
     // Everything this plugin writes onto a subtitle stream, for ONE stream. Two callers reach it - the duplicate fold below and the sidecar-metadata retune -
     // and they must agree on both load-bearing rules: outIdx is the position among the SURVIVING subtitle streams, which is what -map 0 minus the drops
@@ -4255,6 +4314,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // it should have skipped. list is the main output's stream list in its order (source streams less every removal, imports appended), which the name
     // carry reads.
     const commitPreset = (out, list = streams) => {
+        // A subtitle stream ffprobe names no codec for cannot be copied: a WebVTT track mkvmerge wrote (S_TEXT/WEBVTT, which neither jellyfin-ffmpeg 7.1.4
+        // nor mainline 9.0.2 reads) fails a copy at the Matroska header (measured on 7.1.4: exit 178), taking the whole run down and leaving each sidecar
+        // output of it at 0 bytes. Every preset here copies the stream, so none is emitted.
+        const noCodec = list.filter((s) => codecTypeOf(s) === 'subtitle' && ['', 'unknown', 'none'].includes(codecNameOf(s)));
+        if (noCodec.length) {
+            failFile(`${noCodec.map((s) => streamTag(s.index)).join('')} ffmpeg names no codec for this subtitle stream (a WebVTT track mkvmerge wrote reads`
+                + ' so), and it cannot copy one, so this file cannot be written back - convert or remove that track with mkvmerge, then requeue');
+        }
         // The -strict level either -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses without it.
         // Only subtitle streams - and, on a bundled extract, their font attachments - are ever added or dropped here, so every audio/video stream is copied
         // and the copied-subset argument stays at its default; that includes any cover art, which is why every mapped stream is offered to the cover check.
@@ -4269,7 +4336,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const mapped = streams.filter((s) => !uncopyable.includes(s) && !staged.leaveOut.includes(s));   // every video in source order, for mp4TimecodeArgs
         const outGone = [...uncopyable, ...staged.leaveOut].map((s) => s.index);
         let full = out + dropMaps(outGone) + (ccStripAt ? ccStripArg(ccStripAt.index, new Set([...ccStripAt.removed, ...outGone])) : '')
-            + mp4StrictArg(dstContainer, streams)
+            + mp4StrictArg(dstContainer, streams) + movLangRespellArgs(dstContainer, streams)
             + mp4TimecodeArgs(dstContainer, mapped) + mp4NameCarryArgs(dstContainer, list.filter((s) => mapped.includes(s)), titleWritten)
             + matroskaCoverArgs(staged.kept);
         carried = mp4NameCarryView(dstContainer, list.filter((s) => mapped.includes(s)), titleWritten);
@@ -5081,12 +5148,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     alreadyExtracted = false;
                     response.infoLog += `☐${streamTag(s.index)} Replacing ${name} - an earlier run left it empty\n`;
                 }
-                // remove_source is about to strip the stream this name copies, so a file already there must HOLD it (existingSidecarVerdict). An interrupted
-                // run's leftover is replaced - deleted first on the direct-write route, since ffmpeg aborts the whole run rather than overwrite an output, and
-                // uploaded over through a read-only mount - and one cut short or unreadable keeps the stream. Unjudged - on the file API route, which reads no
-                // library file here, or when either side cannot be read - a file with bytes keeps the trust it always had.
-                if (!remote && removeSource && fs.existsSync(full)) {
-                    const verdict = existingSidecarVerdict(s, name, bundle, streams);
+                // remove_source is about to strip the stream this name copies, so a file already there must HOLD it (existingSidecarVerdict; on the file API
+                // route, a copy downloaded to judge). An interrupted run's leftover is replaced - deleted first on the direct-write route, since ffmpeg aborts
+                // the whole run rather than overwrite an output, and uploaded over through a read-only mount or the file API - and one cut short or unreadable
+                // keeps the stream. Unjudged, when either side cannot be read, a file with bytes keeps the trust it always had.
+                if (removeSource && (remote ? remote.state === 'present' : fs.existsSync(full))) {
+                    const verdict = remote ? existingSidecarVerdictRemote(s, name, bundle, streams) : existingSidecarVerdict(s, name, bundle, streams);
                     if (verdict.state === 'short') {
                         held += 1;
                         response.infoLog += `☒${streamTag(s.index)}[remove_source=true] ${name} already on disk stops at ${verdict.end.toFixed(1)} s but this `
@@ -5100,7 +5167,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             + ' NUL character); keeping the embedded subtitle (save it as UTF-8, or delete it to extract it again)\n';
                         continue;
                     }
-                    if (leftIncomplete(verdict, name)) {
+                    if (remote ? verdict.state === 'aborted' : leftIncomplete(verdict, name)) {
                         if (!placeViaApi()) {
                             try { fs.unlinkSync(full); } catch (e) {
                                 refused += 1;
@@ -5735,7 +5802,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             alreadyInFile.push(f);
             response.infoLog += `☑${streamTag(at)}[deduplicate=${dedupeMode}] ${f.rel} is already in the file - not importing a second copy\n`;
             const cur = keptSubs.find((s) => s.index === at);
-            const sameTitle = isMp4 || (cur ? titleAgrees(cur, f.title) : !nameTextOf(f.title));
+            // A name with no title token is no opinion on the title, as its 'und' is none on the language (below): read as an instruction it would erase the
+            // title clean_and_remux's tag_title gives the track, and the two plugins would re-title it on every cycle - different presets, so Tdarr's repeat
+            // guard never stops them. A name can set or change a title, never erase one.
+            const wantTitle = isMp4 || !nameTextOf(f.title) ? null : f.title;
+            const sameTitle = wantTitle === null || (!!cur && titleAgrees(cur, wantTitle));
             const curDisp = new Set(activeDispositions(cur));
             // `default` is muxer-managed rather than a role, so no sidecar name can carry it (see DISPOSITIONS) and f.disp never holds it. The track's own
             // flag joins the wanted set instead, which both cancels it out of the comparison and stops the whole-set write below from stripping it. Without
@@ -5752,19 +5823,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const nameLang = langKey(f.lang || 'und') === 'und' ? '' : f.lang;
             const wantLang = nameLang || resolveLang(cur) || 'und';
             if (sameTitle && langKey(resolveLang(cur) || 'und') === langKey(wantLang) && sameDisp) continue;
-            const named = [logSafe(nameLang), isMp4 ? '' : logSafe(f.title), ...f.disp].filter(Boolean).join(' ');
+            const named = [logSafe(nameLang), wantTitle === null ? '' : logSafe(wantTitle), ...f.disp].filter(Boolean).join(' ');
             if (metadataMode !== 'sidecar') {
                 response.infoLog += `☒${streamTag(at)}[method_import_metadata=${metadataMode}] The sidecar name and the embedded track disagree on metadata `
                     + `- keeping the track's own (name: ${named})\n`;
                 continue;
             }
             const outIdx = keptSubs.findIndex((s) => s.index === at);   // position among the SURVIVING subtitle streams (see retagArgs)
-            if (!isMp4) titleWritten.add(at);
+            if (wantTitle !== null) titleWritten.add(at);
             // An empty Set spreads to an empty array, so the '0' sentinel still applies.
-            retuneMeta += retagOne(outIdx, wantLang, isMp4 ? null : f.title, [...wantDisp]);
+            retuneMeta += retagOne(outIdx, wantLang, wantTitle, [...wantDisp]);
             retunedAt.add(at);
             response.infoLog += `☐${streamTag(at)}[method_import_metadata=sidecar] Retagging the track already in the file from ${f.rel} (${
-                named || (isMp4 ? 'no language or flags' : 'no language, title or flags')})\n`;
+                named || 'no language or flags'})\n`;
         }
 
         // Is there anything to write to the FILE at all: a sidecar to mux, a metadata retune, or a dedup drop. Named once because the two cleanup shortcuts
@@ -5837,6 +5908,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             refusedText += 1;
             response.infoLog += `☒Not importing ${f.members.map((m) => logSafe(m.rel)).join(', ')} - it ${why}, which ffmpeg cannot read whole; save it as`
                 + ' UTF-8 to import it\n';
+        }
+        // A sidecar ffmpeg will not mux (sidecarMuxRefused) would fail the whole import run, every other sidecar with it, on every requeue. It is left out
+        // and named, and the others go in; nothing records it, so it stays on disk until it is fixed or deleted.
+        for (let k = toMux.length - 1; k >= 0; k -= 1) {
+            const f = toMux[k];
+            if (f.bundle || !sidecarMuxRefused(f, isMp4)) continue;
+            toMux.splice(k, 1);
+            refusedText += 1;
+            response.infoLog += `☒Not importing ${f.members.map((m) => logSafe(m.rel)).join(', ')} - ffmpeg cannot read it as a subtitle file (an empty`
+                + ' file, or an srt whose cues have no numbers?), and muxing it would fail the whole import; fix or delete it\n';
         }
         const nothingToMux = !toMux.length && !retuneMeta && !removedIndices.size;
 

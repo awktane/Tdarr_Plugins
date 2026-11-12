@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.82',
+    Version: '3.999.83',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -521,7 +521,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         roleFieldCache.set(s, fields);
         return fields;
     };
-    // -=-=-= keywordRegex / matchesKeyword [all five] =-=-=-
+    // -=-=-= ROLE_NEGATORS / keywordRegex / matchesKeyword [all five] =-=-=-
+    // A keyword naming a role the track lacks does not match: one with a negator word one to three non-alphanumerics before it ('English (Non-SDH)', 'No
+    // Commentary', 'ohne Kommentar' - the languages the keywords serve), or '-free'/'-less' after it ('commentary-free'). Read as the role, the Non-SDH
+    // subtitle is what remove_sub_sdh deletes and the main 'No Commentary' track what downmix_secondary=delete removes.
+    const ROLE_NEGATORS = ['non', 'no', 'not', 'without', 'ohne', 'sans', 'sin', 'sem', 'senza', 'zonder', 'bez', 'uten', 'utan', 'uden', 'ilman'];
     // The whole-token regex for a keyword list: a keyword matches only when not flanked by a letter/digit - '[sdh]', 'eng-sdh', 'sdh.' match, 'deafening' does
     // not - and an internal space matches any run of non-alphanumerics ('hearing impaired' == 'hearing_impaired'). It is case-sensitive, so the text must
     // already be lowercased. A pure function of the list, so memoized by keyword-array identity rather than recompiled per classifier call; the mov cut
@@ -538,7 +542,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const pattern = keywords
                 .map((k) => k.trim().split(/\s+/).map((token, i) => (i ? gapBefore(token) : '') + esc(token)).join(''))
                 .join('|');
-            re = new RegExp(`(?<![\\p{L}\\p{N}])(?:${pattern})(?![\\p{L}\\p{N}])`, 'u');
+            // The negator test (ROLE_NEGATORS) is bounded, so its lookbehind costs the same at every offset of a title nothing caps.
+            const negated = `(?<!(?<![\\p{L}\\p{N}])(?:${ROLE_NEGATORS.join('|')})[^\\p{L}\\p{N}]{1,3})`;
+            re = new RegExp(`(?<![\\p{L}\\p{N}])${negated}(?:${pattern})(?![\\p{L}\\p{N}])(?!-(?:free|less)(?![\\p{L}\\p{N}]))`, 'u');
             keywordRegexCache.set(keywords, re);
         }
         return re;
@@ -1252,7 +1258,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: stream / language / preset helpers =====
     // #endregion
 
-    // #region SHARED helpers (9 sections: ffmpeg metadata escaping … hevc copy fourcc)
+    // #region SHARED helpers (10 sections: ffmpeg metadata escaping … hevc copy fourcc)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
     // -=-=-= escMeta [all five] =-=-=-
     // Tdarr does NOT pass the preset through a shell - it splits the string into a quote-aware argv array for child_process.spawn, so shell metacharacters
@@ -1862,6 +1868,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
     };
     // ===== END SHARED: track title carry =====
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mov language table =====
+    // -=-=-= MOV_LANG  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // mov is the exception to writing a language into the output container (mp4 stores only lowercase 3-letter /T, mkv keeps the raw spelling). The QuickTime
+    // muxer does not store the letters: mov_write_mdhd_tag looks the code up in ffmpeg's legacy Macintosh language table and writes 0x7fff ("unspecified") on
+    // a miss, which the demuxer then excludes - so the track reads back with NO language at all, exit 0 and no warning from either side. That table predates
+    // ISO 639-2/T and spells 15 of the 20 dual-spelling languages the /B way, so their /T spelling is precisely the one mov throws away (measured on
+    // jellyfin-ffmpeg 7.1.4: nld/deu/zho land 0x7fff, dut/ger/chi land a real code; 106 of the 184 codes to6392T can emit are dropped). It spells four of
+    // the others the /T way, so their /B spellings map back (fre -> fra, cze -> ces, rum -> ron, slo -> slk), and Maori has no row, as the table holds
+    // it under no code. Each row maps a spelling the muxer drops to the one it stores for the same language. Anyone extending this must re-measure against
+    // the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a safe source. mp4/m4v/m4a pack the letters directly and keep either
+    // spelling, which is why this is mov-only. Null-prototype so a container tag spelling an Object.prototype member ('constructor', '__proto__') misses the
+    // table instead of resolving an inherited function.
+    const MOV_LANG = Object.assign(Object.create(null), { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
+        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel', fre: 'fra', cze: 'ces', rum: 'ron', slo: 'slk' });
+    // -=-=-= movLangRespellArgs  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The language writes a remux into .mov owes the tracks it copies or re-encodes: a .mov another tool wrote can hold a spelling the table lacks
+    // (AVFoundation stores deu and nld), which the copy would lose, so each such language goes back in MOV_LANG's spelling and nothing else is touched (a
+    // census of 400 spellings on jellyfin-ffmpeg 7.1.4: the muxer drops every key and stores every value). Matched by the language itself - the output stream
+    // specifier m:language:<code> - so no output index is needed; a track whose language a run writes itself gets the same spelling (movLangCode).
+    const movLangRespellArgs = (container, streams) => (container !== 'mov' ? '' : [...new Set(streams.map((s) => getTagCI(s?.tags, 'language')))]
+        .filter((l) => MOV_LANG[l]).map((l) => ` -metadata:s:m:language:${l} language=${MOV_LANG[l]}`).join(''));
+    // ===== END SHARED: mov language table =====
 
     // ===== SHARED [audio_clean, video_clean]: statistics tag clearing =====
     // -=-=-= STATS_TAG_RE / staleStatsArgs / staleStatsNote  [audio_clean, video_clean] =-=-=-
@@ -1933,7 +1961,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Whether a -c copy keeps the stream's Dolby Vision record (true with none), the fourcc aside: jellyfin's muxers check the base layer's pixel format and
     // colour against the compat id (its ff_isom_validate_dovi_config) and drop a record that fails under ANY fourcc, mkv to mkv included, so any remux costs
     // such a stream its Dolby Vision. Matched the copy on all 17 measured sources (P5, P7, P8.1, P8.2, P8.4, P20 from Dolby, ffmpeg, mkvmerge, MP4Box and an
-    // iPhone-style mov). Compat 0's fourcc condition is dvNeedsDvFourcc's (hevc copy fourcc). Read by clean_and_remux's convert gate, hevcCopyPlan's
+    // iPhone-style mov). Compat 0's fourcc condition is dvNeedsDvFourcc's (below). Read by clean_and_remux's convert gate, hevcCopyPlan's
     // Matroska arm and stream_ordering's faststart hold.
     const dvRecordSurvivesCopy = (s) => {
         const id = String(doviRecord(s)?.dv_bl_signal_compatibility_id ?? '');
@@ -1941,6 +1969,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const hdr = (trc) => p10 && s.color_transfer === trc && s.color_primaries === 'bt2020' && s.color_space === 'bt2020nc' && s.color_range === 'tv';
         return id === '0' ? p10 : id === '1' || id === '6' ? hdr('smpte2084') : id === '2' ? s.pix_fmt === 'yuv420p' : id === '4' ? hdr('arib-std-b67') : true;
     };
+    // -=-=-= dvNeedsDvFourcc  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // A record naming no compatible base (compatibility id 0: Profile 5). jellyfin's muxers write a compat-0 record's box only under a dvh1/dvhe fourcc or no
+    // tag at all (its ff_isom_validate_dovi_config), so under hev1 or hvc1 the stream silently becomes plain HEVC whose IPT colour every player shows wrong.
+    // Every other compat id is checked against the stream's colour instead, under any fourcc.
+    const dvNeedsDvFourcc = (s) => String(doviRecord(s)?.dv_bl_signal_compatibility_id) === '0';
     // ===== END SHARED: dolby vision record =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
     // -=-=-= mp4StrictArg [all five] =-=-=-
@@ -1973,11 +2006,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // in the samples (Dolby's own P5 and P8.1 mp4s, every mkv made from them, GPAC's xps_inband). ffprobe prints the size whenever there is extradata, and
     // Tdarr 3.04's scan removes only the `extradata` hex (tdarr_core remove_ffprobe_extradata), so the size reaches a plugin.
     const HVCC_HEADER_BYTES = 23;
-    // -=-=-= dvNeedsDvFourcc  [clean_and_remux, video_clean] =-=-=-
-    // A record naming no compatible base (compatibility id 0: Profile 5). jellyfin's muxers write a compat-0 record's box only under a dvh1/dvhe fourcc or no
-    // tag at all (its ff_isom_validate_dovi_config), so under hev1 or hvc1 the stream silently becomes plain HEVC whose IPT colour every player shows wrong.
-    // Every other compat id is checked against the stream's colour instead, under any fourcc.
-    const dvNeedsDvFourcc = (s) => String(doviRecord(s)?.dv_bl_signal_compatibility_id) === '0';
     // -=-=-= firstKeyParamSets  [clean_and_remux, video_clean] =-=-=-
     // Whether the first KEYFRAME of an HEVC stream carries VPS, SPS and PPS: true / false / null (not read). It is the packet the mov muxer builds an hvcC
     // from once hevc_mp4toannexb has emptied the extradata - a -c copy drops every packet before the first keyframe, and this read is a -c copy too, so it
@@ -3187,7 +3215,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // so one CPU scale filter and -pix_fmt path work uniformly across families; VAAPI is the exception - it needs its frames uploaded, so it carries an
     // explicit device (the candidate's render node) + format,hwupload filter.
     const buildVideoArgs = ({ family, encoderName, device, targetCodec, qNorm, speed, want10Bit, willDownscale, outHeight, dstContainer, file, srcCodec,
-        tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter, dropCaptions, sliceDecode }) => {
+        tonemap, tonemapBackend, tonemapSetparams, preserveDv, preserveDvNoBase, deintFilter, dropCaptions, sliceDecode, oddSize }) => {
         const vaDevice = device || VAAPI_DEVICE;
         const { getNvenc10BitFormatArg } = require('../methods/nvdecPreset');
         const qualityArg = nativeQuality(targetCodec, family, qNorm);
@@ -3215,6 +3243,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // deinterlacers are faster end-to-end but SILENTLY emit fully combed output on some real broadcast sources, and comb baked into a re-encode that is
         // then labelled progressive is unrecoverable. Only the FILTER is CPU - method_encoder still picks the hardware encoder and it still does the encode.
         if (deintFilter) vf.push(deintFilter);
+        // An odd coded width or height (an Xvid/DivX 640x267) is cropped to even by one row or column, with no resample: libx264 and libx265 refuse an odd
+        // 4:2:0 frame (measured on 7.1.4), which would fail the test encode, its retry and the file on every requeue. It leads the downscale and tonemap.
+        if (oddSize) vf.push('crop=trunc(iw/2)*2:trunc(ih/2)*2');
         // The downscale then leads the rest of the chain, in every family and with or without a tonemap, so it is emitted once here rather than per branch.
         // accurate_rnd because on x86 an 8-bit planar scale without it takes a low-precision path arm64 lacks (up to 2 code values off C), so one file scaled
         // differently on every node; with it x86 gives the Mac's exact pixels (80 of 80 on four x86 machines, 2026-10-12) at no measurable encode cost
@@ -3319,12 +3350,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // destructure below, and rep[1] + rep[2] meaning Top + Bottom.
         return best ? best.slice(1).map(Number) : null;
     };
-    const detectInterlace = (ffmpegPath, inputPath, startSec) => {
+    const detectInterlace = (ffmpegPath, inputPath, startSec, streamIndex) => {
         try {
             // Sampled from a way into the file, not the head: logos, black and title cards are commonly progressive even in an interlaced programme, so a
             // head sample under-reports. -ss ahead of -i is safe here because this DECODES; it is only a stream COPY that -ss corrupts.
-            const args = ['-nostats', '-hide_banner', ...(startSec > 0 ? ['-ss', String(startSec)] : []), '-i', inputPath,
-                '-frames:v', String(IDET_SAMPLE_FRAMES), '-vf', 'idet', '-an', '-sn', '-f', 'null', '-'];
+            // -map names the primary video by its absolute index. Left to ffmpeg, the pick favours the larger frame, so a big cover held as a plain track (a
+            // -map 0 remux writes an attached cover so) is decoded instead and reads as progressive (measured on 7.1.4): combed video is encoded unrepaired.
+            const args = ['-nostats', '-hide_banner', ...(startSec > 0 ? ['-ss', String(startSec)] : []), '-i', inputPath, '-map', `0:${streamIndex}`,
+                '-frames:v', String(IDET_SAMPLE_FRAMES), '-vf', 'idet', '-f', 'null', '-'];
             const r = childProcess.spawnSync(ffmpegPath, args,
                 { encoding: 'utf8', timeout: IDET_PROBE_TIMEOUT_MS, maxBuffer: IDET_PROBE_MAX_BYTES });
             // A probe that did not finish gives no verdict. A timeout or the maxBuffer cap still hands back the stderr read SO FAR, and the genuine summary
@@ -3915,8 +3948,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, writes);
             const kept = keptFor(written);
             response.infoLog += mp4NameCarryLog(dstContainer, kept);
-            response.preset = `${inputSide}<io>${out}${mp4TimecodeArgs(dstContainer, kept)}${mp4NameCarryArgs(dstContainer, kept)}`
-                + `${mp4MovflagsArg(dstContainer, tagPlan)}${globalOutputOpt}${outputMuxerArg(dstContainer)}`;
+            response.preset = `${inputSide}<io>${out}${movLangRespellArgs(dstContainer, kept)}${mp4TimecodeArgs(dstContainer, kept)}`
+                + `${mp4NameCarryArgs(dstContainer, kept)}${mp4MovflagsArg(dstContainer, tagPlan)}${globalOutputOpt}${outputMuxerArg(dstContainer)}`;
             response.processFile = true;
             response.infoLog += dropLog(written) + mp4TimecodeLog(dstContainer, kept) + mp4TagPlanLog(tagPlan, dstContainer)
                 + movDvLossLine(dstContainer, kept.filter((s) => !dropsDv || s !== written), act);
@@ -4092,7 +4125,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // starts at 0. Duration comes from the format header; an absent one simply samples from the start.
             const durSec = Number(file.ffProbeData.format?.duration) || 0;
             const startSec = durSec > IDET_SEEK_MIN_DURATION_SEC ? Math.min(Math.floor(durSec / IDET_SEEK_FRACTION), IDET_SEEK_MAX_SEC) : 0;
-            idetMemo = detectInterlace(ffmpegPathOf(otherArguments), file.file, startSec);
+            idetMemo = detectInterlace(ffmpegPathOf(otherArguments), file.file, startSec, primary.index);
             return idetMemo;
         };
         // A repaired file re-detects as progressive on any later pass, so this converges by itself and needs no reprocess fence of its own.
@@ -4682,7 +4715,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const tm0 = tonemap ? tonemapBackendFor(c.family) : null;
                 const build = (tonemapBackend) => buildVideoArgs({ family: c.family, encoderName: c.encoderName, device: c.device, targetCodec: targetCodecName,
                     qNorm, speed, want10Bit, willDownscale, outHeight, dstContainer, file, srcCodec: srcCodecName, tonemap, tonemapBackend, tonemapSetparams,
-                    preserveDv, preserveDvNoBase, deintFilter: resolveDeintFilter(), dropCaptions, sliceDecode });
+                    preserveDv, preserveDvNoBase, deintFilter: resolveDeintFilter(), dropCaptions, sliceDecode,
+                    oddSize: srcWidth % 2 === 1 || srcHeight % 2 === 1 });
                 let enc = build(tm0);
                 if (!canTest) return { ok: true, enc, tm: tm0, tmWhy: '', mem };
                 const runOne = (e) => runTestEncode({ ...testFacts, inputArgv: e.inputArgv, videoArgv: e.videoArgv, isCpu, logOnly,
@@ -4978,7 +5012,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // prevent a divergence that cannot occur - a preserved encode carries the RPU through, so pass 2 re-reads dvSignal and recomputes the same token
         // (measured 2026-08-26, jellyfin 7.1.4, a real profile-8.1 RPU: dvhe/p8/L6 in, dvh1/p8/L6 out, record intact; awk-ffmpeg-test's build-facts.md). Pinned
         // by scenario assertion video-clean-a-preserved-dv-output-still-matches-its-own-fence: a detection drift fails there instead of silently re-encoding a
-        // library every pass.
+        // library every pass. A .mov output re-reads with no Dolby Vision, as ffmpeg cannot write the box there; tokenIsNoop passes dv on such a file.
         const videoSigCore = escMeta([action, targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, want10Bit ? '10' : '8', `s${speed}`,
             ...(effHdrMode === 'tonemap_sdr' ? ['sdr'] : []), ...(effHdrMode === 'strip_dynamic' ? ['strip'] : []), ...(preserveDv ? ['dv'] : []),
             ...(deinterlaceLive ? ['deint'] : [])].join('-'));
@@ -4997,15 +5031,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // pass when their setting is now off, or when it is on and the file gives it nothing to do: no HDR to tonemap, no dynamic layer to strip, idet reading
         // the file progressive (a decode, spent only when deint differs). Dropping one is a no-op over a reverted original too, because sizeExemptWhy never
         // judges - so never reverts - an encode that tonemapped, stripped or deinterlaced: a reject's core can carry sdr, strip or deint only where it did
-        // nothing. The speed shapes only a new encode, so it passes except over a reverted original, where a new speed is a new try. action, codec, q, bit
-        // depth and dv never pass: a new action asks for different work, and the other four re-read as what produced them (the fence comment above). Nothing
-        // is rewritten, so the stored fence keeps its own tokens and every later pass decides the same way. A per-file fence (tokens only for what applied)
-        // would not converge: a repaired, tonemapped or downscaled output re-reads as progressive, SDR or inside the box.
+        // nothing. The speed shapes only a new encode, so it passes except over a reverted original, where a new speed is a new try. dv passes on a file that
+        // reads no Dolby Vision, which has no RPU to keep: a preserved encode written into .mov reads so (the fence comment above), and holding dv there would
+        // encode it a second time before the shrink verdict. action, codec, q and bit depth never pass: a new action asks for different work, and the other
+        // three re-read as what produced them (the fence comment above). Nothing is rewritten, so the stored fence keeps its own tokens and every later pass
+        // decides the same way. A per-file fence (tokens only for what applied) would not converge: a repaired, tonemapped or downscaled output re-reads as
+        // progressive, SDR or inside the box.
         const tokenIsNoop = (t) => (FENCE_BOX_RE.test(t) ? !scalesInto(Number(t.slice(1)))
             : FENCE_SPEED_RE.test(t) ? vqNow?.state !== 'reject'
                 : t === 'sdr' ? !tonemap
                     : t === 'strip' ? !(effHdrMode === 'strip_dynamic' && isDynamicHdr)
-                        : t === 'deint' && (!deinterlaceLive || idet().kind === 'progressive'));
+                        : t === 'dv' ? !dvSignal
+                            : t === 'deint' && (!deinterlaceLive || idet().kind === 'progressive'));
         // The tokens a stored core and this run's do not share, both ways.
         const coreDiff = (core) => {
             const mine = videoSigCore.split('-');
@@ -5336,7 +5373,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (!staleWhy) {
                     // The inputs behind the tokens coreHolds let pass, named as the user set them, so the line says what changed and was not acted on.
                     const passed = [...new Set(coreDiff(priorCore).map((t) => (FENCE_BOX_RE.test(t) ? `downscale=${downscaleOpt}`
-                        : FENCE_SPEED_RE.test(t) ? `method_speed=${speed}` : t === 'deint' ? `deinterlace=${deinterlaceOpt}` : `hdr_mode=${hdrMode}`)))];
+                        : FENCE_SPEED_RE.test(t) ? `method_speed=${speed}` : t === 'deint' ? `deinterlace=${deinterlaceOpt}`
+                            : t === 'dv' ? `guard_dv=${guardDvOpt}` : `hdr_mode=${hdrMode}`)))];
                     const shown = logSafe(priorSig.replace(/\+j[0-9a-f]{8}$/, ''), 120);
                     const only = vqNow?.state === 'reject' ? 'repeat the encode that was put back' : 'add a lossy generation';
                     return skip(`${vqReadLine}${deintVerdictLine()}☑${pTag}[action=${action}] Already processed by ${VIDEO_FENCE_TAG} ${passed.length

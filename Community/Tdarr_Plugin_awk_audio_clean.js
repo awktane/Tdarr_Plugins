@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.81',
+    Version: '4.999.82',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -257,8 +257,8 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['keep','drop','remix'],
             },
-            tooltip: `What to do when a track cannot be written in the target codec because of its channel layout. Left unhandled, ffmpeg aborts the whole
-                job on that track.
+            tooltip: `What to do when a track cannot be written correctly in the target codec because of its channel layout. Left unhandled, ffmpeg aborts
+                the whole job on that track, or writes a 5.0 or 6.1 with its speakers moved.
                 \\n=====
                 \\nActions (only for a layout with no lossless relabel)
                 \\n=====
@@ -272,11 +272,14 @@ const details = () => ({
                 It defers to downmix_to_stereo and the stereo tier (language_stereo, language_unlisted=stereo, downmix_secondary=stereo) when they already
                 convert the track, and falls back to keep rather than create a duplicate stereo. A track guard_quality protects keeps its channels: the
                 stereo is added beside it, and the track stays in its source codec.
-                \\nThis only arises when codec_surround is opus and the track's layout is one libopus cannot encode, such as 2.1, 3.1, 4.0, 4.1,
-                6.0, 7.0 or 7.1(wide); AAC keeps every one of these layouts, and AC3 and EAC3 take those of up to 6 channels but write 6.0 as 5 channels,
-                which guard_quality counts as a channel drop. It is reached either because codec_force is sending the track to opus, or because
-                method_loudnorm has to re-encode a kept track whose own codec ffmpeg cannot encode, such as a DTS core, and it converges to codec_surround.
-                \\nA layout that merely needs relabelling (5.0(side) to 5.0, 6.1(back) to 6.1) is ALWAYS relabelled losslessly, whatever this is set to.`,
+                \\nThis only arises when a track is to be written as opus and its layout is one libopus cannot encode, such as 2.1, 3.1, 4.0, 4.1,
+                5.0(side), 6.0, 6.1(back), 7.0 or 7.1(wide), or one it writes with the speakers moved, 5.0 and 6.1 (the centre lands on a surround); AAC
+                keeps every one of these layouts, and AC3 and EAC3 take those of up to 6 channels but write 6.0 as 5 channels,
+                which guard_quality counts as a channel drop. It is reached because codec_force is sending the track to opus, because method_loudnorm has
+                to re-encode a kept track whose own codec ffmpeg cannot encode, such as a DTS core, and it converges to codec_surround=opus, or because
+                method_loudnorm would re-encode a track that is already opus back into opus. Such a track is always left as it is, un-normalized, whatever
+                this is set to.
+                \\nA layout that merely needs relabelling (quad(side) to quad) is ALWAYS relabelled losslessly, whatever this is set to.`,
         },
         {
             name: 'method_loudnorm',
@@ -562,7 +565,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (23 sections: stream codec type … mp4 strict compliance arg)
+    // #region SHARED helpers (24 sections: stream codec type … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -656,7 +659,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         roleFieldCache.set(s, fields);
         return fields;
     };
-    // -=-=-= keywordRegex / matchesKeyword [all five] =-=-=-
+    // -=-=-= ROLE_NEGATORS / keywordRegex / matchesKeyword [all five] =-=-=-
+    // A keyword naming a role the track lacks does not match: one with a negator word one to three non-alphanumerics before it ('English (Non-SDH)', 'No
+    // Commentary', 'ohne Kommentar' - the languages the keywords serve), or '-free'/'-less' after it ('commentary-free'). Read as the role, the Non-SDH
+    // subtitle is what remove_sub_sdh deletes and the main 'No Commentary' track what downmix_secondary=delete removes.
+    const ROLE_NEGATORS = ['non', 'no', 'not', 'without', 'ohne', 'sans', 'sin', 'sem', 'senza', 'zonder', 'bez', 'uten', 'utan', 'uden', 'ilman'];
     // The whole-token regex for a keyword list: a keyword matches only when not flanked by a letter/digit - '[sdh]', 'eng-sdh', 'sdh.' match, 'deafening' does
     // not - and an internal space matches any run of non-alphanumerics ('hearing impaired' == 'hearing_impaired'). It is case-sensitive, so the text must
     // already be lowercased. A pure function of the list, so memoized by keyword-array identity rather than recompiled per classifier call; the mov cut
@@ -673,7 +680,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const pattern = keywords
                 .map((k) => k.trim().split(/\s+/).map((token, i) => (i ? gapBefore(token) : '') + esc(token)).join(''))
                 .join('|');
-            re = new RegExp(`(?<![\\p{L}\\p{N}])(?:${pattern})(?![\\p{L}\\p{N}])`, 'u');
+            // The negator test (ROLE_NEGATORS) is bounded, so its lookbehind costs the same at every offset of a title nothing caps.
+            const negated = `(?<!(?<![\\p{L}\\p{N}])(?:${ROLE_NEGATORS.join('|')})[^\\p{L}\\p{N}]{1,3})`;
+            re = new RegExp(`(?<![\\p{L}\\p{N}])${negated}(?:${pattern})(?![\\p{L}\\p{N}])(?!-(?:free|less)(?![\\p{L}\\p{N}]))`, 'u');
             keywordRegexCache.set(keywords, re);
         }
         return re;
@@ -1762,6 +1771,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ===== END SHARED: iso639-1 to iso639-2 map =====
 
+    // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mov language table =====
+    // -=-=-= MOV_LANG  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // mov is the exception to writing a language into the output container (mp4 stores only lowercase 3-letter /T, mkv keeps the raw spelling). The QuickTime
+    // muxer does not store the letters: mov_write_mdhd_tag looks the code up in ffmpeg's legacy Macintosh language table and writes 0x7fff ("unspecified") on
+    // a miss, which the demuxer then excludes - so the track reads back with NO language at all, exit 0 and no warning from either side. That table predates
+    // ISO 639-2/T and spells 15 of the 20 dual-spelling languages the /B way, so their /T spelling is precisely the one mov throws away (measured on
+    // jellyfin-ffmpeg 7.1.4: nld/deu/zho land 0x7fff, dut/ger/chi land a real code; 106 of the 184 codes to6392T can emit are dropped). It spells four of
+    // the others the /T way, so their /B spellings map back (fre -> fra, cze -> ces, rum -> ron, slo -> slk), and Maori has no row, as the table holds
+    // it under no code. Each row maps a spelling the muxer drops to the one it stores for the same language. Anyone extending this must re-measure against
+    // the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a safe source. mp4/m4v/m4a pack the letters directly and keep either
+    // spelling, which is why this is mov-only. Null-prototype so a container tag spelling an Object.prototype member ('constructor', '__proto__') misses the
+    // table instead of resolving an inherited function.
+    const MOV_LANG = Object.assign(Object.create(null), { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
+        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel', fre: 'fra', cze: 'ces', rum: 'ron', slo: 'slk' });
+    // -=-=-= movLangRespellArgs  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The language writes a remux into .mov owes the tracks it copies or re-encodes: a .mov another tool wrote can hold a spelling the table lacks
+    // (AVFoundation stores deu and nld), which the copy would lose, so each such language goes back in MOV_LANG's spelling and nothing else is touched (a
+    // census of 400 spellings on jellyfin-ffmpeg 7.1.4: the muxer drops every key and stores every value). Matched by the language itself - the output stream
+    // specifier m:language:<code> - so no output index is needed; a track whose language a run writes itself gets the same spelling (movLangCode).
+    const movLangRespellArgs = (container, streams) => (container !== 'mov' ? '' : [...new Set(streams.map((s) => getTagCI(s?.tags, 'language')))]
+        .filter((l) => MOV_LANG[l]).map((l) => ` -metadata:s:m:language:${l} language=${MOV_LANG[l]}`).join(''));
+    // ===== END SHARED: mov language table =====
+
     // ===== SHARED [audio_clean, sub_worker]: mov language remap =====
     // -=-=-= to6392T  [audio_clean, sub_worker] =-=-=-
     // Fold a language token to a lowercase 3-letter ISO 639-2/T code: langKey folds spelled names and 639-2/B onto the 2-letter key, which ISO639_1_TO_2 maps
@@ -1769,19 +1801,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // sidecar import (mdhd stores only /T) and the mov remap below - and it is the fold MOV_LANG expects. Mirrors clean_and_remux's toCanonicalTag
     // threeLetter(false).
     const to6392T = (lang) => { const key = langKey(lang); if (!key || key.length !== 2) return lang; return ISO639_1_TO_2[key] || lang; };
-    // -=-=-= MOV_LANG (+ movLangCode)  [audio_clean, sub_worker] =-=-=-
-    // mov is the exception to writing a language into the output container (mp4 stores only lowercase 3-letter /T, mkv keeps the raw spelling). The QuickTime
-    // muxer does not store the letters: mov_write_mdhd_tag looks the code up in ffmpeg's legacy Macintosh language table and writes 0x7fff ("unspecified") on
-    // a miss, which the demuxer then excludes - so the track reads back with NO language at all, exit 0 and no warning from either side. That table predates
-    // ISO 639-2/T and spells 15 of the 20 dual-spelling languages the /B way, so to6392T's /T output is precisely the spelling mov throws away (measured on
-    // jellyfin-ffmpeg 7.1.4: nld/deu/zho land 0x7fff, dut/ger/chi land a real code; 106 of the 184 codes to6392T can emit are dropped). ces/ron/slk/fra are
-    // deliberately ABSENT - QuickTime spells those four the /T way and remapping them would break what works - and mri is absent because the table has no
-    // Maori under any code. Anyone extending this must re-measure against the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a
-    // safe source. mp4/m4v/m4a pack the letters directly and keep either spelling, which is why this is mov-only. movLangCode folds to /T then remaps:
-    // audio_clean on an audio language write, sub_worker on a subtitle language write. Null-prototype so a container tag spelling an Object.prototype member
-    // ('constructor', '__proto__') misses the table and falls through to the pass-through instead of resolving an inherited function.
-    const MOV_LANG = Object.assign(Object.create(null), { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
-        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel' });
+    // -=-=-= movLangCode  [audio_clean, sub_worker] =-=-=-
+    // A language a run writes into a .mov: folded to /T, then to the spelling the mov table stores (MOV_LANG) - audio_clean on an audio language write,
+    // sub_worker on a subtitle language write.
     const movLangCode = (lang) => { const t = to6392T(lang); return MOV_LANG[t] || t; };
     // ===== END SHARED: mov language remap =====
 
@@ -3326,23 +3348,72 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         // ====== END DEDUPLICATE ======
 
-        // libopus only accepts its RFC-mapping layouts and HARD-ERRORS on the rest, failing the whole job; ffmpeg's DEFAULT layout for 3ch (2.1) and 4ch (4.0)
-        // is also rejected. ac3/eac3 encode every layout libopus refuses, a few with fewer channels (encodedChannels); native aac keeps the count but refuses
-        // the height layouts (3.1.2, 5.1.2, cube), downmix and an unlabelled PCE decode (AAC_PCE_LAYOUTS) - so this guards only the paths that encode opus. OK
-        // set + relabels verified via `anullsrc=channel_layout=X -c:a libopus` on jellyfin-ffmpeg 7.1.4 (re-verified 2026-10-12: the nine OK layouts encode;
-        // 2.1, 4.0, 5.0(side), 6.1(back) and quad(side) are rejected).
-        const OPUS_OK_LAYOUTS = new Set(['mono', 'stereo', '3.0', 'quad', '5.0', '5.1', '5.1(side)', '6.1', '7.1']);
+        // An aac track with no ffprobe channel_layout carries an AAC program config element (PCE): ffmpeg's native aac writes 3.1, quad(side), 4.1,
+        // 5.0(side), 5.1(side), 6.0, hexagonal, 6.1, 7.0, 7.1(wide), octagonal and their (front)/(back)/(wide-side) twins that way, so every ffmpeg aac
+        // 5.1 made from ac3/eac3/dts has one. ffmpeg decodes it in the layout's own channel order but unlabelled, and only MediaInfo reads which layout
+        // it is. These are Tdarr's mediainfo.js 0.2.0 spellings (ChannelLayout, which carries the element order, then ChannelPositions) of the PCE
+        // jellyfin-ffmpeg 7.1.4 writes for each layout, measured 2026-11-06. No entry for 6.0 and hexagonal, which spell alike though their PCEs
+        // differ, nor for 6.0(front), which ffmpeg decodes with its two front pairs swapped. A Map, so probe text never reads a prototype member.
+        const AAC_PCE_LAYOUTS = new Map([
+            ['L R Ls Rs / Front: L R, Side: L R', 'quad(side)'],
+            ['L R C LFE / Front: L C R, LFE', '3.1'],
+            ['L R C Ls Rs / Front: L C R, Side: L R', '5.0(side)'],
+            ['L R C Cb Cb / Front: L C R, Side: C, Back: C', '4.1'],
+            ['L R C Cb Lb Rb / Front: L C R, Side: C, Back: L R', '5.1(side)'],
+            ['L R C Cb Lb Rb Cb / Front: L C R, Side: C, Back: L C R', '6.1'],   // ffmpeg writes 6.1(back) and 6.1(front) as this same PCE
+            ['L R C Ls Rs Lb Rb / Front: L C R, Side: L R, Back: L R', '7.0'],   // and 7.0(front) as this one
+            ['L R C Cb ? ? ? ? / Front: L C R, Side: C, Back: 4', '7.1(wide)'],  // and 7.1(wide-side) as this one
+            ['L R C Ls Rs Lb Rb Cb / Front: L C R, Side: L R, Back: L C R', 'octagonal'],
+        ]);
+        // An unlabelled PCE decode: an aac track above two channels whose layout ffprobe leaves absent (its JSON) or 'unknown' (its flat output).
+        const unlabelledPce = (s) => codecFamilyOf(s) === 'aac' && s.awkChannels > 2 && (!s.channel_layout || s.channel_layout === 'unknown');
+        // The layout AAC_PCE_LAYOUTS names for an unlabelled PCE; '' for every other track, and for a PCE MediaInfo does not identify (pceUnnamed).
+        const pceLayoutOf = (s) => {
+            if (!unlabelledPce(s)) return '';
+            const mi = mediaInfoFor(s);
+            return AAC_PCE_LAYOUTS.get(`${mi?.ChannelLayout} / ${mi?.ChannelPositions}`) || '';
+        };
+        const pceUnnamed = (s) => unlabelledPce(s) && !pceLayoutOf(s);
+        // Every decode of a named PCE that feeds an encoder or a fold starts with this relabel, `filter` chained behind it. Without it the decode takes the
+        // channel count's default layout and every encoder and fold places the speakers by that: measured 2026-11-11 on jellyfin-ffmpeg 7.1.4, one tone per
+        // speaker, ac3/eac3 put 3.1's centre and LFE and 4.1's LFE and back centre on the surrounds, libopus takes 4.1, 7.0, 7.1(wide) and octagonal as
+        // layouts it accepts (octagonal's back left lands on the LFE), and a stereo or 5.1 fold of 7.0 or octagonal loses the back left. channelmap
+        // renames without mixing: measured 2026-11-06 on every AAC_PCE_LAYOUTS layout, an aac encode behind it writes back a byte-identical
+        // AudioSpecificConfig with every channel's content at its position. Rejected: -ac N relabels to the count's default, which moves or loses a speaker
+        // on 3.1, quad(side), 4.1, 6.0, hexagonal, 7.0, 7.1(wide) and octagonal (a 6.0 back centre becomes an LFE the encoder band-limits away), and
+        // -ch_layout behind the correction's aresample remixes from that default (quad(side) loses a side channel).
+        const pceRelabel = (s, filter = '') => {
+            const lay = pceLayoutOf(s);
+            return lay ? `channelmap=channel_layout=${lay}${filter ? `,${filter}` : ''}` : filter;
+        };
+        // A PCE MediaInfo does not identify is left as it is by every operation that would decode it, with this line: a guessed layout re-encodes
+        // cleanly but puts channels on the wrong speakers.
+        const unnamedPceSkip = (s, tag, what) => {
+            const positions = mediaInfoFor(s)?.ChannelPositions;
+            return `☒${streamTag(s.index)}[${tag}] ${what} - ffmpeg decodes this track's ${s.awkChannels}ch layout unnamed and ${positions
+                ? `MediaInfo's "${logSafe(positions, 60)}" does not identify it` : 'MediaInfo reports no channel positions'}, so no layout is guessed; `
+                + `left as ${codecNameOf(s) || 'unknown'} ${s.awkChannels}ch\n`;
+        };
+
+        // The layouts libopus writes with every speaker in place. It HARD-ERRORS on a layout outside its RFC mappings, failing the whole job (2.1, 4.0,
+        // 5.0(side), 6.1(back) and quad(side) among them; re-verified 2026-10-12 via `anullsrc=channel_layout=X -c:a libopus` on jellyfin-ffmpeg 7.1.4), and it
+        // encodes 5.0 and 6.1 with speakers moved: measured 2026-11-11 on 7.1.4 with one tone per speaker, decoded by ffmpeg and by libopus itself, a 5.0
+        // comes back with FC heard in BR, BL in FC and BR in BL, and a 6.1 with FC heard in BC, BC in SL and SL in FC, while 3.0, quad, 5.1, 5.1(side) and 7.1
+        // come back in place. So 5.0 and 6.1 are treated as refused. Rejected: a channelmap that pre-permutes them to cancel the move (it would move them
+        // silently the day ffmpeg fixes the mapping), and padding them to 5.1 / 7.1 (it changes the channel count that titles, dedup and encodedChannels read).
+        // ac3/eac3 encode every layout libopus refuses, a few with fewer channels (encodedChannels); native aac keeps the count but refuses the height layouts
+        // (3.1.2, 5.1.2, cube), downmix and an unlabelled PCE decode (AAC_PCE_LAYOUTS) - so this guards only the paths that encode opus.
+        const OPUS_OK_LAYOUTS = new Set(['mono', 'stereo', '3.0', 'quad', '5.1', '5.1(side)', '7.1']);
         const opusAcceptsLayout = (channels, layoutStr) => {
             const lay = (layoutStr || '').toLowerCase().trim();
             if (lay) return OPUS_OK_LAYOUTS.has(lay);
-            // No explicit layout → ffmpeg assigns the default for the count; those are OK for every count EXCEPT 3 (2.1) and 4 (4.0).
-            return channels >= 1 && channels <= 8 && channels !== 3 && channels !== 4;
+            // No explicit layout → ffmpeg assigns the count's default: 2.1 and 4.0 are refused and 5.0 and 6.1 moved, so only 1, 2, 6 and 8 channels pass.
+            return [1, 2, 6, 8].includes(channels);
         };
         // Layouts that map LOSSLESSLY to an opus-accepted layout at the SAME channel count by pure relabel (side↔back position equivalence) - emitted via
         // channelmap (a permutation matrix, never a mix). A layout not listed here has no lossless relabel, so it falls to method_layout_err (keep/drop/remix).
+        // 5.0(side) and 6.1(back) are not listed: their relabels lead to 5.0 and 6.1, which libopus moves.
         const OPUS_RELABEL = {
-            '5.0(side)': { layout: '5.0', map: 'FL-FL|FR-FR|FC-FC|SL-BL|SR-BR' },
-            '6.1(back)': { layout: '6.1', map: 'FL-FL|FR-FR|FC-FC|LFE-LFE|BL-SL|BR-SR|BC-BC' },
             'quad(side)': { layout: 'quad', map: 'FL-FL|FR-FR|SL-BL|SR-BR' },
         };
         // One place that answers "what does opus make of this layout?": the normalised layout string, whether libopus accepts it, its lossless relabel (null if
@@ -3350,13 +3421,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // convergence-to-opus path each ask a different downstream question of the same verdict, so a new OPUS_RELABEL entry or a normalisation change lands in
         // one spot instead of three. It reads ffprobe's channel_layout RAW, never the both-probe resolveChannelLayout: these tables are keyed on libavutil's
         // spellings - the layout ffmpeg itself assigns on decode, which is what libopus sees - while MediaInfo spells the same 5.1(side) "L R C LFE Ls Rs"
-        // (Tdarr's mediainfo.js 0.2.0, measured 2026-10-17), which would miss every table and wall off a track libopus accepts. An absent layout takes
-        // opusAcceptsLayout's count-based default, and the count itself comes from resolveChannels.
+        // (Tdarr's mediainfo.js 0.2.0, measured 2026-10-17), which would miss every table and wall off a track libopus accepts. A named PCE reads as the
+        // layout its relabel gives the decode (pceLayoutOf), and its relabel filter starts with that one. An absent layout takes opusAcceptsLayout's
+        // count-based default, and the count itself comes from resolveChannels.
         const opusLayoutFor = (stream, channels) => {
-            const lay = (stream.channel_layout || '').toLowerCase().trim();
+            const lay = (pceLayoutOf(stream) || stream.channel_layout || '').toLowerCase().trim();
             const relabel = OPUS_RELABEL[lay] || null;
             return { lay, ok: opusAcceptsLayout(channels, lay), relabel,
-                relabelFilter: relabel ? `channelmap=map=${relabel.map}:channel_layout=${relabel.layout}` : '' };
+                relabelFilter: relabel ? pceRelabel(stream, `channelmap=map=${relabel.map}:channel_layout=${relabel.layout}`) : '' };
         };
         // Surviving audio COUNT (streams not in removedIndices), read at call time so it reflects dedup + pre-pass removals - backs the never-drop-last guard.
         const countSurvivingAudio = () => file.ffProbeData.streams.filter(a => codecTypeOf(a) === 'audio' && !removedIndices.has(a.index)).length;
@@ -3983,7 +4055,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
 
         // On a mov output the QuickTime muxer silently drops any language spelling outside its legacy Mac table (deu/nld/de all read back with NO
-        // language), so it goes through movLangCode - the shared 'mov language remap' section has the why. mkv/mp4 keep the resolved
+        // language), so it goes through movLangCode - MOV_LANG in the shared 'mov language table' section has the why. mkv/mp4 keep the resolved
         // value verbatim (audio_clean never normalises a language tag - that is clean_and_remux's job), so escMeta is the only transform there.
         const langMetaArg = (idx, lang) => {
             if (!lang) return '';
@@ -4114,7 +4186,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // (54 samples over), while at -2 aac, eac3 and opus all decoded under full scale on all three. The cost is integrated loudness on a peaky mix: 0.0 /
         // 0.9 / 0.9 LU on the three (-1 dBFS cost 0.0 / 0.5 / 0.7). A global sum-normalisation would also stop the clipping, at 6-8 dB of lost level.
         const FOLD_LIMITER = 'alimiter=limit=0.794:level=0:latency=1';
-        const foldFilter = (layout, matrix) => (matrix ? `aformat=sample_fmts=fltp,${matrix},${FOLD_LIMITER}`
+        // A named PCE source is relabelled ahead of the fold (pceRelabel).
+        const foldFilter = (src, layout, matrix) => pceRelabel(src, matrix ? `aformat=sample_fmts=fltp,${matrix},${FOLD_LIMITER}`
             : `aformat=sample_fmts=fltp:channel_layouts=${layout},${FOLD_LIMITER}`);
 
         // Channel/filter snippet for a new or replaced stereo track. No guard check here: every call site either already passed guardBlocks or is a
@@ -4123,7 +4196,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // -ac AFTER an explicit -filter:a, so neither the limiter nor loudnorm would see the folded signal. Returns { arg, measured, changed }: `measured`
         // gates the awk_loudnorm stamp, `changed` the ride-along log tag. Callers that don't run loudnorm read both false.
         const stereoArg = (idx, srcStream) => {
-            const fold = foldFilter('stereo', (methodStereoDownmix === 'dialogue') ? downmixMatrix(srcStream) : null);
+            const fold = foldFilter(srcStream, 'stereo', (methodStereoDownmix === 'dialogue') ? downmixMatrix(srcStream) : null);
             if (methodLoudnorm === 'disabled') return { arg: ` -filter:a:${idx} "${fold}"`, measured: false, changed: false };
             const srcAudioIdx = inputAudioIdxMap.get(srcStream.index);
             const { filter, changed, measured } = buildLoudnormFilter(srcStream.index, srcAudioIdx, fold, LOUDNORM_PRESETS[methodLoudnorm]);
@@ -4134,7 +4207,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // aformat=channel_layouts=5.1 is the matrix -ac 6 uses) ahead of the limiter and of loudnorm's analysis/correction, for the same -ac ordering trap
         // stereoArg documents. Shared by appendSix and the in-place downmix_to_six 'replace' branch so the two can't drift.
         const sixArg = (idx, srcStream) => {
-            const fold = foldFilter('5.1', null);
+            const fold = foldFilter(srcStream, '5.1', null);
             if (methodLoudnorm === 'disabled') return { arg: ` -filter:a:${idx} "${fold}"`, measured: false, changed: false };
             const { filter, changed, measured } = buildLoudnormFilter(srcStream.index, inputAudioIdxMap.get(srcStream.index), fold,
                 LOUDNORM_PRESETS[methodLoudnorm]);
@@ -4142,8 +4215,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
 
         // The in-place counterpart of stereoArg/sixArg for a force that keeps the channel count: same { arg, measured, changed } contract, with whatever
-        // pre-filter the caller needs chained ahead of the analysis (an opus relabel, or nothing). With loudnorm disabled the pre-filter is still emitted
-        // on its own - a lossless relabel is the caller's operation, not loudnorm's, and dropping it would leave the layout unfixed.
+        // pre-filter the caller needs chained ahead of the analysis (an opus relabel, a named PCE's own (pceRelabel), or nothing). With loudnorm disabled
+        // the pre-filter is still emitted alone - a lossless relabel is the caller's operation, not loudnorm's, and dropping it leaves the layout unfixed.
         const loudnormFilterArg = (idx, srcAudioIdx, streamIndex, preFilter = '') => {
             if (methodLoudnorm === 'disabled')
                 return { arg: preFilter ? ` -filter:a:${idx} "${preFilter}"` : '', measured: false, changed: false };
@@ -4256,6 +4329,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     skipDone += `☒${streamTag(ffstream.index)}[${tierTag}][codec_stereo=${codecStereo}] Not downmixing to stereo - ${wallText(codecStereo)}; `
                         + `left as ${ffstreamCodec} ${ffstreamChannels}ch - ${wallRemedy('codec_stereo')}\n`;
                     walledOps += 1;
+                } else if (ffstream.awkTier === 'stereo' && ffstreamChannels > 2 && !modifiedAudioIdx.has(outputAudioIdx) && pceUnnamed(ffstream)) {
+                    skipDone += unnamedPceSkip(ffstream, tierTag, 'Not downmixing to stereo');
                 } else if (ffstream.awkTier === 'stereo' && ffstreamChannels > 2 && !modifiedAudioIdx.has(outputAudioIdx)) {
                     // Downmix changes channel count, so the source bitrate isn't a comparable floor - stereoEnc uses the 2ch target (aac_vbr: no low-info
                     // tier).
@@ -4277,6 +4352,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     skipDone += `☒${streamTag(ffstream.index)}[downmix_to_six=${downmixToSix}][codec_surround=${codecSurround}] Not making a 5.1 - `
                         + `${wallText(codecSurround)}; ${wallRemedy('codec_surround')}\n`;
                     walledOps += 1;
+                } else if (downmixToSix !== 'disabled' && ffstreamChannels > 6 && !hasSixForLang(ffstreamRegionKey) && pceUnnamed(ffstream)) {
+                    skipDone += unnamedPceSkip(ffstream, `downmix_to_six=${downmixToSix}`, 'Not making a 5.1');
                 } else if (downmixToSix !== 'disabled' && ffstreamChannels > 6 && !hasSixForLang(ffstreamRegionKey)) {
                     const sixMode = (downmixToSix === 'replace' && guardBlocks(ffstream, codecSurround, 6, ffstreamChannels)) ? 'add' : downmixToSix;
 
@@ -4312,6 +4389,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     skipDone += `☒${streamTag(ffstream.index)}[downmix_to_stereo=${downmixToStereo}][codec_stereo=${codecStereo}] Not making a stereo - `
                         + `${wallText(codecStereo)}; ${wallRemedy('codec_stereo')}\n`;
                     walledOps += 1;
+                } else if (downmixToStereo !== 'disabled' && ffstreamChannels > 2 && !hasStereoForLang(ffstreamRegionKey) && pceUnnamed(ffstream)) {
+                    skipDone += unnamedPceSkip(ffstream, `downmix_to_stereo=${downmixToStereo}`, 'Not making a stereo');
                 } else if (downmixToStereo !== 'disabled' && ffstreamChannels > 2 && !hasStereoForLang(ffstreamRegionKey)) {
                     const stereoMode = (downmixToStereo === 'replace' && guardBlocks(ffstream, codecStereo, 2, ffstreamChannels)) ? 'add' : downmixToStereo;
 
@@ -4373,6 +4452,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         // at the fold instead (remixFoldsTrack).
                         skipDone += `☒${streamTag(ffstream.index)}[codec_force=${codecForce}] Not forcing ${targetCodecFamily} - would lose detail vs `
                             + `${codecDisplayName(ffstream)} ${forceChannels}ch @ ${srcRateStr} (${guardTriple()}); left as ${ffstreamCodec}\n`;
+                    } else if (shouldForce && pceUnnamed(ffstream)) {
+                        skipDone += unnamedPceSkip(ffstream, `codec_force=${codecForce}`, `Not forcing ${targetCodecFamily}`);
                     } else if (shouldForce) {
                         // Guard the force-to-opus path against libopus-incompatible layouts (method_layout_err). Only opus is affected: ac3/eac3 encode every
                         // layout libopus refuses, a few with fewer channels (encodedChannels), and native aac keeps the count but refuses the height layouts
@@ -4435,10 +4516,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                                 + `${loudnormRideStamp(outputAudioIdx, aacVbrLoud.measured, ffstream, record)}`, record);
                             forced = true;
                         } else {
-                            // Same channel count, codec swap - optionally a LOSSLESS opus relabel (5.0(side)→5.0 via channelmap, keeps all channels).
-                            // resolveBitrate caps the target at the source bitrate when the target codec scores >= the source (guard via awkQuality);
-                            // lossless skips the cap; a high-bitrate lossy source is bounded by the codec ceiling.
-                            const relabelFilter = relabel ? opusLayout.relabelFilter : '';
+                            // Same channel count, codec swap - optionally a LOSSLESS opus relabel (quad(side)→quad via channelmap, keeps all channels), else
+                            // a named PCE's own (pceRelabel). resolveBitrate caps the target at the source bitrate when the target codec scores >= the source
+                            // (guard via awkQuality); lossless skips the cap; a high-bitrate lossy source is bounded by the codec ceiling.
+                            const relabelFilter = relabel ? opusLayout.relabelFilter : pceRelabel(ffstream);
                             const note = relabel ? ` (relabel ${layoutName}→${relabel.layout})` : '';
                             // guardBlocks for this force already passed above (loudnorm rides on that guarantee - see stereoArg). The relabel is the
                             // pre-filter here: a lossless channelmap doesn't change loudness, but chaining it ahead keeps the measurement on the signal
@@ -4495,24 +4576,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // buildLoudnormFilter at its own emit point); this loop only handles the leftovers.
         if (methodLoudnorm !== 'disabled') {
             const preset = LOUDNORM_PRESETS[methodLoudnorm];
-            // An aac track with no ffprobe channel_layout carries an AAC program config element (PCE): ffmpeg's native aac writes 3.1, quad(side), 4.1,
-            // 5.0(side), 5.1(side), 6.0, hexagonal, 6.1, 7.0, 7.1(wide), octagonal and their (front)/(back)/(wide-side) twins that way, so every ffmpeg aac
-            // 5.1 made from ac3/eac3/dts has one. ffmpeg decodes it in the layout's own channel order but unlabelled, and only MediaInfo reads which layout
-            // it is. These are Tdarr's mediainfo.js 0.2.0 spellings (ChannelLayout, which carries the element order, then ChannelPositions) of the PCE
-            // jellyfin-ffmpeg 7.1.4 writes for each layout, measured 2026-11-06. No entry for 6.0 and hexagonal, which spell alike though their PCEs
-            // differ, nor for 6.0(front), which ffmpeg decodes with its two front pairs swapped. A Map, so probe text never reads a prototype member.
-            const AAC_PCE_LAYOUTS = new Map([
-                ['L R Ls Rs / Front: L R, Side: L R', 'quad(side)'],
-                ['L R C LFE / Front: L C R, LFE', '3.1'],
-                ['L R C Ls Rs / Front: L C R, Side: L R', '5.0(side)'],
-                ['L R C Cb Cb / Front: L C R, Side: C, Back: C', '4.1'],
-                ['L R C Cb Lb Rb / Front: L C R, Side: C, Back: L R', '5.1(side)'],
-                ['L R C Cb Lb Rb Cb / Front: L C R, Side: C, Back: L C R', '6.1'],   // ffmpeg writes 6.1(back) and 6.1(front) as this same PCE
-                ['L R C Ls Rs Lb Rb / Front: L C R, Side: L R, Back: L R', '7.0'],   // and 7.0(front) as this one
-                ['L R C Cb ? ? ? ? / Front: L C R, Side: C, Back: 4', '7.1(wide)'],  // and 7.1(wide-side) as this one
-                ['L R C Ls Rs Lb Rb Cb / Front: L C R, Side: L R, Back: L C R', 'octagonal'],
-            ]);
-            const aacPceLayoutOf = (s) => { const mi = mediaInfoFor(s); return AAC_PCE_LAYOUTS.get(`${mi?.ChannelLayout} / ${mi?.ChannelPositions}`) || ''; };
             // WHICH codec a leftover's re-encode lands on. Two candidates, in preference order: keepCodec - the codec the track already has, whenever this
             // plugin can encode it (what a track outside codec_force's scope gets - forceCovers false, e.g. codec_force=disabled - and the only option for
             // a source outside our encodable domain: a kept DTS core, an MP3); configuredCodec - codec_stereo/codec_surround, when codec_force's scope
@@ -4520,13 +4583,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // being spent on the gain correction - this is what makes codec_stereo=aac_vbr reach a track already aac). A guard-protected or over-channel-
             // limit target falls back to the other candidate rather than cancelling the pass, so enabling codec_force can never silently switch loudnorm
             // off. The opus layout wall counts as out of reach too: when libopus refuses the layout with no lossless relabel and no remix will run
-            // (remixFoldsTrack: method_layout_err keep/drop, a remix standing down for an existing stereo, or codec_stereo walled by the container), an opus
-            // target ends in "Not normalizing", so an encodable source codec takes the correction instead: ac3/eac3 encode every layout libopus refuses, a few
-            // with fewer channels (encodedChannels - guard_quality counts that as a channel drop), and native aac keeps the count but refuses the height
-            // layouts (3.1.2, 5.1.2, cube), downmix and an unlabelled PCE decode (AAC_PCE_LAYOUTS). An opus target the remix folds is judged as that fold:
-            // only guardRefusesAnyEncode refuses it here, and guard_quality picks add or replace at the remix. null = neither is in reach.
+            // (remixFoldsTrack: method_layout_err keep/drop, a track already opus, a remix standing down for an existing stereo, or codec_stereo walled by
+            // the container), an opus target ends in "Not normalizing", so an encodable source codec takes the correction instead: ac3/eac3 encode every
+            // layout libopus refuses, a few with fewer channels (encodedChannels - guard_quality counts that as a channel drop), and native aac keeps the
+            // count but refuses the height layouts (3.1.2, 5.1.2, cube), downmix and an unlabelled PCE decode (AAC_PCE_LAYOUTS). An opus target the remix
+            // folds is judged as that fold: only guardRefusesAnyEncode refuses it here, and guard_quality picks add or replace at the remix. null = neither
+            // is in reach.
             const leftoverTarget = (ffstream, channels) => {
-                const ffstreamCodec = codecNameOf(ffstream) || 'unknown';
                 const isStereo = channels <= 2;
                 const configuredCodec = isStereo ? codecStereo : codecSurround;
                 // Folded like every other identity check (codecFamilyOf), so an aac_latm track keeps AAC.
@@ -4539,7 +4602,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const wantCodec = forceCovers(isStereo, channels) ? configuredCodec : keepCodec;
                 let targetCodec = reachable(wantCodec) ? wantCodec : (reachable(keepCodec) ? keepCodec : null);
                 const opusLayoutBlocked = (c) => {
-                    if (aacFamily(c) !== 'opus' || channels <= 2 || ffstreamCodec === 'opus') return false;
+                    if (aacFamily(c) !== 'opus' || channels <= 2) return false;
                     const { ok, relabel } = opusLayoutFor(ffstream, channels);
                     return !ok && !relabel && !folds;
                 };
@@ -4563,8 +4626,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const { targetCodec } = leftoverTarget(ffstream, channels);
                 const stamp = loudnormStampOf(ffstream);
                 if (stamp && (targetCodec === null || loudnormStampHolds(ffstream, stamp))) continue;
-                if (targetCodec === null || (aacFamily(targetCodec) === 'opus' && channels > 2 && codecNameOf(ffstream) !== 'opus'
-                    && !opusLayoutFor(ffstream, channels).ok)) continue;
+                if (targetCodec === null || (aacFamily(targetCodec) === 'opus' && channels > 2 && !opusLayoutFor(ffstream, channels).ok)) continue;
                 leftoverIdxs.push(srcAudioIdx);
             }
             prefetchLoudness(leftoverIdxs.slice(0, Math.max(0, LOUDNORM_MAX_TRACKS - loudnormMeasureCount)), preset);
@@ -4605,14 +4667,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 const targetCodecFamily = aacFamily(targetCodec);
 
-                // Any opus target on a non-opus source - whether codec_force's scope put codec_surround=opus here, or an unencodable source fell through to it:
-                // if libopus CAN'T encode this track's layout, a bare -c:a libopus would abort the whole ffmpeg job. Relabel losslessly when possible (chained
-                // before loudnorm); otherwise defer to method_layout_err. 'remix' downmixes to codec_stereo (+ loudnorm) in place, unless a GENUINE track
-                // already holds this language's stereo (remixDefer, the shared remixDefersToExistingStereo the codec_force path asks too, which never defers a
-                // secondary - a commentary's stereo is not the language's); 'keep' - and 'drop', which can't remove a track once the audio index maps are built
-                // (the codec_force path drops such a track in the pre-pass) - leave it in its source codec, un-normalized.
+                // Any opus target - codec_force's scope put codec_surround=opus here, an unencodable source fell through to it, or the track is already opus:
+                // if libopus can't write this track's layout in place (OPUS_OK_LAYOUTS), a bare -c:a libopus would abort the whole ffmpeg job or move its
+                // speakers. Relabel losslessly when possible (chained before loudnorm); otherwise defer to method_layout_err. 'remix' downmixes to codec_stereo
+                // (+ loudnorm) in place, unless a GENUINE track already holds this language's stereo (remixDefer, the shared remixDefersToExistingStereo the
+                // codec_force path asks too, which never defers a secondary - a commentary's stereo is not the language's); 'keep' - and 'drop', which can't
+                // remove a track once the audio index maps are built (the codec_force path drops such a track in the pre-pass) - leave it in its source codec,
+                // un-normalized. A track already opus is never remixed (remixFoldsTrack), so an opus 5.0 or 6.1 is left as it is under every setting.
                 let loudnormRelabel = '';
-                if (targetCodecFamily === 'opus' && channels > 2 && ffstreamCodec !== 'opus') {
+                if (targetCodecFamily === 'opus' && channels > 2) {
                     const { lay, ok, relabel, relabelFilter } = opusLayoutFor(ffstream, channels);
                     if (!ok) {
                         const remixDefer = remixDefersToExistingStereo(ffstream, relabel);
@@ -4656,7 +4719,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             convert = true;
                             continue;
                         } else {
-                            const why = remixDefer ? 'a stereo already exists for this language' : (methodLayoutErr === 'remix'
+                            const remixWalled = methodLayoutErr === 'remix' && containerRefusesAudio(codecStereo);
+                            const why = remixDefer ? 'a stereo already exists for this language' : (remixWalled
                                 ? `the remix would need codec_stereo=${codecStereo}, and ${wallText(codecStereo)}` : `method_layout_err=${methodLayoutErr}`);
                             skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - libopus can't encode a `
                                 + `${lay || `${channels}ch`} layout; left as ${ffstreamCodec} (${why})\n`;
@@ -4680,18 +4744,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
 
-                // Native aac refuses an unlabelled layout (exit 234, the job fails), so a correction kept in aac on a PCE track (AAC_PCE_LAYOUTS) needs its
-                // layout named. One MediaInfo does not identify is left as it is: a guessed layout re-encodes cleanly but puts channels on the wrong speakers.
-                const unnamedPce = targetCodec === 'aac' && codecFamilyOf(ffstream) === 'aac' && channels > 2
-                    && (!ffstream.channel_layout || ffstream.channel_layout === 'unknown');
-                const pceLayout = unnamedPce ? aacPceLayoutOf(ffstream) : '';
-                if (unnamedPce && !pceLayout) {
-                    const positions = mediaInfoFor(ffstream)?.ChannelPositions;
-                    skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - ffmpeg's aac encoder refuses this track's `
-                        + `unnamed ${channels}ch layout and ${positions ? `MediaInfo's "${logSafe(positions, 60)}" does not identify it`
-                            : 'MediaInfo reports no channel positions'}, so no layout is guessed; left as ${ffstreamCodec} ${channels}ch\n`;
+                // A PCE MediaInfo does not identify is left as it is (unnamedPceSkip), after the within-tolerance exit so an on-target one is still stamped.
+                // For an aac target that also keeps the job alive: native aac refuses an unlabelled decode (exit 234, the job fails).
+                if (pceUnnamed(ffstream)) {
+                    skipDone += unnamedPceSkip(ffstream, `method_loudnorm=${methodLoudnorm}`, 'Not normalizing');
                     continue;
                 }
+                const pceLayout = pceLayoutOf(ffstream);
 
                 if (targetCodec === 'aac_vbr') {
                     const { encoder, args, approxRate, label } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true, channels);
@@ -4716,14 +4775,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         ac3FoldNote(targetCodec, ffstream, record.channels, channels)].filter(Boolean);
                     workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${ffstreamCodec} ${channels}ch @ ${srcRateStr} → `
                         + `${targetCodec} ${record.channels}ch @ ${kbpsToken(dstBps)}${notes.length ? ` (${notes.join('; ')})` : ''}\n`;
-                    // The PCE relabel goes ahead of the correction. Measured 2026-11-06 on jellyfin-ffmpeg 7.1.4, one tone per speaker, on every
-                    // AAC_PCE_LAYOUTS layout: channelmap renames without mixing, so the encoder writes back a byte-identical AudioSpecificConfig with every
-                    // channel's content at its position, and the loudness it measures is unchanged (the analysis needs no relabel). Rejected: -ac N
-                    // relabels to the count's default, which moves or loses a speaker on 3.1, quad(side), 4.1, 6.0, hexagonal, 7.0, 7.1(wide) and octagonal
-                    // (a 6.0 back centre becomes an LFE the encoder band-limits away), and -ch_layout behind the correction's aresample remixes from that
-                    // default (quad(side) loses a side channel).
+                    // The PCE relabel (pceRelabel) goes ahead of the correction, not into its analysis: measured 2026-11-06 on jellyfin-ffmpeg 7.1.4 on every
+                    // AAC_PCE_LAYOUTS layout, the loudness it measures is unchanged, so the prefetch serves the track. An opus relabel already starts with it.
                     replaceInPlace(outputAudioIdx, `${audioEncoder(targetCodec)}${dstBitArg} -filter:a:${outputAudioIdx} `
-                        + `"${pceLayout ? `channelmap=channel_layout=${pceLayout},` : ''}${filter}"${loudnormEncodeStamp(outputAudioIdx, record)}`, record);
+                        + `"${loudnormRelabel ? filter : pceRelabel(ffstream, filter)}"${loudnormEncodeStamp(outputAudioIdx, record)}`, record);
                 }
                 convert = true;
             }
@@ -4832,7 +4887,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams, copiedStreams);
             const mapDrops = [...uncopyable, ...staged.leaveOut].map((s) => ` -map -0:${s.index}`).join('');
             response.preset += `<io>-map 0${mapDrops}${attachLast ? ' -map -0:t' : ''} -c copy${mp4NameCarryArgs(dstContainer, mapped, titleWrittenSrc)}`
-                + `${extraArguments}${attachLast ? ' -map 0:t?' : ''}${strictArg}${mp4TimecodeArgs(dstContainer, mapped)}`
+                + `${extraArguments}${movLangRespellArgs(dstContainer, file.ffProbeData.streams)}${attachLast ? ' -map 0:t?' : ''}${strictArg}`
+                + `${mp4TimecodeArgs(dstContainer, mapped)}`
                 + `${matroskaCoverArgs(staged.kept)}${globalOutputOpt}${mp4MovflagsArg(dstContainer, tagPlan)}${outputMuxerArg(dstContainer)}`;
             response.infoLog += staleStatsNote(statsCleared);
             response.infoLog += `☑Expected results: ${buildOutputSummary()}\n`;
