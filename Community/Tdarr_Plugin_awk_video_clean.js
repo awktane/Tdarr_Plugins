@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.83',
+    Version: '3.999.84',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1876,12 +1876,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ISO 639-2/T and spells 15 of the 20 dual-spelling languages the /B way, so their /T spelling is precisely the one mov throws away (measured on
     // jellyfin-ffmpeg 7.1.4: nld/deu/zho land 0x7fff, dut/ger/chi land a real code; 106 of the 184 codes to6392T can emit are dropped). It spells four of
     // the others the /T way, so their /B spellings map back (fre -> fra, cze -> ces, rum -> ron, slo -> slk), and Maori has no row, as the table holds
-    // it under no code. Each row maps a spelling the muxer drops to the one it stores for the same language. Anyone extending this must re-measure against
-    // the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a safe source. mp4/m4v/m4a pack the letters directly and keep either
-    // spelling, which is why this is mov-only. Null-prototype so a container tag spelling an Object.prototype member ('constructor', '__proto__') misses the
-    // table instead of resolving an inherited function.
+    // it under no code. Each such row maps a spelling the muxer drops to the one it stores for the same language. Anyone extending this must re-measure
+    // against the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a safe source. mp4/m4v/m4a pack the letters directly and keep
+    // either spelling, which is why this is mov-only. Null-prototype so a container tag spelling an Object.prototype member ('constructor', '__proto__')
+    // misses the table instead of resolving an inherited function.
     const MOV_LANG = Object.assign(Object.create(null), { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
-        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel', fre: 'fra', cze: 'ces', rum: 'ron', slo: 'slk' });
+        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel', fre: 'fra', cze: 'ces', rum: 'ron', slo: 'slk',
+        // Rows of another kind: the table holds Norwegian only as the macrolanguage nor, not its two written forms, so Bokmål and Nynorsk (nob and nno,
+        // which land 0x7fff) are written as nor - the language kept, the written form lost, and a .mov holds the two as one language. Every other
+        // language the muxer drops still reads back with none: the table holds Swedish and Irish only as Mac codes ffmpeg spells sve and iri, which no
+        // plugin reads as a language.
+        nob: 'nor', nno: 'nor' });
     // -=-=-= movLangRespellArgs  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // The language writes a remux into .mov owes the tracks it copies or re-encodes: a .mov another tool wrote can hold a spelling the table lacks
     // (AVFoundation stores deu and nld), which the copy would lose, so each such language goes back in MOV_LANG's spelling and nothing else is touched (a

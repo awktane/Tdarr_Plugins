@@ -43,7 +43,7 @@ const details = () => ({
                 stream_ordering (last). If the file has embedded closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that
                 destroys them. Extract with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since
                 the sidecars would land beside the source, where the output never sees them.`,
-    Version: '3.999.98',
+    Version: '3.999.99',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -65,7 +65,10 @@ const details = () => ({
                 Windows-1252) stays on disk with a line saying so; save it as UTF-8 to import it. So does one it cannot read at all - an empty .srt or
                 .ass, or an srt whose cues have no numbers - while the others still go in. A sidecar it imported that something later removed from
                 the file - clean_and_remux's language_sub or remove_sub_sdh, say - is not imported again, and stays on disk; rename it to bring it back.
-                Matching only_languages to language_sub skips that one wasted import.`,
+                Matching only_languages to language_sub skips that one wasted import. While deduplicate compares text, a sidecar whose cues are an embedded
+                track's, every one moved by the same amount of at most 0.1 s - what converting an mp4 to mkv does to a sidecar extracted with
+                remove_source=false - counts as that track: it is not imported and stays on disk, so a sidecar you re-timed by less than 0.1 s is not
+                imported either.`,
         },
         {
             name: 'only_languages',
@@ -90,12 +93,14 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\nenabled_only_sidecar (default) - compare the SIDECARS only. On import a byte-identical group becomes a single track carrying their
-                combined flags (a plain + SDH pair imports once, tagged SDH), and a sidecar whose text is already embedded is skipped instead of added a
-                second time. Nothing is removed from the video.
+                combined flags (a plain + SDH pair imports once, tagged SDH) and the first of their titles that keeps every role their names give (English
+                SDH over English; copies no one title covers, such as English SDH and English Forced, go in as separate tracks), and a sidecar whose text is
+                already embedded is skipped instead of added a second time. Nothing is removed from the video.
                 \\nenabled_checkmedia - also read the video's own subtitle tracks, in both actions. That catches two problems the sidecars alone cannot
-                show: a subtitle the video carries twice (the first copy survives and inherits the others' flags, title and language, so no tagging is
-                lost), and a track holding no text at all, which a player still lists. This is the only setting that deletes a subtitle you did not ask to
-                extract, and it costs one extra read of the file.
+                show: a subtitle the video carries twice (the first copy survives and inherits the others' flags and language, and the first title that keeps
+                every role their names give - English SDH over English - so no tagging is lost; copies no one title covers, such as English SDH and English
+                Forced, all stay), and a track holding no text at all, which a player still lists. This is the only setting that deletes a subtitle you did
+                not ask to extract, and it costs one extra read of the file.
                 \\ndisabled - mux every sidecar as its own track, byte-identical copies included, so you may end up with duplicate subtitles.
                 \\nDeleting the sidecar FILES afterwards is remove_source's decision whatever this is set to, and it removes every member of a collapsed
                 group rather than only the one that was muxed. Embedded closed captions are not subtitle tracks and are never seen here; once embedded_cc
@@ -1779,12 +1784,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ISO 639-2/T and spells 15 of the 20 dual-spelling languages the /B way, so their /T spelling is precisely the one mov throws away (measured on
     // jellyfin-ffmpeg 7.1.4: nld/deu/zho land 0x7fff, dut/ger/chi land a real code; 106 of the 184 codes to6392T can emit are dropped). It spells four of
     // the others the /T way, so their /B spellings map back (fre -> fra, cze -> ces, rum -> ron, slo -> slk), and Maori has no row, as the table holds
-    // it under no code. Each row maps a spelling the muxer drops to the one it stores for the same language. Anyone extending this must re-measure against
-    // the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a safe source. mp4/m4v/m4a pack the letters directly and keep either
-    // spelling, which is why this is mov-only. Null-prototype so a container tag spelling an Object.prototype member ('constructor', '__proto__') misses the
-    // table instead of resolving an inherited function.
+    // it under no code. Each such row maps a spelling the muxer drops to the one it stores for the same language. Anyone extending this must re-measure
+    // against the muxer: the table is a MIXTURE of /T and /B, so the ISO 639-2/B list is not a safe source. mp4/m4v/m4a pack the letters directly and keep
+    // either spelling, which is why this is mov-only. Null-prototype so a container tag spelling an Object.prototype member ('constructor', '__proto__')
+    // misses the table instead of resolving an inherited function.
     const MOV_LANG = Object.assign(Object.create(null), { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
-        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel', fre: 'fra', cze: 'ces', rum: 'ron', slo: 'slk' });
+        deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel', fre: 'fra', cze: 'ces', rum: 'ron', slo: 'slk',
+        // Rows of another kind: the table holds Norwegian only as the macrolanguage nor, not its two written forms, so Bokmål and Nynorsk (nob and nno,
+        // which land 0x7fff) are written as nor - the language kept, the written form lost, and a .mov holds the two as one language. Every other
+        // language the muxer drops still reads back with none: the table holds Swedish and Irish only as Mac codes ffmpeg spells sve and iri, which no
+        // plugin reads as a language.
+        nob: 'nor', nno: 'nor' });
     // -=-=-= movLangRespellArgs  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // The language writes a remux into .mov owes the tracks it copies or re-encodes: a .mov another tool wrote can hold a spelling the table lacks
     // (AVFoundation stores deu and nld), which the copy would lose, so each such language goes back in MOV_LANG's spelling and nothing else is touched (a
@@ -3220,6 +3230,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Those texts as one sha1: the same subtitle gives the same key whatever its timing (a mov_text -> srt conversion moves every cue about 21 ms, measured),
     // another track's text a different one.
     const cueTextKey = (text, ext) => crypto.createHash('sha1').update(cueTexts(text, ext).join('\n\n')).digest('hex');
+    // A subtitle apart from its timing: { key, times } - the sha1 of subTextForHash's text with each cue's two stamps blanked (an srt/vtt timing line keeps
+    // its arrow and cue settings, an ass Dialogue line its other fields), and every cue's [start, end] in whole milliseconds, in order. Two subtitles with
+    // one key differ in their timing alone (shiftedTrack). Each line is tested with one anchored pattern, as cueSpan reads them.
+    const timingApart = (buf, ext) => {
+        const e = String(ext || '').toLowerCase().replace(/^\./, '');
+        const ms = (stamp) => Math.round(hmsSeconds(stamp) * 1000);
+        const times = [];
+        const rest = subTextForHash(buf, e).split('\n').map((line) => {
+            const m = e === 'ass' || e === 'ssa' ? /^(\s*Dialogue\s*:[^,]*,)([^,]*),([^,]*)(,[\s\S]*)/i.exec(line)
+                : /^([ \t]*)((?:\d+:)?\d{1,2}:\d{1,2}[.,]\d{1,3})([ \t]*-->[ \t]*)((?:\d+:)?\d{1,2}:\d{1,2}[.,]\d{1,3})([\s\S]*)/.exec(line);
+            if (!m) return line;
+            const [a, b] = e === 'ass' || e === 'ssa' ? [m[2], m[3]] : [m[2], m[4]];
+            times.push([ms(a), ms(b)]);
+            return e === 'ass' || e === 'ssa' ? `${m[1]},${m[4]}` : `${m[1]}${m[3]}${m[5]}`;
+        });
+        return { key: crypto.createHash('sha1').update(rest.join('\n')).digest('hex'), times };
+    };
     // How many cues show a viewer any text - the count a sidecar and what ffmpeg kept of it are compared on (deletionLoss). Tags (<i>, <font>) and {\...}
     // overrides are taken out first, and a cue left with nothing is not counted on either side: ffmpeg drops an empty srt cue on the way in, mov_text also
     // one holding only tags, it keeps an empty ass Dialogue (measured on 7.1.4), and the import leaves an empty WebVTT cue out of Matroska
@@ -3323,12 +3350,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { any, mp4 };
     };
 
-    // One read per sidecar answers every content question - hash identity (contentKey), cue emptiness (groupHasNoCues), what importing it would drop
-    // (importLosses), its text-cue count (deletionLoss) and why ffmpeg cannot read it whole, '' when it can (ffmpegText, unreadableText) - mirroring
-    // embeddedTextHashes, whose one ffmpeg pass answers the first two for the embedded side. Memoised per rel. null = unreadable or over the cap; each caller
-    // keeps its own failure direction (contentKey -> a unique never-merged key, groupHasNoCues -> false = not provably empty). The size is checked FIRST: a
-    // name that merely parses as a sidecar says nothing about what is behind it, and a runaway OCR dump or a mis-renamed file left as <video>.eng.srt would
-    // otherwise be pulled into the worker whole (the cap's why is at embeddedTextHashes).
+    // One read per sidecar answers every content question - hash identity (contentKey), its text apart from its timing (shiftedTrack), cue emptiness
+    // (groupHasNoCues), what importing it would drop (importLosses), its text-cue count (deletionLoss) and why ffmpeg cannot read it whole, '' when it can
+    // (ffmpegText, unreadableText) - mirroring embeddedTextHashes, whose one ffmpeg pass answers the first two for the embedded side. Memoised per rel. null =
+    // unreadable or over the cap; each caller keeps its own failure direction (contentKey -> a unique never-merged key, groupHasNoCues -> false = not provably
+    // empty). The size is checked FIRST: a name that merely parses as a sidecar says nothing about what is behind it, and a runaway OCR dump or a
+    // mis-renamed file left as <video>.eng.srt would otherwise be pulled into the worker whole (the cap's why is at embeddedTextHashes).
     const sidecarContentMemo = new Map();
     const sidecarContent = (f) => {
         if (sidecarContentMemo.has(f.rel)) return sidecarContentMemo.get(f.rel);
@@ -3347,6 +3374,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 out = {
                     sha1: subTextHash(buf, path.extname(f.rel)),
+                    timing: f.bundle ? null : timingApart(buf, path.extname(f.rel)),
                     noCues: hasNoCues(text, f.ext),
                     loss: importLosses(text, f.ext),
                     cues: textCueCount(read.text, f.ext),
@@ -3368,6 +3396,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const embeddedSpan = new Map();
     // And the key of its cue TEXTS (cueTextKey): the yardstick a sidecar under any other spelling is held to (sameCueText, textDecides).
     const embeddedCues = new Map();
+    // And its text apart from its timing (timingApart): what shiftedTrack holds a sidecar to.
+    const embeddedTiming = new Map();
 
     // The CONTENT of every embedded text subtitle, as a sha1 keyed by source stream index - the only sound answer to "is this sidecar already in the file":
     // metadata cannot answer it in either direction (retitling changes every visible field while the text stays identical; two tracks can share language+title
@@ -3425,6 +3455,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const ext = path.extname(out).replace('.', '');
                     embeddedSpan.set(idx, cueSpan(text, ext));
                     embeddedCues.set(idx, cueTextKey(text, ext));
+                    embeddedTiming.set(idx, timingApart(buf, ext));
                     // A track that decoded to no cues is EMPTY, not a duplicate. It gets no hash deliberately: every empty track would otherwise hash
                     // alike and be reported as a copy of the others, which describes the wrong problem and leaves one empty track standing.
                     if (hasNoCues(text, ext)) { embeddedEmptyIdx.add(idx); continue; }
@@ -3502,9 +3533,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // sidecar. Re-serialised by ffmpeg itself, the two sides match by construction: on jellyfin-ffmpeg 7.1.4 this matched the real import's embedded copy
     // on all 34 shapes tried (17 srt/vtt/ass/ssa sidecars x mkv/mp4). The container step is required - decoding and re-encoding with none differed for
     // mov_text on 2 of them. Two short ffmpeg runs, memoised per target; null when either fails, and callers then have the sidecar's own text alone.
-    // roundTripCues keeps, per target, how many text-bearing cues came back (textCueCount), for deletionLoss. Into Matroska the sidecar is copied through
-    // VTT_EMPTY_CUE_DROP, as the import copies it. roundTripRefused keeps the targets whose mux ffmpeg ran and refused (sidecarMuxRefused).
-    const roundTripMemo = new Map(); const roundTripCues = new Map(); const roundTripRefused = new Set();
+    // roundTripCues keeps, per target, how many text-bearing cues came back (textCueCount), for deletionLoss, and roundTripTiming what came back apart from
+    // its timing (timingApart), for shiftedTrack. Into Matroska the sidecar is copied through VTT_EMPTY_CUE_DROP, as the import copies it.
+    // roundTripRefused keeps the targets whose mux ffmpeg ran and refused (sidecarMuxRefused).
+    const roundTripMemo = new Map(); const roundTripCues = new Map(); const roundTripTiming = new Map(); const roundTripRefused = new Set();
     const sidecarRoundTripHash = (f, mp4) => {
         const key = `${mp4 ? 'mp4' : 'mkv'}|${f.rel}`;
         if (roundTripMemo.has(key)) return roundTripMemo.get(key);
@@ -3527,6 +3559,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const back = fs.readFileSync(out);
                 roundTripMemo.set(key, subTextHash(back, path.extname(out)));
                 roundTripCues.set(key, textCueCount(back.toString('utf8'), enc.ext));
+                roundTripTiming.set(key, timingApart(back, enc.ext));
             }
         } catch (e) { /* no round-trip identity - callers fall back to the sidecar's own text */ }
         try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
@@ -3574,6 +3607,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (own && set.has(own)) return 'text';
         const rt = sidecarRoundTripHash(f, mp4);
         return rt && set.has(rt) ? 'roundtrip' : null;
+    };
+    // A container conversion moves every cue of a subtitle by one constant: the audio's encoder delay an mp4 edit list holds, which Matroska writes into the
+    // timestamps (measured on 7.1.4: 21 ms from an mp4 with 48 kHz aac, 23 ms at 44.1 kHz, 46 ms at 22.05 kHz, 44 ms from a HandBrake mp4). SHIFT_MAX_MS is
+    // the largest shift counted as that rather than as a re-time. SHIFT_ROUNDING_MS is how far one cue's shift may differ from another's: one millisecond,
+    // the unit srt and vtt print a stamp in - the rounding itself measured 0 on every cue of mp4 -> mkv, mkv -> mp4 and mp4 -> mkv -> mp4 conversions, cue
+    // times with sub-millisecond parts and frame-aligned ones included.
+    const SHIFT_MAX_MS = 100;
+    const SHIFT_ROUNDING_MS = 1;
+    // The track (source index) of `hashes` that holds this sidecar with its timing moved: its text apart from its timing (timingApart) is the track's - its
+    // own text's or, on a miss, the round trip's (sidecarMatch) - and every cue's start and end lie within SHIFT_ROUNDING_MS of one shift of at most
+    // SHIFT_MAX_MS. { index, shift } in milliseconds, the track's cue time less the sidecar's; null when no track does.
+    const shiftedTrack = (f, mp4, hashes) => {
+        sidecarRoundTripHash(f, mp4);
+        const sides = [sidecarContent(f)?.timing, roundTripTiming.get(`${mp4 ? 'mp4' : 'mkv'}|${f.rel}`)].filter((x) => x && x.times.length);
+        for (const [index] of hashes) {
+            const t = embeddedTiming.get(index);
+            for (const s of sides) {
+                if (!t || t.key !== s.key || t.times.length !== s.times.length) continue;
+                let lo = Infinity; let hi = -Infinity;
+                s.times.forEach(([a, b], i) => { for (const d of [t.times[i][0] - a, t.times[i][1] - b]) { lo = Math.min(lo, d); hi = Math.max(hi, d); } });
+                if (hi - lo <= SHIFT_ROUNDING_MS && Math.max(-lo, hi) <= SHIFT_MAX_MS) return { index, shift: t.times[0][0] - s.times[0][0] };
+            }
+        }
+        return null;
     };
     // remove_source deletes a sidecar only when nothing is lost by it. A 'text' match proves the file holds the whole subtitle; a 'roundtrip' match only
     // that it holds what the import kept, so a sidecar the import strips stays, and this names what deleting it would cost ('' = safe to delete). The
@@ -3628,9 +3685,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return ![...embeddedCues].some(([i, k]) => i !== s.index && !droppedDuplicates.has(i) && k === key);
     };
     // Whether the file at p (rel names it, for its extension) holds no text while the stream has cues: 0 bytes, or no cue its text decodes to - what an
-    // interrupted run leaves. Replacing it loses nothing, and one left beside a new sidecar fails the next import. The stream is read only for a file that
-    // holds no cue, so a library already extracted pays for no ffmpeg pass; a bundle with bytes is judged under remove_source=true only
-    // (existingSidecarVerdict). Never through a symbolic link; false whenever either side cannot be read, or its text holds a NUL beside other text.
+    // interrupted run leaves. Replacing it loses nothing, and left there it stands in for the stream at the next import, which fails on an empty styled
+    // subtitle bundle, leaves an empty .srt or .ass out with a line, and takes a .vtt (or an .ass holding only its header) in as an empty track. The stream is
+    // read only for a file that holds no cue, so a library already extracted pays for no ffmpeg pass; a bundle with bytes is judged under remove_source=true
+    // only (existingSidecarVerdict). Never through a symbolic link; false whenever either side cannot be read, or its text holds a NUL beside other text.
     const emptyCopyAt = (s, p, rel, bundle, subs) => {
         try { if (isSymlinkAt(p) || !fs.statSync(p).isFile()) return false; } catch (e) { return false; }
         if (fileHasBytes(p)) {
@@ -3733,16 +3791,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return candidates.find((n) => sameCueText(s, libPathOf(n), n, bundle, subs)) || null;
     };
 
+    // The subtitle roles a track's name fields give, rolesNamed on each field on its own, a role by its tag, so CC and SDH are one: what the duplicate fold
+    // below and the import's sidecar merge weigh a title by.
+    const rolesIn = (fields) => fields.flatMap((t) => rolesNamed(t, 'subtitle').map((k) => dispositionTypes[k].tag || k));
     // deduplicate=enabled_checkmedia: the same duplicate test turned on the file's OWN tracks. Two subtitle streams holding identical text are one subtitle
     // stored twice, however their tags read, and this is the only place in the plugin that removes a subtitle the user did not ask to extract - which is why it
     // is its own opt-in value rather than part of enabled_only_sidecar. The survivor is chosen by the sidecar groups' rule: lowest source index wins, and it
-    // inherits the union of the group's flags plus the first title and first real language any member carries - identical text, every tag folded onto the
-    // keeper, so nothing is lost. Returns the source indices to drop and, only when the union differs from what the keeper already has, the metadata to restamp
-    // it with. The title is the first a member holds outside its handler (titleOutsideHandler: an mkv title tag, the udta part of an mp4 or mov mediaInfo
-    // Title), even one equal to its handler, and only with none the first named handler - mediaTitleFor's ranking within one track - so a release name in the
-    // keeper's HANDLER_NAME never displaces a duplicate's real title ('English SDH', whose SDH role would go with it), and a keeper titled as its handler names
-    // keeps that title rather than take a duplicate's. The fold's line names it as the output holds it (foldedStream: a non-ASCII .mov title reads as the
-    // handler), in escMeta's form ('Say "Hi"' is written and named "Say 'Hi'").
+    // inherits the union of the group's flags, the first real language any member carries and the first title with which it keeps every role their names give
+    // (below) - identical text, every tag folded onto the keeper, so nothing is lost. Returns the source indices to drop and, only when the union differs from
+    // what the keeper already has, the metadata to restamp it with. Titles rank as mediaTitleFor ranks them within one track: every title a member holds
+    // outside its handler (titleOutsideHandler: an mkv title tag, the udta part of an mp4 or mov mediaInfo Title), even one equal to its handler, ahead of
+    // every named handler - so a release name in the keeper's HANDLER_NAME never displaces a duplicate's real title ('English SDH', whose SDH role would go
+    // with it), and a keeper titled as its handler names keeps that title rather than take a duplicate's. The fold's line names it as the output holds it
+    // (foldedStream: a non-ASCII .mov title reads as the handler), in escMeta's form ('Say "Hi"' is written and named "Say 'Hi'").
     const dedupeEmbeddedSubs = (subs) => {
         const hashes = embeddedTextHashes(subs);
         const out = { dropIdx: [], retag: null, log: '' };
@@ -3763,17 +3824,31 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (g.length < 2) continue;
             const ordered = g.slice().sort((a, b) => a.index - b.index);
             const keep = ordered[0]; const drop = ordered.slice(1);
-            out.dropIdx.push(...drop.map((s) => s.index));
-            out.log += `☐${streamTag(keep.index)}[deduplicate=enabled_checkmedia] Removing ${drop.length} duplicate subtitle stream${
-                drop.length === 1 ? '' : 's'} (${drop.map((s) => `s${s.index}`).join(', ')}) - byte-identical to this one\n`;
             // `default` is the one flag NOT unioned: it says which track a player should pick, not what the subtitle IS, so this plugin never tracks it
             // (see DISPOSITIONS). Folding it would let a duplicate hand the survivor a default flag it never had, silently changing what plays - so the
             // keeper simply keeps its own, and the disposition write below, which replaces the whole set, neither invents nor strips it.
             const disp = new Set(ordered.flatMap(activeDispositions));
             disp.delete('default');
             if (keep.disposition?.default === 1) disp.add('default');
-            const title = ordered.map((s) => titleOutsideHandler(s)).find(Boolean) || ordered.map((s) => mediaTitleFor(s)).find(Boolean) || '';
             const lang = ordered.map((s) => resolveLang(s) || '').find((l) => l && l !== 'und') || (resolveLang(keep) || 'und');
+            // The roles a remux leaves each copy, read as the next pass reads it (foldedView: the title written, beside the handler and descriptions it
+            // keeps), by rolesIn. The kept title is the first, in the ranking above, that leaves the keeper every one of them; with none, the group is not
+            // folded, since removing a copy would lose a role the file keeps without it.
+            const readsAs = (s, t) => rolesIn(foldedView([{ index: s.index, lang, title: t, disp: [...disp] }], s).readBackRoleFields);
+            const roles = new Set(ordered.flatMap((s) => readsAs(s, titleOutsideHandler(s) || mediaTitleFor(s))));
+            const titles = [...ordered.map((s) => titleOutsideHandler(s)), ...ordered.map((s) => mediaTitleFor(s))].filter(Boolean);
+            const namesAll = (t) => { const got = readsAs(keep, t); return [...roles].every((r) => got.includes(r)); };
+            const title = (titles.length ? titles : ['']).find(namesAll);
+            if (title === undefined) {
+                const named = [...new Set(titles)].map((t) => `'${logSafe(t)}'`).join(', ') || 'none';
+                out.log += `☒${streamTag(keep.index)}[deduplicate=enabled_checkmedia] Keeping ${drop.length} duplicate subtitle stream${
+                    drop.length === 1 ? '' : 's'} (${drop.map((s) => `s${s.index}`).join(', ')}) - byte-identical to this one, but no one of their`
+                    + ` titles (${named}) keeps every role their names give, and removing one would lose a role\n`;
+                continue;
+            }
+            out.dropIdx.push(...drop.map((s) => s.index));
+            out.log += `☐${streamTag(keep.index)}[deduplicate=enabled_checkmedia] Removing ${drop.length} duplicate subtitle stream${
+                drop.length === 1 ? '' : 's'} (${drop.map((s) => `s${s.index}`).join(', ')}) - byte-identical to this one\n`;
             const keepDisp = new Set(activeDispositions(keep));
             const sameDisp = sameDispositions(keepDisp, disp);
             if (sameDisp && mediaTitleFor(keep) === title && langKey(resolveLang(keep) || 'und') === langKey(lang)) continue;
@@ -5133,9 +5208,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 let alreadyExtracted = remote ? remote.state === 'present'
                     : (removeSource ? fileHasBytes(full) : fs.existsSync(full));
-                // A file here that holds no text while the stream has cues is replaced under remove_source=false too (emptyCopyAt): it holds nothing to lose,
-                // and an import muxing it fails the file. A cue-less stream's own empty sidecar is its extract, and stays (or every pass would write it again,
-                // an identical preset Tdarr errors as a loop).
+                // A file here that holds no text while the stream has cues is replaced under remove_source=false too: it holds nothing to lose, and an import
+                // would take it for the stream (emptyCopyAt). A cue-less stream's own empty sidecar is its extract, and stays (or every pass would write it
+                // again, an identical preset Tdarr errors as a loop).
                 if (!remote && !removeSource && alreadyExtracted && emptyCopyAt(s, full, name, bundle, streams)) {
                     if (!placeViaApi()) {
                         try { fs.unlinkSync(full); } catch (e) {
@@ -5183,7 +5258,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (alreadyExtracted) { skipped += 1; response.infoLog += `☑${streamTag(s.index)} Sidecar already exists, not overwriting: ${name}\n`; }
                 // While an old spelling this node cannot rename holds the track's text, no NEW name is written: an import before the user deletes it would mux
                 // the new file beside the kept stream and the old one (measured: three copies of a styled bundle under the default deduplicate). A file at the
-                // current name judged empty or incomplete above is still written over, the stream kept (keep): left as it was, it failed every import.
+                // current name judged empty or incomplete above is still written over, the stream kept (keep): left as it was, every import would take it,
+                // empty or cut short, for the track (an empty one: emptyCopyAt).
                 else if (oldLeft.length && !(remote ? remote.empty : fs.existsSync(full))) { held += 1; continue; }
                 else if (!removeSource && !bundle && unreadable(s)) continue;
                 // API placement: the extraction is deferred to placeSidecars after the loop, so this stream's removedIndices entry and its bundled tally
@@ -5686,8 +5762,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const inFile = surviving ? bundleInFile(f, surviving.values()) : null;
             return inFile === null ? metadataMatchesEmbedded(f, embeddedSubs, hasFontAttachment, isMp4) : inFile;
         };
+        // The track the import writes for each sidecar of a merged group (merged, below): the group's entry, whose title can be another member's ('English'
+        // goes in as 'English SDH'). The marker's metadata match holds such a sidecar to that track, so a merged group settles as a single sidecar does; any
+        // other sidecar - one of an apart group, a bundle - is held to its own name.
+        const writtenAs = new Map();
         const alreadyEmbedded = (f) => importedSet.has(f.rel)
-            && (f.bundle ? bundleConfirmed(f) : metadataMatchesEmbedded(f, embeddedSubs, hasFontAttachment, isMp4));
+            && (f.bundle ? bundleConfirmed(f) : metadataMatchesEmbedded(writtenAs.get(f.rel) || f, embeddedSubs, hasFontAttachment, isMp4));
         // The marker entries a write records: each listed sidecar with the hash of its text now (what this pass imports, or carries forward), else the
         // hash an earlier entry already held for it.
         const markerFor = (rels) => rels.map((rel) => {
@@ -5725,19 +5805,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
-        // One import per group: union the members' disposition tokens (byte-identical plain + SDH -> SDH), and take the first non-"und" language and
-        // first non-empty title. The physical file muxed is the member with the most-specific dispositions (deterministic tie-break by name); its
-        // metadata is overridden by the merged values, so which identical copy we pick doesn't matter.
+        // A group imports as one track (an apart group, below, as one per sidecar): union the members' disposition tokens (byte-identical plain + SDH ->
+        // SDH), and take the first non-"und" language. The physical file muxed is the member with the most-specific dispositions (deterministic tie-break by
+        // name); its metadata is overridden by the merged values, so which identical copy we pick doesn't matter.
         let merged = groups.map((g) => {
             const dispTokens = [...new Set(g.flatMap((m) => m.dispTokens))];
             const extraTokens = [...new Set(g.flatMap((m) => m.extraTokens || []))];   // unioned with the roles, so a merged group keeps every member's flags
             const lang = (g.find((m) => m.lang && m.lang !== 'und') || g[0]).lang;
-            const title = g.map((m) => m.title).find(Boolean) || '';
+            // The title is the first member's, in the group's order, with which the track as the next pass reads it (sidecarToStream: on an mp4-family
+            // target beside the handler written with it) gives every role the members' titles give (rolesIn) - dedupeEmbeddedSubs' rule for its keeper, so
+            // 'English' with 'English SDH' imports as 'English SDH'; a role a name's flag token gives is in the unioned flags. With no such title the group
+            // is apart: its sidecars go in as one track each (below), and its first title stands for it where its text is already in the file, beside
+            // firstTitle - every group's first title (see that comparison).
+            const readsAs = (t) => rolesIn(roleFieldsLower(sidecarToStream({ ...g[0], title: t }, isMp4)));
+            const roles = new Set(g.flatMap((m) => readsAs(m.title)));
+            const titles = g.map((m) => m.title).filter(Boolean);
+            const title = (titles.length ? titles : ['']).find((t) => { const got = readsAs(t); return [...roles].every((r) => got.includes(r)); });
             const src = g.slice().sort((a, b) => b.dispTokens.length - a.dispTokens.length || (a.name < b.name ? -1 : 1))[0];
-            return {
-                members: g, name: src.name, rel: src.rel, ext: src.ext, bundle: src.bundle, lang, title, dispTokens, extraTokens,
-                disp: [...new Set(dispTokens.concat(extraTokens).map(dispFfOf).filter(Boolean))],
+            const entry = {
+                members: g, name: src.name, rel: src.rel, ext: src.ext, bundle: src.bundle, lang, title: title ?? titles[0], firstTitle: titles[0] || '',
+                apart: title === undefined, dispTokens, extraTokens, disp: [...new Set(dispTokens.concat(extraTokens).map(dispFfOf).filter(Boolean))],
             };
+            if (!entry.apart) for (const m of g) writtenAs.set(m.rel, entry);
+            return entry;
         });
 
         // The CONTENT half of the same rule (the marker is not cleared by anything but an extract - see metadataMatchesEmbedded). Specific to THIS site:
@@ -5760,9 +5850,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!surviving.size) return false; // the probe RAN and no surviving track holds text, so this sidecar is demonstrably not in the file - import it
             return !!sidecarMatch(f, isMp4, surviving.values());
         };
-        // The marker skip, now that a group has ONE identity. A group is done only when EVERY member is confirmed embedded AND the group's text is really
-        // there: a partly-confirmed group still has something to say (its merged title or flags may not be on the track yet), and processing it is harmless
-        // because its content is then found already embedded below. The test runs on a GROUP, never on a bare file - see the candidates filter above for why.
+        // The marker skip, now that a group has ONE identity. A group is done only when EVERY member is confirmed embedded (a merged group's by the one
+        // track written for it, writtenAs) AND the group's text is really there: a partly-confirmed group still has something to say (its merged title or
+        // flags may not be on the track yet), and processing it is harmless because its content is then found already embedded below. The test runs on a
+        // GROUP, never on a bare file - see the candidates filter above for why.
         const settled = new Set(merged.filter((f) => f.members.every(alreadyEmbedded) && contentAllowsSkip(f)));
         for (const f of settled) {
             const names = f.members.length > 1 ? `${f.members.length} copies of it (${f.members.map((m) => m.rel).join(', ')})` : f.rel;
@@ -5786,6 +5877,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             for (const [idx, eh] of embeddedHashes) if (eh === h) return idx;
             return null;
         };
+        // On a miss, the same tracks holding the sidecar with every cue moved by one small shift (shiftedTrack) - what a container conversion leaves of a
+        // sidecar extracted with remove_source=false. That sidecar is not imported, and it is never deleted on this match, which is no proof the file holds
+        // the subtitle as the sidecar times it: it stays out of alreadyInFile, which this pass's deletions and the marker's consumed entries come from, and
+        // post-processing deletes only a sidecar whose text the file holds as it is (contentConfirms).
+        const shiftedAt = (f) => (f.bundle || !embeddedHashes || !embeddedHashes.size || !groupHash.has(f.members) ? null
+            : shiftedTrack(f, isMp4, embeddedHashes));
         // A track already in the file needs no mux, so the only open question is its METADATA - and unlike a new track it has metadata of its own to
         // disagree with. method_import_metadata decides who wins: 'embedded' keeps the track's tags and reports the difference (a sidecar name is frozen
         // when written, so an old one carries no token for a flag that did not exist yet, and applying it would STRIP that flag); 'sidecar' makes the
@@ -5796,16 +5893,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // retune the log already announced as done.
         const alreadyInFile = []; const toMux = []; let retuneMeta = ''; const retunedAt = new Set();
         for (const f of merged) {
-            const at = embeddedAt(f);
-            if (at === null) { toMux.push(f); continue; }
-            f.embeddedAt = at;
-            alreadyInFile.push(f);
-            response.infoLog += `☑${streamTag(at)}[deduplicate=${dedupeMode}] ${f.rel} is already in the file - not importing a second copy\n`;
+            let at = embeddedAt(f);
+            // A sidecar found with its timing moved (shiftedAt) is that track here too, so its name's metadata is weighed below like any other.
+            const moved = at === null ? shiftedAt(f) : null;
+            if (moved) {
+                at = moved.index;
+                response.infoLog += `☑${streamTag(at)}[deduplicate=${dedupeMode}] ${f.rel} is already in the file with every cue ${
+                    Math.abs(moved.shift)} ms ${moved.shift < 0 ? 'earlier' : 'later'} - not importing a second copy; the sidecar stays on disk\n`;
+            } else {
+                if (at === null) { toMux.push(f); continue; }
+                f.embeddedAt = at;
+                alreadyInFile.push(f);
+                response.infoLog += `☑${streamTag(at)}[deduplicate=${dedupeMode}] ${f.rel} is already in the file - not importing a second copy\n`;
+            }
             const cur = keptSubs.find((s) => s.index === at);
             // A name with no title token is no opinion on the title, as its 'und' is none on the language (below): read as an instruction it would erase the
             // title clean_and_remux's tag_title gives the track, and the two plugins would re-title it on every cycle - different presets, so Tdarr's repeat
-            // guard never stops them. A name can set or change a title, never erase one.
-            const wantTitle = isMp4 || !nameTextOf(f.title) ? null : f.title;
+            // guard never stops them. A name can set or change a title, never erase one. A group's name here is whichever of its first title and the title
+            // the import writes the track carries, else the latter: the file named that track itself, and holding a plain 'English' track to an 'English'
+            // + 'English SDH' group's 'English SDH' would rename it.
+            const wantTitle = isMp4 || !nameTextOf(f.title) ? null : [f.firstTitle, f.title].find((t) => cur && titleAgrees(cur, t)) || f.title;
             const sameTitle = wantTitle === null || (!!cur && titleAgrees(cur, wantTitle));
             const curDisp = new Set(activeDispositions(cur));
             // `default` is muxer-managed rather than a role, so no sidecar name can carry it (see DISPOSITIONS) and f.disp never holds it. The track's own
@@ -5918,6 +6025,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             refusedText += 1;
             response.infoLog += `☒Not importing ${f.members.map((m) => logSafe(m.rel)).join(', ')} - ffmpeg cannot read it as a subtitle file (an empty`
                 + ' file, or an srt whose cues have no numbers?), and muxing it would fail the whole import; fix or delete it\n';
+        }
+        // A group no one title covers (apart) goes in as one track per sidecar, each under its own name as deduplicate=disabled imports it, and each is
+        // consumed as a merged group's members are.
+        for (let k = toMux.length - 1; k >= 0; k -= 1) {
+            const f = toMux[k];
+            if (!f.apart) continue;
+            toMux.splice(k, 1, ...f.members.map((m) => ({ ...m, members: [m] })));
+            const named = [...new Set(f.members.map((m) => m.title).filter(Boolean))].map((t) => `'${logSafe(t)}'`).join(', ');
+            response.infoLog += `☒[deduplicate=${dedupeMode}] Importing ${f.members.length} byte-identical sidecars as ${f.members.length} tracks (${
+                f.members.map((m) => logSafe(m.rel)).join(', ')}) - no one of their titles (${named}) keeps every role their names give, and one track`
+                + ' would lose a role\n';
         }
         const nothingToMux = !toMux.length && !retuneMeta && !removedIndices.size;
 
