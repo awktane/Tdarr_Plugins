@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.86',
+    Version: '3.999.87',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -80,8 +80,9 @@ const details = () => ({
                 \\n=====
                 \\ndisabled (default): leave interlaced video alone.
                 \\nenabled: detect and repair, keeping everything the file contains.
-                \\nRepairing before any downscale is the whole point: shrinking combed video blends the two half-pictures into each other permanently, and
-                no later pass can undo it.
+                \\nRepair on the first pass that re-encodes the file: a downscale blends the two half-pictures into each other permanently, and any
+                re-encode (a shrink at the same size included) blurs the repeated fields that mark film, so film encoded with this off reads as shot on
+                video afterwards and comes back interpolated at double rate instead of rebuilt at its own 24fps. No later pass can undo either.
                 \\nYou are not asked which kind of source it is - that is detected from the actual pixels, because containers routinely mislabel it, and
                 the two kinds need opposite repairs. Material SHOT on video (sport, news, soaps, camcorders) has no original full frame to recover, so the
                 missing lines are interpolated and every half-picture becomes a frame of its own: 1080i60 comes out as 60fps, keeping all the motion the
@@ -2739,9 +2740,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // One candidate's test encode. o = { spawn(cmd, argv, opts) -> spawnSync-shaped result, ffmpeg, ffprobe ('' = none), file, streamIndex (the primary's
     // absolute index), inputArgv, videoArgv, isCpu, durationS, startS, capH (0 = no cap), declaredFps (a corroborated output frame rate, or 0), logOnly
     // (one window, no re-run, no decode check), lastResort() (true for the last candidate standing: one retry from the start of the file; asked only once
-    // a mid-file window has failed), memo: { keyframes: Map, decodes: Map, encoded: Set } shared by every candidate of one file }. Returns { outcome: 'pass' |
-    // 'fail' | 'stall' | 'slow' | 'source' | 'noexec', estimateH, windows (how many the estimate pooled), fps, needFps, why, tail, busy, dv, inconclusive,
-    // noFrameS, stallFrames, sourceAtS, fromStart, firstFail (the failed window a retry from the start replaced) }.
+    // a mid-file window has failed), endRead (set only by the end-reading retry below: durationS is already the span from startS), memo: { keyframes: Map,
+    // decodes: Map, encoded: Set } shared by every candidate of one file }. Returns { outcome: 'pass' | 'fail' | 'stall' | 'slow' | 'source' | 'noexec',
+    // estimateH, windows (how many the estimate pooled), fps, needFps, why, tail, busy, dv, inconclusive, noFrameS, stallFrames, sourceAtS, fromStart,
+    // firstFail (the failed window a retry from the start replaced) }.
     const runTestEncode = (o) => {
         const dur = Number(o.durationS) > 0 ? Number(o.durationS) : 0;
         const start = Number(o.startS) > 0 ? Number(o.startS) : 0;
@@ -2908,6 +2910,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let seek = T === null ? { S: null } : seekFor(T);
             if (seek.unknown) { T = null; seek = { S: null, unknown: true }; }
             let w = seek.empty ? { empty: true } : judge(T, seek.S, lbPooled);
+            // ffmpeg's Matroska writer (and a fragmented mp4) states the duration as the absolute END, not the span from the start (a 10 s mkv written from
+            // 1.0 s probes start 1.0, duration 11.0 on 7.1.4), so on a file starting after zero a window lands past the content, or so near its end that it
+            // ends early (a segment part at 42.0-60.0 s seeked to 16.1 s of its 18 s). The span reading goes first, since MKVToolNix and a plain mp4 state
+            // the span and the end reading would under-state theirs; such a window retries once over [start, dur].
+            if ((w.empty || w.noEstimate === 'eof-early') && T !== null && !o.endRead && start > 0 && start < dur) {
+                return runTestEncode({ ...o, durationS: dur - start, endRead: true });
+            }
             // A window that encodes nothing at a position the stated duration says has content means the video ends before that duration (an mpegts whose
             // audio outlasts its video, a bad end timestamp): 10% in, then the start, still test the encoder, but the stated duration is no basis for a time
             // verdict. A window that already ran from the start has nowhere else to go, and a log-only candidate takes its one window.
@@ -3669,6 +3678,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: closed-caption handoff =====
 
     // ===== SHARED [sub_worker, video_clean]: video fingerprint =====
+    // -=-=-= STILL_CAPABLE_CODECS / primaryVideo  [sub_worker, video_clean] =-=-=-
+    // The video a file is about - the one video_clean encodes and fingerprints, and sub_worker reads captions from - picked the same way in both, so a caption
+    // read is checked against the stream it was read from. Among the video streams that are not cover art: a default-flagged one, then one whose codec is
+    // not also a stills codec (mjpeg, mjpegb and jpeg2000 are real video too - see IMAGE_CODECS), then the first. A dispositionless mjpeg track ahead of a
+    // default-flagged HEVC is passed over; a camcorder file whose one video is MJPEG keeps it.
+    const STILL_CAPABLE_CODECS = ['mjpeg', 'mjpegb', 'jpeg2000'];
+    const primaryVideo = (streams) => {
+        const rank = (s) => (s.disposition?.default === 1 ? 0 : 2) + (STILL_CAPABLE_CODECS.includes(codecNameOf(s)) ? 1 : 0);
+        return (streams || []).filter((s) => codecTypeOf(s) === 'video' && !isCoverArt(s))
+            .reduce((best, s) => (best === undefined || rank(s) < rank(best) ? s : best), undefined);
+    };
     // -=-=-= FINGERPRINT_* / VQ_FP_RE / videoId8 / isOriginalPath / videoDigest / fpText  [sub_worker, video_clean] =-=-=-
     // A fingerprint names one video stream as <id8>.<dig>: videoId8, then videoDigest's 8 hex, or n where its window held no non-keyframe packet, or x where
     // the read failed. video_clean stamps one on a size verdict (awk_vq) and checks a caption request against one; sub_worker binds a caption read to one.
@@ -3687,7 +3707,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // '' when that window holds none (an all-intra source: the 16 GB ProRes sample gave 0), null when the read failed or read nothing. Keyframes are left out
     // because mkvmerge rewrites them (+2463 B on the first, measured) while every other packet stays byte-identical: the digest was identical through
     // ffmpeg -c copy, mkv<->mp4, mkvmerge, mkvpropedit and MP4Box, and different on every re-encode, a same-settings second generation included. The ABSOLUTE
-    // index of the isCoverArt-aware primary, never v:0, which would hash a poster ahead of the video. The harness answers from
+    // index of the primary (primaryVideo), never v:0, which would hash a poster ahead of the video. The harness answers from
     // __awkCap.videoDigest.{working,original} and never spawns; a missing key reads as a failed read.
     const videoDigest = (filePath, ffprobePath, absIndex, timeoutMs) => {
         const cap = otherArguments && otherArguments.__awkCap;
@@ -3862,20 +3882,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // ====== END SHRINK SAVINGS MEASUREMENT ======
 
-    // Does a video fill its file's timeline? It looks for the stream's packets in three 10 s windows centred at start + 25, 50 and 75% of the duration -> ''
-    // when every window holds one, otherwise why the whole file's rate cannot stand for the video's. One ffprobe read of the stream by its ABSOLUTE index
-    // (never v:0, which a poster can lead), its three windows in one -read_intervals list (the same verdict as three reads on 71 files), the default writer as
-    // packetSum's. It reads the bytes in the windows (0.03-0.7 s locally on files up to 60 Mb/s, 3.3 s at 460 Mb/s; 0.4-2.0 s cold over SMB at 10-59 Mb/s),
-    // except on a Matroska with no Cues index, where ffprobe scans from the start to the last window (about 1.4 s per GB locally, cold); the timeout bounds
-    // both (production ffprobe 7.1.4, 2026-11-07). A window is judged by pts alone: each interval seeks back to the keyframe before its start, so a window
-    // inside a gap still returns packets, all of them outside it. The harness answers from __awkCap.timelineRead and never spawns: { stdout }, a read's own
-    // output put through the same parse, { why }, or a function given the argv and spawn options that returns one of those; a missing key reads as a failed
-    // read.
+    // Does a video fill its file's timeline? It looks for the stream's packets in four 10 s windows: centred at start + 25, 50 and 75% of the duration, and
+    // the one ending 5 s before the stated end, which a truncated file or an overstated duration leaves empty -> { gaps } (true when a window holds none), or
+    // { why } it could not be checked. One ffprobe read of the stream by its ABSOLUTE index (never v:0, which a poster can lead), its windows in one
+    // -read_intervals list (the same verdict as one read per window on 71 files), the default writer as packetSum's. It reads the bytes in the windows
+    // (0.03-0.7 s locally on files up to 60 Mb/s, 3.3 s at 460 Mb/s; 0.4-2.0 s cold over SMB at 10-59 Mb/s), except on a Matroska with no Cues index, where
+    // ffprobe scans from the start to the last window (about 1.4 s per GB locally, cold); the timeout bounds both (production ffprobe 7.1.4, 2026-11-07). A
+    // window is judged by pts alone: each interval seeks back to the keyframe before its start, so a window inside a gap still returns packets, all of them
+    // outside it. The harness answers from __awkCap.timelineRead and never spawns: { stdout }, a read's own output put through the same parse, { why }, or a
+    // function given the argv and spawn options that returns one of those; a missing key reads as a failed read.
     const TIMELINE_READ_TIMEOUT_MS = 20000;
     const TIMELINE_READ_MAX_BYTES = 1024 * 1024;
-    const timelineGapWhy = (filePath, absIndex, start, duration) => {
-        if (!(duration > 0)) return 'its timeline could not be checked (it states no duration)';
-        const wins = [0.25, 0.5, 0.75].map((f) => start + f * duration).map((t) => [t - 5, t + 5]);
+    const timelineGaps = (filePath, absIndex, start, duration) => {
+        if (!(duration > 0)) return { why: 'it states no duration' };
+        const wins = [0.25, 0.5, 0.75].map((f) => start + f * duration).map((t) => [t - 5, t + 5]).concat([[start + duration - 15, start + duration - 5]]);
         const args = ['-v', 'error', '-select_streams', String(absIndex), '-read_intervals', wins.map(([a, b]) => `${a.toFixed(3)}%${b.toFixed(3)}`).join(','),
             '-show_entries', 'packet=pts_time', '-of', 'default=nw=1:nk=1', filePath];
         const opts = { encoding: 'utf8', maxBuffer: TIMELINE_READ_MAX_BYTES, timeout: TIMELINE_READ_TIMEOUT_MS, killSignal: 'SIGKILL' };
@@ -3885,16 +3905,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             read = typeof v === 'function' ? v(args.slice(), { ...opts }) : v;
         } else {
             const ffprobePath = deriveFfprobePath(ffmpegPathOf(otherArguments));
-            if (!ffprobePath) return 'its timeline could not be checked (no ffprobe beside ffmpeg on this node)';
+            if (!ffprobePath) return { why: 'no ffprobe beside ffmpeg on this node' };
             try {
                 const r = childProcess.spawnSync(ffprobePath, args, opts);
                 if (r && r.error && r.error.code === 'ETIMEDOUT') read = { why: 'timed out' };
                 else if (r && !r.error && r.status === 0) read = { stdout: r.stdout };
             } catch (e) { read = null; }
         }
-        if (!read || typeof read.stdout !== 'string') return `its timeline could not be checked (${(read && read.why) || 'ffprobe failed'})`;
+        if (!read || typeof read.stdout !== 'string') return { why: (read && read.why) || 'ffprobe failed' };
         const pts = read.stdout.split(/\r?\n/).map((l) => l.trim()).filter((l) => /^-?\d+(\.\d+)?$/.test(l)).map(Number);
-        return wins.every(([a, b]) => pts.some((p) => p >= a && p <= b)) ? '' : 'its video leaves gaps in the timeline';
+        return { gaps: !wins.every(([a, b]) => pts.some((p) => p >= a && p <= b)) };
     };
 
     // ====== PER-FILE FLOW ======
@@ -4000,9 +4020,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.infoLog += `☐Input streams: ${summariseAll(file.ffProbeData.streams)}\n`;
         response.infoLog += trackNamesUnreadLine(file.ffProbeData.streams);
 
-        // Primary (non-cover-art) video stream - the one we actually encode.
+        // Primary video stream - the one we actually encode (primaryVideo).
         const videoStreams = file.ffProbeData.streams.filter((s) => codecTypeOf(s) === 'video');
-        const primary = videoStreams.find((s) => !isCoverArt(s));
+        const primary = primaryVideo(videoStreams);
         if (!primary) {
             return skip('☑No encodable video stream found (cover-art / still images only)\n');
         }
@@ -4086,6 +4106,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // ====== EMIT HELPERS (both presets) ======
         const coverArtStreams = videoStreams.filter((s) => isCoverArt(s));                                 // embedded cover-art / still-image "video" streams
+        // Every :v:0 option this plugin writes addresses the primary, so the primary is the output's first video. Where another real video leads it in the
+        // source (a dispositionless mjpeg track ahead of the film, which primaryVideo passes over), every stream is mapped by index, the primary first and the
+        // rest in source order; otherwise -map 0. outStreams is the source in that output order, for everything that reads the output's order.
+        const primaryLed = videoStreams.some((s) => !isCoverArt(s) && s.index < primary.index);
+        const outStreams = primaryLed ? [primary, ...file.ffProbeData.streams.filter((s) => s !== primary)] : file.ffProbeData.streams;
+        const mapAll = primaryLed ? outStreams.map((s) => `-map 0:${s.index}`).join(' ') : '-map 0';
         const uncopyable = mp4UncopyableStreams(dstContainer, file.ffProbeData.streams);                     // a data track the container cannot copy
         const outputDrops = [...coverArtStreams, ...uncopyable].map((s) => ` -map -0:${s.index}`).join(''); // dropped from every output this plugin emits
         // A queued change gets its own ☐ line - without this the only trace is the stream's absence from the ☑ summary. Appended by whichever preset path
@@ -4102,8 +4128,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The streams an exit's output maps, the primary as that exit writes it (`written`): the source stream on a copy, the encode at its own frame rate on
         // a transcode (encodeRate), the original's stream on a restore. The mp4 muxer times a tmcd by the video it receives (mp4TimedVideo) and writes one
         // per video it maps, so the drop lines, the summary and mp4TimecodeArgs are built from these. Their videos are in output order on every exit: the
-        // primary is the first video that is not cover art, and a restore maps the original's first.
-        const keptFor = (written) => file.ffProbeData.streams.filter((s) => !coverArtStreams.includes(s) && !uncopyable.includes(s))
+        // primary maps first (mapAll), and a restore maps the original's first.
+        const keptFor = (written) => outStreams.filter((s) => !coverArtStreams.includes(s) && !uncopyable.includes(s))
             .map((s) => (s === primary ? written : s));
         const dropLog = (written) => coverArtLog + mp4UncopyableLog(dstContainer, uncopyable, keptFor(written));
         // input streams minus dropped cover-art video and any uncopyable data track the muxer does not rebuild, with the ones it does rebuild last and the
@@ -4112,7 +4138,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const mappedFor = (written) => {
             const kept = keptFor(written);
             const goneData = mp4LostData(uncopyable, kept);
-            const shown = mp4RebuiltLast(dstContainer, file.ffProbeData.streams.filter((s) => !coverArtStreams.includes(s) && !goneData.includes(s)),
+            const shown = mp4RebuiltLast(dstContainer, outStreams.filter((s) => !coverArtStreams.includes(s) && !goneData.includes(s)),
                 uncopyable, mp4CreatedTracks(dstContainer, kept));
             return readBackDispositions(dstContainer, shown, carriesDisposition(response.preset));
         };
@@ -4179,7 +4205,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += `☐${pTag}[hdr_mode=strip_dynamic] Stripping ${stripped} losslessly (-c:v copy, base HDR10 retained)`
                 + `${leftover}\n`;
             // No input-side args; sealPreset keeps sibling plugins' GLOBAL awk_* markers through an mp4/mov copy, as on the transcode path.
-            sealPreset('', `-map 0 -c copy -bsf:v:0 ${bsf}${outputDrops}${qtVideoTag(srcCodecName)}${riffTag} -c:a copy -c:s copy${strictArg}`, undefined,
+            sealPreset('', `${mapAll} -c copy -bsf:v:0 ${bsf}${outputDrops}${qtVideoTag(srcCodecName)}${riffTag} -c:a copy -c:s copy${strictArg}`, undefined,
                 primary, { dropsDv: stripDv });
             // The strip removes exactly the layer the 'dv'/'hdr10+' token names (see clearDynamicHdrCarriers), leaving the HDR10/HLG base's own transfer,
             // inferred off HDR_Format when neither probe reported one. Everything else about the stream is untouched, since this path is a -c:v copy.
@@ -4411,7 +4437,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const scalesInto = (h) => h > 0 && boxHeight(h) < dispHeight;
         const capHeight = boxHeight(maxH);
         const willDownscale = scalesInto(maxH);
-        const outHeight = willDownscale ? capHeight : dispHeight;
+        // With no downscale the frame is the source's, less the row an odd height loses to buildVideoArgs' crop: the tier, the fence's q token and every
+        // prediction must describe what the encode writes, or a 577-, 721- or 1081-line source is encoded at the tier above and re-read at its own.
+        const outHeight = willDownscale ? capHeight : dispHeight - (dispHeight % 2);
         const qualityForHeight = (h) => ({ sd: qualitySd, p720: quality720, p1080: quality1080, p4k: quality4k }[heightTier(h)]);
         const qNorm = qualityForHeight(outHeight);
 
@@ -4475,50 +4503,75 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // guard_shrink_bitrate gates SHRINK's efficiency re-encode only (a CQ re-encode of an already-lean file can grow it). normalize is compatibility-driven
         // - it must convert regardless of size - and downscale / tonemap / interlace repair / the lossless strip are exempt in both actions, as transforms
         // the user asked for in their own right (the repair is the one that CAN still grow the file: a shot-on-video source comes back at double frame rate).
-        let belowFloorLine = '';
+        // floorRate is the rate the floor would decline the re-encode at, read from the probes alone; whether it does is decided late, where the floor is the
+        // last word (shrinkDeclined, in the transcode branch): guard_lossless, the Dolby Vision and HDR refusals, the awk_video fence and a lossless strip all
+        // answer for the file ahead of it, so theirs is the line shown, and the timeline read is spent only where the floor's verdict decides the file.
+        let floorRate = null;
         if (action === 'shrink' && codecTrigger && guardShrinkKbps > 0) {
-            const ownBps = resolveStreamBitrate(primary) || 0;
             // ffprobe's file rate is size over the stated duration. A file that starts well after zero may have kept another recording's clock (a -copyts
             // remux, a segment-muxer part), so its stated end or its gaps can make the rate read low, and a ts/ps duration is estimated from first and last
             // timestamps. So the rate is read only on Matroska and mp4 files (markerPersists) starting within 1 s of zero, a missing start counting as zero
-            // (ffmpeg's ts clock starts at 1.4 s; rebased files start within 0.12 s); elsewhere the video's own rate decides.
+            // (ffmpeg's ts clock starts at 1.4 s; rebased files start within 0.12 s); elsewhere the video's own rate decides. ffmpeg's Matroska writer states
+            // the duration as the absolute end, so a start s reads the rate low by s/duration (a 10 s clip from 1.0 s read 9.1% low on 7.1.4): the start must
+            // also be within 1% of the duration.
             const fmt = file.ffProbeData.format || {};
-            const fileBps = markerPersists(dstContainer) && !(Number(fmt.start_time) > 1) ? Number(fmt.bit_rate) || 0 : 0;
+            const start = Number(fmt.start_time);
+            const duration = Number(fmt.duration);
+            const zeroStart = markerPersists(dstContainer) && !(start > 1) && !(start > 0.01 * duration);
+            // Both rates in whole kbps, the unit the floor is set in: a sub-kbps figure reads as none, and two that round alike leave the video's own deciding.
+            const ownKbps = Math.round((resolveStreamBitrate(primary) || 0) / 1000);
+            const fileKbps = zeroStart ? Math.round((Number(fmt.bit_rate) || 0) / 1000) : 0;
             // The video's bytes are a share of the file's over the same span, so the whole file's rate bounds the video's: it decides when the video
             // reports no rate of its own, or a higher one.
-            let fileDecides = fileBps > 0 && (ownBps === 0 || fileBps < ownBps);
-            // A timeline that starts at zero can still hold gaps (a concat-demuxer join, a -copyts -start_at_zero remux, a plain remux of a file that kept
-            // one), so before the whole file's rate decides a skip the video's packets are looked for at three points (timelineGapWhy); an empty window or a
-            // failed read leaves the decision to the video's own rate. Any single gap longer than a quarter of the timeline plus 10 s holds one window; a
-            // shorter gap, or several, can all fall between the windows and leave the reading diluted, and a still longer than 10 s can read as a gap, which
-            // only falls back to the own rate.
-            const fileKbps = Math.round(fileBps / 1000);
-            if (fileDecides && fileKbps > 0 && fileKbps < guardShrinkKbps) {
-                const gapWhy = timelineGapWhy(file.file, primary.index, Number(fmt.start_time) || 0, Number(fmt.duration));
-                if (gapWhy) {
-                    fileDecides = false;
-                    response.infoLog += `☒${pTag}[guard_shrink_bitrate=${guardShrinkKbps}] The whole file runs at ${fileKbps}k, but ${gapWhy}, so the video's`
-                        + ' own rate decides\n';
-                }
-            }
-            const vkbps = Math.round((fileDecides ? fileBps : ownBps) / 1000);
-            if (vkbps > 0 && vkbps < guardShrinkKbps) {
-                codecTrigger = false;
-                belowFloorLine = fileDecides
-                    ? `☑${pTag}[guard_shrink_bitrate=${guardShrinkKbps}] The whole file runs at ${vkbps}k, below the ${guardShrinkKbps}k floor, so its video`
-                        + ` does too (${ownBps ? `it reports ${Math.round(ownBps / 1000)}k of its own` : 'it reports no bitrate of its own'})`
-                        + ' - already efficient, left untouched\n'
-                    : `☑${pTag}[guard_shrink_bitrate=${guardShrinkKbps}] Source video bitrate ${vkbps}k is below the ${guardShrinkKbps}k floor`
-                        + ' - already efficient, left untouched\n';
-            }
+            const fileDecides = fileKbps > 0 && (ownKbps === 0 || fileKbps < ownKbps);
+            const kbps = fileDecides ? fileKbps : ownKbps;
+            if (kbps > 0 && kbps < guardShrinkKbps) floorRate = { kbps, ownKbps, fileDecides, zeroStart, start: start || 0, duration };
         }
+        // Whether the floor declines the re-encode, decided once (shrinkDeclined asks). A timeline that starts at zero can still hold gaps (a concat-demuxer
+        // join, a -copyts -start_at_zero remux, a plain remux of a file that kept one), and a gap dilutes both rates - an mp4's stream rate is its bytes over
+        // the gapped duration (24.5 s of 10 Mb/s video across a one-hour jump read 68k) - so on a zero-start Matroska/mp4 the video's packets are looked for
+        // first (timelineGaps): any gap waives the floor and guard_shrink_savings judges the encode instead, and a read that fails leaves the video's own rate
+        // deciding. A gap shorter than a window, or several, can all fall between the windows (a concat join's ~10.6 s gaps read 3631k against a true
+        // 10063k), which only a whole-stream packet read would close, at a full demux of every lean file per pass; a still longer than 10 s reads as a gap.
+        let belowFloorLine = '';
+        let floorMemo = null;
+        const floorDeclines = () => {
+            if (floorMemo !== null) return floorMemo;
+            const { ownKbps, fileDecides, zeroStart } = floorRate;
+            const tag = `${pTag}[guard_shrink_bitrate=${guardShrinkKbps}]`;
+            const read = zeroStart ? timelineGaps(file.file, primary.index, floorRate.start, floorRate.duration) : {};
+            const reading = fileDecides ? `The whole file runs at ${floorRate.kbps}k` : `Source video bitrate ${floorRate.kbps}k is`;
+            if (read.gaps) {
+                response.infoLog += `☒${tag} ${reading}${fileDecides ? ',' : ''} below the ${guardShrinkKbps}k floor, but its video leaves gaps in the`
+                    + ' timeline, which dilute that rate - the floor does not apply\n';
+                floorMemo = false;
+                return floorMemo;
+            }
+            // A failed read where the whole file's rate decided hands the decision to the video's own rate, which stands only where it is under the floor too.
+            const ownTakesOver = fileDecides && !!read.why;
+            if (ownTakesOver) {
+                response.infoLog += `☒${tag} ${reading}, but its timeline could not be checked (${read.why}), ${ownKbps
+                    ? 'so the video\'s own rate decides' : 'and the video reports no rate of its own - the floor does not apply'}\n`;
+            }
+            floorMemo = !ownTakesOver || (ownKbps > 0 && ownKbps < guardShrinkKbps);
+            if (floorMemo) {
+                belowFloorLine = fileDecides && !ownTakesOver
+                    ? `☑${tag} The whole file runs at ${floorRate.kbps}k, below the ${guardShrinkKbps}k floor, so its video does too (${ownKbps
+                        ? `it reports ${ownKbps}k of its own` : 'it reports no bitrate of its own'}) - already efficient, left untouched\n`
+                    : `☑${tag} Source video bitrate ${ownKbps}k is below the ${guardShrinkKbps}k floor - already efficient, left untouched\n`;
+            }
+            return floorMemo;
+        };
+        // The shrink re-encode is the only reason left to encode, and the floor declines it.
+        const shrinkDeclined = () => !!floorRate && !willDownscale && !tonemap && !deinterlaceNeeded() && floorDeclines();
         // A same-codec size pass has ONE stop - the awk_video fence below - and a container that cannot store the tag has nowhere to keep it: the next pass
         // recomputes the identical fingerprint, finds nothing, and re-emits a byte-identical preset, which Tdarr refuses as an infinite transcode loop and
         // ERRORS the file (across separate library scans, where that guard does not apply, it is generational re-encoding instead). Drop the codec trigger
         // rather than the file: a downscale, tonemap or deinterlace pass converges on its own evidence and still runs. normalize needs no fence at all - it
-        // fires only on a codec mismatch, which the encode itself removes.
+        // fires only on a codec mismatch, which the encode itself removes. A file under the floor is the floor's to decline: no timeline read runs on such a
+        // container, so its verdict there is already final, and its line the accurate one.
         let fenceUnstorable = false;
-        if (action === 'shrink' && codecTrigger && !markerPersists(dstContainer)) {
+        if (action === 'shrink' && codecTrigger && !floorRate && !markerPersists(dstContainer)) {
             codecTrigger = false;
             fenceUnstorable = true;
             response.infoLog += `☒${pTag}[action=shrink][container=${dstContainer}] A size pass records what it did in an `
@@ -4531,7 +4584,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // it, so a file that guard_lossless or the DV and HDR refusals were always going to settle never spawns ffmpeg to be told something it does not use.
         // The awk_video fence is the deliberate exception: it is tested INSIDE the realTranscode() branch, so a fenced file whose only live trigger is
         // deinterlace does pay one idet decode per re-cycle. Hoisting it left would pre-empt the strip_dynamic lossless path below and re-label every fenced
-        // no-trigger skip with the fence line instead of its accurate reason.
+        // no-trigger skip with the fence line instead of its accurate reason. codecTrigger still holds a re-encode under the floor (floorRate): the refusals
+        // below and the fence answer for such a file first, and the floor decides it inside that branch (shrinkDeclined).
         const cheapTrigger = codecTrigger || willDownscale || tonemap;
         // Interlace repair forces a real encode exactly as a downscale or a tonemap does.
         const realTranscode = () => cheapTrigger || deinterlaceNeeded();
@@ -4606,7 +4660,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const savingsLive = guardShrinkSavings > 0 && !!origProbe;
         const savingsTag = `[guard_shrink_savings=${savingsText}]`;
         const origPath = String(origLib?.file || '');
-        const origPrimary = origProbe ? origProbe.streams.find((s) => codecTypeOf(s) === 'video' && !isCoverArt(s)) : undefined;
+        const origPrimary = origProbe ? primaryVideo(origProbe.streams) : undefined;
         const origFormat = String(origProbe?.format?.format_name || '');
         // A recover_bad_* repair in this job rewrote the video stream: the working file's stamp differs from the original's.
         const recoveredHere = !!origProbe && getTagCI(fmtTags, RECOVERED_TAG).trim() !== getTagCI(origProbe.format?.tags, RECOVERED_TAG).trim();
@@ -4636,8 +4690,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
 
         // What scale=-2 will emit beside outHeight, in the same DISPLAY orientation (ffmpeg autorotates ahead of the filter chain): the operating point
-        // a test-encode line names, and the predicted output stream's width.
-        const outWidth = willDownscale && dispHeight > 0 ? Math.max(2, Math.round(dispWidth * outHeight / dispHeight / 2) * 2) : dispWidth;
+        // a test-encode line names, and the predicted output stream's width (an odd one less the column the crop takes, as outHeight).
+        const outWidth = willDownscale && dispHeight > 0 ? Math.max(2, Math.round(dispWidth * outHeight / dispHeight / 2) * 2) : dispWidth - (dispWidth % 2);
         // No cross-compatible base (compat id 0 / no surviving HDR transfer, e.g. profile 5): the mp4 output needs the dvh1 tag - hvc1 drops the DV box
         // entirely; a stream WITH a base keeps hvc1.
         const preserveDvNoBase = preserveDv && (dvNoBaseLayer || (!!dovi && dovi.compatId === 0));
@@ -5128,7 +5182,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // fence this file already carries is cleared rather than left to describe an encode that this one replaces.
             const writeFence = !(action === 'normalize' && isMp4Family(dstContainer));
             const globalWrites = writeFence ? { [VIDEO_FENCE_TAG]: videoSig } : priorSig ? { [VIDEO_FENCE_TAG]: '' } : {};
-            let out = `-map 0 -c copy ${enc.videoOut} -c:a copy -c:s copy${outputDrops}${strictArg}`;
+            let out = `${mapAll} -c copy ${enc.videoOut} -c:a copy -c:s copy${outputDrops}${strictArg}`;
             // The encoded primary is output v:0 (cover art and uncopyable streams are mapped out, as -filter:v:0 relies on) - see staleStatsArgs.
             const clearStats = isMatroskaFamily(dstContainer);
             if (clearStats) out += staleStatsArgs('v:0', primary);
@@ -5186,7 +5240,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += `☒${pTag} awk_cc asks to drop the closed captions sub_worker exported, but the caption read behind it may belong to another`
                 + ` video (${why}) - withdrawing the request so the captions are read again before any encode\n`;
             const v = escMeta(`${CC_FP_PREFIX}${ccFpOf(ccTokens)}`);
-            sealPreset('', `-map 0 -c copy${outputDrops}${strictArg} -metadata "${CC_TAG}=${v}"`, { [CC_TAG]: v }, primary, { copied: true });
+            sealPreset('', `${mapAll} -c copy${outputDrops}${strictArg} -metadata "${CC_TAG}=${v}"`, { [CC_TAG]: v }, primary, { copied: true });
             response.infoLog += expectedResultsLine(summariseStream(dvCopyReadBack(dstContainer, enrichStream(primary))));
             return response;
         };
@@ -5219,7 +5273,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const FENCE_BOX_RE = /^h(?:0|2160|1440|1080|720)$/;
         const FENCE_SPEED_RE = /^s(?:slow|medium|fast)$/;
         // A fence or verdict written at OTHER settings still holds when every token that differs is a no-op on this file: an encode for it would only add a
-        // lossy generation to a kept file, or repeat the encode a reverted one rejected. h<N> passes where neither box scales the file. sdr, strip and deint
+        // lossy generation to a kept file, or repeat the encode a reverted one rejected. h<N> passes where neither box scales the file, a stored one judged by
+        // the meaning it was written with (heightOnly: a fence older than 3.28.0 capped the height alone - fenceBoxed below). sdr, strip and deint
         // pass when their setting is now off, or when it is on and the file gives it nothing to do: no HDR to tonemap, no dynamic layer to strip, idet reading
         // the file progressive (a decode, spent only when deint differs). Dropping one is a no-op over a reverted original too, because sizeExemptWhy never
         // judges - so never reverts - an encode that tonemapped, stripped or deinterlaced: a reject's core can carry sdr, strip or deint only where it did
@@ -5229,19 +5284,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // three re-read as what produced them (the fence comment above). Nothing is rewritten, so the stored fence keeps its own tokens and every later pass
         // decides the same way. A per-file fence (tokens only for what applied) would not converge: a repaired, tonemapped or downscaled output re-reads as
         // progressive, SDR or inside the box.
-        const tokenIsNoop = (t) => (FENCE_BOX_RE.test(t) ? !scalesInto(Number(t.slice(1)))
+        const tokenIsNoop = (t, heightOnly = false) => (FENCE_BOX_RE.test(t)
+            ? !(heightOnly ? Number(t.slice(1)) > 0 && Number(t.slice(1)) < dispHeight : scalesInto(Number(t.slice(1))))
             : FENCE_SPEED_RE.test(t) ? vqNow?.state !== 'reject'
                 : t === 'sdr' ? !tonemap
                     : t === 'strip' ? !(effHdrMode === 'strip_dynamic' && isDynamicHdr)
                         : t === 'dv' ? !dvSignal
                             : t === 'deint' && (!deinterlaceLive || idet().kind === 'progressive'));
-        // The tokens a stored core and this run's do not share, both ways.
+        // The tokens a stored core and this run's do not share: this run's, and the stored core's.
         const coreDiff = (core) => {
             const mine = videoSigCore.split('-');
             const theirs = String(core || '').split('-');
-            return [...mine.filter((t) => !theirs.includes(t)), ...theirs.filter((t) => !mine.includes(t))];
+            return { mine: mine.filter((t) => !theirs.includes(t)), theirs: theirs.filter((t) => !mine.includes(t)) };
         };
-        const coreHolds = (core) => core === videoSigCore || coreDiff(core).every(tokenIsNoop);
+        // boxed = false for a stored core written before the 16:9 box, whose own h<N> is judged by its height alone (tokenIsNoop).
+        const coreHolds = (core, boxed = true) => {
+            if (core === videoSigCore) return true;
+            const d = coreDiff(core);
+            return d.mine.every((t) => tokenIsNoop(t)) && d.theirs.every((t) => tokenIsNoop(t, !boxed));
+        };
         const vqRetry = !!vqNow && vqNow.state === 'reject' && coreHolds(vqNow.core) && vqNow.t !== savingsText && vqNow.pct !== null
             && guardShrinkSavings < vqNow.pct + 1 && !(Number(vqNow.t) <= guardShrinkSavings);
         // The ffprobe the verdict's reads and the fence's fingerprint check use, located once and only when one of them runs ('' under the harness, whose
@@ -5375,7 +5436,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
             const ffprobePath = savingsFfprobe();
             const fingerprintOf = (s, filePath) => fpText(s, digestOf(filePath, s.index));
-            const stamp = (state, pct, fp) => escMeta(`${state}:${pct}:${videoSigCore}:${savingsText}:${fp}`);
+            // The core the encode was made at, which the pending marker carries: a speed changed since then passes vqPending, and this run's core would record
+            // a setting nothing was encoded at, beside the fence the encode wrote.
+            const stamp = (state, pct, fp) => escMeta(`${state}:${pct}:${vqNow.core}:${savingsText}:${fp}`);
             const line = (sym, text) => `${sym}${pTag}${savingsTag} ${text}\n`;
             // The KEEP pass: a tag-only remux of this file, whose arguments differ from every encode's and every restore's, so Tdarr's identical-arguments
             // guard cannot trip. reason is the verdict's own line.
@@ -5383,7 +5446,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const value = stamp('keep', pct, fingerprintOf(primary, file.file));
                 response.infoLog += reason
                     + line('☐', `Recording the verdict in ${VQ_TAG} with a tag-only remux, so later passes read it instead of measuring`);
-                sealPreset('', `-map 0 -c copy${outputDrops}${strictArg} -metadata "${VQ_TAG}=${value}"`, { [VQ_TAG]: value }, primary, { copied: true });
+                sealPreset('', `${mapAll} -c copy${outputDrops}${strictArg} -metadata "${VQ_TAG}=${value}"`, { [VQ_TAG]: value }, primary, { copied: true });
                 response.infoLog += expectedResultsLine(summariseStream(dvCopyReadBack(dstContainer, enrichStream(primary))));
                 return response;
             };
@@ -5555,17 +5618,38 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return `☑${pTag}${savingsTag} The re-encode was ${vqNow.state === 'keep' ? 'kept' : 'reverted'} on an earlier pass (it ${saved}${at})\n`;
         })();
         // ====== END SHRINK SAVINGS VERDICT ======
+        // No real transcode: a lossless strip, a bitrate skip, or a benign no-op. Reached once realTranscode() was evaluated in full, or the floor declined the
+        // re-encode after every metadata trigger and the interlace verdict were read (shrinkDeclined), so the verdict (if the setting bought one) is settled.
+        const noTranscode = () => {
+            response.infoLog += deintVerdictLine();
+            if (effHdrMode === 'strip_dynamic' && isDynamicHdr) {   // strip_dynamic is the sole reason - do it losslessly (or skip when it can't be lossless)
+                return tryLosslessStrip('set hdr_mode=tonemap_sdr to flatten it to SDR', belowFloorLine
+                    ? `; guard_shrink_bitrate=${guardShrinkKbps} declined the re-encode that would remove it - lower it to re-encode` : '');
+            }
+            // The declined size pass already logged WHY above; say only that nothing else was left, rather than falling to the shrink line below, which speaks
+            // for a target with no encoder.
+            if (fenceUnstorable)
+                return skip(`☑${pTag}[action=shrink] Nothing else to do for this file\n`);
+            if (belowFloorLine)
+                return skip(belowFloorLine);
+            // Only a target with no encoder gets here under shrink: an encodable one always fires a size pass above (an upgrade, or a fenced same-codec pass),
+            // and the two things that decline it - the bitrate floor and an unstorable fence - have each returned with their own line already.
+            if (action === 'shrink') {
+                return skip(`☑${pTag}[action=shrink] Nothing to shrink - source codec ${srcCodecName || 'unknown'} has no encoder ${codec === 'source'
+                    ? '(set codec=hevc/h264/av1 to convert it)' : `and ${codec} is no more efficient (action=normalize converts it)`}\n`);
+            }
+            return skip(`☑${pTag}[action=normalize] Video is already ${targetCodecName}${dispHeight ? ` ${dispHeight}p` : ''}`
+                + `${srcIs10 ? ' 10-bit' : ''} and within limits\n`);
+        };
         if (realTranscode()) {
             const videoSigShown = `${videoSigCore}-v${escMeta(details().Version)}`;
             const videoSig = `${videoSigShown}${jobToken ? `+j${jobToken}` : ''}`;
             // core only; the stored -v<version>[+j<job>] suffix is forensic, not part of the fence
             const priorCore = priorSig.replace(/-v[^-]*$/, '');
-            const fenceMatches = priorSig !== '' && coreHolds(priorCore);
-            if (fenceMatches && vqRetry) {
-                response.infoLog += `☑${pTag}${savingsTag} The re-encode was reverted at guard_shrink_savings=${logSafe(vqNow.t, 16)} on an earlier pass`
-                    + ` (it ${vqNow.pct < 0 ? 'grew the video' : `saved ${vqNow.pct}%`}), which the new setting allows - processing the file`
-                    + ' again\n';
-            }
+            const fenceMatches = priorSig !== '' && coreHolds(priorCore, fenceBoxed);
+            // The floor decides a re-encode nothing else forces once the fence has not settled the file, so a fenced file never pays its timeline read - but
+            // ahead of the fence where a dynamic-HDR strip is asked for: noTranscode strips losslessly, which the fence never pre-empts (see cheapTrigger).
+            if (effHdrMode === 'strip_dynamic' && isDynamicHdr && shrinkDeclined()) return noTranscode();
             // An inherited fence that no longer describes the video counts as absent - here, and for the implicit fence below - and the encode below writes a
             // fresh one. Its line is held until the run knows it encodes, so the implicit fence can say the same fact without "processing it again".
             let staleWhy = '';
@@ -5573,15 +5657,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 staleWhy = fenceInherited ? fenceStaleWhy() : '';
                 if (!staleWhy) {
                     // The inputs behind the tokens coreHolds let pass, named as the user set them, so the line says what changed and was not acted on.
-                    const passed = [...new Set(coreDiff(priorCore).map((t) => (FENCE_BOX_RE.test(t) ? `downscale=${downscaleOpt}`
+                    const diff = coreDiff(priorCore);
+                    const passed = [...new Set([...diff.mine, ...diff.theirs].map((t) => (FENCE_BOX_RE.test(t) ? `downscale=${downscaleOpt}`
                         : FENCE_SPEED_RE.test(t) ? `method_speed=${speed}` : t === 'deint' ? `deinterlace=${deinterlaceOpt}`
                             : t === 'dv' ? `guard_dv=${guardDvOpt}` : `hdr_mode=${hdrMode}`)))];
                     const shown = logSafe(priorSig.replace(/\+j[0-9a-f]{8}$/, ''), 120);
                     const only = vqNow?.state === 'reject' ? 'repeat the encode that was put back' : 'add a lossy generation';
+                    // A box token both cores share, which today's box would scale into, on a fence older than that box: an encode would downscale too.
+                    const boxKept = !fenceBoxed && willDownscale && priorCore.split('-').includes(`h${maxH}`);
+                    const would = boxKept ? `${only}, and its h${maxH} predates the 16:9 box (3.28.0), so it stands as written` : `only ${only}`;
                     return skip(`${vqReadLine}${deintVerdictLine()}☑${pTag}[action=${action}] Already processed by ${VIDEO_FENCE_TAG} ${passed.length
-                        ? `(${shown}); re-encoding it for ${passed.join(', ')} would only ${only}` : `at this exact setting (${videoSigShown})`}`
+                        ? `(${shown}); re-encoding it for ${passed.join(', ')} would ${would}` : `at this exact setting (${videoSigShown})`}`
                         + ' - left untouched\n');
                 }
+            }
+            if (shrinkDeclined()) return noTranscode();
+            if (fenceMatches && vqRetry) {
+                response.infoLog += `☑${pTag}${savingsTag} The re-encode was reverted at guard_shrink_savings=${logSafe(vqNow.t, 16)} on an earlier pass`
+                    + ` (it ${vqNow.pct < 0 ? 'grew the video' : `saved ${vqNow.pct}%`}), which the new setting allows - processing the file`
+                    + ' again\n';
             }
             const staleLine = staleWhy ? `☒${pTag} ${staleWhy} - an outside tool changed it; processing it again\n` : '';
             if (containerRefusesTarget(dstContainer, targetCodecName)) {
@@ -5628,26 +5722,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return emitTranscode(`[${reasonTags.join('][')}]`, { videoSig, videoSigCore, priorSig });
         }
 
-        // No real transcode: a lossless strip, a bitrate skip, or a benign no-op. Reaching here means realTranscode()
-        // was evaluated in full, so the interlace verdict (if the setting bought one) is settled and can be reported.
-        response.infoLog += deintVerdictLine();
-        if (effHdrMode === 'strip_dynamic' && isDynamicHdr) {   // strip_dynamic is the sole reason - do it losslessly (or skip when it can't be lossless)
-            return tryLosslessStrip('set hdr_mode=tonemap_sdr to flatten it to SDR', '');
-        }
-        // The declined size pass already logged WHY above; say only that nothing else was left, rather than falling to the shrink line below, which speaks
-        // for a target with no encoder.
-        if (fenceUnstorable)
-            return skip(`☑${pTag}[action=shrink] Nothing else to do for this file\n`);
-        if (belowFloorLine)
-            return skip(belowFloorLine);
-        // Only a target with no encoder gets here under shrink: an encodable one always fires a size pass above (an upgrade, or a fenced same-codec pass),
-        // and the two things that decline it - the bitrate floor and an unstorable fence - have each returned with their own line already.
-        if (action === 'shrink') {
-            return skip(`☑${pTag}[action=shrink] Nothing to shrink - source codec ${srcCodecName || 'unknown'} has no encoder `
-                + `${codec === 'source' ? '(set codec=hevc/h264/av1 to convert it)' : `and ${codec} is no more efficient (action=normalize converts it)`}\n`);
-        }
-        return skip(`☑${pTag}[action=normalize] Video is already ${targetCodecName}${dispHeight ? ` ${dispHeight}p` : ''}`
-            + `${srcIs10 ? ' 10-bit' : ''} and within limits\n`);
+        return noTranscode();
         // ====== END DECIDE, GATED BY ACTION ======
     } catch (err) {
         return failUnexpected(err);

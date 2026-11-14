@@ -43,7 +43,7 @@ const details = () => ({
                 stream_ordering (last). If the file has embedded closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that
                 destroys them. Extract with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since
                 the sidecars would land beside the source, where the output never sees them.`,
-    Version: '3.999.101',
+    Version: '3.999.102',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -4253,6 +4253,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: closed-caption handoff =====
 
     // ===== SHARED [sub_worker, video_clean]: video fingerprint =====
+    // -=-=-= STILL_CAPABLE_CODECS / primaryVideo  [sub_worker, video_clean] =-=-=-
+    // The video a file is about - the one video_clean encodes and fingerprints, and sub_worker reads captions from - picked the same way in both, so a caption
+    // read is checked against the stream it was read from. Among the video streams that are not cover art: a default-flagged one, then one whose codec is
+    // not also a stills codec (mjpeg, mjpegb and jpeg2000 are real video too - see IMAGE_CODECS), then the first. A dispositionless mjpeg track ahead of a
+    // default-flagged HEVC is passed over; a camcorder file whose one video is MJPEG keeps it.
+    const STILL_CAPABLE_CODECS = ['mjpeg', 'mjpegb', 'jpeg2000'];
+    const primaryVideo = (streams) => {
+        const rank = (s) => (s.disposition?.default === 1 ? 0 : 2) + (STILL_CAPABLE_CODECS.includes(codecNameOf(s)) ? 1 : 0);
+        return (streams || []).filter((s) => codecTypeOf(s) === 'video' && !isCoverArt(s))
+            .reduce((best, s) => (best === undefined || rank(s) < rank(best) ? s : best), undefined);
+    };
     // -=-=-= FINGERPRINT_* / VQ_FP_RE / videoId8 / isOriginalPath / videoDigest / fpText  [sub_worker, video_clean] =-=-=-
     // A fingerprint names one video stream as <id8>.<dig>: videoId8, then videoDigest's 8 hex, or n where its window held no non-keyframe packet, or x where
     // the read failed. video_clean stamps one on a size verdict (awk_vq) and checks a caption request against one; sub_worker binds a caption read to one.
@@ -4271,7 +4282,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // '' when that window holds none (an all-intra source: the 16 GB ProRes sample gave 0), null when the read failed or read nothing. Keyframes are left out
     // because mkvmerge rewrites them (+2463 B on the first, measured) while every other packet stays byte-identical: the digest was identical through
     // ffmpeg -c copy, mkv<->mp4, mkvmerge, mkvpropedit and MP4Box, and different on every re-encode, a same-settings second generation included. The ABSOLUTE
-    // index of the isCoverArt-aware primary, never v:0, which would hash a poster ahead of the video. The harness answers from
+    // index of the primary (primaryVideo), never v:0, which would hash a poster ahead of the video. The harness answers from
     // __awkCap.videoDigest.{working,original} and never spawns; a missing key reads as a failed read.
     const videoDigest = (filePath, ffprobePath, absIndex, timeoutMs) => {
         const cap = otherArguments && otherArguments.__awkCap;
@@ -4742,7 +4753,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Answered once, ahead of both action branches, because both ask the same two questions: is there caption data worth the decode, and
         // where would it land? Everything that can end the question cheaply is checked before the probe, and the probe before the decode.
         // Returns a job only when there is real work; otherwise a note saying why not, so an enabled setting never passes in silence.
-        const ccVideo = streams.find((s) => codecTypeOf(s) === 'video' && !isCoverArt(s));
+        const ccVideo = primaryVideo(streams);   // the video video_clean encodes and checks this read's fingerprint against
         // The memos that make this converge (the closed-caption handoff section). Tdarr re-runs the stack until every plugin skips, so an answer already paid
         // for must never be paid again.
         const ccTokens = ccTokensOf(file.ffProbeData.format?.tags);
