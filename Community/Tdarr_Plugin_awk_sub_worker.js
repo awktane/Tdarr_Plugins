@@ -43,7 +43,7 @@ const details = () => ({
                 stream_ordering (last). If the file has embedded closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that
                 destroys them. Extract with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since
                 the sidecars would land beside the source, where the output never sees them.`,
-    Version: '3.999.100',
+    Version: '3.999.101',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -436,7 +436,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (Array.isArray(s.readBackRoleFields)) return s.readBackRoleFields;
         if (roleFieldCache.has(s)) return roleFieldCache.get(s);
         const mi = mediaInfoFor(s);
-        // ffprobe's title, description and handler, then mediaInfo's Title less the handler's echo (mediaInfoOwnTitleParts) and its description. Every tag read
+        // ffprobe's title, a TITLE SimpleTag beside the Name (titleTagText: a 'TITLE-<lang>', which mediaInfo's Title shows only when it was written last),
+        // description and handler, then mediaInfo's Title less the handler's echo (mediaInfoOwnTitleParts) and its description. Every tag read
         // goes through getTagCI, as no casing is a safe guess: matroska UPPER-CASES tag keys on write (ffprobe shows HANDLER_NAME, DESCRIPTION), and MediaInfo
         // defines Comment/Description as GENERAL-only, so a per-TRACK value lands in the track's 'extra' bag under whatever spelling the container used. The
         // handler is read as the name it holds (handlerTextOf), so the length bytes a grown .mov name starts with ('HSDH ...') hide no role word. Its echo is
@@ -446,15 +447,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // of<CR><LF>Hearing' reads /sdh, as the name does). The Title goes through mediaInfoText inside mediaInfoOwnTitleParts, which decodes the object
         // mediainfo.js gives for a value holding a control character: undecoded, a role word in it was missed, and the next pass, once a remux had moved the
         // name into the handler, read a role Expected results had not predicted.
-        const fields = roleFieldsOf([getTagCI(s.tags, 'title'), getTagCI(s.tags, 'description'), handlerTextOf(getTagCI(s.tags, 'handler_name')),
-            mediaInfoOwnTitleParts(s).join(' / '), mediaInfoText(getTagCI(mi?.extra, 'description'))]);
+        const fields = roleFieldsOf([getTagCI(s.tags, 'title'), titleTagText(s), getTagCI(s.tags, 'description'),
+            handlerTextOf(getTagCI(s.tags, 'handler_name')), mediaInfoOwnTitleParts(s).join(' / '), mediaInfoText(getTagCI(mi?.extra, 'description'))]);
         roleFieldCache.set(s, fields);
         return fields;
     };
     // -=-=-= ROLE_NEGATORS / keywordRegex / matchesKeyword [all five] =-=-=-
     // A keyword naming a role the track lacks does not match: one with a negator word one to three non-alphanumerics before it ('English (Non-SDH)', 'No
     // Commentary', 'ohne Kommentar' - the languages the keywords serve), or '-free'/'-less' after it ('commentary-free'). Read as the role, the Non-SDH
-    // subtitle is what remove_sub_sdh deletes and the main 'No Commentary' track what downmix_secondary=delete removes.
+    // subtitle is what remove_sub_sdh deletes and the main 'No Commentary' track what downmix_secondary=delete removes. Accepted false negations, where
+    // 'no' or 'sin' means something else: 'Dr. No Commentary', 'Kantoku no Commentary', 'Original Sin Commentary' and a Norwegian 'NO SDH' lose a role only
+    // their title gives. Every narrower rule un-negates a real one - negating only at a field's start or after a bracket reads 'English No Commentary' as
+    // commentary, and dropping 'no'/'sin' loses 'No Commentary' and 'sin comentarios' - so it can delete a main track, where the false negation costs at
+    // most a role read as absent: a commentary read as a main track (measured: removed as a duplicate under audio_clean's method_deduplicate=channel), an
+    // SDH or forced subtitle read as plain.
     const ROLE_NEGATORS = ['non', 'no', 'not', 'without', 'ohne', 'sans', 'sin', 'sem', 'senza', 'zonder', 'bez', 'uten', 'utan', 'uden', 'ilman'];
     // The whole-token regex for a keyword list: a keyword matches only when not flanked by a letter/digit - '[sdh]', 'eng-sdh', 'sdh.' match, 'deafening' does
     // not - and an internal space matches any run of non-alphanumerics ('hearing impaired' == 'hearing_impaired'). It is case-sensitive, so the text must
@@ -845,9 +851,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const isMatroskaFamily = (container) => ['mkv', 'mka', 'mks', 'webm'].includes(String(container || '').toLowerCase());
     // ===== END SHARED: matroska-family container =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: read-back dispositions =====
-    // -=-=-= carriesDisposition (+ readBackDispositions) [all five] =-=-=-
+    // -=-=-= carriesDisposition / MOV_UNSTORED_ROLES (+ readBackDispositions) [all five] =-=-=-
     // Whether an output's command writes any -disposition at all (readBackDispositions' `manual`).
     const carriesDisposition = (args) => /(^|\s)-disposition[:\s]/.test(String(args || ''));
+    // The role flags a .mov stores none of (measured at readBackDispositions' last rule).
+    const MOV_UNSTORED_ROLES = ['forced', 'comment', 'hearing_impaired', 'captions', 'visual_impaired', 'descriptions', 'dub', 'original'];
     // The dispositions an output is read back with, as its Expected results line shows them: `list` is the line's items in output order, `streamOf` reads an
     // item's stream, `withStream` makes an item of a changed copy, and `manual` is carriesDisposition's answer. Summary only - no plugin overrides these flags,
     // and only an audio or subtitle token prints a default one. ffmpeg and the mov muxer change flags no plugin asks for, each rule beside the code that
@@ -871,17 +879,33 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 || (mp4 ? ofType.find((x) => !isMp4Cover(streamOf(x))) : undefined);
             if (pick) out[out.indexOf(pick)] = flagged(pick, { default: 1 });
         }
+        // A .webm stores default and forced on every track and, on a subtitle, one WebVTT kind as its codec (D_WEBVTT/CAPTIONS, else DESCRIPTIONS, else
+        // METADATA): every other flag reads back 0, and of two kinds the first alone (measured 2026-11-14 on jellyfin 7.1.4, each flag written on video,
+        // audio and a webvtt subtitle and copied once more).
+        if (String(container || '').toLowerCase() === 'webm') {
+            return out.map((x) => {
+                const d = streamOf(x).disposition || {};
+                const kind = codecTypeOf(streamOf(x)) === 'subtitle' ? ['captions', 'descriptions', 'metadata'].find((k) => d[k] === 1) : undefined;
+                const gone = Object.keys(d).filter((k) => d[k] === 1 && k !== 'default' && k !== 'forced' && k !== kind);
+                return gone.length ? flagged(x, Object.fromEntries(gone.map((k) => [k, 0]))) : x;
+            });
+        }
         if (!mp4) return out;
         // The mov muxer writes every video stream but a cover as an ordinary track, read back with no attached_pic, still_image or timed_thumbnails flag
         // (attached_pic+default, attached_pic+timed_thumbnails - a QuickTime chapter-image track - still_image and timed_thumbnails alike, in mjpeg and png),
         // so there only an image codec still reads as cover art. It stores no original flag either: a copied one and a +original write both read back 0
-        // (audio and subtitle, mp4, m4v and mov; measured 2026-11-09 on jellyfin 7.1.4), so the role survives only as a title keyword.
+        // (audio and subtitle, mp4, m4v and mov; measured 2026-11-09 on jellyfin 7.1.4), so the role survives only as a title keyword. A .mov, which the mov
+        // muxer writes (no -f mp4), stores no role flag at all, since only its MP4 mode writes the box that carries them: forced, comment, hearing_impaired,
+        // captions, visual_impaired, descriptions and dub written on audio and subtitle read back 0 from .mov, and 1 from .mp4 and from .m4v and .m4a under
+        // -f mp4 (measured 2026-11-14 on jellyfin 7.1.4).
         const COVER_FLAGS = ['attached_pic', 'still_image', 'timed_thumbnails'];
+        const lost = String(container || '').toLowerCase() === 'mov' ? MOV_UNSTORED_ROLES : ['original'];
         return out.map((x) => {
             const d = streamOf(x).disposition || {};
             const cover = codecTypeOf(streamOf(x)) === 'video' && !isMp4Cover(streamOf(x)) && COVER_FLAGS.some((k) => d[k] === 1);
-            if (!cover && d.original !== 1) return x;
-            return flagged(x, { ...(cover ? Object.fromEntries(COVER_FLAGS.map((k) => [k, 0])) : {}), ...(d.original === 1 ? { original: 0 } : {}) });
+            const roles = lost.filter((k) => d[k] === 1);
+            if (!cover && !roles.length) return x;
+            return flagged(x, { ...(cover ? Object.fromEntries(COVER_FLAGS.map((k) => [k, 0])) : {}), ...Object.fromEntries(roles.map((k) => [k, 0])) });
         });
     };
     // ===== END SHARED: read-back dispositions =====
@@ -1121,6 +1145,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // jellyfin 7.1.4).
     const movDvReadBack = (container, s) => (movLosesDvBox(container, s) ? { ...dvLostReadBack(s),
         codec_tag_string: String(s.codec_tag_string || '').toLowerCase().trim() === 'dvh1' ? 'hev1' : s.codec_tag_string } : s);
+    // -=-=-= ROLE_LOSS_WHY / roleLossLine  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // One warning per stream a write takes role flags from (MOV_UNSTORED_ROLES names them all), worded as movDvLossLine: those readBackDispositions
+    // reads back 0 on the output. Only two outputs store fewer than a source of their own kind can hold: a .mov the mp4 muxer wrote (-f mp4) holds
+    // them all and the mov muxer stores none; a .webm mkvmerge wrote holds Matroska's flags, and ffmpeg's webm muxer keeps only default, forced and a
+    // subtitle's one WebVTT kind (measured: a stream_ordering reorder of an mkvmerge --webm file dropped its commentary, original and
+    // visual_impaired flags). So a forced subtitle that stops showing by itself, or a commentary read as a main track, is said.
+    const ROLE_LOSS_WHY = { mov: ['ffmpeg writes no role flag into a .mov', 'mp4 or mkv'],
+        webm: ['a .webm keeps only forced and, on a subtitle, one WebVTT kind', 'mkv'] };
+    const roleLossLine = (container, streams, act = 'remux') => {
+        const why = ROLE_LOSS_WHY[String(container || '').toLowerCase()];
+        return why ? streams.map((s) => {
+            const back = readBackDispositions(container, [s], true)[0].disposition || {};
+            const lost = MOV_UNSTORED_ROLES.filter((k) => s.disposition?.[k] === 1 && back[k] !== 1);
+            return lost.length ? `☒${streamTag(s.index)} Its ${lost.join(' and ')} flag${lost.length > 1 ? 's are' : ' is'} lost in this ${act} - ${why[0]};`
+                + ` run clean_and_remux first to move the file to ${why[1]}\n` : '';
+        }).join('') : '';
+    };
     // -=-=-= dvCopyFourcc (+ dvCopyFourccArgs, dvCopyFourccLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // The fourcc an mp4/m4v -c copy must give a video to keep its Profile 5 record, or '' where its own serves or none can. The muxer carries the source fourcc
     // through a copy, and under hev1/hvc1 the record is lost (dvNeedsDvFourcc), so each takes the Dolby Vision fourcc that reads its hvcC the same way: hev1
@@ -1902,9 +1943,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // TimeCodeHandler, ClosedCaptionHandler, HintHandler, PictureHandler, 'GoPro MET'), Apple's, Bento4's and GPAC's '... Handler', AVFoundation's
     // 'Core Media *' and MP4Box's '<import>@GPAC<ver>'. From writers' source or published dumps, unsampled: Android's SoundHandle, VideoHandle and MetadHandle,
     // Google's 'ISO Media file produced by Google Inc.', QuickTime's localised component names, the GoPro camera ones; any other tool's '... Handler' matches
-    // /handler$/. All but /@gpac/ are ANCHORED: a name may hold the word ('Dog Handler Commentary'), and one read as boilerplate is erased.
-    const GENERIC_HANDLER_RES = [/handler$/i, /^(sound|video|metad)handle$/i, /^core media /i, /@gpac/i, /^iso ?media file produced by /i,
-        /^(gestionnaire|gestor|procedura|module) d/i, /^gopro (avc|aac|tcd|met|sos|h\.?265|hevc)$/i];
+    // /handler$/. The writers' spaced spellings of that word have a pattern of their own as well, since a title box holding one names no track
+    // (boxNamesNothing): 8 of the 17 handler names in 47 corpus files ('Apple Sound Media Handler', 'Video Media Handler', 'Bento4 Video Handler', 'sound
+    // handler' and kin), and, from the writers' source, unsampled, older MP4Box's 'GPAC ISO Video Handler', L-SMASH's, Mainconcept's and Apple's text and
+    // subtitle components. All but /@gpac/ are ANCHORED: a name may hold the word ('Dog Handler Commentary'), and one read as boilerplate is erased. A
+    // real name that ENDS in the word ('Commentary by the Dog Handler') is read as boilerplate all the same - the price of the catch-all, no such name
+    // seen - and loses only its text, a role it names still reaching a flag, a sidecar token or the lost-roles line. Exempting a name that gives a role
+    // would pass 'Closed Caption Handler' too.
+    const GENERIC_HANDLER_RES = [/handler$/i,
+        /^(?:apple |bento4 |gpac iso |l-smash |mainconcept )?(?:sound|video|audio|text|subtitle|closed caption)(?: media)? handler$/i,
+        /^(sound|video|metad)handle$/i, /^core media /i, /@gpac/i, /^iso ?media file produced by /i, /^(gestionnaire|gestor|procedura|module) d/i,
+        /^gopro (avc|aac|tcd|met|sos|h\.?265|hevc)$/i];
     // nameTextOf: a name as written (a handler's or a title's) less control bytes, U+FFFD and whitespace at both ends. A QuickTime-style writer can leave its
     // Pascal length byte in front of an ISO name (ffmpeg strips it only from a QuickTime file, mov.c mov_read_hdlr); from 128 bytes up ffmpeg keeps a mov
     // name's length byte, which ffprobe prints as U+FFFD (movLengthBytes); and escMeta writes a control byte as a space, so a name with one at its edge came
@@ -2068,7 +2117,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const reading = handlerReading(s, String(handler || ''));
         return !!mediaInfoFill(reading) && !(isMatroskaFamily(readContainer) ? HANDLER_LEFT_OUT_MKV : HANDLER_LEFT_OUT_MP4).test(reading);
     };
-    // -=-=-= mediaInfoText / edgeless / mediaInfoOwnTitleParts / trackNameBesideTitleTag / titleTagFate  [all five] =-=-=-
+    // -=-=-= mediaInfoText / edgeless / titleTagKey / titleTagText / titleTagInNamePlace / tagForms / printedAs / mediaInfoOwnTitleParts /
+    //        trackNameBesideTitleTag / titleTagFate  [all five] =-=-=-
     // A mediaInfo value as text. mediainfo.js gives a value holding a control character as {"@dt": "binary.base64", "#value": <its UTF-8 in base64>}, not a
     // string (measured: a handler 'Tab<TAB>Name' is the Title {"@dt":"binary.base64","#value":"VGFiCU5hbWU="}); any other non-string reads as none. Taken as a
     // string, such a value threw and failed the file.
@@ -2081,6 +2131,38 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         while (a < b && !nameTextOf(parts[a])) a += 1;
         while (b > a && !nameTextOf(parts[b - 1])) b -= 1;
         return parts.slice(a, b);
+    };
+    // The key of a matroska per-track TITLE SimpleTag, or undefined. ffprobe shows one in the Name's place - the demuxer's dictionary replaces the Name's
+    // 'title' with it, as 'TITLE', or under the Name's own key where the tag is spelled 'title' - or, carrying a TagLanguage, as 'TITLE-<lang>' beside the
+    // Name, which an mkv copy keeps beside it and an mp4 one drops (measured: 'TITLE-ger'). A key in the Name's place wins; of several beside it, the last,
+    // which MediaInfoLib appends (measured: 'TITLE-ger' then 'TITLE-fre' read 'Name / <fre>'). A 'title' key is the Name unless mediaInfo's Title shows
+    // another (trackNameBesideTitleTag): read as the Name, 'Director Commentary' beside a 'title' SimpleTag 'Nederlands' lost its role to every remux.
+    const titleTagKey = (s) => {
+        if (!isMatroskaFamily(readContainer)) return undefined;
+        const keys = Object.keys(s?.tags || {}).filter((k) => /^title(?:-[a-z]{2,3}(?:-[a-z0-9]+)*)?$/i.test(k));
+        return keys.find((k) => k !== 'title' && !k.includes('-')) || keys.filter((k) => k.includes('-')).pop() || keys.find((k) => k === 'title');
+    };
+    const titleTagText = (s) => { const k = titleTagKey(s); return k ? String(s.tags[k] ?? '') : ''; };
+    // Whether that tag sits in the Name's place: ffmpeg then writes it as the Name on every remux and keeps no TITLE tag beside a Name, so even a matroska
+    // output keeps one title. One beside the Name only a write into another container, or a sidecar, drops.
+    const titleTagInNamePlace = (s) => { const k = titleTagKey(s); return !!k && !k.includes('-'); };
+    // A tag's text in the forms mediaInfo's Title can hold it, each compared as the Name is (mediaInfoOwnTitleParts): in parts as Fill leaves them, the
+    // empty ones at either edge dropped (edgeless), and a leading U+FFFD read as U+FFFE too, which ffprobe prints so (the swap in mediaInfoFill). Compared
+    // any other way a Name alone read as a second title in 6 of 68 builds (a leading line break or ' / ', a trailing ' / ', a leading U+FFFE); compared
+    // so, in none of 76 (measured on mediainfo.js 0.2.0).
+    const tagForms = (t) => {
+        const x = String(t ?? '');
+        const forms = x.charCodeAt(0) === 0xfffd ? [x, String.fromCharCode(0xfffe) + x.slice(1)] : [x];
+        return [...new Set(forms.map((y) => edgeless(partsOf(mediaInfoFill(y))).join(' / ')))];
+    };
+    // Whether `read`, a text as mediaInfo reads it, is the one ffprobe prints as `printed`. The two decode some bytes apart: ffprobe prints U+FFFE and
+    // U+FFFF as U+FFFD, which MediaInfoLib keeps, and a U+FFFD for each sequence that is no UTF-8, which MediaInfoLib may decode as one UTF-16 unit
+    // (an overlong '/', each half of a CESU-8 pair) - so a U+FFFD there stands for any one unit. Read as a second title, a Name holding U+FFFE made
+    // clean_and_remux repeat one mkv preset every pass, and an overlong or CESU-8 one cost a pass (measured on jellyfin 7.1.4 and mediainfo.js 0.2.0).
+    const printedAs = (printed, read) => {
+        if (printed.length !== read.length) return false;
+        for (let i = 0; i < printed.length; i += 1) if (printed[i] !== read[i] && printed.charCodeAt(i) !== 0xfffd) return false;
+        return true;
     };
     // The Title's parts without the handler's echo - the title box on mp4 and mov, the title on matroska - which roleFieldsLower reads as the one stored value
     // they are. The echo goes because the raw join welds boilerplate into a title ('Core Media Audio -> 2.0') no later pass can tell from one the user chose.
@@ -2095,7 +2177,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let parts = partsOf(mediaInfoText(mediaInfoFor(s)?.Title));
         const handler = String(getTagCI(s?.tags, 'handler_name') || '');
         const mkv = isMatroskaFamily(readContainer);
-        const titleKey = Object.keys(s?.tags || {}).find((k) => k.toLowerCase() === 'title');
+        const titleKey = titleTagKey(s);
+        let fromEnd = false;
         // The echo is removed ONCE, where MediaInfoLib puts it - from the front, and on matroska beside a title ffprobe shows from the end alone
         // ('Description / Audio' beside its HANDLER_NAME 'Description' is 'Description / Audio / Description', whose front removed left 'Audio / Description',
         // a role neither value gives, and audio_clean deleted the track; measured) - as a RUN of whole parts (a name holding ' / ' is several parts), never by
@@ -2109,33 +2192,48 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const last = mkv && !!nameTextOf(getTagCI(s?.tags, 'title'));
             const at = (e) => (joined === e ? 1 : (last ? (joined.endsWith(` / ${e}`) ? -1 : 0) : (joined.startsWith(`${e} / `) ? 1 : 0)));
             const echo = handlerEchoes(s, handler).filter(at).reduce((a, e) => (e.length > a.length ? e : a), '');
+            fromEnd = !!echo && at(echo) < 0;
             if (echo) parts = partsOf(at(echo) > 0 ? joined.slice(echo.length + 3) : joined.slice(0, -echo.length - 3));
         }
-        // A matroska per-track TITLE SimpleTag is a second title: ffprobe shows it alone, as 'TITLE' (the demuxer's dictionary replaces the track Name's
-        // 'title' with it), and MediaInfoLib puts it after the Name as the Title's last part - or the HANDLER_NAME there instead, whichever of the two
-        // SimpleTags comes last, since File_Mk.cpp stores both as one 'Title' key. So it is removed from the end as the echo is, leaving the Name ffprobe lost
-        // (measured: 'New Audio / Description of scenes' read as one name gave /description, and audio_clean deleted the track). Readers find it through
-        // getTagCI.
-        if (mkv && titleKey && titleKey !== 'title') {
+        // A matroska per-track TITLE SimpleTag (titleTagKey) is a second title, which MediaInfoLib puts after the Name as the Title's last part - or the
+        // HANDLER_NAME there instead, whichever of the two SimpleTags comes last, since File_Mk.cpp stores both as one 'Title' key. So it is removed from the
+        // end as the echo is, leaving the Name (measured: 'New Audio / Description of scenes' read as one name gave /description, and audio_clean deleted the
+        // track) - unless the echo came off the end, when MediaInfoLib appended the handler and not the tag (measured: removed as well, the tag's text took
+        // the Name 'Director Commentary / English' beside TITLE 'English' down to 'Director Commentary'). roleFieldsLower reads the tag as a field of its own.
+        if (titleKey && !fromEnd) {
             const joined = parts.join(' / ');
-            const tag = partsOf(mediaInfoFill(s.tags[titleKey])).join(' / ');
-            if (tag && joined.endsWith(` / ${tag}`)) parts = partsOf(joined.slice(0, -tag.length - 3));
+            const tag = tagForms(s.tags[titleKey]).find((t) => t && joined.endsWith(` / ${t}`));
+            if (tag) parts = partsOf(joined.slice(0, -tag.length - 3));
         }
         return edgeless(parts);
     };
-    // A matroska track's one name where a per-track TITLE SimpleTag sits beside its Name, else '': ffprobe shows only the tag, as 'TITLE', and the Name is what
-    // is left of mediaInfo's Title (mediaInfoOwnTitleParts) when it is not the tag itself. A remux keeps one title, written as the Name, so that name keeps
-    // both values' roles (rolesNamed): the Name alone when the tag gives none the Name lacks, since players and media servers show the Name; else the two
+    // A matroska track's one name where a per-track TITLE SimpleTag (titleTagKey) sits beside its Name, else '' - the Name being what is left of mediaInfo's
+    // Title (mediaInfoOwnTitleParts) when no tag form is it (tagForms), the one place it shows where the tag is in its place. An output that keeps one title -
+    // any remux of a tag in the Name's place (titleTagInNamePlace), else a write into another container or a sidecar - writes it as the Name, so that name
+    // keeps both values' roles (rolesNamed): the Name alone when the tag gives none the Name lacks, since players and media servers show the Name; else the two
     // joined as mediaInfo joins them, 'Name / TITLE', or else 'TITLE / Name', whichever reads exactly their roles together - a keyword can form across the
     // join ('Main Audio / Description Commentary' reads 'audio description'); else the Name, the roles only the tag gives lost (titleTagFate). Measured:
     // read as the tag, 'Director Commentary' beside 'German' was written over with 'German'; read as the Name alone, 'English' beside 'Director Commentary'
     // made the commentary the default audio.
     const trackNameBesideTitleTag = (s) => {
-        const key = Object.keys(s?.tags || {}).find((k) => k.toLowerCase() === 'title');
-        if (!isMatroskaFamily(readContainer) || !key || key === 'title') return '';
-        const name = mediaInfoOwnTitleParts(s).join(' / ').trim();
-        const tag = partsOf(mediaInfoFill(s.tags[key])).join(' / ');
-        if (!name || name === tag) return '';
+        const key = titleTagKey(s);
+        if (!key) return '';
+        let name = mediaInfoOwnTitleParts(s).join(' / ').trim();
+        const forms = tagForms(s.tags[key]);
+        const tag = forms[0];
+        // A 'TITLE-<lang>' on a track mediaInfo shows no Name for: ffprobe's title is the Name where there is one (mediainfo.js lists no tracks once
+        // mkvpropedit has moved the Tracks element after the clusters, and read as no Name the tag replaced it - measured), else a named HANDLER_NAME
+        // stands in for it, else the tag is the one name (measured: beside a later HANDLER_NAME mediaInfo's Title is that handler alone, and read so an
+        // mp4 conversion lost the tag's role while Expected results promised it).
+        if (!name && !titleTagInNamePlace(s)) {
+            const handler = handlerTextOf(getTagCI(s.tags, 'handler_name'));
+            name = nameTextOf(getTagCI(s.tags, 'title')) || (isGenericHandler(handler) ? '' : handler);
+            if (!name) return tag;
+        }
+        // The Name is the tag where the two engines only decode one text apart (printedAs): compared as Fill and nameTextOf leave each, and with the tag
+        // whole, since they trim a U+FFFD at an edge that mediaInfo read as a character (a CESU-8 pair opening the Name).
+        const read = [name, ...tagForms(name.replace(/[\ufffe\uffff]/g, '\ufffd'))];
+        if (!name || [...forms, String(s.tags[key] ?? '').trim()].some((f) => read.some((n) => printedAs(f, n)))) return '';
         const roles = (t) => rolesNamed(t, codecTypeOf(s)).sort().join();
         const both = [...new Set([...rolesNamed(name, codecTypeOf(s)), ...rolesNamed(tag, codecTypeOf(s))])].sort().join();
         return roles(name) === both ? name : [`${name} / ${tag}`, `${tag} / ${name}`].find((t) => roles(t) === both) || name;
@@ -2145,11 +2243,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const titleTagFate = (s) => {
         const named = trackNameBesideTitleTag(s);
         if (!named) return { joined: false, lost: [] };
-        const tag = partsOf(mediaInfoFill(getTagCI(s?.tags, 'title'))).join(' / ');
+        const tag = tagForms(titleTagText(s))[0];
         const lost = rolesNamed(tag, codecTypeOf(s)).filter((k) => !rolesNamed(named, codecTypeOf(s)).includes(k));
         return { joined: named !== mediaInfoOwnTitleParts(s).join(' / ').trim(), lost: [...new Set(lost.map((k) => dispositionTypes[k].tag || k))] };
     };
-    // -=-=-= titleOutsideHandler / titleBesideHandler / mediaTitleFor  [all five] =-=-=-
+    // -=-=-= titleOutsideHandler / titleBesideHandler / boxNamesNothing / mediaTitleFor  [all five] =-=-=-
     // The track's own title: the title tag (on matroska beside a TITLE SimpleTag, the track's one name: trackNameBesideTitleTag), else the Title less the
     // handler's echo, even one repeating the handler (sub_worker's duplicate fold reads it so).
     const titleOutsideHandler = (s) => {
@@ -2171,15 +2269,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (nameTextOf(getTagCI(s?.tags, 'title'))) return title === name && !isGenericHandler(name) ? '' : title;
         return title && name && (handlerEchoes(s, handler).includes(title) || (escMeta(name) === title && !isGenericHandler(name))) ? '' : title;
     };
+    // A title box that names no track: boilerplate by a tool's own pattern, the writers' spaced '... Handler' spellings among them, or a one-word
+    // '...Handler' (ffmpeg's SoundHandler; measured: 'Core Media Audio' and 'Apple Sound Media Handler' beside 'SoundHandler' each became an mkv
+    // conversion's title), that gives a track of its type no role. Beside a boilerplate handler the box is the one place its role words live, so
+    // 'Apple Closed Caption Media Handler' stays a subtitle's title: read as nothing, an mkv conversion dropped the SDH role Expected results promised,
+    // and an extract named the sidecar with neither. A spaced name only the '... Handler' catch-all reads as boilerplate is a name there ('The Dog
+    // Handler' beside Apple's 'Core Media Audio' handler).
+    const boxNamesNothing = (t, type) => {
+        const x = nameTextOf(t);
+        return isGenericHandler(x) && !rolesNamed(x, type).length
+            && !(/\s/.test(x) && !HDLR_TYPE_FOURCCS.has(x) && GENERIC_HANDLER_RES.slice(1).every((re) => !re.test(x)));
+    };
     // A stream's title: ffprobe's title tag, else mediaInfo's Title outside the handler's echo (titleBesideHandler - on mp4 the udta/name box, which ffprobe
     // never surfaces), else a NAMED handler (isGenericHandler). A real title outranks the handler, so a GPAC release name in the handler never displaces
-    // "Main Feature"; the handler is the title only when nothing else names the track. On matroska ffmpeg keeps an mp4 handler only as a HANDLER_NAME tag
-    // (mediaInfo shows it as the Title, mkvmerge as no track name), so this makes an mp4 -> mkv remux carry the name as a real title.
+    // "Main Feature"; the handler is the title only when nothing else names the track, or when, with no title tag, the box beside it reads as boilerplate
+    // (measured: 'Core Media Audio' beside 'Deutsch Kommentar' became an mkv conversion's title and the handler was wiped, its name gone). Beside a
+    // boilerplate handler such a box is no name either where a tool wrote it (boxNamesNothing); a name it merely reads as stays. On matroska
+    // ffmpeg keeps an mp4 handler only as a HANDLER_NAME tag (mediaInfo shows it as the Title, mkvmerge as no track name), so this makes an mp4 -> mkv
+    // remux carry the name as a real title.
     const mediaTitleFor = (s) => {
         const beside = titleBesideHandler(s);
-        if (beside) return beside;
         const name = handlerTextOf(getTagCI(s?.tags, 'handler_name'));
-        return isGenericHandler(name) ? '' : name;
+        const named = isGenericHandler(name) ? '' : name;
+        if (!beside || !isGenericHandler(beside) || nameTextOf(getTagCI(s?.tags, 'title'))) return beside || named;
+        return named || (boxNamesNothing(beside, codecTypeOf(s)) ? '' : beside);
     };
     // -=-=-= MOV_HANDLER_MAX_BYTES / movHandlerGrows / cutName / movNameCut / handlerNameFor  [all five] =-=-=-
     // mov stores the handler as a Pascal string, and ffmpeg's reader compares its length byte as a plain char (mov.c mov_read_hdlr), signed on x86 and Apple
@@ -2203,7 +2316,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const cutName = (t, max, size = (x) => Buffer.byteLength(x, 'utf8'), generic = isGenericHandler) => {
         const fits = (x) => size(x) <= max;
         if (fits(t) || generic(t)) return generic(t) ? '' : t;
-        const untrail = (x) => x.replace(/[\s\-–—/:,;.]+$/, '');
+        // An index walk, for the reason nameTextOf is one: keepRoles' candidates keep whole units of any length (measured: 526 s for one 60,000-character
+        // .mov name stripped by /[...]+$/).
+        const UNTRAIL_CHAR = /[\s\-–—/:,;.]/;
+        const untrail = (x) => { let b = x.length; while (b > 0 && UNTRAIL_CHAR.test(x[b - 1])) b -= 1; return x.slice(0, b); };
         // The roles a name gives each classifier, read both as written and as NFC (rolesNamed folds to NFC; handlerOnlyDisp and clean_and_remux's cleared-role
         // test read the case-folded text as written). Every candidate passes reads(): it fits, it reads as a name, and it gives exactly the full name's roles -
         // or, for the plain cut the limits leave (`lose`), a subset of them, never one the name lacks. The roles are the cut's alone: the next pass reads it
@@ -2369,12 +2485,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The line a write of a track's one name (trackNameBesideTitleTag) as its title logs, by what that leaves of the TITLE SimpleTag (titleTagFate).
     const titleTagLine = (s) => {
         const { joined, lost } = titleTagFate(s);
-        const named = quotedName(trackNameBesideTitleTag(s)); const tag = `the TITLE tag "${logShown(getTagCI(s.tags, 'title'))}"`;
+        const named = quotedName(trackNameBesideTitleTag(s)); const tag = `the TITLE tag "${logShown(titleTagText(s))}"`;
         if (joined) return `☐${streamTag(s.index)} Writing ${named} as the title - the track name joined with ${tag} beside it, since ffmpeg keeps`
             + ' one title\n';
         return `☒${streamTag(s.index)} Writing the track name ${named} as the title, so ${tag} beside it is dropped`
             + `${lost.length ? ` with its ${lost.join(' and ')} role${lost.length > 1 ? 's' : ''} - no join of the two reads both their roles`
                 : ' - ffmpeg keeps one title, and players show the name'}\n`;
+    };
+    // -=-=-= trackNamesUnreadLine  [all five] =-=-=-
+    // Tdarr's mediainfo.js lists only the General track for a Matroska file whose Tracks element sits after its clusters (mkvpropedit moves it there when an
+    // edit does not fit), so a Name beside a TITLE SimpleTag in its place, which only mediaInfo shows, is unseen: the track reads as the tag (measured: a
+    // 'Director Commentary' Name beside TITLE 'English' read as plain English audio) and a remux writes the tag over the Name. Nothing here can recover it.
+    const trackNamesUnreadLine = (streams) => {
+        const tracks = file?.mediaInfo?.track || [];
+        if (!tracks.length || tracks.some((t) => t['@type'] !== 'General') || !streams.some((x) => titleTagInNamePlace(x) && titleTagKey(x) !== 'title')) {
+            return '';
+        }
+        return '☒mediaInfo lists no tracks in this Matroska file (its Tracks element sits after the clusters), so a track name beside a TITLE tag cannot be'
+            + ' read and a remux writes the tag over it - a plain mkvmerge remux moves the Tracks element back to the front\n';
     };
     // -=-=-= handlerFor / mp4NameCarry  [all five] =-=-=-
     // The handler a write of `title` leaves on s (null: s's own, untouched), shared with sub_worker's duplicate fold. A handler is left as it is when it
@@ -2394,15 +2522,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // moves it into the handler unless the handler already says it (handlerFor; with no title, a growing .mov handler gets the default); it never remuxes for
     // this alone.
     const mp4NameCarry = (s, typeLetter, idx, container) => {
-        // On a matroska output, a track named beside a TITLE SimpleTag (trackNameBesideTitleTag): ffmpeg reads the tag in the Name's place and writes it as the
-        // Name on every remux, and keeps no TITLE tag beside a Name - so the track's one name is restated, and titleTagLine says what it leaves of the tag.
-        const named = isMatroskaFamily(container) ? trackNameBesideTitleTag(s) : '';
+        // On a matroska output, a track named beside a TITLE SimpleTag in its place (trackNameBesideTitleTag, titleTagInNamePlace): ffmpeg reads the tag in
+        // the Name's place and writes it as the Name on every remux, and keeps no TITLE tag beside a Name - so the track's one name is restated, and
+        // titleTagLine says what it leaves of the tag. A 'TITLE-<lang>' beside the Name rides the remux as it is.
+        const named = isMatroskaFamily(container) && titleTagInNamePlace(s) ? trackNameBesideTitleTag(s) : '';
         if (named) {
             return { s, title: named, move: null, said: escMeta(named), fate: 'tag', why: '', cut: false,
                 args: ` -metadata:s:${typeLetter}:${idx} "title=${escMeta(named)}"` };
         }
         if (!isMp4Family(container)) return null;
-        const title = mediaTitleFor(s);
+        // A title box that reads as boilerplate names no track (mediaTitleFor), but the remux drops it, so it is restated as it is.
+        const title = mediaTitleFor(s) || titleBesideHandler(s);
         const handler = String(getTagCI(s.tags, 'handler_name') || '');
         const grows = movHandlerGrows(handler, container);
         const next = title ? handlerFor(s, title, container) : (grows ? '' : null);
@@ -2515,7 +2645,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // disposition keys that, when set on the source, emit this token on extract. They differ only for SDH: hearing_impaired and captions are
     // the same closed-captions role, but captions has no Matroska flag and does not survive an mp4->mkv round-trip (the muxer silently drops
     // +captions), so BOTH normalise to the container-portable hearing_impaired - extract emits a single 'sdh' token for either flag and import
-    // restores hearing_impaired. The human-readable role also survives in the encoded title. `default` is deliberately NOT tracked: muxers
+    // restores hearing_impaired - on a .webm, which keeps no hearing_impaired flag, the WebVTT captions kind (sub_worker's dispFfOf). The
+    // human-readable role also survives in the encoded title. `default` is deliberately NOT tracked: muxers
     // auto-manage it (mp4 forces default on the first subtitle), so it is neither identity-stable nor ours. Nothing in the stack normalises a
     // SUBTITLE default either - stream_ordering's +default/-default pass is audio-only, and only READS the flag for subtitle_first=default_tagged
     // - so whatever a muxer stamped survives untouched. That is deliberate: "no subtitle is default" and "the first forced subtitle is default"
@@ -2558,17 +2689,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // nothing is lost because our own parser reads both regions. forced wins the slot over sdh: it drives AUTOMATIC selection (a forced track that loses
     // its flag stops appearing by itself), whereas an unlabelled SDH track is still listed and selectable, just not marked.
     const SERVER_FLAG_TOKENS = ['forced', 'sdh'];
-    // Whether s's handler_name (read as the name it holds, handlerTextOf) names d's role and `title`, the title the sidecar carries, does not: sub_worker's
-    // sidecar title, a name in whichever box it sits, and by default - for clean_and_remux's .mks export, which spells no title - the title other than the
-    // handler (titleBesideHandler) that the .mks carries. A sidecar keeps no handler, so a role only the handler names gets its token, or it is gone after
-    // import (measured: an mp4 handler 'SDH' and an mkv HANDLER_NAME 'Forced' both came back as plain tracks). Judged against the carried title, the spelling
+    // Whether a field a sidecar keeps nothing of - s's handler_name (read as the name it holds, handlerTextOf), a description, ffprobe's or mediaInfo's, or a
+    // matroska TITLE SimpleTag other than the track's one name (titleTagText; a 'TITLE-<lang>' on a track with no Name came back a plain track) -
+    // names d's role and `title`, the title the sidecar carries, does not: sub_worker's sidecar title, a name in whichever box it sits, and by default - for
+    // clean_and_remux's .mks export, which spells no title - the title other than the handler (titleBesideHandler) that the .mks carries. A sidecar keeps no
+    // handler or description, so a role only one of them names gets its token, or it is gone after import (measured: an mp4 handler 'SDH', an mkv
+    // HANDLER_NAME 'Forced' and an mkv DESCRIPTION 'Commentary' all came back as plain tracks). Judged against the carried title, the spelling
     // does not depend on which box or container holds the name: 'English (SDH)' in an mp4 handler and the same mkv title both give
     // '<video>.s2.English (SDH).eng.srt' (measured: judged against the title beside the handler, the mp4 one got '.sdh' too, and a container conversion then
-    // made the next extract write a second sidecar).
+    // made the next extract write a second sidecar). A role is named by the words of any flag its token stands for, so captions words give sdh too
+    // (measured: a real .mov's 'Apple Closed Caption Media Handler' extracted with no token, and the import brought back a plain track).
     const handlerOnlyDisp = (d, s, title = titleBesideHandler(s)) => {
-        const handler = handlerTextOf(getTagCI(s.tags, 'handler_name')).toLowerCase();
-        const keywords = dispositionTypes[d.ff]?.keywords || [];
-        return !!handler && matchesKeyword(handler, keywords) && !matchesKeyword(String(title || '').toLowerCase(), keywords);
+        const keywords = d.flags.flatMap((f) => dispositionTypes[f]?.keywords || []);
+        const lost = [handlerTextOf(getTagCI(s.tags, 'handler_name')), getTagCI(s.tags, 'description'),
+            mediaInfoText(getTagCI(mediaInfoFor(s)?.extra, 'description')),
+            titleTagKey(s) && (!titleTagInNamePlace(s) || trackNameBesideTitleTag(s)) ? titleTagText(s) : ''];
+        return lost.some((t) => matchesKeyword(String(t || '').toLowerCase(), keywords)) && !matchesKeyword(String(title || '').toLowerCase(), keywords);
     };
     // The token rule for every sidecar either plugin names: one canonical token per role the stream's real flags carry (sdh covers hearing_impaired OR
     // captions), plus each role onlyDisp (handlerOnlyDisp by default) adds. Names live in titles and flags come from clean_and_remux (the owner's rule): a role
@@ -2723,8 +2859,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const normSidecarLang = (lang) => (LANG_CODE_SHAPE.test(String(lang)) ? canonSidecarRegion(String(lang)) : to6392T(lang));
 
-    // The ffmpeg -disposition name a filename token restores on import. Import-only, so it stays out of the shared 'sidecar name tokens' section.
-    const dispFfOf = (token) => (DISPOSITIONS.concat(EXTRA_DISPOSITIONS).find((d) => d.token === token) || {}).ff;
+    // The ffmpeg -disposition name a filename token restores on import. Import-only, so it stays out of the shared 'sidecar name tokens' section. On a .webm
+    // sdh is the WebVTT captions kind: the webm muxer stores a subtitle's captions flag as its codec (D_WEBVTT/CAPTIONS) and keeps it through a further
+    // copy, while hearing_impaired reads back 0 (measured on jellyfin 7.1.4) - written so, the role went at every import and the sidecar was kept forever.
+    const dispFfOf = (token) => (token === 'sdh' && dstContainer === 'webm' ? 'captions'
+        : (DISPOSITIONS.concat(EXTRA_DISPOSITIONS).find((d) => d.token === token) || {}).ff);
 
     // A title parseSidecar would read as something else. TITLE_SAFE passes letters and '_' straight through, so a title that IS a role or extra token
     // ('forced', 'original') encodes to that exact word and parseSidecar's token strip eats it - losing the title and inventing a flag; and beside a
@@ -3708,15 +3847,57 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // that it holds what the import kept, so a sidecar the import strips stays, and this names what deleting it would cost ('' = safe to delete). The
     // round trip reads the sidecar as the import does, so a cue ffmpeg cannot read is missing from both sides of that match - the count of text-bearing
     // cues is what shows it. Measured on 7.1.4, each short on both sides: a Windows-1252 cue (into mkv and mp4) and every cue after a NUL.
-    const deletionLoss = (f, how, mp4) => {
+    // A role the name gives that no track holding its text shows (`holders`) - by a flag, or by its words in a title or tag - is gone with the sidecar,
+    // whatever the container: a .mov stores no role flag (readBackDispositions), and a file converted out of one keeps none it lost there (measured: a
+    // .mov import kept its .sdh sidecar, and once clean_and_remux moved the file to mkv, post-processing deleted it). So it is named as a loss too, and
+    // the sidecar stays. 'original' is not kept for: no mp4-family output stores it, so its loss is said where the sidecar goes (originalLostLine).
+    const ROLE_SHOWN = { forced: (s) => hasDisposition(s, 'forced'), sdh: isSdh, commentary: isCommentary, descriptive: isDescriptive,
+        visual_impaired: isDescriptive };
+    // The roles a sidecar's name gives that no track holding its text shows (`holders`), by a flag or by its words (ROLE_SHOWN).
+    const tokensOf = (f) => [...(f.dispTokens || []), ...(f.extraTokens || [])];
+    const rolesUnshown = (f, holders) => (holders.length ? tokensOf(f).filter((t) => ROLE_SHOWN[t] && !holders.some(ROLE_SHOWN[t])) : []);
+    // The tokens whose flags the output stores, written together on one subtitle and read back as readBackDispositions has them - none in a .mov, in a
+    // .webm forced and one of sdh (as captions, dispFfOf) and descriptive, in an mp4 all but original - and the words for the ones it does not.
+    const storedTokens = (tokens) => {
+        const back = readBackDispositions(dstContainer, [{ codec_type: 'subtitle', disposition: Object.fromEntries(tokens.map((t) => [dispFfOf(t), 1])) }],
+            true)[0].disposition;
+        return tokens.filter((t) => back[dispFfOf(t)] === 1);
+    };
+    const unstoredText = (tokens) => ({ mov: '.mov stores no role flag', webm: '.webm keeps only forced and one of sdh and descriptive' }[dstContainer]
+        || `.${dstContainer} stores no ${tokens.join(' or ')} flag`);
+    // `settled`: roles said by a line of their own (keptByEmbeddedLine), left out here; `named`: the sidecar whose own name the roles are read from, one
+    // member of a byte-identical group (the cues are the group's).
+    const deletionLoss = (f, how, mp4, holders = [], settled = [], named = f) => {
+        const roles = rolesUnshown(named, holders).filter((t) => !settled.includes(t));
+        if (roles.length) {
+            const stored = storedTokens(tokensOf(named));
+            const unstored = roles.filter((t) => !stored.includes(t));
+            return `its ${roles.join(' and ')} role${roles.length > 1 ? 's' : ''} (${unstored.length ? unstoredText(unstored)
+                : 'no track holding its text shows it'})`;
+        }
         if (how !== 'roundtrip') return '';
         const own = sidecarContent(f);
         const kept = roundTripCues.get(`${mp4 ? 'mp4' : 'mkv'}|${f.rel}`);
         if (own?.loss?.[mp4 ? 'mp4' : 'any']) return own.loss[mp4 ? 'mp4' : 'any'];
         return own && kept < own.cues ? `${own.cues - kept} of its ${own.cues} cues` : '';
     };
-    const keepForLossLine = (rel, loss) => `☒[remove_source=true] Keeping ${logSafe(rel)}: its text is in the file, but importing it dropped ${loss}`
-        + ' - delete it yourself if you do not need that\n';
+    // `imported`: false for a role a sidecar already in the file names, which the track may never have had (a flag cleared after the extract, a
+    // sidecar named by hand), so no import lost it.
+    const keepForLossLine = (rel, loss, imported = true) => `☒[remove_source=true] Keeping ${logSafe(rel)}: its text is in the file, but ${
+        imported ? 'importing it dropped' : 'not'} ${loss} - delete it yourself if you do not need that\n`;
+    // A sidecar already in the file whose name gives a role the track holding its text lacks, one the output could store: under
+    // method_import_metadata=embedded the track keeps its own roles by choice, so the role lives only in the name - the setting's outcome, not a loss.
+    const keptByEmbeddedLine = (at, rel, roles) => {
+        const them = roles.length > 1 ? 'them' : 'it';
+        return `☑${streamTag(at)}[method_import_metadata=embedded] Keeping ${logSafe(rel)}: its text is in the file, but the track keeps its own roles, so`
+            + ` the ${roles.join(' and ')} role${roles.length > 1 ? 's its name gives live' : ' its name gives lives'} only there - set`
+            + ` method_import_metadata=sidecar to put ${them} on the track, or rename or delete the sidecar to drop ${them}\n`;
+    };
+    // The line a deletion adds when the sidecar's name held an original role no track holding its text has (deletionLoss).
+    const originalLostLine = (f, holders) => ((f.extraTokens || []).includes('original') && holders.length
+        && !holders.some((s) => s.disposition?.original === 1)
+        ? `☒[remove_source=true] The original-language role ${logSafe(f.rel)} named is lost with it - ${isMp4Family(dstContainer)
+            ? `${dstContainer} stores no original flag` : 'no track holding its text has the flag'}\n` : '');
     // What a sidecar already at an extract's name is worth when remove_source is about to strip the stream it copies - an earlier run's file there would
     // otherwise become the ONLY copy, unexamined. { state }: 'whole' when it holds this stream's text exactly, or when its cues reach the stream's own end
     // (an edit that kept the timeline - trusted, as it always was); 'aborted' when it is empty, cue-less, or a bundle ffmpeg cannot decode while the stream
@@ -4346,9 +4527,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     hashes === null ? " (the file's subtitle text could not be read)" : ''} - not deleting (unverified)\n`;
                 continue;
             }
-            const loss = deletionLoss(f, contentConfirms(f), mp4Target);
+            const how = contentConfirms(f);
+            const held = how === 'text' ? sidecarContent(f)?.sha1 : (how === 'roundtrip' ? sidecarRoundTripHash(f, mp4Target) : null);
+            const holders = held ? embedded.filter((s) => hashes?.get(s.index) === held) : [];
+            const loss = deletionLoss(f, how, mp4Target, holders);
             if (loss) { log += keepForLossLine(f.rel, loss); continue; }
-            try { fs.unlinkSync(libPathOf(f.rel)); deleted += 1; log += `☑[${delReason}] Deleted sidecar (${why}): ${logSafe(f.rel)}\n`; }
+            try {
+                fs.unlinkSync(libPathOf(f.rel)); deleted += 1;
+                log += `☑[${delReason}] Deleted sidecar (${why}): ${logSafe(f.rel)}\n${originalLostLine(f, holders)}`;
+            }
             catch (e) { log += `☒[${delReason}] Could not delete sidecar ${logSafe(f.rel)}: ${logPath(e && e.message ? e.message : e)}\n`; }
         }
         log += deleteSpentSubtitleList(delReason, marked);
@@ -4497,7 +4684,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.infoLog += mp4UncopyableLog(dstContainer, uncopyable, mapped) + matroskaCoverLog(staged)
             + mp4TagPlanLog(tagPlan, dstContainer, mapped) + mp4TimecodeLog(dstContainer, mapped)
             + mp4NameCarryLog(dstContainer, list.filter((s) => mapped.includes(s)), titleWritten) + dvCopyFourccLog(dstContainer, mapped)
-            + dvCopyLossLine(dstContainer, mapped) + movDvLossLine(dstContainer, mapped);
+            + dvCopyLossLine(dstContainer, mapped) + movDvLossLine(dstContainer, mapped)
+            + roleLossLine(dstContainer, list.filter((s) => mapped.includes(s)));
         const goneData = mp4LostData(uncopyable, mapped);
         for (const s of [...goneData, ...mp4CoversLost(tagPlan, dstContainer, mapped), ...staged.leaveOut]) leftOut.add(s.index);
         unmapped.push(...uncopyable);
@@ -4532,7 +4720,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // webvtt fallback only guards a future caller that reads a sidecar without going through it.
         const codec = f.bundle ? 'ass' : (mp4 ? 'mov_text' : (TEXT_EXTS.includes(f.ext) ? EXT_TO_CODEC[f.ext] : 'webvtt'));
         const disposition = {};
-        for (const d of DISPOSITIONS.concat(EXTRA_DISPOSITIONS)) if ((f.dispTokens.concat(f.extraTokens || [])).includes(d.token)) disposition[d.ff] = 1;
+        for (const t of tokensOf(f)) if (dispFfOf(t)) disposition[dispFfOf(t)] = 1;
         // The title as the import writes it (titleMetaArgs): on an mp4-family output beside the same handler, which is all a .mov keeps of a non-ASCII one.
         const tags = { language: f.lang, title: f.title, ...(mp4 ? { handler_name: handlerNameFor(f.title, dstContainer) } : {}) };
         return titleReadBack({ codec_type: 'subtitle', codec_name: codec, index: -1, tags, disposition }, dstContainer);
@@ -4542,6 +4730,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     try {
         response.infoLog += `☐Input streams: ${summariseAll(streams)}\n`;
+        response.infoLog += trackNamesUnreadLine(streams);
         // An unmapped node with method_unmapped=error cannot import at all - there is no way to discover sidecars. Fail HERE, before the caption plan pays the
         // A53 caption probe and a remote existence round-trip it would only discard, since every requeue would otherwise re-pay them before quarantining.
         if (action === 'import' && isUnmappedNode && unmappedMode === 'error') {
@@ -5081,10 +5270,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // A stream named beside a matroska TITLE SimpleTag leaves the file with its sidecar named after its one name (trackNameBesideTitleTag): where that
             // is the Name alone, the tag's text goes with the stream, and any role only the tag gave (titleTagFate) - said where the stream is taken out.
             const titleTagGoes = (st) => {
-                const { joined, lost } = titleTagFate(st);
+                const tokened = new Set(DISPOSITIONS.filter((d) => handlerOnlyDisp(d, st)).map((d) => dispositionTypes[d.ff].tag));
+                const { joined } = titleTagFate(st);
+                const lost = titleTagFate(st).lost.filter((t) => !tokened.has(t));
                 if (!trackNameBesideTitleTag(st) || joined) return '';
                 return `☒${streamTag(st.index)}[remove_source=true] The sidecar carries the track name ${quotedName(trackNameBesideTitleTag(st))}, so the TITLE`
-                    + ` tag "${logShown(getTagCI(st.tags, 'title'))}" beside it is dropped`
+                    + ` tag "${logShown(titleTagText(st))}" beside it is dropped`
                     + `${lost.length ? ` with its ${lost.join(' and ')} role${lost.length > 1 ? 's' : ''}` : ''}\n`;
             };
             // The names each stream takes by name - its current spelling, and the previous sub_worker's titled or role-token one - mapped to its index;
@@ -5988,7 +6179,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // + 'English SDH' group's 'English SDH' would rename it.
             const wantTitle = isMp4 || !nameTextOf(f.title) ? null : [f.firstTitle, f.title].find((t) => cur && titleAgrees(cur, t)) || f.title;
             const sameTitle = wantTitle === null || (!!cur && titleAgrees(cur, wantTitle));
+            // A role the track gives through a field a sidecar cannot hold - a handler, a description, a TITLE tag beside its one name - is the one the name's
+            // token stands for (handlerOnlyDisp), so it counts as the track's: compared with its flags alone, an extract -> import round trip of a
+            // DESCRIPTION-only commentary disagreed on every pass.
             const curDisp = new Set(activeDispositions(cur));
+            if (cur) for (const d of DISPOSITIONS) if (handlerOnlyDisp(d, cur, f.title)) curDisp.add(d.ff);
             // `default` is muxer-managed rather than a role, so no sidecar name can carry it (see DISPOSITIONS) and f.disp never holds it. The track's own
             // flag joins the wanted set instead, which both cancels it out of the comparison and stops the whole-set write below from stripping it. Without
             // that a default-flagged track never matches its sidecar: one wasted retune remux under 'sidecar', a disagreement warning under 'embedded' on
@@ -6116,11 +6311,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Sidecars that were only ever redundant, with nothing to mux alongside them. Both cleanup shortcuts below must be the EXACT negation of the mux
         // branch's trigger (toMux || retuneMeta || removedIndices) - a queued embedded-dedup drop is work on the FILE, and returning here would discard it
         // silently. A sidecar whose import stripped something stays whichever route would remove it (deletionLoss) - said once, here, for both.
-        const deletable = (nothingToMux && removeSource) ? alreadyInFile.filter((f) => {
-            const loss = deletionLoss(f, f.matchedBy, isMp4);
-            if (loss) for (const m of f.members) response.infoLog += keepForLossLine(m.rel, loss);
-            return !loss;
-        }) : alreadyInFile;
+        // The tracks holding a sidecar's text are every surviving track whose text hash is its - as post-processing reads them - not only the first,
+        // embeddedAt's (measured: a plain track ahead of a same-text SDH one kept a .sdh sidecar forever, its role said to live only in the name). Each
+        // member of a byte-identical group is judged by its own name: judged by the group's tokens, a plain 'u.en.srt' beside 'u.en.sdh.srt' was kept
+        // forever, said to give the sdh role, so a group may lose some members and keep the rest.
+        const deletable = (nothingToMux && removeSource) ? alreadyInFile.map((f) => {
+            const held = f.matchedBy === 'text' ? sidecarContent(f)?.sha1 : sidecarRoundTripHash(f, isMp4);
+            f.holders = keptSubs.filter((s) => s.index === f.embeddedAt || (!!held && embeddedHashes.get(s.index) === held));
+            const members = f.members.filter((m) => {
+                const roles = rolesUnshown(m, f.holders);
+                const stored = storedTokens(tokensOf(m));
+                const settled = metadataMode === 'embedded' ? roles.filter((t) => stored.includes(t)) : [];
+                const loss = deletionLoss(f, f.matchedBy, isMp4, f.holders, settled, m);
+                if (settled.length) response.infoLog += keptByEmbeddedLine(f.embeddedAt, m.rel, settled);
+                if (loss) response.infoLog += keepForLossLine(m.rel, loss, !roles.some((t) => !settled.includes(t)));
+                return !loss && !settled.length;
+            });
+            return members.length ? { ...f, members } : null;
+        }).filter(Boolean) : alreadyInFile;
         // Deleting them needs a WRITABLE library view, which placeViaApi() is the negation of: a read-only mount refuses the unlink, and without any mount
         // workLibDir() is the node-local mirror - under text_file the sidecars there are this run's own downloaded scratch copies, so unlinking them reports a
         // deletion that never touched the library. Nor can any other route delete directly (the file API has no delete; with nothing to mux there is no
@@ -6175,10 +6383,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return endImport(`☑Nothing to import - every ${refusedText ? 'other ' : ''}sidecar was already in the file\n`);
             }
             let gone = 0; const removedRels = new Set();
-            for (const rel of deletable.flatMap((f) => f.members.map((m) => m.rel))) {
+            for (const [m, f] of deletable.flatMap((g) => g.members.map((x) => [x, g]))) {
+                const rel = m.rel;
                 try {
                     fs.unlinkSync(libPathOf(rel)); gone += 1; removedRels.add(rel);
-                    response.infoLog += `☑[remove_source=true] Deleted sidecar (its content is already in the file): ${rel}\n`;
+                    response.infoLog += `☑[remove_source=true] Deleted sidecar (its content is already in the file): ${rel}\n`
+                        + originalLostLine(m, f.holders || []);
                 }
                 catch (e) { response.infoLog += `☒[remove_source=true] Could not delete sidecar ${rel}: ${e && e.message ? e.message : e}\n`; }
             }
@@ -6222,8 +6432,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const dropsEmptyCues = !f.bundle && isMatroskaFamily(dstContainer);
                 if (dropsEmptyCues) meta += ` -bsf:s:${outIdx} ${VTT_EMPTY_CUE_DROP}`;
                 // Report EVERY flag being restored, the pre-language ones included - they are the whole reason that slot exists, and a line naming only the
-                // roles would say "(chi forced)" while writing forced+original, or nothing at all for a sidecar carrying visual_impaired alone.
-                const flagsBack = f.dispTokens.concat(f.extraTokens || []);
+                // roles would say "(chi forced)" while writing forced+original, or nothing at all for a sidecar carrying visual_impaired alone. A flag the
+                // output does not store (storedTokens) is said lost instead of promised.
+                const flagsBack = storedTokens(tokensOf(f));
+                const flagsLost = tokensOf(f).filter((t) => !flagsBack.includes(t));
                 const flagText = flagsBack.length ? ` ${flagsBack.join('+')}` : '';
                 const origin = f.members.find(stillEmbedded);
                 if (origin) response.infoLog += `☒${streamTag(origin.index)} Importing ${f.rel} as a SECOND copy - the stream it was extracted from is still `
@@ -6231,6 +6443,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (f.members.length > 1) response.infoLog += `☑[deduplicate=${dedupeMode}] Deduplicated ${f.members.length} byte-identical sidecars -> ${
                     f.rel} (${f.lang}${flagText})\n`;
                 response.infoLog += `☐Import ${f.rel} -> subtitle ${outIdx} (${f.lang}${flagText})${restoreFonts ? ' and its bundled font attachments' : ''}\n`;
+                if (flagsLost.length) {
+                    response.infoLog += `☒The ${flagsLost.join(' and ')} flag${flagsLost.length > 1 ? 's' : ''} ${logSafe(f.rel)} names ${
+                        flagsLost.length > 1 ? 'are' : 'is'} lost in this import - ${unstoredText(flagsLost)}\n`;
+                }
                 const emptyCues = dropsEmptyCues ? sidecarContent(f)?.emptyVttCues : 0;
                 if (emptyCues) {
                     response.infoLog += `☐Leaving ${emptyCues} empty cue${emptyCues === 1 ? '' : 's'} of ${logSafe(f.rel)} out of subtitle ${outIdx}`
