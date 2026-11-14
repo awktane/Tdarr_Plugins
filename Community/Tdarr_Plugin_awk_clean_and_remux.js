@@ -30,7 +30,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.81',
+    Version: '4.999.82',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -1301,24 +1301,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : [])
             .some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
-    // ===== SHARED [clean_and_remux, stream_ordering, video_clean]: dolby vision record =====
-    // -=-=-= doviRecord  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: dolby vision record =====
+    // -=-=-= doviRecord [all five] =-=-=-
     // The stream's Dolby Vision configuration record as ffprobe reports it, or undefined.
     const doviRecord = (s) => (Array.isArray(s?.side_data_list) ? s.side_data_list : [])
         .find((sd) => /dovi configuration record/i.test(String(sd?.side_data_type || '')));
-    // -=-=-= dvRecordSurvivesCopy  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // -=-=-= dvRecordSurvivesCopy [all five] =-=-=-
     // Whether a -c copy keeps the stream's Dolby Vision record (true with none), the fourcc aside: jellyfin's muxers check the base layer's pixel format and
     // colour against the compat id (its ff_isom_validate_dovi_config) and drop a record that fails under ANY fourcc, mkv to mkv included, so any remux costs
     // such a stream its Dolby Vision. Matched the copy on all 17 measured sources (P5, P7, P8.1, P8.2, P8.4, P20 from Dolby, ffmpeg, mkvmerge, MP4Box and an
-    // iPhone-style mov). Compat 0's fourcc condition is dvNeedsDvFourcc's (below). Read by clean_and_remux's convert gate, hevcCopyPlan's
-    // Matroska arm and stream_ordering's faststart hold.
+    // iPhone-style mov). Compat 0's fourcc condition is dvNeedsDvFourcc's (below). Read by clean_and_remux's convert gate, hevcCopyPlan's Matroska arm and the
+    // write-back plugins' dvCopyDropsRecord.
     const dvRecordSurvivesCopy = (s) => {
         const id = String(doviRecord(s)?.dv_bl_signal_compatibility_id ?? '');
         const p10 = s.pix_fmt === 'yuv420p10le';
         const hdr = (trc) => p10 && s.color_transfer === trc && s.color_primaries === 'bt2020' && s.color_space === 'bt2020nc' && s.color_range === 'tv';
         return id === '0' ? p10 : id === '1' || id === '6' ? hdr('smpte2084') : id === '2' ? s.pix_fmt === 'yuv420p' : id === '4' ? hdr('arib-std-b67') : true;
     };
-    // -=-=-= dvNeedsDvFourcc  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // -=-=-= dvNeedsDvFourcc [all five] =-=-=-
     // A record naming no compatible base (compatibility id 0: Profile 5). jellyfin's muxers write a compat-0 record's box only under a dvh1/dvhe fourcc or no
     // tag at all (its ff_isom_validate_dovi_config), so under hev1 or hvc1 the stream silently becomes plain HEVC whose IPT colour every player shows wrong.
     // Every other compat id is checked against the stream's colour instead, under any fourcc.

@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.84',
+    Version: '3.999.85',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1004,7 +1004,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const noMuxerSkipLine = (container) => `☒A .${container} file has no ffmpeg muxer that can write it back - left untouched; remux it to mkv or mp4 first`
         + ' (clean_and_remux does that)\n';
-    // -=-=-= movLosesDvBox (+ movDvLossLine, movDvReadBack)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // -=-=-= movLosesDvBox (+ movDvLossLine, dvLostReadBack, movDvReadBack)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // Whether a write into `container` takes this video stream's Dolby Vision box away. The mov muxer (MODE_MOV) writes no dvcC/dvvC box under any fourcc
     // (0 of 96 readable .mov outputs, jellyfin 7.1.4), so -strict unofficial does not help: an iPhone Profile 8.4 .mov remuxed into .mov reads back as
     // plain HLG HEVC. `-f mp4` is no escape, as the mp4 muxer refuses that file's mebx tracks. clean_and_remux writes only mkv or mp4, so the box survives
@@ -1016,10 +1016,59 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const movDvLossLine = (container, streams, act = 'remux') => streams.filter((s) => movLosesDvBox(container, s))
         .map((s) => `☒${streamTag(s.index)} Dolby Vision is lost in this ${act} - ffmpeg cannot write its box into a .mov; run clean_and_remux first to move`
             + ' the file to mp4 or mkv\n').join('');
-    // Stream s as the next pass reads it once a .mov write has taken the box, for an Expected results token: the DOVI record gone and mediaInfo detached
-    // (index -1, summariseStream joins by index), its transfer kept so the hdr token stands. The fourcc is left: a dvhe stream keeps dvhe through a copy and
-    // still reads dv.
-    const movDvReadBack = (container, s) => (movLosesDvBox(container, s) ? { ...s, side_data_list: [], color_transfer: videoTransferOf(s), index: -1 } : s);
+    // Stream s as the next pass reads it once a write has dropped its Dolby Vision record, for an Expected results token: the record gone and mediaInfo
+    // detached (index -1, summariseStream joins by index), its transfer kept so the hdr token stands. Where mediaInfo's HDR_Format names a static layer
+    // beside the Dolby Vision and the transfer names no HDR curve (none, or a loose bt2020-10), that layer is what the next pass reads ('Dolby Vision /
+    // SMPTE ST 2086' reads back 'SMPTE ST 2086', hdr), so smpte2084 stands in for it; an HDR10+ layer there reads back hdr10+ but is predicted hdr.
+    const dvLostReadBack = (s) => {
+        const others = String(mediaInfoFor(s)?.HDR_Format || '').split('/').filter((p) => p.trim() !== '' && !/dolby vision/i.test(p));
+        const trc = videoTransferOf(s);
+        return { ...s, side_data_list: [], color_transfer: others.length && !HDR_TRANSFERS.includes(trc) ? 'smpte2084' : trc, index: -1 };
+    };
+    // The same once a .mov write has taken the box. An untagged copy writes a dvh1 stream as hev1 and keeps dvhe, which still reads dv (both measured on
+    // jellyfin 7.1.4).
+    const movDvReadBack = (container, s) => (movLosesDvBox(container, s) ? { ...dvLostReadBack(s),
+        codec_tag_string: String(s.codec_tag_string || '').toLowerCase().trim() === 'dvh1' ? 'hev1' : s.codec_tag_string } : s);
+    // -=-=-= dvCopyFourcc (+ dvCopyFourccArgs, dvCopyFourccLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The fourcc an mp4/m4v -c copy must give a video to keep its Profile 5 record, or '' where its own serves or none can. The muxer carries the source fourcc
+    // through a copy, and under hev1/hvc1 the record is lost (dvNeedsDvFourcc), so each takes the Dolby Vision fourcc that reads its hvcC the same way: hev1
+    // (parameter sets in-band) dvhe, hvc1 dvh1. Both kept the record and decoded on jellyfin 7.1.4, a real Profile 5 copied each way. AV1 under av01 has none:
+    // dav1 keeps the record, but production ffprobe then reads the stream as codec_name=unknown (awk-ffmpeg-test's dvbox:av1-p10-fourcc row re-measures it; its
+    // dav1 cell reading av1 means AV1 has a Dolby Vision fourcc too). Nothing in .mov (movLosesDvBox).
+    const dvCopyFourcc = (container, s) => {
+        if (!['mp4', 'm4v'].includes(container) || !dvNeedsDvFourcc(s)) return '';
+        const tag = String(s.codec_tag_string || '').toLowerCase().trim();
+        return tag === 'hev1' ? 'dvhe' : tag === 'hvc1' ? 'dvh1' : '';
+    };
+    // The -tag:v args for `kept`, the streams the output writes in output order: each video is addressed by its place among the output's video streams.
+    const dvCopyFourccArgs = (container, kept) => kept.filter((s) => codecTypeOf(s) === 'video')
+        .map((v, n) => (dvCopyFourcc(container, v) ? ` -tag:v:${n} ${dvCopyFourcc(container, v)}` : '')).join('');
+    // One ☐ line per video the args retag.
+    const dvCopyFourccLog = (container, kept) => kept.filter((s) => codecTypeOf(s) === 'video' && dvCopyFourcc(container, s))
+        .map((s) => `☐${streamTag(s.index)} Tag video as ${dvCopyFourcc(container, s)} - a Profile 5 Dolby Vision record keeps its box in mp4 only under a`
+            + ' Dolby Vision fourcc\n').join('');
+    // -=-=-= dvCopyDropsRecord (+ dvCopyReadBack, dvCopyLossLine)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Whether a -c copy into `container` loses the stream's Dolby Vision record: one no copy keeps (dvRecordSurvivesCopy), or in the mp4 family a compat-0
+    // record under a fourcc that is neither Dolby Vision's nor one dvCopyFourcc gives it - AV1 under av01, or hev1/hvc1 in a .mov.
+    const dvCopyDropsRecord = (container, s) => !dvRecordSurvivesCopy(s) || (isMp4Family(container) && dvNeedsDvFourcc(s) && !dvCopyFourcc(container, s)
+        && !DV_FOURCC_RE.test(String(s.codec_tag_string || '').toLowerCase().trim()));
+    // Stream s as the next pass reads it after a -c copy into `container`, for every write-back plugin's Expected results: without a record the copy
+    // loses, and without the box a .mov write takes.
+    const dvCopyReadBack = (container, s) => movDvReadBack(container, dvCopyDropsRecord(container, s) ? dvLostReadBack(s) : s);
+    // One warning per video a -c copy into `container` takes the record from, worded as movDvLossLine, which says a .mov write's own loss. A stream under
+    // a Dolby Vision fourcc keeps it through the copy and still reads as Dolby Vision (only a colour mismatch costs such a stream its record), so its
+    // line says the record is dropped rather than the Dolby Vision lost.
+    const dvCopyLossLine = (container, streams, act = 'remux') => streams.filter((s) => codecTypeOf(s) === 'video' && !isCoverArt(s)
+        && dvCopyDropsRecord(container, s) && !movLosesDvBox(container, s))
+        .map((s) => {
+            const tag = String(s.codec_tag_string || '').toLowerCase().trim();
+            if (DV_FOURCC_RE.test(tag)) {
+                return `☒${streamTag(s.index)} The Dolby Vision record is dropped in this ${act} - it does not match the video's colour, so no ffmpeg copy`
+                    + ` keeps it; the ${tag} fourcc stays, so the file still reads as Dolby Vision\n`;
+            }
+            return `☒${streamTag(s.index)} Dolby Vision is lost in this ${act} - ${dvRecordSurvivesCopy(s) ? 'no fourcc this copy can give the video keeps'
+                + ' its record' : 'its record does not match the video\'s colour, so no ffmpeg copy keeps it'}\n`;
+        }).join('');
     // ===== END SHARED: output muxer =====
     // ===== SHARED [sub_worker, video_clean]: marker persistence =====
     // -=-=-= markerPersists  [sub_worker, video_clean] =-=-=-
@@ -1957,24 +2006,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : [])
             .some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
-    // ===== SHARED [clean_and_remux, stream_ordering, video_clean]: dolby vision record =====
-    // -=-=-= doviRecord  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: dolby vision record =====
+    // -=-=-= doviRecord [all five] =-=-=-
     // The stream's Dolby Vision configuration record as ffprobe reports it, or undefined.
     const doviRecord = (s) => (Array.isArray(s?.side_data_list) ? s.side_data_list : [])
         .find((sd) => /dovi configuration record/i.test(String(sd?.side_data_type || '')));
-    // -=-=-= dvRecordSurvivesCopy  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // -=-=-= dvRecordSurvivesCopy [all five] =-=-=-
     // Whether a -c copy keeps the stream's Dolby Vision record (true with none), the fourcc aside: jellyfin's muxers check the base layer's pixel format and
     // colour against the compat id (its ff_isom_validate_dovi_config) and drop a record that fails under ANY fourcc, mkv to mkv included, so any remux costs
     // such a stream its Dolby Vision. Matched the copy on all 17 measured sources (P5, P7, P8.1, P8.2, P8.4, P20 from Dolby, ffmpeg, mkvmerge, MP4Box and an
-    // iPhone-style mov). Compat 0's fourcc condition is dvNeedsDvFourcc's (below). Read by clean_and_remux's convert gate, hevcCopyPlan's
-    // Matroska arm and stream_ordering's faststart hold.
+    // iPhone-style mov). Compat 0's fourcc condition is dvNeedsDvFourcc's (below). Read by clean_and_remux's convert gate, hevcCopyPlan's Matroska arm and the
+    // write-back plugins' dvCopyDropsRecord.
     const dvRecordSurvivesCopy = (s) => {
         const id = String(doviRecord(s)?.dv_bl_signal_compatibility_id ?? '');
         const p10 = s.pix_fmt === 'yuv420p10le';
         const hdr = (trc) => p10 && s.color_transfer === trc && s.color_primaries === 'bt2020' && s.color_space === 'bt2020nc' && s.color_range === 'tv';
         return id === '0' ? p10 : id === '1' || id === '6' ? hdr('smpte2084') : id === '2' ? s.pix_fmt === 'yuv420p' : id === '4' ? hdr('arib-std-b67') : true;
     };
-    // -=-=-= dvNeedsDvFourcc  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // -=-=-= dvNeedsDvFourcc [all five] =-=-=-
     // A record naming no compatible base (compatibility id 0: Profile 5). jellyfin's muxers write a compat-0 record's box only under a dvh1/dvhe fourcc or no
     // tag at all (its ff_isom_validate_dovi_config), so under hev1 or hvc1 the stream silently becomes plain HEVC whose IPT colour every player shows wrong.
     // Every other compat id is checked against the stream's colour instead, under any fourcc.
@@ -2868,7 +2917,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // an in-band hvcC themselves (the P8.1 sample: 23 bytes in, 2770 out, Apple decodes), and the restore of an AV1 or H.264 original. The encode path
     // tags hevc only, choosing for the stream it encodes - do not merge the two. The key is an ffprobe codec_name, so the read goes through tableGet
     // (see its definition for why a bare TABLE[key] || fallback is unsafe here).
-    const QT_VIDEO_TAG = { hevc: ' -tag:v:0 hvc1', av1: ' -tag:v:0 av01', h264: ' -tag:v:0 avc1' };
+    const QT_VIDEO_TAG = { hevc: 'hvc1', av1: 'av01', h264: 'avc1' };
 
     // A source container that cannot hold the codec this run would write is a refusal, not an encode. Two failure shapes, both measured on jellyfin-ffmpeg
     // 7.1.4 by encoding into every container in Tdarr's default filter plus the 3gp/ogg/asf family and reading the result back (explicit hvc1/hev1/av01
@@ -3915,9 +3964,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const coverArtLog = coverArtStreams
             .map((s) => `☐${streamTag(s.index)} Remove cover-art/thumbnail (video-${codecNameOf(s) || 'unknown'})\n`)
             .join('');
-        // Apple/QuickTime fourCC for a COPIED stream (QT_VIDEO_TAG), gated on isQtVideoContainer rather than isMp4Family (see its definition).
-        const qtVideoTag = (cn) => (isQtVideoContainer(dstContainer)
-            ? tableGet(QT_VIDEO_TAG, cn, '') : '');
+        // Apple/QuickTime fourCC for a COPIED stream (QT_VIDEO_TAG) and the -tag:v:0 that writes it, gated on isQtVideoContainer rather than isMp4Family
+        // (see its definition).
+        const qtFourcc = (cn) => (isQtVideoContainer(dstContainer) ? tableGet(QT_VIDEO_TAG, cn, '') : '');
+        const qtVideoTag = (cn) => (qtFourcc(cn) ? ` -tag:v:0 ${qtFourcc(cn)}` : '');
         // The streams an exit's output maps, the primary as that exit writes it (`written`): the source stream on a copy, the encode at its own frame rate on
         // a transcode (encodeRate), the original's stream on a restore. The mp4 muxer times a tmcd by the video it receives (mp4TimedVideo) and writes one
         // per video it maps, so the drop lines, the summary and mp4TimecodeArgs are built from these. Their videos are in output order on every exit: the
@@ -3943,20 +3993,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const expectedResultsLine = (primaryToken, written = primary) => {
             const carried = carriedFor(written);
             return `☑Expected results: ${mappedFor(written).map((s) => (isPrimary(s) ? primaryToken
-                : summariseStream(movDvReadBack(dstContainer, enrichStream(carried(s)))))).join('')}\n`;
+                : summariseStream(dvCopyReadBack(dstContainer, enrichStream(carried(s)))))).join('')}\n`;
         };
         // The ending every exit's preset shares: the mp4 tag plan, timecode and name-carry args, muxer, and the log lines for these and the drops. writes holds
         // the global tags the exit sets (the transcode's globalWrites, a verdict's VQ_TAG; none on the strip); written is the primary as keptFor takes it.
         // dropsDv says the exit itself takes the primary's Dolby Vision away (a strip, an encode that carries no RPU), so no .mov box of its is lost; act is
-        // what movDvLossLine calls this write.
-        const sealPreset = (inputSide, out, writes, written = primary, { dropsDv = false, act = 'remux' } = {}) => {
+        // what movDvLossLine calls this write. Every video the exit copies takes the Profile 5 retag (dvCopyFourccArgs) and its lines: the secondaries
+        // always, the primary only where copied says the exit copies it (the caption-withdraw and keep passes) - an encode, strip or restore writes it
+        // under its own fourcc, so a stand-in keeps its output ordinal, and the restore says its copied original's own loss beside its Expected results.
+        // On an encode the copied streams' loss line names the encode's copy.
+        const sealPreset = (inputSide, out, writes, written = primary, { dropsDv = false, act = 'remux', copied = false } = {}) => {
             const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, writes);
             const kept = keptFor(written);
-            response.infoLog += mp4NameCarryLog(dstContainer, kept);
-            response.preset = `${inputSide}<io>${out}${movLangRespellArgs(dstContainer, kept)}${mp4TimecodeArgs(dstContainer, kept)}`
-                + `${mp4NameCarryArgs(dstContainer, kept)}${mp4MovflagsArg(dstContainer, tagPlan)}${globalOutputOpt}${outputMuxerArg(dstContainer)}`;
+            const copies = copied ? kept : kept.map((s) => (s === written ? { codec_type: 'video' } : s));
+            response.infoLog += mp4NameCarryLog(dstContainer, kept) + dvCopyFourccLog(dstContainer, copies);
+            response.preset = `${inputSide}<io>${out}${dvCopyFourccArgs(dstContainer, copies)}${movLangRespellArgs(dstContainer, kept)}`
+                + `${mp4TimecodeArgs(dstContainer, kept)}${mp4NameCarryArgs(dstContainer, kept)}${mp4MovflagsArg(dstContainer, tagPlan)}${globalOutputOpt}`
+                + `${outputMuxerArg(dstContainer)}`;
             response.processFile = true;
             response.infoLog += dropLog(written) + mp4TimecodeLog(dstContainer, kept) + mp4TagPlanLog(tagPlan, dstContainer)
+                + dvCopyLossLine(dstContainer, copies, act === 'encode' ? 'encode\'s copy' : act)
                 + movDvLossLine(dstContainer, kept.filter((s) => !dropsDv || s !== written), act);
         };
         // A predicted output stream that has lost its dynamic HDR layer must not still read 'dv' or 'hdr10+', so both predictions (the lossless strip and the
@@ -4999,8 +5055,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += `☒${pTag} awk_cc asks to drop the closed captions sub_worker exported, but the caption read behind it may belong to another`
                 + ` video (${why}) - withdrawing the request so the captions are read again before any encode\n`;
             const v = escMeta(`${CC_FP_PREFIX}${ccFpOf(ccTokens)}`);
-            sealPreset('', `-map 0 -c copy${outputDrops}${strictArg} -metadata "${CC_TAG}=${v}"`, { [CC_TAG]: v });
-            response.infoLog += expectedResultsLine(summariseStream(movDvReadBack(dstContainer, enrichStream(primary))));
+            sealPreset('', `-map 0 -c copy${outputDrops}${strictArg} -metadata "${CC_TAG}=${v}"`, { [CC_TAG]: v }, primary, { copied: true });
+            response.infoLog += expectedResultsLine(summariseStream(dvCopyReadBack(dstContainer, enrichStream(primary))));
             return response;
         };
         // ====== END TRANSCODE EMIT ======
@@ -5015,7 +5071,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // method_bitdepth=source, q from the OUTPUT height, dv from preserveDv. Do NOT "correct" one to key on its setting: keying dv on guardDvLive would
         // stamp it on EVERY file run with guard_dv enabled (the default), invalidating every awk_video tag in the field (a full re-encode for every user) to
         // prevent a divergence that cannot occur - a preserved encode carries the RPU through, so pass 2 re-reads dvSignal and recomputes the same token
-        // (measured 2026-08-26, jellyfin 7.1.4, a real profile-8.1 RPU: dvhe/p8/L6 in, dvh1/p8/L6 out, record intact; awk-ffmpeg-test's build-facts.md). Pinned
+        // (measured on jellyfin 7.1.4 with a real profile-8.1 RPU: dvhe/p8 in, hvc1/p8 out, record intact - re-measured 2026-11-14; build-facts.md). Pinned
         // by scenario assertion video-clean-a-preserved-dv-output-still-matches-its-own-fence: a detection drift fails there instead of silently re-encoding a
         // library every pass. A .mov output re-reads with no Dolby Vision, as ffmpeg cannot write the box there; tokenIsNoop passes dv on such a file.
         const videoSigCore = escMeta([action, targetCodecName, `q${Math.round(qNorm)}`, `h${maxH || 0}`, want10Bit ? '10' : '8', `s${speed}`,
@@ -5196,8 +5252,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const value = stamp('keep', pct, fingerprintOf(primary, file.file));
                 response.infoLog += reason
                     + line('☐', `Recording the verdict in ${VQ_TAG} with a tag-only remux, so later passes read it instead of measuring`);
-                sealPreset('', `-map 0 -c copy${outputDrops}${strictArg} -metadata "${VQ_TAG}=${value}"`, { [VQ_TAG]: value });
-                response.infoLog += expectedResultsLine(summariseStream(movDvReadBack(dstContainer, enrichStream(primary))));
+                sealPreset('', `-map 0 -c copy${outputDrops}${strictArg} -metadata "${VQ_TAG}=${value}"`, { [VQ_TAG]: value }, primary, { copied: true });
+                response.infoLog += expectedResultsLine(summariseStream(dvCopyReadBack(dstContainer, enrichStream(primary))));
                 return response;
             };
 
@@ -5329,10 +5385,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // The restored stream's fourcc: for HEVC the plan clean_and_remux applies to the same stream (hevcCopyPlan), so the restore never re-triggers that
             // remux, and a dvh1 original whose Dolby Vision record a copy keeps restores into Matroska; qtVideoTag for the rest. Its -bsf:v:0 and -tag:v:0
             // land on the restored stream, which maps first.
-            const restoreTag = origCodec === 'hevc'
+            const plan = origCodec === 'hevc'
                 ? hevcCopyPlan(origPrimary, origFormat === MP4_DEMUXER ? origPrimary.codec_tag_string : '', 0, ffmpegPathOf(otherArguments), origPath,
-                    dstContainer).args
-                : qtVideoTag(origCodec);
+                    dstContainer)
+                : null;
+            const restoreTag = plan ? plan.args : qtVideoTag(origCodec);
             const value = stamp('reject', pct, fingerprintOf(origPrimary, origPath));
             const verdict = shown < 0 ? `The re-encode grew the video by ${-shown}%` : `The re-encode saved only ${shown}%`;
             response.infoLog += line('☐', `${verdict} (${rates}) - restoring the original video stream and keeping every other stream; this file is not`
@@ -5340,11 +5397,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const restored = { ...origPrimary, index: primary.index };   // in the primary's place, as keptFor expects
             sealPreset('', `-i "${origPath}" -map 1:${origPrimary.index} -map 0 -map -0:${primary.index}${outputDrops} -map_chapters 0 -c copy`
                 + `${restoreTag}${restoreStrict} -metadata "${VQ_TAG}=${value}"`, { [VQ_TAG]: value }, restored);
+            // sealPreset's .mov loss line reads the restored stream through THIS file's mediaInfo (see restoreStrict above), so a Dolby Vision signal only
+            // the original's own track carries is warned of here, by a stand-in that carries it as a fourcc.
+            if (isDolbyVisionVideo(origPrimary, origMi) && !movLosesDvBox(dstContainer, restored))
+                response.infoLog += movDvLossLine(dstContainer, [{ ...restored, codec_tag_string: 'dvhe' }]);
             // The restored stream maps first, and its token is summarised detached (index -1): summariseStream joins mediaInfo by index, and THIS file's
-            // track at the original's index can be another stream entirely (the audio, on a cover-art-first original).
+            // track at the original's index can be another stream entirely (the audio, on a cover-art-first original). It reads back under the fourcc the
+            // restore writes - the plan's (a stuck stream's keep, else its want), or the QuickTime table's - else its own.
             const carried = carriedFor(restored);
-            response.infoLog += `☑Expected results: ${summariseStream(movDvReadBack(dstContainer, { ...origPrimary, index: -1 }))}${mappedFor(restored)
-                .filter((s) => !isPrimary(s)).map((s) => summariseStream(movDvReadBack(dstContainer, enrichStream(carried(s))))).join('')}\n`;
+            const writtenTag = plan ? plan.args && (plan.keep || plan.want) : qtFourcc(origCodec);
+            const restoredRead = { ...origPrimary, codec_tag_string: writtenTag || origPrimary.codec_tag_string, index: -1 };
+            response.infoLog += dvCopyLossLine(dstContainer, [{ ...restoredRead, index: primary.index }]);
+            response.infoLog += `☑Expected results: ${summariseStream(dvCopyReadBack(dstContainer, restoredRead))}${mappedFor(restored)
+                .filter((s) => !isPrimary(s)).map((s) => summariseStream(dvCopyReadBack(dstContainer, enrichStream(carried(s))))).join('')}\n`;
             return response;
         }
         // A verdict this file already carries at this setting, said only where the fence below then skips the file - never ahead of a stale line. The

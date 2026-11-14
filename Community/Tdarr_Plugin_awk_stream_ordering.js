@@ -26,7 +26,7 @@ const details = () => ({
         review rather than failed. The same goes for a broadcast .ts or .mpg capture remuxed to mkv or mp4 in the same job with its video copied, not
         re-encoded: a capture whose timestamps jump or reset states a longer length than it holds. A later job on that file is checked in full again. This
         check is always on and has no setting.\n`,
-    Version: '4.999.59',
+    Version: '4.999.60',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -196,9 +196,9 @@ const details = () => ({
                 \\nforce (default): front-load the moov atom. It rides any remux this plugin makes, and otherwise forces ONE lossless -c copy remux the
                 first time a file arrives back-loaded (detected without decoding) - in a full awk stack, only a file no plugin before it remuxed. An
                 already-fronted file is left untouched, so this settles after one pass and never loops. A file whose Dolby Vision record no ffmpeg copy
-                keeps (one whose colour does not match its compatibility id) or whose cover art a remux would drop (any .mov - its muxer stores none) stays
-                back-loaded rather than be remuxed for this alone, and so does one with a Profile 5 (compatibility id 0) record under the hev1 or hvc1 tag,
-                which a copy keeps only under a Dolby Vision tag - clean_and_remux gives it one on a remux that also front-loads it.
+                keeps (one whose colour does not match its compatibility id, or an AV1 Profile 10.0 record), a .mov holding a Profile 5 Dolby Vision
+                record (a .mov cannot store its box - clean_and_remux moves the file to mp4 or mkv), or a file whose cover art a remux would drop (any
+                .mov - its muxer stores none) stays back-loaded rather than be remuxed for this alone.
                 \\nstrip: never front-load. A remux this plugin makes for another reason - reordering, the default flag or remove_junk_tags - writes the
                 moov atom at the END, the mov muxer's default, so a front-loaded file it remuxes comes out back-loaded; it never remuxes for this alone.
                 Only pick this if you never stream this library remotely.`,
@@ -1108,7 +1108,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const noMuxerSkipLine = (container) => `☒A .${container} file has no ffmpeg muxer that can write it back - left untouched; remux it to mkv or mp4 first`
         + ' (clean_and_remux does that)\n';
-    // -=-=-= movLosesDvBox (+ movDvLossLine, movDvReadBack)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // -=-=-= movLosesDvBox (+ movDvLossLine, dvLostReadBack, movDvReadBack)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // Whether a write into `container` takes this video stream's Dolby Vision box away. The mov muxer (MODE_MOV) writes no dvcC/dvvC box under any fourcc
     // (0 of 96 readable .mov outputs, jellyfin 7.1.4), so -strict unofficial does not help: an iPhone Profile 8.4 .mov remuxed into .mov reads back as
     // plain HLG HEVC. `-f mp4` is no escape, as the mp4 muxer refuses that file's mebx tracks. clean_and_remux writes only mkv or mp4, so the box survives
@@ -1120,10 +1120,59 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const movDvLossLine = (container, streams, act = 'remux') => streams.filter((s) => movLosesDvBox(container, s))
         .map((s) => `☒${streamTag(s.index)} Dolby Vision is lost in this ${act} - ffmpeg cannot write its box into a .mov; run clean_and_remux first to move`
             + ' the file to mp4 or mkv\n').join('');
-    // Stream s as the next pass reads it once a .mov write has taken the box, for an Expected results token: the DOVI record gone and mediaInfo detached
-    // (index -1, summariseStream joins by index), its transfer kept so the hdr token stands. The fourcc is left: a dvhe stream keeps dvhe through a copy and
-    // still reads dv.
-    const movDvReadBack = (container, s) => (movLosesDvBox(container, s) ? { ...s, side_data_list: [], color_transfer: videoTransferOf(s), index: -1 } : s);
+    // Stream s as the next pass reads it once a write has dropped its Dolby Vision record, for an Expected results token: the record gone and mediaInfo
+    // detached (index -1, summariseStream joins by index), its transfer kept so the hdr token stands. Where mediaInfo's HDR_Format names a static layer
+    // beside the Dolby Vision and the transfer names no HDR curve (none, or a loose bt2020-10), that layer is what the next pass reads ('Dolby Vision /
+    // SMPTE ST 2086' reads back 'SMPTE ST 2086', hdr), so smpte2084 stands in for it; an HDR10+ layer there reads back hdr10+ but is predicted hdr.
+    const dvLostReadBack = (s) => {
+        const others = String(mediaInfoFor(s)?.HDR_Format || '').split('/').filter((p) => p.trim() !== '' && !/dolby vision/i.test(p));
+        const trc = videoTransferOf(s);
+        return { ...s, side_data_list: [], color_transfer: others.length && !HDR_TRANSFERS.includes(trc) ? 'smpte2084' : trc, index: -1 };
+    };
+    // The same once a .mov write has taken the box. An untagged copy writes a dvh1 stream as hev1 and keeps dvhe, which still reads dv (both measured on
+    // jellyfin 7.1.4).
+    const movDvReadBack = (container, s) => (movLosesDvBox(container, s) ? { ...dvLostReadBack(s),
+        codec_tag_string: String(s.codec_tag_string || '').toLowerCase().trim() === 'dvh1' ? 'hev1' : s.codec_tag_string } : s);
+    // -=-=-= dvCopyFourcc (+ dvCopyFourccArgs, dvCopyFourccLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The fourcc an mp4/m4v -c copy must give a video to keep its Profile 5 record, or '' where its own serves or none can. The muxer carries the source fourcc
+    // through a copy, and under hev1/hvc1 the record is lost (dvNeedsDvFourcc), so each takes the Dolby Vision fourcc that reads its hvcC the same way: hev1
+    // (parameter sets in-band) dvhe, hvc1 dvh1. Both kept the record and decoded on jellyfin 7.1.4, a real Profile 5 copied each way. AV1 under av01 has none:
+    // dav1 keeps the record, but production ffprobe then reads the stream as codec_name=unknown (awk-ffmpeg-test's dvbox:av1-p10-fourcc row re-measures it; its
+    // dav1 cell reading av1 means AV1 has a Dolby Vision fourcc too). Nothing in .mov (movLosesDvBox).
+    const dvCopyFourcc = (container, s) => {
+        if (!['mp4', 'm4v'].includes(container) || !dvNeedsDvFourcc(s)) return '';
+        const tag = String(s.codec_tag_string || '').toLowerCase().trim();
+        return tag === 'hev1' ? 'dvhe' : tag === 'hvc1' ? 'dvh1' : '';
+    };
+    // The -tag:v args for `kept`, the streams the output writes in output order: each video is addressed by its place among the output's video streams.
+    const dvCopyFourccArgs = (container, kept) => kept.filter((s) => codecTypeOf(s) === 'video')
+        .map((v, n) => (dvCopyFourcc(container, v) ? ` -tag:v:${n} ${dvCopyFourcc(container, v)}` : '')).join('');
+    // One ☐ line per video the args retag.
+    const dvCopyFourccLog = (container, kept) => kept.filter((s) => codecTypeOf(s) === 'video' && dvCopyFourcc(container, s))
+        .map((s) => `☐${streamTag(s.index)} Tag video as ${dvCopyFourcc(container, s)} - a Profile 5 Dolby Vision record keeps its box in mp4 only under a`
+            + ' Dolby Vision fourcc\n').join('');
+    // -=-=-= dvCopyDropsRecord (+ dvCopyReadBack, dvCopyLossLine)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Whether a -c copy into `container` loses the stream's Dolby Vision record: one no copy keeps (dvRecordSurvivesCopy), or in the mp4 family a compat-0
+    // record under a fourcc that is neither Dolby Vision's nor one dvCopyFourcc gives it - AV1 under av01, or hev1/hvc1 in a .mov.
+    const dvCopyDropsRecord = (container, s) => !dvRecordSurvivesCopy(s) || (isMp4Family(container) && dvNeedsDvFourcc(s) && !dvCopyFourcc(container, s)
+        && !DV_FOURCC_RE.test(String(s.codec_tag_string || '').toLowerCase().trim()));
+    // Stream s as the next pass reads it after a -c copy into `container`, for every write-back plugin's Expected results: without a record the copy
+    // loses, and without the box a .mov write takes.
+    const dvCopyReadBack = (container, s) => movDvReadBack(container, dvCopyDropsRecord(container, s) ? dvLostReadBack(s) : s);
+    // One warning per video a -c copy into `container` takes the record from, worded as movDvLossLine, which says a .mov write's own loss. A stream under
+    // a Dolby Vision fourcc keeps it through the copy and still reads as Dolby Vision (only a colour mismatch costs such a stream its record), so its
+    // line says the record is dropped rather than the Dolby Vision lost.
+    const dvCopyLossLine = (container, streams, act = 'remux') => streams.filter((s) => codecTypeOf(s) === 'video' && !isCoverArt(s)
+        && dvCopyDropsRecord(container, s) && !movLosesDvBox(container, s))
+        .map((s) => {
+            const tag = String(s.codec_tag_string || '').toLowerCase().trim();
+            if (DV_FOURCC_RE.test(tag)) {
+                return `☒${streamTag(s.index)} The Dolby Vision record is dropped in this ${act} - it does not match the video's colour, so no ffmpeg copy`
+                    + ` keeps it; the ${tag} fourcc stays, so the file still reads as Dolby Vision\n`;
+            }
+            return `☒${streamTag(s.index)} Dolby Vision is lost in this ${act} - ${dvRecordSurvivesCopy(s) ? 'no fourcc this copy can give the video keeps'
+                + ' its record' : 'its record does not match the video\'s colour, so no ffmpeg copy keeps it'}\n`;
+        }).join('');
     // ===== END SHARED: output muxer =====
     // ===== SHARED [audio_clean, stream_ordering]: mka cover-art refusal =====
     // -=-=-= mkaCarriesCoverArt + mkaCoverArtSkipLine  [audio_clean, stream_ordering] =-=-=-
@@ -2222,24 +2271,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         || (Array.isArray(ffstream?.side_data_list) ? ffstream.side_data_list : [])
             .some((sd) => /dovi configuration record|dolby vision/i.test(String(sd?.side_data_type || '')));
     // ===== END SHARED: dolby vision detection =====
-    // ===== SHARED [clean_and_remux, stream_ordering, video_clean]: dolby vision record =====
-    // -=-=-= doviRecord  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: dolby vision record =====
+    // -=-=-= doviRecord [all five] =-=-=-
     // The stream's Dolby Vision configuration record as ffprobe reports it, or undefined.
     const doviRecord = (s) => (Array.isArray(s?.side_data_list) ? s.side_data_list : [])
         .find((sd) => /dovi configuration record/i.test(String(sd?.side_data_type || '')));
-    // -=-=-= dvRecordSurvivesCopy  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // -=-=-= dvRecordSurvivesCopy [all five] =-=-=-
     // Whether a -c copy keeps the stream's Dolby Vision record (true with none), the fourcc aside: jellyfin's muxers check the base layer's pixel format and
     // colour against the compat id (its ff_isom_validate_dovi_config) and drop a record that fails under ANY fourcc, mkv to mkv included, so any remux costs
     // such a stream its Dolby Vision. Matched the copy on all 17 measured sources (P5, P7, P8.1, P8.2, P8.4, P20 from Dolby, ffmpeg, mkvmerge, MP4Box and an
-    // iPhone-style mov). Compat 0's fourcc condition is dvNeedsDvFourcc's (below). Read by clean_and_remux's convert gate, hevcCopyPlan's
-    // Matroska arm and stream_ordering's faststart hold.
+    // iPhone-style mov). Compat 0's fourcc condition is dvNeedsDvFourcc's (below). Read by clean_and_remux's convert gate, hevcCopyPlan's Matroska arm and the
+    // write-back plugins' dvCopyDropsRecord.
     const dvRecordSurvivesCopy = (s) => {
         const id = String(doviRecord(s)?.dv_bl_signal_compatibility_id ?? '');
         const p10 = s.pix_fmt === 'yuv420p10le';
         const hdr = (trc) => p10 && s.color_transfer === trc && s.color_primaries === 'bt2020' && s.color_space === 'bt2020nc' && s.color_range === 'tv';
         return id === '0' ? p10 : id === '1' || id === '6' ? hdr('smpte2084') : id === '2' ? s.pix_fmt === 'yuv420p' : id === '4' ? hdr('arib-std-b67') : true;
     };
-    // -=-=-= dvNeedsDvFourcc  [clean_and_remux, stream_ordering, video_clean] =-=-=-
+    // -=-=-= dvNeedsDvFourcc [all five] =-=-=-
     // A record naming no compatible base (compatibility id 0: Profile 5). jellyfin's muxers write a compat-0 record's box only under a dvh1/dvhe fourcc or no
     // tag at all (its ff_isom_validate_dovi_config), so under hev1 or hvc1 the stream silently becomes plain HEVC whose IPT colour every player shows wrong.
     // Every other compat id is checked against the stream's colour instead, under any fourcc.
@@ -2881,6 +2930,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 + `${keptMusicTags.length > 5 ? ` and ${keptMusicTags.length - 5} more` : ''}), which a music library is organised by\n`;
         // ====== END JUNK TAG STRIP: GLOBAL ======
 
+        // Why the faststart hold keeps video s back-loaded, for the hold and its line, or '' when it does not: a record the copy loses (dvCopyDropsRecord),
+        // or a compat-0 record in a .mov, whose box any .mov write loses (movLosesDvBox) with no compatible base to fall back on, and which
+        // clean_and_remux's move to mp4 or mkv keeps. A based Dolby Vision .mov (an iPhone Profile 8.4 HLG recording) is not held: its front-load costs the
+        // box, says so (movDvLossLine), and leaves its HDR10/HLG base playing correctly.
+        const dvHeldWhy = (s) => (dstContainer === 'mov' && dvNeedsDvFourcc(s) && !dvCopyDropsRecord('mp4', s)
+            ? 'which a .mov cannot store - clean_and_remux moves the file to mp4 or mkv'
+            : dvCopyDropsRecord(dstContainer, s) ? 'which no ffmpeg remux keeps' : '');
+
         // ====== MOOV / FASTSTART PROBE ======
 
         // True if the mp4 already has moov before mdat (front-loaded), so method_mp4_faststart needn't remux it. Reads only top-level box headers (a few
@@ -2917,14 +2974,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
         // method_mp4_faststart=force front-loads the mp4 moov atom. +faststart rides every remux this plugin emits (mp4MovflagsArg), but a file already in
         // order is skipped, so a back-loaded one (moovBeforeMdat, fail-safe, defined just above) forces a one-time remux of its own - it settles after one
-        // pass and never loops. Not on a video whose Dolby Vision record no -c copy keeps (dvRecordSurvivesCopy): clean_and_remux holds such a file back from
-        // a remux for the same reason, so it arrives here back-loaded, and a remux made only to move the moov would cost it the record. Nor on a Profile 5
-        // record under a fourcc that is not Dolby Vision's (dvNeedsDvFourcc), which a copy keeps only under one: mainline ffmpeg's -c copy -strict unofficial
-        // writes such a file back-loaded under hev1 (measured on 9.0.2), and clean_and_remux retags it. A remux made for anything else still front-loads it.
+        // pass and never loops. Not on a video dvHeldWhy holds (a record the copy loses, or a compat-0 record in a .mov): clean_and_remux holds a record no
+        // copy keeps back from a remux for the same reason, so such a file arrives here back-loaded, and a remux made only to move the moov would cost it
+        // the record. A remux made for anything else still front-loads it.
         const faststartOn = methodMp4Faststart === 'force';
         const backLoaded = faststartOn && isMp4Family(dstContainer) && !moovBeforeMdat(file.file, otherArguments);
-        const wantsDvFourcc = (s) => dvNeedsDvFourcc(s) && !DV_FOURCC_RE.test(String(s.codec_tag_string || '').toLowerCase().trim());
-        const frontHeldBy = backLoaded ? file.ffProbeData.streams.filter((s) => !dvRecordSurvivesCopy(s) || wantsDvFourcc(s)) : [];
+        const frontHeldBy = backLoaded ? file.ffProbeData.streams.filter((s) => dvHeldWhy(s) !== '') : [];
         const needsFront = backLoaded && !frontHeldBy.length;
         // ====== END MOOV / FASTSTART PROBE ======
 
@@ -2941,8 +2996,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // The lines a Dolby Vision hold (frontHeldBy) leads either skip below with, so a file force leaves back-loaded says why.
         const heldLines = frontHeldBy.map((s) => `☑${streamTag(s.index)}[method_mp4_faststart=${methodMp4Faststart}] Left as it is - a remux to front-load the`
-            + ` moov atom would drop this video's Dolby Vision record, ${wantsDvFourcc(s) ? 'which a copy keeps only under a Dolby Vision fourcc'
-                : 'which no ffmpeg remux keeps'}\n`).join('');
+            + ` moov atom would drop this video's Dolby Vision record, ${dvHeldWhy(s)}\n`).join('');
         if (!orderChanged && dispositionArgs === '' && !needsFront && junkArgs === '') return skip(`${heldLines}☑Streams already in desired order\n`);
         // An mp4-family -c copy keeps a sibling's custom GLOBAL marker (clean_and_remux's awk_recovered, set upstream) only under use_metadata_tags, so
         // mp4TagPlan sets it exactly when one is there - dropping it would re-trigger that plugin's work.
@@ -3009,12 +3063,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // without it. It reads the RAW ffprobe streams, never sortRows (see its header); this plugin only reorders, and the streams it leaves out
         // (mp4UncopyableStreams) are data tracks that can trigger neither -strict reason, so the copied-subset argument stays at its default.
         const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams);
-        // The mapped streams in OUTPUT order, which the per-video clears of mp4TimecodeArgs and the per-type ordinals of mp4NameCarryArgs key on: a cover sorts
-        // after every real video, and into the mp4 family after every track (isCovrRow).
+        // The mapped streams in OUTPUT order, which the per-video clears of mp4TimecodeArgs and the per-type ordinals of mp4NameCarryArgs and dvCopyFourccArgs
+        // key on: a cover sorts after every real video, and into the mp4 family after every track (isCovrRow).
         const outStreams = [...mappedRows, ...asTrackRows].map((r) => r.stream);
-        response.infoLog += mp4NameCarryLog(dstContainer, outStreams);
+        response.infoLog += mp4NameCarryLog(dstContainer, outStreams) + dvCopyFourccLog(dstContainer, outStreams);
         response.preset = `<io>${ffmpegMap} -c copy${dispositionArgs}${autoDefaultPin}${junkArgs}${movLangRespellArgs(dstContainer, outStreams)}${strictArg}`
-            + `${mp4TimecodeArgs(dstContainer, outStreams)}`
+            + `${mp4TimecodeArgs(dstContainer, outStreams)}${dvCopyFourccArgs(dstContainer, outStreams)}`
             + `${mp4NameCarryArgs(dstContainer, outStreams)}${matroskaCoverArgs(staged.kept)}${globalOutputOpt}`
             + `${mp4MovflagsArg(dstContainer, tagPlan, faststartOn)}${outputMuxerArg(dstContainer)}`;
         const mapped = file.ffProbeData.streams.filter((s) => !uncopyable.includes(s) && !staged.leaveOut.includes(s));
@@ -3024,7 +3078,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             + mp4TagPlanLog(tagPlan, dstContainer, mapped)
             + unidentified.map((r) => `☐${streamTag(r.index)} Leaving out a stream ffmpeg cannot identify - it cannot be copied`
                 + ` (${r.type || 'unknown'}-${codecNameOf(r.stream) || 'none'})\n`).join('') + mp4TimecodeLog(dstContainer, outStreams)
-            + movDvLossLine(dstContainer, mapped);
+            + dvCopyLossLine(dstContainer, mapped) + movDvLossLine(dstContainer, mapped);
         const goneData = mp4LostData(uncopyable, mapped);
         const coversLost = mp4CoversLost(tagPlan, dstContainer, mapped);
         // A kept covr cover the source reports ahead of a track - a udta written before the tracks - is read back after every one once remuxed.
@@ -3044,7 +3098,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const outRows = readBackDispositions(dstContainer, withTracks, carriesDisposition(response.preset), (r) => r.stream, (r, s) => ({ ...r, stream: s }));
         const carried = mp4NameCarryView(dstContainer, outStreams);   // a name the carry moves into the handler alone reads back as that handler
         const outList = outRows.map((r) => carried(r.stream)).concat(staged.kept.map(keptCoverStream));
-        response.infoLog += `☑Expected results: ${outList.map((st) => summariseStream(movDvReadBack(dstContainer, st))).join('')}\n`;
+        response.infoLog += `☑Expected results: ${outList.map((st) => summariseStream(dvCopyReadBack(dstContainer, st))).join('')}\n`;
 
         return response;
         // ====== END PRESET ASSEMBLY ======
