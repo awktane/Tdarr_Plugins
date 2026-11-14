@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.85',
+    Version: '4.999.86',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -312,8 +312,14 @@ const details = () => ({
                 encode is already being spent, so the setting is honoured even where codec_force alone would have declined it as not worth a re-encode.
                 \\nIt applies whether or not the track is being downmixed, forced or converted for some other reason this run: an otherwise untouched track
                 is measured and corrected on its own, while one already being modified rides on that same re-encode instead of a separate one.
-                \\nOn a Matroska container (mkv, webm, mka) a track untouched by anything else this run is stamped with an awk_loudnorm tag once measured,
-                and a later run trusts that tag and skips re-measuring while this setting stays the same; changing the setting forces a fresh measurement.
+                \\nWhen loudnorm has to compress a track to reach the target (its range is wider than the preset's, or the gain would push its peaks past
+                the true-peak limit), the correction is measured once more before it is applied - a second full pass, two to two and a half times as long
+                as the first. A correction that would widen the loudness range is not applied. One that lands off target is followed by a level trim onto
+                it - measured once more when the trim needs a limiter - and is not applied if it still misses the target by more than 1 LU. A correction
+                not applied leaves the track at its loudness, to be measured again on later runs.
+                \\nOn a Matroska container (mkv, webm, mka) a track untouched by anything else this run is stamped with an awk_loudnorm tag once it is
+                corrected or found already on target (a correction left out is not stamped), and a later run trusts that tag and skips re-measuring while
+                this setting stays the same; changing the setting forces a fresh measurement.
                 The stamp records the track's codec and channel count (and, for a track left as it was, a fingerprint of its opening audio), so a track
                 another tool has since converted, downmixed or changed is measured again; another tool's same-codec, same-channel re-encode of a track
                 this plugin re-encoded is not noticed. The mp4-family muxers (mp4, m4v, m4a, mov) drop custom tags, so there loudnorm re-measures on every
@@ -2894,28 +2900,56 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Per-codec channel-count ceiling of ffmpeg's native encoders (ac3/eac3 cap at 6ch, aac/opus at 8ch). One source for the codec_force targetMaxCh limit, the
     // targetTable bitrate-ladder cap, and loudnorm's channel ceiling below, so those can't drift; aac_vbr folds to aac (anything that isn't ac3/eac3 is 8).
     const codecMaxCh = (codec) => (codec === 'ac3' || codec === 'eac3') ? 6 : 8;
-    // The channels ac3/eac3 WRITE for a source layout of up to 6 channels (codecMaxCh keeps anything wider away from them unfolded). Both re-matrix a layout
-    // they cannot hold to the nearest one they can and exit 0: 6.0, 6.0(front) and hexagonal come out 5.0(side), 3.1.2 comes out 3.1, downmix (DL+DR) mono;
-    // every other layout keeps its count; aac and libopus write the source's count or refuse (measured on jellyfin-ffmpeg 7.1.4, 2026-11-06). Read from
+    // The layout ac3/eac3 WRITE for a source layout of up to 6 channels (codecMaxCh keeps anything wider away from them unfolded). Both re-matrix a layout
+    // they cannot hold to the nearest one they can and exit 0: 6.0, 6.0(front) and hexagonal come out 5.0(side), 3.1.2 comes out 3.1; every other standard
+    // layout keeps its count, and a custom channel order is not sent to them at its count (layoutRefusal); aac and libopus write the source's count or
+    // refuse (measured on jellyfin-ffmpeg 7.1.4, 2026-11-06). A downmix (DL+DR) comes out mono, so it never reaches them unrenamed (pceRelabel). Read from
     // ffprobe's channel_layout RAW, as opusLayoutFor does. A Map, never an object: the key is the file's own string.
-    const AC3_REMATRIXED = new Map([['6.0', 5], ['6.0(front)', 5], ['hexagonal', 5], ['3.1.2', 4], ['downmix', 1]]);
+    const AC3_REMATRIXED = new Map([['6.0', { layout: '5.0(side)', channels: 5 }], ['6.0(front)', { layout: '5.0(side)', channels: 5 }],
+        ['hexagonal', { layout: '5.0(side)', channels: 5 }], ['3.1.2', { layout: '3.1', channels: 4 }]]);
     const layoutKeyOf = (stream) => String(stream?.channel_layout || '').toLowerCase().trim();
-    const encodedChannels = (codec, stream, channels) => ((codec === 'ac3' || codec === 'eac3')
-        ? (AC3_REMATRIXED.get(layoutKeyOf(stream)) ?? channels) : channels);
+    const ac3Rematrix = (codec, stream) => ((codec === 'ac3' || codec === 'eac3') ? AC3_REMATRIXED.get(layoutKeyOf(stream)) : undefined);
+    const encodedChannels = (codec, stream, channels) => ac3Rematrix(codec, stream)?.channels ?? channels;
+    // The re-matrix as an explicit filter, so a loudness analysis and its correction measure the mix the encoder writes rather than the source's. Measured
+    // on jellyfin-ffmpeg 7.1.4 with uncorrelated noise on each speaker, under tv into ac3 and eac3: corrected on its own channels a 3.1.2 landed 1.26 LU
+    // under target and a 6.0 or hexagonal 0.85 LU over; behind this filter all three landed within 0.14 LU, the 3.1.2 with its LFE band-limited as real LFE
+    // content is. A full-band LFE still lands about 1 LU under: loudnorm counts a 4-channel input's index-3 LFE as a surround, and ac3/eac3 band-limit it
+    // after the measurement. Byte-identical to the encoder's own re-matrix (6.0, 6.0(front), hexagonal and 3.1.2 into ac3 and eac3). '' for every other
+    // encode.
+    const ac3RematrixFilter = (codec, stream) => (ac3Rematrix(codec, stream) ? `aformat=channel_layouts=${ac3Rematrix(codec, stream).layout}` : '');
     // The log note for an encode that writes fewer channels than its source has ('' otherwise); the layout is always one of AC3_REMATRIXED's keys when it
     // prints. Bare text: each caller puts it in its own parenthetical.
     const ac3FoldNote = (codec, stream, written, channels) => (written < channels
-        ? `${codec} holds a ${layoutKeyOf(stream)} layout as ${written} channel${written === 1 ? '' : 's'}` : '');
+        ? `${codec} holds a ${layoutKeyOf(stream)} layout as ${written} channels` : '');
     // The codecs this plugin can actually EMIT, derived from the bitrate ladder rather than restated, so adding an output codec cannot leave the two
     // disagreeing. Read by loudnorm to decide whether a source codec can simply stay put or has to converge on codec_surround/codec_stereo.
     const ENCODABLE_CODECS = Object.keys(CODEC_TARGET_BPS);
     // Fold the aac_vbr pseudo-codec onto the real aac family for scoring/limit/target lookups (aac_vbr is an encoder choice, not a distinct codec). One local
     // source for every non-shared fold site below; the two inside the shared audio-scoring section keep the idiom inline (byte-identical, so no drift).
     const aacFamily = (codec) => codec === 'aac_vbr' ? 'aac' : codec;
+    // The standard layouts of up to 8 channels native aac refuses (exit 234, 'Unsupported channel layout'), measured on every one on jellyfin-ffmpeg 7.1.4:
+    // the height layouts, whose top speakers have no lossless rename, and downmix, which pceRelabel renames to stereo first. Wider layouts never reach aac
+    // (codecMaxCh), nor does aac_vbr's stereo-only encode meet these.
+    const AAC_REFUSED_LAYOUTS = new Set(['3.1.2', '5.1.2', 'cube']);
     // Codec family of a STREAM for identity checks ("is this track already the target codec?"): the shared alias fold (foldCodecAlias) and nothing else, so
     // aac_latm (AAC in MPEG-TS/LATM, routine in DVR/.ts captures) matches an 'aac' target instead of taking a pointless lossy aac->aac re-encode. Deliberately
     // NOT resolveCodecName: its refinement resolves eac3 to eac3atmos and dts to dtsma/dtshr, names no codec_* target ever uses, causing re-encodes of its own.
     const codecFamilyOf = (stream) => foldCodecAlias(codecNameOf(stream));
+    // A channel order outside every standard layout, which ffprobe spells by its speakers ('4 channels (FL+FR+TFL+TFR)'), on a non-aac track: a FLAC or
+    // WAV custom channel mask, a .mov chan atom. An aac one is an unlabelled PCE, which pceRelabel names or pceUnnamed leaves as it is.
+    const customOrder = (stream) => codecFamilyOf(stream) !== 'aac' && /^\d+ channels \(/.test(String(stream?.channel_layout || ''));
+    // Why `codec` cannot take this track at its own channel count, as the clause a skip line ends on ('' when it can); the track is then left as it is
+    // rather than encoded. Native aac refuses AAC_REFUSED_LAYOUTS and every custom order (exit 234 on every requeue). ac3/eac3 take a custom order but
+    // re-matrix it to a layout nobody measured - on jellyfin-ffmpeg 7.1.4 '4 channels (FL+FR+TFL+TFR)' came out stereo at -18.20 LUFS and '6 channels
+    // (FL+FR+FC+LFE+FLC+FRC)' as 3.1 - so the written count, the loudness and the stamp would all be guesses. A fold to stereo or 5.1 is not affected:
+    // swresample folds a custom order by its speakers.
+    const layoutRefusal = (codec, stream) => {
+        const family = aacFamily(codec);
+        const shown = logSafe(String(stream?.channel_layout || '').trim(), 60);
+        if (family === 'aac' && (AAC_REFUSED_LAYOUTS.has(layoutKeyOf(stream)) || customOrder(stream))) return `native aac can't encode a ${shown} layout`;
+        if ((family === 'ac3' || family === 'eac3') && customOrder(stream)) return `${family} would re-matrix a ${shown} layout to one nobody measured`;
+        return '';
+    };
     // The "N kb/s" rate token every operation log renders a bitrate with. Single source of truth for units and rounding: a user reads several of these lines
     // side by side in one run's infoLog (a dedup removal beside a transcode beside a loudnorm pass), so the same track's rate must not render differently
     // on different lines. Callers add their own surrounding text, the " @ " separator - but NOT the no-bitrate-known fallback, which is srcRateToken below.
@@ -3556,12 +3590,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         // ====== END DEDUPLICATE ======
 
-        // An aac track with no ffprobe channel_layout carries an AAC program config element (PCE): ffmpeg's native aac writes 3.1, quad(side), 4.1,
-        // 5.0(side), 5.1(side), 6.0, hexagonal, 6.1, 7.0, 7.1(wide), octagonal and their (front)/(back)/(wide-side) twins that way, so every ffmpeg aac
-        // 5.1 made from ac3/eac3/dts has one. ffmpeg decodes it in the layout's own channel order but unlabelled, and only MediaInfo reads which layout
-        // it is. These are Tdarr's mediainfo.js 0.2.0 spellings (ChannelLayout, which carries the element order, then ChannelPositions) of the PCE
-        // jellyfin-ffmpeg 7.1.4 writes for each layout, measured 2026-11-06. No entry for 6.0 and hexagonal, which spell alike though their PCEs
-        // differ, nor for 6.0(front), which ffmpeg decodes with its two front pairs swapped. A Map, so probe text never reads a prototype member.
+        // An aac track with no ffprobe channel_layout carries an AAC program config element (PCE): ffmpeg's native aac writes 3.1, quad(side), 4.1, 5.0(side),
+        // 5.1(side), 6.0, hexagonal, 6.1, 7.0, 7.1(wide), octagonal and their (front)/(back)/(wide-side) twins that way, so every ffmpeg aac 5.1 made from
+        // ac3/eac3/dts has one. ffmpeg decodes it in the layout's own channel order but unlabelled, and only MediaInfo reads which layout it is. These are
+        // Tdarr's mediainfo.js 0.2.0 spellings (ChannelLayout, which carries the element order, then ChannelPositions) of the PCE jellyfin-ffmpeg 7.1.4 writes
+        // for each layout, measured 2026-11-06. No entry for 6.0 and hexagonal, which spell alike though their PCEs differ, nor for 6.0(front), which ffmpeg
+        // decodes with its two front pairs swapped. Two residuals are accepted. A 5.0(back) written with a forced PCE (-aac_pce 1) spells exactly as the native
+        // 5.0(side) one, so it is relabelled side: every channel stays at its index, only the surround pair's label moves, and dropping the row would leave
+        // every common 5.0(side) aac unconverted. In a .mov MediaInfo reads the chan atom instead, which ffmpeg writes by channel count alone (5.1(side), 6.0,
+        // 6.0(front) and hexagonal all read as 5.1, 3.1 and quad(side) as 4.0), and a .ts gives no positions, so no row can name a PCE there: those tracks take
+        // the unnamed skip, and a stack is unaffected because clean_and_remux writes mkv or mp4 first. A Map, so probe text never reads a prototype member.
         const AAC_PCE_LAYOUTS = new Map([
             ['L R Ls Rs / Front: L R, Side: L R', 'quad(side)'],
             ['L R C LFE / Front: L C R, LFE', '3.1'],
@@ -3573,15 +3611,35 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             ['L R C Cb ? ? ? ? / Front: L C R, Side: C, Back: 4', '7.1(wide)'],  // and 7.1(wide-side) as this one
             ['L R C Ls Rs Lb Rb Cb / Front: L C R, Side: L R, Back: L C R', 'octagonal'],
         ]);
-        // An unlabelled PCE decode: an aac track above two channels whose layout ffprobe leaves absent (its JSON) or 'unknown' (its flat output).
-        const unlabelledPce = (s) => codecFamilyOf(s) === 'aac' && s.awkChannels > 2 && (!s.channel_layout || s.channel_layout === 'unknown');
+        // ffprobe names no layout: the key absent (its JSON) or 'unknown' (its flat output).
+        const noLayout = (s) => !s.channel_layout || s.channel_layout === 'unknown';
+        // An unlabelled PCE decode: an aac track above two channels with no ffprobe layout, or one ffprobe spells as a custom channel order ('6 channels
+        // (FL+FR+BL+BR+FLC+FRC)', how jellyfin-ffprobe 7.1.4 reads a front-wide PCE a mainline ffmpeg wrote), which native aac refuses outright (exit 234).
+        const unlabelledPce = (s) => codecFamilyOf(s) === 'aac' && s.awkChannels > 2 && (noLayout(s) || /^\d+ channels \(/.test(s.channel_layout));
         // The layout AAC_PCE_LAYOUTS names for an unlabelled PCE; '' for every other track, and for a PCE MediaInfo does not identify (pceUnnamed).
         const pceLayoutOf = (s) => {
             if (!unlabelledPce(s)) return '';
             const mi = mediaInfoFor(s);
             return AAC_PCE_LAYOUTS.get(`${mi?.ChannelLayout} / ${mi?.ChannelPositions}`) || '';
         };
-        const pceUnnamed = (s) => unlabelledPce(s) && !pceLayoutOf(s);
+        // A non-aac track with no ffprobe layout whose decode no encoder or fold can place: an opus above two channels (mapping family 255, whose channels
+        // carry no meaning at all - measured on jellyfin-ffmpeg 7.1.4, a 6ch one to native aac exits 234 'Unsupported channel layout "6 channels"', and a 3ch
+        // one to ac3 behind loudnorm comes out with its third channel silent), and any codec at 3 or 7 channels, whose count default puts an LFE where a
+        // full-range speaker sits (3 decodes as 2.1, so a 3.0's centre - its dialogue - is taken as LFE, and 7 as 6.1, so a 7.0's back left is): measured on
+        // PCM in Matroska, a stereo fold drops that channel, a 5.1 fold puts it on the LFE, and at 3 channels ac3 and native aac write it silent. At 5, 6 and 8
+        // channels the default (5.0, 5.1, 7.1) is the common real layout, so those still convert. Matroska keeps no PCM layout at all, so a PCM written from a
+        // layout other than its count's default is converted on that default: a 6.0's back centre lands on the LFE that ac3 band-limits away - an accepted
+        // upstream residual.
+        const noLayoutGuess = (s) => codecFamilyOf(s) !== 'aac' && noLayout(s)
+            && (codecFamilyOf(s) === 'opus' ? s.awkChannels > 2 : [3, 7].includes(s.awkChannels));
+        // A decode no encoder or fold can place by its layout: a PCE MediaInfo does not identify, a no-layout guess above, and an ambisonic layout, which
+        // swresample refuses outright ("Input channel layout 'ambisonic 1' is not supported", exit 234).
+        const pceUnnamed = (s) => (unlabelledPce(s) && !pceLayoutOf(s)) || noLayoutGuess(s) || /^ambisonic\b/i.test(String(s.channel_layout || ''));
+        // The one decode pceUnnamed must not stop: an opus with no layout re-encoded to opus in place, which keeps its mapping family 255 (the encode carries
+        // -mapping_family 255). Measured on jellyfin-ffmpeg 7.1.4 through loudnorm at 3 to 8 channels, in mkv and mp4: exit 0, every channel at its own
+        // index, and the output still reads no layout, so a later pass stops it from the same conversions. libopus's default mapping instead takes the
+        // count's Vorbis layout: it moved channels at 5 and 7 (5.0, 6.1) and labelled every count, which a later pass would then convert or fold by.
+        const opusInPlace = (s, targetCodec) => aacFamily(targetCodec) === 'opus' && codecFamilyOf(s) === 'opus' && noLayout(s);
         // Every decode of a named PCE that feeds an encoder or a fold starts with this relabel, `filter` chained behind it. Without it the decode takes the
         // channel count's default layout and every encoder and fold places the speakers by that: measured 2026-11-11 on jellyfin-ffmpeg 7.1.4, one tone per
         // speaker, ac3/eac3 put 3.1's centre and LFE and 4.1's LFE and back centre on the surrounds, libopus takes 4.1, 7.0, 7.1(wide) and octagonal as
@@ -3590,17 +3648,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // AudioSpecificConfig with every channel's content at its position. Rejected: -ac N relabels to the count's default, which moves or loses a speaker
         // on 3.1, quad(side), 4.1, 6.0, hexagonal, 7.0, 7.1(wide) and octagonal (a 6.0 back centre becomes an LFE the encoder band-limits away), and
         // -ch_layout behind the correction's aresample remixes from that default (quad(side) loses a side channel).
+        // A QuickTime Lt/Rt track (a .mov PCM 'downmix', DL+DR) is renamed stereo the same way: native aac and libopus refuse 'downmix' (exit 234), and
+        // ac3, eac3 and aac_at write it mono. Measured on jellyfin-ffmpeg 7.1.4 with a different tone on each side: behind the rename every one of them
+        // writes stereo with DL on FL and DR on FR, nothing mixed.
         const pceRelabel = (s, filter = '') => {
-            const lay = pceLayoutOf(s);
+            const lay = pceLayoutOf(s) || (layoutKeyOf(s) === 'downmix' ? 'stereo' : '');
             return lay ? `channelmap=channel_layout=${lay}${filter ? `,${filter}` : ''}` : filter;
         };
-        // A PCE MediaInfo does not identify is left as it is by every operation that would decode it, with this line: a guessed layout re-encodes
-        // cleanly but puts channels on the wrong speakers.
+        // A decode pceUnnamed stops is left as it is by every operation that would decode it, with this line, which says what the probes read: a
+        // guessed layout re-encodes cleanly but puts channels on the wrong speakers. MediaInfo is named only for aac, the one codec it can name a PCE for.
         const unnamedPceSkip = (s, tag, what) => {
+            // ffprobe's own count, which the enriched stream's has replaced with the both-probe one (enrichStream)
+            const probed = Number(file.ffProbeData.streams.find((x) => x.index === s.index)?.channels) > 0;
+            const read = probed ? `channel_layout "${logSafe(String(s.channel_layout || '').trim() || 'none', 60)}"` : 'no channel count';
             const positions = mediaInfoFor(s)?.ChannelPositions;
-            return `☒${streamTag(s.index)}[${tag}] ${what} - ffmpeg decodes this track's ${s.awkChannels}ch layout unnamed and ${positions
-                ? `MediaInfo's "${logSafe(positions, 60)}" does not identify it` : 'MediaInfo reports no channel positions'}, so no layout is guessed; `
-                + `left as ${codecNameOf(s) || 'unknown'} ${s.awkChannels}ch\n`;
+            const mi = codecFamilyOf(s) !== 'aac' ? '' : ` and MediaInfo ${positions ? `"${logSafe(positions, 60)}"` : 'no channel positions'}`;
+            return `☒${streamTag(s.index)}[${tag}] ${what} - ffprobe reads ${read}${mi}, which ${mi ? 'match' : 'matches'} no layout its `
+                + `${s.awkChannels} channels can be placed by, so none is guessed; left as ${codecNameOf(s) || 'unknown'} ${s.awkChannels}ch\n`;
         };
 
         // The layouts libopus writes with every speaker in place. It HARD-ERRORS on a layout outside its RFC mappings, failing the whole job (2.1, 4.0,
@@ -3609,8 +3673,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // comes back with FC heard in BR, BL in FC and BR in BL, and a 6.1 with FC heard in BC, BC in SL and SL in FC, while 3.0, quad, 5.1, 5.1(side) and 7.1
         // come back in place. So 5.0 and 6.1 are treated as refused. Rejected: a channelmap that pre-permutes them to cancel the move (it would move them
         // silently the day ffmpeg fixes the mapping), and padding them to 5.1 / 7.1 (it changes the channel count that titles, dedup and encodedChannels read).
-        // ac3/eac3 encode every layout libopus refuses, a few with fewer channels (encodedChannels); native aac keeps the count but refuses the height layouts
-        // (3.1.2, 5.1.2, cube), downmix and an unlabelled PCE decode (AAC_PCE_LAYOUTS) - so this guards only the paths that encode opus.
+        // ac3/eac3 encode every standard layout libopus refuses, a few with fewer channels (encodedChannels), and native aac keeps the count bar the layouts
+        // it refuses; a layout either cannot take at its count never reaches it (layoutRefusal, pceRelabel, pceUnnamed) - so this guards only the paths
+        // that encode opus.
         const OPUS_OK_LAYOUTS = new Set(['mono', 'stereo', '3.0', 'quad', '5.1', '5.1(side)', '7.1']);
         const opusAcceptsLayout = (channels, layoutStr) => {
             const lay = (layoutStr || '').toLowerCase().trim();
@@ -3706,6 +3771,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (codecNameOf(s) === 'opus') continue;                 // already opus
                 // guard_lossless/guard_quality/guard_object_audio — mirrors the force-site guard (codecSurround is opus)
                 if (guardBlocks(s, codecSurround, ch, ch)) continue;
+                if (pceUnnamed(s)) continue;                              // the force site leaves it as it is (unnamedPceSkip)
                 if (!forceCovers(false, ch)) continue;   // is this surround track (never stereo here: ch is 3-8) in codec_force's scope?
                 const opusLayout = opusLayoutFor(s, ch);
                 if (opusLayout.ok) continue;
@@ -3923,6 +3989,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             quiet_room: { I: -16, LRA: 6,  TP: -1.5 },
         };
         const LOUDNORM_TOLERANCE_LU = 1;
+        // How much wider a corrected track's loudness range may measure before its trial counts it as widened. loudnorm reads LRA off a histogram of 0.1 LU
+        // bins, so a pure gain moves the range by about one bin; 0.2 is margin over that. Measured on jellyfin-ffmpeg 7.1.4: linear corrections of +15 and
+        // +16 dB on two real tracks moved LRA by 0.0 and -0.1, while the dynamic-mode widenings this exists to catch were +1.8 to +5.5 LU.
+        const LOUDNORM_LRA_RESOLUTION_LU = 0.2;
+        // A trial runs loudnorm twice in dynamic mode (the correction, then the analysis) where the first pass runs it once: measured on jellyfin-ffmpeg 7.1.4
+        // at 2.2 to 2.4 times the first pass's wall time, so its kill-switch is the first pass's budget scaled by this, keeping the same headroom. The
+        // check of a limited trim (buildLoudnormFilter) is the same pass with a gain and a limiter added, and takes the same budget.
+        const LOUDNORM_TRIAL_TIMEOUT_FACTOR = 2.5;
+        // The smallest level trim worth chaining after an accepted trial (dB); below it the correction already sits on target.
+        const LOUDNORM_TRIM_MIN_DB = 0.05;
+        // How far under the preset's TP an upward trim may lift the peak, and where its limiter holds it (dB). A limiter at TP itself packs the peaks at the
+        // ceiling, and the encoders then overshoot it further than they overshoot the untrimmed correction: measured on jellyfin-ffmpeg 7.1.4 on a 45 s clip
+        // whose trial landed at -16.95 LUFS / -1.46 dBTP, at TP ac3 224k wrote +0.02 dBTP (untrimmed -0.66) and native aac 256k -0.49 (-0.96); 0.5 dB
+        // under, every encoder wrote a lower peak than untrimmed (ac3 224k -0.72, 320k -1.18, aac -1.25, aac_at -1.69).
+        const LOUDNORM_TRIM_PEAK_MARGIN_DB = 0.5;
         // Shape of a measured value: minus/digits/dot only, the %.2f form the real binary emits ('-21.75', '0.00', '-70.00'). Tested on String(val).
         const LOUDNORM_MEASURED_SHAPE = /^-?\d+(?:\.\d+)?$/;
         const LOUDNORM_FIELD_LOG_MAX = 40;   // a real measurement is a few characters; anything longer is already the evidence
@@ -3931,7 +4012,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // be right: measured ~11x realtime idle but ~3.4x with six analyses running, and a node normally runs several workers, so budget three wall-seconds per
         // second of audio (~10x loaded headroom). Tripping it FAILS THE FILE, so a ceiling a long legitimate track can reach would quarantine the video. The
         // floor keeps a short track sane and absorbs spawn latency; the cap bounds a hang and a corrupt header declaring a nonsense duration; an unreadable
-        // duration falls back to the CAP - work of unknown length must never be killed early.
+        // duration falls back to the CAP - work of unknown length must never be killed early. A trial's bound is this one scaled by
+        // LOUDNORM_TRIAL_TIMEOUT_FACTOR, so a wedged trial on an unreadable duration holds the worker for up to 10 h.
         const LOUDNORM_ANALYSIS_MIN_TIMEOUT_MS = 10 * 60 * 1000;
         const LOUDNORM_ANALYSIS_MAX_TIMEOUT_MS = 4 * 60 * 60 * 1000;
         const LOUDNORM_ANALYSIS_MS_PER_AUDIO_SEC = 3000;
@@ -3962,21 +4044,26 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Synchronous analysis-only ffmpeg spawn measuring one stream's EBU R128 loudness: { stats } (input_i/input_tp/input_lra/input_thresh/target_offset) or
         // { error } - every failure is reported, never thrown, so the caller decides how to fail the file. The loudnorm JSON logs at AV_LOG_INFO, so -loglevel
         // must stay at or above that (-nostats silences only the unrelated progress line). Args-array form only, never a shell string.
-        const measureLoudness = (srcAudioIdx, preFilter, preset) => {
+        const measureLoudness = (srcAudioIdx, preFilter, preset, timeoutMs = loudnormAnalysisTimeoutMs, pass = 'analysis') => {
             const prefetched = loudnormPrefetched.get(loudnormKey(srcAudioIdx, preFilter));
             if (prefetched) return prefetched;
             const args = ['-nostats', '-hide_banner', '-i', file.file, '-map', `0:a:${srcAudioIdx}`, '-af', loudnormAnalysisFilter(preFilter, preset),
                 '-f', 'null', '-'];
-            const result = spawnSync(ffmpegPathOf(otherArguments), args,
-                { timeout: loudnormAnalysisTimeoutMs, maxBuffer: LOUDNORM_ANALYSIS_MAX_BYTES, encoding: 'utf-8' });
+            const result = spawnSync(ffmpegPathOf(otherArguments), args, { timeout: timeoutMs, maxBuffer: LOUDNORM_ANALYSIS_MAX_BYTES, encoding: 'utf-8' });
             // A tripped `timeout` sets BOTH error (code ETIMEDOUT) and signal (SIGTERM), and error is tested first - so the timeout must be named HERE or it
             // reports as a failure to launch, which is the opposite of what happened. The bare signal branch below is then only an external kill (an OOM
             // killer, an operator), which is worth telling apart from a timeout because the remedies differ.
             if (result.error && result.error.code === 'ETIMEDOUT')
-                return { error: `ffmpeg exceeded the ${Math.round(loudnormAnalysisTimeoutMs / 60000)} min analysis timeout for this file's duration` };
+                return { error: `ffmpeg exceeded the ${Math.round(timeoutMs / 60000)} min ${pass} timeout for this file's duration` };
             if (result.error) return { error: `could not start ffmpeg (${result.error.message})` };
             if (result.signal) return { error: `ffmpeg was killed from outside (signal ${result.signal})` };
-            if (result.status !== 0) return { error: `ffmpeg exited with status ${result.status}` };
+            // A codec this build has no decoder for is named, in ffmpeg's own words, so the quarantine says why (jellyfin-ffmpeg 7.1.4 on MPEG-H: '[aist#0:0/
+            // mpegh_3d_audio @ 0x...] Decoding requested, but no decoder found for: mpegh_3d_audio', exit 234). Read only from a line of ffmpeg's own, which
+            // starts with its bracketed context: a track title the input dump echoes is indented, so it cannot name a codec here.
+            if (result.status !== 0) {
+                const noDecoder = /^\[[^\]\r\n]*\] Decoding requested, but no decoder found for: (\w+)/m.exec(String(result.stderr || ''));
+                return { error: `ffmpeg exited with status ${result.status}${noDecoder ? ` - no decoder found for: ${noDecoder[1]}` : ''}` };
+            }
             const stats = loudnormStatsIn(result.stderr || '');
             if (!stats) return { error: 'could not find loudnorm measurement JSON in ffmpeg output' };
             return { stats };
@@ -4024,18 +4111,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
 
         // Measure, then decide the correction filter comma-chained onto preFilter, or return unchanged (changed:false) when already within
-        // LOUDNORM_TOLERANCE_LU of target. `measured` gates the awk_loudnorm cache stamp: the track-cap branch also returns changed:false WITHOUT
-        // measuring, and stamping that would cache a claim nothing ever checked. measured_thresh has NO uppercase alias (unlike measured_I/_LRA/_TP) -
-        // keep it exactly lowercase. Pass-1's JSON field names (input_i/input_lra/input_tp/target_offset) are NOT pass-2's filter option names
-        // (measured_I/measured_LRA/measured_TP/offset) - same numbers, different names per side. The per-file analysis cap exists because each pass is a
-        // synchronous full-duration spawn - a crafted file declaring many audio tracks could tie up a worker for hours; past the cap the rest are left at
-        // source loudness with one warning, for a later queue pass.
+        // LOUDNORM_TOLERANCE_LU of target or when the correction's trial declines it (declined:true). `measured` gates the awk_loudnorm cache stamp: the
+        // track-cap branch and a declined correction also return changed:false WITHOUT it, and stamping either would cache a claim nothing checked.
+        // measured_thresh has NO uppercase alias (unlike measured_I/_LRA/_TP) - keep it exactly lowercase. Pass-1's JSON field names
+        // (input_i/input_lra/input_tp/target_offset) are NOT pass-2's filter option names (measured_I/measured_LRA/measured_TP/offset) - same numbers,
+        // different names per side. The per-file analysis cap exists because each pass is a synchronous full-duration spawn - a crafted file declaring many
+        // audio tracks could tie up a worker for hours; past the cap the rest are left at source loudness with one warning, for a later queue pass. A
+        // counted track spends one analysis, a dynamic-mode correction a trial as well (LOUDNORM_TRIAL_TIMEOUT_FACTOR), and a limited trim one more pass of
+        // the trial's length: on an M1, a 2 h 5.1 track is about 10 min of analysis and 25 min of trial. Tdarr's Worker Stall Detector (off by default)
+        // cancels a plugin phase that outlasts its interval, because plugin work never moves the progress percentage: an interval of 30 min covers one
+        // corrected 5.1 track of up to about 100 min, and several corrected tracks add up.
         const LOUDNORM_MAX_TRACKS = 24;
         let loudnormMeasureCount = 0;
         let loudnormCapWarned = false;
         // A sample rate read off either probe, as a plain integer in a real audio range - it is spliced into the filter string, so nothing else passes.
         const sampleRateOf = (v) => { const n = Number(v); return Number.isInteger(n) && n >= 8000 && n <= 768000 ? n : 0; };
-        const buildLoudnormFilter = (streamIndex, srcAudioIdx, preFilter, preset) => {
+        // `trial` false measures only: a track the caller will leave as it is anyway (pceUnnamed) needs the analysis for an on-target stamp, never a trial.
+        const buildLoudnormFilter = (streamIndex, srcAudioIdx, preFilter, preset, trial = true) => {
             if (loudnormMeasureCount >= LOUDNORM_MAX_TRACKS) {
                 if (!loudnormCapWarned) {
                     response.infoLog += `☒[method_loudnorm=${methodLoudnorm}] More than ${LOUDNORM_MAX_TRACKS} audio tracks to normalize - measuring `
@@ -4045,11 +4137,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return { filter: preFilter, changed: false, measured: false };
             }
             loudnormMeasureCount++;
+            const failedPass = (pass, error) => failWithBuffers(`${streamTag(streamIndex)}[method_loudnorm=${methodLoudnorm}] loudnorm ${pass} pass failed `
+                + `(${error}) - if this file has known corruption, try clean_and_remux's recover_bad_timestamps/recover_bad_data first; if the codec itself is `
+                + `unsupported, that won't help`);
             const analysis = measureLoudness(srcAudioIdx, preFilter, preset);
-            if (analysis.error)
-                failWithBuffers(`${streamTag(streamIndex)}[method_loudnorm=${methodLoudnorm}] loudnorm analysis pass failed (${analysis.error}) - if this file `
-                    + `has known corruption, try clean_and_remux's recover_bad_timestamps/recover_bad_data first; if the codec itself is unsupported, `
-                    + `that won't help`);
+            if (analysis.error) failedPass('analysis', analysis.error);
             const { stats } = analysis;
             // A digitally-silent track measures input_i="-inf" (and target_offset="inf"); Number("-inf") is NaN (JS parses "Infinity", not "inf"), which would
             // defeat the tolerance test AND then bake a literal measured_I=-inf into the correction filter that the real pass-2 transcode rejects ("out of
@@ -4079,17 +4171,87 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // aresample returns every encoder to the source rate (48000 measured), and is a no-op in linear mode.
             const src = file.ffProbeData.streams.find((s) => s.index === streamIndex);
             const srcRate = sampleRateOf(src?.sample_rate) || (src && sampleRateOf(mediaInfoFor(src)?.SamplingRate)) || 48000;
-            const corrected = `loudnorm=I=${preset.I}:LRA=${preset.LRA}:TP=${preset.TP}:measured_I=${stats.input_i}:measured_LRA=${stats.input_lra}`
-                + `:measured_TP=${stats.input_tp}:measured_thresh=${stats.input_thresh}:offset=${stats.target_offset}:linear=true,aresample=${srcRate}`;
-            return { filter: preFilter ? `${preFilter},${corrected}` : corrected, changed: true, measured: true };
+            const correction = `loudnorm=I=${preset.I}:LRA=${preset.LRA}:TP=${preset.TP}:measured_I=${stats.input_i}:measured_LRA=${stats.input_lra}`
+                + `:measured_TP=${stats.input_tp}:measured_thresh=${stats.input_thresh}:offset=${stats.target_offset}:linear=true`;
+            // The applied chain, with `trim` (a level trim after the correction) ahead of the trailing aresample.
+            const chain = (trim = '') => `${preFilter ? `${preFilter},` : ''}${correction}${trim},aresample=${srcRate}`;
+            // loudnorm's own linear-mode test, mirrored exactly: the gain keeps the peak at or under TP, the range fits the preset's LRA, and no measured value
+            // sits at loudnorm's unset default (tp 99, thresh -70, lra 0, i 0). Proved on jellyfin-ffmpeg 7.1.4 by running the correction itself and reading
+            // its normalization_type on both sides of the TP and LRA edges under all three presets, at each unset default, and at ten pairs whose
+            // floating-point sum lands either side of TP: 25 of 25 agree. A linear correction is a pure gain, lands on target and moves the range by at most a
+            // bin, so a trial could never decline it, nor a trim move it. (loudnorm also runs linear on an input under 3 s; such a track takes the trial.)
+            const [mI, mTp, mLra, mThresh] = [stats.input_i, stats.input_tp, stats.input_lra, stats.input_thresh].map(Number);
+            const linear = mTp !== 99 && mThresh !== -70 && mLra !== 0 && mI !== 0 && mTp + (preset.I - mI) <= preset.TP && mLra <= preset.LRA;
+            if (!trial || linear) return { filter: chain(), changed: true, measured: true };
+            // The trial: a dynamic-mode correction measured as the encoder will receive it, before anything is encoded or stamped. Dynamic mode compresses
+            // most wide film as intended but widens a long level step or a quiet opening and can miss the target - measured on jellyfin-ffmpeg 7.1.4 under
+            // tv, a 180 s 5.1 film track went 14.0 -> 9.4 LU at -16.02 LUFS, while a 45 s clip with a quiet opening went 14.0 -> 17.5 LU and a 300 s
+            // stepped track 14.0 -> 19.5 LU at 1.3 LU off target. Cost: one more full-duration pass (LOUDNORM_TRIAL_TIMEOUT_FACTOR; +35 s on that film
+            // track, whose first pass took 15 s).
+            const passTimeoutMs = Math.round(loudnormAnalysisTimeoutMs * LOUDNORM_TRIAL_TIMEOUT_FACTOR);
+            const srcLra = Number(stats.input_lra);
+            // A measured chain against the target and the source's range. The range is compared in hundredths, as loudnorm prints it: 14.10 + 0.2 is
+            // 14.299999... in floating point, which would call a 14.30 wider. A non-finite reading is off and wider, never accepted.
+            const judge = (st) => {
+                const [i, lra, tp] = [st.input_i, st.input_lra, st.input_tp].map(Number);
+                const miss = Math.abs(i - preset.I);
+                return { i, lra, tp, miss, off: !(miss <= LOUDNORM_TOLERANCE_LU),
+                    wider: !(Math.round((lra - srcLra) * 100) <= Math.round(LOUDNORM_LRA_RESOLUTION_LU * 100)) };
+            };
+            const tried = measureLoudness(srcAudioIdx, chain(), preset, passTimeoutMs, 'trial');
+            if (tried.error) failedPass('trial', tried.error);
+            const t = judge(tried.stats);
+            // The trim: a gain of target - trial after the correction. An accepted trial can still sit up to 1 LU off, and the encoder's own drift then
+            // pushes it out of tolerance on the next pass (measured: a trial at -16.95 written -17.03 by native aac and aac_at at 256k, corrected a second
+            // time on mp4/mov or stamped 1.03 LU off on mkv); and a trial further off than that is not lost, just short (a 128k re-encode of that clip's
+            // trial landed at -17.17). Without a limiter the gain is linear: it moves the level exactly and leaves the range alone, so its result is known
+            // without measuring it. An upward gain that would lift the peak past LOUDNORM_TRIM_PEAK_MARGIN_DB under TP is followed by a limiter there, since
+            // dynamic mode leaves the peak at TP (the -16.95 trial read -1.46 dBTP) and a gain capped at the peak's headroom could not move it. The limiter
+            // has a loudness cost of its own, and on dense transients it takes more than the gain adds - measured on jellyfin-ffmpeg 7.1.4 on pink noise
+            // bursts, a trial at -16.87 LUFS trimmed +0.87 dB read -16.97, and was written 1.04 LU off by native aac and ac3 where untrimmed it was
+            // written -16.94 - so a limited trim is measured once more as it will be applied, the same pass as the trial with a gain and a limiter added.
+            // A trial wider than its source gets no trim: a gain cannot narrow it.
+            const raw = Number.isFinite(t.i) && !t.wider ? Math.round((preset.I - t.i) * 100) / 100 : 0;
+            const trim = Math.abs(raw) < LOUDNORM_TRIM_MIN_DB ? 0 : raw;
+            const ceiling = preset.TP - LOUDNORM_TRIM_PEAK_MARGIN_DB;
+            const limited = trim > 0 && !(trim <= ceiling - t.tp);
+            const trimmed = chain(`,volume=${trim.toFixed(2)}dB${limited ? `,alimiter=limit=${Math.pow(10, ceiling / 20).toFixed(4)}:level=0:latency=1` : ''}`);
+            const checked = limited ? measureLoudness(srcAudioIdx, trimmed, preset, passTimeoutMs, 'trim check') : null;
+            const c = !trim || checked?.error ? null
+                : checked ? judge(checked.stats) : { ...t, i: t.i + trim, miss: Math.abs(t.i + trim - preset.I), off: false };
+            // The one decision, on the best measurement there is: the trimmed chain when it lands closer to target than the trial and no wider than the
+            // source, else the untrimmed one; applied when that lands within LOUDNORM_TOLERANCE_LU and no wider, else the track keeps its loudness, unstamped,
+            // so a container that keeps no stamp declines it again next pass instead of spending another lossy generation on it. A trim check that fails
+            // to run leaves the untrimmed chain to decide - the trial already measured it - with a line saying so; a file is never failed over it.
+            const best = c && c.miss < t.miss && !c.wider ? { filter: trimmed, r: c } : { filter: chain(), r: t };
+            if (checked?.error) {
+                skipDone += `☒${streamTag(streamIndex)}[method_loudnorm=${methodLoudnorm}] The level trim after the loudness correction is left out - `
+                    + `measuring it failed (${checked.error})\n`;
+            }
+            if (best.r.off || best.r.wider) {
+                const why = !Number.isFinite(t.i) ? 'reads no finite loudness' : [Number.isFinite(t.lra)
+                    ? (t.wider ? `widens its loudness range from ${srcLra.toFixed(1)} to ${t.lra.toFixed(1)} LU` : '') : 'reads no finite loudness range',
+                t.off ? `lands at ${t.i.toFixed(2)} LUFS against the ${preset.I} LUFS target` : ''].filter(Boolean).join(' and ');
+                const after = c && checked ? `, and ${c.wider ? `widens its loudness range to ${c.lra.toFixed(1)} LU` : `at ${c.i.toFixed(2)} LUFS`} `
+                    + `trimmed by ${trim > 0 ? '+' : ''}${trim.toFixed(2)} dB` : '';
+                skipDone += `☒${streamTag(streamIndex)}[method_loudnorm=${methodLoudnorm}] Not correcting the loudness - a trial of the correction ${why}`
+                    + `${after}; its loudness is left as is\n`;
+                return { filter: preFilter, changed: false, measured: false, declined: true };
+            }
+            // What is written still differs from target by the limiter's own cost (0.17-0.24 LU on synthetic edge and dense tracks, at most 0.02 on real
+            // film) and encoder drift: on the film track above, native aac wrote 0.11 LU louder and 0.5 LU wider than its trial at 256k (0.45 / 1.4 at
+            // 128k) and aac_at 0.29 quieter; ac3 stayed within 0.1 LU of its trial on five real tracks and 0.34 on a 16 s clip, eac3 and libopus within
+            // 0.05. The worst written result measured was 0.54 LU off (native aac 128k).
+            return { filter: best.filter, changed: true, measured: true };
         };
 
         // Caching tag, stamped wherever this run measured the track: the leftovers loop below AND every re-encode a correction rode along on (downmix,
         // codec_force, remix) - the ride-along sites measure and correct in the same command, so their output is at target just as surely, and skipping
         // their stamp would cost a whole extra queue pass (re-measure, find within tolerance, remux the file to write nothing but this tag). Trusting the
-        // correction is measured-sound: across nine source/preset/downmix combinations (incl. +37.7 dB and -7.5 dB corrections) the two-pass output landed
-        // at most 0.240 LU from target, a 4x margin inside LOUDNORM_TOLERANCE_LU. Matroska uppercases custom tag names on write, so read-back goes through
-        // getTagCI.
+        // correction is measured-sound: a linear correction lands on target; a dynamic one is applied only when its trial, or the trim after it, lands within
+        // LOUDNORM_TOLERANCE_LU and no wider than its source (buildLoudnormFilter, which gives what is written its measured residual); and
+        // across nine source/preset/downmix combinations (incl. +37.7 dB and -7.5 dB corrections) the two-pass output landed at most 0.240 LU from target.
+        // Matroska uppercases custom tag names on write, so read-back goes through getTagCI.
         const LOUDNORM_TAG = 'awk_loudnorm';   // named once: a read and a write that drift apart re-measure every track on every pass
         const readLoudnormTag = (stream) => getTagCI(stream.tags || {}, LOUDNORM_TAG).trim();
         // A stamp's codec field: the codec family ffprobe reads, cut down to the grammar's own characters (production has acelp.kelvin).
@@ -4194,7 +4356,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // On those containers the cache stamp would vanish and be re-applied every reprocess - and for an already-within-tolerance track that stamp
         // is the ONLY change, so it would remux the file on every single pass forever (a non-idempotent loop). So the stamp is emitted only when it
         // will actually survive; on other containers a within-tolerance track is left a true no-op (re-measured on the next stack cycle, but never
-        // remuxed). A track that genuinely needs correction still re-encodes once regardless of container, then measures within tolerance next run.
+        // remuxed). A track that genuinely needs correction re-encodes once regardless of container, then measures within tolerance next run (the trial and
+        // the trim, buildLoudnormFilter). A correction the trial declined is declined again each pass, at the cost of two analyses and no encode.
         // DECLINED: a GLOBAL awk_loudnorm marker, which the mov muxer does keep. It would force -movflags use_metadata_tags on every such file for good
         // (mp4TagPlan), turning its native iTunes tags into mdta keys that taggers and Apple players cannot read and costing its covr cover art - a worse
         // trade than one analysis per eligible track per stack cycle.
@@ -4317,12 +4480,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             '7.1':            ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'SL', 'SR'],
             '7.1(wide)':      ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'FLC', 'FRC'],
             '7.1(wide-side)': ['FL', 'FR', 'FC', 'LFE', 'FLC', 'FRC', 'SL', 'SR'],
+            '3.1.2':          ['FL', 'FR', 'FC', 'LFE', 'TFL', 'TFR'],
+            '5.1.2':          ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'TFL', 'TFR'],
+            'cube':           ['FL', 'FR', 'BL', 'BR', 'TFL', 'TFR', 'TBL', 'TBR'],
+            '7.1.2':          ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'SL', 'SR', 'TFL', 'TFR'],
+            '5.1.4':          ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'TFL', 'TFR', 'TBL', 'TBR'],
+            '7.1.4':          ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'SL', 'SR', 'TFL', 'TFR', 'TBL', 'TBR'],
+            '7.2.3':          ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'SL', 'SR', 'TFL', 'TFR', 'TBC', 'LFE2'],
+            '9.1.4':          ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'FLC', 'FRC', 'SL', 'SR', 'TFL', 'TFR', 'TBL', 'TBR'],
         };
 
         // Per-speaker contribution to the L and R downmix outputs - the standard Lo/Ro gains, matching what Blu-ray players, AV receivers and streaming
-        // services do. FL/FR pass at full scale (peak 1.0); FC folds in at -3 dB (0.707) into both sides so dialogue stays clear; back/side/wide fold at -3 dB
-        // into their own side; any centered channel (FC, BC) splits equally to both; LFE contributes nothing (dropping it avoids mud). These gains do NOT
-        // keep a hot mix under full scale - a fold sums several channels - which is what FOLD_LIMITER is for.
+        // services do. FL/FR pass at full scale (peak 1.0); FC folds in at -3 dB (0.707) into both sides so dialogue stays clear; back/side/wide and the
+        // height speakers fold at -3 dB into their own side; any other centred channel (BC, TBC) splits equally to both; an LFE contributes nothing (dropping
+        // it avoids mud). These gains do NOT keep a hot mix under full scale - a fold sums several channels - which is what FOLD_LIMITER is for.
         const SPEAKER_GAINS = {
             FL:  { L: 1.0,   R: 0     },
             FR:  { L: 0,     R: 1.0   },
@@ -4335,6 +4506,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             FLC: { L: 0.707, R: 0     },
             FRC: { L: 0,     R: 0.707 },
             BC:  { L: 0.5,   R: 0.5   },
+            TFL: { L: 0.707, R: 0     },
+            TFR: { L: 0,     R: 0.707 },
+            TBL: { L: 0.707, R: 0     },
+            TBR: { L: 0,     R: 0.707 },
+            TBC: { L: 0.5,   R: 0.5   },
+            LFE2: { L: 0,    R: 0     },
         };
 
         // Build a Lo/Ro pan=stereo matrix string for a known canonical layout, or null if the layout contributes no surround/center content (pure FL/FR or
@@ -4397,21 +4574,47 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // (54 samples over), while at -2 aac, eac3 and opus all decoded under full scale on all three. The cost is integrated loudness on a peaky mix: 0.0 /
         // 0.9 / 0.9 LU on the three (-1 dBFS cost 0.0 / 0.5 / 0.7). A global sum-normalisation would also stop the clipping, at 6-8 dB of lost level.
         const FOLD_LIMITER = 'alimiter=limit=0.794:level=0:latency=1';
+        // swresample's fold has no rule for the top-back speakers (TBL, TBR, TBC) or a second LFE: measured on jellyfin-ffmpeg 7.1.4 with one tone per
+        // speaker, its stereo and 5.1 folds of cube, 5.1.4, 7.1.4, 9.1.4 and 7.2.3 drop them silently, while every other standard layout of up to 14
+        // channels folds in full. So ahead of that fold a pan sends each into its own side's back speaker (or surround, when there is no back pair) at
+        // -3 dB, a top-back centre into both at -6 dB and LFE2 into the LFE, leaving a layout swresample folds in full (measured: every tone kept, to
+        // stereo and to 5.1, on all five). The 16- and 24-channel broadcast layouts (hexadecagonal, 22.2) lose more speakers still and are left as they are.
+        const TOP_BACK_INTO = { TBL: [['BL', 'SL'], 0.707], TBR: [['BR', 'SR'], 0.707], TBC: [['BL', 'SL'], 0.5, ['BR', 'SR']], LFE2: [['LFE'], 1] };
+        const topBackPrefold = (src) => {
+            const list = CANON_LAYOUTS[layoutKeyOf(src)];
+            if (!list || Number(src?.channels) !== list.length || !list.some((c) => c in TOP_BACK_INTO)) return '';
+            const keep = list.filter((c) => !(c in TOP_BACK_INTO));
+            const terms = Object.fromEntries(keep.map((c) => [c, [`c${list.indexOf(c)}`]]));
+            for (const c of list.filter((x) => x in TOP_BACK_INTO)) {
+                const [first, gain, second] = TOP_BACK_INTO[c];
+                for (const opts of second ? [first, second] : [first]) {
+                    const to = opts.find((t) => keep.includes(t));
+                    if (!to) return '';
+                    terms[to].push(`${gain.toFixed(3)}*c${list.indexOf(c)}`);
+                }
+            }
+            return `pan=${keep.join('+')}|${keep.map((c) => `${c}=${terms[c].join('+')}`).join('|')}`;
+        };
         // A named PCE source is relabelled ahead of the fold (pceRelabel).
-        const foldFilter = (src, layout, matrix) => pceRelabel(src, matrix ? `aformat=sample_fmts=fltp,${matrix},${FOLD_LIMITER}`
-            : `aformat=sample_fmts=fltp:channel_layouts=${layout},${FOLD_LIMITER}`);
+        const foldFilter = (src, layout, matrix) => {
+            if (matrix) return pceRelabel(src, `aformat=sample_fmts=fltp,${matrix},${FOLD_LIMITER}`);
+            const prefold = topBackPrefold(src);
+            const pre = prefold ? `,${prefold},aformat=sample_fmts=fltp` : '';
+            return pceRelabel(src, `aformat=sample_fmts=fltp${pre}:channel_layouts=${layout},${FOLD_LIMITER}`);
+        };
 
         // Channel/filter snippet for a new or replaced stereo track. No guard check here: every call site either already passed guardBlocks or is a
         // brand-new appended derivative (an unconditional lossy re-encode by construction), so loudnorm rides on whichever guarantee applies. The fold is
         // always an explicit filter (foldFilter - aformat=channel_layouts=stereo is the matrix -ac 2 uses) rather than a bare -ac: ffmpeg applies an implicit
-        // -ac AFTER an explicit -filter:a, so neither the limiter nor loudnorm would see the folded signal. Returns { arg, measured, changed }: `measured`
-        // gates the awk_loudnorm stamp, `changed` the ride-along log tag. Callers that don't run loudnorm read both false.
+        // -ac AFTER an explicit -filter:a, so neither the limiter nor loudnorm would see the folded signal. Returns { arg, measured, changed, declined }:
+        // `measured` gates the awk_loudnorm stamp, `changed` the ride-along log tag, `declined` marks a correction its trial refused (buildLoudnormFilter).
+        // Callers that don't run loudnorm read all three false.
         const stereoArg = (idx, srcStream) => {
             const fold = foldFilter(srcStream, 'stereo', (methodStereoDownmix === 'dialogue') ? downmixMatrix(srcStream) : null);
             if (methodLoudnorm === 'disabled') return { arg: ` -filter:a:${idx} "${fold}"`, measured: false, changed: false };
             const srcAudioIdx = inputAudioIdxMap.get(srcStream.index);
-            const { filter, changed, measured } = buildLoudnormFilter(srcStream.index, srcAudioIdx, fold, LOUDNORM_PRESETS[methodLoudnorm]);
-            return { arg: ` -filter:a:${idx} "${filter}"`, measured, changed };
+            const { filter, changed, measured, declined } = buildLoudnormFilter(srcStream.index, srcAudioIdx, fold, LOUDNORM_PRESETS[methodLoudnorm]);
+            return { arg: ` -filter:a:${idx} "${filter}"`, measured, changed, declined };
         };
 
         // 6ch (5.1) channel/filter snippet for a new or replaced 5.1 track, mirroring stereoArg for the surround case: the explicit 5.1 fold (foldFilter -
@@ -4665,10 +4868,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             + `${codecDisplayName(ffstream)} ${forceChannels}ch @ ${srcRateStr} (${guardTriple()}); left as ${ffstreamCodec}\n`;
                     } else if (shouldForce && pceUnnamed(ffstream)) {
                         skipDone += unnamedPceSkip(ffstream, `codec_force=${codecForce}`, `Not forcing ${targetCodecFamily}`);
+                    } else if (shouldForce && layoutRefusal(targetCodec, ffstream)) {
+                        skipDone += `☒${streamTag(ffstream.index)}[codec_force=${codecForce}] Not forcing ${targetCodecFamily} - `
+                            + `${layoutRefusal(targetCodec, ffstream)}; left as ${ffstreamCodec}\n`;
                     } else if (shouldForce) {
-                        // Guard the force-to-opus path against libopus-incompatible layouts (method_layout_err). Only opus is affected: ac3/eac3 encode every
-                        // layout libopus refuses, a few with fewer channels (encodedChannels), and native aac keeps the count but refuses the height layouts
-                        // (3.1.2, 5.1.2, cube), downmix and an unlabelled PCE decode (AAC_PCE_LAYOUTS). `forced` gates the run's convert flag so a
+                        // Guard the force-to-opus path against libopus-incompatible layouts (method_layout_err). Only opus is affected (OPUS_OK_LAYOUTS);
+                        // what another codec cannot take at its count was stood down above (layoutRefusal). `forced` gates the run's convert flag so a
                         // keep/defer makes no change (and doesn't cause a needless re-run).
                         const opusLayout = opusLayoutFor(ffstream, forceChannels);
                         const srcLayout = opusLayout.lay;
@@ -4717,9 +4922,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // aac_vbr stereo force: aacVbrArgsIdx picks this node's best VBR AAC encoder, at its leaner tier for a low-bitrate source.
                             // srcBitrate is meaningful here — this is a codec swap at the same channel count.
                             const { encoder, args, approxRate, label } = aacVbrArgsIdx(outputAudioIdx, srcBitrate, true, forceChannels);
-                            // No pre-filter (same channel count, no relabel) - measure the source directly. guardBlocks for this force already
-                            // passed above (loudnorm rides on that guarantee - see stereoArg).
-                            const aacVbrLoud = loudnormFilterArg(outputAudioIdx, srcAudioIdx, ffstream.index);
+                            // Same channel count, so the only pre-filter is a Lt/Rt track's rename to stereo (pceRelabel), without which aac_at writes it
+                            // mono. guardBlocks for this force already passed above (loudnorm rides on that guarantee - see stereoArg).
+                            const aacVbrLoud = loudnormFilterArg(outputAudioIdx, srcAudioIdx, ffstream.index, pceRelabel(ffstream));
                             const record = { codec: 'aac', channels: forceChannels, bps: 0, approxRate };
                             workDone += `☐${streamTag(ffstream.index)}[codec_force=${codecForce}]${loudnormRideTag(aacVbrLoud.changed)} Transcoding `
                                 + `${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → aac ${forceChannels}ch @ ${approxRate} (${label})\n`;
@@ -4728,13 +4933,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             forced = true;
                         } else {
                             // Same channel count, codec swap - optionally a LOSSLESS opus relabel (quad(side)→quad via channelmap, keeps all channels), else
-                            // a named PCE's own (pceRelabel). resolveBitrate caps the target at the source bitrate when the target codec scores >= the source
-                            // (guard via awkQuality); lossless skips the cap; a high-bitrate lossy source is bounded by the codec ceiling.
-                            const relabelFilter = relabel ? opusLayout.relabelFilter : pceRelabel(ffstream);
+                            // a named PCE's or a Lt/Rt track's own (pceRelabel), ahead of the re-matrix ac3/eac3 apply (ac3RematrixFilter). resolveBitrate
+                            // caps the target at the source bitrate when the target codec scores >= the source (guard via awkQuality); lossless skips the cap;
+                            // a high-bitrate lossy source is bounded by the codec ceiling.
+                            const relabelFilter = relabel ? opusLayout.relabelFilter : pceRelabel(ffstream, ac3RematrixFilter(targetCodec, ffstream));
                             const note = relabel ? ` (relabel ${layoutName}→${relabel.layout})` : '';
-                            // guardBlocks for this force already passed above (loudnorm rides on that guarantee - see stereoArg). The relabel is the
-                            // pre-filter here: a lossless channelmap doesn't change loudness, but chaining it ahead keeps the measurement on the signal
-                            // that is actually encoded.
+                            // guardBlocks for this force already passed above (loudnorm rides on that guarantee - see stereoArg). The relabel and the
+                            // re-matrix are the pre-filter here, so the measurement is of the signal that is actually encoded.
                             const forceLoud = loudnormFilterArg(outputAudioIdx, srcAudioIdx, ffstream.index, relabelFilter);
                             const dstBps = resolveBitrate(targetCodec, forceChannels, srcBitrate, ffstream.awkLossless, ffstream.awkQuality);
                             const dstBitArg = encoderArgsBps(targetCodec, outputAudioIdx, dstBps);
@@ -4795,11 +5000,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // limit target falls back to the other candidate rather than cancelling the pass, so enabling codec_force can never silently switch loudnorm
             // off. The opus layout wall counts as out of reach too: when libopus refuses the layout with no lossless relabel and no remix will run
             // (remixFoldsTrack: method_layout_err keep/drop, a track already opus, a remix standing down for an existing stereo, or codec_stereo walled by
-            // the container), an opus target ends in "Not normalizing", so an encodable source codec takes the correction instead: ac3/eac3 encode every
-            // layout libopus refuses, a few with fewer channels (encodedChannels - guard_quality counts that as a channel drop), and native aac keeps the
-            // count but refuses the height layouts (3.1.2, 5.1.2, cube), downmix and an unlabelled PCE decode (AAC_PCE_LAYOUTS). An opus target the remix
-            // folds is judged as that fold: only guardRefusesAnyEncode refuses it here, and guard_quality picks add or replace at the remix. null = neither
-            // is in reach.
+            // the container), an opus target ends in "Not normalizing", so an encodable source codec takes the correction instead (OPUS_OK_LAYOUTS; an ac3/
+            // eac3 one that writes fewer channels counts as a channel drop to guard_quality). A layout the target cannot take at its count (layoutRefusal)
+            // puts that target out of reach the same way. An opus target the remix folds is judged as that fold: only
+            // guardRefusesAnyEncode refuses it here, and guard_quality picks add or replace at the remix. null = neither is in reach.
             const leftoverTarget = (ffstream, channels) => {
                 const isStereo = channels <= 2;
                 const configuredCodec = isStereo ? codecStereo : codecSurround;
@@ -4809,16 +5013,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const folds = remixFoldsTrack(ffstream, channels);
                 const reachable = (c) => channels <= codecMaxCh(aacFamily(c)) && !containerRefusesAudio(c)
                     && !(folds && aacFamily(c) === 'opus' ? guardRefusesAnyEncode(ffstream)
-                        : guardBlocks(ffstream, c, encodedChannels(aacFamily(c), ffstream, channels), channels));
+                        : guardBlocks(ffstream, c, encodedChannels(aacFamily(c), ffstream, channels), channels)) && !layoutRefusal(c, ffstream);
                 const wantCodec = forceCovers(isStereo, channels) ? configuredCodec : keepCodec;
                 let targetCodec = reachable(wantCodec) ? wantCodec : (reachable(keepCodec) ? keepCodec : null);
                 const opusLayoutBlocked = (c) => {
-                    if (aacFamily(c) !== 'opus' || channels <= 2) return false;
+                    if (aacFamily(c) !== 'opus' || channels <= 2 || opusInPlace(ffstream, c)) return false;
                     const { ok, relabel } = opusLayoutFor(ffstream, channels);
                     return !ok && !relabel && !folds;
                 };
-                if (targetCodec !== null && targetCodec !== keepCodec && opusLayoutBlocked(targetCodec) && reachable(keepCodec)
-                    && !opusLayoutBlocked(keepCodec)) {
+                // A decode no layout places stops every target but an opus re-encoded in place (pceUnnamed, opusInPlace), so a no-layout opus whose
+                // configured target is another codec still takes its correction as opus.
+                const unnamedBlocked = (c) => pceUnnamed(ffstream) && !opusInPlace(ffstream, c);
+                if (targetCodec !== null && targetCodec !== keepCodec && (opusLayoutBlocked(targetCodec) || unnamedBlocked(targetCodec))
+                    && reachable(keepCodec) && !opusLayoutBlocked(keepCodec) && !unnamedBlocked(keepCodec)) {
                     targetCodec = keepCodec;
                 }
                 return { targetCodec, keepCodec, configuredCodec, isStereo };
@@ -4826,7 +5033,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // COLLECT, then MEASURE, then emit: every leftover whose correction is a bare analysis of its own track goes to prefetchLoudness in one pass
             // before the loop below emits anything, and the loop reads the results back through measureLoudness. The test mirrors the loop's path to its
             // pre-filter-free buildLoudnormFilter call, so a divergence costs a wasted or a missed prefetch, never a wrong measurement; a track the opus
-            // layout wall routes through a relabel or a remix keeps its own pass, with that pre-filter.
+            // layout wall routes through a relabel or a remix, or one ac3/eac3 re-matrix, keeps its own pass, with that pre-filter.
             const leftoverIdxs = [];
             for (const ffstream of audioStreams) {
                 const outputAudioIdx = outputAudioIdxMap.get(ffstream.index);
@@ -4837,7 +5044,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const { targetCodec } = leftoverTarget(ffstream, channels);
                 const stamp = loudnormStampOf(ffstream);
                 if (stamp && (targetCodec === null || loudnormStampHolds(ffstream, stamp))) continue;
-                if (targetCodec === null || (aacFamily(targetCodec) === 'opus' && channels > 2 && !opusLayoutFor(ffstream, channels).ok)) continue;
+                if (targetCodec === null || ac3RematrixFilter(targetCodec, ffstream) || (aacFamily(targetCodec) === 'opus' && channels > 2
+                    && !opusLayoutFor(ffstream, channels).ok && !pceUnnamed(ffstream))) continue;
                 leftoverIdxs.push(srcAudioIdx);
             }
             prefetchLoudness(leftoverIdxs.slice(0, Math.max(0, LOUDNORM_MAX_TRACKS - loudnormMeasureCount)), preset);
@@ -4871,7 +5079,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - ${wallText(keepCodec)}, the codec it `
                             + `would be re-encoded to; left as ${ffstreamCodec}${remedy}\n`;
                         walledOps += 1;
-                    } else
+                    } else if (layoutRefusal(keepCodec, ffstream) && !guardBlocks(ffstream, keepCodec, channels, channels))
+                        skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - the re-encode would be to `
+                            + `${aacFamily(keepCodec)}, and ${layoutRefusal(keepCodec, ffstream)}; left as ${ffstreamCodec}\n`;
+                    else
                         skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - would lose detail vs `
                             + `${codecDisplayName(ffstream)} ${channels}ch (${guardTriple()}); left as ${ffstreamCodec}\n`;
                     continue;
@@ -4884,9 +5095,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // (+ loudnorm) in place, unless a GENUINE track already holds this language's stereo (remixDefer, the shared remixDefersToExistingStereo the
                 // codec_force path asks too, which never defers a secondary - a commentary's stereo is not the language's); 'keep' - and 'drop', which can't
                 // remove a track once the audio index maps are built (the codec_force path drops such a track in the pre-pass) - leave it in its source codec,
-                // un-normalized. A track already opus is never remixed (remixFoldsTrack), so an opus 5.0 or 6.1 is left as it is under every setting.
+                // un-normalized. A track already opus is never remixed (remixFoldsTrack), so an opus 5.0 or 6.1 is left as it is under every setting. A
+                // decode no layout places (pceUnnamed) bypasses the wall, since the unnamed line below speaks for it, and an opus with no layout goes on to be
+                // re-encoded in place keeping mapping family 255 (opusInPlace), which libopus takes at any count.
                 let loudnormRelabel = '';
-                if (targetCodecFamily === 'opus' && channels > 2) {
+                if (targetCodecFamily === 'opus' && channels > 2 && !pceUnnamed(ffstream)) {
                     const { lay, ok, relabel, relabelFilter } = opusLayoutFor(ffstream, channels);
                     if (!ok) {
                         const remixDefer = remixDefersToExistingStereo(ffstream, relabel);
@@ -4907,10 +5120,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // layout reasoning, would suppress their correction for good once the settings stop routing the track through the remix. The cost
                             // is one analysis spawn per pass, the price a container that cannot persist the tag pays.
                             if (!two.changed) {
-                                skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] ${two.measured
-                                    ? 'Remix not needed - the stereo fold is already within tolerance'
-                                    : 'Remix skipped - the per-file analysis cap left the stereo fold unmeasured (a later pass can normalize it)'}; left as `
-                                    + `${ffstreamCodec} ${channels}ch un-normalized\n`;
+                                // A correction its trial declined has said why already (buildLoudnormFilter).
+                                if (!two.declined) {
+                                    skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] ${two.measured
+                                        ? 'Remix not needed - the stereo fold is already within tolerance'
+                                        : 'Remix skipped - the per-file analysis cap left the stereo fold unmeasured (a later pass can normalize it)'}`
+                                        + `; left as ${ffstreamCodec} ${channels}ch un-normalized\n`;
+                                }
                                 continue;
                             }
                             // A track guard_quality protects is judged against the stereo the remix emits (see the codec_force remix): its normalized stereo is
@@ -4941,13 +5157,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
 
                 const srcBitrate = Number(ffstream.bit_rate || 0);
-                const { filter, changed, measured } = buildLoudnormFilter(ffstream.index, srcAudioIdx, loudnormRelabel, preset);
+                const preFilter = loudnormRelabel || ac3RematrixFilter(targetCodec, ffstream);
+                const unnamed = pceUnnamed(ffstream) && !opusInPlace(ffstream, targetCodec);
+                const { filter, changed, measured } = buildLoudnormFilter(ffstream.index, srcAudioIdx, preFilter, preset, !unnamed);
                 if (!changed) {
                     // Already within tolerance. On a tag-persisting container, stamp it (a metadata-only remux) so a FUTURE run can skip re-measuring while
                     // the preset stays the same. On a container that would drop the tag, do NOTHING (a true no-op) - stamping there would just remux every
                     // reprocess forever without ever caching (see loudnormTagPersists above). A track the analysis cap left unmeasured also lands here with
                     // changed:false, and must NOT be stamped: the cache would claim a loudness nothing ever read, and every future run would trust it and
-                    // skip the track for good. It is simply left at source loudness, as the cap warning says, for a later pass to pick up.
+                    // skip the track for good. It is simply left at source loudness, as the cap warning says, for a later pass to pick up. So is a correction
+                    // its trial declined (buildLoudnormFilter), which the next pass weighs afresh.
                     if (loudnormTagPersists && measured) {
                         stampWithinTolerance(ffstream, outputAudioIdx);
                         convert = true;
@@ -4955,9 +5174,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
 
-                // A PCE MediaInfo does not identify is left as it is (unnamedPceSkip), after the within-tolerance exit so an on-target one is still stamped.
-                // For an aac target that also keeps the job alive: native aac refuses an unlabelled decode (exit 234, the job fails).
-                if (pceUnnamed(ffstream)) {
+                // A decode no layout places (pceUnnamed) is left as it is (unnamedPceSkip), after the within-tolerance exit so an on-target one is still
+                // stamped. For an aac target that also keeps the job alive: native aac refuses an unlabelled decode (exit 234, the job fails). An opus with
+                // no layout re-encoded to opus in place is the exception (opusInPlace).
+                if (unnamed) {
                     skipDone += unnamedPceSkip(ffstream, `method_loudnorm=${methodLoudnorm}`, 'Not normalizing');
                     continue;
                 }
@@ -4968,8 +5188,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const record = { codec: 'aac', channels, bps: 0, approxRate };
                     workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${ffstreamCodec} ${channels}ch → aac `
                         + `${channels}ch @ ${approxRate} (${label})\n`;
-                    replaceInPlace(outputAudioIdx, `${encoder}${args} -filter:a:${outputAudioIdx} "${filter}"${loudnormEncodeStamp(outputAudioIdx, record)}`,
-                        record);
+                    replaceInPlace(outputAudioIdx, `${encoder}${args} -filter:a:${outputAudioIdx} "${pceRelabel(ffstream, filter)}"`
+                        + `${loudnormEncodeStamp(outputAudioIdx, record)}`, record);
                 } else {
                     // Format in == format out (the plain loudnorm case, and codec_force aimed at the codec the track already uses): match the source rate
                     // rather than re-deriving a ladder target, which would re-encode a 192k mono aac at the 160k aac ceiling and build in a loss nobody
@@ -4977,7 +5197,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const sameFormat = targetCodecFamily === codecFamilyOf(ffstream);
                     const matchedBps = sameFormat ? sameFormatBitrate(targetCodecFamily, channels, srcBitrate) : 0;
                     const dstBps = matchedBps || resolveBitrate(targetCodec, channels, srcBitrate, ffstream.awkLossless, ffstream.awkQuality);
-                    const dstBitArg = encoderArgsBps(targetCodec, outputAudioIdx, dstBps);
+                    // An opus with no layout keeps mapping family 255, so libopus writes its channels back by index (opusInPlace).
+                    const dstBitArg = `${encoderArgsBps(targetCodec, outputAudioIdx, dstBps)}`
+                        + `${opusInPlace(ffstream, targetCodec) ? ` -mapping_family:a:${outputAudioIdx} 255` : ''}`;
                     const srcRateStr = srcRateToken(ffstream);
                     // The channels the encoder writes (encodedChannels), as at FORCE CODEC: the log, Expected results and the stamp read the record.
                     const record = { codec: targetCodec, channels: encodedChannels(targetCodec, ffstream, channels), bps: dstBps };
@@ -4986,10 +5208,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         ac3FoldNote(targetCodec, ffstream, record.channels, channels)].filter(Boolean);
                     workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${ffstreamCodec} ${channels}ch @ ${srcRateStr} → `
                         + `${targetCodec} ${record.channels}ch @ ${kbpsToken(dstBps)}${notes.length ? ` (${notes.join('; ')})` : ''}\n`;
-                    // The PCE relabel (pceRelabel) goes ahead of the correction, not into its analysis: measured 2026-11-06 on jellyfin-ffmpeg 7.1.4 on every
-                    // AAC_PCE_LAYOUTS layout, the loudness it measures is unchanged, so the prefetch serves the track. An opus relabel already starts with it.
+                    // The PCE or Lt/Rt rename (pceRelabel) goes ahead of the correction, not into its analysis: measured 2026-11-06 on jellyfin-ffmpeg 7.1.4
+                    // on every AAC_PCE_LAYOUTS layout, the loudness it measures is unchanged, so the prefetch serves the track. An opus relabel or an ac3
+                    // re-matrix is already the filter's start.
                     replaceInPlace(outputAudioIdx, `${audioEncoder(targetCodec)}${dstBitArg} -filter:a:${outputAudioIdx} `
-                        + `"${loudnormRelabel ? filter : pceRelabel(ffstream, filter)}"${loudnormEncodeStamp(outputAudioIdx, record)}`, record);
+                        + `"${preFilter ? filter : pceRelabel(ffstream, filter)}"${loudnormEncodeStamp(outputAudioIdx, record)}`, record);
                 }
                 convert = true;
             }
@@ -5069,10 +5292,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.infoLog += workDone + skipDone;
         if (convert === true) {
             // Dispositions (default flag) are intentionally untouched: ffmpeg copies the source disposition onto mapped/transcoded outputs, so a downmix from a
-            // default-flagged source also carries default - two default tracks, acceptable (near-identical content, players cope); reassigning default is
-            // outside this plugin's scope. An mp4-family output keeps a sibling's GLOBAL awk_* marker (clean_and_remux's awk_recovered, say) only under
-            // use_metadata_tags, so mp4TagPlan sets it exactly when one is there; this plugin writes no global tag of its own. (Per-stream custom tags like
-            // awk_loudnorm are NOT rescued by the flag, verified against the real mov muxer - why loudnorm caches on Matroska only; see loudnormTagPersists.)
+            // default-flagged source also carries default - two default tracks, acceptable (near-identical content, players cope). Likewise a removal that
+            // takes the default-flagged track can leave no default audio: ffmpeg auto-defaults the first track of a type only when two or more undefaulted ones
+            // remain and the command carries no -disposition, so a lone survivor (which every player plays anyway) or a run writing a -disposition (a cover's
+            // attached_pic, say) leaves none, and a player then picks by its language preference. Reassigning default is outside this plugin's scope:
+            // stream_ordering, designed to run last, gives the sole default to the first main track. An mp4-family output keeps a sibling's GLOBAL awk_* marker
+            // (clean_and_remux's awk_recovered, say) only under use_metadata_tags, so mp4TagPlan sets it exactly when one is there; this plugin writes no
+            // global tag of its own. (Per-stream custom tags like awk_loudnorm are NOT rescued by the flag, verified against the real mov muxer - why loudnorm
+            // caches on Matroska only; see loudnormTagPersists.)
             const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags);
             const uncopyable = mp4UncopyableStreams(dstContainer, file.ffProbeData.streams);
             const staged = stageMatroskaCovers(dstContainer, matroskaCovers(dstContainer, file.ffProbeData.streams), file.file, otherArguments,
