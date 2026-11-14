@@ -43,7 +43,7 @@ const details = () => ({
                 stream_ordering (last). If the file has embedded closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that
                 destroys them. Extract with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since
                 the sidecars would land beside the source, where the output never sees them.`,
-    Version: '3.999.102',
+    Version: '3.999.103',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -137,11 +137,11 @@ const details = () => ({
                 off as success), styling such as italics and colour is dropped, two caption services sharing one field (CC1 and CC2 at once) come out mixed
                 in one subtitle, a CEA-708 service is never read (no ffmpeg reader can extract one), and roll-up captions repeat each line across three cues,
                 which is what roll-up is rather than a fault.
-                \\nRemoving the captions from the video is remove_source's decision, as for any other subtitle, and waits until both fields are out where the
-                file can record its reads (an mkv or mp4-family file); on any other container a sidecar of either caption field alone still lets it run
-                (an earlier version's, or one whose other field could not be placed or was deleted). It removes ALL caption data in the video, a CEA-708
-                service included. It needs either a compatible source (H.264 whose keyframes are all IDR frames, not HDR, not Dolby Vision) or a later
-                re-encode by video_clean, which picks the request up automatically.`,
+                \\nRemoving the captions from the video is remove_source's decision, as for any other subtitle, and waits until both fields have been read,
+                reading a field first where it can - one never read, or one with no sidecar on a container that cannot record its reads (anything but mkv or
+                mp4-family) - at one more decode. Keep both caption sidecars until then: one deleted after its field was read is not always read again before
+                the removal. It removes ALL caption data in the video, a CEA-708 service included. It needs either a compatible source (H.264 whose keyframes
+                are all IDR frames, not HDR, not Dolby Vision) or a later re-encode by video_clean, which picks the request up automatically.`,
         },
         {
             name: 'remove_source',
@@ -3284,13 +3284,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!dest) { response.infoLog += `☒[method_unmapped=text_file] Cannot work out the server path for ${logSafe(rel)}\n`; continue; }
             const dl = downloadLibraryFile(dest, path.join(libDir, rel));
             if (dl.ok) { got.push(rel); continue; }
+            // A caption staging file fetched by name (ccUnlisted) may not be on the list at all, and this pass placed or found it, so its failure line makes
+            // no claim about the list, nor that an earlier pass embedded it.
+            if (byName) { response.infoLog += `☒[method_unmapped=text_file] Could not fetch ${logSafe(rel)} back from the library - ${dl.why}\n`; continue; }
             if (embeddedAlready && embeddedAlready.has(rel)) {
                 response.infoLog += `☑[method_unmapped=text_file] ${subtitleListName} still lists ${logSafe(rel)}, which an earlier pass already embedded`
                     + ' and removed\n';
                 continue;
             }
-            // A caption staging file fetched by name (ccUnlisted) may not be on the list at all, so its failure line makes no claim about the list.
-            if (byName) { response.infoLog += `☒[method_unmapped=text_file] Could not fetch ${logSafe(rel)} back from the library - ${dl.why}\n`; continue; }
             response.infoLog += `☒[method_unmapped=text_file] ${subtitleListName} lists ${logSafe(rel)} but it could not be fetched - ${dl.why}\n`;
         }
         return got;
@@ -3348,7 +3349,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (full !== path.resolve(workLibDir()) && !full.startsWith(path.resolve(workLibDir()) + path.sep)) {
                 bad.push([entry, 'resolves outside the video\'s folder']); continue;
             }
-            ok.push(norm);
+            // In the one spelling every name test compares (the caption stop, isCcSidecar, the marker): './x' and 'subs//x' as 'x' and 'subs/x'.
+            ok.push(path.posix.normalize(norm));
         }
         return { ok, bad };
     };
@@ -4893,9 +4895,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const ccPresetOutputs = (fields) => fields.map((f, i) => `-map ${1 + i}:s:0 -c:s text -f srt "${libPathOf(ccNameOf(f))}"`).join(' ');
         // A caption sidecar moved aside is kept beside it as a hidden, content-named copy - .<name>.<first 8 hex of the sha1 of its text>.prev - so each
         // distinct text (a hand edit, a swapped-out video's captions) keeps its own file and none is ever written over. The import scan never parses a .prev
-        // (no subtitle extension) and media servers skip dotfiles.
+        // (no subtitle extension) and media servers skip dotfiles. A name the 15 extra bytes take over NAME_BYTE_CAP is .awk_cc.<8 hex>.prev instead, which
+        // still never writes over a different text: it is keyed on the text alone.
         const sha8 = (text) => crypto.createHash('sha1').update(text).digest('hex').slice(0, 8);
-        const prevNameOf = (name, h) => `.${name.replace(/^\./, '')}.${h}.prev`;
+        const prevNameOf = (name, h) => {
+            const long = `.${name.replace(/^\./, '')}.${h}.prev`;
+            return Buffer.byteLength(long, 'utf8') <= NAME_BYTE_CAP ? long : `.awk_cc.${h}.prev`;
+        };
         // A caption sidecar ccPlan found in the library on a LOCAL view, judged as field 1's or field 2's: { plan } answers the plan outright, { leftoverNote }
         // means it was cleared away and the captions are read again, and { state, field, name, note } reports it 'text' (the captions are out), 'kept' (it is
         // their only copy) or 'empty' (judged, and unlinked unless `unlinked` says otherwise).
@@ -4997,8 +5003,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // mount, read-only included - it can also be opened, which is the only way to tell a field that carried no text from one that was never read: A53
             // side data is present whether or not anyone was speaking, so an empty field looks exactly like a full one to the probe. On the API route an
             // unconfirmed answer stops here: a job would upload over whatever is there, and the captions stay put for a later pass; a sidecar the server holds
-            // is trusted as it is, unless the read behind it was withdrawn or no longer matches the video. Returns null when that spelling is absent, {
-            // remote } for a trusted one on the server, or what judgeLocalCaptionSidecar answers.
+            // is trusted as it is, unless the read behind it was withdrawn or no longer matches a video that may still carry captions. Returns null when that
+            // spelling is absent, { remote } for a trusted one on the server, or what judgeLocalCaptionSidecar answers.
             const lookFor = (at, field) => {
                 const atFull = libPathOf(at);
                 const remote = readViaApi() ? sidecarExistsRemote(placeViaApi() ? serverDestFor(at) : '') : null;
@@ -5016,7 +5022,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     : ((() => { try { return fs.existsSync(atFull) ? 'local' : ''; } catch (e) { return ''; } })());
                 if (existing === 'remote') {
                     const stale = ccWithdrawn ? 'video_clean withdrew the caption read' : ccReadStaleWhy();
-                    if (!stale) return { remote: at };
+                    // With no captions left in the video it is their only copy, as the local judge keeps one.
+                    if (!stale || ccProbeVerdict() === false) return { remote: at };
                     return { plan: { job: null, untrusted: true, note: `☒[embedded_cc=enabled] ${at} in the library was read from another video (${stale}) -`
                         + ' not importing it or removing any captions; delete it and requeue to read this video\'s captions\n' } };
                 }
@@ -5099,6 +5106,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (texts.length) {
                 const owed = action === 'extract' && removeSource && !texts.some((s) => s.state === 'kept') && ccProbeVerdict() === true;
                 const out = texts.filter((s) => s.state === 'text').map((s) => s.name);
+                // A field with no sidecar judged this pass is read again before a strip that would go without it, as the owed field-2 read above: either
+                // field where the container records no reads (an earlier version read field 1 alone), and field 1 behind its read on record (its sidecar
+                // deleted or renamed since) - field 2's absence there is its empty verdict (clearNote). Not where the strip is refused, which no read can
+                // change, so it would repeat every pass. On the API placement route the read finishes in this pass and the strip follows it there, an
+                // empty field included (stripOwed); field 1 is not read there, because an empty read leaves the next pass nothing to judge and
+                // ccStripReady stands no field-1 read on field 2's.
+                const reread = owed && !ccStripRefusal() ? [1, 2].find((f) => !judged.some((s) => s.field === f)
+                    && (f === 1 ? !placeViaApi() && (!canRecord || ccHas(CC_TOKENS.decoded) || ccHas(CC_TOKENS.decoded2)) : !canRecord)) : 0;
+                if (reread) {
+                    return { job: { fields: [reread] }, stripOwed: placeViaApi(), note: `${notes}☐${streamTag(ccVideo.index)}[embedded_cc=enabled] Caption`
+                        + ` field ${reread} has no sidecar beside ${out.join(', ')} - reading it to ${ccNameOf(reread)} before the captions can be removed\n` };
+                }
                 const now = owed && ccStripReady() && !ccStripRefusal();
                 return { job: null, stripOwed: owed, note: `${notes}${judged.filter((s) => s.state === 'empty').map(emptyLine).join('')}${out.length
                     ? `☑[embedded_cc=enabled] Captions already extracted to ${out.join(', ')}${now
@@ -5948,8 +5967,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // is subInScopeLogged above; on the text_file route it already ran against the listed names, and re-testing the fetched survivors here passes silently.
         const scanParsed = scan.rels.map((rel) => [rel, parseSidecarRel(rel)]);
         // A held pass drops the caption sidecars, except one an earlier pass imported: the marker is written whole, so it must stay to be carried forward.
+        // Both caption sidecars carry the video's index, so the field-2 one is put after the rest at that index, or 'CC3' would sort ahead of field 1's.
+        const isCc2 = (f) => Number(!!ccName2 && (f.rel === ccName2 || f.rel === ccName2Bare));
         const found = scanParsed.map(([, f]) => f).filter(Boolean)
-            .sort(byOriginalPosition)
+            .sort((a, b) => (a.index === b.index && isCc2(a) - isCc2(b)) || byOriginalPosition(a, b))
             .filter(subInScopeLogged)
             .filter((f) => !ccHold || !isCcSidecar(f.rel) || importedSet.has(f.rel));
         // A file that LOOKS like a subtitle but does not parse as a sidecar is almost always a hand-named one, and saying nothing about it turns a typo into
@@ -6368,7 +6389,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += '☒[remove_source=true] Every sidecar is already in the file and this node cannot delete them from the library - '
                 + 'remuxing losslessly, since only an accepted transcode gives the server a pass in which to do it\n';
             for (const rel of stranded) response.infoLog += `☐[remove_source=true] Queued for removal once accepted: ${rel}\n`;
-            return commitWithExpected(` -map 0 -c copy${globalMetaArg(SUB_MARKER_TAG, encodeMarkerEntries(markerFor(markList)))}`, streams);
+            return commitWithExpected(` -map 0 -c copy${globalMetaArg(SUB_MARKER_TAG, encodeMarkerEntries(markerFor(markList)))}${
+                ccApiRead.length ? ccTagArg(...ccApiRead) : ''}`, streams);   // see endImport
         }
         // Deleting them also needs the file this pass read, the one the content check above hashed, to BE the library file: the text is then in the library
         // when the sidecar goes, so a job that is rejected, cancelled or failed cannot lose it. A plugin after this one in the same job that drops the track
@@ -6481,8 +6503,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // video shows the user both at once. Same two routes: strip in this very -c copy pass where the source qualifies, otherwise record the
             // request for video_clean's next re-encode. `imported` is kept alongside `strip` rather than replaced by it, because that token is the
             // memo that stops this plugin decoding the captions out all over again; only the pair says both things at once.
-            // Both fields must be out first (ccStripReady), and a request already on record is video_clean's to serve (see ccPlan).
-            if (consumed.some(isCcSidecar)) {
+            // Both fields must be out first (ccStripReady), and a request already on record is video_clean's to serve (see ccPlan). A held pass records
+            // only the read, whatever caption sidecar the marker carried through it (see ccHold).
+            if (consumed.some(isCcSidecar) && !ccHold) {
                 const ccAdd = [CC_TOKENS.imported];
                 if (removeSource && ccStripReady() && !ccHas(CC_TOKENS.strip)) {
                     const why = ccStripRefusal();
@@ -6495,6 +6518,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         ccAdd.push(CC_TOKENS.strip);
                         response.infoLog += ccDeferNote(ccVideo.index, why);
                     }
+                } else if (removeSource && !ccHas(CC_TOKENS.strip) && !ccHas(CC_TOKENS.removed) && ccProbeVerdict() !== false) {
+                    response.infoLog += `☒${streamTag(ccVideo.index)}[remove_source=true] Not removing the closed captions from the video bitstream - that`
+                        + ` waits for a finished read of both caption fields, and none stands behind ${consumed.filter(isCcSidecar).join(', ')}\n`;
                 }
                 meta += ccTagArg(...ccAdd, ...ccApiRead);
             } else if (ccApiRead.length) {
