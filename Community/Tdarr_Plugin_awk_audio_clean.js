@@ -15,7 +15,7 @@ const details = () => ({
                   closed captions); stream_ordering last.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.98',
+    Version: '4.999.99',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -3543,8 +3543,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Why `codec` cannot take this track at its own channel count, as the clause a skip line ends on ('' when it can); the track is then left as it is
         // rather than encoded. Native aac refuses AAC_REFUSED_LAYOUTS and every custom order (exit 234 on every requeue). ac3/eac3 take a custom order but
         // re-matrix it to a layout nobody measured - on jellyfin-ffmpeg 7.1.4 '4 channels (FL+FR+TFL+TFR)' came out stereo at -18.20 LUFS and '6 channels
-        // (FL+FR+FC+LFE+FLC+FRC)' as 3.1 - so the written count, the loudness and the stamp would all be guesses. A fold to stereo or 5.1 is not affected:
-        // swresample folds a custom order by its speakers.
+        // (FL+FR+FC+LFE+FLC+FRC)' as 3.1 - so the written count, the loudness and the stamp would all be guesses. A fold to stereo or 5.1 is not refused
+        // here: speakerPrefold says what swresample makes of a custom order.
         const layoutRefusal = (codec, stream) => {
             const family = aacFamily(codec);
             const shown = logSafe(String(stream?.channel_layout || '').trim(), LAYOUT_LOG_MAX);
@@ -3589,10 +3589,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // carry no meaning at all - measured on jellyfin-ffmpeg 7.1.4, a 6ch one to native aac exits 234 'Unsupported channel layout "6 channels"', and a 3ch
         // one to ac3 behind loudnorm comes out with its third channel silent), and any codec at 3 or 7 channels, whose count default puts an LFE where a
         // full-range speaker sits (3 decodes as 2.1, so a 3.0's centre - its dialogue - is taken as LFE, and 7 as 6.1, so a 7.0's back left is): measured on
-        // PCM in Matroska, a stereo fold drops that channel, a 5.1 fold puts it on the LFE, and at 3 channels ac3 and native aac write it silent. At 5, 6 and 8
-        // channels the default (5.0, 5.1, 7.1) is the common real layout, so those still convert. Matroska keeps no PCM layout at all, so a PCM written from a
-        // layout other than its count's default is converted on that default: a 6.0's back centre lands on the LFE that ac3 band-limits away - an accepted
-        // upstream residual.
+        // PCM in Matroska, a stereo fold drops that channel, a 5.1 fold puts it on the LFE, and at 3 channels ac3 and native aac write it silent. At 4, 5, 6
+        // and 8 channels the default (4.0, 5.0, 5.1, 7.1) is the common real layout, so those still convert. Matroska keeps no PCM layout at all, so a PCM
+        // written from another layout of that count is converted on the default - an accepted upstream residual: a quad's back pair lands on the centre and
+        // back centre (moved, none dropped), and a 6.0's back centre, a 6.0(front)'s right-of-centre and a hexagonal's or octagonal's back left land on the
+        // LFE, which a stereo fold drops and ac3 band-limits away. Above 8 channels the count default is a height layout (10 5.1.4, 12 7.1.4, 14 9.1.4,
+        // 16 hexadecagonal, 24 22.2), and a fold takes the track as that layout (speakerPrefold).
         const noLayoutGuess = (s) => codecFamilyOf(s) !== 'aac' && noLayout(s)
             && (codecFamilyOf(s) === 'opus' ? s.awkChannels > 2 : [3, 7].includes(s.awkChannels));
         // A decode no encoder or fold can place by its layout: a PCE MediaInfo does not identify, a no-layout guess above, and an ambisonic layout, which
@@ -3601,8 +3603,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The one decode layoutUnplaceable must not stop: an opus with no layout re-encoded to opus in place, which keeps its mapping family 255 (the encode
         // carries -mapping_family 255). Measured on jellyfin-ffmpeg 7.1.4 through loudnorm at 3 to 8 channels, in mkv and mp4: exit 0, every channel at its
         // own index, and the output still reads no layout, so a later pass stops it from the same conversions. libopus's default mapping instead takes the
-        // count's Vorbis layout: it moved channels at 5 and 7 (5.0, 6.1) and labelled every count, which a later pass would then convert or fold by.
-        const opusInPlace = (s, targetCodec) => aacFamily(targetCodec) === 'opus' && codecFamilyOf(s) === 'opus' && noLayout(s);
+        // count's Vorbis layout: it moved channels at 5 and 7 (5.0, 6.1) and labelled every count, which a later pass would then convert or fold by. At 1 and
+        // 2 channels that default is right: measured the same way, it keeps both channels in place and labels the track mono or stereo, where family 255
+        // writes it unlabelled again, so a mono or stereo opus takes the default mapping.
+        const opusInPlace = (s, targetCodec) => aacFamily(targetCodec) === 'opus' && codecFamilyOf(s) === 'opus' && noLayout(s) && s.awkChannels > 2;
         // Every decode of a named PCE that feeds an encoder or a fold starts with this relabel, `filter` chained behind it. Without it the decode takes the
         // channel count's default layout and every encoder and fold places the speakers by that: measured 2026-11-11 on jellyfin-ffmpeg 7.1.4, one tone per
         // speaker, ac3/eac3 put 3.1's centre and LFE and 4.1's LFE and back centre on the surrounds, libopus takes 4.1, 7.0, 7.1(wide) and octagonal as
@@ -4682,6 +4686,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // as "LFE", panning a back-center where a surround belongs - audio that sounds wrong with no error. The matrix is built from speaker roles (gains +
         // rationale at SPEAKER_GAINS below); a layout without a verified channel list returns null and the caller takes the plain aformat stereo fold
         // (foldFilter - the matrix -ac 2 uses). Channel lists verified against ffmpeg-utils "Channel Layout" docs; array position is the pan filter's cN index.
+        // speakerPrefold reads the same lists.
         const CANON_LAYOUTS = {
             '3.1':            ['FL', 'FR', 'FC', 'LFE'],
             '4.0':            ['FL', 'FR', 'FC', 'BC'],
@@ -4705,12 +4710,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             '7.1.4':          ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'SL', 'SR', 'TFL', 'TFR', 'TBL', 'TBR'],
             '7.2.3':          ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'SL', 'SR', 'TFL', 'TFR', 'TBC', 'LFE2'],
             '9.1.4':          ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'FLC', 'FRC', 'SL', 'SR', 'TFL', 'TFR', 'TBL', 'TBR'],
+            'hexadecagonal':  ['FL', 'FR', 'FC', 'BL', 'BR', 'BC', 'SL', 'SR', 'TFL', 'TFC', 'TFR', 'TBL', 'TBC', 'TBR', 'WL', 'WR'],
+            '22.2':           ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'FLC', 'FRC', 'BC', 'SL', 'SR', 'TC', 'TFL', 'TFC', 'TFR', 'TBL', 'TBC', 'TBR', 'LFE2',
+                'TSL', 'TSR', 'BFC', 'BFL', 'BFR'],
         };
 
         // Per-speaker contribution to the L and R downmix outputs - the standard Lo/Ro gains, matching what Blu-ray players, AV receivers and streaming
         // services do. FL/FR pass at full scale (peak 1.0); FC folds in at -3 dB (0.707) into both sides so dialogue stays clear; back/side/wide and the
-        // height speakers fold at -3 dB into their own side; any other centred channel (BC, TBC) splits equally to both; an LFE contributes nothing (dropping
-        // it avoids mud). These gains do NOT keep a hot mix under full scale - a fold sums several channels - which is what FOLD_LIMITER is for.
+        // height and bottom speakers fold at -3 dB into their own side; any other centred channel (BC, TC, TFC, TBC, BFC) splits equally to both; an LFE
+        // contributes nothing (dropping it avoids mud). These gains do NOT keep a hot mix under full scale - a fold sums several channels - which is what
+        // FOLD_LIMITER is for.
         const SPEAKER_GAINS = {
             FL:  { L: 1.0,   R: 0     },
             FR:  { L: 0,     R: 1.0   },
@@ -4725,9 +4734,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             BC:  { L: 0.5,   R: 0.5   },
             TFL: { L: 0.707, R: 0     },
             TFR: { L: 0,     R: 0.707 },
+            TFC: { L: 0.5,   R: 0.5   },
             TBL: { L: 0.707, R: 0     },
             TBR: { L: 0,     R: 0.707 },
             TBC: { L: 0.5,   R: 0.5   },
+            TC:  { L: 0.5,   R: 0.5   },
+            WL:  { L: 0.707, R: 0     },
+            WR:  { L: 0,     R: 0.707 },
+            TSL: { L: 0.707, R: 0     },
+            TSR: { L: 0,     R: 0.707 },
+            BFL: { L: 0.707, R: 0     },
+            BFR: { L: 0,     R: 0.707 },
+            BFC: { L: 0.5,   R: 0.5   },
             LFE2: { L: 0,    R: 0     },
         };
 
@@ -4791,19 +4809,40 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // (54 samples over), while at -2 aac, eac3 and opus all decoded under full scale on all three. The cost is integrated loudness on a peaky mix: 0.0 /
         // 0.9 / 0.9 LU on the three (-1 dBFS cost 0.0 / 0.5 / 0.7). A global sum-normalisation would also stop the clipping, at 6-8 dB of lost level.
         const FOLD_LIMITER = 'alimiter=limit=0.794:level=0:latency=1';
-        // swresample's fold has no rule for the top-back speakers (TBL, TBR, TBC) or a second LFE: measured on jellyfin-ffmpeg 7.1.4 with one tone per
-        // speaker, its stereo and 5.1 folds of cube, 5.1.4, 7.1.4, 9.1.4 and 7.2.3 drop them silently, while every other standard layout of up to 14
-        // channels folds in full. So ahead of that fold a pan sends each into its own side's back speaker (or surround, when there is no back pair) at
-        // -3 dB, a top-back centre into both at -6 dB and LFE2 into the LFE, leaving a layout swresample folds in full (measured: every tone kept, to
-        // stereo and to 5.1, on all five). The 16- and 24-channel broadcast layouts (hexadecagonal, 22.2) lose more speakers still and are left as they are.
-        const TOP_BACK_INTO = { TBL: [['BL', 'SL'], 0.707], TBR: [['BR', 'SR'], 0.707], TBC: [['BL', 'SL'], 0.5, ['BR', 'SR']], LFE2: [['LFE'], 1] };
-        const topBackPrefold = (src) => {
-            const list = CANON_LAYOUTS[layoutKeyOf(src)];
-            if (!list || Number(src?.channels) !== list.length || !list.some((c) => c in TOP_BACK_INTO)) return '';
-            const keep = list.filter((c) => !(c in TOP_BACK_INTO));
+        // swresample's fold places only FL, FR, FC, LFE, BL, BR, FLC, FRC, BC, SL, SR, TFL and TFR, and only in libavutil's channel order (PREFOLD_KEPT):
+        // measured on jellyfin-ffmpeg 7.1.4 with one tone per speaker, its stereo and 5.1 folds keep every one of those, silently drop every other speaker
+        // (TC, TFC, TBL, TBC, TBR, WL, WR, TSL, TSR, BFC, BFL, BFR, SDL, SDR, SSL, SSR, TTL, TTR, DL, DR, and LFE2 from a 5.1), a 22.2 losing its SL, SR,
+        // TFL and TFR as well, and refuse a custom order outside libavutil's order outright ('Input channel layout ... is not supported', exit 234). So
+        // ahead of that fold a pan writes the kept speakers in PREFOLD_KEPT's order and sends each dropped one into the nearest one the track keeps (the
+        // first of its PREFOLD_INTO list the track has): a left or right speaker into the ear-level one beneath or beside it at -3 dB, a centred one into
+        // the centre beneath it at -3 dB or into each side of a pair at -6 dB, LFE2 into the LFE. Measured: every tone kept, to stereo and to 5.1, on
+        // cube, 5.1.4, 7.1.4, 7.2.3, 9.1.4, hexadecagonal and 22.2, named and with no stored layout, and on custom orders in and out of libavutil's order.
+        // A track with no dropped speaker, or one holding DL or DR (a stereo downmix carried beside the mix, which has no row), takes the plain fold:
+        // that drops DL and DR, and swresample refuses it out of libavutil's order.
+        const PREFOLD_KEPT = ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'FLC', 'FRC', 'BC', 'SL', 'SR', 'TFL', 'TFR'];
+        // A Map, so a custom order's spelling never reads a prototype member.
+        const PREFOLD_INTO = new Map([
+            ['TBL', [['BL', 'SL'], 0.707]], ['TBR', [['BR', 'SR'], 0.707]], ['TSL', [['SL', 'BL'], 0.707]], ['TSR', [['SR', 'BR'], 0.707]],
+            ['TTL', [['SL', 'BL'], 0.707]], ['TTR', [['SR', 'BR'], 0.707]], ['SDL', [['SL', 'BL'], 0.707]], ['SDR', [['SR', 'BR'], 0.707]],
+            ['SSL', [['SL', 'BL'], 0.707]], ['SSR', [['SR', 'BR'], 0.707]], ['WL', [['FL'], 0.707]], ['WR', [['FR'], 0.707]], ['BFL', [['FL'], 0.707]],
+            ['BFR', [['FR'], 0.707]], ['TFC', [['FC'], 0.707]], ['BFC', [['FC'], 0.707]], ['TBC', [['BL', 'SL'], 0.5, ['BR', 'SR']]],
+            ['TC', [['SL', 'BL'], 0.5, ['SR', 'BR']]], ['LFE2', [['LFE'], 1]],
+        ]);
+        // The layout ffmpeg decodes a track with no stored layout as, by channel count (measured on a PCM in Matroska; no other count has one).
+        const PREFOLD_COUNT_DEFAULT = new Map([[10, '5.1.4'], [12, '7.1.4'], [14, '9.1.4'], [16, 'hexadecagonal'], [24, '22.2']]);
+        // The track's speakers by index - its CANON_LAYOUTS list, the speakers ffprobe spells a custom order by, or its count default when no layout is
+        // stored - then the pan. '' (the plain fold) when nothing is dropped, the count disagrees with the list, a speaker is in neither table, or a
+        // dropped one has nowhere listed to go.
+        const speakerPrefold = (src) => {
+            const spelled = customOrder(src) ? /^\d+ channels \((.+)\)$/.exec(String(src.channel_layout).trim())?.[1].split('+') : undefined;
+            const counted = noLayout(src) ? CANON_LAYOUTS[PREFOLD_COUNT_DEFAULT.get(Number(src.channels))] : undefined;
+            const list = CANON_LAYOUTS[layoutKeyOf(src)] || spelled || counted;
+            if (!list || Number(src?.channels) !== list.length || !list.some((c) => PREFOLD_INTO.has(c))
+                || !list.every((c) => PREFOLD_INTO.has(c) || PREFOLD_KEPT.includes(c))) return '';
+            const keep = PREFOLD_KEPT.filter((c) => list.includes(c));
             const terms = Object.fromEntries(keep.map((c) => [c, [`c${list.indexOf(c)}`]]));
-            for (const c of list.filter((x) => x in TOP_BACK_INTO)) {
-                const [first, gain, second] = TOP_BACK_INTO[c];
+            for (const c of list.filter((x) => PREFOLD_INTO.has(x))) {
+                const [first, gain, second] = PREFOLD_INTO.get(c);
                 for (const opts of second ? [first, second] : [first]) {
                     const to = opts.find((t) => keep.includes(t));
                     if (!to) return '';
@@ -4815,7 +4854,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // A named PCE source is relabelled ahead of the fold (pceRelabel).
         const foldFilter = (src, layout, matrix) => {
             if (matrix) return pceRelabel(src, `aformat=sample_fmts=fltp,${matrix},${FOLD_LIMITER}`);
-            const prefold = topBackPrefold(src);
+            const prefold = speakerPrefold(src);
             const pre = prefold ? `,${prefold},aformat=sample_fmts=fltp` : '';
             return pceRelabel(src, `aformat=sample_fmts=fltp${pre}:channel_layouts=${layout},${FOLD_LIMITER}`);
         };
@@ -5425,7 +5464,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const sameFormat = targetCodecFamily === codecFamilyOf(ffstream);
                     const matchedBps = sameFormat ? sameFormatBitrate(targetCodecFamily, channels, srcBitrate) : 0;
                     const dstBps = matchedBps || resolveBitrate(targetCodec, channels, srcBitrate, ffstream.awkLossless, ffstream.awkQuality);
-                    // An opus with no layout keeps mapping family 255, so libopus writes its channels back by index (opusInPlace).
+                    // An opus above two channels with no layout keeps mapping family 255, so libopus writes its channels back by index (opusInPlace).
                     const dstBitArg = `${encoderArgsBps(targetCodec, outputAudioIdx, dstBps)}`
                         + `${opusInPlace(ffstream, targetCodec) ? ` -mapping_family:a:${outputAudioIdx} 255` : ''}`;
                     const srcRateStr = srcRateToken(ffstream);
