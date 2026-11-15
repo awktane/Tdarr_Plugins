@@ -30,7 +30,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.84',
+    Version: '4.999.85',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -3410,12 +3410,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const deferredFontIndices = [];
 
         let exportRefusedCount = 0;   // image-sub exports that could not be written this run - any at all fails the file, see the check after the stream loop
-        // Styled bundles already on disk that could be neither trusted nor replaced (cut short, or undeletable). Unlike the other styled refusals the user can
-        // fix these, so the file fails with the styled original intact rather than flattening it to mov_text for good - see the check after the stream loop.
+        // Styled bundles a requeue can still export: one already on disk that could be neither trusted nor replaced (cut short, undeletable, a symbolic link),
+        // or an unmapped placement that did not complete (unconfirmedSidecars). Unlike the other styled refusals these clear, so the file fails with the styled
+        // original intact rather than flattening it to mov_text for good - see the check after the stream loop.
         let bundleHeldCount = 0;
         const placedSidecars = new Set(); const failedSidecars = new Map(); const emptySidecars = new Set();
-        // The subset of failedSidecars whose only fault is that the server could not say whether the sidecar is already there - a transient answer, not a
-        // placement that failed. A styled export never flattens over one (see the styled refusal).
+        // The subset of failedSidecars a requeue can clear: the server could not say whether the sidecar is already there, or the placement itself failed (an
+        // upload refused or timed out, a staging or extraction fault). A styled export never flattens over one (see the styled refusal); only a path no
+        // translator maps, a permanent gap, does.
         const unconfirmedSidecars = new Set();
         // The font attachments a styled-subtitle bundle carries. Read once here: they are the same set for every styled subtitle in the file, and the
         // pre-scan below needs them before the stream loop runs.
@@ -3469,6 +3471,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const stageSidecar = (ffstream, styled) => {
             const { name, mapTokens } = sidecarPlan(ffstream, styled);
             const sidecarPath = path.join(libDir, name);
+            // videoBase is the user's own filename and nothing bounds it, so the finished name can exceed the filesystem's 255-byte basename cap on its own.
+            // On a mapped node the sidecar and the strip are outputs of ONE ffmpeg command, so an over-long name does not merely lose the sidecar: ffmpeg
+            // answers "File name too long" and refuses EVERY output of the run, quarantining a file that re-fails on every requeue. On an unmapped node the
+            // server's filesystem refuses the upload after a full extraction, under a reason that never names the cause (the pre-scan skips such a name).
+            // Tested BEFORE the route and the path - it is a property of the name, not of the directory.
+            const bytes = Buffer.byteLength(name, 'utf8');
+            if (bytes > NAME_BYTE_CAP) return { status: 'refused', name, why: 'namecap', bytes };
             if (isUnmappedNode) {
                 if (placedSidecars.has(name)) return { status: 'placed', name };
                 if (trustedRemoteBundles.has(name)) return { status: 'exists', name };
@@ -3476,12 +3485,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (emptySidecars.has(name)) return { status: 'empty', name };
                 return { status: 'refused', name, why: unconfirmedSidecars.has(name) ? 'unconfirmed' : 'unmapped' };
             }
-            // videoBase is the user's own filename and nothing bounds it, so the finished name can exceed the filesystem's 255-byte basename cap on its own.
-            // The sidecar and the strip are outputs of ONE ffmpeg command, so an over-long name does not merely lose the sidecar: ffmpeg answers "File name
-            // too long" and refuses EVERY output of the run, quarantining a file that re-fails on every requeue. Tested BEFORE the path, not after - it is a
-            // property of the name, not of the directory.
-            const bytes = Buffer.byteLength(name, 'utf8');
-            if (bytes > NAME_BYTE_CAP) return { status: 'refused', name, why: 'namecap', bytes };
             if (!pathIsPresetSafe(sidecarPath)) return { status: 'refused', name, why: 'unsafe' };
             // A file an earlier pass left at this name. ffmpeg refuses to overwrite an existing output (no -y reaches the preset - it answers "Not overwriting
             // - exiting") and aborts the ENTIRE run, on every requeue, so whatever is not trusted is deleted before the export is queued. Zero bytes is never
@@ -3518,6 +3521,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const image = imageSubDropped(codec) && removeImageSubs === 'export';
                 if (!styled && !image) continue;
                 const { name, mapTokens } = sidecarPlan(s, styled);
+                if (Buffer.byteLength(name, 'utf8') > NAME_BYTE_CAP) continue;   // refused in the loop (stageSidecar), with nothing probed or uploaded
                 const dest = serverSidePath(path.join(libDir, name));
                 if (!dest) { failedSidecars.set(name, 'no path translator maps this library directory back to the server'); continue; }
                 // An image .sup is always extracted again and uploaded over whatever is there, as the mapped route deletes and re-exports one: the source
@@ -3532,6 +3536,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 try {
                     stageDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_bundlecheck_'));
                     const local = path.join(stageDir, 'b.mks');
+                    // Fetched whole, with no byte cap, deliberately: a bundle's size is its fonts, which the Matroska muxer writes ahead of the first cue
+                    // (measured: a 72 MB font at byte 97, the subtitle after it), so no text cap bounds it - and a cap whose 'over' meant trust would hand
+                    // a truncated large bundle the only copy, where judged here it is 'short' and held (measured: a killed export kept 385 of 600 cues).
                     there = sidecarExistsRemote(dest, local);
                     if (there.state === 'present') {
                         const judged = judgeBundle(local, s);
@@ -3554,7 +3561,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const { placed, failed, empty } = placeSidecars(exportJobs);
                 for (const n of placed) placedSidecars.add(n);
                 for (const n of empty) emptySidecars.add(n);
-                for (const [n, why] of failed) failedSidecars.set(n, why);
+                for (const [n, why] of failed) { failedSidecars.set(n, why); unconfirmedSidecars.add(n); }
             }
         }
 
@@ -3895,10 +3902,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     } else if (status === 'exists') {
                         workDone += `☑${inputTag} Styled-subtitle bundle already exists, not overwriting: ${sidecarName}\n`;
                     } else {
-                        // Except a bundle already in the library that is cut short, undeletable or a symbolic link, or a server that could not say whether one
-                        // is there: those clear on a requeue, so the file fails with the styled original intact instead of flattening it for good
-                        // (bundleHeldCount). The bundle route has no 'empty' answer of its own and does not need one: placeSidecars files an empty extraction
-                        // under BOTH empty and failed, so the unmapped refusal already names it ('extraction produced no data') rather than reading undefined.
+                        // Except a bundle already in the library that is cut short, undeletable or a symbolic link, or an unmapped placement that did not
+                        // complete (unconfirmedSidecars): those clear on a requeue, so the file fails with the styled original intact instead of flattening it
+                        // for good (bundleHeldCount). The bundle route has no 'empty' answer of its own and does not need one: placeSidecars files an empty
+                        // extraction under BOTH empty and failed, so the unmapped refusal already names it ('extraction produced no data') rather than reading
+                        // undefined.
                         const refusal = {
                             unmapped: `Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}; converting to mov_text instead,`
                                 + ' which loses the styling',
@@ -3909,8 +3917,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             leftover: `An incomplete ${sidecarName} from an earlier run could not be deleted to export it again - delete it and requeue`,
                             symlink: `${sidecarName} in the library is a symbolic link - not exporting through it, since it could point anywhere; remove it`
                                 + ' and requeue',
-                            unconfirmed: `Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}; a transient answer, so the`
-                                + ' styled subtitle is not flattened over it - requeue once the server answers',
+                            unconfirmed: `Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}; a fault a requeue can clear, so`
+                                + ' the styled subtitle is not flattened over it - requeue once it is resolved',
                             short: `${sidecarName} already in the library stops at ${Number(staged.end).toFixed(1)} s but this subtitle runs to `
                                 + `${Number(staged.streamEnd).toFixed(1)} s - a run that failed partway, or an edit that cut the end, so it cannot be `
                                 + 'trusted with the only copy - delete it and requeue to export the whole subtitle',
