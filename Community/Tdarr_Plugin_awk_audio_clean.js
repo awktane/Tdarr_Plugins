@@ -15,7 +15,7 @@ const details = () => ({
                   closed captions); stream_ordering last.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.97',
+    Version: '4.999.98',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -30,8 +30,9 @@ const details = () => ({
                 match literally.
                 \\nThese tracks are never protected by the guards, so the downmix always happens. A language in BOTH this list and language_surround is
                 treated as surround.
-                \\nWith method_deduplicate on, such a track is judged as the stereo it becomes, so one stereo of the language survives: one whose bitrate
-                is known outranks the fold, which has none, and an -error mode aborts before any encode.
+                \\nWith method_deduplicate on, such a track is judged as the stereo it becomes, so one stereo of the language survives (method_deduplicate
+                gives the ranking), a surround of the language that cannot be folded is removed beside a fold that survives, and an -error mode aborts
+                before any encode.
                 \\nExample:\\nspa,deu
                 \\nKeep the Spanish and German dubs, but only in stereo.`,
         },
@@ -255,8 +256,10 @@ const details = () => ({
                 that one key and two untagged tracks of genuinely different languages would otherwise look alike. An und track can neither be removed nor
                 be the survivor that removes another.
                 \\nA surround track the stereo tier (language_stereo, language_unlisted=stereo) folds to stereo in the same run is judged as the
-                codec_stereo stereo it becomes, before it is transcoded. It has no measured bitrate, so a stereo of its language whose bitrate is known
-                outranks it, and an -error mode aborts before any encode.
+                codec_stereo stereo it becomes, before it is transcoded: in an mp4, m4v, m4a or mov file at the bitrate its encode writes, elsewhere with no
+                measured bitrate, so there a stereo of its language whose bitrate is known outranks it. Two folds that tie are ranked by the tracks they are
+                made from, a fold never displaces a track guard_original keeps (the fold is removed instead), and a surround of the stereo tier that cannot
+                be folded is removed beside a fold of its language that survives. An -error mode aborts before any encode.
                 \\nA stream newly created by downmix_to_six or downmix_to_stereo is always kept. While downmix_to_six is enabled the 5.1/5.0 band (5-6
                 channels) forms its own role rather than folding into "surround", so a downmix-created 6 channel track is never dropped in favour of a
                 7.1; while downmix_to_stereo is enabled, exactly-2-channel tracks likewise form their own role rather than folding into "stereo", so a
@@ -3680,7 +3683,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             : (langStereoKeys.includes(s.awkMatchKey) ? 'language_stereo' : `language_unlisted=${langUnlisted}`));
         // A surround the stereo tier folds to a codec_stereo stereo this pass: the STEREO TIER fold arm acts on exactly these, and DEDUPLICATE judges
         // them as the stereo they become. Not one whose codec_stereo the container refuses, nor a decode no layout places (layoutUnplaceable): both are left as
-        // they are, each with its own line.
+        // they are, each with its own line, unless DEDUPLICATE removes one beside a fold of its language.
         const stereoTierFolds = (s) => s.awkTier === 'stereo' && s.awkChannels > 2 && !containerRefusesAudio(codecStereo) && !layoutUnplaceable(s);
 
         // ====== DEDUPLICATE ======
@@ -3724,13 +3727,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // when guard_lossless is disabled). hasKnownRate still gates the rate DISPLAY below (a lossless track with no bitrate simply shows no "@ N kb/s").
             const trustedRate = (s) => hasKnownRate(s) || s.awkLossless;
             // A surround the stereo tier folds this pass (stereoTierFolds) is grouped and ranked as the stereo the next pass reads back: codec_stereo's
-            // family at 2 channels, with no measured bitrate and none of the source's lossless, object-audio or Dolby Surround EX flags. So a fold that
-            // would duplicate a stereo of its language is removed here instead of encoded, and an -error mode stops the file before any encode. It is scored
-            // as a bare stream no probe joins to, so the source's own MediaInfo cannot refine the fold's codec (an eac3 fold of an Atmos track is plain
-            // eac3); foldOf keeps the source for the log, foldsBy the setting that folds it.
+            // family at 2 channels, with none of the source's lossless, object-audio or Dolby Surround EX flags. On an mp4-family output it carries the rate
+            // its encode asks for, which that muxer stores for the next pass to read (native aac at 256k reads back about its target on program content - 257k
+            // measured on jellyfin-ffmpeg 7.1.4 - and less on near-tonal content, 219k on a sine 5.1; aac_vbr is predicted as guardBlocks predicts it);
+            // elsewhere it has none. So the stereo the next pass would keep survives here: a fold that duplicates a stereo of its language is removed instead
+            // of encoded, or keeps the fold and removes that stereo, and an -error mode stops the file before any encode. It is scored as a bare stream no
+            // probe joins to, so the source's own MediaInfo cannot refine the fold's codec (an eac3 fold of an Atmos track is plain eac3); foldOf keeps the
+            // source for the log, foldsBy the setting that folds it.
             const foldCodec = aacFamily(codecStereo);
-            const asDeduped = (s) => (stereoTierFolds(s) ? { ...s, codec_name: foldCodec, channels: 2, awkChannels: 2, bit_rate: 0, awkLossless: false,
-                awkObjectAudio: false, awkMatrixSurround: false, awkQuality: audioQuality({ codec_name: foldCodec, channels: 2 }), foldOf: s,
+            const foldBps = isMp4Family(dstContainer) ? (codecStereo === 'aac_vbr' ? aacVbrPredictedBps(0) : resolveBitrate(codecStereo, 2)) : 0;
+            const asDeduped = (s) => (stereoTierFolds(s) ? { ...s, codec_name: foldCodec, channels: 2, awkChannels: 2, bit_rate: foldBps, awkLossless: false,
+                awkObjectAudio: false, awkMatrixSurround: false, awkQuality: audioQuality({ codec_name: foldCodec, channels: 2, bit_rate: foldBps }), foldOf: s,
                 foldsBy: tierTagOf(s) } : s);
             // A track as the guard-block, abort and removal lines show it: three renderings of the same comparison, of which one executes per hit. The rate
             // is shown for contrast, since duplicates are decided by quality score (largely bitrate-driven). The codec renders through codecDisplayName, so
@@ -3739,7 +3746,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const dedupTok = (x, withLang) => {
                 const t = x.foldOf || x;
                 return `${codecDisplayName(t)}${t.awkMatrixSurround ? ' dd-ex' : ''} ${t.channels}ch${withLang ? ` ${logSafe(t.awkRegionKey)}` : ''}`
-                    + `${hasKnownRate(t) ? ` @ ${kbpsToken(t.bit_rate)}` : ''}${x.foldOf ? `, folds to ${foldCodec} 2ch: ${x.foldsBy}` : ''}`;
+                    + `${hasKnownRate(t) ? ` @ ${kbpsToken(t.bit_rate)}` : ''}`
+                    + `${x.foldOf ? `, folds to ${foldCodec} 2ch${hasKnownRate(x) ? ` @ ${kbpsToken(x.bit_rate)}` : ''}: ${x.foldsBy}` : ''}`;
             };
             // On a quality tie, keep the higher channel count before falling back to index, so multi-stereo dedup collapsing a language's
             // surround variants keeps the 7.1 over a same-quality 5.1 (channel mode already tiers by exact count, so this only bites the broad
@@ -3747,10 +3755,44 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // copy with the object layer. Then a Dolby Surround EX (matrix-6.1) track is kept over a plain 5.1 twin for the same reason: the
             // EX copy carries an extra matrixed rear channel a non-EX decoder folds harmlessly, so keeping it is never worse. Both bumps
             // usually get separated by the score/bitrate first; the tie-breaks only matter when everything above them lands exactly equal.
-            const byQuality = audioStreams.map(asDeduped).sort((a, b) =>
-                (trustedRate(b) ? 1 : 0) - (trustedRate(a) ? 1 : 0) || b.awkQuality - a.awkQuality || b.awkChannels - a.awkChannels
-                || (b.awkObjectAudio ? 1 : 0) - (a.awkObjectAudio ? 1 : 0)
-                || (b.awkMatrixSurround ? 1 : 0) - (a.awkMatrixSurround ? 1 : 0) || a.index - b.index);
+            const rankOrder = (a, b) => (trustedRate(b) ? 1 : 0) - (trustedRate(a) ? 1 : 0) || b.awkQuality - a.awkQuality || b.awkChannels - a.awkChannels
+                || (b.awkObjectAudio ? 1 : 0) - (a.awkObjectAudio ? 1 : 0) || (b.awkMatrixSurround ? 1 : 0) - (a.awkMatrixSurround ? 1 : 0);
+            // Ties go by file order, except that a language's main folds trade places among themselves by their sources (foldSlot): the best-sourced fold takes
+            // the first fold's place, so the stereo kept is the one made from the better track (an ac3 5.1 @ 640k over an aac 7.1 @ 172k ahead of it) while a
+            // stereo of the same rank keeps its place against the folds. One total order: comparing two folds by source but a fold and a stereo by index went
+            // round in a cycle when the stereo sat between the folds, and kept the worse fold.
+            const views = audioStreams.map(asDeduped);
+            const foldSlot = new Map();
+            const foldsByLang = new Map();
+            for (const v of views.filter((x) => x.foldOf && !x.awkSecondaryTrack && x.awkLangKey !== 'und'))
+                foldsByLang.set(v.awkRegionKey, [...(foldsByLang.get(v.awkRegionKey) || []), v]);
+            for (const folds of foldsByLang.values()) {
+                const slots = folds.map((v) => v.index).sort((a, b) => a - b);
+                [...folds].sort((a, b) => rankOrder(a.foldOf, b.foldOf) || a.index - b.index).forEach((v, k) => foldSlot.set(v.index, slots[k]));
+            }
+            const slotOf = (v) => (foldSlot.has(v.index) ? foldSlot.get(v.index) : v.index);
+            const byQuality = views.sort((a, b) => rankOrder(a, b) || slotOf(a) - slotOf(b));
+            // The sort key that decided a pair, walking the same order rankOrder does ('' when everything ties). Quality is only the SECOND key, so a removed
+            // track can outscore its survivor (see dedupeGuardBlock's note) - and a removal decided on channels or a tiebreak explains nothing at all unless
+            // the survivor's channel count is rendered beside its bitrate.
+            const whyRanked = (s, kept) => {
+                if (!trustedRate(s) && trustedRate(kept)) return 'no measured bitrate';
+                if (s.awkQuality < kept.awkQuality) return 'lower quality';
+                if (s.channels < kept.channels) return 'fewer channels';
+                if (!s.awkObjectAudio && kept.awkObjectAudio) return 'no object audio';
+                return !s.awkMatrixSurround && kept.awkMatrixSurround ? 'no matrixed rear channel' : '';
+            };
+            // A duplicate's -error abort, or its removal and the line saying why; `tag` adds the setting that decided it beside method_deduplicate.
+            const dropDuplicate = (s, kept, why, tag = '') => {
+                const [rmTok, keptTok] = [dedupTok(s, true), dedupTok(kept, false)];
+                if (methodDeduplicateErrorMode) {
+                    failWithBuffers(`${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Duplicate audio track (${rmTok}) alongside stream `
+                        + `${kept.index} (${keptTok}) - aborting; tag/remove tracks manually and requeue, or switch method_deduplicate to a non-error mode`);
+                }
+                removedIndices.add(s.index);
+                workDone += `☐${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}]${tag} Removing duplicate (${why}: ${rmTok}) - keeping stream `
+                    + `${kept.index} (${keptTok})\n`;
+            };
             // Only worth reporting the und exemption below when two or more untagged MAIN tracks are present: a lone untagged track has nothing it could be
             // a duplicate of, so the exemption changes nothing there and a line about it would be noise on a very common file.
             const undMainCount = byQuality.filter((s) => !s.awkSecondaryTrack && s.awkLangKey === 'und').length;
@@ -3800,38 +3842,41 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const key = `${s.awkRegionKey}|${dedupBand}`;
                 if (seen.has(key)) {
                     const kept = seen.get(key);
-                    const rmTok = dedupTok(s, true);
-                    const keptTok = dedupTok(kept, false);
                     // A guard-blocked duplicate SURVIVES (documented in the method_deduplicate tooltip) - but say so, or a user with two obvious duplicates
                     // watches dedup do nothing and cannot tell an exemption from a bug. Same reasoning as the und and no-channel-count exemptions above, and
                     // it also has to precede the -error abort: a duplicate a guard is protecting is not a duplicate the user is being asked to resolve.
                     const guardBlock = dedupeGuardBlock(s, kept);
-                    if (guardBlock) {
-                        skipDone += `☒${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}][${guardBlock}] Keeping duplicate ${rmTok} - removing it `
-                            + `would lose detail stream ${kept.index} (${keptTok}) can't hold\n`;
+                    // A guarded track (a guard_original 'original' held at surround) that a fold outranks is not kept beside it: the fold is the one removed,
+                    // so the language ends with the one stereo the guard keeps on every container, rather than the guarded track plus a new encode that only
+                    // duplicates it. A fold is stereo tier, which no guard protects; the guarded track becomes the group's survivor.
+                    if (guardBlock && kept.foldOf) {
+                        dropDuplicate(kept, s, 'the track it duplicates is protected', `[${guardBlock}]`);
+                        seen.set(key, s);
                         continue;
                     }
-                    if (methodDeduplicateErrorMode) {
-                        failWithBuffers(`${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Duplicate audio track (${rmTok}) alongside stream `
-                            + `${kept.index} (${keptTok}) - aborting; tag/remove tracks manually and requeue, or switch method_deduplicate to a `
-                            + 'non-error mode');
+                    if (guardBlock) {
+                        skipDone += `☒${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}][${guardBlock}] Keeping duplicate ${dedupTok(s, true)} - `
+                            + `removing it would lose detail stream ${kept.index} (${dedupTok(kept, false)}) can't hold\n`;
+                        continue;
                     }
-                    removedIndices.add(s.index);
-                    // Name the sort key that actually decided this, walking the same order byQuality does. Quality is only the SECOND key, so a removed
-                    // track can outscore its survivor (see dedupeGuardBlock's note) - and a removal decided on channels or a tiebreak explains nothing at
-                    // all unless the survivor's channel count is rendered beside its bitrate.
-                    let why;
-                    if (!trustedRate(s) && trustedRate(kept)) why = 'no measured bitrate';
-                    else if (s.awkQuality < kept.awkQuality) why = 'lower quality';
-                    else if (s.channels < kept.channels) why = 'fewer channels';
-                    else if (!s.awkObjectAudio && kept.awkObjectAudio) why = 'no object audio';
-                    else if (!s.awkMatrixSurround && kept.awkMatrixSurround) why = 'no matrixed rear channel';
-                    else why = 'equal, keeping the earlier track';
-                    if (s.foldOf && !why.startsWith('equal')) why += ' once folded';   // the reason is the fold's, not that of the source the line names
-                    workDone += `☐${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}] Removing duplicate (${why}: ${rmTok}) - keeping stream `
-                        + `${kept.index} (${keptTok})\n`;
+                    // A fold's reason is the fold's, not that of the source the line names. Two folds that tie were ordered by their sources, and the
+                    // best-sourced fold can take a fold's place ahead of a stereo that ties it (foldSlot), which file order alone does not explain.
+                    const why = whyRanked(s, kept);
+                    const whySrc = !why && s.foldOf && kept.foldOf ? whyRanked(s.foldOf, kept.foldOf) : '';
+                    const slotted = !why && !s.foldOf && kept.foldOf && kept.index > s.index;
+                    dropDuplicate(s, kept, why ? `${why}${s.foldOf ? ' once folded' : ''}` : (whySrc ? `equal once folded; the source has ${whySrc}`
+                        : (slotted ? "equal, keeping the best-sourced fold in the first fold's place" : 'equal, keeping the earlier track')));
                 } else
                     seen.set(key, s);
+            }
+            // A stereo-tier surround the fold cannot reach (stereoTierFolds: a codec_stereo the container refuses, or a decode no layout places) holds the
+            // content a fold of its language carries, so beside one that survives it is removed as that fold's duplicate rather than kept at surround in a
+            // language the stereo tier holds in stereo. Secondaries and und tracks stay exempt, as above.
+            for (const s of byQuality) {
+                if (s.awkSecondaryTrack || s.awkLangKey === 'und' || s.awkTier !== 'stereo' || !(s.awkChannels > 2) || stereoTierFolds(s)
+                    || removedIndices.has(s.index)) continue;
+                const fold = byQuality.find((x) => x.foldOf && !x.awkSecondaryTrack && x.awkRegionKey === s.awkRegionKey && !removedIndices.has(x.index));
+                if (fold) dropDuplicate(s, fold, 'it cannot be folded to stereo');
             }
         }
         // ====== END DEDUPLICATE ======
@@ -4139,10 +4184,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             quiet_room: { I: -16, LRA: 6,  TP: -1.5 },
         };
         const LOUDNORM_TOLERANCE_LU = 1;
-        // How much wider a corrected track's loudness range may measure before its trial counts it as widened. loudnorm reads LRA off a histogram of 0.1 LU
-        // bins, so a pure gain moves the range by about one bin; 0.2 is margin over that. Measured on jellyfin-ffmpeg 7.1.4: linear corrections of +15 and
-        // +16 dB on two real tracks moved LRA by 0.0 and -0.1, while the dynamic-mode widenings this exists to catch were +1.8 to +5.5 LU.
-        const LOUDNORM_LRA_RESOLUTION_LU = 0.2;
+        // How much wider a corrected track's loudness range may measure before its trial counts it as widened: the range's own jitter, under the smallest
+        // real widening. Measured on jellyfin-ffmpeg 7.1.4: linear corrections of +15 and +16 dB on two real tracks moved LRA by 0.0 and -0.1 (loudnorm
+        // reads it off 0.1 LU bins), and dynamic mode moved near-flat ranges (LRA 0.3-0.5, synthetic bursts) by +0.2 to +0.5 LU, while the dynamic-mode
+        // widenings this exists to catch were +1.8 to +5.5 LU. Below 0.5 a near-flat track's verdict turns on 0.1 LU of that jitter, and under codec_force or
+        // a downmix a decline costs it a second lossy generation when the next pass corrects it.
+        const LOUDNORM_LRA_ALLOWANCE_LU = 0.5;
         // A trial runs loudnorm twice in dynamic mode (the correction, then the analysis) where the first pass runs it once: measured on jellyfin-ffmpeg 7.1.4
         // at 2.2 to 2.4 times the first pass's wall time, so its kill-switch is the first pass's budget scaled by this, keeping the same headroom. The
         // check of a limited trim (buildLoudnormFilter) is the same pass with a gain and a limiter added, and takes the same budget.
@@ -4279,7 +4326,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let loudnormCapWarned = false;
         // A sample rate read off either probe, as a plain integer in a real audio range - it is spliced into the filter string, so nothing else passes.
         const sampleRateOf = (v) => { const n = Number(v); return Number.isInteger(n) && n >= 8000 && n <= 768000 ? n : 0; };
-        // `recordDecline`: the caller copy-stamps a declined track it leaves as it was (the leftovers, on Matroska), so the decline line says so.
+        // `recordDecline`: the caller stamps a declined verdict (on Matroska: a leftover's copy stamp, a ride-along encode's stamp, the remix exit's fold
+        // stamp), so the decline line says so.
         const buildLoudnormFilter = (streamIndex, srcAudioIdx, preFilter, preset, recordDecline = false) => {
             if (loudnormMeasureCount >= LOUDNORM_MAX_TRACKS) {
                 if (!loudnormCapWarned) {
@@ -4344,13 +4392,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // track, whose first pass took 15 s).
             const passTimeoutMs = Math.round(loudnormAnalysisTimeoutMs * LOUDNORM_TRIAL_TIMEOUT_FACTOR);
             const srcLra = Number(stats.input_lra);
-            // A measured chain against the target and the source's range. The range is compared in hundredths, as loudnorm prints it: 14.10 + 0.2 is
-            // 14.299999... in floating point, which would call a 14.30 wider. A non-finite reading is off and wider, never accepted.
+            // A measured chain against the target and the source's range. The range is compared in hundredths, as loudnorm prints it: 1.10 - 0.60 is
+            // 0.5000000000000001 in floating point, which would call a 1.10 from 0.60 wider. A non-finite reading is off and wider, never accepted.
             const judge = (st) => {
                 const [i, lra, tp] = [st.input_i, st.input_lra, st.input_tp].map(Number);
                 const miss = Math.abs(i - preset.I);
                 return { i, lra, tp, miss, off: !(miss <= LOUDNORM_TOLERANCE_LU),
-                    wider: !(Math.round((lra - srcLra) * 100) <= Math.round(LOUDNORM_LRA_RESOLUTION_LU * 100)) };
+                    wider: !(Math.round((lra - srcLra) * 100) <= Math.round(LOUDNORM_LRA_ALLOWANCE_LU * 100)) };
             };
             const tried = measureLoudness(srcAudioIdx, chain(), preset, passTimeoutMs, 'trial');
             if (tried.error) failedPass('trial', tried.error);
@@ -4374,9 +4422,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const c = !trim || checked?.error ? null
                 : checked ? judge(checked.stats) : { ...t, i: t.i + trim, miss: Math.abs(t.i + trim - preset.I), off: false };
             // The one decision, on the best measurement there is: the trimmed chain when it lands closer to target than the trial and no wider than the
-            // source, else the untrimmed one; applied when that lands within LOUDNORM_TOLERANCE_LU and no wider, else the track keeps its loudness, unstamped,
-            // so a container that keeps no stamp declines it again next pass instead of spending another lossy generation on it. A trim check that fails
-            // to run leaves the untrimmed chain to decide - the trial already measured it - with a line saying so; a file is never failed over it.
+            // source, else the untrimmed one; applied when that lands within LOUDNORM_TOLERANCE_LU and no wider, else the track keeps its loudness (stamped
+            // only where the caller records the verdict), so a container that keeps no stamp declines it again next pass instead of spending another lossy
+            // generation on it. A trim check that fails to run leaves the untrimmed chain to decide - the trial already measured it - with a line saying so; a
+            // file is never failed over it.
             const best = c && c.miss < t.miss && !c.wider ? { filter: trimmed, r: c } : { filter: chain(), r: t };
             if (checked?.error) {
                 skipDone += `☒${streamTag(streamIndex)}[method_loudnorm=${methodLoudnorm}] The level trim after the loudness correction is left out - `
@@ -4402,12 +4451,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return { filter: best.filter, changed: true, measured: true };
         };
 
-        // Caching tag, stamped wherever this run measured the track: the leftovers loop below AND every re-encode a correction rode along on (downmix,
-        // codec_force, remix) - the ride-along sites measure and correct in the same command, so their output is at target just as surely, and skipping
-        // their stamp would cost a whole extra queue pass (re-measure, find within tolerance, remux the file to write nothing but this tag). Trusting the
-        // correction is measured-sound: a linear correction lands on target; a dynamic one is applied only when its trial, or the trim after it, lands within
-        // LOUDNORM_TOLERANCE_LU and no wider than its source (buildLoudnormFilter, which gives what is written its measured residual); and
-        // across nine source/preset/downmix combinations (incl. +37.7 dB and -7.5 dB corrections) the two-pass output landed at most 0.240 LU from target.
+        // Caching tag, stamped wherever this run measured the track or declined its correction: the leftovers loop below AND every re-encode a correction
+        // rode along on (downmix, codec_force, remix) - the ride-along sites measure and correct in the same command, so their output is at target just as
+        // surely, and skipping their stamp would cost a whole extra queue pass (re-measure, find within tolerance, remux the file to write nothing but this
+        // tag). Trusting the correction is measured-sound: a linear correction lands on target; a dynamic one is applied only when its trial, or the trim
+        // after it, lands within LOUDNORM_TOLERANCE_LU and no wider than its source (buildLoudnormFilter, which gives what is written its measured residual);
+        // and across nine source/preset/downmix combinations (incl. +37.7 dB and -7.5 dB corrections) the two-pass output landed at most 0.240 LU from target.
         // Matroska uppercases custom tag names on write, so read-back goes through getTagCI.
         const LOUDNORM_TAG = 'awk_loudnorm';   // named once: a read and a write that drift apart re-measure every track on every pass
         const readLoudnormTag = (stream) => getTagCI(stream.tags || {}, LOUDNORM_TAG).trim();
@@ -4418,14 +4467,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         //   <preset>-<version>-e.<codec>.<ch>        an encode this plugin made: codec family and the channels the encoder WRITES
         //   <preset>-<version>-c.<codec>.<ch>.<dig>  a track measured and left as it was (on target, or its correction declined); dig = audioDigest, or
         //                                            x when none was read
-        const LOUDNORM_STAMP_RE = /^([a-z_]+)(?:-[0-9][0-9.]*(?:-e\.([a-z0-9_]+)\.(\d+)|-c\.([a-z0-9_]+)\.(\d+)\.([0-9a-f]{8}|x))?)?$/;
-        // The current preset's stamp on a stream as { kind: 'e' | 'c' | '' (legacy), codec, channels, dig }, or null: no stamp, another preset's, or a value
-        // the grammar does not read - each measured like an unstamped track, with no line.
+        //   <preset>-<version>-f.<codec>.<ch>.<dig>  a track the opus-wall remix leaves as it was because its stereo FOLD measured on target or had its
+        //                                            correction declined: about the fold, not the track, so trusted only on that route (loudnormStampSkips).
+        //                                            A downgrade to stable 4.26.0, whose reader takes the preset prefix alone, trusts it as the track's own
+        //                                            measurement, as it does a 'c' stamp: the accepted downgrade residual
+        const LOUDNORM_STAMP_RE = /^([a-z_]+)(?:-[0-9][0-9.]*(?:-e\.([a-z0-9_]+)\.(\d+)|-([cf])\.([a-z0-9_]+)\.(\d+)\.([0-9a-f]{8}|x))?)?$/;
+        // The current preset's stamp on a stream as { kind: 'e' | 'c' | 'f' | '' (legacy), codec, channels, dig }, or null: no stamp, another preset's, or a
+        // value the grammar does not read - each measured like an unstamped track, with no line.
         const loudnormStampOf = (stream) => {
             const m = LOUDNORM_STAMP_RE.exec(readLoudnormTag(stream));
             if (!m || m[1] !== methodLoudnorm) return null;
             if (m[2]) return { kind: 'e', codec: m[2], channels: Number(m[3]), dig: '' };
-            if (m[4]) return { kind: 'c', codec: m[4], channels: Number(m[5]), dig: m[6] };
+            if (m[4]) return { kind: m[4], codec: m[5], channels: Number(m[6]), dig: m[7] };
             return { kind: '', codec: '', channels: 0, dig: '' };
         };
 
@@ -4532,21 +4585,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // next pass doesn't re-measure a track this one already normalized. Gated separately - `changed` is "a correction was applied" (nothing to announce
         // when the track was already at target), `measured` is "an analysis actually ran" (see buildLoudnormFilter's track cap).
         const loudnormRideTag = (changed) => (changed ? `[method_loudnorm=${methodLoudnorm}]` : '');
-        // A measured ride-along stamps the encode from its `record`. With no measurement riding along, a track this run RE-ENCODES or DERIVES must not keep a
-        // stamp its source carried: ffmpeg copies a mapped stream's tags to its output, so the new audio would claim a measurement nothing made of it, and a
-        // later loudnorm run trusts the stamp and skips the track for good, saying nothing. Matroska only - it is the one container that keeps the per-stream
-        // tag at all.
-        const loudnormRideStamp = (idx, measured, src, record) => (measured ? loudnormEncodeStamp(idx, record)
+        // A measured ride-along stamps the encode from its `record`, as does one whose correction was declined (`recorded`): the encode is written at the
+        // loudness the verdict was reached on, so the next pass skips it rather than measure and decline it again. With neither, a track this run RE-ENCODES
+        // or DERIVES must not keep a stamp its source carried: ffmpeg copies a mapped stream's tags to its output, so the new audio would claim a measurement
+        // nothing made of it, and a later loudnorm run trusts the stamp and skips the track for good, saying nothing. Matroska only - it is the one container
+        // that keeps the per-stream tag at all. `loud` is the { measured, recorded } its builder returned.
+        const loudnormRideStamp = (idx, loud, src, record) => (loud.measured || loud.recorded ? loudnormEncodeStamp(idx, record)
             : (loudnormTagPersists && readLoudnormTag(src || {}) ? ` -metadata:s:a:${idx} "${LOUDNORM_TAG}="` : ''));
-        // The copy stamp, for a track measured and left as it was: recording its codec family, channel count and opening-audio digest. The caller keeps the
-        // loudnormTagPersists gate that decides whether it is written at all - the reasoning for it is at the main-path call site.
-        const copyStampArg = (stream, idx) => loudnormStampArg(idx,
-            `c.${stampCodec(codecFamilyOf(stream))}.${stream.awkChannels}.${audioDigest(stream.index) || 'x'}`);
-        // The within-tolerance no-op: no re-encode is needed, but the measurement is still worth caching.
-        const stampWithinTolerance = (stream, idx) => {
-            workDone += `☐${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Stamping ${LOUDNORM_TAG}=${methodLoudnorm} (already within tolerance)`
+        // The copy stamp (kind 'c', or the remix exit's 'f'), for a track measured and left as it was: recording its codec family, channel count and
+        // opening-audio digest. The caller keeps the loudnormTagPersists gate that decides whether it is written at all - the reasoning for it is at the
+        // main-path call site.
+        const copyStampArg = (stream, idx, kind) => loudnormStampArg(idx,
+            `${kind}.${stampCodec(codecFamilyOf(stream))}.${stream.awkChannels}.${audioDigest(stream.index) || 'x'}`);
+        // A remux whose only change is the stamp: no re-encode is needed, but the verdict (`why`) is still worth caching.
+        const stampOnly = (stream, idx, why, kind) => {
+            workDone += `☐${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Stamping ${LOUDNORM_TAG}=${methodLoudnorm} (${why})`
                 + ` - future runs skip re-measuring while loudnorm stays "${methodLoudnorm}"\n`;
-            extraArguments += copyStampArg(stream, idx);
+            extraArguments += copyStampArg(stream, idx, kind);
         };
         // ====== END LOUDNORM ======
 
@@ -4768,15 +4823,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Channel/filter snippet for a new or replaced stereo track. No guard check here: every call site either already passed guardBlocks or is a
         // brand-new appended derivative (an unconditional lossy re-encode by construction), so loudnorm rides on whichever guarantee applies. The fold is
         // always an explicit filter (foldFilter - aformat=channel_layouts=stereo is the matrix -ac 2 uses) rather than a bare -ac: ffmpeg applies an implicit
-        // -ac AFTER an explicit -filter:a, so neither the limiter nor loudnorm would see the folded signal. Returns { arg, measured, changed, declined }:
-        // `measured` gates the awk_loudnorm stamp, `changed` the ride-along log tag, `declined` marks a correction its trial refused (buildLoudnormFilter).
-        // Callers that don't run loudnorm read all three false.
+        // -ac AFTER an explicit -filter:a, so neither the limiter nor loudnorm would see the folded signal. Returns { arg, measured, changed, declined,
+        // recorded }: `measured` and `recorded` gate the awk_loudnorm stamp (loudnormRideStamp), `changed` the ride-along log tag, `declined` marks a
+        // correction its trial refused (buildLoudnormFilter), which `recorded` says the stamp keeps. Callers that don't run loudnorm read them all false.
         const stereoArg = (idx, srcStream) => {
             const fold = foldFilter(srcStream, 'stereo', (methodStereoDownmix === 'dialogue') ? downmixMatrix(srcStream) : null);
             if (methodLoudnorm === 'disabled') return { arg: ` -filter:a:${idx} "${fold}"`, measured: false, changed: false };
             const srcAudioIdx = inputAudioIdxMap.get(srcStream.index);
-            const { filter, changed, measured, declined } = buildLoudnormFilter(srcStream.index, srcAudioIdx, fold, LOUDNORM_PRESETS[methodLoudnorm]);
-            return { arg: ` -filter:a:${idx} "${filter}"`, measured, changed, declined };
+            const { filter, changed, measured, declined, recorded } = buildLoudnormFilter(srcStream.index, srcAudioIdx, fold, LOUDNORM_PRESETS[methodLoudnorm],
+                loudnormTagPersists);
+            return { arg: ` -filter:a:${idx} "${filter}"`, measured, changed, declined, recorded };
         };
 
         // 6ch (5.1) channel/filter snippet for a new or replaced 5.1 track, mirroring stereoArg for the surround case: the explicit 5.1 fold (foldFilter -
@@ -4785,19 +4841,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const sixArg = (idx, srcStream) => {
             const fold = foldFilter(srcStream, '5.1', null);
             if (methodLoudnorm === 'disabled') return { arg: ` -filter:a:${idx} "${fold}"`, measured: false, changed: false };
-            const { filter, changed, measured } = buildLoudnormFilter(srcStream.index, inputAudioIdxMap.get(srcStream.index), fold,
-                LOUDNORM_PRESETS[methodLoudnorm]);
-            return { arg: ` -filter:a:${idx} "${filter}"`, measured, changed };
+            const { filter, changed, measured, recorded } = buildLoudnormFilter(srcStream.index, inputAudioIdxMap.get(srcStream.index), fold,
+                LOUDNORM_PRESETS[methodLoudnorm], loudnormTagPersists);
+            return { arg: ` -filter:a:${idx} "${filter}"`, measured, changed, recorded };
         };
 
-        // The in-place counterpart of stereoArg/sixArg for a force that keeps the channel count: same { arg, measured, changed } contract, with whatever
-        // pre-filter the caller needs chained ahead of the analysis (an opus relabel, a named PCE's own (pceRelabel), or nothing). With loudnorm disabled
-        // the pre-filter is still emitted alone - a lossless relabel is the caller's operation, not loudnorm's, and dropping it leaves the layout unfixed.
+        // The in-place counterpart of stereoArg/sixArg for a force that keeps the channel count: same { arg, measured, changed, recorded } contract, with
+        // whatever pre-filter the caller needs chained ahead of the analysis (an opus relabel, a named PCE's own (pceRelabel), or nothing). With loudnorm
+        // disabled the pre-filter is still emitted alone - a lossless relabel is the caller's operation, not loudnorm's, and dropping it leaves the layout
+        // unfixed.
         const loudnormFilterArg = (idx, srcAudioIdx, streamIndex, preFilter = '') => {
             if (methodLoudnorm === 'disabled')
                 return { arg: preFilter ? ` -filter:a:${idx} "${preFilter}"` : '', measured: false, changed: false };
-            const { filter, changed, measured } = buildLoudnormFilter(streamIndex, srcAudioIdx, preFilter, LOUDNORM_PRESETS[methodLoudnorm]);
-            return { arg: filter ? ` -filter:a:${idx} "${filter}"` : '', measured, changed };
+            const { filter, changed, measured, recorded } = buildLoudnormFilter(streamIndex, srcAudioIdx, preFilter, LOUDNORM_PRESETS[methodLoudnorm],
+                loudnormTagPersists);
+            return { arg: filter ? ` -filter:a:${idx} "${filter}"` : '', measured, changed, recorded };
         };
 
         // An APPENDED downmix track - a brand-new output stream derived from the ORIGINAL input audio via -map 0:a:N, whether or not that source stream
@@ -4805,7 +4863,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // `createdSet`, and the newStreamOutputIdx/convert bookkeeping, so an appended 5.1 and an appended stereo cannot be written differently.
         const appendTrack = (srcStream, srcAudioIdx, title, enc, arg, createdSet, regionKeyVal) => {
             extraArguments += ` -map 0:a:${srcAudioIdx} -c:a:${newStreamOutputIdx} ${enc.frag}${arg.arg}`
-                + `${loudnormRideStamp(newStreamOutputIdx, arg.measured, srcStream, enc.record)}`
+                + `${loudnormRideStamp(newStreamOutputIdx, arg, srcStream, enc.record)}`
                 + `${titleMetaArgs('a', newStreamOutputIdx, title, dstContainer)}`
                 + clearStatsArgs(newStreamOutputIdx, srcStream);
             extraArguments += langMetaArg(newStreamOutputIdx, langForWrite(srcStream));
@@ -4855,7 +4913,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const replaceDownmix = (srcStream, idx, label, enc, arg, createdSet, registerKey) => {
             const title = buildTitle(srcStream, label);
             titleWrittenSrc.add(srcStream.index);
-            replaceInPlace(idx, `${enc.frag}${arg.arg}${loudnormRideStamp(idx, arg.measured, srcStream, enc.record)}`
+            replaceInPlace(idx, `${enc.frag}${arg.arg}${loudnormRideStamp(idx, arg, srcStream, enc.record)}`
                 + titleMetaArgs('a', idx, title, dstContainer), { ...enc.record, title });
             extraArguments += langMetaArg(idx, langForWrite(srcStream));
             if (createdSet) createdSet.add(registerKey);
@@ -5092,7 +5150,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             workDone += `☐${streamTag(ffstream.index)}[codec_force=${codecForce}]${loudnormRideTag(aacVbrLoud.changed)} Transcoding `
                                 + `${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → aac ${forceChannels}ch @ ${approxRate} (${label})\n`;
                             replaceInPlace(outputAudioIdx, `${encoder}${args}${aacVbrLoud.arg}`
-                                + `${loudnormRideStamp(outputAudioIdx, aacVbrLoud.measured, ffstream, record)}`, record);
+                                + `${loudnormRideStamp(outputAudioIdx, aacVbrLoud, ffstream, record)}`, record);
                             forced = true;
                         } else {
                             // Same channel count, codec swap - optionally a LOSSLESS opus relabel (quad(side)→quad via channelmap, keeps all channels), else
@@ -5114,7 +5172,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                                 + `${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} → ${targetCodec} ${record.channels}ch @ `
                                 + `${kbpsToken(dstBps)}${note}${fold ? ` (${fold})` : ''}\n`;
                             replaceInPlace(outputAudioIdx, `${audioEncoder(targetCodec)}${dstBitArg}${forceLoud.arg}`
-                                + `${loudnormRideStamp(outputAudioIdx, forceLoud.measured, ffstream, record)}`, record);
+                                + `${loudnormRideStamp(outputAudioIdx, forceLoud, ffstream, record)}`, record);
                             forced = true;
                         }
                         if (forced) convert = true;
@@ -5193,6 +5251,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 return { targetCodec, keepCodec, configuredCodec, isStereo, unplaceable: unplaceableBlocked(targetCodec) };
             };
+            // Whether a stamp spares the track its measurement. An 'f' stamp records its stereo fold's verdict, so it holds only while the track still takes
+            // the opus-wall remix that measured that fold: an opus target its layout walls off, no relabel, nothing standing the remix down. Once the route
+            // moves (codec_surround off opus, a stereo the language gains) the track is measured as itself. Every other kind holds as loudnormStampHolds says,
+            // and a track no codec can reach is skipped with its stamp unread.
+            const remixRoute = (s, targetCodec, channels) => targetCodec !== null && aacFamily(targetCodec) === 'opus' && !opusInPlace(s, targetCodec)
+                && remixFoldsTrack(s, channels);
+            const loudnormStampSkips = (s, stamp, targetCodec, channels) => (stamp.kind === 'f'
+                ? remixRoute(s, targetCodec, channels) && loudnormStampHolds(s, stamp) : targetCodec === null || loudnormStampHolds(s, stamp));
             // COLLECT, then MEASURE, then emit: every leftover whose correction is a bare analysis of its own track goes to prefetchLoudness in one pass
             // before the loop below emits anything, and the loop reads the results back through measureLoudness. The test mirrors the loop's path to its
             // pre-filter-free buildLoudnormFilter call, so a divergence costs a wasted or a missed prefetch, never a wrong measurement; a track the opus
@@ -5206,7 +5272,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     || channels <= 0) continue;
                 const { targetCodec, unplaceable } = leftoverTarget(ffstream, channels);
                 const stamp = loudnormStampOf(ffstream);
-                if (stamp && (targetCodec === null || loudnormStampHolds(ffstream, stamp))) continue;
+                if (stamp && loudnormStampSkips(ffstream, stamp, targetCodec, channels)) continue;
                 if (targetCodec === null || unplaceable || ac3RematrixFilter(targetCodec, ffstream) || (aacFamily(targetCodec) === 'opus' && channels > 2
                     && !opusLayoutFor(ffstream, channels).ok && !opusInPlace(ffstream, targetCodec))) continue;
                 leftoverIdxs.push(srcAudioIdx);
@@ -5226,12 +5292,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const ffstreamCodec = codecNameOf(ffstream) || 'unknown';
                 const { targetCodec, keepCodec, configuredCodec, isStereo, unplaceable } = leftoverTarget(ffstream, channels);
                 // Cache check, ahead of every skip line but the no-channel-count one above (the collect loop tests it in the same place): this stream isn't
-                // being touched by anything else this run, so a stamp of the CURRENT preset that still holds (loudnormStampHolds) means its content hasn't
+                // being touched by anything else this run, so a stamp of the CURRENT preset that still spares it (loudnormStampSkips) means its content hasn't
                 // changed since we last measured or corrected it against this exact target - trust it, skipping the measurement subprocess. A stamped track
                 // no codec can reach is skipped too, silently and with its stamp unread: its skip line would report a change nothing needs. A stamp from a
                 // DIFFERENT preset, one that no longer holds, or no stamp at all falls through to a fresh measurement below.
                 const stamp = loudnormStampOf(ffstream);
-                if (stamp && (targetCodec === null || loudnormStampHolds(ffstream, stamp))) continue;
+                if (stamp && loudnormStampSkips(ffstream, stamp, targetCodec, channels)) continue;
                 if (targetCodec === null) {
                     // Both candidates are out of reach; report against keepCodec, the one the track would otherwise have stayed in.
                     if (channels > codecMaxCh(aacFamily(keepCodec)))
@@ -5281,12 +5347,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // the codec change IS the requested operation and loudnorm merely rides along.
                             const guarded = guardBlocks(ffstream, codecStereo, 2, channels);
                             const two = stereoArg(guarded ? newStreamOutputIdx : outputAudioIdx, ffstream);
-                            // NO stamp on this exit, unlike every other within-tolerance one: stereoArg measured the stereo FOLD, which this track never
-                            // becomes here, so a stamp would claim the surround content is at target when nothing measured it. A fold reads 0.95-3.0 LU quieter
-                            // than the track natively (0.12 LU only on pure dialogue; measured on this build), past LOUDNORM_TOLERANCE_LU, so the false claim
-                            // lands on exactly the loud tracks loudnorm exists to tame, and the cache check, which trusts a stamp that still holds before any
-                            // layout reasoning, would suppress their correction for good once the settings stop routing the track through the remix. The cost
-                            // is one analysis spawn per pass, the price a container that cannot persist the tag pays.
+                            // The fold's verdict is cached in the route-scoped 'f' stamp, never the 'c' one: stereoArg measured the stereo FOLD, which this
+                            // track never becomes here. A fold reads 0.95-3.0 LU quieter than the track natively (0.12 LU only on pure dialogue; measured on
+                            // this build), past LOUDNORM_TOLERANCE_LU, so a 'c' stamp would claim the surround content is at target and, once the settings
+                            // stop routing the track through the remix, suppress its correction for good; the 'f' stamp is trusted only on this route
+                            // (loudnormStampSkips). A container that keeps no stamp pays one analysis per pass, and a trial when the fold is declined.
                             if (!two.changed) {
                                 // A correction its trial declined has said why already (buildLoudnormFilter).
                                 if (!two.declined) {
@@ -5294,6 +5359,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                                         ? 'Remix not needed - the stereo fold is already within tolerance'
                                         : 'Remix skipped - the per-file analysis cap left the stereo fold unmeasured (a later pass can normalize it)'}`
                                         + `; left as ${ffstreamCodec} ${channels}ch un-normalized\n`;
+                                }
+                                if (two.recorded || (loudnormTagPersists && two.measured)) {
+                                    stampOnly(ffstream, outputAudioIdx,
+                                        `its stereo fold ${two.recorded ? 'had its correction declined' : 'is already within tolerance'}`, 'f');
+                                    convert = true;
                                 }
                                 continue;
                             }
@@ -5333,11 +5403,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // trial declined is stamped the same way, its line saying so (`recorded`): reaching the same verdict again costs an analysis and a trial
                     // on every pass (about 35 min for a 2 h 5.1 track on an M1), and the stamp's preset, codec, channels and digest re-open it when any of
                     // them changes, as they do an on-target track's.
-                    if (loudnormTagPersists && measured) {
-                        stampWithinTolerance(ffstream, outputAudioIdx);
-                        convert = true;
-                    } else if (recorded) {
-                        extraArguments += copyStampArg(ffstream, outputAudioIdx);
+                    if ((loudnormTagPersists && measured) || recorded) {
+                        stampOnly(ffstream, outputAudioIdx, recorded ? 'its correction declined' : 'already within tolerance', 'c');
                         convert = true;
                     }
                     continue;
