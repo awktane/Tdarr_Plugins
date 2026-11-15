@@ -40,11 +40,12 @@ const details = () => ({
                 a duplicate or an empty one (see its tooltip).
                 SETUP: add this plugin ONCE to the library's plugin stack. It declares no Stage, so Tdarr runs that same entry again after you accept a
                 transcode, which is when import deletes the sidecars it embedded; a second copy would run in both stages too, each with its own settings. A
-                Flow has no such pass (see remove_source). Runs standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before
-                stream_ordering (last). If the file has embedded closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that
-                can destroy them. Extract with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since
-                the sidecars would land beside the source, where the output never sees them.`,
-    Version: '3.999.118',
+                Flow has no such pass (see remove_source). Runs standalone, or in the awk stack. Stack order: clean_and_remux first; video_clean /
+                audio_clean / sub_worker in any order (sub_worker before video_clean when the video carries closed captions); stream_ordering last.
+                Embedded closed captions are why this plugin goes before video_clean: re-encoding the video is the one thing that can destroy them. Extract
+                with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since the sidecars would land
+                beside the source, where the output never sees them.`,
+    Version: '3.999.119',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -3266,6 +3267,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     //   text_file - no directory access at all; the user lists the filenames and each is fetched by name through the download API.
     const SUBTITLE_LIST_SUFFIX = '.subtitles.txt';
     const subtitleListName = `${videoBase}${SUBTITLE_LIST_SUFFIX}`;   // one name for the file, rather than the same join at every site
+    // The list's name meets the filesystem's NAME_BYTE_CAP as a sidecar's does: '' when it fits, else the cause, so neither side asks the server for a file no
+    // filesystem can hold. The suffix is longer than a sidecar's, so a video name can leave room for its sidecars and none for its list.
+    const listNameOver = Buffer.byteLength(subtitleListName, 'utf8') > NAME_BYTE_CAP
+        ? `its name is ${Buffer.byteLength(subtitleListName, 'utf8')} bytes, over the ${NAME_BYTE_CAP}-byte filesystem limit` : '';
+    const LIST_NAME_REMEDY = 'import on a node that can read the library folder, or rename the video and its sidecars shorter';
     const SUBTITLE_LIST_MAX = 1024 * 1024;   // one filename per line is a few KB; a file this size at the list's name is something else
     // seedSubtitleList answers '' for success and free prose for a real failure - but two of the values the caller compares its answer
     // against are NOT failures and the caller has to tell them apart to decide whether to warn. Naming them makes that a comparison against
@@ -3381,6 +3387,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const entryAt = (name) => {
         try { return fs.readdirSync(workLibDir()).includes(name); } catch (e) { return fs.existsSync(libPathOf(name)) || isSymlinkAt(libPathOf(name)); }
     };
+    // The spelling the node's view holds for `name`, which an existence check on a case-insensitive disk (APFS, NTFS) confirms whatever its case: the
+    // entry spelled exactly so, else the listing's case variant of it, else `name` itself - always where the node has no view and asks the server.
+    const onDiskName = (name) => {
+        const fold = (n) => n.normalize('NFC').toLowerCase();
+        if (readViaApi()) return name;
+        try {
+            const listed = fs.readdirSync(workLibDir());
+            return listed.includes(name) ? name : listed.find((n) => fold(n) === fold(name)) || name;
+        } catch (e) { return name; }
+    };
     // A path, or an fs error message carrying one, echoed into infoLog: sanitised like every echo (logSafe), but never cut - PATH_MAX already bounds it,
     // and the tail a cap would drop is the part that names the file. The library directory is the user's own name, so it can hold a newline.
     const logPath = (v) => logSafe(v, Infinity);
@@ -3452,6 +3468,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // discard the OCR'd subtitles they added, which is the one failure that would make the feature untrustworthy. The header explains itself, so opening
     // the file is enough to understand it.
     const seedSubtitleList = (rels) => {
+        if (listNameOver) return `${listNameOver}, so a text_file import cannot find these sidecars - ${LIST_NAME_REMEDY}`;
         const dest = serverSidePath(path.join(libDir, subtitleListName));
         if (!dest) return `no path translator maps ${libDir} back to the server`;
         const there = sidecarExistsRemote(dest);
@@ -4663,16 +4680,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // field 2 (CC3/CC4). Each field is named explicitly - the default (auto) locks onto whichever field it meets first, so a broadcast that pads field 1 reads
     // empty on it; auto equals 0 on all 13 caption samples (jellyfin-ffmpeg 7.1.4). cc_dec has no channel option: CC2 or CC4 alone is read, two services
     // sharing one field decode interleaved into one garbled sidecar, and CEA-708 is never read (all measured).
+    // Each read names the video it decodes, `videoIdx` - the primary, the one the caption probe checks and video_clean encodes and fingerprints - as
+    // stream_index, which movie= hands to av_find_best_stream as the ABSOLUTE stream number. Left to that pick (default flag, then frame count), two
+    // default HEVC videos read the one with more frames (measured on 7.1.4: 0 bytes from it, 204 from stream 0, which carried the captions).
     // The IN-PLUGIN read of one field, as argv - both unmapped routes run it, one placeSidecars call per field (ccReadViaApi). The MAPPED routes' preset
     // forms are built below: they name file.file because Tdarr runs that command against the working file, where this spawn needs the real path the node
     // holds now.
-    const ccLavfiArgs = (dataField) => ['-data_field', String(dataField), '-f', 'lavfi', '-i',
-        `movie=${escapeMoviePath(String(file._id || file.file || ''))}[out0+subcc]`, '-map', '1:s:0', '-c:s', 'text', '-f', 'srt'];
+    const ccLavfiArgs = (dataField, videoIdx) => ['-data_field', String(dataField), '-f', 'lavfi', '-i',
+        `movie=${escapeMoviePath(String(file._id || file.file || ''))}:stream_index=${videoIdx}[out0+subcc]`, '-map', '1:s:0', '-c:s', 'text', '-f', 'srt'];
     // The mapped routes' read: one lavfi input per field, in field order, at the head of the OUTPUT side (Tdarr's own -i is spliced in ahead, so on the input
     // side they would become input 0 and shift every -map 0), each read out by its own -map <1+i>:s:0 output. One run decodes the video once per field
     // (additive: 0.84 + 0.78 s single against 1.72 s for both on 60 s of 1080i), every sidecar byte-identical to a single-field read (measured on five
     // samples), and an empty field writes a 0-byte srt.
-    const ccPresetInputs = (fields) => fields.map((f) => `-data_field ${f - 1} -f lavfi -i "movie=${escapeMoviePath(file.file)}[out0+subcc]" `).join('');
+    const ccPresetInputs = (fields, videoIdx) => fields
+        .map((f) => `-data_field ${f - 1} -f lavfi -i "movie=${escapeMoviePath(file.file)}:stream_index=${videoIdx}[out0+subcc]" `).join('');
     // The one wording for "the caption channel was read out to this sidecar", shared by the same two routes.
     const ccReadLine = (videoIdx, name) => `☑${streamTag(videoIdx)}[embedded_cc=enabled] Read the embedded closed captions -> ${name}\n`;
     // ====== END EMBEDDED CLOSED CAPTIONS ======
@@ -5312,8 +5333,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The caption sidecars' names under both spellings belong to the captions whatever embedded_cc says: no subtitle stream's extract takes one as its
         // sidecar by its text (claimedBy), so a subtitle holding the captions' text gets its own. Taken by one, under remove_source=true that subtitle would
         // leave the video with its text only in the import's hidden record, which media servers skip, or in the captions' own file, which their round trip
-        // moves on.
-        const ccCaptionNames = ccBareAny ? [ccBareAny, cc2Of(ccBareAny)].flatMap((n) => [n, `.${n}`]) : [];
+        // moves on. Under remove_source=false the subtitle stays in the video, so it may take a VISIBLE one: a stack alternating import and extract then
+        // finds the visible copy the extract places of the import's record, rather than extracting the imported caption tracks again each time.
+        const ccVisibleNames = ccBareAny ? [ccBareAny, cc2Of(ccBareAny)] : [];
+        const ccCaptionNames = ccVisibleNames.flatMap((n) => [n, `.${n}`]);
         const ccDestOf = (field) => (placeViaApi() ? serverDestFor(ccNameOf(field)) : '');
         // On extract the import's hidden record answers whether the captions were read, but the extract's deliverable is the visible sidecar beside the
         // video, so a copy of the record is placed there - never a decode - and a strip waits for it (ccPlan). '' once the copy is in place, else why not.
@@ -5573,11 +5596,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     break;
                 }
             }
+            const rereadNote = (field, beside) => `☐${streamTag(ccVideo.index)}[embedded_cc=enabled] Caption field ${field} has no sidecar beside`
+                + ` ${beside.join(', ')} - reading it to ${ccNameOf(field)} before the captions can be removed\n`;
+            // The import's twin of the extract's re-read below: a field-1 staging file gone since its read, the read still on record, would let the import
+            // mux CC3 alone and strip, with field 1's captions then nowhere. owe1 (its line, '' when none) asks for field 1 to be read again, and the import
+            // takes it only where a caption sidecar goes into its mux (see there): one whose text is already a track, with nothing else to mux, is kept as
+            // the memo and records nothing, so a read for it would repeat every pass when field 1 is legitimately empty, which leaves no sidecar to find.
+            // Under remove_source=true only, where the strip follows; a container that cannot record the import stops it before any mux. A field 2
+            // judged empty, or absent too, is read again with field 1 below.
+            const field2Text = [...remotes, ...judged.filter((s) => s.state !== 'empty')].filter((s) => s.field === 2);
+            const owe1 = action === 'import' && canRecord && removeSource && field2Text.length && ![...remotes, ...judged].some((s) => s.field === 1)
+                && (ccHas(CC_TOKENS.decoded) || ccHas(CC_TOKENS.decoded2)) ? rereadNote(1, field2Text.map((s) => s.name)) : '';
             // On extract a sidecar the library holds for field 1 - trusted, or copied there this pass - owes the strip under remove_source as the local judge's
             // does: the read behind it finished on this video, and ccStripReady and ccStripRefusal still decide.
             if (remotes.length) {
                 const owedRemote = action === 'extract' && removeSource && !copyMissing && remotes.some((r) => r.field === 1) && ccProbeVerdict() === true;
-                return { job: null, staged: true, stagedNames: remotes.map((r) => r.name), stripOwed: owedRemote,
+                return { job: null, staged: true, stagedNames: remotes.map((r) => r.name), stripOwed: owedRemote, owe1,
                     note: `${notes}${remotes.filter((r) => !r.uncopied).map((r) => `☑[embedded_cc=enabled] Caption sidecar already in the library: ${r.name}\n`)
                         .join('')}` };
             }
@@ -5599,12 +5633,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // empty field included (stripOwed), since an empty read leaves the next pass nothing to judge.
                 const reread = owed && !ccStripRefusal() ? [1, 2].find((f) => !judged.some((s) => s.field === f)
                     && (f === 1 ? !canRecord || ccHas(CC_TOKENS.decoded) || ccHas(CC_TOKENS.decoded2) : !canRecord)) : 0;
-                if (reread) {
-                    return { job: { fields: [reread] }, stripOwed: placeViaApi(), note: `${notes}☐${streamTag(ccVideo.index)}[embedded_cc=enabled] Caption`
-                        + ` field ${reread} has no sidecar beside ${out.join(', ')} - reading it to ${ccNameOf(reread)} before the captions can be removed\n` };
-                }
+                if (reread) return { job: { fields: [reread] }, stripOwed: placeViaApi(), note: `${notes}${rereadNote(reread, out)}` };
                 const now = owed && ccStripReady() && !ccStripRefusal();
-                return { job: null, stripOwed: owed, note: `${notes}${judged.filter((s) => s.state === 'empty').map(emptyLine).join('')}${out.length
+                return { job: null, stripOwed: owed, owe1, note: `${notes}${judged.filter((s) => s.state === 'empty').map(emptyLine).join('')}${out.length
                     ? `☑[embedded_cc=enabled] Captions already extracted to ${out.join(', ')}${now
                         ? ' - removing the bitstream copy now that the sidecar is confirmed to hold them' : ''}\n` : ''}` };
             }
@@ -5645,7 +5676,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const res = { placed: [], empty: [], failed: null, read: [] };
             for (const f of fields) {
                 const name = ccNameOf(f);
-                const got = placeSidecars([{ name, dest: ccDestOf(f), args: ccLavfiArgs(f - 1) }]);
+                const got = placeSidecars([{ name, dest: ccDestOf(f), args: ccLavfiArgs(f - 1, ccVideo.index) }]);
                 if (got.placed.has(name)) res.placed.push(name);
                 else if (got.empty.has(name)) res.empty.push(name);
                 else { res.failed = { name, why: got.failed.get(name) || 'it was not placed' }; break; }
@@ -5785,7 +5816,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         if (!placeViaApi()) {
                             try {
                                 fs.unlinkSync(libPathOf(c.name));
-                                response.infoLog += `☐${streamTag(s.index)} Replacing ${c.name} with ${name} - an earlier run left it empty\n`;
+                                // With the current name already there nothing is written in its place, so the line says only what went.
+                                response.infoLog += `☐${streamTag(s.index)} ${current ? `Removing ${c.name}` : `Replacing ${c.name} with ${name}`}`
+                                    + ' - an earlier run left it empty\n';
                                 continue;
                             } catch (e) { /* it stays, reported below */ }
                         }
@@ -5818,7 +5851,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (atName.verdict) remoteVerdict = { name, verdict: atName.verdict };
                     const absent = remoteAnswer.state === 'absent' && !remoteAnswer.empty;
                     // (3)'s name at another subtitle index, where a renumbering (a reorder, a dropped stream) left the sidecar: tried only while the current
-                    // name is absent, so it costs at most one download per subtitle, and taken by its cue texts alone.
+                    // name is absent, so it costs at most one download per subtitle, and taken by its cue texts alone. Under remove_source=false the stream
+                    // stays and nothing here renames the moved file, so every later extract pass pays this again: the request at the current name, then a
+                    // download per other index until the moved one matches. Accepted, since nothing is lost and the only memo would be a tag, which costs a
+                    // remux of the whole file.
                     const head = `${bundle ? '.' : ''}${videoBase}.s${s.index}.`;
                     const moved = !absent ? [] : streams.filter((x) => codecTypeOf(x) === 'subtitle' && x.index !== s.index)
                         .map((x) => ({ name: `${bundle ? '.' : ''}${videoBase}.s${x.index}.${name.slice(head.length)}`, byText: true, moved: true }))
@@ -5874,7 +5910,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // A styled subtitle with no cue is never bundled: a Matroska file of a subtitle track with no events reads as "End of file" (measured on 7.1.4:
             // the bundle of such a track and its font, 774 kB, failed every import), so the fonts would leave the video in a file nothing reads. Under
             // remove_source=true it goes as an empty track, as deduplicate=enabled_checkmedia takes one out; otherwise it stays, said. One whose cues
-            // cannot be counted is kept with its fonts, unbundled, for a later pass. True when this has dealt with the stream.
+            // cannot be counted is kept with its fonts, unbundled, for a later pass. True when this has dealt with the stream. Kept under
+            // remove_source=false, it is read again on every extract pass - one embeddedTextHashes read of the file (0.3 s on an 885 MB mkv locally, the
+            // whole file over SMB), where remove_source=true reads it once. Accepted: the only memo would be a tag, which costs a remux of its own.
             const refuseCueless = (s) => {
                 const cues = styledCues(s);
                 if (cues === 'some') return false;
@@ -5903,7 +5941,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // fresh-extract pass never strips - the strip is owed on a later pass via stripOwed, once the sidecar is proven to hold cues.
             let ccInput = ''; const ccRecord = new Set(); let ccPlaced = false; let ccPlacedNames = [];
             if (ccPlan.job && !placeViaApi()) {
-                ccInput = ccPresetInputs(ccPlan.job.fields);
+                ccInput = ccPresetInputs(ccPlan.job.fields, ccVideo.index);
                 // The read's own memo, on the same output: the next pass only trusts a sidecar once a finished read stands behind it.
                 if (canRecord) for (const t of ccReadTokens(ccPlan.job.fields)) ccRecord.add(t);
                 sidecarOut += ` ${ccPresetOutputs(ccPlan.job.fields)}`;
@@ -5931,7 +5969,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             };
             // The names each stream takes by name - its current spelling, and the previous sub_worker's titled or role-token one - mapped to its index;
             // no other stream adopts one of them by its text (sidecarByText), or two would share one file and remove_source strip both. The caption
-            // sidecars' names are the captions', at the video's index (ccCaptionNames).
+            // sidecars' names are the captions', at the video's index, the visible ones only under remove_source=true (ccCaptionNames).
             const claimedBy = new Map(ccCaptionNames.map((n) => [n, ccVideo.index]));
             for (const st of eligible) {
                 const b = fontIndices.length > 0 && isStyledSub(st.codec_name);
@@ -5951,7 +5989,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const { name: spelled, roleTokens: cutRoles, rolesLost: cutLost, budget: cutBytes, flagsLost } = spelledCut;
                 const cutSpelling = spelledCut.truncated ? spelled : null;
                 const earlier = earlierSidecarNames(foldRetag(s), view, bundle, removeSource ? carryView(s) : null).filter((c) => c.name !== spelled);
-                const claimed = new Set([...claimedBy].filter(([, i]) => i !== s.index).map(([n]) => n));
+                const claimed = new Set([...claimedBy].filter(([n, i]) => i !== s.index && (removeSource || !ccVisibleNames.includes(n))).map(([n]) => n));
                 // Whether the current name can be written at all: the refusals below keep the stream, so no earlier file is renamed for a name they refuse.
                 const nameWritable = Buffer.byteLength(spelled, 'utf8') <= NAME_BYTE_CAP && pathIsPresetSafe(libPathOf(spelled));
                 const { name, remoteAnswer, remoteVerdict, emptyLeft, oldLeft, stray }
@@ -6009,15 +6047,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // An earlier run's leftover at this name that is judged unusable below (empty, or incomplete under remove_source=true) is replaced:
                 // deleted first unless placeViaApi writes over it. One this node cannot delete keeps the stream - false, and the caller moves on.
                 const replaceLeftover = (adj, tag = '') => {
+                    const shown = onDiskName(name);   // read before the unlink takes the entry away
                     if (!placeViaApi()) {
                         try { fs.unlinkSync(full); } catch (e) {
                             refused += 1;
-                            response.infoLog += `☒${streamTag(s.index)} An ${adj} ${name} from an earlier run could not be deleted to extract it again - delete`
-                                + ' it and requeue, keeping the embedded subtitle\n';
+                            response.infoLog += `☒${streamTag(s.index)} An ${adj} ${shown} from an earlier run could not be deleted to extract it again -`
+                                + ' delete it and requeue, keeping the embedded subtitle\n';
                             return false;
                         }
                     }
-                    response.infoLog += `☐${streamTag(s.index)}${tag} Replacing ${name} - an earlier run left it ${adj}\n`;
+                    response.infoLog += `☐${streamTag(s.index)}${tag} Replacing ${shown} - an earlier run left it ${adj}\n`;
                     return true;
                 };
                 // The path goes into the quoted "${full}" token of the extract preset, so it has to survive Tdarr's quote-aware tokenizer
@@ -6097,15 +6136,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         : remoteVerdict && remoteVerdict.name === name ? remoteVerdict.verdict : existingSidecarVerdictRemote(s, name, bundle, streams);
                     if (verdict.state === 'short') {
                         held += 1;
-                        response.infoLog += `☒${streamTag(s.index)}[remove_source=true] ${name} already on disk stops at ${verdict.end.toFixed(1)} s but this `
-                            + `subtitle runs to ${verdict.streamEnd.toFixed(1)} s - a run that failed partway, or an edit that cut the end; keeping the `
-                            + 'embedded subtitle (delete the sidecar to extract it again)\n';
+                        response.infoLog += `☒${streamTag(s.index)}[remove_source=true] ${onDiskName(name)} already on disk stops at`
+                            + ` ${verdict.end.toFixed(1)} s but this subtitle runs to ${verdict.streamEnd.toFixed(1)} s - a run that failed partway, or an edit`
+                            + ' that cut the end; keeping the embedded subtitle (delete the sidecar to extract it again)\n';
                         continue;
                     }
                     if (verdict.state === 'unreadable') {
                         held += 1;
-                        response.infoLog += `☒${streamTag(s.index)}[remove_source=true] ${name} already on disk is not text ffmpeg can read whole (it holds a`
-                            + ' NUL character); keeping the embedded subtitle (save it as UTF-8, or delete it to extract it again)\n';
+                        response.infoLog += `☒${streamTag(s.index)}[remove_source=true] ${onDiskName(name)} already on disk is not text ffmpeg can read`
+                            + ' whole (it holds a NUL character); keeping the embedded subtitle (save it as UTF-8, or delete it to extract it again)\n';
                         continue;
                     }
                     if (remote ? verdict.state === 'aborted' : leftIncomplete(verdict, name)) {
@@ -6114,7 +6153,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     } else alreadyExtracted = true;
                 }
                 if (alreadyExtracted) {
-                    skipped += 1; response.infoLog += `☑${streamTag(s.index)} Sidecar already exists, not overwriting: ${name}\n`;
+                    skipped += 1; response.infoLog += `☑${streamTag(s.index)} Sidecar already exists, not overwriting: ${onDiskName(name)}\n`;
                     if (removeSource && keepStream) held += 1;   // kept for the reason said above, so the pass does not read as done
                 }
                 // While an old spelling this node cannot rename holds the track's text, no NEW name is written: an import before the user deletes it would mux
@@ -6242,7 +6281,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // captions and could neither strip them nor record the request reaches this line with removal ON - one line under the ☒ that says why.
                 if (wrote) return skip(`☑[remove_source=${removeSource}] Sidecars placed in the library - nothing left to remux\n`);
                 if (held || unread || unsure) {
-                    const why = held ? 'a sidecar already on disk keeps the embedded subtitle' : unread ? 'ffmpeg cannot read every cue of a subtitle'
+                    const why = held ? 'a subtitle was held back' : unread ? 'ffmpeg cannot read every cue of a subtitle'
                         : 'whether a styled subtitle holds any text could not be read';
                     return skip(`☒Nothing extracted this pass - ${why}, see the reasons above\n`);
                 }
@@ -6291,13 +6330,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // duplicates against what is embedded, converts to mov_text for an mp4 target, restores metadata from the name and deletes the file afterwards. Muxing
         // the captions straight in would be a second, weaker copy of all of that. The staging files are dot-prefixed so no media server offers them in the gap
         // between the two passes. With no writable view the read runs in-plugin and falls through into this same pass (below).
-        if (ccPlan.job && !placeViaApi()) {
-            const { fields } = ccPlan.job;
+        const ccReadPass = (fields) => {
             const readMemo = canRecord ? ccTagArg(...ccReadTokens(fields)) : '';   // see the extract route
             response.infoLog += `☐${streamTag(ccVideo.index)}[embedded_cc=enabled] Reading the embedded closed captions -> ${fields.map(ccNameOf).join(', ')}`
                 + ' (decodes the video once per caption field); the next pass muxes them in as subtitle tracks\n';
-            return commitWithExpected(`${ccPresetInputs(fields)}${ccPresetOutputs(fields)} -map 0 -c copy${readMemo}`, streams);
-        }
+            return commitWithExpected(`${ccPresetInputs(fields, ccVideo.index)}${ccPresetOutputs(fields)} -map 0 -c copy${readMemo}`, streams);
+        };
+        if (ccPlan.job && !placeViaApi()) return ccReadPass(ccPlan.job.fields);
         // With no writable library view to aim an extra ffmpeg output at, the same read runs in-plugin, one field per call, and uploads through the file API -
         // and then falls THROUGH into the import below rather than returning, because the sidecars are in the library now and this pass can still mux them.
         if (ccPlan.job) {
@@ -6441,7 +6480,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // sidecars, so a video with no text subtitles never has one - and a completed round trip deletes the list once its last entry is embedded.
                 // Failing here would quarantine every such file, turning both "nothing to do" and "finished successfully" into errors. This is the same
                 // outcome a mapped node reaches by scanning the folder and finding no sidecars; only the way it looks is different.
-                const listDl = downloadLibraryFile(listDest, listLocal, SUBTITLE_LIST_MAX);
+                // A name over the cap is not asked for: it reads as no list, said with its cause.
+                const listDl = listNameOver ? { ok: false, serverAnswered: true } : downloadLibraryFile(listDest, listLocal, SUBTITLE_LIST_MAX);
                 // A server-answered miss (curl reached it, HTTP 400/501) genuinely means no list is there - the same "nothing to import"
                 // a mapped node reaches by scanning an empty folder. A transport failure (server unreachable, timed out, dropped, or no
                 // server URL) is NOT that: the list may exist and we simply could not read it, so mapping it to the benign path would
@@ -6450,7 +6490,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (!listDl.ok && !listDl.serverAnswered)
                     failFile(`[method_unmapped=text_file] Could not fetch ${subtitleListName} to find what to import - ${listDl.why}`);
                 if (!listDl.ok) {
-                    response.infoLog += `☑[method_unmapped=text_file] No ${subtitleListName} in the library, so there is nothing listed to import`
+                    response.infoLog += listNameOver ? `☒[method_unmapped=text_file] ${subtitleListName} cannot exist - ${listNameOver}, so there is nothing`
+                        + ` listed to import; ${LIST_NAME_REMEDY}\n`
+                        : `☑[method_unmapped=text_file] No ${subtitleListName} in the library, so there is nothing listed to import`
                         + ' - extract creates one when it writes sidecars, or add it yourself with one filename per line\n';
                     listedRels = [];   // nothing to import - but the file's own duplicate subtitle streams are still worth collapsing, so fall through
                 }
@@ -7020,6 +7062,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += `☒Not importing ${f.members.map((m) => logSafe(m.rel)).join(', ')} - it ${why}, which ffmpeg cannot read whole; save it as`
                 + ' UTF-8 to import it\n';
         });
+        // A webm stores only WebVTT, and subWebmFits can judge only the name, before any fetch. A loose sidecar named .vtt that ffmpeg reads as another
+        // format (sidecarKind: an srt or ASS saved as .vtt) goes in as that and the webm muxer refuses it at header write, failing the whole import on
+        // every requeue (measured on 7.1.4: exit 234). Refused as the name gate refuses one; nothing records it, so it stays on disk, named every pass.
+        withdraw((f) => (dstContainer === 'webm' && !f.bundle && sidecarContent(f) && sidecarContent(f).kind !== 'vtt' ? sidecarContent(f).kind : ''),
+            (f, kind) => {
+                refusedText += 1;
+                response.infoLog += `☒Not importing ${f.members.map((m) => logSafe(m.rel)).join(', ')} - it holds ${kind === 'ass' ? 'an ASS' : 'an srt'}`
+                    + ' subtitle, which ffmpeg reads as that whatever its name, and a webm target stores only WebVTT subtitles, so it stays on disk; convert it'
+                    + ' to WebVTT, or remux to mkv (clean_and_remux does that) and run import again\n';
+            });
         // A sidecar ffmpeg will not mux (sidecarMuxRefused), or a bundle it cannot open (bundleUnreadable: an empty, event-less or cut-short
         // one - exit 183, 187 or 251 measured on 7.1.4), would fail the whole import run, every other sidecar with it, on every requeue. A
         // bundle it opens but whose subtitle it cannot decode (not UTF-8) muxes, but every read of the track it makes fails (exit 0, then 69,
@@ -7167,6 +7219,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // A retune is a mux of its own: no new inputs and no new maps, just the metadata of a stream that is already there. It rides the same output as any
         // real import when both are due, so a pass that adds one track and retags another does it in a single remux.
         if (!nothingToMux) {
+            // ccPlan's owed first-field read (owe1), taken here and only here: a caption sidecar goes into this mux, so the pass would record `imported`
+            // and strip. The mapped route reads on a pass of its own. The API routes read in-plugin: a field that reads empty lets the caption sidecars go in
+            // and the strip follow; one placed, or a read that failed, holds them all back (ccHold) while the rest goes in, and a later pass stages both or
+            // reads again.
+            if (ccPlan.owe1 && !ccHold && [...toMux, ...alreadyInFile].some((f) => f.members.some((m) => isCcSidecar(m.rel))) && ccProbeVerdict() === true) {
+                response.infoLog += ccPlan.owe1;
+                if (!placeViaApi()) return ccReadPass([1]);
+                const res = ccReadViaApi([1]);
+                response.infoLog += ccApiLines(res, '');
+                if (canRecord) ccApiRead = ccApiTokens(res);
+                if (!res.empty.length) {
+                    ccHold = res.placed.length
+                        ? `☑[embedded_cc=enabled] ${res.placed.join(', ')} is imported on a later pass, together with the second caption field's sidecar\n`
+                        : '☒[embedded_cc=enabled] Importing no caption sidecar on this pass: the first caption field could not be read again, and the caption'
+                            + ' sidecars go into the file only all together - a later pass reads it again\n';
+                    response.infoLog += ccHold;
+                    for (const list of [toMux, alreadyInFile]) {
+                        for (let k = list.length - 1; k >= 0; k -= 1) if (list[k].members.some((m) => isCcSidecar(m.rel))) list.splice(k, 1);
+                    }
+                    if (!toMux.length && !retuneMeta && !removedIndices.size) return endImport('☑No other subtitle sidecars to import on this pass\n');
+                }
+            }
             // Mux one track per group. Extra -i inputs go on the OUTPUT side of the preset, so the video being transcoded stays input 0.
             let inputSide = ''; let extraMaps = ''; let meta = retuneMeta; let fontsFrom = null;   // fontsFrom: the bundle whose fonts this import restores
             toMux.forEach((f, k) => {
@@ -7242,16 +7316,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // exactly as it is on extract, and for the same reason - the captions have MOVED to a subtitle track, so leaving them burned into the
             // video shows the user both at once (ccStripOrDefer). `imported` is kept alongside `strip` rather than replaced by it, because that token
             // is the memo that stops this plugin decoding the captions out all over again; only the pair says both things at once.
-            // Both fields must be out first (ccStripReady), and a request already on record is video_clean's to serve (see ccPlan). A held pass records
-            // only the read, whatever caption sidecar the marker carried through it (see ccHold).
+            // Both fields must be out first (ccStripReady), the video must still hold captions (the A53 probe; one that cannot answer counts as may), and a
+            // request already on record is video_clean's to serve (see ccPlan). A held pass records only the read, whatever caption sidecar the marker
+            // carried through it (see ccHold). A later pass reads only field 2, and only while its read is not on record behind a field-1 read on record or
+            // recorded now (ccPlan's owed field-2 read): with `imported` recorded here nothing else ever reads the captions again, so the line says they stay.
             if (consumed.some(isCcSidecar) && !ccHold) {
                 const ccAdd = [CC_TOKENS.imported];
-                if (removeSource && ccStripReady() && !ccHas(CC_TOKENS.strip)) {
+                if (removeSource && ccStripReady() && !ccHas(CC_TOKENS.strip) && ccProbeVerdict() !== false) {
                     const tok = ccStripOrDefer(removedIndices);
                     if (tok) ccAdd.push(tok);
                 } else if (removeSource && !ccHas(CC_TOKENS.strip) && !ccHas(CC_TOKENS.removed) && ccProbeVerdict() !== false) {
+                    const owed = !ccHas(CC_TOKENS.decoded2) && !ccApiRead.includes(CC_TOKENS.decoded2)
+                        && (ccHas(CC_TOKENS.decoded) || ccApiRead.includes(CC_TOKENS.decoded));
                     response.infoLog += `☒${streamTag(ccVideo.index)}[remove_source=true] Not removing the closed captions from the video bitstream - that`
-                        + ` waits for a finished read of both caption fields, and none stands behind ${consumed.filter(isCcSidecar).join(', ')}\n`;
+                        + ` ${owed ? 'waits for' : 'needs'} a finished read of both caption fields, and none stands behind ${consumed.filter(isCcSidecar)
+                            .join(', ')}${owed ? '' : '; no later pass reads them, so the captions stay in the video beside the imported track'}\n`;
                 }
                 meta += ccTagArg(...ccAdd, ...ccApiRead);
             } else if (ccApiRead.length) {
