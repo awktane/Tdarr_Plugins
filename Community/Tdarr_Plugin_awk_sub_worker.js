@@ -43,7 +43,7 @@ const details = () => ({
                 stream_ordering (last). If the file has embedded closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that
                 destroys them. Extract with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since
                 the sidecars would land beside the source, where the output never sees them.`,
-    Version: '3.999.107',
+    Version: '3.999.108',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -390,11 +390,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each keyword
     // lives on ONE flag PER STREAM TYPE - hasDisposition scopes by entry.streams - so title->flag promotion stays unambiguous; descriptive/descriptions/dvs
     // deliberately appear on both the audio and subtitle entries), and the canonical title string (tag, null when never written). The single table every
-    // classifier, sort key, summary token and title tagger reads, so the lists can never drift. The commentary, audio-description, dub, SDH, forced and
-    // original roles also carry the words European releases title such tracks with, unflagged (German, French, Spanish, Portuguese, Italian, Dutch,
-    // Polish and the Nordic languages), plurals and the one-word compounds release labels use (Kommentare, Audiokommentar) included - compounds have no
-    // end, so these are the standard labels, not every word. Each is a whole-token match, so only a word that means nothing else in a track title belongs
-    // here (VO, OV, UT stay out), and every one is pinned by the harness.
+    // classifier, sort key, summary token and title tagger reads, so the lists can never drift. The roles also carry the words European releases title such
+    // tracks with, unflagged: commentary, audio description and SDH in German, French, Spanish, Portuguese, Italian, Dutch, Polish and the Nordic languages;
+    // forced in all of those but the Nordic ones, which have no standard forced label; dub in all but German, Dutch and Finnish; original in German, French,
+    // Italian, Dutch and Polish, and in Spanish and Portuguese through the bare 'original'. Plurals and the one-word compounds release labels use (Kommentare,
+    // Audiokommentar) are included - compounds have no end, so these are the standard labels, not every word. Each is a whole-token match, so only a word that
+    // means nothing else in a track title belongs here: VO, OV and UT stay out, and French, Italian, Dutch and Polish carry 'original' as the phrase, since
+    // their lone word also names an original soundtrack (bande originale, oryginalna ścieżka dźwiękowa). Every one is pinned by the harness.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary', 'kommentar', 'commentaire', 'comentario', 'comentário', 'commento',
                                 'commentaar', 'komentarz', 'kommentaari', 'kommentare', 'kommentarer', 'audiokommentar', 'regiekommentar',
@@ -406,15 +408,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                                 'kuvailutulkkaus', 'audio described'],                                                          tag: 'Descriptive' },
         descriptions:     { streams:['subtitle'],                 keywords: ['descriptive','descriptions','dvs'],                      tag: 'Descriptive' },
         hearing_impaired: { streams:['subtitle'],                 keywords: ['sdh','hearing impaired','hard of hearing','hoh','deaf', 'malentendants',
-                                'hörgeschädigte', 'gehörlose', 'sordos', 'non udenti', 'slechthorenden'],                       tag: 'SDH'         },
+                                'hörgeschädigte', 'gehörlose', 'sordos', 'non udenti', 'slechthorenden', 'surdos', 'niesłyszących',
+                                'hörselskadade', 'hørehæmmede', 'hørselshemmede', 'kuulovammaiset'],                            tag: 'SDH'         },
         captions:         { streams:['subtitle'],                 keywords: ['caption','captions','cc'],                               tag: 'SDH'         },
         lyrics:           { streams:['subtitle'],                 keywords: ['songs','lyrics'],                                        tag: 'Lyrics'      },
         forced:           { streams:['subtitle'],                 keywords: ['forced','foreign', 'forcé', 'forcés', 'forzados',
-                                'erzwungen'],                                                                                   tag: 'Forced'      },
+                                'erzwungen', 'forçadas', 'forçada', 'forzati', 'geforceerd', 'wymuszone'],                      tag: 'Forced'      },
         dub:              { streams:['audio'],                    keywords: ['dub','dubbed', 'dubbing', 'doublage', 'doblaje', 'doblado', 'dublado', 'dublagem',
                                 'doppiaggio', 'doppiato', 'dubbad', 'dubbet'],                                                  tag: 'Dub'         },
         original:         { streams:['audio'],                    keywords: ['original', 'originalton', 'o-ton', 'originalfassung', 'version originale',
-                                'versione originale'],                                                                          tag: 'Original'    },
+                                'versione originale', 'originele versie', 'wersja oryginalna'],                                 tag: 'Original'    },
         clean_effects:    { streams:['audio'],                    keywords: ['music and effects','music & effects','m&e','m and e'],   tag: 'M&E'         },
         karaoke:          { streams:['audio'],                    keywords: ['karaoke'],                                               tag: 'Karaoke'     },
         default:          { streams:['audio','subtitle','video'], keywords: ['default'],                                               tag: null          },
@@ -1074,23 +1077,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .map(([what, d]) => `☒${streamTag(d.s.index)} ${what} - ${COVER_LOST_WHY[d.why]}${d.detail ? ` (${d.detail})` : ''}\n`).join('');
     // ===== END SHARED: matroska cover keep =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 uncopyable streams =====
-    // -=-=-= mp4UncopyableStreams (+ mp4LostData, mp4UncopyableLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
-    // The data streams an mp4-family -c copy cannot carry as they are, which each remux here leaves out of its map. One is a stream ffprobe names no codec
-    // for - in practice a camera's tmcd timecode track - in mp4/m4v/m4a: the mp4 muxer refuses it outright ("Could not find tag for codec none", exit 234 on
-    // jellyfin 7.1.4) and takes the whole command down, so a -map 0 copy of such a file fails on every requeue. Its timecode survives where the muxer
-    // rebuilds it (isMp4RebuiltTimecode). mov copies the track as-is and is left alone. The other is the chapter track, in mov too, which the muxer
-    // always rebuilds from the chapters (see isMp4ChapterTrack). clean_and_remux removes every such stream the muxer would not put back, so in the designed
-    // stack only a run without it meets a lost one. The log line names each stream left out and says what carries over.
+    // -=-=-= isUnidentifiedStream / mp4UncopyableStreams (+ mp4LostData, mp4UncopyableLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // A stream ffmpeg cannot identify at all: ffprobe omits its codec_type (an MPEG-TS private-section PID, stream_type 0x05, as DVB recordings carry), and
+    // ffmpeg refuses any map of it, -map 0 included ("Cannot map stream ... unsupported type", exit 234 on jellyfin 7.1.4; -map 0 -map -0:N exits 0), so a
+    // remux keeping it fails on every requeue, in any container. clean_and_remux removes it; a run without that meets it here.
+    const isUnidentifiedStream = (s) => !['video', 'audio', 'subtitle', 'attachment', 'data'].includes(codecTypeOf(s));
+    // The streams a -c copy cannot carry as they are, which each remux here leaves out of its map: in every container a stream ffmpeg cannot identify, and
+    // two data streams of the mp4 family. One is a stream ffprobe names no codec for - in practice a camera's tmcd timecode track - in mp4/m4v/m4a: the mp4
+    // muxer refuses it outright ("Could not find tag for codec none", exit 234 on jellyfin 7.1.4) and takes the whole command down, so a -map 0 copy of such a
+    // file fails on every requeue. Its timecode survives where the muxer rebuilds it (isMp4RebuiltTimecode). mov copies the track as-is and is left alone.
+    // The other is the chapter track, in mov too, which the muxer always rebuilds from the chapters (see isMp4ChapterTrack). clean_and_remux removes every
+    // such stream the muxer would not put back, so in the designed stack only a run without it meets a lost one. The log line names each stream left out and
+    // says what carries over.
     const mp4UncopyableStreams = (container, streams) => {
         const c = String(container || '').toLowerCase();
         const noCodec = (s) => ['mp4', 'm4v', 'm4a'].includes(c) && codecTypeOf(s) === 'data' && ['', 'unknown', 'none'].includes(codecNameOf(s));
-        return (streams || []).filter((s) => noCodec(s) || (isMp4Family(c) && isMp4ChapterTrack(s)));
+        return (streams || []).filter((s) => isUnidentifiedStream(s) || noCodec(s) || (isMp4Family(c) && isMp4ChapterTrack(s)));
     };
     // The dropped streams whose data really leaves the output - all of them but a track the muxer rebuilds - so an Expected results line never promises one.
     // `kept` is what the output maps (see isMp4RebuiltTimecode); a tmcd carrying the timecode of a video the muxer cannot time is lost for that reason
     // (mp4OverfastFor), and one lost while the muxer still writes others is one past its one-per-video count.
     const mp4LostData = (dropped, kept) => dropped.filter((s) => !isMp4ChapterTrack(s) && !isMp4RebuiltTimecode(s, kept));
     const mp4UncopyableLog = (container, dropped, kept) => dropped.map((s) => {
+        if (isUnidentifiedStream(s)) {
+            return `☐${streamTag(s.index)} Leaving out a stream ffmpeg cannot identify - it cannot be copied (${codecTypeOf(s) || 'unknown'}-`
+                + `${codecNameOf(s) || 'none'})\n`;
+        }
         if (!mp4LostData([s], kept).length) return mp4RebuiltLine(s, container);
         const tmcd = String(s.codec_tag_string || '').toLowerCase() === 'tmcd';
         const what = tmcd ? 'tmcd timecode' : 'unidentified data';

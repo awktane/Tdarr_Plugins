@@ -26,7 +26,7 @@ const details = () => ({
         review rather than failed. The same goes for a broadcast .ts or .mpg capture remuxed to mkv or mp4 in the same job with its video copied, not
         re-encoded: a capture whose timestamps jump or reset states a longer length than it holds. A later job on that file is checked in full again. This
         check is always on and has no setting.\n`,
-    Version: '4.999.62',
+    Version: '4.999.63',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -360,11 +360,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each keyword
     // lives on ONE flag PER STREAM TYPE - hasDisposition scopes by entry.streams - so title->flag promotion stays unambiguous; descriptive/descriptions/dvs
     // deliberately appear on both the audio and subtitle entries), and the canonical title string (tag, null when never written). The single table every
-    // classifier, sort key, summary token and title tagger reads, so the lists can never drift. The commentary, audio-description, dub, SDH, forced and
-    // original roles also carry the words European releases title such tracks with, unflagged (German, French, Spanish, Portuguese, Italian, Dutch,
-    // Polish and the Nordic languages), plurals and the one-word compounds release labels use (Kommentare, Audiokommentar) included - compounds have no
-    // end, so these are the standard labels, not every word. Each is a whole-token match, so only a word that means nothing else in a track title belongs
-    // here (VO, OV, UT stay out), and every one is pinned by the harness.
+    // classifier, sort key, summary token and title tagger reads, so the lists can never drift. The roles also carry the words European releases title such
+    // tracks with, unflagged: commentary, audio description and SDH in German, French, Spanish, Portuguese, Italian, Dutch, Polish and the Nordic languages;
+    // forced in all of those but the Nordic ones, which have no standard forced label; dub in all but German, Dutch and Finnish; original in German, French,
+    // Italian, Dutch and Polish, and in Spanish and Portuguese through the bare 'original'. Plurals and the one-word compounds release labels use (Kommentare,
+    // Audiokommentar) are included - compounds have no end, so these are the standard labels, not every word. Each is a whole-token match, so only a word that
+    // means nothing else in a track title belongs here: VO, OV and UT stay out, and French, Italian, Dutch and Polish carry 'original' as the phrase, since
+    // their lone word also names an original soundtrack (bande originale, oryginalna ścieżka dźwiękowa). Every one is pinned by the harness.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary', 'kommentar', 'commentaire', 'comentario', 'comentário', 'commento',
                                 'commentaar', 'komentarz', 'kommentaari', 'kommentare', 'kommentarer', 'audiokommentar', 'regiekommentar',
@@ -376,15 +378,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                                 'kuvailutulkkaus', 'audio described'],                                                          tag: 'Descriptive' },
         descriptions:     { streams:['subtitle'],                 keywords: ['descriptive','descriptions','dvs'],                      tag: 'Descriptive' },
         hearing_impaired: { streams:['subtitle'],                 keywords: ['sdh','hearing impaired','hard of hearing','hoh','deaf', 'malentendants',
-                                'hörgeschädigte', 'gehörlose', 'sordos', 'non udenti', 'slechthorenden'],                       tag: 'SDH'         },
+                                'hörgeschädigte', 'gehörlose', 'sordos', 'non udenti', 'slechthorenden', 'surdos', 'niesłyszących',
+                                'hörselskadade', 'hørehæmmede', 'hørselshemmede', 'kuulovammaiset'],                            tag: 'SDH'         },
         captions:         { streams:['subtitle'],                 keywords: ['caption','captions','cc'],                               tag: 'SDH'         },
         lyrics:           { streams:['subtitle'],                 keywords: ['songs','lyrics'],                                        tag: 'Lyrics'      },
         forced:           { streams:['subtitle'],                 keywords: ['forced','foreign', 'forcé', 'forcés', 'forzados',
-                                'erzwungen'],                                                                                   tag: 'Forced'      },
+                                'erzwungen', 'forçadas', 'forçada', 'forzati', 'geforceerd', 'wymuszone'],                      tag: 'Forced'      },
         dub:              { streams:['audio'],                    keywords: ['dub','dubbed', 'dubbing', 'doublage', 'doblaje', 'doblado', 'dublado', 'dublagem',
                                 'doppiaggio', 'doppiato', 'dubbad', 'dubbet'],                                                  tag: 'Dub'         },
         original:         { streams:['audio'],                    keywords: ['original', 'originalton', 'o-ton', 'originalfassung', 'version originale',
-                                'versione originale'],                                                                          tag: 'Original'    },
+                                'versione originale', 'originele versie', 'wersja oryginalna'],                                 tag: 'Original'    },
         clean_effects:    { streams:['audio'],                    keywords: ['music and effects','music & effects','m&e','m and e'],   tag: 'M&E'         },
         karaoke:          { streams:['audio'],                    keywords: ['karaoke'],                                               tag: 'Karaoke'     },
         default:          { streams:['audio','subtitle','video'], keywords: ['default'],                                               tag: null          },
@@ -1085,23 +1088,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .map(([what, d]) => `☒${streamTag(d.s.index)} ${what} - ${COVER_LOST_WHY[d.why]}${d.detail ? ` (${d.detail})` : ''}\n`).join('');
     // ===== END SHARED: matroska cover keep =====
     // ===== SHARED [audio_clean, stream_ordering, sub_worker, video_clean]: mp4 uncopyable streams =====
-    // -=-=-= mp4UncopyableStreams (+ mp4LostData, mp4UncopyableLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
-    // The data streams an mp4-family -c copy cannot carry as they are, which each remux here leaves out of its map. One is a stream ffprobe names no codec
-    // for - in practice a camera's tmcd timecode track - in mp4/m4v/m4a: the mp4 muxer refuses it outright ("Could not find tag for codec none", exit 234 on
-    // jellyfin 7.1.4) and takes the whole command down, so a -map 0 copy of such a file fails on every requeue. Its timecode survives where the muxer
-    // rebuilds it (isMp4RebuiltTimecode). mov copies the track as-is and is left alone. The other is the chapter track, in mov too, which the muxer
-    // always rebuilds from the chapters (see isMp4ChapterTrack). clean_and_remux removes every such stream the muxer would not put back, so in the designed
-    // stack only a run without it meets a lost one. The log line names each stream left out and says what carries over.
+    // -=-=-= isUnidentifiedStream / mp4UncopyableStreams (+ mp4LostData, mp4UncopyableLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // A stream ffmpeg cannot identify at all: ffprobe omits its codec_type (an MPEG-TS private-section PID, stream_type 0x05, as DVB recordings carry), and
+    // ffmpeg refuses any map of it, -map 0 included ("Cannot map stream ... unsupported type", exit 234 on jellyfin 7.1.4; -map 0 -map -0:N exits 0), so a
+    // remux keeping it fails on every requeue, in any container. clean_and_remux removes it; a run without that meets it here.
+    const isUnidentifiedStream = (s) => !['video', 'audio', 'subtitle', 'attachment', 'data'].includes(codecTypeOf(s));
+    // The streams a -c copy cannot carry as they are, which each remux here leaves out of its map: in every container a stream ffmpeg cannot identify, and
+    // two data streams of the mp4 family. One is a stream ffprobe names no codec for - in practice a camera's tmcd timecode track - in mp4/m4v/m4a: the mp4
+    // muxer refuses it outright ("Could not find tag for codec none", exit 234 on jellyfin 7.1.4) and takes the whole command down, so a -map 0 copy of such a
+    // file fails on every requeue. Its timecode survives where the muxer rebuilds it (isMp4RebuiltTimecode). mov copies the track as-is and is left alone.
+    // The other is the chapter track, in mov too, which the muxer always rebuilds from the chapters (see isMp4ChapterTrack). clean_and_remux removes every
+    // such stream the muxer would not put back, so in the designed stack only a run without it meets a lost one. The log line names each stream left out and
+    // says what carries over.
     const mp4UncopyableStreams = (container, streams) => {
         const c = String(container || '').toLowerCase();
         const noCodec = (s) => ['mp4', 'm4v', 'm4a'].includes(c) && codecTypeOf(s) === 'data' && ['', 'unknown', 'none'].includes(codecNameOf(s));
-        return (streams || []).filter((s) => noCodec(s) || (isMp4Family(c) && isMp4ChapterTrack(s)));
+        return (streams || []).filter((s) => isUnidentifiedStream(s) || noCodec(s) || (isMp4Family(c) && isMp4ChapterTrack(s)));
     };
     // The dropped streams whose data really leaves the output - all of them but a track the muxer rebuilds - so an Expected results line never promises one.
     // `kept` is what the output maps (see isMp4RebuiltTimecode); a tmcd carrying the timecode of a video the muxer cannot time is lost for that reason
     // (mp4OverfastFor), and one lost while the muxer still writes others is one past its one-per-video count.
     const mp4LostData = (dropped, kept) => dropped.filter((s) => !isMp4ChapterTrack(s) && !isMp4RebuiltTimecode(s, kept));
     const mp4UncopyableLog = (container, dropped, kept) => dropped.map((s) => {
+        if (isUnidentifiedStream(s)) {
+            return `☐${streamTag(s.index)} Leaving out a stream ffmpeg cannot identify - it cannot be copied (${codecTypeOf(s) || 'unknown'}-`
+                + `${codecNameOf(s) || 'none'})\n`;
+        }
         if (!mp4LostData([s], kept).length) return mp4RebuiltLine(s, container);
         const tmcd = String(s.codec_tag_string || '').toLowerCase() === 'tmcd';
         const what = tmcd ? 'tmcd timecode' : 'unidentified data';
@@ -2999,18 +3011,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const canPersistDefault = isMatroskaFamily(dstContainer) || isMp4Family(dstContainer) || ['3gp', '3g2'].includes(dstContainer);
         let defaultFlagSkipped = false;
 
-        // Three kinds of stream are left out of the map, so outIdx - the output position the per-stream -metadata writes key on - counts only the streams
-        // actually mapped: a data track the container cannot copy (mp4UncopyableStreams), every Matroska cover (matroskaCovers: attached again from a staged
-        // copy, or dropped, after the skip test - a cover that cannot be staged is mapped as a track after everything, so no outIdx moves), and a stream ffmpeg
-        // cannot identify at all - ffprobe omits its codec_type (an MPEG-TS private-section PID, stream_type 0x05, as DVB recordings carry) and ffmpeg refuses
-        // an explicit map of it ("Cannot map stream ... unsupported type", exit 234 on jellyfin-ffmpeg 7.1.4), so mapping it would fail every remux this plugin
-        // emits for the file. None forces a remux on its own: the order test reads only the mapped streams, so a cover's place is never work, and the other two
-        // are dropped only from a remux some other change already called for. The -disposition:a: writes key on the audio-relative audioIndex instead, which no
-        // such stream can move: none is ever an audio stream.
+        // Two kinds of stream are left out of the map, so outIdx - the output position the per-stream -metadata writes key on - counts only the streams
+        // actually mapped: a stream the container cannot copy (mp4UncopyableStreams: one ffmpeg cannot identify at all, in any container, or a data track the
+        // mp4 family cannot carry), and every Matroska cover (matroskaCovers: attached again from a staged copy, or dropped, after the skip test - a cover that
+        // cannot be staged is mapped as a track after everything, so no outIdx moves). Neither forces a remux on its own: the order test reads only the mapped
+        // streams, so a cover's place is never work, and an uncopyable stream is dropped only from a remux some other change already called for. The
+        // -disposition:a: writes key on the audio-relative audioIndex instead, which no such stream can move: none is ever an audio stream.
         const uncopyable = mp4UncopyableStreams(dstContainer, file.ffProbeData.streams);
         const mkvCoverStreams = matroskaCovers(dstContainer, file.ffProbeData.streams);
-        const unidentified = sortRows.filter((r) => TYPE_ORDER[r.type] === undefined);
-        const leftOutOfMap = (r) => [...uncopyable, ...mkvCoverStreams].some((s) => s.index === r.index) || unidentified.includes(r);
+        const leftOutOfMap = (r) => [...uncopyable, ...mkvCoverStreams].some((s) => s.index === r.index);
         // Into the mp4 family a cover's place is not this plugin's to set: the muxer stores it as a covr atom, which the next pass reads after every track
         // wherever it was mapped (isMp4Cover). So it is mapped last, where it will be read, and the order test passes over it - a file whose only disorder
         // is its cover is in order, and nothing is remuxed only to move one.
@@ -3250,9 +3259,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         response.infoLog += mp4UncopyableLog(dstContainer, uncopyable, mapped) + matroskaCoverLog(staged)
             + asTrackRows.filter((r) => r.stream.disposition?.attached_pic !== 1).map((r) => `☐${streamTag(r.index)} The cover-art track goes after every`
                 + ' other track - cover art is never sorted among the real video\n').join('')
-            + mp4TagPlanLog(tagPlan, dstContainer, mapped)
-            + unidentified.map((r) => `☐${streamTag(r.index)} Leaving out a stream ffmpeg cannot identify - it cannot be copied`
-                + ` (${r.type || 'unknown'}-${codecNameOf(r.stream) || 'none'})\n`).join('') + mp4TimecodeLog(dstContainer, outStreams)
+            + mp4TagPlanLog(tagPlan, dstContainer, mapped) + mp4TimecodeLog(dstContainer, outStreams)
             + dvCopyLossLine(dstContainer, mapped) + movDvLossLine(dstContainer, mapped) + roleLossLine(dstContainer, mapped);
         const goneData = mp4LostData(uncopyable, mapped);
         const coversLost = mp4CoversLost(tagPlan, dstContainer, mapped);
@@ -3262,7 +3269,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .map((r) => `☐${streamTag(r.index)} Cover art goes after every track - the .${dstContainer} muxer stores it as a cover atom, read back`
                 + ' after them\n')
             .join('');
-        const leftOut = new Set([...goneData, ...coversLost, ...mkvCoverStreams, ...unidentified.map((r) => r.stream)].map((s) => s.index));
+        const leftOut = new Set([...goneData, ...coversLost, ...mkvCoverStreams].map((s) => s.index));
         // a track the muxer rebuilds or creates lands after every mapped one, where the muxer writes it, and a kept cover after those (mp4RebuiltLast); the
         // flags are the ones the output is read back with (readBackDispositions), and this preset's own -disposition writes turn ffmpeg's default rule off
         const created = mp4CreatedTracks(dstContainer, outStreams);
