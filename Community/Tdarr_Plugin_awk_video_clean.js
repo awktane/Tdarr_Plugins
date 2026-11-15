@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.87',
+    Version: '3.999.88',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -2391,7 +2391,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const queryCapabilities = (ffmpegPath) => {
         const cap = { encoders: new Set(), nvidia: false, dri: false, renderNodes: [] };
         try {
-            const r = childProcess.spawnSync(ffmpegPath, ['-hide_banner', '-encoders'], { encoding: 'utf8', timeout: ENCODERS_PROBE_TIMEOUT_MS });
+            const r = childProcess.spawnSync(ffmpegPath, ['-hide_banner', '-encoders'],
+                { encoding: 'utf8', timeout: ENCODERS_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' });
             cap.encoders = parseFfmpegEncoders(r.stdout);
         } catch (e) { /* leave encoders empty -> everything falls back to CPU */ }
         try {
@@ -2409,7 +2410,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Run one probe command and report only whether it exited 0 - the shared spawn+verdict skeleton for the confirm* probes below, so a future hardening
     // (a maxBuffer cap, stderr capture) lands once instead of per probe. Each caller builds its own args; that is pure string work and cannot throw.
     const probeOk = (ffmpegPath, args) => {
-        try { return childProcess.spawnSync(ffmpegPath, args, { encoding: 'utf8', timeout: CONFIRM_PROBE_TIMEOUT_MS }).status === 0; }
+        try { return childProcess.spawnSync(ffmpegPath, args, { encoding: 'utf8', timeout: CONFIRM_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' }).status === 0; }
         catch (e) { return false; }
     };
 
@@ -2772,7 +2773,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const probe = (interval) => {
                     const r = o.spawn(o.ffprobe, ['-hide_banner', '-v', 'error', '-select_streams', String(o.streamIndex), '-read_intervals', interval,
                         '-show_entries', 'packet=pts_time,dts_time,flags', '-of', 'csv=p=0', o.file],
-                    { encoding: 'utf8', timeout: KEYFRAME_PROBE_TIMEOUT_MS, maxBuffer: TEST_MAX_BUFFER });
+                    { encoding: 'utf8', timeout: KEYFRAME_PROBE_TIMEOUT_MS, maxBuffer: TEST_MAX_BUFFER, killSignal: 'SIGKILL' });
                     return classifySpawn(r) === 'eof' ? packetRows(r.stdout) : null;
                 };
                 const keys = (rows) => rows.filter((r) => r.key).map((r) => r.t);
@@ -3552,7 +3553,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const args = ['-nostats', '-hide_banner', ...(startSec > 0 ? ['-ss', String(startSec)] : []), '-i', inputPath, '-map', `0:${streamIndex}`,
                 '-frames:v', String(IDET_SAMPLE_FRAMES), '-vf', 'idet', '-f', 'null', '-'];
             const r = childProcess.spawnSync(ffmpegPath, args,
-                { encoding: 'utf8', timeout: IDET_PROBE_TIMEOUT_MS, maxBuffer: IDET_PROBE_MAX_BYTES });
+                { encoding: 'utf8', timeout: IDET_PROBE_TIMEOUT_MS, maxBuffer: IDET_PROBE_MAX_BYTES, killSignal: 'SIGKILL' });
             // A probe that did not finish gives no verdict. A timeout or the maxBuffer cap still hands back the stderr read SO FAR, and the genuine summary
             // prints last - so a cut-off read holds at best the init block, and at worst whatever the input dump put there.
             if (!r || r.error || r.signal || r.status !== 0) {
@@ -3634,7 +3635,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const { spawnSync } = require('child_process');
             const args = ['-v', 'error', '-select_streams', String(absIndex), '-read_intervals', `%+#${A53_PROBE_FRAMES}`,
                 '-show_frames', '-show_entries', 'frame=side_data_list', '-of', 'default=nw=1', filePath];
-            const r = spawnSync(ffprobePath, args, { encoding: 'utf8', timeout: A53_PROBE_TIMEOUT_MS, maxBuffer: A53_PROBE_MAX_BYTES });
+            const r = spawnSync(ffprobePath, args, { encoding: 'utf8', timeout: A53_PROBE_TIMEOUT_MS, maxBuffer: A53_PROBE_MAX_BYTES, killSignal: 'SIGKILL' });
             if (!r || r.status !== 0) return 'unknown';
             return String(r.stdout || '').includes(A53_SIDE_DATA);
         } catch (e) { return 'unknown'; }
@@ -5322,12 +5323,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Why sub_worker's pending `strip` may belong to another video ('' when it is honoured), memoised: asked once, right before the encode that would
         // serve it (after every skip and refusal, before the test encodes). A request beside the caption track sub_worker imported is honoured with no read
         // - the captions are in this file as that track. Otherwise the read's inherited fingerprint is checked against the primary (ccFpStaleWhy, where a
-        // failed read counts as stale).
+        // failed read counts as stale). An mp4-family file keeps no track tag, so there any hearing-impaired mov_text track is that track whatever its
+        // language - language_fill gives the imported one a language, as clean_and_remux's language_sub stop advises. The cost: an unrelated SDH track left
+        // after the real one was removed by hand has a stale request honoured with no read.
         let ccStaleMemo = null;
         const ccStripStaleWhy = () => {
             if (ccStaleMemo !== null) return ccStaleMemo;
+            const mp4Track = isMp4Family(dstContainer)
+                && file.ffProbeData.streams.some((s) => codecNameOf(s) === 'mov_text' && s.disposition?.hearing_impaired === 1);
             ccStaleMemo = !ccExported ? ''
-                : ccTokens.includes(CC_TOKENS.imported) && importedCaptionTracks(file.ffProbeData.streams, ccTokens, () => false).length ? ''
+                : ccTokens.includes(CC_TOKENS.imported) && (mp4Track || importedCaptionTracks(file.ffProbeData.streams, ccTokens, () => false).length) ? ''
                     : ccFpStaleWhy(ccTokens, ccTokensOf(origProbe?.format?.tags), primary, () => digestOf(file.file, primary.index));
             return ccStaleMemo;
         };

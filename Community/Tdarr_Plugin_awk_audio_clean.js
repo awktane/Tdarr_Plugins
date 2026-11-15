@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.86',
+    Version: '4.999.87',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -3097,7 +3097,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 encoderSet = new Set();
                 try {
                     const r = spawnSync(ffmpegPathOf(otherArguments), ['-hide_banner', '-encoders'],
-                        { encoding: 'utf8', timeout: ENCODERS_PROBE_TIMEOUT_MS });
+                        { encoding: 'utf8', timeout: ENCODERS_PROBE_TIMEOUT_MS, killSignal: 'SIGKILL' });
                     encoderSet = parseFfmpegEncoders(r && r.stdout);
                 } catch (e) { /* leave empty → native aac fallback, which every build has */ }
             }
@@ -4049,10 +4049,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (prefetched) return prefetched;
             const args = ['-nostats', '-hide_banner', '-i', file.file, '-map', `0:a:${srcAudioIdx}`, '-af', loudnormAnalysisFilter(preFilter, preset),
                 '-f', 'null', '-'];
-            const result = spawnSync(ffmpegPathOf(otherArguments), args, { timeout: timeoutMs, maxBuffer: LOUDNORM_ANALYSIS_MAX_BYTES, encoding: 'utf-8' });
-            // A tripped `timeout` sets BOTH error (code ETIMEDOUT) and signal (SIGTERM), and error is tested first - so the timeout must be named HERE or it
-            // reports as a failure to launch, which is the opposite of what happened. The bare signal branch below is then only an external kill (an OOM
-            // killer, an operator), which is worth telling apart from a timeout because the remedies differ.
+            const result = spawnSync(ffmpegPathOf(otherArguments), args,
+                { timeout: timeoutMs, maxBuffer: LOUDNORM_ANALYSIS_MAX_BYTES, encoding: 'utf-8', killSignal: 'SIGKILL' });
+            // A tripped `timeout` sets BOTH error (code ETIMEDOUT) and signal (the killSignal), and error is tested first - so the timeout must be named
+            // HERE or it reports as a failure to launch, which is the opposite of what happened. The bare signal branch below is then only an external kill
+            // (an OOM killer, an operator), which is worth telling apart from a timeout because the remedies differ.
             if (result.error && result.error.code === 'ETIMEDOUT')
                 return { error: `ffmpeg exceeded the ${Math.round(timeoutMs / 60000)} min ${pass} timeout for this file's duration` };
             if (result.error) return { error: `could not start ffmpeg (${result.error.message})` };
@@ -4083,7 +4084,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const args = ['-nostats', '-hide_banner', '-i', file.file];
                 batch.forEach((idx, k) => args.push('-map', `0:a:${idx}`, '-af', loudnormAnalysisFilter('', preset, `loudnorm@r${k}`), '-f', 'null', '-'));
                 const timeout = Math.min(LOUDNORM_ANALYSIS_MAX_TIMEOUT_MS, loudnormAnalysisTimeoutMs * batch.length);
-                const result = spawnSync(ffmpegPathOf(otherArguments), args, { timeout, maxBuffer: LOUDNORM_ANALYSIS_MAX_BYTES, encoding: 'utf-8' });
+                const result = spawnSync(ffmpegPathOf(otherArguments), args,
+                    { timeout, maxBuffer: LOUDNORM_ANALYSIS_MAX_BYTES, encoding: 'utf-8', killSignal: 'SIGKILL' });
                 const err = String(result.stderr || '');
                 // Each track's stats come only from ITS OWN teardown report: the instance name at the start of a line, the JSON opening on the next. The
                 // stream dumps echo every title and global tag at the same INFO level and land between the reports (an output whose track is shorter than

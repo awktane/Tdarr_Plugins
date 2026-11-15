@@ -43,7 +43,7 @@ const details = () => ({
                 stream_ordering (last). If the file has embedded closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that
                 destroys them. Extract with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since
                 the sidecars would land beside the source, where the output never sees them.`,
-    Version: '3.999.103',
+    Version: '3.999.104',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1760,7 +1760,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', String(file._id || file.file || '')];
         for (const j of staged) args.push(...j.args, j.tmp);
         const ff = spawnSync(ffmpegPathOf(otherArguments), args,
-            { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES });
+            { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES, killSignal: 'SIGKILL' });
         if (ff.error || ff.status !== 0) {
             const why = ff.error ? `extraction failed (${ff.error.code || ff.error.message})`
                 : `extraction failed (ffmpeg exit ${ff.status}: ${logSafe(String(ff.stderr || '').trim())})`;
@@ -1827,8 +1827,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The subtitle inside a styled .mks bundle, decoded to ASS by ffmpeg into a private temp dir, and how many font attachments ffmpeg's input listing
     // names ("Stream #0:1: Attachment: ttf", measured on 7.1.4). { state: 'ok', buf, fonts }, or { state: 'unreadable' } when ffmpeg RAN and could not
     // decode it - what an interrupted export leaves: killed mid-write it ends "File ended prematurely", and a run whose OTHER output failed at
-    // write_header leaves a header with no cluster ("End of file"), both measured on 7.1.4 - or { state: 'unknown' } when it could not be judged (no temp
-    // dir, a spawn error or timeout, a read-out over the cap), where every caller keeps the answer it had before it could look.
+    // write_header leaves a header with no cluster ("End of file"), both measured on 7.1.4 - or { state: 'unknown' } when it could not be judged (gone, or
+    // not a regular file - ffmpeg blocks on a FIFO's -i until the timeout -, no temp dir, a spawn error or timeout, a read-out over the cap), where every
+    // caller keeps the answer it had before it could look.
     const readBundleSubtitle = (p) => {
         let dir = '';
         try { dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_subbundle_')); } catch (e) { return { state: 'unknown' }; }
@@ -1836,10 +1837,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let res = { state: 'unknown' };
         try {
             const { spawnSync } = require('child_process');
-            const r = spawnSync(ffmpegPathOf(otherArguments), ['-hide_banner', '-y', '-loglevel', 'info', '-i', p, '-map', '0:s:0', '-c:s', 'ass',
-                '-fs', String(SIDECAR_HASH_MAX + 1), out], { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES });
-            if (!r.error && r.status !== 0) res = { state: 'unreadable' };
-            else if (!r.error && fs.statSync(out).size <= SIDECAR_HASH_MAX) {
+            const r = fs.statSync(p).isFile() ? spawnSync(ffmpegPathOf(otherArguments), ['-hide_banner', '-y', '-loglevel', 'info', '-i', p, '-map', '0:s:0',
+                '-c:s', 'ass', '-fs', String(SIDECAR_HASH_MAX + 1), out],
+            { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES, killSignal: 'SIGKILL' }) : null;
+            if (r && !r.error && r.status !== 0) res = { state: 'unreadable' };
+            else if (r && !r.error && fs.statSync(out).size <= SIDECAR_HASH_MAX) {
                 res = { state: 'ok', buf: fs.readFileSync(out),
                     fonts: String(r.stderr || '').split('\n').filter((l) => l.trimStart().startsWith('Stream #') && l.includes(': Attachment:')).length };
             }
@@ -2753,7 +2755,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         text:     { ext: 'srt', enc: 'srt' },
         ass:      { ext: 'ass', enc: 'ass' },
         ssa:      { ext: 'ass', enc: 'ass' },
-        webvtt:   { ext: 'vtt', enc: 'webvtt' },
+        // Copied, not re-encoded: ffmpeg's decode writes &nbsp; back as a literal \h and drops cue ids, settings and tags (measured on 7.1.4).
+        webvtt:   { ext: 'vtt', enc: 'copy' },
         // The decodable-to-text formats a sidecar is the only way out for (the shared decodable text subtitle vocabulary). eia_608 alone takes its own
         // encoder; the legacy family carries no overrides, so it takes srt like the canonical rows above. Listed AFTER them so EXT_TO_CODEC still resolves
         // .srt back to subrip.
@@ -3417,27 +3420,30 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // The identity every sidecar comparison keys on: the sha1 of the normalised text above.
     const subTextHash = (buf, ext) => crypto.createHash('sha1').update(subTextForHash(buf, ext)).digest('hex');
+    // An srt or vtt timing line's two stamps, start and end - one anchored pattern per line.
+    const CUE_TIMING = /^[ \t]*((?:\d+:)?\d{1,2}:\d{1,2}[.,]\d{1,3})[ \t]*-->[ \t]*((?:\d+:)?\d{1,2}:\d{1,2}[.,]\d{1,3})/;
     // The cue TEXTS of decoded subtitle text, in order - each cue's lines trimmed, its number, timing and settings left out. srt/vtt cues are the lines
     // after a '-->' line up to a blank one; ass/ssa cues the text after a Dialogue line's ninth comma. One pass over the lines, each tested with an anchored
-    // pattern, since the text is untrusted and up to SIDECAR_HASH_MAX.
-    const cueTexts = (text, ext) => {
+    // pattern, since the text is untrusted and up to SIDECAR_HASH_MAX. `lasting` leaves out a cue whose stamps both read and end no later than it starts.
+    const cueTexts = (text, ext, lasting = false) => {
         const ass = ext === 'ass' || ext === 'ssa';
-        const cues = []; let cur = null;
+        const lasts = (m) => !lasting || !m || !(hmsSeconds(m[2]) <= hmsSeconds(m[1]));
+        const cues = []; let cur = null; let keep = true;
         for (const line of String(text).split(/\r\n|\r|\n/)) {
             if (ass) {
                 if (!/^\s*Dialogue\s*:/i.test(line)) continue;
                 let at = -1;
                 for (let k = 0; k < 9; k += 1) { at = line.indexOf(',', at + 1); if (at < 0) break; }
-                if (at >= 0) cues.push(line.slice(at + 1).trim());
+                if (at >= 0 && lasts(/^\s*Dialogue\s*:[^,]*,([^,]*),([^,]*),/i.exec(line))) cues.push(line.slice(at + 1).trim());
             } else if (line.includes('-->')) {
-                if (cur) cues.push(cur.join('\n'));
-                cur = [];
+                if (cur && keep) cues.push(cur.join('\n'));
+                cur = []; keep = lasts(CUE_TIMING.exec(line));
             } else if (!line.trim()) {
-                if (cur) cues.push(cur.join('\n'));
+                if (cur && keep) cues.push(cur.join('\n'));
                 cur = null;
             } else if (cur) cur.push(line.trim());
         }
-        if (cur) cues.push(cur.join('\n'));
+        if (cur && keep) cues.push(cur.join('\n'));
         return cues;
     };
     // Those texts as one sha1: the same subtitle gives the same key whatever its timing (a mov_text -> srt conversion moves every cue about 21 ms, measured),
@@ -3463,15 +3469,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // How many cues show a viewer any text - the count a sidecar and what ffmpeg kept of it are compared on (deletionLoss). Tags (<i>, <font>) and {\...}
     // overrides are taken out first, and a cue left with nothing is not counted on either side: ffmpeg drops an empty srt cue on the way in, mov_text also
     // one holding only tags, it keeps an empty ass Dialogue (measured on 7.1.4), and the import leaves an empty WebVTT cue out of Matroska
-    // (VTT_EMPTY_CUE_DROP) - none of which shows anything on screen. Each pattern stops at the next bracket of its own kind, so the scan stays linear on
-    // untrusted text.
-    const textCueCount = (text, ext) => cueTexts(text, ext).filter((t) => t.replace(/<[^<>]*>|\{[^{}]*\}/g, '').trim()).length;
+    // (VTT_EMPTY_CUE_DROP) - none of which shows anything on screen. Nor is a cue that ends no later than it starts: mov_text drops one, Matroska keeps it
+    // (measured on 7.1.4 in srt, vtt and ass: cc_dec writes one last in every caption sidecar). Each pattern stops at the next bracket of its own kind, so
+    // the scan stays linear on untrusted text.
+    const textCueCount = (text, ext) => cueTexts(text, ext, true).filter((t) => t.replace(/<[^<>]*>|\{[^{}]*\}/g, '').trim()).length;
     // How many cues of WebVTT text ffmpeg's reader turns into a zero-byte packet, the ones VTT_EMPTY_CUE_DROP leaves out: a timing line with no text line
     // after it - the next line empty or the end of the file, a line ending at CR, LF or CRLF. Measured on 7.1.4 with LF and CRLF, with and without a cue
-    // id or settings; a cue of spaces or &nbsp; is text to it and stays. A file whose lines end at CR alone is over-counted: that reader does not end a
-    // cue at a blank line made of CR alone, so it merges such cues into the one before.
+    // id or settings; a cue of spaces or &nbsp; is text to it and stays. On text whose lines end at CR alone that reader ends no cue at a blank line, so it
+    // merges each empty cue into the one before (losing the first), and only a timing line followed by nothing but the end of the file is empty (measured
+    // on 7.1.4: an empty cue mid-file makes no zero-byte packet, one at the end makes one).
     const emptyVttCueCount = (text) => {
         const lines = String(text).split(/\r\n|\r|\n/);
+        if (!String(text).includes('\n')) return lines.filter((line) => line).pop()?.includes('-->') ? 1 : 0;
         return lines.filter((line, i) => line.includes('-->') && !lines[i + 1]).length;
     };
 
@@ -3495,16 +3504,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // selects UTF-16, a UTF-8 one is dropped, else UTF-8. Its WebVTT demuxer reads raw bytes, so a .vtt is UTF-8 (measured on 7.1.4: a UTF-16 srt or ass
     // with the mark imports whole; a UTF-16 vtt, or one without the mark, fails to open). A user's edit saved as UTF-16 reads as its text. `readable` is
     // false when UTF-8 bytes are not valid UTF-8: ffmpeg's subtitle decoder drops every cue holding such a byte and still exits 0, unless more than two
-    // thirds of them fail, when the run exits 69 (-max_error_rate; measured on 7.1.4 with Windows-1252 srt cues, into mkv and mp4 alike).
+    // thirds of them fail, when the run exits 69 (-max_error_rate; measured on 7.1.4 with Windows-1252 srt cues, into mkv and mp4 alike). An ass/ssa's
+    // header and Comment lines are no cue: Matroska copies them through as bytes (measured: a Windows-1252 font name and Comment, every Dialogue back whole),
+    // so only its Dialogue lines must be UTF-8 for `readable`. `whole` is the whole file's answer, which mov_text needs (the import's refusal has the why).
     const ffmpegText = (buf, ext) => {
         const at = (...mark) => mark.every((x, i) => buf[i] === x);
         if (ext !== 'vtt' && (at(0xff, 0xfe) || at(0xfe, 0xff))) {
             const body = Buffer.from(buf.subarray(2, buf.length - (buf.length % 2)));
-            return { text: (at(0xfe, 0xff) ? body.swap16() : body).toString('utf16le'), readable: true };
+            return { text: (at(0xfe, 0xff) ? body.swap16() : body).toString('utf16le'), readable: true, whole: true };
         }
-        let readable = true;
-        try { new TextDecoder('utf-8', { fatal: true }).decode(buf); } catch (e) { readable = false; }
-        return { text: buf.toString('utf8', at(0xef, 0xbb, 0xbf) ? 3 : 0), readable };
+        const utf8 = (b) => { try { new TextDecoder('utf-8', { fatal: true }).decode(b); return true; } catch (e) { return false; } };
+        const whole = utf8(buf);
+        const dialogue = () => Buffer.from(buf.toString('latin1').split(/\r\n|\r|\n/).filter((l) => /^\s*Dialogue\s*:/i.test(l)).join('\n'), 'latin1');
+        return { text: buf.toString('utf8', at(0xef, 0xbb, 0xbf) ? 3 : 0), readable: whole || ((ext === 'ass' || ext === 'ssa') && utf8(dialogue())), whole };
     };
     // The same stat-first rule for the other library files read whole as TEXT - the caption sidecar and the subtitle list sit at names anyone can put a
     // file at. Over the cap, or not a regular file (a FIFO would block the read; see scanSidecarDirs), it throws like an unreadable file, so each caller's
@@ -3518,14 +3530,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Whether decoded text holds a NUL beside other text: ffmpeg's text reader ends the subtitle at a NUL (measured on 7.1.4: one in an srt's second cue
     // imports the first cue alone) and cannot open UTF-16 without the mark, so such a file is never empty, never matched by its text, and never deleted
     // or written over; under remove_source=true it is not taken by its name either. Text of NULs and whitespace alone holds nothing, as a 0-byte file does,
-    // and is empty.
-    const unreadableText = (text) => text.includes('\0') && /[^\0\s]/.test(text);
+    // and is empty. A run of NULs and whitespace that starts after the last line ends is padding - an editor's or a preallocating writer's - and is left
+    // out: 7.1.4 reads every cue before it (measured: 3 srt, vtt and ass cues, then 4 KiB of zeros, into mkv and mp4). NULs straight after a cue's text are
+    // not: an srt loses that cue (measured). An index walk, as nameTextOf's: a /[\0\s]+$/ strip backtracks quadratically on a long interior run.
+    const unreadableText = (text) => {
+        let b = text.length;
+        while (b > 0 && (text[b - 1] === '\0' || /\s/.test(text[b - 1]))) b -= 1;
+        const tail = text.slice(b); const nul = tail.indexOf('\0');
+        const body = nul >= 0 && /[\r\n]/.test(tail.slice(0, nul)) ? text.slice(0, b) : text;
+        return body.includes('\0') && /[^\0\s]/.test(body);
+    };
     // Whether any two cues of srt or vtt text overlap in time: each timing line's two stamps, sorted by start, every start tested against the latest end
     // before it. One anchored pattern per line, as cueSpan reads them.
     const cuesOverlap = (text) => {
         const cues = [];
         for (const line of String(text).split(/\r\n|\r|\n/)) {
-            const m = /^[ \t]*((?:\d+:)?\d{1,2}:\d{1,2}[.,]\d{1,3})[ \t]*-->[ \t]*((?:\d+:)?\d{1,2}:\d{1,2}[.,]\d{1,3})/.exec(line);
+            const m = CUE_TIMING.exec(line);
             if (m) cues.push([hmsSeconds(m[1]), hmsSeconds(m[2])]);
         }
         cues.sort((a, b) => a[0] - b[0]);
@@ -3534,28 +3554,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     // What importing a sidecar provably DROPS, so remove_source never deletes the only complete copy (deletionLoss). Measured on jellyfin-ffmpeg 7.1.4 by
     // muxing each shape into mkv and mp4 and extracting it back. Into Matroska an srt or ass/ssa survives whole - spaces, timestamp spelling, cue order,
-    // tag case and Comment placement are re-serialised, nothing visible changes - but a WebVTT loses its cue settings (align/position/line), STYLE and
-    // REGION blocks, and every tag except <b>/<i>/<u>: voice, class, lang, ruby (flattened into the text) and karaoke timestamps. Into mp4's mov_text an
-    // ass/ssa loses all its styling, and an srt or vtt its <font> tags and {\...} overrides ({\an8} positioning). Over-reporting only keeps a sidecar that
-    // could have gone, so the scan is coarse - and linear, never a backtracking pattern, since a sidecar is untrusted text up to SIDECAR_HASH_MAX.
-    // Returns the first loss for each target family, '' for none.
+    // tag case and Comment placement are re-serialised, nothing visible changes - and a WebVTT loses only its STYLE and REGION blocks, which ffmpeg's WebVTT
+    // reader drops on the way in: the Matroska block keeps each cue's id, its settings (align/position/line) and every tag, and the copy extract gives
+    // them back (TEXT_SUB). Into mp4's mov_text an ass/ssa loses all its styling, a vtt its cue settings and every tag except <b>/<i>/<u> - voice, class,
+    // lang, ruby (flattened into the text) and karaoke timestamps - and an srt or vtt its <font> tags and {\...} overrides ({\an8} positioning).
+    // Over-reporting only keeps a sidecar that could have gone, so the scan is coarse - and linear, never a backtracking pattern, since a sidecar is
+    // untrusted text up to SIDECAR_HASH_MAX. Returns the first loss for each target family, '' for none.
     const importLosses = (text, ext) => {
-        let any = '';
+        let any = ''; let movText = '';
         if (ext === 'vtt') {
-            for (const line of text.split('\n')) {
+            for (const line of text.split(/\r\n|\r|\n/)) {
                 const t = line.trim();
                 if (t === 'STYLE' || t === 'REGION') { any = 'its STYLE/REGION block'; break; }
                 const arrow = line.indexOf('-->');
-                if (arrow >= 0 && line.slice(arrow + 3).trim().split(/\s+/).length > 1) { any = 'its cue positioning'; break; }
+                if (!movText && arrow >= 0 && line.slice(arrow + 3).trim().split(/\s+/).length > 1) movText = 'its cue positioning';
             }
-            for (let p = text.indexOf('<'); !any && p >= 0;) {
+            for (let p = text.indexOf('<'); !movText && p >= 0;) {
                 const q = text.indexOf('>', p);
                 if (q < 0) break;
-                if (!/^\/?[biu]$/i.test(text.slice(p + 1, q).trim())) any = 'its WebVTT voice, class, ruby or timing tags';
+                if (!/^\/?[biu]$/i.test(text.slice(p + 1, q).trim())) movText = 'its WebVTT voice, class, ruby or timing tags';
                 p = text.indexOf('<', q + 1);
             }
         }
-        let mp4 = any;
+        let mp4 = any || movText;
         if (!mp4) mp4 = ext === 'ass' ? 'its ASS styling' : ((/<font\b/i.test(text) || text.includes('{\\')) ? 'its font and positioning overrides' : '');
         // mov_text shows one cue at a time, so each cue ends where the next one starts (measured on 7.1.4: a sign held from 0.5 to 4.0 s over two lines of
         // speech came back ending at 1.0 s, its text and the cue count unchanged).
@@ -3564,8 +3585,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
 
     // One read per sidecar answers every content question - hash identity (contentKey), its text apart from its timing (shiftedTrack), cue emptiness
-    // (groupHasNoCues), what importing it would drop (importLosses), its text-cue count (deletionLoss) and why ffmpeg cannot read it whole, '' when it can
-    // (ffmpegText, unreadableText) - mirroring embeddedTextHashes, whose one ffmpeg pass answers the first two for the embedded side. Memoised per rel. null =
+    // (groupHasNoCues), what importing it would drop (importLosses), its text-cue count (deletionLoss), whether ffmpeg reads it as WebVTT, and why ffmpeg
+    // cannot read it whole, '' when it can (ffmpegText, unreadableText) - every text verdict taken from the text as ffmpeg decodes it, so a UTF-16 sidecar is
+    // judged by its words - mirroring embeddedTextHashes, whose one ffmpeg pass answers the first two for the embedded side. Memoised per rel. null =
     // unreadable or over the cap; each caller keeps its own failure direction (contentKey -> a unique never-merged key, groupHasNoCues -> false = not provably
     // empty). The size is checked FIRST: a name that merely parses as a sidecar says nothing about what is behind it, and a runaway OCR dump or a
     // mis-renamed file left as <video>.eng.srt would otherwise be pulled into the worker whole (the cap's why is at embeddedTextHashes).
@@ -3580,27 +3602,40 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const buf = fs.readFileSync(p);
                 const text = buf.toString('utf8');
                 // A bundle is a container, not text: neither count means anything for it, and nothing reads them.
-                const read = f.bundle ? { text: '', readable: true } : ffmpegText(buf, f.ext);
-                let unreadable = read.readable ? '' : 'is not UTF-8 text (a legacy character set such as Windows-1252?)';
+                const read = f.bundle ? { text: '', readable: true, whole: true } : ffmpegText(buf, f.ext);
+                const legacy = 'is not UTF-8 text (a legacy character set such as Windows-1252?)';
+                // Only a .vtt reaches this with a UTF-16 mark (ffmpegText decodes any other's).
+                const utf16 = (buf[0] === 0xff && buf[1] === 0xfe) || (buf[0] === 0xfe && buf[1] === 0xff);
+                let unreadable = read.readable ? '' : (utf16 ? 'is UTF-16 text (ffmpeg reads a WebVTT file as UTF-8 alone)' : legacy);
                 if (!unreadable && unreadableText(read.text)) {
                     unreadable = 'holds a NUL character (UTF-16 saved without its byte-order mark, or a damaged file?)';
                 }
+                // ffmpeg picks its WebVTT reader by CONTENT, whatever the name: WEBVTT after an optional UTF-8 BOM, then a space, tab, line break or the end
+                // of the file (webvtt_probe, 7.1, on the raw bytes) - so a WebVTT saved as .srt is read, counted and round-tripped as one.
+                const vtt = !f.bundle && /^WEBVTT(?:[ \t\r\n]|$)/.test(text.slice(text.charCodeAt(0) === 0xfeff ? 1 : 0, 8));
+                const cues = textCueCount(read.text, f.ext);
                 out = {
                     sha1: subTextHash(buf, path.extname(f.rel)),
                     timing: f.bundle ? null : timingApart(buf, path.extname(f.rel)),
-                    noCues: hasNoCues(text, f.ext),
-                    loss: importLosses(text, f.ext),
-                    cues: textCueCount(read.text, f.ext),
-                    // ffmpeg picks its WebVTT reader by CONTENT, whatever the name: WEBVTT after an optional UTF-8 BOM, then a space, tab, line break or
-                    // the end of the file (webvtt_probe, 7.1) - so a WebVTT saved as .srt is read, and counted, as one.
-                    emptyVttCues: /^WEBVTT(?:[ \t\r\n]|$)/.test(text.slice(text.charCodeAt(0) === 0xfeff ? 1 : 0, 8)) ? emptyVttCueCount(read.text) : 0,
+                    // ffmpeg reads by content, so an .ass holding srt timing lines has cues. A WebVTT with no cue that shows text holds nothing: its empty
+                    // cues go in as a track with nothing in it.
+                    noCues: (hasNoCues(read.text, f.ext) && hasNoCues(read.text, 'srt')) || (vtt && !cues),
+                    loss: importLosses(read.text, vtt ? 'vtt' : f.ext),
+                    cues,
+                    vtt,
+                    emptyVttCues: vtt ? emptyVttCueCount(read.text) : 0,
                     unreadable,
+                    // What an mp4-family import refuses: the whole file must be UTF-8 there (the import's refusal has the why).
+                    unreadableMp4: unreadable || (read.whole ? '' : legacy),
                 };
             }
         } catch (e) { out = null; }
         sidecarContentMemo.set(f.rel, out);
         return out;
     };
+    // The codec ffmpeg imports a loose sidecar as: WebVTT by its content, else the one its extension names. parseSidecar reports every ext it admits as one
+    // of TEXT_EXTS (see IMPORT_ONLY_EXTS), so the webvtt fallback only guards a future caller that reads a sidecar without going through it.
+    const sidecarCodec = (f) => (sidecarContent(f)?.vtt || !TEXT_EXTS.includes(f.ext) ? 'webvtt' : EXT_TO_CODEC[f.ext]);
 
     // Source indices whose text decoded to no cues at all, filled in by embeddedTextHashes on the one pass it already makes. Only meaningful once that
     // call has returned, and it always has: dedupeEmbeddedSubs forces it first, so an unrun probe can never be mistaken for "no empty tracks".
@@ -3647,7 +3682,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             outs.set(s.index, out);
         }
         const r = spawnSync(ffmpegPathOf(otherArguments), args,
-            { encoding: 'utf8', timeout: SUB_EXTRACT_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES });
+            { encoding: 'utf8', timeout: SUB_EXTRACT_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES, killSignal: 'SIGKILL' });
         if (!r.error && r.status === 0) {
             const map = new Map();
             for (const [idx, out] of outs) {
@@ -3754,13 +3789,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const key = `${mp4 ? 'mp4' : 'mkv'}|${f.rel}`;
         if (roundTripMemo.has(key)) return roundTripMemo.get(key);
         roundTripMemo.set(key, null);
-        // An archive is not text, and a sidecar sidecarContent could not read (gone, or over the cap) is never handed to ffmpeg either.
-        const enc = TEXT_SUB[mp4 ? 'mov_text' : EXT_TO_CODEC[f.ext]];
-        if (f.bundle || !enc || !sidecarContent(f)) return null;
+        // An archive is not text, and a sidecar sidecarContent could not read (gone, or over the cap) is never handed to ffmpeg either. Read back as the
+        // codec ffmpeg imports it as (sidecarCodec).
+        const enc = !f.bundle && sidecarContent(f) ? TEXT_SUB[mp4 ? 'mov_text' : sidecarCodec(f)] : null;
+        if (!enc) return null;
         let dir = '';
         try { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'awk_subrt_')); } catch (e) { return null; }
         const ff = (args) => spawnSync(ffmpegPathOf(otherArguments), ['-y', '-loglevel', 'error', ...args],
-            { encoding: 'utf8', timeout: SUB_EXTRACT_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES });
+            { encoding: 'utf8', timeout: SUB_EXTRACT_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES, killSignal: 'SIGKILL' });
         const mux = path.join(dir, mp4 ? 'rt.mp4' : 'rt.mkv');
         const out = path.join(dir, `rt.${enc.ext}`);
         try {
@@ -3790,23 +3826,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // its NAME as the only evidence: a bundle whose subtitle carries a title the name does not spell (clean_and_remux's export writes no title token), or
     // one with no fonts at all, never matched its own imported track and was added again on every pass. The same run counts the bundle's font
     // attachments from ffmpeg's input listing ("Stream #0:1: Attachment: ttf", measured on 7.1.4), so a deletion knows whether the file must hold fonts
-    // for nothing to be lost. Memoised per rel; null when the run fails, and callers then fall back to the name (metadataMatchesEmbedded).
+    // for nothing to be lost. Memoised per rel with the read-out's state (readBundleSubtitle); null when the run fails, and callers then fall back to the
+    // name (metadataMatchesEmbedded).
     const bundleMemo = new Map();
     const bundleContent = (f) => {
-        if (bundleMemo.has(f.rel)) return bundleMemo.get(f.rel);
-        bundleMemo.set(f.rel, null);
+        if (bundleMemo.has(f.rel)) return bundleMemo.get(f.rel).content;
+        const memo = { state: 'unknown', content: null };
+        bundleMemo.set(f.rel, memo);
         if (!f.bundle || !sidecarContent(f)) return null;   // gone, or over the cap
         const b = readBundleSubtitle(libPathOf(f.rel));
+        memo.state = b.state;
         if (b.state !== 'ok') return null;   // no content identity - callers fall back to the name
         const text = b.buf.toString('utf8');
-        bundleMemo.set(f.rel, {
+        memo.content = {
             // A subtitle with no cues gets no hash, exactly as embeddedTextHashes gives an empty track none - the name decides for it, as before.
             sha1: hasNoCues(text, 'ass') ? null : subTextHash(b.buf, '.ass'),
             fonts: b.fonts,
             span: cueSpan(text, 'ass'),
-        });
-        return bundleMemo.get(f.rel);
+        };
+        return memo.content;
     };
+    // Whether ffmpeg ran on a bundle and could not read it out - what an interrupted export leaves, and what fails an import's whole mux (exit 183 on a
+    // 0-byte bundle, 251 on one cut off after its header, measured on 7.1.4). The same read as bundleContent's.
+    const bundleUnreadable = (f) => { bundleContent(f); return bundleMemo.get(f.rel).state === 'unreadable'; };
     // Is this bundle's subtitle one of these embedded text hashes? true / false, or null when the bundle could not be read out.
     const bundleInFile = (f, hashes) => {
         const b = bundleContent(f);
@@ -3867,8 +3909,39 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const unstoredText = (tokens) => ({ mov: '.mov stores no role flag', webm: '.webm keeps only forced and one of sdh and descriptive' }[dstContainer]
         || `.${dstContainer} stores no ${tokens.join(' or ')} flag`);
+    // What an earlier sub_worker version's import of a WebVTT with n empty cues did to a Matroska file (VTT_EMPTY_CUE_DROP), and the repair while no remux
+    // has made it permanent - said where the import finds that sidecar (cutByEarlierImport) and where a deletion would take it (deletionLoss).
+    const earlierCutWords = (n) => `by an earlier sub_worker version with ${n} empty WebVTT cue${n === 1 ? '' : 's'}, after each of which ffmpeg 7.1 skips`
+        + ' a few seconds of the video and audio, and any remux makes that permanent';
+    const cutRepairWords = () => "while Tdarr's ffprobe (7.1), with -count_packets, reads fewer video packets with every stream than with -select_streams v:0"
+        + ` alone, FFmpeg 8 or later still repairs it losslessly, until anything remuxes the file: ffmpeg -i FILE -map 0 -c copy -bsf:s 'noise=drop=not(size)'`
+        + ` FIXED.${dstContainer}`;
+    // Whether this file still shows that gap: Tdarr's ffprobe (7.1) reads fewer of the video's packets with every stream than with the video alone, which
+    // reads around the refused blocks. { all, alone } when the two differ; null when they agree, the file has no video, or a read cannot be made (no ffprobe,
+    // an error, the timeout) - nothing then shows a gap, and the sidecar goes as it would have: the repair needs the video alone. Two whole-file reads
+    // (measured on 7.1.4: about 550 MB/s from local disk and 190 MB/s cold over SMB, the second from the page cache when the file fits it), made once a
+    // pass and only for a WebVTT with empty cues that a Matroska file would otherwise see deleted.
+    let avGapMemo;
+    const avGap = () => {
+        if (avGapMemo !== undefined) return avGapMemo;
+        avGapMemo = null;
+        const probeBin = deriveFfprobePath(ffmpegPathOf(otherArguments));
+        const target = String(file._id || file.file || libFilePath || '');
+        const read = (args) => (probeBin && target ? spawnSync(probeBin, ['-v', 'error', ...args, '-count_packets', target],
+            { encoding: 'utf8', timeout: SUB_EXTRACT_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES, killSignal: 'SIGKILL' }) : null);
+        const ok = (r) => r && !r.error && r.status === 0;
+        const every = read(['-show_entries', 'stream=index,codec_type,nb_read_packets:stream_disposition=attached_pic', '-of', 'json']);
+        let v = null;
+        try { v = ok(every) && JSON.parse(every.stdout).streams.find((x) => x.codec_type === 'video' && x.disposition?.attached_pic !== 1); }
+        catch (e) { v = null; }
+        const alone = v && read(['-select_streams', String(v.index), '-show_entries', 'stream=nb_read_packets', '-of', 'csv=p=0']);
+        const [all, one] = [Number(v?.nb_read_packets), Number(String(ok(alone) ? alone.stdout : '').replace(/[\s,]+$/, ''))];
+        if (Number.isInteger(all) && Number.isInteger(one) && all !== one) avGapMemo = { all, alone: one };
+        return avGapMemo;
+    };
     // `settled`: roles said by a line of their own (keptByEmbeddedLine), left out here; `named`: the sidecar whose own name the roles are read from, one
-    // member of a byte-identical group (the cues are the group's).
+    // member of a byte-identical group (the cues are the group's). A WebVTT with empty cues is checked last, and only on Matroska, for the gap an earlier
+    // version's import of it left (avGap): its words are the only line that names it, so it stays while the gap does.
     const deletionLoss = (f, how, mp4, holders = [], settled = [], named = f) => {
         const roles = rolesUnshown(named, holders).filter((t) => !settled.includes(t));
         if (roles.length) {
@@ -3877,11 +3950,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return `its ${roles.join(' and ')} role${roles.length > 1 ? 's' : ''} (${unstored.length ? unstoredText(unstored)
                 : 'no track holding its text shows it'})`;
         }
-        if (how !== 'roundtrip') return '';
         const own = sidecarContent(f);
-        const kept = roundTripCues.get(`${mp4 ? 'mp4' : 'mkv'}|${f.rel}`);
-        if (own?.loss?.[mp4 ? 'mp4' : 'any']) return own.loss[mp4 ? 'mp4' : 'any'];
-        return own && kept < own.cues ? `${own.cues - kept} of its ${own.cues} cues` : '';
+        if (how === 'roundtrip') {
+            const kept = roundTripCues.get(`${mp4 ? 'mp4' : 'mkv'}|${f.rel}`);
+            if (own?.loss?.[mp4 ? 'mp4' : 'any']) return own.loss[mp4 ? 'mp4' : 'any'];
+            if (own && kept < own.cues) return `${own.cues - kept} of its ${own.cues} cues`;
+        }
+        const gap = !mp4 && isMatroskaFamily(dstContainer) && own?.emptyVttCues > 0 ? avGap() : null;
+        return gap ? `seconds of the video and audio - it was imported into this file ${earlierCutWords(own.emptyVttCues)} (${gap.all} video packets read with`
+            + ` every stream, ${gap.alone} with the video alone); ${cutRepairWords()}` : '';
     };
     // `imported`: false for a role a sidecar already in the file names, which the track may never have had (a flag cleared after the extract, a
     // sidecar named by hand), so no import lost it.
@@ -4211,7 +4288,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const { spawnSync } = require('child_process');
             const args = ['-v', 'error', '-select_streams', String(absIndex), '-read_intervals', `%+#${A53_PROBE_FRAMES}`,
                 '-show_frames', '-show_entries', 'frame=side_data_list', '-of', 'default=nw=1', filePath];
-            const r = spawnSync(ffprobePath, args, { encoding: 'utf8', timeout: A53_PROBE_TIMEOUT_MS, maxBuffer: A53_PROBE_MAX_BYTES });
+            const r = spawnSync(ffprobePath, args, { encoding: 'utf8', timeout: A53_PROBE_TIMEOUT_MS, maxBuffer: A53_PROBE_MAX_BYTES, killSignal: 'SIGKILL' });
             if (!r || r.status !== 0) return 'unknown';
             return String(r.stdout || '').includes(A53_SIDE_DATA);
         } catch (e) { return 'unknown'; }
@@ -4484,7 +4561,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const ffprobePath = deriveFfprobePath(ffmpegPathOf(otherArguments));
         if (!ffprobePath) return null;
         const r = spawnSync(ffprobePath, ['-v', 'quiet', '-print_format', 'json', '-show_format', '-show_streams', target],
-            { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES });
+            { encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES, killSignal: 'SIGKILL' });
         if (r.error || r.status !== 0) return null;
         try {
             const j = JSON.parse(r.stdout); return Array.isArray(j.streams) ? { streams: j.streams, tags: j.format?.tags || {} } : null;
@@ -4728,10 +4805,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // case is why it is worth more than tidiness: a loose styled sidecar is not filtered out for mp4 (only .mks BUNDLES are), so it is silently flattened
     // into mov_text and losing its styling while the log says [sub:eng ass].
     const sidecarToStream = (f, mp4) => {
-        // A bundle always carries a styled subtitle, and can never reach an mp4 target. Every other sidecar maps back through EXT_TO_CODEC behind a TEXT_EXTS
-        // gate - parseSidecar reports every ext it admits as one of TEXT_EXTS (see IMPORT_ONLY_EXTS), so an ext outside the table cannot reach here and the
-        // webvtt fallback only guards a future caller that reads a sidecar without going through it.
-        const codec = f.bundle ? 'ass' : (mp4 ? 'mov_text' : (TEXT_EXTS.includes(f.ext) ? EXT_TO_CODEC[f.ext] : 'webvtt'));
+        // A bundle always carries a styled subtitle, and can never reach an mp4 target. Every other sidecar is the codec ffmpeg imports it as (sidecarCodec).
+        const codec = f.bundle ? 'ass' : (mp4 ? 'mov_text' : sidecarCodec(f));
         const disposition = {};
         for (const t of tokensOf(f)) if (dispFfOf(t)) disposition[dispFfOf(t)] = 1;
         // The title as the import writes it (titleMetaArgs): on an mp4-family output beside the same handler, which is all a .mov keeps of a non-ASCII one.
@@ -4852,11 +4927,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return ccRefusalMemo;
         };
         // Whether a strip - made in this pass, or recorded for video_clean - may follow now: both caption fields must be out. A pass that ran a caption read
-        // decides by what that read finished (set by the API routes' read), and one that read field 2 alone stands on the field-1 read on record, which must
+        // decides by what that read finished (set by the API routes' read), and a field it did not read stands on that field's read on record, which must
         // still describe this video (ccReadStaleWhy); otherwise field 2's read must be on record, or the container records no reads at all. A strip that is
         // not ready is not recorded either: a recorded request would be served with a field unread.
-        let ccReadRan = false; let ccRead1Done = false; let ccRead2Done = false;
-        const ccStripReady = () => (ccReadRan ? ccRead2Done && (ccRead1Done || !ccReadStaleWhy()) : (!canRecord || ccHas(CC_TOKENS.decoded2)));
+        let ccReadRan = null; let ccRead1Done = false; let ccRead2Done = false;
+        const ccOutBy = (f, done, onRecord) => done || (!ccReadRan.includes(f) && onRecord && !ccReadStaleWhy());
+        const ccStripReady = () => (ccReadRan ? ccOutBy(2, ccRead2Done, ccHas(CC_TOKENS.decoded2)) && ccOutBy(1, ccRead1Done, true)
+            : (!canRecord || ccHas(CC_TOKENS.decoded2)));
 
         // The two sentences the caption branches repeat verbatim. Written once because they are a CONTRACT with the user, not incidental wording: the memo
         // note tells them which containers keep the answer, and the deferral note names the plugin that will finish the job. Three and two sites respectively,
@@ -5110,10 +5187,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // field where the container records no reads (an earlier version read field 1 alone), and field 1 behind its read on record (its sidecar
                 // deleted or renamed since) - field 2's absence there is its empty verdict (clearNote). Not where the strip is refused, which no read can
                 // change, so it would repeat every pass. On the API placement route the read finishes in this pass and the strip follows it there, an
-                // empty field included (stripOwed); field 1 is not read there, because an empty read leaves the next pass nothing to judge and
-                // ccStripReady stands no field-1 read on field 2's.
+                // empty field included (stripOwed), since an empty read leaves the next pass nothing to judge.
                 const reread = owed && !ccStripRefusal() ? [1, 2].find((f) => !judged.some((s) => s.field === f)
-                    && (f === 1 ? !placeViaApi() && (!canRecord || ccHas(CC_TOKENS.decoded) || ccHas(CC_TOKENS.decoded2)) : !canRecord)) : 0;
+                    && (f === 1 ? !canRecord || ccHas(CC_TOKENS.decoded) || ccHas(CC_TOKENS.decoded2) : !canRecord)) : 0;
                 if (reread) {
                     return { job: { fields: [reread] }, stripOwed: placeViaApi(), note: `${notes}☐${streamTag(ccVideo.index)}[embedded_cc=enabled] Caption`
                         + ` field ${reread} has no sidecar beside ${out.join(', ')} - reading it to ${ccNameOf(reread)} before the captions can be removed\n` };
@@ -5166,7 +5242,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 else { res.failed = { name, why: got.failed.get(name) || 'it was not placed' }; break; }
                 res.read.push(f === 1 ? CC_TOKENS.decoded : CC_TOKENS.decoded2);
             }
-            ccReadRan = true;
+            ccReadRan = fields;
             ccRead1Done = res.read.includes(CC_TOKENS.decoded);
             ccRead2Done = res.read.includes(CC_TOKENS.decoded2);
             return res;
@@ -6266,28 +6342,40 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!surviving) return false;
             return f.bundle ? bundleInFile(f, surviving.values()) === false : !sidecarMatch(f, isMp4, surviving.values());
         };
-        // A .vtt an EARLIER sub_worker imported into this Matroska file went in with its empty cues, as blocks ffmpeg 7.1 refuses (VTT_EMPTY_CUE_DROP): the
+        // The text tracks a group's earlier import here still matches by metadata (alreadyEmbedded's test, against the track written for it), or null when
+        // the marker records no such import of its text: a member listed with the hash its text still has, or - byte-identical copies being apart groups
+        // under deduplicate=disabled - any entry recorded with the group's text. An entry with no hash (a file version 3.46.0 imported) cannot tell an edit
+        // from the original, so it records none; an edit is a real arrival.
+        const importedTracks = (f) => {
+            const sha = !f.bundle && sidecarContent(f)?.sha1;
+            const m = sha && markerEntries.filter((e) => e.sha && sha.startsWith(e.sha))
+                .map((e) => f.members.find((x) => x.rel === e.rel) || parseSidecarRel(e.rel)).find((x) => x && alreadyEmbedded(x));
+            return m ? embeddedSubs.filter((s) => isTextSub(s) && metaMatchesStream(s, writtenAs.get(m.rel) || m, isMp4)) : null;
+        };
+        // Such a track in a text format the sidecar's round trip does not read back as (TEXT_SUB's ext) was converted since - a .vtt imported into mp4 and
+        // moved to mkv is subrip now - so the two texts cannot be compared and the group arrives here; it lost nothing, and is neither removed nor cut.
+        const otherFormat = (f, tracks) => !!tracks?.length
+            && !tracks.some((s) => TEXT_SUB[codecNameOf(s)].ext === TEXT_SUB[isMp4 ? 'mov_text' : sidecarCodec(f)].ext);
+        // A WebVTT an EARLIER sub_worker imported into this Matroska file went in with its empty cues, as blocks ffmpeg 7.1 refuses (VTT_EMPTY_CUE_DROP): the
         // cues after each one in its cluster were lost with the video and audio, so its track is short of the sidecar and the group arrives here, neither
         // settled nor found in the file. Importing it again would add a second copy, and like any remux make the loss permanent where FFmpeg 8 can still
         // repair it; calling it removed would be false. So it is named, with the check and the repair, and not imported - its marker entry is carried
-        // (priorStillPresent). The evidence costs no read of the video: the marker names it, its track is still there by metadata (alreadyEmbedded; one
-        // removed since is goneSinceImport's), its text is unchanged since that import by the marker's hash (an edit is a real arrival), and it holds an
-        // empty cue. An entry with no hash (a file version 3.46.0 imported) cannot tell an edit from the original, so that sidecar is imported as any
-        // arrival is. This version's own Matroska import leaves those cues out, so its track matches and never arrives here; a .vtt imported into mp4
-        // and converted to mkv afterwards does arrive, and gets the same line although that file lost nothing. Only a .vtt: a WebVTT under another name
-        // never matches its own track however it was imported (the round trip reads it back by its name's codec), so arriving here says nothing.
-        const cutByEarlierImport = (f) => f.ext === 'vtt' && isMatroskaFamily(dstContainer) && sidecarContent(f)?.emptyVttCues > 0
-            && f.members.every((m) => alreadyEmbedded(m) && unchangedSinceImport(m));
+        // (priorStillPresent). The evidence costs no read of the video: the marker records the import of its text, its track is still there by metadata as
+        // WebVTT (importedTracks; one removed since is goneSinceImport's), and it holds an empty cue and a cue with text - with none, it imported as an
+        // empty track and cut nothing. This version's own Matroska import leaves those cues out, so its track matches and never arrives here.
+        const cutByEarlierImport = (f, tracks) => isMatroskaFamily(dstContainer) && sidecarContent(f)?.emptyVttCues > 0 && sidecarContent(f).cues > 0
+            && !!tracks?.some((s) => codecNameOf(s) === 'webvtt');
+        // Said once the pass knows whether it remuxes anyway (nothingToMux), which would make the loss permanent itself.
+        const cutGroups = [];
         for (let k = toMux.length - 1; k >= 0; k -= 1) {
             const f = toMux[k];
-            if (!cutByEarlierImport(f)) continue;
+            const tracks = importedTracks(f);
+            const other = otherFormat(f, tracks);
+            if (!other && !cutByEarlierImport(f, tracks)) continue;
             toMux.splice(k, 1);
-            const n = sidecarContent(f).emptyVttCues;
-            response.infoLog += `☒${logSafe(f.rel)} was imported into this file by an earlier sub_worker version with ${n} empty WebVTT cue${
-                n === 1 ? '' : 's'}, after each of which ffmpeg 7.1 skips a few seconds of the video and audio, and any remux makes that permanent - not`
-                + " importing it again, and the sidecar stays; while Tdarr's ffprobe (7.1), with -count_packets, reads fewer video packets with every"
-                + ' stream than with -select_streams v:0 alone, FFmpeg 8 or later still repairs it losslessly, until anything remuxes the file: ffmpeg -i'
-                + ` FILE -map 0 -c copy -bsf:s 'noise=drop=not(size)' FIXED.${dstContainer}\n`;
+            if (!other) { cutGroups.push(f); continue; }
+            response.infoLog += `☒${logSafe(f.rel)} was imported by an earlier pass, and its track is in the file as ${[...new Set(tracks.map(codecNameOf))]
+                .join(' or ')} now, whose text cannot be compared with the sidecar's - not importing it again, and the sidecar stays on disk\n`;
         }
         // The marker is written whole, so a removal the guard upholds survives only while its entry does: every marker rebuilt below carries goneRels, or
         // the first pass with other work to do (a new sidecar, a retune, a dedup drop) would erase it and the next pass would import the subtitle again.
@@ -6307,25 +6395,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // decode - into mp4 at once, into Matroska as raw bytes every later read drops - and with more than two thirds undecodable the job fails. A NUL:
         // the track ends at it, and UTF-16 without its mark fails the job (measured on 7.1.4, exit 183). Refused, never converted: no character set can be
         // told from the bytes alone. Nothing records it, so it stays on disk and is named on every pass until it is re-saved.
+        // Into mp4 the whole file must be UTF-8 (unreadableMp4): mov_text puts an ass font name into every cue it gives back, so a legacy byte in one is a
+        // cue's (measured on 7.1.4: each cue extracted back as <font face="Fr\xe9d">, and that srt re-read loses all three, exit 69).
         let refusedText = 0;
         for (let k = toMux.length - 1; k >= 0; k -= 1) {
             const f = toMux[k];
-            const why = f.bundle ? '' : sidecarContent(f)?.unreadable;
+            const why = f.bundle ? '' : sidecarContent(f)?.[isMp4 ? 'unreadableMp4' : 'unreadable'];
             if (!why) continue;
             toMux.splice(k, 1);
             refusedText += 1;
             response.infoLog += `☒Not importing ${f.members.map((m) => logSafe(m.rel)).join(', ')} - it ${why}, which ffmpeg cannot read whole; save it as`
                 + ' UTF-8 to import it\n';
         }
-        // A sidecar ffmpeg will not mux (sidecarMuxRefused) would fail the whole import run, every other sidecar with it, on every requeue. It is left out
-        // and named, and the others go in; nothing records it, so it stays on disk until it is fixed or deleted.
+        // A sidecar ffmpeg will not mux (sidecarMuxRefused), or a bundle it cannot read out (bundleUnreadable), would fail the whole import run, every other
+        // sidecar with it, on every requeue. A loose sidecar with no cue (sidecarContent's noCues: a 0-byte or header-only .vtt or .ass, or a WebVTT whose
+        // cues are all empty) muxes, as a track with nothing in it that no content can ever confirm. Each is left out and named, and the others go in;
+        // nothing records it, so it stays on disk until it is fixed or deleted.
         for (let k = toMux.length - 1; k >= 0; k -= 1) {
             const f = toMux[k];
-            if (f.bundle || !sidecarMuxRefused(f, isMp4)) continue;
+            const refused = f.bundle ? bundleUnreadable(f) : sidecarMuxRefused(f, isMp4);
+            const empty = !refused && !f.bundle && sidecarContent(f)?.noCues === true;
+            if (!refused && !empty) continue;
             toMux.splice(k, 1);
             refusedText += 1;
-            response.infoLog += `☒Not importing ${f.members.map((m) => logSafe(m.rel)).join(', ')} - ffmpeg cannot read it as a subtitle file (an empty`
-                + ' file, or an srt whose cues have no numbers?), and muxing it would fail the whole import; fix or delete it\n';
+            response.infoLog += `☒Not importing ${f.members.map((m) => logSafe(m.rel)).join(', ')} - ${empty ? 'it holds no subtitle, and importing it would'
+                + ' add an empty track' : 'ffmpeg cannot read it as a subtitle file (an empty file, or an srt whose cues have no numbers?), and muxing it would'
+                + ' fail the whole import'}; fix or delete it\n`;
         }
         // A group no one title covers (apart) goes in as one track per sidecar, each under its own name as deduplicate=disabled imports it, and each is
         // consumed as a merged group's members are.
@@ -6339,6 +6434,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 + ' would lose a role\n';
         }
         const nothingToMux = !toMux.length && !retuneMeta && !removedIndices.size;
+        for (const f of cutGroups) {
+            response.infoLog += `☒${logSafe(f.rel)} was imported into this file ${earlierCutWords(sidecarContent(f).emptyVttCues)} - not importing it again,`
+                + ` and the sidecar stays; ${nothingToMux ? cutRepairWords() : 'this pass remuxes the file for its other work, which makes that permanent'}\n`;
+        }
 
         // Sidecars that were only ever redundant, with nothing to mux alongside them. Both cleanup shortcuts below must be the EXACT negation of the mux
         // branch's trigger (toMux || retuneMeta || removedIndices) - a queued embedded-dedup drop is work on the FILE, and returning here would discard it

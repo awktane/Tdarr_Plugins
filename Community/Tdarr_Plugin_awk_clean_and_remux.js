@@ -30,7 +30,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.83',
+    Version: '4.999.84',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -2041,7 +2041,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', String(file._id || file.file || '')];
         for (const j of staged) args.push(...j.args, j.tmp);
         const ff = spawnSync(ffmpegPathOf(otherArguments), args,
-            { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES });
+            { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES, killSignal: 'SIGKILL' });
         if (ff.error || ff.status !== 0) {
             const why = ff.error ? `extraction failed (${ff.error.code || ff.error.message})`
                 : `extraction failed (ffmpeg exit ${ff.status}: ${logSafe(String(ff.stderr || '').trim())})`;
@@ -2108,8 +2108,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The subtitle inside a styled .mks bundle, decoded to ASS by ffmpeg into a private temp dir, and how many font attachments ffmpeg's input listing
     // names ("Stream #0:1: Attachment: ttf", measured on 7.1.4). { state: 'ok', buf, fonts }, or { state: 'unreadable' } when ffmpeg RAN and could not
     // decode it - what an interrupted export leaves: killed mid-write it ends "File ended prematurely", and a run whose OTHER output failed at
-    // write_header leaves a header with no cluster ("End of file"), both measured on 7.1.4 - or { state: 'unknown' } when it could not be judged (no temp
-    // dir, a spawn error or timeout, a read-out over the cap), where every caller keeps the answer it had before it could look.
+    // write_header leaves a header with no cluster ("End of file"), both measured on 7.1.4 - or { state: 'unknown' } when it could not be judged (gone, or
+    // not a regular file - ffmpeg blocks on a FIFO's -i until the timeout -, no temp dir, a spawn error or timeout, a read-out over the cap), where every
+    // caller keeps the answer it had before it could look.
     const readBundleSubtitle = (p) => {
         let dir = '';
         try { dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_subbundle_')); } catch (e) { return { state: 'unknown' }; }
@@ -2117,10 +2118,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let res = { state: 'unknown' };
         try {
             const { spawnSync } = require('child_process');
-            const r = spawnSync(ffmpegPathOf(otherArguments), ['-hide_banner', '-y', '-loglevel', 'info', '-i', p, '-map', '0:s:0', '-c:s', 'ass',
-                '-fs', String(SIDECAR_HASH_MAX + 1), out], { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES });
-            if (!r.error && r.status !== 0) res = { state: 'unreadable' };
-            else if (!r.error && fs.statSync(out).size <= SIDECAR_HASH_MAX) {
+            const r = fs.statSync(p).isFile() ? spawnSync(ffmpegPathOf(otherArguments), ['-hide_banner', '-y', '-loglevel', 'info', '-i', p, '-map', '0:s:0',
+                '-c:s', 'ass', '-fs', String(SIDECAR_HASH_MAX + 1), out],
+            { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES, killSignal: 'SIGKILL' }) : null;
+            if (r && !r.error && r.status !== 0) res = { state: 'unreadable' };
+            else if (r && !r.error && fs.statSync(out).size <= SIDECAR_HASH_MAX) {
                 res = { state: 'ok', buf: fs.readFileSync(out),
                     fonts: String(r.stderr || '').split('\n').filter((l) => l.trimStart().startsWith('Stream #') && l.includes(': Attachment:')).length };
             }
