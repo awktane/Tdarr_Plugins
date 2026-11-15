@@ -26,7 +26,7 @@ const details = () => ({
         review rather than failed. The same goes for a broadcast .ts or .mpg capture remuxed to mkv or mp4 in the same job with its video copied, not
         re-encoded: a capture whose timestamps jump or reset states a longer length than it holds. A later job on that file is checked in full again. This
         check is always on and has no setting.\n`,
-    Version: '4.999.61',
+    Version: '4.999.62',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -929,8 +929,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // -attach writes an attachment, and it reads a FILE, so a remux these plugins make for another reason copies each cover's bytes out first, leaves the
     // stream out of its map and attaches the file again. The cover is never itself a reason to remux, and one that cannot be attached again is copied as a
     // video track instead, with a line, never a failed file. A track a plain copy made of a cover keeps the attachment's mimetype tag (see isCoverArt), so it
-    // is found too: the next remux that can stage it turns it back into an attachment. An attached one is dropped only on .webm, which stores neither, or
-    // when its picture does not read as an image (see stageMatroskaCovers).
+    // is found too: the next remux that can stage it turns it back into an attachment. An attached one is dropped only when its picture does not read as
+    // an image (see stageMatroskaCovers), and every cover on .webm, which stores neither.
     const COVER_EXT_BY_CODEC = { mjpeg: 'jpg', png: 'png', gif: 'gif', tiff: 'tiff' };
     const COVER_MIME_BY_CODEC = { mjpeg: 'image/jpeg', png: 'image/png', gif: 'image/gif', tiff: 'image/tiff' };
     const matroskaCovers = (container, streams) => (isMatroskaFamily(container) ? (streams || []).filter((s) => codecTypeOf(s) === 'video'
@@ -986,8 +986,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Stages the covers of a Matroska-family remux: `kept` are attached again (matroskaCoverArgs), `asTrack` (every other cover, copied as a video track -
     // `track` says it was one already) and `dropped` carry the reason, and `leaveOut` is every input stream the map must leave out. No ownership test on the
     // folder: on a CIFS or root-squashed NFS cache every file reads as the mount's owner, and a retry may resume on another node; lstat refuses a symlink, and
-    // anyone who can write the work directory can already replace the cache file Tdarr promotes. .webm stores no attachments (its muxer ignores -attach), so
-    // there no cover is attached again: an attached_pic one is dropped, and a cover track is copied as the track it is.
+    // anyone who can write the work directory can already replace the cache file Tdarr promotes. .webm stores no attachments (its muxer ignores -attach), and
+    // its muxer refuses an image track (only VP8/VP9/AV1 video; exit 234, jellyfin 7.1.4), so there every cover is dropped.
     const stageMatroskaCovers = (container, covers, inputPath, otherArgs, streams) => {
         const path = require('path');
         const fs = require('fs');
@@ -996,7 +996,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // track it takes the whole Matroska mux down ('dimensions not set', exit 234; measured 2026-11-09 on jellyfin 7.1.4), so only one with dimensions
         // can stay a track; the other is dropped for that reason.
         const fail = (it, why, detail = '') => {
-            if (it.track || (why !== 'webm' && Number(it.s.width) > 0 && Number(it.s.height) > 0)) res.asTrack.push({ s: it.s, why, detail, track: it.track });
+            if (why !== 'webm' && (it.track || (Number(it.s.width) > 0 && Number(it.s.height) > 0)))
+                res.asTrack.push({ s: it.s, why, detail, track: it.track });
             else res.dropped.push(why === 'webm' ? { s: it.s, why, detail } : { s: it.s, why: 'unreadable', detail: '' });
         };
         const dir = coverWorkDir(otherArgs);
@@ -1119,10 +1120,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // isom. .tp/.trp/.tod and .divx have no muxer by extension at all but are plain MPEG-TS and AVI. A null entry has no -f that serves it: .m2p/.vro/.mod/
     // .evo (-f vob) and .dat (-f mpeg) take native DVD content but refuse a copied AAC track, so such a file is left for clean_and_remux to remux instead.
     // .m2v is the raw mpeg2video muxer, which takes only MPEG-2 video (an H.264, HEVC or AV1 write-back fails), and no muxer takes .mpv at all.
+    // .rm's muxer exits 0 but writes every video as an RV20 stream (RV10 for rv10) that no longer decodes - a copy of rv10, rv20 or H.264 and an HEVC
+    // encode all decoded 0 frames - so a write-back would replace the file with one whose picture is gone (an audio-only .ra writes back whole, so it has
+    // no row); .rmvb, .ogm, .mk3d, .qt, .3gpp, .wm, .mpe and .dvr-ms have no muxer by extension (exit 234).
     // awk-ffmpeg-test's muxmatrix mirrors this table (guarded by selftest_mirrors) and re-measures its rows.
     const OUTPUT_MUXER_BY_EXT = {
         m4v: 'mp4', m4a: 'mp4', tp: 'mpegts', trp: 'mpegts', tod: 'mpegts', divx: 'avi', m2p: null, vro: null, mod: null, evo: null, dat: null,
-        m2v: null, mpv: null,
+        m2v: null, mpv: null, rm: null, rmvb: null, ogm: null, mk3d: null, qt: null, '3gpp': null, wm: null, mpe: null, 'dvr-ms': null,
     };
     // The output-side -f a container needs: '' where ffmpeg's own pick by extension is right, null where no muxer can write the extension back at all.
     const outputMuxerArg = (container) => {
@@ -1132,6 +1136,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const noMuxerSkipLine = (container) => `☒A .${container} file has no ffmpeg muxer that can write it back - left untouched; remux it to mkv or mp4 first`
         + ' (clean_and_remux does that)\n';
+    // -=-=-= CONTAINER_REFUSES_COPY (+ containerRefusesCopy, copyRefusedSkipLine)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // The cells where even a STREAM COPY back into the same container is refused: the muxer has no way to store the codec at all, so it refuses at header
+    // write whatever tag the stream carries (measured on jellyfin-ffmpeg 7.1.4, 2026-10-12). Only another tool writes such a file - an AV1 .mov the mp4
+    // muxer wrote, say - and a copy of its video back fails it on every requeue with nothing but ffmpeg's message (exit 234). video_clean's
+    // CONTAINER_REFUSES_VIDEO holds these cells and more that fail only an ENCODE: avi/asf/wmv write whatever fourcc the stream carries, so an encode with
+    // none is refused or reads back as rawvideo while a copy that keeps the source's working tag muxes and reads back fine; and the MPEG-PS/TS AV1 cells
+    // cannot be reached by a copy, since a source those muxers cannot carry never probes as av1. awk-ffmpeg-test's muxmatrix mirrors this table too
+    // (WRITEBACK_COPY_REFUSES).
+    const CONTAINER_REFUSES_COPY = {
+        webm: ['hevc', 'h264'], mov: ['av1'], '3gp': ['hevc', 'av1'], '3g2': ['hevc', 'av1'],
+        ogv: ['hevc', 'h264', 'av1'], ogg: ['hevc', 'h264', 'av1'],
+    };
+    const containerRefusesCopy = (container, codec) => (Object.prototype.hasOwnProperty.call(CONTAINER_REFUSES_COPY, container)
+        ? CONTAINER_REFUSES_COPY[container] : []).includes(codec);
+    // The skip for a copy of `streams` back into `container` when it refuses one of their video codecs ('' when it refuses none), tagged with that stream
+    // and `tag`, the input that asked for the copy.
+    const copyRefusedSkipLine = (container, streams, tag = '') => {
+        const v = (streams || []).find((s) => codecTypeOf(s) === 'video' && containerRefusesCopy(container, codecNameOf(s)));
+        return v ? `☒${streamTag(v.index)}${tag} A .${container} file cannot hold ${codecNameOf(v)} video, so even a lossless copy is refused - left untouched;`
+            + ' remux it to mkv or mp4 first (clean_and_remux does that)\n' : '';
+    };
     // -=-=-= movLosesDvBox (+ movDvLossLine, dvLostReadBack, movDvReadBack)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // Whether a write into `container` takes this video stream's Dolby Vision box away. The mov muxer (MODE_MOV) writes no dvcC/dvvC box under any fourcc
     // (0 of 96 readable .mov outputs, jellyfin 7.1.4), so -strict unofficial does not help: an iPhone Profile 8.4 .mov remuxed into .mov reads back as
@@ -2426,12 +2451,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: dolby vision record =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
     // -=-=-= mp4StrictArg [all five] =-=-=-
-    // The ' -strict <level>' an mp4/mov -c copy needs, or '' when it needs none. Two independent reasons share one flag, because `experimental` is a strict
-    // SUPERSET of `unofficial` and does both jobs:
+    // The ' -strict <level>' an mp4/mov -c copy needs, or '' when it needs none. Three independent reasons share one flag, because `experimental` is a strict
+    // SUPERSET of `unofficial` and does every job:
     //   experimental - a TrueHD stream copied INTO mp4, which the muxer otherwise refuses outright (rc 88); `unofficial` does NOT satisfy it. Matched on
     //                  the raw codec_name, not resolveCodecName, whose refined truehdatmos would not equal 'truehd'.
     //   unofficial   - a Dolby Vision video stream, so the mov muxer keeps its dvcC/dvvC boxes; a plain copy drops them, demoting DV to plain HEVC/AV1
     //                  (verified on real HEVC + AV1 DV samples). Cover art is excluded so a leading cover-art stream cannot mask a real DV stream.
+    //                  Or an mp3 below 16 kHz, which the mp4 muxer refuses without it ('not standard', exit 234 at 8, 11.025 and 12 kHz; .mov takes
+    //                  one either way; measured on jellyfin 7.1.4).
     // Pass the RAW file.ffProbeData.streams as `streams`: the DV signals (codec_tag_string / side_data_list) live only there. `copied` is the subset this
     // run emits as -c copy (defaults to all) - a caller that drops or re-encodes tracks passes its own survivor list, so a TrueHD track on its way out
     // never pulls in a flag the output does not need. Never decide this by regex over the half-built argument string: it carries container-supplied
@@ -2441,7 +2468,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const list = Array.isArray(streams) ? streams : [];
         const kept = Array.isArray(copied) ? copied : list;
         if (kept.some((s) => codecTypeOf(s) === 'audio' && codecNameOf(s) === 'truehd')) return ' -strict experimental';
-        return list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s))) ? ' -strict unofficial' : '';
+        const lowRateMp3 = kept.some((s) => codecTypeOf(s) === 'audio' && codecNameOf(s) === 'mp3' && (Number(s.sample_rate) || 16000) < 16000);
+        return lowRateMp3 || list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s)))
+            ? ' -strict unofficial' : '';
     };
     // ===== END SHARED: mp4 strict compliance arg =====
     // #endregion
@@ -2508,8 +2537,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // 0, and a music file whose first track is a JPEG reads as a video to taggers and media servers. Excluding them is what lets the comparator stay
     // untouched, so none of this can reach a video file. An .m4a's cover is a covr atom, which the mp4 muxer writes after every track wherever it is mapped,
     // so it is mapped last and never ordered (isCovrRow below); any other video stream in one - a QuickTime chapter-image track, which a remux writes as an
-    // ordinary video track - would be hoisted all the same, so such an .m4a is left untouched. So is an audio-medium .mka with cover art (mkaCarriesCoverArt
-    // has the reason). Both skip lines say why.
+    // ordinary video track - would be hoisted all the same, so such an .m4a is left untouched (past the truncation check, see there). So is an audio-medium
+    // .mka with cover art (mkaCarriesCoverArt has the reason). Both skip lines say why.
     const AUDIO_ORDERED = ['mka', 'm4a'];
     if (file.fileMedium !== 'video' && !(file.fileMedium === 'audio' && AUDIO_ORDERED.includes(dstContainer))) {
         if (file.fileMedium === 'audio')
@@ -2520,10 +2549,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (file.fileMedium === 'audio' && mkaCarriesCoverArt(dstContainer, file.ffProbeData?.streams)) {
         return skip(mkaCoverArtSkipLine);
     }
-    if (file.fileMedium === 'audio' && dstContainer === 'm4a' && (file.ffProbeData?.streams || []).some((s) => codecTypeOf(s) === 'video' && !isMp4Cover(s))) {
-        return skip('☒[m4a] This .m4a carries a video stream besides its cover art, which a reorder would write ahead of the audio - left untouched\n');
-    }
     if (outputMuxerArg(dstContainer) === null) return skip(noMuxerSkipLine(dstContainer));   // an extension no muxer writes back (outputMuxerArg)
+    const copyRefused = copyRefusedSkipLine(dstContainer, file.ffProbeData?.streams);
+    if (copyRefused) return skip(copyRefused);   // a video codec the container refuses even on a copy (CONTAINER_REFUSES_COPY)
 
     // #region SHARED helpers (1 section: recovered marker vocabulary)
     // ===== SHARED [clean_and_remux, stream_ordering, video_clean]: recovered marker vocabulary =====
@@ -2663,6 +2691,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // .m4v, writes no stamp, so an .m4v another tool encoded reads as a copy; these plugins write .m4v with the mp4 muxer (OUTPUT_MUXER_BY_EXT),
             // which stamps. That is also why the output must be Matroska or mp4: a TS/PS output holds no stamp, and nothing would tell a copy from an encode.
             // An mp4 muxer's own XDCAM name on MPEG-2 is not a Lavc stamp.
+            // Only the video's stamp counts: a cut-short audio-only encode reads exactly like a jump capture whose audio audio_clean re-encoded, and no
+            // duration tells them apart (the original's audio states the same inflated length), so both are accepted for review and the line names the jump as
+            // a possibility, not the cause.
             const originalContainer = String(originalFile.container || '').toLowerCase().trim();
             const tsPsOriginal = isMpegTsPsFamily(originalContainer);
             const videoEncoded = /^lavc/i.test(getTagCI(newVideo?.tags, 'encoder').trim());
@@ -2681,8 +2712,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const compared = `(compared using ${verdict.name})`;
                     if (!recovered && tsPsRemux) {
                         response.infoLog += `☒${durTag}${shorter}, but the .${originalContainer} original was remuxed in this job with its video`
-                            + ' copied, not re-encoded - a capture whose timestamps jump or reset states a longer length than it holds, and the remux'
-                            + ` reports the true one\n☒${durTag}${REVIEW_HINT} ${compared}\n`;
+                            + ' copied, not re-encoded - it may be a capture whose timestamps jump or reset, which states a longer length than it holds'
+                            + ` while the remux reports the true one\n☒${durTag}${REVIEW_HINT} ${compared}\n`;
                     } else {
                         const tsPsCause = tsPsOriginal ? `, or the .${originalContainer} original's timestamps jump or reset and state a longer length`
                             + ' than it holds' : '';
@@ -2703,6 +2734,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
         // ====== END TRUNCATION CHECK ======
+        // The .m4a with a video stream besides its cover (AUDIO_ORDERED) is left untouched only now: audio_clean re-encodes such a file's audio, so a cut-short
+        // encode of it must still meet the check above.
+        if (file.fileMedium === 'audio' && dstContainer === 'm4a'
+            && (file.ffProbeData?.streams || []).some((s) => codecTypeOf(s) === 'video' && !isMp4Cover(s))) {
+            return skip('☒[m4a] This .m4a carries a video stream besides its cover art, which a reorder would write ahead of the audio - left untouched\n');
+        }
 
         // Input summary — the streams exactly as they arrived, before re-ordering.
         response.infoLog += `☐Input streams: ${summariseAll(file.ffProbeData.streams)}\n`;
@@ -2958,7 +2995,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // standalone run on a .ts/.avi capture would otherwise write '+default' every pass, read it back missing, and re-emit a byte-identical preset - which
         // Tdarr's infinite-transcode-loop guard errors, quarantining a healthy file. Normalize the sole-default flag only where it sticks; elsewhere leave the
         // audio default flags untouched (the same container-unstorable-flag skip clean_and_remux's tag_disposition already applies to captions/original).
-        const canPersistDefault = isMatroskaFamily(dstContainer) || isMp4Family(dstContainer);
+        // .3gp and .3g2 store it too, both ways (measured 2026-11-13).
+        const canPersistDefault = isMatroskaFamily(dstContainer) || isMp4Family(dstContainer) || ['3gp', '3g2'].includes(dstContainer);
         let defaultFlagSkipped = false;
 
         // Three kinds of stream are left out of the map, so outIdx - the output position the per-stream -metadata writes key on - counts only the streams
@@ -3144,6 +3182,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 + `${dstContainer === 'mov' ? '' : ` beside the ${tagPlan.markers.map((m) => logSafe(m, 40)).join(', ')} marker`}\n`);
         }
 
+        // A subtitle ffprobe names no codec for cannot be copied (sub_worker's commitPreset has the measurement), so the remux is stopped, naming it.
+        const noCodecSubs = mappedRows.filter((r) => r.type === 'subtitle' && ['', 'unknown', 'none'].includes(codecNameOf(r.stream)));
+        if (noCodecSubs.length) {
+            failFile(`${noCodecSubs.map((r) => streamTag(r.index)).join('')} ffmpeg names no codec for this subtitle stream (a WebVTT track mkvmerge wrote`
+                + ' reads so), and it cannot copy one, so this file cannot be written back - convert or remove that track with mkvmerge, then requeue');
+        }
         response.processFile = true;
         // Describe the reorder itself - this plugin's headline change, and the only one that would otherwise leave no trace in the log: without these lines a
         // pure reorder runs straight from the input summary to Expected results and the user has to diff the two token lists to see that anything happened.

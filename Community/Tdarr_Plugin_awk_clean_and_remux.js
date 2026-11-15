@@ -30,7 +30,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.85',
+    Version: '4.999.86',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -286,11 +286,13 @@ const details = () => ({
                 stream, still fails the file rather than writing a stump.
                 \\nmkv_fallback: keep THIS file in mkv with every stream intact; your container setting still applies to every other file. A codec mkv
                 cannot store either falls back to error, there being nothing to fall back TO.
-                \\nmp4 refuses a long list that mkv accepts: MLP, WMA, most ADPCM, A-law / mu-law / 8-bit PCM, LATM AAC (what every DVB and broadcast
-                capture carries), VP8, Theora, ProRes, DNxHD, FFV1, HuffYUV, MagicYUV, UtVideo, v210, DV, Cinepak, H.263, the WMV / MS-MPEG-4 family, and
-                the QuickTime-only codecs. TrueHD stores in mp4 only as experimental, so a TrueHD track arriving from another container is gated the same
-                way, while one ALREADY in an mp4-family file is kept as it stands.
-                \\nA few fit in NEITHER container - AC-4, Blu-ray PCM, SMPTE 302M, IMA-QT ADPCM, Nellymoser - so for those no container choice is a way out.`,
+                \\nmp4 refuses a long list that mkv accepts: MLP, WMA, WavPack, TTA, AMR, most ADPCM, A-law / mu-law / unsigned 8-bit PCM, LATM AAC (what
+                every DVB and broadcast capture carries), VP8, Theora, ProRes, DNxHD, CineForm, FFV1, HuffYUV, MagicYUV, UtVideo, v210, raw video, DV,
+                Cinepak, H.263, the WMV / MS-MPEG-4 family, and the QuickTime-only codecs. TrueHD stores in mp4 only as experimental, so a TrueHD track
+                arriving from another container is gated the same way, while one ALREADY in an mp4-family file is kept as it stands.
+                \\nA few fit in NEITHER container - AC-4, SMPTE 302M, IMA-QT ADPCM, Nellymoser, RealVideo 1-3 and the RealAudio codecs bar 14.4 - so for
+                those no container choice is a way out. Blu-ray, DVD and signed 8-bit PCM, which neither stores as they are, are instead repacked as plain
+                PCM without losing a sample, as is big-endian float PCM bound for mkv.`,
         },
         {
             name: 'guard_audio_language',
@@ -1350,12 +1352,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: dolby vision record =====
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: mp4 strict compliance arg =====
     // -=-=-= mp4StrictArg [all five] =-=-=-
-    // The ' -strict <level>' an mp4/mov -c copy needs, or '' when it needs none. Two independent reasons share one flag, because `experimental` is a strict
-    // SUPERSET of `unofficial` and does both jobs:
+    // The ' -strict <level>' an mp4/mov -c copy needs, or '' when it needs none. Three independent reasons share one flag, because `experimental` is a strict
+    // SUPERSET of `unofficial` and does every job:
     //   experimental - a TrueHD stream copied INTO mp4, which the muxer otherwise refuses outright (rc 88); `unofficial` does NOT satisfy it. Matched on
     //                  the raw codec_name, not resolveCodecName, whose refined truehdatmos would not equal 'truehd'.
     //   unofficial   - a Dolby Vision video stream, so the mov muxer keeps its dvcC/dvvC boxes; a plain copy drops them, demoting DV to plain HEVC/AV1
     //                  (verified on real HEVC + AV1 DV samples). Cover art is excluded so a leading cover-art stream cannot mask a real DV stream.
+    //                  Or an mp3 below 16 kHz, which the mp4 muxer refuses without it ('not standard', exit 234 at 8, 11.025 and 12 kHz; .mov takes
+    //                  one either way; measured on jellyfin 7.1.4).
     // Pass the RAW file.ffProbeData.streams as `streams`: the DV signals (codec_tag_string / side_data_list) live only there. `copied` is the subset this
     // run emits as -c copy (defaults to all) - a caller that drops or re-encodes tracks passes its own survivor list, so a TrueHD track on its way out
     // never pulls in a flag the output does not need. Never decide this by regex over the half-built argument string: it carries container-supplied
@@ -1365,7 +1369,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const list = Array.isArray(streams) ? streams : [];
         const kept = Array.isArray(copied) ? copied : list;
         if (kept.some((s) => codecTypeOf(s) === 'audio' && codecNameOf(s) === 'truehd')) return ' -strict experimental';
-        return list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s))) ? ' -strict unofficial' : '';
+        const lowRateMp3 = kept.some((s) => codecTypeOf(s) === 'audio' && codecNameOf(s) === 'mp3' && (Number(s.sample_rate) || 16000) < 16000);
+        return lowRateMp3 || list.some((s) => codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s)))
+            ? ' -strict unofficial' : '';
     };
     // ===== END SHARED: mp4 strict compliance arg =====
     // ===== SHARED [clean_and_remux, video_clean]: hevc copy fourcc =====
@@ -1737,28 +1743,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Which audio/video codecs the destination MUXER refuses on a -c copy. Every row was muxed for real into both containers; the 78-row matrix came out
     // IDENTICAL on Mac/Linux/Windows jellyfin-ffmpeg 7.1.4 (a muxer's codec-tag table is compiled-in, not a build option), so a static table is correct
     // and no runtime probe is needed - and a row measured later on one platform generalizes for that same reason. A codec this build cannot ENCODE is still
-    // measurable: retag an encodable sibling (patch the AVI FOURCC, the WAV wFormatTag or the RealMedia FOURCC), since -c copy never decodes and the muxer's
-    // refusal names the codec, which is also what proves the retag took. Tested and PASSED into mp4, so deliberately absent: vc1, wmv3's successor and the one
-    // WMV-family codec mp4 can tag. Keyed on the RAW ffprobe codec_name, NEVER resolveCodecName: that helper folds aac_latm->aac and pcm_*->pcm, and
-    // since plain aac and pcm_s16le mux into mp4 fine, a resolved key would miss the exact rows this table exists for - aac_latm above all, the codec
-    // every DVB/broadcast capture carries. Only PROVEN failures are listed, which is what makes it fail-safe: an unlisted codec reaches ffmpeg and fails
-    // there exactly as it does today - incompleteness costs a missed diagnosis, never a wrongly-refused file.
+    // measurable: retag an encodable sibling (patch the AVI FOURCC, the WAV wFormatTag, the RealMedia or QuickTime FOURCC, or the Matroska CodecID), since -c
+    // copy never decodes and the muxer's refusal names the codec, which is also what proves the retag took. rawvideo is refused whatever its pixel format
+    // (yuv420p measured), so it is listed here although matroska takes its YUV formats (see MKV_UNMUXABLE). Tested and PASSED into mp4, so deliberately absent:
+    // vc1, wmv3's successor and the one WMV-family codec mp4 can tag. Keyed on the RAW ffprobe codec_name, NEVER resolveCodecName: that helper folds
+    // aac_latm->aac and pcm_*->pcm, and since plain aac and pcm_s16le mux into mp4 fine, a resolved key would miss the exact rows this table exists for -
+    // aac_latm above all, the codec every DVB/broadcast capture carries. Only PROVEN failures are listed, which is what makes it fail-safe: an unlisted codec
+    // reaches ffmpeg and fails there exactly as it does today - incompleteness costs a missed diagnosis, never a wrongly-refused file.
     const MP4_UNMUXABLE = [
         // audio - "Could not find tag for codec X in stream #N, codec not currently supported in container"
         'aac_latm', 'adpcm_ima_wav', 'adpcm_ms', 'adpcm_yamaha', 'mlp', 'pcm_alaw', 'pcm_mulaw', 'pcm_u8',
-        'wmalossless', 'wmapro', 'wmav1', 'wmav2', 'wmavoice',
+        'wmalossless', 'wmapro', 'wmav1', 'wmav2', 'wmavoice', 'adpcm_g722', 'adpcm_g726', 'amr_nb', 'amr_wb', 'g723_1', 'pcm_s64le', 'ra_144', 'tta',
+        'wavpack',
         // video - same error
         'cinepak', 'dnxhd', 'dvvideo', 'ffv1', 'ffvhuff', 'flv1', 'h263', 'huffyuv', 'magicyuv', 'msmpeg4v2', 'msmpeg4v3',
         'prores', 'qtrle', 'rv40', 'svq1', 'theora', 'utvideo', 'v210', 'vp8', 'wmv1', 'wmv2', 'wmv3',
+        'amv', 'asv1', 'asv2', 'avrp', 'cfhd', 'cljr', 'flashsv', 'h261', 'msvideo1', 'r210', 'rawvideo', 'rpza', 'smc', 'snow', 'speedhq', 'v308', 'zmbv',
         // Flash ADPCM: mp4 has no tag for it, but matroska does carry it (its sibling adpcm_ima_qt does not) - so mkv_fallback CAN rescue this one.
         'adpcm_swf',
     ];
     // Refused by BOTH muxers, so mkv_fallback cannot rescue these - there is nothing to fall back TO; the gate degrades them to error/drop and says so. The
     // wording differs by family: matroska answers "No wav codec tag found for codec X" for the audio rows and "The Matroska muxer does not yet support muxing
-    // X" for RealVideo. (s302m and pcm_bluray occur naturally only in MPEG-TS and on Blu-ray respectively, which is how a file can be carrying a codec neither
-    // of our two output containers accepts. rv40 is deliberately NOT here: it is the one RealVideo generation matroska implements, so it sits in the mp4-only
-    // list above, where mkv_fallback genuinely rescues it.)
-    const UNMUXABLE_ANYWHERE = ['ac4', 'adpcm_ima_qt', 'nellymoser', 'pcm_bluray', 'rv10', 'rv20', 'rv30', 's302m'];
+    // X" for RealVideo 1-3 and the RealAudio codecs bar 14.4 (cook, ra_288, sipr, atrac3 measured by retagging a 14.4 track's CodecID). (s302m occurs naturally
+    // only in MPEG-TS and the Real codecs in RealMedia, which is how a file can be carrying a codec neither of our two output containers accepts. Blu-ray and
+    // DVD LPCM are converted instead, see PCM_LOSSLESS_REMAP. rv40 is deliberately NOT here: it is the one RealVideo generation matroska implements, so it sits
+    // in the mp4-only list above, where mkv_fallback genuinely rescues it.)
+    const UNMUXABLE_ANYWHERE = ['ac4', 'adpcm_ima_qt', 'atrac3', 'cook', 'nellymoser', 'ra_288', 'rv10', 'rv20', 'rv30', 's302m', 'sipr'];
     // Refused by MATROSKA but muxable into mp4 - the mirror of MP4_UNMUXABLE, measured the same way. Deliberately SHORTER than the mp4 half: only a codec
     // this build can encode, or that exists as a real sample, is testable at all, and matroska accepted nearly everything offered (every lossless video
     // codec, wmav1/wmav2, the adpcm family bar the two above, aac_latm, VVC, DTS, TrueHD). rawvideo is the one measured failure deliberately NOT listed:
@@ -1771,6 +1781,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // exactly like the rows above. It survives only for a file that is ALREADY mp4-family TrueHD (codec_tag mlpa), where the format is a fact on disk rather
     // than a conversion we are choosing: re-muxing mp4 -> mp4 emits the flag and preserves it instead of overriding the user's container.
     const MP4_STRICT_GATED = ['truehd'];
+    // PCM a target refuses only for its byte order, sample size or disc framing, and the PCM codec it is converted to instead, losing nothing: the decoded
+    // samples came out md5-identical (jellyfin 7.1.4) for Blu-ray LPCM 5.1 at 16 and 24 bits and DVD LPCM at 16 and 24 bits, into mkv and mp4 alike, and for
+    // QuickTime 8-bit 'twos' and the big-endian floats into mkv. Neither container stores Blu-ray/DVD LPCM or 8-bit PCM; mp4 stores the big-endian floats
+    // as they are, so those are converted only into mkv. A 16-bit target is taken only where the probe says 16 bits or fewer (sample_fmt s16, or u8 for
+    // 8-bit); anything deeper, or unread, is written 24-bit, which holds the 20- and 24-bit disc formats exactly. Every target still reads as pcm
+    // (resolveCodecName), so audio_clean's guard_lossless keeps protecting it, and the next pass copies it. s302m is NOT converted: it can carry Dolby E,
+    // which a PCM decode would garble.
+    const PCM_LOSSLESS_REMAP = { pcm_bluray: 'pcm_s16le', pcm_dvd: 'pcm_s16le', pcm_s8: 'pcm_s16le', pcm_f32be: 'pcm_f32le', pcm_f64be: 'pcm_f64le' };
+    // The codec stream s is converted to for the current destination, or '' when it is copied as it is.
+    const pcmLosslessTarget = (s) => {
+        const codec = codecNameOf(s);
+        if (!Object.prototype.hasOwnProperty.call(PCM_LOSSLESS_REMAP, codec) || (dstContainer === 'mp4' && codec.startsWith('pcm_f'))) return '';
+        return PCM_LOSSLESS_REMAP[codec] === 'pcm_s16le' && !/^(s16|u8)p?$/.test(String(s.sample_fmt || '')) ? 'pcm_s24le' : PCM_LOSSLESS_REMAP[codec];
+    };
     // Which of the three the codec falls into for the CURRENT destination, or '' when it muxes fine. Read once per stream by the gate below.
     const unmuxableClass = (codec) => {
         if (UNMUXABLE_ANYWHERE.includes(codec)) return 'anywhere';
@@ -3386,9 +3410,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let audioOutOrdinal = -1;
         let videoOutOrdinal = -1;
         // Predicted-output tracking for the closing summary line (does not affect the ffmpeg preset). removedIndices: input stream positions
-        // dropped via -map -0:ffstream.index. subCodecOverride: input stream position -> converted subtitle codec ('srt' / 'mov_text').
+        // dropped via -map -0:ffstream.index. streamOverlay: input stream position -> the fields the output writes differently, laid over that stream (a
+        // converted subtitle's or PCM track's codec_name).
         const removedIndices = new Set();
-        const subCodecOverride = new Map();
+        const streamOverlay = new Map();
         const muxerRebuilt = [];   // streams left out of the map that the mp4 muxer writes back (see the data branch) - summarised last, where it writes them
         // clearedRolePrediction: input stream position -> { adds, roleFields } for a stream whose cleared carrier held a role (see clearedOnlyRoles) - the
         // flags the remux promotes and the role fields that survive it. handlerRolesLost: '[s N] Role' entries no flag in the target can hold, on ONE line.
@@ -3984,7 +4009,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         + ` to ${landsAs}\n`;
                     extraArguments += metadataCommand+` -c:s:${subtitleOutOrdinal} ${subConvertTarget}`;
                     nameCarryArgs += carryCommand;
-                    subCodecOverride.set(ffstream.index, landsAs);
+                    streamOverlay.set(ffstream.index, { codec_name: landsAs });
                     convert = true;
                     continue;
                 }
@@ -4041,6 +4066,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
 
                 emitCommentRemoval('a', audioOutOrdinal, 'audio');
+
+                const pcmTarget = pcmLosslessTarget(ffstream);   // PCM the target refuses, repacked as PCM it stores (PCM_LOSSLESS_REMAP)
+                if (pcmTarget) {
+                    workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Unsupported codec - converting ${ffstreamCodec} audio to ${pcmTarget}`
+                        + ' (lossless)\n';
+                    extraArguments += ` -c:a:${audioOutOrdinal} ${pcmTarget}`;
+                    // the rate the next pass reads: 8-bit PCM doubles in 16 bits, a 20-bit disc track grows by a fifth in 24
+                    const rate = Number(ffstream.sample_rate) * Number(ffstream.channels) * Number(pcmTarget.replace(/\D/g, ''));
+                    streamOverlay.set(ffstream.index, { codec_name: pcmTarget, ...(rate > 0 ? { bit_rate: String(rate) } : {}) });
+                    convert = true;
+                }
 
             } else if(ffstreamType === 'video') {
                 videoOutOrdinal++;
@@ -4194,10 +4230,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         // One spelling of the all-gone test and of the method_unmuxable=drop wording for both stream types, so a remedy fix cannot reach only one of them.
+        // mkv_fallback is offered only where it keeps the file, matroska storing every codec in it - never on an mkv target, which drops what matroska refuses.
         const allGone = (type) => streams.some((s) => codecTypeOf(s) === type) && !streams.some((s) => codecTypeOf(s) === type && !removedIndices.has(s.index));
+        const fallbackKeeps = !streams.some((s) => [...UNMUXABLE_ANYWHERE, ...MKV_UNMUXABLE].includes(codecNameOf(s)));
         const failUnmuxableDropAll = (type) => failWithBuffers(`[method_unmuxable=drop] Dropping every ${type} stream ${dstContainer} cannot store would `
-            + `leave the file with no ${type} at all - set method_unmuxable=error to stop instead, or mkv_fallback to keep this file in a container that can `
-            + 'hold them');
+            + `leave the file with no ${type} at all - set method_unmuxable=error to stop instead${fallbackKeeps ? ', or mkv_fallback to keep this file in a'
+            + ' container that can hold them' : ''}`);
 
         // Every path that can drop a video stream (method_unmuxable=drop above, cover art in the video branch, the pair mappedVideos reads) records it in
         // removedIndices, so the survivors are read from there. The first clause exists to stop the second being VACUOUSLY true: with no video stream at all,
@@ -4365,15 +4403,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 roleFieldCache.set(out, p.roleFields);
                 return out;
             };
-            // Predicted output: re-renders the input streams with the mutations this summary tracks - removedIndices filtering, subCodecOverride (converted
-            // subtitle codec), predictClearedRoles, the tracks the muxer rebuilds or creates, where it writes them (mp4RebuiltLast, mp4CreatedTracks), and the
+            // Predicted output: re-renders the input streams with the mutations this summary tracks - removedIndices filtering, streamOverlay (a converted
+            // stream's codec), predictClearedRoles, the tracks the muxer rebuilds or creates, where it writes them (mp4RebuiltLast, mp4CreatedTracks), and the
             // flags the output is read back with (readBackDispositions, ahead of predictClearedRoles, whose copy is the one roleFieldsLower is seeded for). It
             // does NOT reflect queued language fills / tag_language standardization: those emit only a -metadata:s:...language= arg and never mutate the
             // ffprobe object summariseStream reads, so a track whose blank/looser tag will be rewritten still shows its pre-change lang token here.
             const shown = mp4RebuiltLast(dstContainer, streams, muxerRebuilt, mp4CreatedTracks(dstContainer, mappedStreams))
                 .map(s => ({ s: enrichStream(s), idx: s.index }))
                 .filter(({ idx }) => !removedIndices.has(idx))
-                .map(({ s, idx }) => (subCodecOverride.has(idx) ? { ...s, codec_name: subCodecOverride.get(idx) } : s));
+                .map(({ s, idx }) => (streamOverlay.has(idx) ? { ...s, ...streamOverlay.get(idx) } : s));
             const outSummary = readBackDispositions(dstContainer, shown, carriesDisposition(response.preset))
                 .map(predictClearedRoles)
                 .map((s) => summariseStream(s)).join('');
