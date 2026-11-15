@@ -11,10 +11,10 @@ const details = () => ({
                      -Auto-selects an available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one
                      plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
-                     -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
-                     embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that can destroy them (see
-                     guard_captions).\n\n`,
-    Version: '3.999.95',
+                     -Stack order: clean_and_remux first; video_clean / audio_clean / sub_worker in any order (sub_worker before video_clean when the video
+                     carries closed captions); stream_ordering last. Embedded closed captions are why sub_worker goes first: re-encoding is the one thing that
+                     can destroy them (see guard_captions).\n\n`,
+    Version: '3.999.96',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -464,17 +464,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: role/disposition classifiers =====
     // -=-=-= dispositionTypes [all five] =-=-=-
-    // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each
-    // keyword lives on ONE flag PER STREAM TYPE - hasDisposition scopes by entry.streams - so title->flag promotion stays unambiguous;
-    // descriptive/descriptions/dvs deliberately appear on both the audio and subtitle entries), and the canonical title string (tag, null when never
-    // written). The single table every classifier, sort key, summary token and title tagger reads, so the lists can never drift; isCoverArt alone reads
-    // its three cover-art flags raw (see there). The roles also carry the words European releases title such tracks with, unflagged: commentary, audio
-    // description and SDH in German, French, Spanish, Portuguese, Italian, Dutch, Polish and the Nordic languages; forced in all of those but the Nordic
-    // ones, which have no standard forced label; dub in all but German, Dutch and Finnish; original in German, French, Italian, Dutch and Polish, and in
-    // Spanish and Portuguese through the bare 'original'. Plurals and the one-word compounds release labels use (Kommentare, Audiokommentar) are
-    // included - compounds have no end, so these are the standard labels, not every word. Each is a whole-token match, so only a word that means nothing
-    // else in a track title belongs here: VO, OV and UT stay out, and French, Italian, Dutch and Polish carry 'original' as the phrase, since their lone
-    // word also names an original soundtrack (bande originale, oryginalna ścieżka dźwiękowa). Every one is pinned by the harness.
+    // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each keyword
+    // lives on ONE flag PER STREAM TYPE - hasDisposition scopes by entry.streams - so title->flag promotion stays unambiguous; descriptive/descriptions/dvs
+    // deliberately appear on both the audio and subtitle entries), and the canonical title string (tag, null when never written). The single table every
+    // classifier, sort key, summary token and title tagger reads, so the lists can never drift; isCoverArt alone reads its three cover-art flags raw (see
+    // there). The roles also carry the words European releases title such tracks with, unflagged: commentary, audio description and SDH in German, French,
+    // Spanish, Portuguese, Italian, Dutch, Polish and the Nordic languages; forced in all of those but the Nordic ones, which have no standard forced label;
+    // dub in all but German, Dutch and Finnish; original in German, French, Italian, Dutch and Polish (Polish in either word order), and in Spanish and
+    // Portuguese through the bare 'original'. Plurals, inflected forms and the one-word compounds release labels use (Kommentare, forçados, kuulovammaisille,
+    // Audiokommentar) are included - compounds have no end, so these are the standard labels, not every word. Each is a whole-token match, so only a word
+    // that means nothing else in a track title belongs here: VO, OV and UT stay out, and French, Italian, Dutch and Polish carry 'original' as the phrase,
+    // since their lone word also names an original soundtrack (bande originale, oryginalna ścieżka dźwiękowa). Every one is pinned by the harness.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary', 'kommentar', 'commentaire', 'comentario', 'comentário', 'commento',
                                 'commentaar', 'komentarz', 'kommentaari', 'kommentare', 'kommentarer', 'audiokommentar', 'regiekommentar',
@@ -487,15 +487,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         descriptions:     { streams:['subtitle'],                 keywords: ['descriptive','descriptions','dvs'],                      tag: 'Descriptive' },
         hearing_impaired: { streams:['subtitle'],                 keywords: ['sdh','hearing impaired','hard of hearing','hoh','deaf', 'malentendants',
                                 'hörgeschädigte', 'gehörlose', 'sordos', 'non udenti', 'slechthorenden', 'surdos', 'niesłyszących',
-                                'hörselskadade', 'hørehæmmede', 'hørselshemmede', 'kuulovammaiset'],                            tag: 'SDH'         },
+                                'hörselskadade', 'hørehæmmede', 'hørselshemmede', 'kuulovammaiset', 'kuulovammaisille'],        tag: 'SDH'         },
         captions:         { streams:['subtitle'],                 keywords: ['caption','captions','cc'],                               tag: 'SDH'         },
         lyrics:           { streams:['subtitle'],                 keywords: ['songs','lyrics'],                                        tag: 'Lyrics'      },
-        forced:           { streams:['subtitle'],                 keywords: ['forced','foreign', 'forcé', 'forcés', 'forzados',
-                                'erzwungen', 'forçadas', 'forçada', 'forzati', 'geforceerd', 'wymuszone'],                      tag: 'Forced'      },
+        forced:           { streams:['subtitle'],                 keywords: ['forced','foreign', 'forcé', 'forcés', 'forzados', 'erzwungen', 'forçadas',
+                                'forçada', 'forçados', 'forzati', 'geforceerd', 'geforceerde', 'wymuszone', 'wymuszony'],       tag: 'Forced'      },
         dub:              { streams:['audio'],                    keywords: ['dub','dubbed', 'dubbing', 'doublage', 'doblaje', 'doblado', 'dublado', 'dublagem',
                                 'doppiaggio', 'doppiato', 'dubbad', 'dubbet'],                                                  tag: 'Dub'         },
         original:         { streams:['audio'],                    keywords: ['original', 'originalton', 'o-ton', 'originalfassung', 'version originale',
-                                'versione originale', 'originele versie', 'wersja oryginalna'],                                 tag: 'Original'    },
+                                'versione originale', 'originele versie', 'wersja oryginalna', 'oryginalna wersja'],            tag: 'Original'    },
         clean_effects:    { streams:['audio'],                    keywords: ['music and effects','music & effects','m&e','m and e'],   tag: 'M&E'         },
         karaoke:          { streams:['audio'],                    keywords: ['karaoke'],                                               tag: 'Karaoke'     },
         default:          { streams:['audio','subtitle','video'], keywords: ['default'],                                               tag: null          },
@@ -1150,8 +1150,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const mediaInfoFor = (s) => (file?.mediaInfo?.track || []).find(t => t['@type'] !== 'Menu' && Number(t.StreamOrder) === s.index);
     // -=-=-= resolveLang [all five] =-=-=-
     // ffprobe tags.language, else mediaInfo Language (files often tag one probe but not the other); '' when neither reports it - callers wanting a
-    // placeholder use `resolveLang(s) || 'und'`.
-    const resolveLang = (s) => { const t = (s.tags?.language || '').trim(); return (t || (mediaInfoFor(s)?.Language ?? '')).trim().toLowerCase(); };
+    // placeholder use `resolveLang(s) || 'und'`. mediaInfo's is read through mediaInfoText: a tag of whitespace and control characters (a tab) reads as
+    // none in ffprobe and reaches mediainfo.js as a base64 object, and read raw it threw and failed the file on every requeue.
+    const resolveLang = (s) => { const t = (s.tags?.language || '').trim(); return (t || mediaInfoText(mediaInfoFor(s)?.Language)).trim().toLowerCase(); };
     // -=-=-= resolveStreamBitrate [all five] =-=-=-
     // ffprobe first, then mediaInfo: some formats hide per-stream bitrate from ffprobe (e.g. DTS-HD MA in MP4/M4V). mediaInfo order: measured BitRate,
     // declared BitRate_Nominal, then StreamSize*8/Duration - still a real measurement, far better than the codec-target estimate audioQuality falls back
@@ -1650,14 +1651,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return edgeless(parts);
     };
-    // A matroska track's one name where a per-track TITLE SimpleTag (titleTagKey) sits beside its Name, else '' - the Name being what is left of mediaInfo's
-    // Title (mediaInfoOwnTitleParts) when no tag form is it (tagForms), the one place it shows where the tag is in its place. An output that keeps one title -
-    // any remux of a tag in the Name's place (titleTagInNamePlace), else a write into another container or a sidecar - writes it as the Name, so that name
-    // keeps both values' roles (rolesNamed): the Name alone when the tag gives none the Name lacks, since players and media servers show the Name; else the two
-    // joined as mediaInfo joins them, 'Name / TITLE', or else 'TITLE / Name', whichever reads exactly their roles together - a keyword can form across the
-    // join ('Main Audio / Description Commentary' reads 'audio description'); else the Name, the roles only the tag gives lost (titleTagFate). Measured:
-    // read as the tag, 'Director Commentary' beside 'German' was written over with 'German'; read as the Name alone, 'English' beside 'Director Commentary'
-    // made the commentary the default audio.
+    // A matroska track's one name where a per-track TITLE SimpleTag (titleTagKey) sits beside its Name, else '' - the Name being what is left of
+    // mediaInfo's Title (mediaInfoOwnTitleParts) when no tag form is it (tagForms), the one place it shows where the tag is in its place. An
+    // output that keeps one title - any remux of a tag in the Name's place (titleTagInNamePlace), else a write into another container or a
+    // sidecar - writes it as the Name, so that name keeps both values' roles (rolesNamed): the Name alone when the tag gives none the Name lacks,
+    // since players and media servers show the Name; else the two joined as mediaInfo joins them, 'Name / TITLE', or else 'TITLE / Name',
+    // whichever reads exactly their roles together - a keyword can form across the join ('Main Audio / Description Commentary' reads 'audio
+    // description'); else the Name, the roles only the tag gives lost (titleTagFate). Measured: read as the tag, 'Director Commentary' beside
+    // 'German' was written over with 'German'; read as the Name alone, 'English' beside 'Director Commentary' made the commentary the default
+    // audio. A line break in the Name comes back from mediaInfo's Title as ' / ' (mediaInfoFill), and the name is written so - a stated residual.
     const trackNameBesideTitleTag = (s) => {
         const key = titleTagKey(s);
         if (!key) return '';
@@ -1780,32 +1782,38 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // long to keep or named in `split`. A word with no space in it (a release name, 'Film.2020.1080p...Commentaire') is kept whole while it can be.
         const unitsOf = (split) => words.flatMap((w, k) => (fits(w[0]) && !split.has(k) ? [[w.index, w.index + w[0].length, k]]
             : [...w[0].matchAll(/[^._-]+/g)].map((p) => [w.index + p.index, w.index + p.index + p[0].length, k])));
+        // The one bracket rule, matched by type with a stack: `pairs` holds each [opener, closer] that pair, `lone` every bracket nothing pairs - a closer
+        // that does not match the opener on top or comes with none open, and an opener left open. The role-phrase grouping reads the pairs and a cut's edge
+        // cleanup the lone ones, so the two always agree on what is paired.
+        const bracketScan = (s) => {
+            const pairs = []; const lone = new Set(); const open = [];
+            for (let i = 0; i < s.length; i += 1) {
+                const kind = '([{)]}'.indexOf(s[i]);
+                if (kind >= 0 && kind < 3) open.push(i);
+                else if (kind >= 3 && open.length && s[open[open.length - 1]] === '([{'[kind - 3]) pairs.push([open.pop(), i]);
+                else if (kind >= 3) lone.add(i);
+            }
+            open.forEach((i) => lone.add(i));
+            return { pairs, lone };
+        };
         let cut = '';
         for (const ch of t) { if (!fits(cut + ch)) break; cut += ch; }
         const within = (spans) => spans.filter(([, b]) => b <= cut.length).length;
         const base = unitsOf(new Set());
         const plain = untrail(within(base) ? t.slice(0, base[within(base) - 1][1]) : cut);
         if (reads(plain)) return plain;
-        const EDGE_PUNCT = /[^\p{L}\p{N}()[\]{}]/u;
-        // The role-keeping cut over `spans`, or '' when none reads as the name does within the bytes; `held` gets the words its role phrases lie in.
-        const keepRoles = (spans, held) => {
-            // The text each unit is kept after: a space after a word, its own separator after a part.
-            const seps = spans.map(([a], i) => (i ? t.slice(spans[i - 1][1], a) : '')).map((g) => (/\s/.test(g) ? ' ' : g));
-            // Each role's first phrase, as NFC and as written: in `grouped` with the bracket group around it when the whole group fits, in `bare` alone. Both
-            // forms, as a keyword stored decomposed reads only as NFC: where a precomposed copy came later, the first phrase alone read one role fewer as
-            // written, every candidate failed and the plain cut lost a role ('... forc' + U+0301 + ' then ... Hard of Hearing ... Forced' lost /sdh; measured).
+        // Each role's first phrase over `spans`, each unit kept after its `seps`, as NFC and as written: in `grouped` with the bracket group around it when the
+        // whole group fits, in `bare` alone. Both forms, as a keyword stored decomposed reads only as NFC: where a precomposed copy came later, the first
+        // phrase alone read one role fewer as written, every candidate failed and the plain cut lost a role ('... forc' + U+0301 + ' then ... Hard of Hearing
+        // ... Forced' lost /sdh; measured).
+        const rolePhraseUnits = (spans, seps) => {
             const grouped = new Set(); const bare = new Set();
             for (const [r, form] of [[1, (x) => x.normalize('NFC')], [0, (x) => x]]) {
                 // Each unit in this form, lowercased, and where it starts in their join, which the role keywords and the bracket pairs are found in.
                 const lower = spans.map(([a, b]) => form(t.slice(a, b)).toLowerCase());
                 const at = []; let joined = '';
                 lower.forEach((w, i) => { joined += seps[i]; at.push(joined.length); joined += w; });
-                const pairs = []; const open = [];
-                for (let i = 0; i < joined.length; i += 1) {
-                    const kind = '([{)]}'.indexOf(joined[i]);
-                    if (kind >= 0 && kind < 3) open.push(i);
-                    else if (kind >= 3 && open.length && joined[open[open.length - 1]] === '([{'[kind - 3]) pairs.push([open.pop(), i]);
-                }
+                const { pairs } = bracketScan(joined);
                 const over = (a, b) => spans.map((_, i) => i).filter((i) => at[i] < b && at[i] + lower[i].length > a);
                 for (const k of full[r]) {
                     const m = keywordRegex(dispositionTypes[k].keywords).exec(joined);
@@ -1817,6 +1825,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     (whole.length && fits(t.slice(spans[whole[0]][0], spans[whole[whole.length - 1]][1])) ? whole : phrase).forEach((i) => grouped.add(i));
                 }
             }
+            return { grouped, bare };
+        };
+        const EDGE_PUNCT = /[^\p{L}\p{N}()[\]{}]/u;
+        // The role-keeping cut over `spans`, or '' when none reads as the name does within the bytes; `held` gets the words its role phrases lie in.
+        const keepRoles = (spans, held) => {
+            // The text each unit is kept after: a space after a word, its own separator after a part.
+            const seps = spans.map(([a], i) => (i ? t.slice(spans[i - 1][1], a) : '')).map((g) => (/\s/.test(g) ? ' ' : g));
+            const { grouped, bare } = rolePhraseUnits(spans, seps);
             bare.forEach((i) => held.add(spans[i][2]));
             // The head (as much of the start as fits) and the kept units after it; a bracket at the edge of a run of kept units, or behind the punctuation that
             // ends or starts one, that nothing in the name pairs with is dropped - a separating unit (sep, below) counts as a run of its own.
@@ -1835,14 +1851,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     last = i;
                 }
                 if (last >= h) end(name.length - 1);
-                const lone = new Set(); const stack = [];
-                for (let i = 0; i < name.length; i += 1) {
-                    const kind = '([{)]}'.indexOf(name[i]);
-                    if (kind >= 0 && kind < 3) stack.push(i);
-                    else if (kind >= 3 && stack.length && name[stack[stack.length - 1]] === '([{'[kind - 3]) stack.pop();
-                    else if (kind >= 3) lone.add(i);
-                }
-                stack.forEach((i) => lone.add(i));
+                const { lone } = bracketScan(name);
                 return untrail(name.split('').filter((_, i) => !(edges.has(i) && lone.has(i))).join(''));
             };
             // As much of the start as fits first, a shorter head next. Joining two kept words across dropped ones can spell another role's keyword ('... new
@@ -2086,7 +2095,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         'kas', 'kaz', 'khm', 'kin', 'kir', 'kor', 'kur', 'lao', 'lat', 'lav', 'lit', 'mac', 'mal', 'mar', 'may', 'mlg', 'mlt', 'mol', 'mon', 'nep', 'nor',
         'nya', 'ori', 'orm', 'per', 'pol', 'por', 'pus', 'que', 'ron', 'run', 'rus', 'san', 'sin', 'slk', 'slv', 'smi', 'snd', 'som', 'spa', 'sve', 'swa',
         'tam', 'tat', 'tel', 'tgk', 'tgl', 'tha', 'tib', 'tir', 'tuk', 'tur', 'uig', 'ukr', 'urd', 'uzb', 'vie', 'wel', 'yid']);
-    // -=-=-= movLangRespellArgs (+ movLangRespelled, movLangRespellLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // -=-=-= movLangRespellArgs (+ movLangRespelled, movLangDropped, movLangRespellLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // The language writes a remux into .mov owes the tracks it copies or re-encodes: a .mov another tool wrote can hold a spelling the table lacks
     // (AVFoundation stores deu and nld), which the copy would lose, so each such language goes back in MOV_LANG's spelling and nothing else is touched (a
     // census of 400 spellings on jellyfin-ffmpeg 7.1.4: the muxer drops every key and stores every value). Matched by the language itself - the output stream
@@ -2095,10 +2104,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .filter((l) => MOV_LANG[l]));
     const movLangRespellArgs = (container, streams) => movLangRespelled(container, streams)
         .map((l) => ` -metadata:s:m:language:${l} language=${MOV_LANG[l]}`).join('');
+    // The languages among `streams` a .mov write loses outright: a code the table stores under none (MOV_LANG_STORED), which the next pass reads as no
+    // language (movLangReadBack); und already reads as none.
+    const movLangDropped = (container, streams) => (container !== 'mov' ? [] : [...new Set(streams.map((s) => getTagCI(s?.tags, 'language')))]
+        .filter((l) => String(l || '').trim() && String(l).toLowerCase() !== 'und' && !MOV_LANG_STORED.has(MOV_LANG[l] || l)));
     // One line per language the args respell among `streams`, the ones the output holds, so a language change the next pass reads is said; Bokmål and
-    // Nynorsk (nob, nno) say that they merge.
+    // Nynorsk (nob, nno) say that they merge. A language the .mov loses (movLangDropped) gets the same line, as written with no language.
     const movLangRespellLog = (container, streams) => movLangRespelled(container, streams).map((l) => `☐Writing ${l} as ${MOV_LANG[l]} - a .mov stores no`
-        + ` ${l}${MOV_LANG[l] === 'nor' ? ', so Bokmål and Nynorsk both become Norwegian and can no longer be told apart' : ''}\n`).join('');
+        + ` ${l}${MOV_LANG[l] === 'nor' ? ', so Bokmål and Nynorsk both become Norwegian and can no longer be told apart' : ''}\n`).join('')
+        + movLangDropped(container, streams).map((l) => `☒Writing ${logSafe(l)} as no language - a .mov stores no ${logSafe(l)}\n`).join('');
     // -=-=-= movLangReadBack  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // Stream s as the next pass reads its language after a .mov write, for an Expected results line: in MOV_LANG's spelling, or as und where the table
     // stores the code under none (MOV_LANG_STORED) - und, not no tag, so the source's own mediaInfo language does not stand in for it.
