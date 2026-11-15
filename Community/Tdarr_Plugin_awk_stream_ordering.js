@@ -26,7 +26,7 @@ const details = () => ({
         review rather than failed. The same goes for a broadcast .ts or .mpg capture remuxed to mkv or mp4 in the same job with its video copied, not
         re-encoded: a capture whose timestamps jump or reset states a longer length than it holds. A later job on that file is checked in full again. This
         check is always on and has no setting.\n`,
-    Version: '4.999.66',
+    Version: '4.999.67',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -83,8 +83,8 @@ const details = () => ({
             inputUI: { type: 'text' },
             tooltip: `Comma-separated language priority list. Listed languages sort first; blank (the default) skips language ordering.
                 \\nOne form is enough - en, eng, or English all match the same language, region variants like en-US included.
-                \\nA language not in the list is not reordered by language: it sorts by the other keys (role, codec, channel, quality) and keeps its
-                original position relative to the others.
+                \\nA language not in the list is not reordered by language: it sorts by the other keys (role, codec, channel, quality), keeping its
+                original position only where those tie.
                 \\nExample: with order_channel descending and order_language eng,jpn\\nger 2.0, fre 2.0, eng 2.0, jpn 2.0, eng 5.1, jpn 5.1 is reordered to
                 eng 5.1, eng 2.0, jpn 5.1, jpn 2.0, ger 2.0, fre 2.0`,
         },
@@ -98,7 +98,7 @@ const details = () => ({
                 order_quality. The list is a membership set, not a ranking. It sits below role and above channels and quality.
                 \\nMatching is by family prefix on the canonical codec: dts matches DTS-HD MA, HR and Express, and eac3 includes Atmos. Use dtsma, dtshr,
                 dtsexpress or eac3atmos to name a specific variant; the spelling the Input streams log line prints, such as dts-hd-ma or eac3-atmos, works
-                too.
+                too, and a raw name such as pcm_s24le or aac_latm matches its whole family (every PCM depth; wmav2 every WMA codec).
                 \\nExample:\\neac3,aac`,
         },
         {
@@ -140,8 +140,8 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\ndescending (default): best quality first, so 640k then 128k.
-                \\ndescending <=1024k: as descending, but tracks above 1024k - lossless-scale TrueHD and DTS-HD MA, including a lossless track whose bitrate
-                is unknown - are demoted to the END of their own language/role/codec tier.
+                \\ndescending <=1024k: as descending, but tracks above 1024k - lossless-scale TrueHD and DTS-HD MA, full-rate DTS (1509k) and
+                stereo or wider PCM, and a lossless track whose bitrate is unknown - are demoted to the END of their own language/role/codec tier.
                 \\nascending: lowest quality first, so 128k then 640k.
                 \\ndisabled: skip quality ordering entirely. See order_channel for what disabling both leaves.
                 \\nWhy cap: the client's auto-pick then leads with a track it can serve without a heavy transcode, rather than the huge one. The demoted
@@ -2513,10 +2513,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     if (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))
         failFile('No ffProbe stream data available for this file - the plugin cannot process it');
 
-    // Value checks. The two free-text inputs (order_language/order_codec) have no fixed option set; the six dropdowns each do, and are checked here as
-    // [inputName, valueToTest, validOptions], top-down, failing on the first bad value. Every dropdown value is case/whitespace-normalised ONCE here and the
-    // use sites below read those same constants, so the value that gets validated is provably the value that gets executed, and the failFile message shows that
-    // normalised value - the same discipline the other four plugins follow.
+    // Value checks: order_language/order_codec are free text; the six dropdowns go through ddValue/checkDropdowns (see there).
     const audioFirst = ddValue(inputs.audio_first, 'disabled');
     const subtitleFirst = ddValue(inputs.subtitle_first, 'disabled');
     const orderChannel = ddValue(inputs.order_channel, 'descending');
@@ -2536,7 +2533,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // order_language has no option set, but it still holds LANGUAGES, so a token that is not one FAILS the file. A typo does not announce itself here: an
     // unmatched entry simply scores as "not listed" and the tracks the user meant to promote stay wherever they were, which reads exactly like the ordering
     // rules not working. order_codec is genuinely open (codec names come and go, and an unknown one is inert rather than misleading), so it stays unchecked.
-    // The und/mul/zxx/mis/qaa-qtz allowance matches every other language input - 'und' is a real ordering target, since untagged tracks sort somewhere too.
+    // The und/mul/zxx/mis/qaa-qtz allowance matches every other language list input - 'und' is a real ordering target, as untagged tracks sort somewhere too.
     // #region SHARED helpers (2 sections: special language code … language token recognition)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: special language code =====
     // -=-=-= isNonLang  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
@@ -2680,7 +2677,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const newVideo = durVideoStream(file);
             // Carries its own trailing separator, so an audio-only file (or one whose only video stream is cover art - durVideoStream excludes those) does not
             // leave a bare space sitting directly after the ☒ status symbol.
-            const durTag = newVideo ? `${streamTag(newVideo.index)} ` : '';
+            const verdictPrefix = newVideo ? `${streamTag(newVideo.index)} ` : '';
             let verdict = null;
             let oldAny = 0;
             let newAny = 0;
@@ -2726,8 +2723,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const tsPsRemux = tsPsOriginal && (isMatroskaFamily(dstContainer) || isMp4Family(dstContainer)) && !videoEncoded;
             // Both verdicts below: a recover_bad_* repair from THIS job is accepted for review with a warning, anything else fails the file.
             const truncationVerdict = (soft, hard, reviewTail = '', failTail = '') => {
-                if (recovered) response.infoLog += `☒${durTag}${soft}\n☒${durTag}${REVIEW_HINT}, and do not auto-approve a recovery queue${reviewTail}\n`;
-                else failFile(`${durTag}${hard}\n☒${durTag}${OOM_HINT}${failTail}`);
+                if (recovered) response.infoLog += `☒${verdictPrefix}${soft}\n☒${verdictPrefix}${REVIEW_HINT}, and do not auto-approve a recovery queue`
+                    + `${reviewTail}\n`;
+                else failFile(`${verdictPrefix}${hard}\n☒${verdictPrefix}${OOM_HINT}${failTail}`);
             };
             if (verdict) {
                 const pct = (verdict.now / verdict.old) * 100;
@@ -2737,17 +2735,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const shorter = `output duration ${verdict.now.toFixed(1)} s is ${pctText}% of the original ${verdict.old.toFixed(1)} s`;
                     const compared = `(compared using ${verdict.name})`;
                     if (!recovered && tsPsRemux) {
-                        response.infoLog += `☒${durTag}${shorter}, but the .${originalContainer} original was remuxed in this job with its video`
+                        response.infoLog += `☒${verdictPrefix}${shorter}, but the .${originalContainer} original was remuxed in this job with its video`
                             + ' copied, not re-encoded - it may be a capture whose timestamps jump or reset, which states a longer length than it holds'
-                            + ` while the remux reports the true one\n☒${durTag}${REVIEW_HINT} ${compared}\n`;
+                            + ` while the remux reports the true one\n☒${verdictPrefix}${REVIEW_HINT} ${compared}\n`;
                     } else {
                         const tsPsCause = tsPsOriginal ? `, or the .${originalContainer} original's timestamps jump or reset and state a longer length`
                             + ' than it holds' : '';
-                        const tsPsHint = tsPsOriginal ? `\n☒${durTag}if this capture's timestamps jump, set clean_and_remux's recover_bad_timestamps to`
+                        const tsPsHint = tsPsOriginal ? `\n☒${verdictPrefix}if this capture's timestamps jump, set clean_and_remux's recover_bad_timestamps to`
                             + ' light: its repair in the same job is then accepted for review' : '';
                         truncationVerdict(`${shorter}, but this file carries an ${RECOVERED_TAG} tag - a recover_bad_* repair of a truncated source `
                             + 'legitimately reports a shorter true duration', `${shorter} - the transcode did not run to completion${tsPsCause}`,
-                            ` ${compared}`, `${tsPsHint}\n☒${durTag}${compared}`);
+                            ` ${compared}`, `${tsPsHint}\n☒${verdictPrefix}${compared}`);
                     }
                 }
             } else if (oldAny && !newAny) {
@@ -2794,11 +2792,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // The "not listed" sentinel must exceed every real index; a bare 999 would collide on a >999-entry order_language list (unbounded free text).
             return idx === -1 ? preferredLangKeys.length : idx;
         };
-        // order_codec takes the canonical key (eac3atmos) or the spelling this plugin's own Input streams line prints (eac3-atmos): a display token maps
-        // back to its key, so a codec copied from the log matches. Built from the shared CODEC_DISPLAY, so a new display name needs no second edit here.
+        // order_codec takes the canonical key (eac3atmos) or the spelling this plugin's own Input streams line prints, so a codec copied from the log matches:
+        // a display token (eac3-atmos) maps back to its key through the shared CODEC_DISPLAY (a new display name needs no second edit here), and a raw name
+        // folds as the stream's does (foldCodecAlias), so pcm_s24le or aac_latm matches its whole family (every PCM depth; wmav2 every WMA codec).
         const codecKeyForDisplay = new Map(Object.entries(CODEC_DISPLAY).map(([key, shown]) => [shown, key]));
         const codecFirstList = splitList(inputs.order_codec).map(c => c.toLowerCase())   // canon codec names are lowercase, so the list must be too
-            .map(c => codecKeyForDisplay.get(c) || c);
+            .map(c => codecKeyForDisplay.get(c) || foldCodecAlias(c));
 
         // Parse an order mode ('descending' | 'descending <=N' | 'ascending' | 'disabled') into {enabled, dir, cap}. The '<=N' suffix caps descending: a stream
         // whose cap-metric exceeds N is demoted below every at/under-cap stream. A trailing 'k' (order_quality's bitrate cap) means N is in kbps -> bps. Parsed
@@ -2829,7 +2828,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const aRole = audioRoleRank(a);
             const bRole = audioRoleRank(b);
             if (aRole !== bRole) return aRole - bRole;
-            // order_codec tier: preferred codecs group above the rest
             if (codecFirstList.length > 0 && a.codecMatch !== b.codecMatch) return a.codecMatch ? -1 : 1;
             if (chanCap < Infinity || qualCap < Infinity) {
                 const aOver = overCap(a), bOver = overCap(b);
@@ -2872,7 +2870,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const roleRead = mp4NameCarryView(dstContainer, file.ffProbeData.streams.filter((x) => isMatroskaFamily(dstContainer) && trackNameBesideTitleTag(x)));
         for (let i = 0; i < file.ffProbeData.streams.length; i++) {
             const ffstream = file.ffProbeData.streams[i];
-            const roles = roleRead(ffstream);
+            const readBack = roleRead(ffstream);
             // Enrich with the both-probe bitrate and channel count before audioQuality/summariseStream (see resolveStreamBitrate/resolveChannels above).
             const enrichedStream = enrichStream(ffstream);
             const streamLang = resolveLang(ffstream) || 'und';
@@ -2897,21 +2895,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // freshly-transcoded aac) is genuinely small and stays 0 = under-cap. Only the '<=Nk' cap reads this; plain descending/ascending ignore it.
                 capBitrate: (streamType === 'audio' && !(enrichedStream.bit_rate > 0) && codecInfo[canon]?.lossless === true)
                     ? Infinity : (enrichedStream.bit_rate || 0),
-                forced: hasDisposition(roles, 'forced'),   // flag OR title keyword - a "Forced"/"Foreign Parts Only" title counts where the flag isn't set
+                forced: hasDisposition(readBack, 'forced'),   // flag OR title keyword - a "Forced"/"Foreign Parts Only" title counts where the flag isn't set
                 // Only score audio, and only when order_quality actually reads the score: scoring video/subtitle/data would spam bogus "unknown audio codec" /
                 // "no bitrate reported" notices, and with order_quality=disabled the score is dead - scoring anyway warns about values the sort ignores.
                 audioQuality: (streamType === 'audio' && qualityMode.enabled) ? audioQuality(enrichedStream) : 0,
                 // Does this audio stream's canonical codec match order_codec? Family-prefix: "dts" catches dtsma/dtshr/dtsexpress, "eac3" catches eac3atmos.
                 codecMatch: canon !== '' && codecFirstList.some(c => canon.startsWith(c)),
                 default: ffstream?.disposition?.default === 1,
-                original: hasDisposition(roles, 'original'),   // for audio_first='original_tagged': promote the original-language track above language
+                original: hasDisposition(readBack, 'original'),   // for audio_first='original_tagged': promote the original-language track above language
 
                 // Role classification via the shared classifiers (single source of truth — keeps the sort and the summary line in agreement).
-                commentary: isCommentary(roles),
-                descriptive: isDescriptive(roles),
-                secondary: isSecondaryTrack(roles),
-                sdh: isSdh(roles),
-                lyrics: isLyrics(roles),
+                commentary: isCommentary(readBack),
+                descriptive: isDescriptive(readBack),
+                secondary: isSecondaryTrack(readBack),
+                sdh: isSdh(readBack),
+                lyrics: isLyrics(readBack),
 
                 // Cover art/poster/thumbnail sort last: cover-art dispositions (any codec) or a still-image codec - mirrors clean_and_remux image removal.
                 coverArt: isCoverArt(ffstream),
@@ -2921,7 +2919,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Which audio tracks may hold the sole default flag: a main track, never a secondary one (isSecondaryTrack) - language ranks before role, so
         // order_language=eng on a Japanese film whose English tracks are only a commentary and an audio description sorts the description first, and as the
         // default every player would auto-select it over the Japanese main track. audio_first=descriptive_tagged asks for exactly that, so there the
-        // description qualifies too. A file with no qualifying track gives the flag to its first track, as before.
+        // description qualifies too. A file with no qualifying track gives the flag to its first track.
         const audioRows = sortRows.filter((s) => s.type === 'audio');
         const defaultEligible = (s) => !s.secondary || (audioFirst === 'descriptive_tagged' && s.descriptive);
         const eligibleRows = audioRows.some(defaultEligible) ? audioRows.filter(defaultEligible) : audioRows;
@@ -2946,7 +2944,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return compareAudioKeys(a, b);
         };
 
-        // Sort the streams: stream-type precedence, then the per-type comparator, then source-index order as the final tie-break.
         sortRows.sort((a, b) => {
             const aOrder = TYPE_ORDER[a.type] ?? UNKNOWN_TYPE_ORDER;
             const bOrder = TYPE_ORDER[b.type] ?? UNKNOWN_TYPE_ORDER;
@@ -3187,8 +3184,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             response.infoLog += `☒${dstContainer} cannot store a default-track flag, so audio default flags are left as they are\n`;
 
         if (!orderChanged && dispositionArgs === '' && !backLoaded && junkArgs === '') return skip('☑Streams already in desired order\n');
-        // An mp4-family -c copy keeps a sibling's custom GLOBAL marker (clean_and_remux's awk_recovered, set upstream) only under use_metadata_tags, so
-        // mp4TagPlan sets it exactly when one is there - dropping it would re-trigger that plugin's work.
+        // Keeps a sibling's awk_* marker under use_metadata_tags (mp4TagPlan).
         const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, globalWrites);
         // A remux whose only work is front-loading the moov or clearing junk tags is not worth the Dolby Vision record (dvHeld) or the cover art it would
         // drop (mp4CoversLost: every cover in a .mov, and elsewhere in the mp4 family the ones a kept awk_* marker costs), so the file is left as it is and
@@ -3282,11 +3278,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             .map((r) => `☐${streamTag(r.index)} Cover art goes after every track - the .${dstContainer} muxer stores it as a cover atom, read back`
                 + ' after them\n')
             .join('');
-        const leftOut = new Set([...goneData, ...coversLost, ...mkvCoverStreams].map((s) => s.index));
+        const hiddenFromSummary = new Set([...goneData, ...coversLost, ...mkvCoverStreams].map((s) => s.index));
         // a track the muxer rebuilds or creates lands after every mapped one, where the muxer writes it, and a kept cover after those (mp4RebuiltLast); the
         // flags are the ones the output is read back with (readBackDispositions), and this preset's own -disposition writes turn ffmpeg's default rule off
         const created = mp4CreatedTracks(dstContainer, outStreams);
-        const shown = mp4RebuiltLast(dstContainer, outputRows.filter((s) => !leftOut.has(s.index)), uncopyable, created, (s) => ({ index: -1, stream: s }));
+        const shown = mp4RebuiltLast(dstContainer, outputRows.filter((s) => !hiddenFromSummary.has(s.index)), uncopyable, created,
+            (s) => ({ index: -1, stream: s }));
         // a cover copied as a track is mapped after everything and read back after every track (coverTracksAsRead); a cover attached again is an attachment
         // stream in the command, outside ffmpeg's default rule, and is listed after everything
         const withTracks = coverTracksAsRead([...shown, ...asTrackRows], staged.asTrack, (r) => r.stream);
