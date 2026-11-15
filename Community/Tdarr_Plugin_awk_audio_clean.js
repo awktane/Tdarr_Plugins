@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.92',
+    Version: '4.999.93',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -3752,6 +3752,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // No explicit layout → ffmpeg assigns the count's default: 2.1 and 4.0 are refused and 5.0 and 6.1 moved, so only 1, 2, 6 and 8 channels pass.
             return [1, 2, 6, 8].includes(channels);
         };
+        // The reason a log line gives for this wall, from the layout that hits it: libopus moves the speakers of a 5.0 or 6.1 (the defaults a track with no
+        // layout takes at 5 and 7 channels) and refuses every other. Phrased 'its <layout> layout', which reads right whatever the layout is called.
+        const opusLayoutWhy = (lay, channels) => ((lay ? ['5.0', '6.1'].includes(lay) : [5, 7].includes(channels))
+            ? `libopus would move the speakers of its ${lay || `${channels}ch`} layout` : `libopus can't encode its ${lay || `${channels}ch`} layout`);
         // Layouts that map LOSSLESSLY to an opus-accepted layout at the SAME channel count by pure relabel (side↔back position equivalence) - emitted via
         // channelmap (a permutation matrix, never a mix). A layout not listed here has no lossless relabel, so it falls to method_layout_err (keep/drop/remix).
         // 5.0(side) and 6.1(back) are not listed: their relabels lead to 5.0 and 6.1, which libopus moves.
@@ -3866,8 +3870,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 removedIndices.add(s.index);
                 // this IS a queued change (a removal), so it takes the change symbol like every other removal line, not the warning symbol
-                workDone += `☐${streamTag(s.index)}[method_layout_err=${methodLayoutErr}] Dropping - libopus can't encode a `
-                    + `${s.channel_layout || `${ch}ch`} layout\n`;
+                workDone += `☐${streamTag(s.index)}[method_layout_err=${methodLayoutErr}] Dropping - ${opusLayoutWhy(opusLayout.lay, ch)}\n`;
                 // Remember a dropped source a downmix ('add' mode) would derive from, so its stereo/5.1 still gets created even though the source itself is
                 // gone (see the post-loop pass below). 'replace' modes already deferred above (they convert the source in place), so only 'add' reaches here.
                 // Only a genuine surround track derives: a 'stereo'-tier track is converted in place, never derived from.
@@ -4198,9 +4201,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         let loudnormCapWarned = false;
         // A sample rate read off either probe, as a plain integer in a real audio range - it is spliced into the filter string, so nothing else passes.
         const sampleRateOf = (v) => { const n = Number(v); return Number.isInteger(n) && n >= 8000 && n <= 768000 ? n : 0; };
-        // `trial` false measures only: a track the caller will leave as it is anyway (pceUnnamed) needs the analysis for an on-target stamp, never a trial.
         // `recordDecline`: the caller copy-stamps a declined track it leaves as it was (the leftovers, on Matroska), so the decline line says so.
-        const buildLoudnormFilter = (streamIndex, srcAudioIdx, preFilter, preset, trial = true, recordDecline = false) => {
+        const buildLoudnormFilter = (streamIndex, srcAudioIdx, preFilter, preset, recordDecline = false) => {
             if (loudnormMeasureCount >= LOUDNORM_MAX_TRACKS) {
                 if (!loudnormCapWarned) {
                     response.infoLog += `☒[method_loudnorm=${methodLoudnorm}] More than ${LOUDNORM_MAX_TRACKS} audio tracks to normalize - measuring `
@@ -4255,7 +4257,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // bin, so a trial could never decline it, nor a trim move it. (loudnorm also runs linear on an input under 3 s; such a track takes the trial.)
             const [mI, mTp, mLra, mThresh] = [stats.input_i, stats.input_tp, stats.input_lra, stats.input_thresh].map(Number);
             const linear = mTp !== 99 && mThresh !== -70 && mLra !== 0 && mI !== 0 && mTp + (preset.I - mI) <= preset.TP && mLra <= preset.LRA;
-            if (!trial || linear) return { filter: chain(), changed: true, measured: true };
+            if (linear) return { filter: chain(), changed: true, measured: true };
             // The trial: a dynamic-mode correction measured as the encoder will receive it, before anything is encoded or stamped. Dynamic mode compresses
             // most wide film as intended but widens a long level step or a quiet opening and can miss the target - measured on jellyfin-ffmpeg 7.1.4 under
             // tv, a 180 s 5.1 film track went 14.0 -> 9.4 LU at -16.02 LUFS, while a 45 s clip with a quiet opening went 14.0 -> 17.5 LU and a 300 s
@@ -4978,8 +4980,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             else if (methodLayoutErr === 'drop') why = dropKeptWhy.has(ffstream.index) ? ` (kept - ${dropKeptWhy.get(ffstream.index)})`
                                 : ' (kept - no downmix converted it to an opus-safe layout)';
                             else why = ', enable a downmix option or set method_layout_err to drop/remix';
-                            skipDone += `☒${streamTag(ffstream.index)}[codec_force=${codecForce}] Not forcing opus - libopus can't encode a `
-                                + `${layoutName} layout; left as ${ffstreamCodec}${why}\n`;
+                            skipDone += `☒${streamTag(ffstream.index)}[codec_force=${codecForce}] Not forcing opus - `
+                                + `${opusLayoutWhy(srcLayout, forceChannels)}; left as ${ffstreamCodec}${why}\n`;
                         } else if (folds && guardBlocks(ffstream, codecStereo, 2, forceChannels)) {
                             // The remix drops channels, so it is judged against the stereo it emits, not the opus it can't: a track guard_quality protects
                             // keeps its channels and source codec, and the codec_stereo stereo is ADDED beside it - a downmix 'replace' becoming 'add'. The
@@ -5054,13 +5056,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (srcAudioIdx === undefined) continue;
             const srcRateStr = srcRateToken(s);
             const srcCodec = codecNameOf(s) || 'unknown';
+            const dropped = ` (source dropped - ${opusLayoutWhy(opusLayoutFor(s, s.awkChannels).lay, s.awkChannels)})`;
             // 5.1 derivative from a >6ch source (downmix_to_six), when the language still lacks one.
             if (s.channels > 6 && downmixToSix !== 'disabled' && !hasSixForLang(regionKey)) {
-                appendSix(s, srcAudioIdx, srcCodec, srcRateStr, regionKey, " (source dropped - libopus can't encode its layout)");
+                appendSix(s, srcAudioIdx, srcCodec, srcRateStr, regionKey, dropped);
             }
             // Stereo derivative (downmix_to_stereo), when the language still lacks one.
             if (downmixToStereo !== 'disabled' && !hasStereoForLang(regionKey)) {
-                appendStereo(s, srcAudioIdx, srcCodec, srcRateStr, regionKey, " (source dropped - libopus can't encode its layout)");
+                appendStereo(s, srcAudioIdx, srcCodec, srcRateStr, regionKey, dropped);
             }
         }
         // ====== END LAYOUT-DROP DOWNMIX DERIVATIVES ======
@@ -5109,7 +5112,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     && reachable(keepCodec) && !opusLayoutBlocked(keepCodec) && !unnamedBlocked(keepCodec)) {
                     targetCodec = keepCodec;
                 }
-                return { targetCodec, keepCodec, configuredCodec, isStereo };
+                return { targetCodec, keepCodec, configuredCodec, isStereo, unnamed: unnamedBlocked(targetCodec) };
             };
             // COLLECT, then MEASURE, then emit: every leftover whose correction is a bare analysis of its own track goes to prefetchLoudness in one pass
             // before the loop below emits anything, and the loop reads the results back through measureLoudness. The test mirrors the loop's path to its
@@ -5122,10 +5125,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const channels = ffstream.awkChannels;
                 if (removedIndices.has(ffstream.index) || outputAudioIdx === undefined || srcAudioIdx === undefined || modifiedAudioIdx.has(outputAudioIdx)
                     || channels <= 0) continue;
-                const { targetCodec } = leftoverTarget(ffstream, channels);
+                const { targetCodec, unnamed } = leftoverTarget(ffstream, channels);
                 const stamp = loudnormStampOf(ffstream);
                 if (stamp && (targetCodec === null || loudnormStampHolds(ffstream, stamp))) continue;
-                if (targetCodec === null || ac3RematrixFilter(targetCodec, ffstream) || (aacFamily(targetCodec) === 'opus' && channels > 2
+                if (targetCodec === null || unnamed || ac3RematrixFilter(targetCodec, ffstream) || (aacFamily(targetCodec) === 'opus' && channels > 2
                     && !opusLayoutFor(ffstream, channels).ok && !pceUnnamed(ffstream))) continue;
                 leftoverIdxs.push(srcAudioIdx);
             }
@@ -5142,7 +5145,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     continue;
                 }
                 const ffstreamCodec = codecNameOf(ffstream) || 'unknown';
-                const { targetCodec, keepCodec, configuredCodec, isStereo } = leftoverTarget(ffstream, channels);
+                const { targetCodec, keepCodec, configuredCodec, isStereo, unnamed } = leftoverTarget(ffstream, channels);
                 // Cache check, ahead of every skip line but the no-channel-count one above (the collect loop tests it in the same place): this stream isn't
                 // being touched by anything else this run, so a stamp of the CURRENT preset that still holds (loudnormStampHolds) means its content hasn't
                 // changed since we last measured or corrected it against this exact target - trust it, skipping the measurement subprocess. A stamped track
@@ -5168,6 +5171,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             + `${codecDisplayName(ffstream)} ${channels}ch (${guardTriple()}); left as ${ffstreamCodec}\n`;
                     continue;
                 }
+                // A decode no layout places (pceUnnamed) is left as it is (unnamedPceSkip) before it is measured, as every other operation leaves it: no stamp
+                // follows the skip, so an analysis would repeat every pass for nothing. For an aac target it also keeps the job alive: native aac refuses an
+                // unlabelled decode (exit 234). An opus with no layout re-encoded to opus in place is the exception (opusInPlace).
+                if (unnamed) {
+                    skipDone += unnamedPceSkip(ffstream, `method_loudnorm=${methodLoudnorm}`, 'Not normalizing');
+                    continue;
+                }
                 const targetCodecFamily = aacFamily(targetCodec);
 
                 // Any opus target - codec_force's scope put codec_surround=opus here, an unencodable source fell through to it, or the track is already opus:
@@ -5176,9 +5186,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // (+ loudnorm) in place, unless a GENUINE track already holds this language's stereo (remixDefer, the shared remixDefersToExistingStereo the
                 // codec_force path asks too, which never defers a secondary - a commentary's stereo is not the language's); 'keep' - and 'drop', which can't
                 // remove a track once the audio index maps are built (the codec_force path drops such a track in the pre-pass) - leave it in its source codec,
-                // un-normalized. A track already opus is never remixed (remixFoldsTrack), so an opus 5.0 or 6.1 is left as it is under every setting. A
-                // decode no layout places (pceUnnamed) bypasses the wall, since the unnamed line below speaks for it, and an opus with no layout goes on to be
-                // re-encoded in place keeping mapping family 255 (opusInPlace), which libopus takes at any count.
+                // un-normalized. A track already opus is never remixed (remixFoldsTrack), so an opus 5.0 or 6.1 is left as it is under every setting. The
+                // one decode no layout places that gets here (pceUnnamed) bypasses the wall: an opus re-encoded in place keeping mapping family 255
+                // (opusInPlace), which libopus takes at any count.
                 let loudnormRelabel = '';
                 if (targetCodecFamily === 'opus' && channels > 2 && !pceUnnamed(ffstream)) {
                     const { lay, ok, relabel, relabelFilter } = opusLayoutFor(ffstream, channels);
@@ -5215,23 +5225,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // encodes never gets here (leftoverTarget hands it the correction, or the codec_force remix has already run on it).
                             if (guarded) {
                                 appendStereo(ffstream, srcAudioIdx, ffstreamCodec, srcRateToken(ffstream), ffstream.awkRegionKey,
-                                    ` (libopus can't encode its ${lay || `${channels}ch`} layout; the source is kept un-normalized as ${ffstreamCodec})`,
+                                    ` (${opusLayoutWhy(lay, channels)}; the source is kept un-normalized as ${ffstreamCodec})`,
                                     { tag: `[method_layout_err=${methodLayoutErr}][guard_quality=${guardQuality}]`, measuredTwo: two });
                                 continue;
                             }
                             const enc = stereoEnc(outputAudioIdx);
                             workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${ffstreamCodec} ${channels}ch → `
-                                + `${enc.logCodec} stereo @ ${enc.rate} (${enc.label ? `${enc.label}; ` : ''}remixed - libopus can't encode a `
-                                + `${lay || `${channels}ch`} layout)\n`;
+                                + `${enc.logCodec} stereo @ ${enc.rate} (${enc.label ? `${enc.label}; ` : ''}remixed - ${opusLayoutWhy(lay, channels)})\n`;
                             replaceStereo(ffstream, outputAudioIdx, enc, two, ffstream.awkSecondaryTrack ? '' : ffstream.awkRegionKey);
                             convert = true;
                             continue;
                         } else {
                             const remixWalled = methodLayoutErr === 'remix' && containerRefusesAudio(codecStereo);
-                            const why = remixDefer ? 'a stereo already exists for this language' : (remixWalled
-                                ? `the remix would need codec_stereo=${codecStereo}, and ${wallText(codecStereo)}` : `method_layout_err=${methodLayoutErr}`);
-                            skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - libopus can't encode a `
-                                + `${lay || `${channels}ch`} layout; left as ${ffstreamCodec} (${why})\n`;
+                            const why = codecNameOf(ffstream) === 'opus' ? 'it is already opus, which is never remixed'
+                                : (remixDefer ? 'a stereo already exists for this language' : (remixWalled
+                                ? `the remix would need codec_stereo=${codecStereo}, and ${wallText(codecStereo)}` : `method_layout_err=${methodLayoutErr}`));
+                            skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - ${opusLayoutWhy(lay, channels)}; `
+                                + `left as ${ffstreamCodec} (${why})\n`;
                             continue;
                         }
                     }
@@ -5239,9 +5249,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 const srcBitrate = Number(ffstream.bit_rate || 0);
                 const preFilter = loudnormRelabel || ac3RematrixFilter(targetCodec, ffstream);
-                const unnamed = pceUnnamed(ffstream) && !opusInPlace(ffstream, targetCodec);
-                const { filter, changed, measured, recorded } = buildLoudnormFilter(ffstream.index, srcAudioIdx, preFilter, preset, !unnamed,
-                    loudnormTagPersists);
+                const { filter, changed, measured, recorded } = buildLoudnormFilter(ffstream.index, srcAudioIdx, preFilter, preset, loudnormTagPersists);
                 if (!changed) {
                     // Already within tolerance. On a tag-persisting container, stamp it (a metadata-only remux) so a FUTURE run can skip re-measuring while
                     // the preset stays the same. On a container that would drop the tag, do NOTHING (a true no-op) - stamping there would just remux every
@@ -5258,14 +5266,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         extraArguments += copyStampArg(ffstream, outputAudioIdx);
                         convert = true;
                     }
-                    continue;
-                }
-
-                // A decode no layout places (pceUnnamed) is left as it is (unnamedPceSkip), after the within-tolerance exit so an on-target one is still
-                // stamped. For an aac target that also keeps the job alive: native aac refuses an unlabelled decode (exit 234, the job fails). An opus with
-                // no layout re-encoded to opus in place is the exception (opusInPlace).
-                if (unnamed) {
-                    skipDone += unnamedPceSkip(ffstream, `method_loudnorm=${methodLoudnorm}`, 'Not normalizing');
                     continue;
                 }
                 const pceLayout = pceLayoutOf(ffstream);
