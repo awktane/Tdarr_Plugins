@@ -26,7 +26,7 @@ const details = () => ({
         review rather than failed. The same goes for a broadcast .ts or .mpg capture remuxed to mkv or mp4 in the same job with its video copied, not
         re-encoded: a capture whose timestamps jump or reset states a longer length than it holds. A later job on that file is checked in full again. This
         check is always on and has no setting.\n`,
-    Version: '4.999.64',
+    Version: '4.999.65',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -358,16 +358,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: role/disposition classifiers =====
     // -=-=-= dispositionTypes [all five] =-=-=-
-    // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each keyword
-    // lives on ONE flag PER STREAM TYPE - hasDisposition scopes by entry.streams - so title->flag promotion stays unambiguous; descriptive/descriptions/dvs
-    // deliberately appear on both the audio and subtitle entries), and the canonical title string (tag, null when never written). The single table every
-    // classifier, sort key, summary token and title tagger reads, so the lists can never drift. The roles also carry the words European releases title such
-    // tracks with, unflagged: commentary, audio description and SDH in German, French, Spanish, Portuguese, Italian, Dutch, Polish and the Nordic languages;
-    // forced in all of those but the Nordic ones, which have no standard forced label; dub in all but German, Dutch and Finnish; original in German, French,
-    // Italian, Dutch and Polish, and in Spanish and Portuguese through the bare 'original'. Plurals and the one-word compounds release labels use (Kommentare,
-    // Audiokommentar) are included - compounds have no end, so these are the standard labels, not every word. Each is a whole-token match, so only a word that
-    // means nothing else in a track title belongs here: VO, OV and UT stay out, and French, Italian, Dutch and Polish carry 'original' as the phrase, since
-    // their lone word also names an original soundtrack (bande originale, oryginalna ścieżka dźwiękowa). Every one is pinned by the harness.
+    // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each
+    // keyword lives on ONE flag PER STREAM TYPE - hasDisposition scopes by entry.streams - so title->flag promotion stays unambiguous;
+    // descriptive/descriptions/dvs deliberately appear on both the audio and subtitle entries), and the canonical title string (tag, null when never
+    // written). The single table every classifier, sort key, summary token and title tagger reads, so the lists can never drift; isCoverArt alone reads
+    // its three cover-art flags raw (see there). The roles also carry the words European releases title such tracks with, unflagged: commentary, audio
+    // description and SDH in German, French, Spanish, Portuguese, Italian, Dutch, Polish and the Nordic languages; forced in all of those but the Nordic
+    // ones, which have no standard forced label; dub in all but German, Dutch and Finnish; original in German, French, Italian, Dutch and Polish, and in
+    // Spanish and Portuguese through the bare 'original'. Plurals and the one-word compounds release labels use (Kommentare, Audiokommentar) are
+    // included - compounds have no end, so these are the standard labels, not every word. Each is a whole-token match, so only a word that means nothing
+    // else in a track title belongs here: VO, OV and UT stay out, and French, Italian, Dutch and Polish carry 'original' as the phrase, since their lone
+    // word also names an original soundtrack (bande originale, oryginalna ścieżka dźwiękowa). Every one is pinned by the harness.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary', 'kommentar', 'commentaire', 'comentario', 'comentário', 'commento',
                                 'commentaar', 'komentarz', 'kommentaari', 'kommentare', 'kommentarer', 'audiokommentar', 'regiekommentar',
@@ -492,7 +493,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: secondary audio role =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: image / cover-art codecs =====
-    // -=-=-= IMAGE_CODECS / isCoverArt [all five] =-=-=-
+    // -=-=-= IMAGE_CODECS / COVER_FLAGS / isCoverArt [all five] =-=-=-
     // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last; summariseStream
     // flags them /cover. Two codecs that LOOK like they belong are deliberately ABSENT, for one reason: they are also real moving-picture codecs. mjpeg/mjpegb
     // is camcorder/AVI-era footage, and jpeg2000 is the DCP / IMF / broadcast-mezzanine codec - listing either drops genuine video as cover art, while
@@ -503,9 +504,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // one-frame video track carries no flag, and in mjpeg no image codec either, but it keeps the attachment's filename and mimetype tags (image/jpeg,
     // image/png; measured 2026-10-23 on jellyfin 7.1.4). No real video track carries an image mimetype, so the mimetype clause names it cover art.
     const IMAGE_CODECS = ['png', 'apng', 'gif', 'bmp', 'webp', 'tiff', 'qoi'];
+    const COVER_FLAGS = ['attached_pic', 'still_image', 'timed_thumbnails'];
+    // Reads ffprobe fields only - the raw flags, on a video stream as dispositionTypes scopes them, never hasDisposition, whose
+    // keyword half reaches mediaInfoFor - so it is safe on another file's streams (the library original's, in primaryVideo and
+    // stream_ordering's truncation check). A keyword added to those three dispositionTypes rows is not read here.
     const isCoverArt = (s) => IMAGE_CODECS.includes(codecNameOf(s))
-        || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails')
-        || (codecTypeOf(s) === 'video' && /^image\//i.test(getTagCI(s.tags, 'mimetype')));
+        || (codecTypeOf(s) === 'video' && (COVER_FLAGS.some((k) => s.disposition?.[k] === 1) || /^image\//i.test(getTagCI(s.tags, 'mimetype'))));
     // ===== END SHARED: image / cover-art codecs =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: codec name resolution =====
@@ -900,7 +904,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // muxer writes (no -f mp4), stores no role flag at all, since only its MP4 mode writes the box that carries them: forced, comment, hearing_impaired,
         // captions, visual_impaired, descriptions and dub written on audio and subtitle read back 0 from .mov, and 1 from .mp4 and from .m4v and .m4a under
         // -f mp4 (measured 2026-11-14 on jellyfin 7.1.4).
-        const COVER_FLAGS = ['attached_pic', 'still_image', 'timed_thumbnails'];
         const lost = String(container || '').toLowerCase() === 'mov' ? MOV_UNSTORED_ROLES : ['original'];
         return out.map((x) => {
             const d = streamOf(x).disposition || {};
@@ -2570,8 +2573,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // so it is mapped last and never ordered (isCovrRow below); any other video stream in one - a QuickTime chapter-image track, which a remux writes as an
     // ordinary video track - would be hoisted all the same, so such an .m4a is left untouched (past the truncation check, see there). So is an audio-medium
     // .mka with cover art (mkaCarriesCoverArt has the reason). Both skip lines say why.
-    const AUDIO_ORDERED = ['mka', 'm4a'];
-    if (file.fileMedium !== 'video' && !(file.fileMedium === 'audio' && AUDIO_ORDERED.includes(dstContainer))) {
+    const AUDIO_MEDIUM_CONTAINERS = ['mka', 'm4a'];
+    if (file.fileMedium !== 'video' && !(file.fileMedium === 'audio' && AUDIO_MEDIUM_CONTAINERS.includes(dstContainer))) {
         if (file.fileMedium === 'audio')
             return skip(`☑[${dstContainer || 'none'}] Audio-only file - only mka and m4a are reordered, since every other audio container carries cover art`
                 + ' as a video stream that would be ordered ahead of the audio\n');
@@ -2608,18 +2611,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // quietly keeps a video that stops a few minutes in. This plugin is designed to run LAST, so it sees the finished article, and the check sits ahead of
         // everything else here BECAUSE the ordinary outcome is `skip` a few hundred lines down: on the final cycle the streams are usually already in order, so
         // a check placed beside the reordering work would be dead in exactly the case it exists for.
-        //
-        // Cover art is tested on ffprobe fields alone (probeOnlyCoverArt: an image codec, a raw cover-art disposition flag, or an image mimetype tag), since
-        // durVideoStream and durStreamShape also run over originalLibraryFile's streams, and isCoverArt reaches mediaInfoFor, which is bound to THIS file (see
-        // its header) and would read the transcoded file's mediaInfo track at a foreign stream's index. The three cover-art dispositionTypes are
-        // streams:['video'], keywords:[], so for a video stream this is exactly isCoverArt's answer, and it stays sound if a keyword is ever added.
-        const probeOnlyCoverArt = (s) => IMAGE_CODECS.includes(codecNameOf(s))
-            || s.disposition?.attached_pic === 1 || s.disposition?.still_image === 1 || s.disposition?.timed_thumbnails === 1
-            || (codecTypeOf(s) === 'video' && /^image\//i.test(getTagCI(s.tags, 'mimetype')));
-        const durVideoStream = (obj) => (obj?.ffProbeData?.streams || []).find(s => codecTypeOf(s) === 'video' && !probeOnlyCoverArt(s));
+        const durVideoStream = (obj) => (obj?.ffProbeData?.streams || []).find(s => codecTypeOf(s) === 'video' && !isCoverArt(s));
         // The timed streams a container duration spans, as a sorted type list - equal on both sides exactly when no type's count changed. Attachments and
         // cover art carry no timeline, so dropping one cannot move the container duration.
-        const durStreamShape = (obj) => (obj?.ffProbeData?.streams || []).filter((s) => codecTypeOf(s) !== 'attachment' && !probeOnlyCoverArt(s))
+        const durStreamShape = (obj) => (obj?.ffProbeData?.streams || []).filter((s) => codecTypeOf(s) !== 'attachment' && !isCoverArt(s))
             .map((s) => codecTypeOf(s)).sort().join(',');
         // Matroska's per-track statistics tag, "HH:MM:SS.nnnnnnnnn" - where an mkv keeps a video track's length. ffmpeg's matroska muxer writes it fresh from
         // the packets when it finalises a file and never carries the source's over (a 20 s mkv cut to 5 s, copied or re-encoded, reports 5 s), and a killed,
@@ -2765,8 +2760,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
         // ====== END TRUNCATION CHECK ======
-        // The .m4a with a video stream besides its cover (AUDIO_ORDERED) is left untouched only now: audio_clean re-encodes such a file's audio, so a cut-short
-        // encode of it must still meet the check above.
+        // The .m4a with a video stream besides its cover (AUDIO_MEDIUM_CONTAINERS) is left untouched only now:
+        // audio_clean re-encodes such a file's audio, so a cut-short encode of it must still meet the check above.
         if (file.fileMedium === 'audio' && dstContainer === 'm4a'
             && (file.ffProbeData?.streams || []).some((s) => codecTypeOf(s) === 'video' && !isMp4Cover(s))) {
             return skip('☒[m4a] This .m4a carries a video stream besides its cover art, which a reorder would write ahead of the audio - left untouched\n');

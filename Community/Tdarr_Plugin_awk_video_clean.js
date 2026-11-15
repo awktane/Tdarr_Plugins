@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.92',
+    Version: '3.999.93',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -457,16 +457,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: role/disposition classifiers =====
     // -=-=-= dispositionTypes [all five] =-=-=-
-    // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each keyword
-    // lives on ONE flag PER STREAM TYPE - hasDisposition scopes by entry.streams - so title->flag promotion stays unambiguous; descriptive/descriptions/dvs
-    // deliberately appear on both the audio and subtitle entries), and the canonical title string (tag, null when never written). The single table every
-    // classifier, sort key, summary token and title tagger reads, so the lists can never drift. The roles also carry the words European releases title such
-    // tracks with, unflagged: commentary, audio description and SDH in German, French, Spanish, Portuguese, Italian, Dutch, Polish and the Nordic languages;
-    // forced in all of those but the Nordic ones, which have no standard forced label; dub in all but German, Dutch and Finnish; original in German, French,
-    // Italian, Dutch and Polish, and in Spanish and Portuguese through the bare 'original'. Plurals and the one-word compounds release labels use (Kommentare,
-    // Audiokommentar) are included - compounds have no end, so these are the standard labels, not every word. Each is a whole-token match, so only a word that
-    // means nothing else in a track title belongs here: VO, OV and UT stay out, and French, Italian, Dutch and Polish carry 'original' as the phrase, since
-    // their lone word also names an original soundtrack (bande originale, oryginalna ścieżka dźwiękowa). Every one is pinned by the harness.
+    // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each
+    // keyword lives on ONE flag PER STREAM TYPE - hasDisposition scopes by entry.streams - so title->flag promotion stays unambiguous;
+    // descriptive/descriptions/dvs deliberately appear on both the audio and subtitle entries), and the canonical title string (tag, null when never
+    // written). The single table every classifier, sort key, summary token and title tagger reads, so the lists can never drift; isCoverArt alone reads
+    // its three cover-art flags raw (see there). The roles also carry the words European releases title such tracks with, unflagged: commentary, audio
+    // description and SDH in German, French, Spanish, Portuguese, Italian, Dutch, Polish and the Nordic languages; forced in all of those but the Nordic
+    // ones, which have no standard forced label; dub in all but German, Dutch and Finnish; original in German, French, Italian, Dutch and Polish, and in
+    // Spanish and Portuguese through the bare 'original'. Plurals and the one-word compounds release labels use (Kommentare, Audiokommentar) are
+    // included - compounds have no end, so these are the standard labels, not every word. Each is a whole-token match, so only a word that means nothing
+    // else in a track title belongs here: VO, OV and UT stay out, and French, Italian, Dutch and Polish carry 'original' as the phrase, since their lone
+    // word also names an original soundtrack (bande originale, oryginalna ścieżka dźwiękowa). Every one is pinned by the harness.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary', 'kommentar', 'commentaire', 'comentario', 'comentário', 'commento',
                                 'commentaar', 'komentarz', 'kommentaari', 'kommentare', 'kommentarer', 'audiokommentar', 'regiekommentar',
@@ -579,7 +580,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: role/disposition classifiers =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: image / cover-art codecs =====
-    // -=-=-= IMAGE_CODECS / isCoverArt [all five] =-=-=-
+    // -=-=-= IMAGE_CODECS / COVER_FLAGS / isCoverArt [all five] =-=-=-
     // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last; summariseStream
     // flags them /cover. Two codecs that LOOK like they belong are deliberately ABSENT, for one reason: they are also real moving-picture codecs. mjpeg/mjpegb
     // is camcorder/AVI-era footage, and jpeg2000 is the DCP / IMF / broadcast-mezzanine codec - listing either drops genuine video as cover art, while
@@ -590,9 +591,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // one-frame video track carries no flag, and in mjpeg no image codec either, but it keeps the attachment's filename and mimetype tags (image/jpeg,
     // image/png; measured 2026-10-23 on jellyfin 7.1.4). No real video track carries an image mimetype, so the mimetype clause names it cover art.
     const IMAGE_CODECS = ['png', 'apng', 'gif', 'bmp', 'webp', 'tiff', 'qoi'];
+    const COVER_FLAGS = ['attached_pic', 'still_image', 'timed_thumbnails'];
+    // Reads ffprobe fields only - the raw flags, on a video stream as dispositionTypes scopes them, never hasDisposition, whose
+    // keyword half reaches mediaInfoFor - so it is safe on another file's streams (the library original's, in primaryVideo and
+    // stream_ordering's truncation check). A keyword added to those three dispositionTypes rows is not read here.
     const isCoverArt = (s) => IMAGE_CODECS.includes(codecNameOf(s))
-        || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails')
-        || (codecTypeOf(s) === 'video' && /^image\//i.test(getTagCI(s.tags, 'mimetype')));
+        || (codecTypeOf(s) === 'video' && (COVER_FLAGS.some((k) => s.disposition?.[k] === 1) || /^image\//i.test(getTagCI(s.tags, 'mimetype'))));
     // ===== END SHARED: image / cover-art codecs =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: codec name resolution =====
@@ -975,7 +979,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // muxer writes (no -f mp4), stores no role flag at all, since only its MP4 mode writes the box that carries them: forced, comment, hearing_impaired,
         // captions, visual_impaired, descriptions and dub written on audio and subtitle read back 0 from .mov, and 1 from .mp4 and from .m4v and .m4a under
         // -f mp4 (measured 2026-11-14 on jellyfin 7.1.4).
-        const COVER_FLAGS = ['attached_pic', 'still_image', 'timed_thumbnails'];
         const lost = String(container || '').toLowerCase() === 'mov' ? MOV_UNSTORED_ROLES : ['original'];
         return out.map((x) => {
             const d = streamOf(x).disposition || {};
@@ -3065,8 +3068,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // visual quality sits at a higher number there. HW flag syntax mirrors the proven community plugins (Migz nvenc -cq:v, Boosh qsv
     // -global_quality, vaapi -qp, amf -qp_i/-qp_p). VideoToolbox's -q:v is an inverted 1-100 scale (higher = better), opposite the
     // low-is-better HEVC-CRF q; this linear fit maps CRF onto it (intercept = -q:v at CRF 0, pre-clamp; slope = -q:v units dropped per +1 CRF).
-    // QUALITY_MAX: the widest scale any emit uses (AV1's, on libsvtav1 and av1_nvenc; HEVC/H.264 targets clamp to 51 below), and parseQuality bounds
-    // input by it.
+    // QUALITY_MAX: the widest scale any emit uses (AV1's, on libsvtav1 and av1_nvenc; HEVC/H.264 targets clamp to 51 below), and parseNumber bounds
+    // the quality inputs by it.
     const QUALITY_MAX = 63;
     const AV1_Q_OFFSET = 8;
     const VT_Q_INTERCEPT = 118;
@@ -3742,7 +3745,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return (streams || []).filter((s) => codecTypeOf(s) === 'video' && !isCoverArt(s))
             .reduce((best, s) => (best === undefined || rank(s) < rank(best) ? s : best), undefined);
     };
-    // -=-=-= FINGERPRINT_* / VQ_FP_RE / videoId8 / isOriginalPath / videoDigest / fpText  [sub_worker, video_clean] =-=-=-
+    // -=-=-= FINGERPRINT_* / FINGERPRINT_RE / videoId8 / isOriginalPath / videoDigest / fpText  [sub_worker, video_clean] =-=-=-
     // A fingerprint names one video stream as <id8>.<dig>: videoId8, then videoDigest's 8 hex, or n where its window held no non-keyframe packet, or x where
     // the read failed. video_clean stamps one on a size verdict (awk_vq) and checks a caption request against one; sub_worker binds a caption read to one.
     // The read takes the first 120 packets (~10 KB of output): 0.02-0.11 s locally, 0.30-0.47 s cold over SMB, measured 2026-10-22.
@@ -3750,7 +3753,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const FINGERPRINT_TIMEOUT_MS = 20000;
     const FINGERPRINT_MAX_BYTES = 1024 * 1024;
     // A stored fingerprint split into its id8 and dig; a value that does not match is no fingerprint at all.
-    const VQ_FP_RE = /^([0-9a-f]{8})\.([0-9a-f]{8}|n|x)$/;
+    const FINGERPRINT_RE = /^([0-9a-f]{8})\.([0-9a-f]{8}|n|x)$/;
     // The fingerprint's free half, from ffProbeData alone: what the stream IS (codec, profile, size, pixel format).
     const videoId8 = (s) => require('crypto').createHash('sha1').update(`${s.codec_name}|${s.profile ?? ''}|${s.width}x${s.height}|${s.pix_fmt}`)
         .digest('hex').slice(0, 8);
@@ -3799,7 +3802,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const ccFpStaleWhy = (tokens, origTokens, stream, digest) => {
         const fp = ccFpOf(tokens);
         if (!fp || fp !== ccFpOf(origTokens)) return '';
-        const m = VQ_FP_RE.exec(fp);
+        const m = FINGERPRINT_RE.exec(fp);
         if (!m) return 'its fingerprint token is unreadable';
         if (m[1] !== videoId8(stream)) return 'its format changed';
         if (!/^[0-9a-f]{8}$/.test(m[2])) return '';
@@ -3987,46 +3990,31 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const encoderOpt = ddValue(inputs.method_encoder, 'node');
     const hdrMode = ddValue(inputs.hdr_mode, 'preserve');
     const deinterlaceOpt = ddValue(inputs.deinterlace, 'disabled');
-    const guardCaptionsOpt = ddValue(inputs.guard_captions, 'disabled');   // opt-in, unlike the two guards below (see its tooltip)
-    const guardDvOpt = ddValue(inputs.guard_dv, 'enabled');
-    const guardLosslessOpt = ddValue(inputs.guard_lossless, 'enabled');
+    const guardCaptions = ddValue(inputs.guard_captions, 'disabled');   // opt-in, unlike the two guards below (see its tooltip)
+    const guardDv = ddValue(inputs.guard_dv, 'enabled');
+    const guardLossless = ddValue(inputs.guard_lossless, 'enabled');
 
     // The free-text NUMERIC inputs (the four quality_* tiers, guard_shrink_bitrate, guard_shrink_savings and guard_encode_hours) are the only user-typed
     // values this plugin echoes back, so they go through logSafe like every free-text echo (see its header): failFile's message becomes the file's stored
     // error, and loadDefaultValues only trims.
-    const parseQuality = (v, name) => {
+    const parseNumber = (name, max, phrase) => {
+        const v = inputs[name];
         const n = Number(String(v).trim());
-        if (!Number.isFinite(n) || n < 0 || n > QUALITY_MAX)
-            failFile(`[${name}=${logSafe(v)}] must be a number between 0 and ${QUALITY_MAX}, check your settings`);
+        if (!Number.isFinite(n) || n < 0 || n > max) failFile(`[${name}=${logSafe(v)}] must be ${phrase}, check your settings`);
         return n;
     };
-    const qualitySd = parseQuality(inputs.quality_sd, 'quality_sd');
-    const quality720 = parseQuality(inputs.quality_720p, 'quality_720p');
-    const quality1080 = parseQuality(inputs.quality_1080p, 'quality_1080p');
-    const quality4k = parseQuality(inputs.quality_4k, 'quality_4k');
-    const guardShrinkKbps = (() => {
-        const n = Number(String(inputs.guard_shrink_bitrate).trim());
-        if (!Number.isFinite(n) || n < 0)
-            failFile(`[guard_shrink_bitrate=${logSafe(inputs.guard_shrink_bitrate)}] must be a non-negative number (kbps), check your settings`);
-        return n;
-    })();
+    const qualityRange = `a number between 0 and ${QUALITY_MAX}`;
+    const qualitySd = parseNumber('quality_sd', QUALITY_MAX, qualityRange);
+    const quality720 = parseNumber('quality_720p', QUALITY_MAX, qualityRange);
+    const quality1080 = parseNumber('quality_1080p', QUALITY_MAX, qualityRange);
+    const quality4k = parseNumber('quality_4k', QUALITY_MAX, qualityRange);
+    const guardShrinkKbps = parseNumber('guard_shrink_bitrate', Infinity, 'a non-negative number (kbps)');
     // Hours, fractional allowed (0.5); 0 = no limit. Parsed here, with the others, so a bad value fails every file rather than only those that reach a
     // transcode.
-    const encodeCapHours = (() => {
-        const n = Number(String(inputs.guard_encode_hours).trim());
-        if (!Number.isFinite(n) || n < 0 || n > ENCODE_CAP_MAX_HOURS)
-            failFile(`[guard_encode_hours=${logSafe(inputs.guard_encode_hours)}] must be a number of hours from 0 to ${ENCODE_CAP_MAX_HOURS}`
-                + ' (0 = no limit), check your settings');
-        return n;
-    })();
+    const encodeCapHours = parseNumber('guard_encode_hours', ENCODE_CAP_MAX_HOURS, `a number of hours from 0 to ${ENCODE_CAP_MAX_HOURS} (0 = no limit)`);
     // A percentage, fractional allowed; 0 = off. savingsText, the parsed number's own text, is the threshold awk_vq records and every line names, so only a
     // changed NUMBER reads as a new setting: '25.0', '025' and '+25' are all 25.
-    const guardShrinkSavings = (() => {
-        const n = Number(String(inputs.guard_shrink_savings).trim());
-        if (!Number.isFinite(n) || n < 0 || n > 100)
-            failFile(`[guard_shrink_savings=${logSafe(inputs.guard_shrink_savings)}] must be a percentage from 0 to 100 (0 = off), check your settings`);
-        return n;
-    })();
+    const guardShrinkSavings = parseNumber('guard_shrink_savings', 100, 'a percentage from 0 to 100 (0 = off)');
     const savingsText = String(guardShrinkSavings);
 
     // Every dropdown's accepted set, as ONE table driving the shared checkDropdowns loop. The shape matters beyond the line count: CLAUDE.md's retired-option
@@ -4042,14 +4030,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         ['method_bitdepth',  bitDepthOpt,      ['source', '8', '10']],
         ['method_encoder',   encoderOpt,       ['node', 'node_strict', 'auto', 'cpu']],
         ['method_speed',     speed,            ['slow', 'medium', 'fast']],
-        ['guard_captions',   guardCaptionsOpt, ['disabled', 'enabled']],
-        ['guard_dv',         guardDvOpt,       ['enabled', 'disabled']],
-        ['guard_lossless',   guardLosslessOpt, ['enabled', 'disabled']],
+        ['guard_captions',   guardCaptions,    ['disabled', 'enabled']],
+        ['guard_dv',         guardDv,          ['enabled', 'disabled']],
+        ['guard_lossless',   guardLossless,    ['enabled', 'disabled']],
     ];
     checkDropdowns(dropdownChecks);
-    const guardCaptions = guardCaptionsOpt === 'enabled';
-    const guardDv = guardDvOpt === 'enabled';
-    const guardLossless = guardLosslessOpt === 'enabled';
+    const guardCaptionsOn = guardCaptions === 'enabled';
+    const guardDvOn = guardDv === 'enabled';
+    const guardLosslessOn = guardLossless === 'enabled';
     // The one cross-input config error: tonemap_sdr is a pixel-domain re-encode, so it can never satisfy hdr_cleanup_only's lossless-or-skip promise.
     if (hdrMode === 'tonemap_sdr' && action === 'hdr_cleanup_only')
         failFile('[hdr_mode=tonemap_sdr][action=hdr_cleanup_only] tonemapping is always a re-encode (never lossless)'
@@ -4357,7 +4345,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Dolby Vision guard (action-aware). guard_dv protects DV through a transcode: forces HEVC + libx265 (CPU, below) + 10-bit + RPU
         // passthrough, and overrides a strip_dynamic/tonemap_sdr request for a DV file. INERT under hdr_cleanup_only (a lossless-only action - a
         // deliberate strip there is honoured). Only libx265 carries the RPU, and only from an HEVC source; keys on dvSignal (DV, not HDR10+).
-        const guardDvLive = guardDv && action !== 'hdr_cleanup_only';
+        const guardDvLive = guardDvOn && action !== 'hdr_cleanup_only';
         const preserveDv = dvSignal && guardDvLive && srcCodecName === 'hevc';
         if (preserveDv) targetCodecName = 'hevc';   // force HEVC (overrides codec / codec=source)
         if (preserveDv && codec !== 'source' && codec !== 'hevc')
@@ -4648,7 +4636,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Skips that a pending real transcode would otherwise turn destructive. guard_lossless leads the block: it is the one that says
         // "don't touch this file at all", so it should answer for a lossless source whatever else also applies. It keys on realTranscode,
         // so the lossless -c:v copy paths (hdr_cleanup_only, a bare strip_dynamic) still run - they cost the master nothing.
-        if (guardLossless && LOSSLESS_VIDEO_CODECS.includes(srcCodecName) && realTranscode()) {
+        if (guardLosslessOn && LOSSLESS_VIDEO_CODECS.includes(srcCodecName) && realTranscode()) {
             return skip(`☒${pTag}[guard_lossless=enabled] ${srcCodecName} is a lossless/mastering source - a re-encode would flatten it`
                 + ` to lossy 4:2:0 ${want10Bit ? '10' : '8'}-bit; set guard_lossless=disabled to convert it anyway\n`);
         }
@@ -4939,7 +4927,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return tmMemo.get(base);
             };
             const captionLines = [];
-            let captionGate = guardCaptions && !dropCaptions ? 'open' : 'off';   // open -> not probed yet; survive -> skip every dropper
+            let captionGate = guardCaptionsOn && !dropCaptions ? 'open' : 'off';   // open -> not probed yet; survive -> skip every dropper
             let ccContradicted = false;   // awk_cc says `removed`, and the probe found the captions this encode now keeps
             let ccVia = '';
             let displaced = null;   // the dropper guard_captions skipped first
@@ -5425,7 +5413,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // that fails proves nothing - it never undoes a fence. A stored n or x (an all-intra window, or a stamping read that failed) leaves identity only, and
         // so does sub_worker's later caption removal, which rewrites the H.264 packets (measured) without making the verdict false.
         const vqFingerprintStale = () => {
-            const fp = vqNow && vqNow.state !== 'encoded' && coreHolds(vqNow.core) ? VQ_FP_RE.exec(vqNow.fp) : null;
+            const fp = vqNow && vqNow.state !== 'encoded' && coreHolds(vqNow.core) ? FINGERPRINT_RE.exec(vqNow.fp) : null;
             if (!fp) return null;
             if (fp[1] !== videoId8(primary)) return 'its format';
             if (!/^[0-9a-f]{8}$/.test(fp[2]) || ccAlreadyGone) return '';
@@ -5722,7 +5710,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const diff = coreDiff(priorCore);
                     const passed = [...new Set([...diff.mine, ...diff.theirs].map((t) => (FENCE_BOX_RE.test(t) ? `downscale=${downscaleOpt}`
                         : FENCE_SPEED_RE.test(t) ? `method_speed=${speed}` : t === 'deint' ? `deinterlace=${deinterlaceOpt}`
-                            : t === 'dv' ? `guard_dv=${guardDvOpt}` : `hdr_mode=${hdrMode}`)))];
+                            : t === 'dv' ? `guard_dv=${guardDv}` : `hdr_mode=${hdrMode}`)))];
                     const shown = logSafe(priorSig.replace(/\+j[0-9a-f]{8}$/, ''), 120);
                     const only = vqNow?.state === 'reject' ? 'repeat the encode that was put back' : 'add a lossy generation';
                     // A box token both cores share, which today's box would scale into, on a fence older than that box: an encode would downscale too.

@@ -43,7 +43,7 @@ const details = () => ({
                 stream_ordering (last). If the file has embedded closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that
                 destroys them. Extract with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since
                 the sidecars would land beside the source, where the output never sees them.`,
-    Version: '3.999.110',
+    Version: '3.999.111',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -392,16 +392,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: role/disposition classifiers =====
     // -=-=-= dispositionTypes [all five] =-=-=-
-    // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each keyword
-    // lives on ONE flag PER STREAM TYPE - hasDisposition scopes by entry.streams - so title->flag promotion stays unambiguous; descriptive/descriptions/dvs
-    // deliberately appear on both the audio and subtitle entries), and the canonical title string (tag, null when never written). The single table every
-    // classifier, sort key, summary token and title tagger reads, so the lists can never drift. The roles also carry the words European releases title such
-    // tracks with, unflagged: commentary, audio description and SDH in German, French, Spanish, Portuguese, Italian, Dutch, Polish and the Nordic languages;
-    // forced in all of those but the Nordic ones, which have no standard forced label; dub in all but German, Dutch and Finnish; original in German, French,
-    // Italian, Dutch and Polish, and in Spanish and Portuguese through the bare 'original'. Plurals and the one-word compounds release labels use (Kommentare,
-    // Audiokommentar) are included - compounds have no end, so these are the standard labels, not every word. Each is a whole-token match, so only a word that
-    // means nothing else in a track title belongs here: VO, OV and UT stay out, and French, Italian, Dutch and Polish carry 'original' as the phrase, since
-    // their lone word also names an original soundtrack (bande originale, oryginalna ścieżka dźwiękowa). Every one is pinned by the harness.
+    // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each
+    // keyword lives on ONE flag PER STREAM TYPE - hasDisposition scopes by entry.streams - so title->flag promotion stays unambiguous;
+    // descriptive/descriptions/dvs deliberately appear on both the audio and subtitle entries), and the canonical title string (tag, null when never
+    // written). The single table every classifier, sort key, summary token and title tagger reads, so the lists can never drift; isCoverArt alone reads
+    // its three cover-art flags raw (see there). The roles also carry the words European releases title such tracks with, unflagged: commentary, audio
+    // description and SDH in German, French, Spanish, Portuguese, Italian, Dutch, Polish and the Nordic languages; forced in all of those but the Nordic
+    // ones, which have no standard forced label; dub in all but German, Dutch and Finnish; original in German, French, Italian, Dutch and Polish, and in
+    // Spanish and Portuguese through the bare 'original'. Plurals and the one-word compounds release labels use (Kommentare, Audiokommentar) are
+    // included - compounds have no end, so these are the standard labels, not every word. Each is a whole-token match, so only a word that means nothing
+    // else in a track title belongs here: VO, OV and UT stay out, and French, Italian, Dutch and Polish carry 'original' as the phrase, since their lone
+    // word also names an original soundtrack (bande originale, oryginalna ścieżka dźwiękowa). Every one is pinned by the harness.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary', 'kommentar', 'commentaire', 'comentario', 'comentário', 'commento',
                                 'commentaar', 'komentarz', 'kommentaari', 'kommentare', 'kommentarer', 'audiokommentar', 'regiekommentar',
@@ -514,7 +515,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: role/disposition classifiers =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: image / cover-art codecs =====
-    // -=-=-= IMAGE_CODECS / isCoverArt [all five] =-=-=-
+    // -=-=-= IMAGE_CODECS / COVER_FLAGS / isCoverArt [all five] =-=-=-
     // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last; summariseStream
     // flags them /cover. Two codecs that LOOK like they belong are deliberately ABSENT, for one reason: they are also real moving-picture codecs. mjpeg/mjpegb
     // is camcorder/AVI-era footage, and jpeg2000 is the DCP / IMF / broadcast-mezzanine codec - listing either drops genuine video as cover art, while
@@ -525,9 +526,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // one-frame video track carries no flag, and in mjpeg no image codec either, but it keeps the attachment's filename and mimetype tags (image/jpeg,
     // image/png; measured 2026-10-23 on jellyfin 7.1.4). No real video track carries an image mimetype, so the mimetype clause names it cover art.
     const IMAGE_CODECS = ['png', 'apng', 'gif', 'bmp', 'webp', 'tiff', 'qoi'];
+    const COVER_FLAGS = ['attached_pic', 'still_image', 'timed_thumbnails'];
+    // Reads ffprobe fields only - the raw flags, on a video stream as dispositionTypes scopes them, never hasDisposition, whose
+    // keyword half reaches mediaInfoFor - so it is safe on another file's streams (the library original's, in primaryVideo and
+    // stream_ordering's truncation check). A keyword added to those three dispositionTypes rows is not read here.
     const isCoverArt = (s) => IMAGE_CODECS.includes(codecNameOf(s))
-        || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails')
-        || (codecTypeOf(s) === 'video' && /^image\//i.test(getTagCI(s.tags, 'mimetype')));
+        || (codecTypeOf(s) === 'video' && (COVER_FLAGS.some((k) => s.disposition?.[k] === 1) || /^image\//i.test(getTagCI(s.tags, 'mimetype'))));
     // ===== END SHARED: image / cover-art codecs =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: codec name resolution =====
@@ -910,7 +914,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // muxer writes (no -f mp4), stores no role flag at all, since only its MP4 mode writes the box that carries them: forced, comment, hearing_impaired,
         // captions, visual_impaired, descriptions and dub written on audio and subtitle read back 0 from .mov, and 1 from .mp4 and from .m4v and .m4a under
         // -f mp4 (measured 2026-11-14 on jellyfin 7.1.4).
-        const COVER_FLAGS = ['attached_pic', 'still_image', 'timed_thumbnails'];
         const lost = String(container || '').toLowerCase() === 'mov' ? MOV_UNSTORED_ROLES : ['original'];
         return out.map((x) => {
             const d = streamOf(x).disposition || {};
@@ -4521,7 +4524,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return (streams || []).filter((s) => codecTypeOf(s) === 'video' && !isCoverArt(s))
             .reduce((best, s) => (best === undefined || rank(s) < rank(best) ? s : best), undefined);
     };
-    // -=-=-= FINGERPRINT_* / VQ_FP_RE / videoId8 / isOriginalPath / videoDigest / fpText  [sub_worker, video_clean] =-=-=-
+    // -=-=-= FINGERPRINT_* / FINGERPRINT_RE / videoId8 / isOriginalPath / videoDigest / fpText  [sub_worker, video_clean] =-=-=-
     // A fingerprint names one video stream as <id8>.<dig>: videoId8, then videoDigest's 8 hex, or n where its window held no non-keyframe packet, or x where
     // the read failed. video_clean stamps one on a size verdict (awk_vq) and checks a caption request against one; sub_worker binds a caption read to one.
     // The read takes the first 120 packets (~10 KB of output): 0.02-0.11 s locally, 0.30-0.47 s cold over SMB, measured 2026-10-22.
@@ -4529,7 +4532,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const FINGERPRINT_TIMEOUT_MS = 20000;
     const FINGERPRINT_MAX_BYTES = 1024 * 1024;
     // A stored fingerprint split into its id8 and dig; a value that does not match is no fingerprint at all.
-    const VQ_FP_RE = /^([0-9a-f]{8})\.([0-9a-f]{8}|n|x)$/;
+    const FINGERPRINT_RE = /^([0-9a-f]{8})\.([0-9a-f]{8}|n|x)$/;
     // The fingerprint's free half, from ffProbeData alone: what the stream IS (codec, profile, size, pixel format).
     const videoId8 = (s) => require('crypto').createHash('sha1').update(`${s.codec_name}|${s.profile ?? ''}|${s.width}x${s.height}|${s.pix_fmt}`)
         .digest('hex').slice(0, 8);
@@ -4578,7 +4581,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const ccFpStaleWhy = (tokens, origTokens, stream, digest) => {
         const fp = ccFpOf(tokens);
         if (!fp || fp !== ccFpOf(origTokens)) return '';
-        const m = VQ_FP_RE.exec(fp);
+        const m = FINGERPRINT_RE.exec(fp);
         if (!m) return 'its fingerprint token is unreadable';
         if (m[1] !== videoId8(stream)) return 'its format changed';
         if (!/^[0-9a-f]{8}$/.test(m[2])) return '';
@@ -4655,7 +4658,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // silently flip the branch. This stage can legitimately arrive without ffProbeData, so the probe guard below belongs to pre-processing alone.
     const isPostProcessing = !!otherArguments?.homePath && !otherArguments?.configVars && !otherArguments?.job;
     if (!isPostProcessing && (!file.ffProbeData || !Array.isArray(file.ffProbeData.streams))) {
-        failFile('No ffProbe stream data available, cannot process this file');
+        failFile('No ffProbe stream data available for this file - the plugin cannot process it');
     }
     const action = ddValue(inputs.action, 'import');
     // Deleting the sidecar FILES is remove_source's decision alone in every mode - deduplicate only ever decides what counts as a duplicate. An unrecognised
@@ -5753,6 +5756,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // The stream stays in the file while any of the above stands (removedIndices, and a placement's keep).
                 const keepStream = emptyLeft.length > 0 || oldLeft.length > 0 || flagKeep;
                 const full = libPathOf(name);
+                // An earlier run's leftover at this name that is judged unusable below (empty, or incomplete under remove_source=true) is replaced:
+                // deleted first unless placeViaApi writes over it. One this node cannot delete keeps the stream - false, and the caller moves on.
+                const replaceLeftover = (adj, tag = '') => {
+                    if (!placeViaApi()) {
+                        try { fs.unlinkSync(full); } catch (e) {
+                            refused += 1;
+                            response.infoLog += `☒${streamTag(s.index)} An ${adj} ${name} from an earlier run could not be deleted to extract it again - delete`
+                                + ' it and requeue, keeping the embedded subtitle\n';
+                            return false;
+                        }
+                    }
+                    response.infoLog += `☐${streamTag(s.index)}${tag} Replacing ${name} - an earlier run left it ${adj}\n`;
+                    return true;
+                };
                 // The path goes into the quoted "${full}" token of the extract preset, so it has to survive Tdarr's quote-aware tokenizer
                 // (pathIsPresetSafe). Only the library directory can fail that - the name we build is already sanitised - and a directory has to stay
                 // literal, so the extract is skipped instead. The stream is NOT recorded in removedIndices either: a refused extract must never strip the
@@ -5817,16 +5834,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // would take it for the stream (emptyCopyAt). A cue-less stream's own empty sidecar is its extract, and stays (or every pass would write it
                 // again, an identical preset Tdarr errors as a loop).
                 if (!remote && !removeSource && alreadyExtracted && emptyCopyAt(s, full, name, bundle, streams)) {
-                    if (!placeViaApi()) {
-                        try { fs.unlinkSync(full); } catch (e) {
-                            refused += 1;
-                            response.infoLog += `☒${streamTag(s.index)} An empty ${name} from an earlier run could not be deleted to extract it again - delete`
-                                + ' it and requeue, keeping the embedded subtitle\n';
-                            continue;
-                        }
-                    }
+                    if (!replaceLeftover('empty')) continue;
                     alreadyExtracted = false;
-                    response.infoLog += `☐${streamTag(s.index)} Replacing ${name} - an earlier run left it empty\n`;
                 }
                 // remove_source is about to strip the stream this name copies, so a file already there must HOLD it (existingSidecarVerdict; on the file API
                 // route, a copy downloaded to judge). An interrupted run's leftover is replaced - deleted first on the direct-write route, since ffmpeg aborts
@@ -5848,16 +5857,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         continue;
                     }
                     if (remote ? verdict.state === 'aborted' : leftIncomplete(verdict, name)) {
-                        if (!placeViaApi()) {
-                            try { fs.unlinkSync(full); } catch (e) {
-                                refused += 1;
-                                response.infoLog += `☒${streamTag(s.index)} An incomplete ${name} from an earlier run could not be deleted to extract it again `
-                                    + '- delete it and requeue, keeping the embedded subtitle\n';
-                                continue;
-                            }
-                        }
+                        if (!replaceLeftover('incomplete', '[remove_source=true]')) continue;
                         alreadyExtracted = false;
-                        response.infoLog += `☐${streamTag(s.index)}[remove_source=true] Replacing ${name} - an earlier run left it incomplete\n`;
                     } else alreadyExtracted = true;
                 }
                 if (alreadyExtracted) {

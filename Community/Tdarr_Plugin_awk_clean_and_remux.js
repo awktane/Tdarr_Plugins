@@ -30,7 +30,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.88',
+    Version: '4.999.89',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -520,16 +520,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: role/disposition classifiers =====
     // -=-=-= dispositionTypes [all five] =-=-=-
-    // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each keyword
-    // lives on ONE flag PER STREAM TYPE - hasDisposition scopes by entry.streams - so title->flag promotion stays unambiguous; descriptive/descriptions/dvs
-    // deliberately appear on both the audio and subtitle entries), and the canonical title string (tag, null when never written). The single table every
-    // classifier, sort key, summary token and title tagger reads, so the lists can never drift. The roles also carry the words European releases title such
-    // tracks with, unflagged: commentary, audio description and SDH in German, French, Spanish, Portuguese, Italian, Dutch, Polish and the Nordic languages;
-    // forced in all of those but the Nordic ones, which have no standard forced label; dub in all but German, Dutch and Finnish; original in German, French,
-    // Italian, Dutch and Polish, and in Spanish and Portuguese through the bare 'original'. Plurals and the one-word compounds release labels use (Kommentare,
-    // Audiokommentar) are included - compounds have no end, so these are the standard labels, not every word. Each is a whole-token match, so only a word that
-    // means nothing else in a track title belongs here: VO, OV and UT stay out, and French, Italian, Dutch and Polish carry 'original' as the phrase, since
-    // their lone word also names an original soundtrack (bande originale, oryginalna ścieżka dźwiękowa). Every one is pinned by the harness.
+    // Keyed by the real ffmpeg disposition flag; each entry declares the valid stream types, the title keywords that also indicate the role (each
+    // keyword lives on ONE flag PER STREAM TYPE - hasDisposition scopes by entry.streams - so title->flag promotion stays unambiguous;
+    // descriptive/descriptions/dvs deliberately appear on both the audio and subtitle entries), and the canonical title string (tag, null when never
+    // written). The single table every classifier, sort key, summary token and title tagger reads, so the lists can never drift; isCoverArt alone reads
+    // its three cover-art flags raw (see there). The roles also carry the words European releases title such tracks with, unflagged: commentary, audio
+    // description and SDH in German, French, Spanish, Portuguese, Italian, Dutch, Polish and the Nordic languages; forced in all of those but the Nordic
+    // ones, which have no standard forced label; dub in all but German, Dutch and Finnish; original in German, French, Italian, Dutch and Polish, and in
+    // Spanish and Portuguese through the bare 'original'. Plurals and the one-word compounds release labels use (Kommentare, Audiokommentar) are
+    // included - compounds have no end, so these are the standard labels, not every word. Each is a whole-token match, so only a word that means nothing
+    // else in a track title belongs here: VO, OV and UT stay out, and French, Italian, Dutch and Polish carry 'original' as the phrase, since their lone
+    // word also names an original soundtrack (bande originale, oryginalna ścieżka dźwiękowa). Every one is pinned by the harness.
     const dispositionTypes = {
         comment:          { streams:['audio','subtitle'],         keywords: ['commentary', 'kommentar', 'commentaire', 'comentario', 'comentário', 'commento',
                                 'commentaar', 'komentarz', 'kommentaari', 'kommentare', 'kommentarer', 'audiokommentar', 'regiekommentar',
@@ -654,7 +655,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: secondary audio role =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: image / cover-art codecs =====
-    // -=-=-= IMAGE_CODECS / isCoverArt [all five] =-=-=-
+    // -=-=-= IMAGE_CODECS / COVER_FLAGS / isCoverArt [all five] =-=-=-
     // Still-image / cover-art codecs. clean_and_remux drops these video/attachment streams; stream_ordering sorts such video streams last; summariseStream
     // flags them /cover. Two codecs that LOOK like they belong are deliberately ABSENT, for one reason: they are also real moving-picture codecs. mjpeg/mjpegb
     // is camcorder/AVI-era footage, and jpeg2000 is the DCP / IMF / broadcast-mezzanine codec - listing either drops genuine video as cover art, while
@@ -665,9 +666,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // one-frame video track carries no flag, and in mjpeg no image codec either, but it keeps the attachment's filename and mimetype tags (image/jpeg,
     // image/png; measured 2026-10-23 on jellyfin 7.1.4). No real video track carries an image mimetype, so the mimetype clause names it cover art.
     const IMAGE_CODECS = ['png', 'apng', 'gif', 'bmp', 'webp', 'tiff', 'qoi'];
+    const COVER_FLAGS = ['attached_pic', 'still_image', 'timed_thumbnails'];
+    // Reads ffprobe fields only - the raw flags, on a video stream as dispositionTypes scopes them, never hasDisposition, whose
+    // keyword half reaches mediaInfoFor - so it is safe on another file's streams (the library original's, in primaryVideo and
+    // stream_ordering's truncation check). A keyword added to those three dispositionTypes rows is not read here.
     const isCoverArt = (s) => IMAGE_CODECS.includes(codecNameOf(s))
-        || hasDisposition(s, 'attached_pic') || hasDisposition(s, 'still_image') || hasDisposition(s, 'timed_thumbnails')
-        || (codecTypeOf(s) === 'video' && /^image\//i.test(getTagCI(s.tags, 'mimetype')));
+        || (codecTypeOf(s) === 'video' && (COVER_FLAGS.some((k) => s.disposition?.[k] === 1) || /^image\//i.test(getTagCI(s.tags, 'mimetype'))));
     // ===== END SHARED: image / cover-art codecs =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: codec name resolution =====
@@ -1062,7 +1066,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // muxer writes (no -f mp4), stores no role flag at all, since only its MP4 mode writes the box that carries them: forced, comment, hearing_impaired,
         // captions, visual_impaired, descriptions and dub written on audio and subtitle read back 0 from .mov, and 1 from .mp4 and from .m4v and .m4a under
         // -f mp4 (measured 2026-11-14 on jellyfin 7.1.4).
-        const COVER_FLAGS = ['attached_pic', 'still_image', 'timed_thumbnails'];
         const lost = String(container || '').toLowerCase() === 'mov' ? MOV_UNSTORED_ROLES : ['original'];
         return out.map((x) => {
             const d = streamOf(x).disposition || {};
@@ -1564,7 +1567,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const methodUnmuxable = ddValue(inputs.method_unmuxable, 'error');
 
     const fillLanguage = (inputs.language_fill ? inputs.language_fill.toLowerCase().trim() : '');
-    const subLanguages = splitList(inputs.language_sub).map(lang => lang.toLowerCase());
+    const subLanguages = splitList(inputs.language_sub);
     // Pre-normalise the user language list to comparison keys once (langMatchKey folds en/eng/english/en-US, 639-2/B vs /T and nb/nn -> no) - the filter
     // matches against these.
     const subLangKeys = subLanguages.map(langMatchKey);
