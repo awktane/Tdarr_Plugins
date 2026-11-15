@@ -11,10 +11,10 @@ const details = () => ({
                 action=extract writes each embedded TEXT subtitle to a sidecar next to the video (native format: srt/ass/vtt) and, by default, removes those
                 tracks from the file. A subtitle ffmpeg cannot read whole - text that is not UTF-8 - is neither written nor removed, and the log says so.
                 A STYLED subtitle (ASS/SSA) in a file that has embedded fonts is exported as a bundle named
-                .<video>.s<streamIndex>[.<title>].<lang>[.<flags>].styled.mks - one Matroska holding the subtitle plus those fonts, which leave the video with
-                it (they exist nowhere else, and Matroska is the only container that can carry both). The leading dot hides it from Plex/Jellyfin. Import
-                restores the subtitle and its fonts together. An mp4 target cannot hold font attachments at all, so a bundle is left on disk until the file is
-                mkv again.
+                .<video>.s<streamIndex>[.<title>][.<other flags>].<lang>[.<forced|sdh>].styled.mks - one Matroska holding the subtitle plus those fonts,
+                which leave the video with it (they exist nowhere else, and Matroska is the only container that can carry both). The leading dot hides it
+                from Plex/Jellyfin. Import restores the subtitle and its fonts together. An mp4 target cannot hold font attachments at all, so a bundle is
+                left on disk until the file is mkv again.
                 action=import muxes matching sidecars back into the file (restoring language, title, and disposition) and, by default, deletes the sidecar
                 once it is safely embedded. Import never drops a subtitle - anything not already embedded is muxed in (a copy already present just becomes a
                 duplicate, never a loss), except a sidecar ffmpeg cannot read whole - text in a legacy character set such as Windows-1252 - which is named in
@@ -35,15 +35,16 @@ const details = () => ({
                 carried inside the video picture (EIA-608/708, standard on North American broadcast recordings), which is why no player lists them beside the
                 subtitles. extract writes them to a sidecar, import turns them into an embedded track. Reading them decodes the video, so it happens only on a
                 file a cheap check says has them, and the verdict is remembered so no later pass repeats it.
-                Scope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses byte-identical sidecar copies on
-                import, and its enabled_checkmedia mode also reads the video's own subtitle tracks to drop a duplicate or an empty one (see its tooltip).
+                Scope both actions with only_languages (comma-separated, e.g. eng,jpn; blank = all). deduplicate collapses identical-text sidecar copies on
+                import, and its enabled_checkmedia mode also reads the video's own subtitle tracks - of every language, whatever only_languages says - to drop
+                a duplicate or an empty one (see its tooltip).
                 SETUP: add this plugin ONCE to the library's plugin stack. It declares no Stage, so Tdarr runs that same entry again after you accept a
                 transcode, which is when import deletes the sidecars it embedded; a second copy would run in both stages too, each with its own settings. A
                 Flow has no such pass (see remove_source). Runs standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before
                 stream_ordering (last). If the file has embedded closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that
                 destroys them. Extract with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since
                 the sidecars would land beside the source, where the output never sees them.`,
-    Version: '3.999.113',
+    Version: '3.999.114',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -75,7 +76,8 @@ const details = () => ({
             type: 'string',
             defaultValue: '',
             inputUI: { type: 'text' },
-            tooltip: `Limit both actions to these languages, comma-separated. Blank (default) acts on every language.
+            tooltip: `Limit both actions to these languages, comma-separated. Blank (default) acts on every language. deduplicate=enabled_checkmedia's check
+                of the video's own subtitle tracks reads every language, whatever this says.
                 \\nOne form is enough - en, eng, or English all match the same language, region variants like en-US included.
                 \\nExample:\\neng,fra`,
         },
@@ -92,7 +94,7 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nenabled_only_sidecar (default) - compare the SIDECARS only. On import a byte-identical group becomes a single track carrying their
+                \\nenabled_only_sidecar (default) - compare the SIDECARS only. On import an identical-text group becomes a single track carrying their
                 combined flags (a plain + SDH pair imports once, tagged SDH) and the first of their titles that keeps every role their names give (English
                 SDH over English; copies no one title covers, such as English SDH and English Forced, go in as separate tracks), and a sidecar whose text is
                 already embedded is skipped instead of added a second time. Nothing is removed from the video.
@@ -101,7 +103,7 @@ const details = () => ({
                 every role their names give - English SDH over English - so no tagging is lost; copies no one title covers, such as English SDH and English
                 Forced, all stay), and a track holding no text at all, which a player still lists. This is the only setting that deletes a subtitle you did
                 not ask to extract, and it costs one extra read of the file.
-                \\ndisabled - mux every sidecar as its own track, byte-identical copies included, so you may end up with duplicate subtitles.
+                \\ndisabled - mux every sidecar as its own track, identical-text copies included, so you may end up with duplicate subtitles.
                 \\nDeleting the sidecar FILES afterwards is remove_source's decision whatever this is set to, and it removes every member of a collapsed
                 group rather than only the one that was muxed. Embedded closed captions are not subtitle tracks and are never seen here; once embedded_cc
                 has turned them into a sidecar or a track they are ordinary subtitles and deduplicate like any other.`,
@@ -166,8 +168,10 @@ const details = () => ({
                 voice tags, or an ASS/SSA - or an srt's font and {\\an8} overrides, or the timing of cues that overlap - going into an mp4. So is a sidecar
                 whose name the import does not apply (under method_import_metadata=embedded, or beside the sidecar the track takes its name from) and that gives
                 a language, a role or - outside mp4, m4v and mov - a title no track holding its text has: it is the only record of it, until you rename or
-                delete it.
-                \\nfalse - keep both copies: nothing leaves the video on extract, and no sidecar is deleted on import.
+                delete it. So is a hidden closed-caption sidecar (embedded_cc) whose text is already in the file, until the captions are removed from the
+                video: it is the record that stops them being read out of the video again.
+                \\nfalse - keep both copies: no extracted subtitle leaves the video, and no sidecar is deleted on import. deduplicate=enabled_checkmedia still
+                removes a duplicate or empty subtitle track from the video whatever this says.
                 \\nWhen import deletes: add this plugin to the stack ONCE. It declares no Stage, so Tdarr runs that same entry again after you accept the
                 transcode, and that pass deletes the sidecars the job embedded - deleting sooner would destroy the sidecars of a run you then reject. A second
                 copy of the plugin would run in both stages too, each with its own settings. A sidecar whose text the library file already held is deleted
@@ -176,7 +180,10 @@ const details = () => ({
                 has no post-processing pass, so there a sidecar stays on disk until a later run finds its text in the library file before any step has
                 written an output.
                 \\nStyled ASS/SSA depend on fonts embedded in the video, so extract exports them as a .mks bundle holding the subtitle and those fonts
-                together, and removes the fonts along with it. That is what keeps the styling intact for a later reimport.
+                together, and removes the fonts along with it. That is what keeps the styling intact for a later reimport. A styled subtitle with no text
+                in it is never bundled, since a bundle of it cannot be read back: true removes it as an empty track. Its fonts then leave only in a bundle
+                another styled subtitle makes; with no styled subtitle left to use them, clean_and_remux removes them as orphaned on its next run, as it
+                does after enabled_checkmedia removes an empty track.
                 \\nOn a node that cannot see the library folder, both a sidecar's arrival and its deletion work differently - see method_unmapped.`,
         },
         {
@@ -219,16 +226,19 @@ const details = () => ({
                 \\nerror (default) - fail the file and say why, so nothing is skipped silently. Run import on a node that can see the library.
                 \\nmount - reach the library directly. The node's own path is tried first, so a container bind-mounting the library at the server's own path
                 (e.g. /media) needs nothing more. Otherwise set this node's Node Tag field, on the server's node options page, to a "key=value" entry - key
-                being the FIRST folder of the server's path, value being where THIS node sees that same folder. Windows and macOS nodes need one, because the
-                server's path cannot exist locally. Tdarr keeps its own tags in that field too, so add yours alongside them rather than replacing them.
-                Extract writes directly in this mode as well, skipping the upload API. A mount that is READ-ONLY from this node still works: everything is
-                read through it, while sidecars are placed through the upload API and deletion waits for the server, as if there were no mount.
+                being one or more whole leading folders of the server's path, value being where THIS node sees that same folder. Windows and macOS nodes need
+                one, because the server's path cannot exist locally. Tdarr keeps its own tags in that field too, so add yours alongside them rather than
+                replacing them. Extract writes directly in this mode as well, skipping the upload API. A mount that is READ-ONLY from this node still works:
+                everything is read through it, while sidecars are placed through the upload API and deletion waits for the server, as if there were no mount.
                 \\nExample: server library /media/Shows, mounted on this Windows node as M:\\Shows
                 \\nmedia=M:
-                \\ntext_file - read "<video>.subtitles.txt" beside the video: one filename per line, lines starting with # ignored. Extract seeds the list
-                with what it wrote; after that it is yours to maintain, which is how a subtitle you OCR'd from an exported image sub gets imported. Each name
-                must still follow the sidecar naming convention, since that is where its language, title and flags come from. A mapped node that renames a
-                listed sidecar to the track's current name (remove_source on extract, after a retitle or a new flag) leaves the list alone - change that line.
+                \\nExample: an unRAID server's library /mnt/user/media, mounted on this Windows node as M:
+                \\nmnt/user/media=M:
+                \\ntext_file - read "<video>.subtitles.txt" beside the video: one filename per line, lines starting with "# " (a # then a space) ignored.
+                Extract seeds the list with what it wrote; after that it is yours to maintain, which is how a subtitle you OCR'd from an exported image sub
+                gets imported. Each name must still follow the sidecar naming convention, since that is where its language, title and flags come from. A
+                mapped node that renames a listed sidecar to the track's current name (remove_source on extract, after a retitle or a new flag) leaves the
+                list alone - change that line.
                 \\nDELETING a sidecar (remove_source on import) is separate again: an unmapped node cannot delete a library file at all, since Tdarr's API
                 offers upload and download but not delete. The pass Tdarr runs after you accept the transcode does it server-side instead (see remove_source).
                 \\nOne case costs an extra pass: on an unmapped node with no mount it can write to, when every sidecar is ALREADY embedded there is nothing
@@ -1758,17 +1768,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const key = apiAuthKey();
         return key ? `header = "x-api-key: ${key}"\nheader = "tdarrKey: ${key}"\nheader = "Authorization: Bearer ${key}"\n` : '';
     };
-    // Is a non-empty sidecar already at this server path? Download is the only read the API offers, so the test IS a fetch - discarded to the null device, or
-    // written to `saveTo` (a path in the caller's private staging directory) when the caller must judge the body - and measured with curl's own counters, never
-    // buffered through spawnSync (a large body silently exceeds maxBuffer and fakes a failure). Three answers, not two, because a caller's next step on
+    // Is a non-empty sidecar already at this server path? Download is the only read the API offers, so the test IS a fetch - discarded to the null device,
+    // or written to `saveTo` (a path in the caller's private staging directory) when the caller must judge the body - and measured with curl's own counters,
+    // never buffered through spawnSync (a large body silently exceeds maxBuffer and fakes a failure). Not a yes or a no, because a caller's next step on
     // 'absent' is an upload, and the upload endpoint REPLACES whatever is there - possibly a sidecar the user has OCR'd or edited. So 'absent' needs a
-    // completed request the server answered definitively: its File-not-found (HTTP 400), or a 200 with no body, which holds nothing to lose. Everything else -
-    // no URL, a spawn error, a non-zero curl exit (connection refused, the -m timeout, a dropped transfer), a 5xx, a 501 - is 'unknown': the sidecar may well
-    // be there, so the caller leaves it alone this pass instead of writing over it. Returns { state: 'present' | 'absent' | 'unknown', why, empty }: `why` is
-    // for the user's log line ('' unless 'unknown'); `empty` marks the 200 with no body - a file IS there, holding nothing, which no API route can delete (only
-    // DB-indexed media and cache paths are deletable), so a caller that writes under another name would leave it beside the new one. `maxBytes`, when given,
-    // has curl refuse a larger file before fetching any of it, answered 'over': a file there that is no sidecar of this stream, never fetched whole on every
-    // pass (measured: an 80 MiB file at an earlier spelling was downloaded in full).
+    // completed request the server answered definitively: its File-not-found (HTTP 400), or a 200 with no body, which holds nothing to lose. Everything else
+    // - no URL, a spawn error, a non-zero curl exit (connection refused, the -m timeout, a dropped transfer), a 5xx, a 501 - is 'unknown': the sidecar may
+    // well be there, so the caller leaves it alone this pass instead of writing over it. Returns { state: 'present' | 'absent' | 'unknown' | 'over', why,
+    // empty }: `why` is for the user's log line ('' unless 'unknown' or 'over'); `empty` marks the 200 with no body - a file IS there, holding nothing,
+    // which no API route can delete (only DB-indexed media and cache paths are deletable), so a caller that writes under another name would leave it beside
+    // the new one. `maxBytes`, when given, has curl refuse a larger file before fetching any of it, answered 'over': a file is there, never fetched whole on
+    // every pass, and each caller says what it makes of one (measured: an 80 MiB file at an earlier spelling was downloaded in full).
     const sidecarExistsRemote = (dest, saveTo = '', maxBytes = 0) => {
         const { spawnSync } = require('child_process');
         const url = serverApiUrl();
@@ -1893,12 +1903,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { cues, end };
     };
     // -=-=-= readBundleSubtitle  [clean_and_remux, sub_worker] =-=-=-
-    // The subtitle inside a styled .mks bundle, decoded to ASS by ffmpeg into a private temp dir, and the codec of each font attachment ffmpeg's input
-    // listing names ("Stream #0:1: Attachment: ttf", measured on 7.1.4). { state: 'ok', buf, fonts }, or { state: 'unreadable' } when ffmpeg RAN and could not
-    // decode it - what an interrupted export leaves: killed mid-write it ends "File ended prematurely", and a run whose OTHER output failed at
-    // write_header leaves a header with no cluster ("End of file"), both measured on 7.1.4 - or { state: 'unknown' } when it could not be judged (gone, or
-    // not a regular file - ffmpeg blocks on a FIFO's -i until the timeout -, no temp dir, a spawn error or timeout, a read-out over the cap), where every
-    // caller keeps the answer it had before it could look.
+    // The subtitle inside a styled .mks bundle, decoded to ASS by ffmpeg into a private temp dir, and the codec of each font attachment
+    // ffmpeg's input listing names ("Stream #0:1: Attachment: ttf", measured on 7.1.4). { state: 'ok', buf, fonts }, or { state: 'unreadable',
+    // opened } when ffmpeg RAN and could not decode it - opened when it got as far as listing the input ("Input #0"), as a bundle does whose
+    // subtitle is not UTF-8 (decode exit 69), and not for what an interrupted export leaves: killed mid-write it ends "File ended prematurely",
+    // and a run whose OTHER output failed at write_header leaves a header with no cluster ("End of file"), both measured on 7.1.4 - or { state:
+    // 'unknown' } when it could not be judged (gone, or not a regular file - ffmpeg blocks on a FIFO's -i until the timeout -, no temp dir, a
+    // spawn error or timeout, a read-out over the cap), where every caller keeps the answer it had before it could look.
     const readBundleSubtitle = (p) => {
         let dir = '';
         try { dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_subbundle_')); } catch (e) { return { state: 'unknown' }; }
@@ -1909,7 +1920,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const r = fs.statSync(p).isFile() ? spawnSync(ffmpegPathOf(otherArguments), ['-hide_banner', '-y', '-loglevel', 'info', '-i', p, '-map', '0:s:0',
                 '-c:s', 'ass', '-fs', String(SIDECAR_HASH_MAX + 1), out],
             { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES, killSignal: 'SIGKILL' }) : null;
-            if (r && !r.error && r.status !== 0) res = { state: 'unreadable' };
+            if (r && !r.error && r.status !== 0) res = { state: 'unreadable', opened: /^Input #0/m.test(String(r.stderr || '')) };
             else if (r && !r.error && fs.statSync(out).size <= SIDECAR_HASH_MAX) {
                 res = { state: 'ok', buf: fs.readFileSync(out), fonts: String(r.stderr || '').split('\n')
                     .filter((l) => l.trimStart().startsWith('Stream #') && l.includes(': Attachment:'))
@@ -2969,16 +2980,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // read as written alone its role was not seen as cut away, so no token kept it (measured: 'Sous-titres forc' + 'e' + U+0301 + 's' lost /forced).
     const titleGives = (t, d) => [String(t || ''), String(t || '').normalize('NFC')]
         .some((x) => matchesKeyword(x.toLowerCase(), dispositionTypes[d.ff]?.keywords || []));
-    // Keeps the sidecar basename under the filesystem's 255-byte cap. A title whose encoding pushes it over is cut by cutName (track title), the role-keeping
-    // cut a .mov handler takes, measured in the bytes its percent-encoding spends in the filename (measured: a cut at the last character that fitted dropped a
-    // role only the name gave, and the import brought the track back without it). It is a title's cut, so titleIsToken takes the place of cutName's boilerplate
-    // test: a title that reads as a tool's boilerplate ('... the Dog Handler') is cut like any other, never to nothing (measured: the track lost its name and
-    // gained a flag), and a cut that would be a bare token ('English ... commentary' cut to 'commentary', which the import read as a flag) keeps one more word
-    // - or, where every cut clear of a token loses a role or is nothing, is the token escaped, its two bytes counted. Returns { enc, cut, budget }: the
-    // encoded cut, the cut whose roles sidecarBasename checks, and the bytes the title had. titleTruncated flags a lossy cut, and each cut is made once a run
-    // (sidecarTitleCuts). headTrim spells the previous sub_worker's cut - whole characters off the end of at most 255 - for earlierSidecarNames; lang is the
-    // language slot beside the title.
-    let titleTruncated = false;
+    // Keeps the sidecar basename under the filesystem's 255-byte cap. A title whose encoding pushes it over is cut by cutName (track title), the
+    // role-keeping cut a .mov handler takes, measured in the bytes its percent-encoding spends in the filename (measured: a cut at the last
+    // character that fitted dropped a role only the name gave, and the import brought the track back without it). It is a title's cut, so
+    // titleIsToken takes the place of cutName's boilerplate test: a title that reads as a tool's boilerplate ('... the Dog Handler') is cut like any
+    // other, never to nothing (measured: the track lost its name and gained a flag), and a cut that would be a bare token ('English ... commentary'
+    // cut to 'commentary', which the import read as a flag) keeps one more word - or, where every cut clear of a token loses a role or is nothing,
+    // is the token escaped, its two bytes counted. Returns { enc, cut, budget, truncated }: the encoded cut, the cut whose roles sidecarBasename
+    // checks, the bytes the title had, and whether it was cut. Each cut is made once a run (sidecarTitleCuts). headTrim spells the previous
+    // sub_worker's cut - whole characters off the end of at most 255 - for earlierSidecarNames; lang is the language slot beside the title.
     const sidecarTitleCuts = new Map();
     const encodeTitleCapped = (rawTitle, fixedLen, headTrim = false, lang = '') => {
         const raw = String(rawTitle);
@@ -2986,15 +2996,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const token = (x) => !headTrim && titleIsToken(x, lang);
         const size = (x) => Buffer.byteLength(encodeTitle(x), 'utf8') + (token(x) ? 2 : 0);
         const budget = NAME_BYTE_CAP - fixedLen - (fixedLen ? 1 : 0);
-        if ((headTrim ? Buffer.byteLength(enc, 'utf8') : size(raw)) <= budget) return { enc, cut: raw, budget };
-        titleTruncated = true;
+        if ((headTrim ? Buffer.byteLength(enc, 'utf8') : size(raw)) <= budget) return { enc, cut: raw, budget, truncated: false };
         if (headTrim) {
             let r = raw.slice(0, NAME_BYTE_CAP);
             let e = encodeTitle(r);
             while (r.length > 0 && Buffer.byteLength(`${e}${'.'.repeat(fixedLen ? 1 : 0)}`, 'utf8') + fixedLen > NAME_BYTE_CAP) {
                 r = r.slice(0, -1); e = encodeTitle(r);
             }
-            return { enc: e, cut: r, budget };
+            return { enc: e, cut: r, budget, truncated: true };
         }
         const key = `${budget}\n${DISP_AMBIGUOUS_LANG.has(lang) ? 1 : 0}\n${raw}`;
         if (!sidecarTitleCuts.has(key)) {
@@ -3006,7 +3015,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             sidecarTitleCuts.set(key, bare && (!cut || !loses(bare)) ? bare : cut);
         }
         const cut = sidecarTitleCuts.get(key);
-        return { enc: encodeTitle(cut), cut, budget };
+        return { enc: encodeTitle(cut), cut, budget, truncated: true };
     };
 
     // The sidecar-name extension, and the basename of a library-relative path. Both are read by parseSidecar and again by the unparseable-name
@@ -3017,16 +3026,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const SIDECAR_EXT_RE = /\.([A-Za-z0-9]+)$/;
     const relBasename = (rel) => path.basename(rel);
 
-    // For the name extract uses (logged): the role tokens the last sidecarBasename wrote for roles its title's cut could not keep, the roles that lost even
-    // the token, the bytes the title had before any token took its share, and the tokens of the track's own flags (or of a role only its handler or
-    // description gives) the name had no room for.
-    let cutRoleTokens = []; let cutRolesLost = []; let cutBudget = 0; let cutFlagsLost = [];
     // sidecarBasename <-> parseSidecar are exact inverses. Name = <videoBase>.s<index>[.<encTitle>][.<role...>].<lang>[.<forced|sdh>].<ext>, the two role runs
     // from sidecarNameTokens. parseSidecar ALSO accepts a server-native name with no s<index> (e.g. <videoBase>.en.forced.srt), anchored on a recognized <lang>
     // token. A styled-subtitle BUNDLE uses the same name with a leading dot and STYLED_BUNDLE.mark before its .mks extension, so media servers skip it (it is
     // an archive, not a subtitle to offer the viewer). The name stays the authority on language/title/disposition for a bundle too - the .mks also carries them
     // internally, but import re-applies the filename's values, so renaming a bundle retunes it exactly like renaming a loose sidecar.
-    const sidecarBasename = (s, bundle, titleOf = sidecarTitleOf, onlyDisp, headTrim = false) => {
+    // sidecarNameWithCut spells the name and returns it with what extract logs of the spelling: { name, truncated: the title written was cut, roleTokens:
+    // the role tokens written for roles the cut could not keep, rolesLost: the roles that lost even the token, budget: the bytes the title had before any
+    // token took its share, flagsLost: the tokens of the track's own flags (or of a role only its handler or description gives) the name had no room for }.
+    const sidecarNameWithCut = (s, bundle, titleOf = sidecarTitleOf, onlyDisp, headTrim = false) => {
         // The stream's title - sidecarTitleOf (a named handler counts); titleOf, onlyDisp and headTrim spell an earlier name (earlierSidecarNames). Only for
         // a real subtitle stream: the caption pseudo-stream shares the VIDEO's index, and a mediaInfo join on it would read the video's title.
         const rawTitle = codecTypeOf(s) === 'subtitle' ? titleOf(s) : (s.tags?.title || '');
@@ -3049,9 +3057,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const isFlag = (d) => d.flags.some((f) => s.disposition?.[f] === 1) || EXTRA_DISPOSITIONS.includes(d) || handlerOnlyDisp(d, s, rawTitle);
         const roleToken = onlyDisp || ((d, x) => !dropped.has(d.token) && (handlerOnlyDisp(d, x, rawTitle) || kept.has(d.token)));
         let ownBudget = null;
-        const truncatedIn = titleTruncated;
         for (;;) {
-            titleTruncated = truncatedIn;   // the final round's cut alone says whether the title written was cut
             const off = new Set(order.filter((d) => dropped.has(d.token)).flatMap((d) => d.flags));
             const sv = off.size ? { ...s, disposition: Object.fromEntries(Object.entries(s.disposition || {}).map(([k, v]) => [k, off.has(k) ? 0 : v])) } : s;
             const { lang, pre, disp } = sidecarNameTokens(sv, roleToken);
@@ -3068,19 +3074,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 continue;
             }
             const headToken = headTrim && titleIsToken(rawTitle, lang);
-            const { enc: encRaw, cut, budget } = rawTitle ? encodeTitleCapped(rawTitle, Buffer.byteLength(fixed, 'utf8') + (headToken ? 2 : 0), headTrim, lang)
-                : { enc: '', cut: '', budget: 0 };
+            const { enc: encRaw, cut, budget, truncated } = rawTitle
+                ? encodeTitleCapped(rawTitle, Buffer.byteLength(fixed, 'utf8') + (headToken ? 2 : 0), headTrim, lang)
+                : { enc: '', cut: '', budget: 0, truncated: false };
             if (ownBudget === null) ownBudget = budget;
             const collides = headTrim ? headToken : titleIsToken(cut, lang);
             const lost = onlyDisp ? [] : DISPOSITIONS.filter((d) => !kept.has(d.token) && !dropped.has(d.token)
                 && !d.flags.some((f) => s.disposition?.[f] === 1) && titleGives(rawTitle, d) && !titleGives(cut, d));
             if (lost.length) { lost.forEach((d) => kept.add(d.token)); continue; }
             const lostOf = (flag) => order.filter((d) => dropped.has(d.token) && isFlag(d) === flag && (flag || !titleGives(cut, d))).map((d) => d.token);
-            cutRoleTokens = [...kept]; cutRolesLost = lostOf(false); cutFlagsLost = lostOf(true); cutBudget = ownBudget;
             const encTitle = collides && encRaw ? `${pctEncode(encRaw.slice(0, 1), NEVER_SAFE)}${encRaw.slice(1)}` : encRaw;
-            return `${dot}${videoBase}.s${s.index}${encTitle ? `.${encTitle}` : ''}${pre}.${lang}${disp}${mark}.${ext}`;
+            return { name: `${dot}${videoBase}.s${s.index}${encTitle ? `.${encTitle}` : ''}${pre}.${lang}${disp}${mark}.${ext}`, truncated,
+                roleTokens: [...kept], rolesLost: lostOf(false), flagsLost: lostOf(true), budget: ownBudget };
         }
     };
+    const sidecarBasename = (s, bundle, titleOf, onlyDisp, headTrim) => sidecarNameWithCut(s, bundle, titleOf, onlyDisp, headTrim).name;
     // The name a sidecar is spelled from: the track's name as the next pass reads it, in escMeta's form, as every write and import gives it. For a stand-in
     // (sidecarView: a fold's restamp, or the name carry's view of a kept stream - a .mov name's cut, or the kept handler beside a name the .mov box refuses)
     // that is the title it holds, else its named handler - never the source's mediaInfo its index still joins. So the next pass and container spell the same
@@ -3108,19 +3116,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const keywords = dispositionTypes[d.ff]?.keywords || [];
         return !!handler && matchesKeyword(handler, keywords) && !matchesKeyword(earlierTitleOf(s).toLowerCase(), keywords);
     };
-    // The spellings the previous sub_worker (3.999.88, never released) gave the same track, so a sidecar already on disk under one counts as
-    // extracted, not a second copy beside it: its own (earlierTitleOf, earlierOnlyDisp); the released 3.46.0's (the title tag alone, a token only for
-    // a real flag); and off .mov, which no container conversion writes, the name of view (the stream as sidecarView gives it) as spelled before a
-    // conversion moved it - out of a title, as the title token with no handler role token; out of an mp4 or .mov handler, with no title token and a
-    // token for each role the name gives; a non-ASCII .mov handler name as its MacRoman echo, with a token for a role only the name as written spells.
-    // A title in any of these is cut as that sub_worker cut a long one (headTrim). carried (remove_source=true only) adds the remove_source=false
-    // spelling a kept stream's sidecar took, and every track's current spelling less a flag token its title gives (below). Each is {name, byText, own}:
-    // only an own spelling that is not byText (it has a title or a handler role token) stands in by its name; any other is also another track's
-    // possible spelling - an untitled track's own at that index, a neighbour a reorder moved there, a waiting import, a user's copy - so it stands in
-    // only by its cue texts (sameCueText; measured: another track's sidecar was kept as this one's and remove_source stripped the stream, its text
-    // then nowhere). titleTruncated is left as it was: an adopted earlier spelling is a sidecar already on disk, never reported as cut.
+    // The spellings the previous sub_worker (3.999.88, never released) gave the same track, so a sidecar already on disk under one counts as extracted,
+    // not a second copy beside it: its own (earlierTitleOf, earlierOnlyDisp); the released 3.46.0's (the title tag alone, a token only for a real
+    // flag); and off .mov, which no container conversion writes, the name of view (the stream as sidecarView gives it) as spelled before a conversion
+    // moved it - out of a title, as the title token with no handler role token; out of an mp4 or .mov handler, with no title token and a token for each
+    // role the name gives; a non-ASCII .mov handler name as its MacRoman echo, with a token for a role only the name as written spells. A title in any
+    // of these is cut as that sub_worker cut a long one (headTrim). carried (remove_source=true only) adds the remove_source=false spelling a kept
+    // stream's sidecar took, and every track's current spelling less a flag token its title gives (below). Each is {name, byText, own}: only an own
+    // spelling that is not byText (it has a title or a handler role token) stands in by its name; any other is also another track's possible spelling -
+    // an untitled track's own at that index, a neighbour a reorder moved there, a waiting import, a user's copy - so it stands in only by its cue texts
+    // (sameCueText; measured: another track's sidecar was kept as this one's and remove_source stripped the stream, its text then nowhere).
     const earlierSidecarNames = (s, view, bundle, carried) => {
-        const truncated = titleTruncated;
         const names = [];
         const add = (name, byText, own = false) => { if (!names.some((n) => n.name === name)) names.push({ name, byText, own }); };
         const own = sidecarBasename(s, bundle, earlierTitleOf, earlierOnlyDisp, true);
@@ -3145,7 +3151,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const unflagged = { ...view, disposition: { ...(view.disposition || {}) } };
         for (const d of DISPOSITIONS.filter((x) => titleGives(title, x))) d.flags.forEach((f) => { unflagged.disposition[f] = 0; });
         add(sidecarBasename(unflagged, bundle), true);
-        titleTruncated = truncated;
         return names;
     };
     // A name with its hidden-marker dot taken off, or null when it is not named after this video. The marker is a dot BEYOND the video's own: a
@@ -3175,9 +3180,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Require (and consume) the bundle marker before anything else reads the trailing tokens, so a clean_and_remux image-subtitle export sharing the
         // .mks extension and the same name shape is rejected here rather than re-imported as a styled bundle. See STYLED_BUNDLE.mark.
         if (bundle) { if (toks[toks.length - 1] !== STYLED_BUNDLE.mark) return null; toks.pop(); }
-        // Our own sidecars lead with an s<index> order marker; a fresh server-native sidecar (Movie.en.forced.srt) has none. Consume the marker if
-        // present (index only keeps our names unique); otherwise index is null and the language token below MUST be a recognized language, so an
-        // unrelated .srt (Movie.backup.srt) is not mis-read as lang="backup" and imported as junk.
+        // Our own sidecars lead with an s<index> order marker; a fresh server-native sidecar (Movie.en.forced.srt) has none. Consume the
+        // marker if present (index only keeps our names unique); otherwise index is null and the language token below MUST be a recognized
+        // language (or und, below), so an unrelated .srt (Movie.backup.srt) is not mis-read as lang="backup" and imported as junk.
         const ours = /^s\d+$/.test(toks[0]);
         if (bundle && !ours) return null;
         const index = ours ? parseInt(toks.shift().slice(1), 10) : null;
@@ -3257,10 +3262,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const NODE_TAG_FETCH_S = 30;
     const LIBRARY_DOWNLOAD_S = 600;
     const SUBTITLE_LIST_UPLOAD_S = 300;
-    // And the matching ceiling on how much a spawn may write back. Exceeding maxBuffer KILLS the child and reports a failure that never happened, so this is
-    // sized for the largest legitimate output any of these four calls produces - the node registry JSON, an ffprobe -show_streams document, and the stderr of
-    // the embedded-text extraction and its sidecar round trip - not for the smallest that usually suffices. Named once for the same reason the durations are:
-    // an unlabelled ceiling gives nobody raising it a way to tell whether the number was chosen or copied.
+    // And the matching ceiling on how much a spawn may write back. Exceeding maxBuffer KILLS the child and reports a failure that never
+    // happened, so this is sized for the largest legitimate output of any caller, not for the smallest that usually suffices: cueLoss's
+    // listing of every packet of every subtitle stream, which grows with the file (a row of about 15 bytes a packet, so about 1.5 MB at 10^5
+    // packets), against a few kB for the node registry JSON, an ffprobe -show_streams document or ffmpeg's error-level stderr. Named once for
+    // the same reason the durations are: an unlabelled ceiling gives nobody raising it a way to tell whether the number was chosen or copied.
     const SPAWN_MAX_OUTPUT_BYTES = 8 * 1024 * 1024;
 
     // This node's Node Tags, as [key, value] pairs. One request, memoised, and only ever made when something actually needs it. Tdarr maintains entries in
@@ -3489,7 +3495,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ====== END UNMAPPED-NODE LIBRARY ACCESS ======
 
     // ====== SIDECAR SCAN / HASH / DEDUP (both node types) ======
-    // The spawn ceiling for the subtitle hash and round-trip reads below: it scales with the container, and is a ceiling on a hang, not a target.
+    // The spawn ceiling for the subtitle reads below - the text hash, the round trip, cueLoss's cue count
+    // and avGap's packet counts: it scales with the container, and is a ceiling on a hang, not a target.
     const SUB_EXTRACT_TIMEOUT_MS = 600000;
     // Where a sidecar can legitimately live. Plex is the only one of the three servers that reads a SUBFOLDER: it accepts `subs` or `subtitles` beside the
     // video (the season directory for a show), with the files inside named exactly as they would be beside the video. Jellyfin reads only the video's own
@@ -3769,8 +3776,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // of TEXT_EXTS (see IMPORT_ONLY_EXTS), so the webvtt fallback only guards a future caller that reads a sidecar without going through it.
     const sidecarCodec = (f) => (sidecarContent(f)?.vtt || !TEXT_EXTS.includes(f.ext) ? 'webvtt' : EXT_TO_CODEC[f.ext]);
 
-    // Source indices whose text decoded to no cues at all, filled in by embeddedTextHashes on the one pass it already makes. Only meaningful once that
-    // call has returned, and it always has: dedupeEmbeddedSubs forces it first, so an unrun probe can never be mistaken for "no empty tracks".
+    // Source indices whose text decoded to no cues at all, filled in by embeddedTextHashes on the one pass it already makes. Only meaningful
+    // once that call has returned, and every reader calls it first, so an unrun probe can never be mistaken for "no empty tracks".
     const embeddedEmptyIdx = new Set();
     // The same pass's cueSpan of every embedded text track it could read, keyed by source index: the yardstick existingSidecarVerdict holds a copy to.
     const embeddedSpan = new Map();
@@ -3784,10 +3791,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // with different text). One ffmpeg run extracts them all in a SINGLE pass through the same codec->format map the sidecars were written with. The bytes are
     // NOT directly comparable - ffmpeg re-serialises on the way out (CRLF folded, BOM dropped, cue numbers renumbered from 1), which is identical only for a
     // sidecar ffmpeg itself wrote - so every side hashes subTextForHash(), and a sidecar ffmpeg did not write is compared through its round trip
-    // (sidecarRoundTripHash). Costs one sequential read (0.3s on an 885MB mkv), so callers only reach it with a real candidate - but the extract and
-    // post-processing callers are gated on remove_source and the import on the marker or deduplicate (default on), so stock settings DO arrive here. An empty
-    // map means "asked, found nothing"; null means the probe could not run, which every caller must read as "cannot prove anything" and import - a redundant
-    // track is recoverable, a dropped one is not.
+    // (sidecarRoundTripHash). Costs one sequential read (0.3s on an 885MB mkv), so callers only reach it with a real candidate - but stock settings DO arrive
+    // here: the extract whenever a sidecar on disk is judged by its text, a styled subtitle is about to be bundled or enabled_checkmedia reads the tracks, the
+    // import on the marker or deduplicate (default on), and post-processing under remove_source. An empty map means "asked, found nothing"; null means the
+    // probe could not run, which every caller must read as "cannot prove anything" and import - a redundant track is recoverable, a dropped one is not.
     let embeddedHashCache;
     const embeddedTextHashes = (subs) => {
         if (embeddedHashCache !== undefined) return embeddedHashCache;
@@ -3861,6 +3868,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // packet larger than its codec's empty sample is a cue that should decode. Memoised; an empty map when the probe cannot run, and the extract then goes
     // ahead unchecked, with a line saying so.
     let cueLossCache;
+    const cueCounts = new Map();   // each listed stream's cue count (cueCount)
     const cueLoss = (index) => {
         if (cueLossCache === undefined) {
             cueLossCache = new Map();
@@ -3874,18 +3882,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.infoLog += `☒Could not count the subtitles' cues (${why}) - extracting without checking that ffmpeg reads each one whole\n`;
             } else {
                 // csv rows are 'packet,<index>,<size>', then 'stream,<index>,<codec>,<frames>'; a stream that decoded nothing reads N/A, and a trailing
-                // field ffprobe adds for side data is ignored by position. Packets are tallied per index against both empty-sample sizes, since the
-                // codec arrives after them.
-                const big = new Map();
+                // field ffprobe adds for side data is ignored by position. Each index's packet sizes are kept until its codec arrives after them, and
+                // counted against that codec's empty sample.
+                const sizes = new Map();
                 for (const row of String(r.stdout).split('\n')) {
                     const [kind, idx, a, b] = row.trim().split(',');
                     if (kind === 'packet') {
-                        const t = big.get(idx) || { 0: 0, 2: 0 };
-                        if (Number(a) > 0) t[0] += 1;
-                        if (Number(a) > 2) t[2] += 1;
-                        big.set(idx, t);
+                        if (!sizes.has(idx)) sizes.set(idx, []);
+                        sizes.get(idx).push(Number(a));
                     } else if (kind === 'stream' && Object.prototype.hasOwnProperty.call(CUE_PACKET_EMPTY_BYTES, a)) {
-                        const cues = (big.get(idx) || { 0: 0, 2: 0 })[CUE_PACKET_EMPTY_BYTES[a]];
+                        const cues = (sizes.get(idx) || []).filter((n) => n > CUE_PACKET_EMPTY_BYTES[a]).length;
+                        cueCounts.set(Number(idx), cues);
                         const read = Number(b) || 0;
                         if (read < cues) cueLossCache.set(Number(idx), { lost: cues - read, cues });
                     }
@@ -3894,6 +3901,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
         return cueLossCache.get(index) || null;
     };
+    // The same listing's count of a stream's cues - its packets larger than its codec's empty sample - or null when the probe could not run or listed no
+    // such stream. It counts what the demuxer reads, so a track whose text ffmpeg cannot decode does not stop it (measured on 7.1.4: an event-less ASS
+    // beside a Windows-1252 srt, listed with no packet by an ffprobe that exits 0, where the text read of every track exits 69).
+    const cueCount = (index) => { cueLoss(index); return cueCounts.has(index) ? cueCounts.get(index) : null; };
 
     // Every loose text sidecar goes into Matroska through this filter, which drops zero-byte packets - the empty WebVTT cues, which show nothing - and
     // leaves every other byte alone: cue ids, settings and voice tags included. ffmpeg 7.1's Matroska muxer stores an empty cue as a block with nothing
@@ -3967,7 +3978,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         bundleMemo.set(f.rel, memo);
         if (!f.bundle || !sidecarContent(f)) return null;   // gone, or over the cap
         const b = readBundleSubtitle(libPathOf(f.rel));
-        memo.state = b.state;
+        memo.state = b.state; memo.opened = !!b.opened;
         if (b.state !== 'ok') return null;   // no content identity - callers fall back to the name
         const text = b.buf.toString('utf8');
         memo.content = {
@@ -4079,7 +4090,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return avGapMemo;
     };
     // `settled`: roles said by a line of their own (keptByEmbeddedLine), left out here; `named`: the sidecar whose own name the roles are read from, one
-    // member of a byte-identical group (the cues are the group's). A WebVTT with empty cues is checked last, and only on Matroska, for the gap an earlier
+    // member of an identical-text group (the cues are the group's). A WebVTT with empty cues is checked last, and only on Matroska, for the gap an earlier
     // version's import of it left (avGap): its words are the only line that names it, so it stays while the gap does.
     const deletionLoss = (f, how, mp4, holders = [], settled = [], named = f) => {
         const roles = rolesUnshown(named, holders).filter((t) => !settled.includes(t));
@@ -4237,6 +4248,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ } }
         return { ...answer, empty, unreadable: unreadableText(text) };
     };
+    // The file API route's existence check of a sidecar at a stream's current name, which is a download, capped at SIDECAR_HASH_MAX: with `judge`
+    // (remove_source=true) the copy is saved to a private staging directory and judged there at once (existingSidecarVerdict), the directory gone before
+    // this returns, so the verdict needs no second download. { answer, verdict }: verdict is null unless the answer is 'present' and the copy was judged.
+    const sidecarAtNameRemote = (s, rel, bundle, subs, judge) => {
+        let dir = '';
+        if (judge) { try { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'awk_subcue_')); } catch (e) { dir = ''; } }
+        const local = dir ? path.join(dir, `c${path.extname(rel).replace(/[^.a-z0-9]/gi, '')}`) : '';
+        try {
+            const answer = sidecarExistsRemote(serverDestFor(rel), local, SIDECAR_HASH_MAX);
+            return { answer, verdict: local && answer.state === 'present' ? existingSidecarVerdict(s, rel, bundle, subs, local) : null };
+        } finally {
+            if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ } }
+        }
+    };
     // existingSidecarVerdict where the node has no library view: the file at rel fetched with the same cap into a private staging directory and judged
     // there - 'unknown' when it cannot be fetched.
     const existingSidecarVerdictRemote = (s, rel, bundle, subs) => {
@@ -4309,73 +4334,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The subtitle roles a track's name fields give, rolesNamed on each field on its own, a role by its tag, so CC and SDH are one: what the duplicate fold
     // below and the import's sidecar merge weigh a title by.
     const rolesIn = (fields) => fields.flatMap((t) => rolesNamed(t, 'subtitle').map((k) => dispositionTypes[k].tag || k));
-    // deduplicate=enabled_checkmedia: the same duplicate test turned on the file's OWN tracks. Two subtitle streams holding identical text are one subtitle
-    // stored twice, however their tags read, and this is the only place in the plugin that removes a subtitle the user did not ask to extract - which is why it
-    // is its own opt-in value rather than part of enabled_only_sidecar. The survivor is chosen by the sidecar groups' rule: lowest source index wins, and it
-    // inherits the union of the group's flags, the first real language any member carries and the first title with which it keeps every role their names give
-    // (below) - identical text, every tag folded onto the keeper, so nothing is lost. Returns the source indices to drop and, only when the union differs from
-    // what the keeper already has, the metadata to restamp it with. Titles rank as mediaTitleFor ranks them within one track: every title a member holds
-    // outside its handler (titleOutsideHandler: an mkv title tag, the udta part of an mp4 or mov mediaInfo Title), even one equal to its handler, ahead of
-    // every named handler - so a release name in the keeper's HANDLER_NAME never displaces a duplicate's real title ('English SDH', whose SDH role would go
-    // with it), and a keeper titled as its handler names keeps that title rather than take a duplicate's. The fold's line names it as the output holds it
-    // (foldedStream: a non-ASCII .mov title reads as the handler), in escMeta's form ('Say "Hi"' is written and named "Say 'Hi'").
-    const dedupeEmbeddedSubs = (subs) => {
-        const hashes = embeddedTextHashes(subs);
-        const out = { dropIdx: [], retag: null, log: '' };
-        if (!hashes) return out;   // the probe could not run, so nothing is proven and nothing is removed
-        // An EMPTY track goes first, and on the same evidence: the read that hashes the others also shows which ones decoded to nothing. A player still
-        // lists such a track and shows the viewer nothing, so it is worth keeping only in the sense that a blank page is. Nothing is lost by removing it -
-        // there is no content to keep and, unlike a duplicate, no survivor to fold the tags onto. "Could not read the track" is NOT empty (see the catch
-        // in embeddedTextHashes): an unreadable stream never enters this set, so a failed probe leaves every subtitle alone.
-        for (const s of subs) {
-            if (!embeddedEmptyIdx.has(s.index)) continue;
-            out.dropIdx.push(s.index);
-            out.log += `☐${streamTag(s.index)}[deduplicate=enabled_checkmedia] Removing this subtitle stream - it carries no subtitle text at all\n`;
-        }
-        if (hashes.size < 2) return out;
-        const byHash = new Map();
-        for (const s of subs) { const h = hashes.get(s.index); if (!h) continue; if (!byHash.has(h)) byHash.set(h, []); byHash.get(h).push(s); }
-        for (const g of byHash.values()) {
-            if (g.length < 2) continue;
-            const ordered = g.slice().sort((a, b) => a.index - b.index);
-            const keep = ordered[0]; const drop = ordered.slice(1);
-            // `default` is the one flag NOT unioned: it says which track a player should pick, not what the subtitle IS, so this plugin never tracks it
-            // (see DISPOSITIONS). Folding it would let a duplicate hand the survivor a default flag it never had, silently changing what plays - so the
-            // keeper simply keeps its own, and the disposition write below, which replaces the whole set, neither invents nor strips it.
-            const disp = new Set(ordered.flatMap(activeDispositions));
-            disp.delete('default');
-            if (keep.disposition?.default === 1) disp.add('default');
-            const lang = ordered.map((s) => resolveLang(s) || '').find((l) => l && l !== 'und') || (resolveLang(keep) || 'und');
-            // The roles a remux leaves each copy, read as the next pass reads it (foldedView: the title written, beside the handler and descriptions it
-            // keeps), by rolesIn. The kept title is the first, in the ranking above, that leaves the keeper every one of them; with none, the group is not
-            // folded, since removing a copy would lose a role the file keeps without it.
-            const readsAs = (s, t) => rolesIn(foldedView([{ index: s.index, lang, title: t, disp: [...disp] }], s).readBackRoleFields);
-            const roles = new Set(ordered.flatMap((s) => readsAs(s, titleOutsideHandler(s) || mediaTitleFor(s))));
-            const titles = [...ordered.map((s) => titleOutsideHandler(s)), ...ordered.map((s) => mediaTitleFor(s))].filter(Boolean);
-            const namesAll = (t) => { const got = readsAs(keep, t); return [...roles].every((r) => got.includes(r)); };
-            const title = (titles.length ? titles : ['']).find(namesAll);
-            if (title === undefined) {
-                const named = [...new Set(titles)].map((t) => `'${logSafe(t)}'`).join(', ') || 'none';
-                out.log += `☑${streamTag(keep.index)}[deduplicate=enabled_checkmedia] Keeping ${drop.length} duplicate subtitle stream${
-                    drop.length === 1 ? '' : 's'} (${drop.map((s) => `s${s.index}`).join(', ')}) - byte-identical to this one, but no one of their`
-                    + ` titles (${named}) keeps every role their names give, and removing one would lose a role\n`;
-                continue;
-            }
-            out.dropIdx.push(...drop.map((s) => s.index));
-            out.log += `☐${streamTag(keep.index)}[deduplicate=enabled_checkmedia] Removing ${drop.length} duplicate subtitle stream${
-                drop.length === 1 ? '' : 's'} (${drop.map((s) => `s${s.index}`).join(', ')}) - byte-identical to this one\n`;
-            const keepDisp = new Set(activeDispositions(keep));
-            const sameDisp = sameDispositions(keepDisp, disp);
-            if (sameDisp && mediaTitleFor(keep) === title && langKey(resolveLang(keep) || 'und') === langKey(lang)) continue;
-            const entry = { index: keep.index, lang, title, disp: [...disp] };
-            out.retag = (out.retag || []).concat([entry]);
-            const written = foldedStream([entry], keep).tags;
-            out.log += `☐${streamTag(keep.index)}[deduplicate=enabled_checkmedia] Folding the removed streams' tags onto it (${
-                [logSafe(written.language), logSafe(escMeta(written.title)), ...disp].filter(Boolean).join(' ')})\n`;
-        }
-        return out;
-    };
-
     // The title test metaMatchesStream and the import retune share: the title extract names a sidecar from (mediaTitleFor, a track an mp4 -> mkv conversion
     // left named only by a HANDLER_NAME tag included) against the sidecar's title as the name gives it (nameTextOf) - the track it was extracted from - or as
     // titleMetaArgs writes it, in escMeta's form - the track it was imported as: a double quote goes in as ', so that track never matched, and an import beside
@@ -4391,11 +4349,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const titleCutFrom = (s, m) => {
         const t = m.title; const token = (ownSidecarBare(m.name) || '').slice(`${videoBase}.s${m.index}.`.length).split('.')[0];
         if (!t || m.index === null || !token) return false;
-        const fixed = Buffer.byteLength(m.name, 'utf8') - Buffer.byteLength(token, 'utf8') - 1; const truncated = titleTruncated;
-        const cuts = [[sidecarTitleOf(s), false], [earlierTitleOf(s), true]]
-            .map(([full, head]) => full !== t && encodeTitleCapped(full, fixed, head, m.lang).cut);
-        titleTruncated = truncated;
-        return cuts.includes(t);
+        const fixed = Buffer.byteLength(m.name, 'utf8') - Buffer.byteLength(token, 'utf8') - 1;
+        return [[sidecarTitleOf(s), false], [earlierTitleOf(s), true]]
+            .map(([full, head]) => full !== t && encodeTitleCapped(full, fixed, head, m.lang).cut).includes(t);
     };
     // Whether a track reading language `have` carries `lang`, a sidecar name's, as this container's write leaves it. Off .mov the two are one language
     // (langKey). On .mov the muxer stores a code as movLangCode spells it (Bokmål and Nynorsk as nor) or, where its table has none (Swedish, Croatian,
@@ -4632,9 +4588,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         .replace(/[[\],;]/g, (c) => `\\${c}`);
 
     // The caption sidecar is named through sidecarBasename like any other, from a stand-in stream describing what the captions ARE: they belong to the video
-    // stream (so its index anchors the name and can never collide with a real subtitle's), they carry no language of their own, and closed captions are the
-    // SDH role in this plugin's vocabulary. Going through sidecarBasename is what keeps parseSidecar its exact inverse, so the import side needs no special
-    // case - and the s<index> anchor is load-bearing: without it parseSidecar requires the language token to be a REAL language, and 'und' is not one.
+    // stream (so its index anchors the name and can never collide with a real subtitle's), they carry no language of their own, and closed captions are the SDH
+    // role in this plugin's vocabulary. Going through sidecarBasename is what keeps parseSidecar its exact inverse, so the import side needs no special case.
     const CC_LANG = 'und';
     const ccPseudoStream = (videoIdx) => ({ index: videoIdx, codec_name: 'subrip', tags: { language: CC_LANG }, disposition: { hearing_impaired: 1 } });
     // A caption field is read through cc_dec's field selector, -data_field, an input option on the lavfi caption source: 0 reads field 1 (CC1/CC2), 1 reads
@@ -4689,7 +4644,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // value FAILS the file rather than falling through to a default, since the three modes do materially different amounts of work and a typo must not
     // quietly pick one. That is true of every dropdown here, which is why they are validated together below.
     const dedupeMode = ddValue(inputs.deduplicate, 'enabled_only_sidecar');
-    const dedupeSidecars = dedupeMode !== 'disabled';          // both enabled values collapse byte-identical sidecars and skip one already embedded
+    const dedupeSidecars = dedupeMode !== 'disabled';          // both enabled values collapse identical-text sidecars and skip one already embedded
     const dedupeStreams = dedupeMode === 'enabled_checkmedia'; // only this one reads the file's own tracks, to find a duplicate or an empty one
     const ccMode = ddValue(inputs.embedded_cc, 'disabled');
     const metadataMode = ddValue(inputs.method_import_metadata, 'embedded');
@@ -4740,15 +4695,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // costs depends on the operation, so each site decides for itself rather than the whole plugin declining: an extract memoises through the SIDECAR ON DISK
     // and needs no tag, while an import has nothing else to tell an already-embedded sidecar from a new one.
     const canRecord = markerPersists(dstContainer);
+    // Pre-processing stops here on a container it cannot write back: an extension no muxer writes (outputMuxerArg), or a video codec the container
+    // refuses even on a copy (CONTAINER_REFUSES_COPY). Post-processing writes nothing, so it still deletes the sidecars of such a file.
+    if (!isPostProcessing && outputMuxerArg(dstContainer) === null) return skip(noMuxerSkipLine(dstContainer));
+    const copyRefused = isPostProcessing ? '' : copyRefusedSkipLine(dstContainer, streams);
+    if (copyRefused) return skip(copyRefused);
     // ====== END GUARDS + INPUT VALIDATION ======
 
     // ====== POST-PROCESSING: remove sidecars now that the import is ACCEPTED ======
-    // The only hook that runs after Tdarr's accept gate, and so the only place remove_source may act. Deleting during pre-processing would
-    // destroy the sidecars of a transcode the user then REJECTS: the muxed copy goes with the work directory and the library file never had
-    // those subtitles, so they would exist nowhere. This stage also runs SERVER-side, which is what lets it clean up on behalf of an
-    // UNMAPPED node - the file API offers upload and download but nothing that removes a path, while the server simply has the library on
-    // disk. Nothing here may throw: the post-processing runner swallows exceptions, so a throw would be invisible. Nothing here needs to
-    // either - a delete that fails leaves a sidecar the marker already excludes from re-import, and the next pass over this file retries it.
+    // The only hook that runs after Tdarr's accept gate, and so the only place a sidecar THIS job embedded may be deleted; one whose text
+    // the library file already held is deleted by the import's redundant-only branch. Deleting during pre-processing would destroy the
+    // sidecars of a transcode the user then REJECTS: the muxed copy goes with the work directory and the library file never had those
+    // subtitles, so they would exist nowhere. This stage also runs SERVER-side, which is what lets it clean up on behalf of an UNMAPPED
+    // node - the file API offers upload and download but nothing that removes a path, while the server simply has the library on disk.
+    // Nothing here may throw: the post-processing runner swallows exceptions, so a throw would be invisible. Nothing here needs to either
+    // - a delete that fails leaves a sidecar the marker already excludes from re-import, and the next pass over this file retries it.
 
     // The streams and global tags of the file as it stands NOW. Pre-processing is always handed ffProbeData; the post-processing stage may not be, so fall
     // back to running ffprobe here - otherArguments supplies ffmpegPath and ffprobe sits beside it under the matching name. null means neither route
@@ -4773,10 +4734,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         } catch (e) { return null; }
     };
 
-    // remove_source's actual deletion. Called ONLY from the post-processing pass, once Tdarr has accepted the transcode and moved it into the library, so the
-    // embedded copy is the one that survives. This unlink is the one irreversible thing the plugin does, so each marker-listed sidecar has to be proved against
-    // the accepted file's own text before it goes; the marker VALUE still scopes deletion to names we listed, so no file outside this video's sidecars is ever
-    // a candidate. A false negative merely keeps the sidecar (a later pass, or the user, removes it) and never loses subtitle content, so this fails safe.
+    // remove_source's actual deletion. Called ONLY from the post-processing pass, once Tdarr has accepted the transcode and moved it into the library,
+    // so the embedded copy is the one that survives. This unlink is irreversible, so each marker-listed sidecar has to be proved against the accepted
+    // file's own text before it goes; the marker VALUE still scopes deletion to names we listed, so no file outside this video's sidecars is ever a
+    // candidate. A false negative merely keeps the sidecar (a later pass, or the user, removes it) and never loses subtitle content, so this fails safe.
     const deleteImportedSidecars = (streamList, globalTags, mp4Target) => {
         const delReason = 'remove_source=true';   // this pass only runs when removal is on
         const marked = new Set(decodeMarkerList(getTagCI(globalTags || {}, SUB_MARKER_TAG)));
@@ -4852,9 +4813,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             : `☑[remove_source=true] No imported sidecar is waiting to be removed\n`);
     }
     // ====== END POST-PROCESSING ======
-    if (outputMuxerArg(dstContainer) === null) return skip(noMuxerSkipLine(dstContainer));   // an extension no muxer writes back (outputMuxerArg)
-    const copyRefused = copyRefusedSkipLine(dstContainer, file.ffProbeData?.streams);
-    if (copyRefused) return skip(copyRefused);   // a video codec the container refuses even on a copy (CONTAINER_REFUSES_COPY)
 
     // ====== SUBTITLE METADATA / RETAG ARGS ======
     // The one rule for writing a subtitle language into the output container: mp4 folds to /T (to6392T), mkv keeps the sidecar spelling (normSidecarLang),
@@ -4911,6 +4869,72 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const foldedView = (retag, st) => {
         const f = foldedStream(retag, st);
         return f === st ? st : { ...f, readBackRoleFields: readBackFieldsOf(f, getTagCI(f.tags, 'handler_name') || '', f.tags.title || '', dstContainer) };
+    };
+    // deduplicate=enabled_checkmedia: the same duplicate test turned on the file's OWN tracks. Two subtitle streams holding identical text are one subtitle
+    // stored twice, however their tags read, and this is the only place in the plugin that removes a subtitle the user did not ask to extract - which is why it
+    // is its own opt-in value rather than part of enabled_only_sidecar. The survivor is chosen by the sidecar groups' rule: lowest source index wins, and it
+    // inherits the union of the group's flags, the first real language any member carries and the first title with which it keeps every role their names give
+    // (below) - identical text, every tag folded onto the keeper, so nothing is lost. Returns the source indices to drop and, only when the union differs from
+    // what the keeper already has, the metadata to restamp it with. Titles rank as mediaTitleFor ranks them within one track: every title a member holds
+    // outside its handler (titleOutsideHandler: an mkv title tag, the udta part of an mp4 or mov mediaInfo Title), even one equal to its handler, ahead of
+    // every named handler - so a release name in the keeper's HANDLER_NAME never displaces a duplicate's real title ('English SDH', whose SDH role would go
+    // with it), and a keeper titled as its handler names keeps that title rather than take a duplicate's. The fold's line names it as the output holds it
+    // (foldedStream: a non-ASCII .mov title reads as the handler), in escMeta's form ('Say "Hi"' is written and named "Say 'Hi'").
+    const dedupeEmbeddedSubs = (subs) => {
+        const hashes = dedupeStreams && embeddedTextHashes(subs);
+        const out = { dropIdx: [], retag: null, log: '' };
+        if (!hashes) return out;   // another deduplicate value, or the probe could not run: nothing is proven and nothing is removed
+        // An EMPTY track goes first, and on the same evidence: the read that hashes the others also shows which ones decoded to nothing. A player still
+        // lists such a track and shows the viewer nothing, so it is worth keeping only in the sense that a blank page is. Nothing is lost by removing it -
+        // there is no content to keep and, unlike a duplicate, no survivor to fold the tags onto. "Could not read the track" is NOT empty (see the catch
+        // in embeddedTextHashes): an unreadable stream never enters this set, so a failed probe leaves every subtitle alone.
+        for (const s of subs) {
+            if (!embeddedEmptyIdx.has(s.index)) continue;
+            out.dropIdx.push(s.index);
+            out.log += `☐${streamTag(s.index)}[deduplicate=enabled_checkmedia] Removing this subtitle stream - it carries no subtitle text at all\n`;
+        }
+        if (hashes.size < 2) return out;
+        const byHash = new Map();
+        for (const s of subs) { const h = hashes.get(s.index); if (!h) continue; if (!byHash.has(h)) byHash.set(h, []); byHash.get(h).push(s); }
+        for (const g of byHash.values()) {
+            if (g.length < 2) continue;
+            const ordered = g.slice().sort((a, b) => a.index - b.index);
+            const keep = ordered[0]; const drop = ordered.slice(1);
+            // `default` is the one flag NOT unioned: it says which track a player should pick, not what the subtitle IS, so this plugin never tracks it
+            // (see DISPOSITIONS). Folding it would let a duplicate hand the survivor a default flag it never had, silently changing what plays - so the
+            // keeper simply keeps its own, and the disposition write below, which replaces the whole set, neither invents nor strips it.
+            const disp = new Set(ordered.flatMap(activeDispositions));
+            disp.delete('default');
+            if (keep.disposition?.default === 1) disp.add('default');
+            const lang = ordered.map((s) => resolveLang(s) || '').find((l) => l && l !== 'und') || (resolveLang(keep) || 'und');
+            // The roles a remux leaves each copy, read as the next pass reads it (foldedView: the title written, beside the handler and descriptions it
+            // keeps), by rolesIn. The kept title is the first, in the ranking above, that leaves the keeper every one of them; with none, the group is not
+            // folded, since removing a copy would lose a role the file keeps without it.
+            const readsAs = (s, t) => rolesIn(foldedView([{ index: s.index, lang, title: t, disp: [...disp] }], s).readBackRoleFields);
+            const roles = new Set(ordered.flatMap((s) => readsAs(s, titleOutsideHandler(s) || mediaTitleFor(s))));
+            const titles = [...ordered.map((s) => titleOutsideHandler(s)), ...ordered.map((s) => mediaTitleFor(s))].filter(Boolean);
+            const namesAll = (t) => { const got = readsAs(keep, t); return [...roles].every((r) => got.includes(r)); };
+            const title = (titles.length ? titles : ['']).find(namesAll);
+            if (title === undefined) {
+                const named = [...new Set(titles)].map((t) => `'${logSafe(t)}'`).join(', ') || 'none';
+                out.log += `☑${streamTag(keep.index)}[deduplicate=enabled_checkmedia] Keeping ${drop.length} duplicate subtitle stream${
+                    drop.length === 1 ? '' : 's'} (${drop.map((s) => `s${s.index}`).join(', ')}) - identical in text to this one, but no one of their`
+                    + ` titles (${named}) keeps every role their names give, and removing one would lose a role\n`;
+                continue;
+            }
+            out.dropIdx.push(...drop.map((s) => s.index));
+            out.log += `☐${streamTag(keep.index)}[deduplicate=enabled_checkmedia] Removing ${drop.length} duplicate subtitle stream${
+                drop.length === 1 ? '' : 's'} (${drop.map((s) => `s${s.index}`).join(', ')}) - identical in text to this one\n`;
+            const keepDisp = new Set(activeDispositions(keep));
+            const sameDisp = sameDispositions(keepDisp, disp);
+            if (sameDisp && mediaTitleFor(keep) === title && langKey(resolveLang(keep) || 'und') === langKey(lang)) continue;
+            const entry = { index: keep.index, lang, title, disp: [...disp] };
+            out.retag = (out.retag || []).concat([entry]);
+            const written = foldedStream([entry], keep).tags;
+            out.log += `☐${streamTag(keep.index)}[deduplicate=enabled_checkmedia] Folding the removed streams' tags onto it (${
+                [logSafe(written.language), logSafe(escMeta(written.title)), ...disp].filter(Boolean).join(' ')})\n`;
+        }
+        return out;
     };
     // ====== END SUBTITLE METADATA / RETAG ARGS ======
 
@@ -5501,7 +5525,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // ====== EXTRACT: embedded text subs -> sidecars (+ optional removal) ======
             // Duplicate tracks the file already carries go before anything else: a dropped stream must not also be written to a sidecar, or the copy we just
             // decided was redundant comes straight back on the next import under a name of its own.
-            const dupes = dedupeStreams ? dedupeEmbeddedSubs(streams.filter((s) => codecTypeOf(s) === 'subtitle')) : { dropIdx: [], retag: null, log: '' };
+            const dupes = dedupeEmbeddedSubs(streams.filter((s) => codecTypeOf(s) === 'subtitle'));
             response.infoLog += dupes.log;
             dupes.dropIdx.forEach((i) => droppedDuplicates.add(i));
             const eligible = streams.filter((s) => codecTypeOf(s) === 'subtitle' && isTextSub(s)
@@ -5560,21 +5584,148 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return f === st ? st : { ...f, sidecarView: true };
             };
 
+            // Which file already on disk is this track's sidecar, by one rule: (1) the current name, whenever an entry spelled exactly so exists
+            // (entryAt) - a user's edit under it is theirs; (2) else the previous sub_worker's own titled or role-token spelling, by name
+            // (earlierSidecarNames); (3) else a file under any other spelling, only when its cue texts are this stream's and no other stream shares them
+            // - on a library this node can read, any of this video's sidecars in the stream's language (sidecarByText), and on the file API route, which
+            // cannot list, the earlier spellings and this name at each of the file's other subtitle indices, each downloaded (cueTextRemote) - and under
+            // remove_source=true only as it is when it spells the track as the current name does (sameSpelledTrack), else renamed to the current name,
+            // or, where the node cannot rename, the stream kept and no new name written while that file stands (an empty or incomplete current name is
+            // still written over); (4) a file at one of this track's earlier spellings that holds no text while the stream has cues (emptyCopyAt; on the
+            // file API each downloaded, (2)'s too: ownSpellingRemote) is deleted, and where the node cannot delete it the current name is written and,
+            // under remove_source=true, the stream kept; (5) never through a symbolic link, and a candidate fails the file only on the file API, where
+            // an unconfirmed answer - or under remove_source=true a file holding a NUL - waits for a later cycle, or the pass fails; (6) under
+            // remove_source=true, on a library this node can read, a file left at this track's index, language and format is named when its text is this
+            // stream's and another's too, and when it is no stream's it keeps the stream as (3)'s unrenamed file does (strayAtIndex).
+            // What the rule leaves: under remove_source=false a sidecar the user EDITED under a spelling no longer current matches no text, so one new
+            // sidecar is written beside it, and a stale file holding a text two streams share is taken by neither; and (1) has no content check, so after a
+            // renumbering a track whose new index is a neighbour's old one takes that file by name and its own text is written again. On the file API,
+            // which cannot list, a file under a title the track no longer has is not found, nor is an edit: under remove_source=true the stream goes, and
+            // the import folds that file with the current one (their flags joined, the first title by name).
+            // Returns { name, remoteAnswer, remoteVerdict, emptyLeft, oldLeft, stray }: the name kept; on the API route the server's
+            // answer for it, reused by the loop's existence test, and under remove_source=true the verdict on the copy that answer
+            // fetched ({ name, verdict }, sidecarAtNameRemote); the empty earlier spellings this node cannot delete (4); the files
+            // (3) finds that it cannot rename (and (6)'s edits, which keep the stream the same way); and what (6) finds. Its unlinks,
+            // renames and lines happen here, in the rule's order. nameWritable: whether the current name can be written at all.
+            const adoptExistingSidecar = (s, spelled, bundle, earlier, claimed, nameWritable) => {
+                let name = spelled; let remoteAnswer = null; let remoteVerdict = null;
+                const emptyLeft = []; const oldLeft = []; let stray = [];
+                if (!readViaApi()) {
+                    const current = entryAt(name);
+                    // Under remove_source=true (4) looks beside the current name too, every pass, so an empty file this node cannot delete keeps the stream
+                    // while it stands; and a read-only mount, which renames nothing, has (3) look there as well.
+                    const lookBesideCurrent = removeSource && placeViaApi();
+                    for (const c of !current || removeSource ? earlier : []) {
+                        if (!emptyCopyAt(s, libPathOf(c.name), c.name, bundle, streams)) continue;
+                        if (!placeViaApi()) {
+                            try {
+                                fs.unlinkSync(libPathOf(c.name));
+                                response.infoLog += `☐${streamTag(s.index)} Replacing ${c.name} with ${name} - an earlier run left it empty\n`;
+                                continue;
+                            } catch (e) { /* it stays, reported below */ }
+                        }
+                        emptyLeft.push(c.name);
+                    }
+                    const own = current ? undefined : earlier.find((c) => c.own && !c.byText && !emptyLeft.includes(c.name)
+                        && fs.existsSync(libPathOf(c.name)) && !isSymlinkAt(libPathOf(c.name)))?.name;
+                    const found = own || (current && !lookBesideCurrent) ? null : sidecarByText(s, name, earlier.map((c) => c.name), bundle, streams, claimed);
+                    // Under remove_source=true, where the route can delete, (2)'s file is replaced under the current name when an interrupted run left it
+                    // incomplete.
+                    if (own && removeSource && !placeViaApi() && leftIncomplete(existingSidecarVerdict(s, own, bundle, streams), own)) {
+                        try {
+                            fs.unlinkSync(libPathOf(own));
+                            response.infoLog += `☐${streamTag(s.index)}[remove_source=true] Replacing ${own} with ${name}`
+                                + ' - an earlier run left it incomplete\n';
+                        } catch (e) { name = own; }   // the check below meets it again, and says it could not be deleted
+                    } else if (own) name = own;
+                    else if (found && current) { if (!sameSpelledTrack(found, name)) oldLeft.push(found); }
+                    else if (found && (!removeSource || sameSpelledTrack(found, name))) name = found;
+                    else if (found && nameWritable && !placeViaApi()) {
+                        try {
+                            fs.renameSync(libPathOf(found), libPathOf(name));
+                            response.infoLog += `☐${streamTag(s.index)}[remove_source=true] Renaming ${found} to ${name} - its text is this track's\n`;
+                        } catch (e) { oldLeft.push(found); }
+                    } else if (found && nameWritable) oldLeft.push(found);
+                    if (removeSource) stray = strayAtIndex(s, name, bundle, streams, claimed);
+                } else if (serverDestFor(name)) {
+                    const atName = sidecarAtNameRemote(s, name, bundle, streams, removeSource);
+                    remoteAnswer = atName.answer;
+                    if (atName.verdict) remoteVerdict = { name, verdict: atName.verdict };
+                    const absent = remoteAnswer.state === 'absent' && !remoteAnswer.empty;
+                    // (3)'s name at another subtitle index, where a renumbering (a reorder, a dropped stream) left the sidecar: tried only while the current
+                    // name is absent, so it costs at most one download per subtitle, and taken by its cue texts alone.
+                    const head = `${bundle ? '.' : ''}${videoBase}.s${s.index}.`;
+                    const moved = !absent ? [] : streams.filter((x) => codecTypeOf(x) === 'subtitle' && x.index !== s.index)
+                        .map((x) => ({ name: `${bundle ? '.' : ''}${videoBase}.s${x.index}.${name.slice(head.length)}`, byText: true, moved: true }))
+                        .filter((c) => !claimed.has(c.name) && !earlier.some((e) => e.name === c.name));
+                    let adopted = false;
+                    for (const c of absent || (removeSource && remoteAnswer.state !== 'unknown') ? earlier.concat(moved) : []) {
+                        if (adopted && !removeSource) break;
+                        const byText = !c.own || c.byText;
+                        const got = byText ? cueTextRemote(s, c.name, bundle, streams) : '';
+                        if (c.moved && got !== 'same') continue;
+                        const answer = byText ? null : ownSpellingRemote(s, c.name, bundle, streams);
+                        if (got === 'empty' || answer?.empty) { emptyLeft.push(c.name); continue; }
+                        if (got === 'same' && removeSource && !sameSpelledTrack(c.name, name)) {
+                            if (nameWritable) oldLeft.push(c.name); adopted = true; continue;
+                        }
+                        if (adopted || !absent) continue;
+                        if (got === 'same') { name = c.name; remoteAnswer = { state: 'present', why: '' }; adopted = true; }
+                        // One holding a NUL beside other text is not trusted by name where the stream would go: it waits, as for any unconfirmed answer.
+                        else if (answer && answer.state !== 'absent' && answer.state !== 'over') {
+                            name = c.name; adopted = true;
+                            remoteAnswer = removeSource && answer.unreadable ? { state: 'unknown', unreadable: true } : answer;
+                        }
+                    }
+                }
+                return { name, remoteAnswer, remoteVerdict, emptyLeft, oldLeft, stray };
+            };
             // sidecarOut carries the extra ffmpeg outputs that write the sidecars on a node with a WRITABLE library view (mapped, or a writable mount).
             // Without one the same extractions are collected in placeJobs instead, to be run and uploaded by placeSidecars once the loop has seen every
             // stream - which is why the placement decision is made HERE: Tdarr runs the preset only after the plugin returns, so a preset output that
             // fails against a read-only mount cannot be caught and rerouted, only quarantined.
             let sidecarOut = ''; const removedIndices = new Set(dupes.dropIdx); let wrote = 0; let skipped = 0; let refused = 0; let bundled = 0;
-            let deferred = 0; let held = 0; let unread = 0;
-            // A stream ffmpeg cannot read whole (cueLoss) is neither written to a loose sidecar nor taken out of the file. A bundle is not decoded - it
-            // copies the packets as they are - so it is exempt. Asked under remove_source=true before anything is renamed or replaced for the stream, and
-            // otherwise only where a sidecar is about to be written, so a finished extract whose subtitles stay in the file pays no probe.
-            const unreadable = (s) => {
+            let deferred = 0; let held = 0; let unread = 0; let titleTruncated = false; let blank = 0; let unsure = 0;
+            // A stream ffmpeg cannot read whole (cueLoss) is neither written to a sidecar nor taken out of the file, and a styled one's
+            // fonts stay with it. A bundle copies the packets as they are, but the import reads its subtitle out and refuses one it cannot
+            // decode, so a bundle is no exception (measured on 7.1.4: a Windows-1252 ASS bundled and stripped with its font was refused on
+            // every import). Asked under remove_source=true before anything is renamed or replaced for the stream, and otherwise only
+            // where a sidecar is about to be written, so a finished extract whose subtitles stay in the file pays no probe.
+            const refuseUnreadable = (s) => {
                 const l = cueLoss(s.index);
                 if (!l) return false;
                 unread += 1;
                 response.infoLog += `☒${streamTag(s.index)} ffmpeg reads only ${l.cues - l.lost} of this subtitle's ${l.cues} cues - the rest are not`
                     + ' UTF-8 text (a legacy character set such as Windows-1252?); not extracting it, keeping the embedded subtitle\n';
+                return true;
+            };
+            // Whether a styled subtitle holds any cue: the shared text read (embeddedEmptyIdx), or where that read fails - a track whose text it cannot
+            // decode stops it - cueLoss's packet listing (cueCount); 'unknown' when neither can say.
+            const styledCues = (s) => {
+                if (embeddedTextHashes(streams)) return embeddedEmptyIdx.has(s.index) ? 'none' : 'some';
+                const n = cueCount(s.index);
+                return n === null ? 'unknown' : n > 0 ? 'some' : 'none';
+            };
+            // A styled subtitle with no cue is never bundled: a Matroska file of a subtitle track with no events reads as "End of file" (measured on 7.1.4:
+            // the bundle of such a track and its font, 774 kB, failed every import), so the fonts would leave the video in a file nothing reads. Under
+            // remove_source=true it goes as an empty track, as deduplicate=enabled_checkmedia takes one out; otherwise it stays, said. One whose cues
+            // cannot be counted is kept with its fonts, unbundled, for a later pass. True when this has dealt with the stream.
+            const refuseCueless = (s) => {
+                const cues = styledCues(s);
+                if (cues === 'some') return false;
+                if (cues === 'unknown') {
+                    unsure += 1;
+                    response.infoLog += `☒${streamTag(s.index)} Could not read whether this styled subtitle holds any text - not bundling it, keeping it`
+                        + ' and its fonts in the video\n';
+                } else if (removeSource) {
+                    removedIndices.add(s.index);
+                    response.infoLog += `☐${streamTag(s.index)}[remove_source=true] Removing this subtitle stream - it carries no subtitle text at`
+                        + ' all, so there is nothing to bundle\n';
+                } else {
+                    blank += 1;
+                    response.infoLog += `☑${streamTag(s.index)} Not extracting this subtitle - it carries no subtitle text at all, so there is nothing`
+                        + ' to bundle\n';
+                }
                 return true;
             };
             const placeJobs = [];
@@ -5616,121 +5767,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // The names each stream takes by name - its current spelling, and the previous sub_worker's titled or role-token one - mapped to its index;
             // no other stream adopts one of them by its text (sidecarByText), or two would share one file and remove_source strip both.
             const claimedBy = new Map();
-            {
-                const truncated = titleTruncated; const roles = cutRoleTokens; const lostRoles = cutRolesLost; const budget = cutBudget;
-                const flags = cutFlagsLost;
-                for (const st of eligible) {
-                    const b = fontIndices.length > 0 && isStyledSub(st.codec_name);
-                    claimedBy.set(sidecarBasename(sidecarView(st), b), st.index);
-                    const own = earlierSidecarNames(foldRetag(st), sidecarView(st), b, null).find((c) => c.own && !c.byText);
-                    if (own) claimedBy.set(own.name, st.index);
-                }
-                titleTruncated = truncated; cutRoleTokens = roles; cutRolesLost = lostRoles; cutBudget = budget; cutFlagsLost = flags;
+            for (const st of eligible) {
+                const b = fontIndices.length > 0 && isStyledSub(st.codec_name);
+                claimedBy.set(sidecarBasename(sidecarView(st), b), st.index);
+                const own = earlierSidecarNames(foldRetag(st), sidecarView(st), b, null).find((c) => c.own && !c.byText);
+                if (own) claimedBy.set(own.name, st.index);
             }
             for (const s of eligible) {
                 const { enc } = TEXT_SUB[codecNameOf(s)];
                 const bundle = fontIndices.length > 0 && isStyledSub(s.codec_name);
-                if (removeSource && !bundle && unreadable(s)) continue;
-                // This name's cut (titleTruncated, cutRoleTokens) is reported below only if the extract keeps this name, not an earlier spelling.
-                const truncatedBefore = titleTruncated;
-                titleTruncated = false;
-                // Spelled from sidecarView's stream (sidecarTitleOf); a track named only by its handler takes that name as a title token.
+                if (removeSource && refuseUnreadable(s)) continue;
+                if (removeSource && bundle && refuseCueless(s)) continue;
+                // Spelled from sidecarView's stream (sidecarTitleOf); a track named only by its handler takes that name as a title token. Its cut is reported
+                // below only if the extract keeps this name, not an earlier spelling.
                 const view = sidecarView(s);
-                let name = sidecarBasename(view, bundle);
-                const cutSpelling = titleTruncated ? name : null;
-                const cutRoles = cutRoleTokens; const cutLost = cutRolesLost; const cutBytes = cutBudget; const flagsLost = cutFlagsLost; const spelled = name;
-                titleTruncated = truncatedBefore;
-                // Which file already on disk is this track's sidecar, by one rule: (1) the current name, whenever an entry spelled exactly so exists
-                // (entryAt) - a user's edit under it is theirs; (2) else the previous sub_worker's own titled or role-token spelling, by name
-                // (earlierSidecarNames); (3) else a file under any other spelling, only when its cue texts are this stream's and no other stream shares them
-                // - on a library this node can read, any of this video's sidecars in the stream's language (sidecarByText), and on the file API route, which
-                // cannot list, the earlier spellings and this name at each of the file's other subtitle indices, each downloaded (cueTextRemote) - and under
-                // remove_source=true only as it is when it spells the track as the current name does (sameSpelledTrack), else renamed to the current name,
-                // or, where the node cannot rename, the stream kept and no new name written while that file stands (an empty or incomplete current name is
-                // still written over); (4) a file at one of this track's earlier spellings that holds no text while the stream has cues (emptyCopyAt; on the
-                // file API each downloaded, (2)'s too: ownSpellingRemote) is deleted, and where the node cannot delete it the current name is written and,
-                // under remove_source=true, the stream kept; (5) never through a symbolic link, and a candidate fails the file only on the file API, where
-                // an unconfirmed answer - or under remove_source=true a file holding a NUL - waits for a later cycle, or the pass fails; (6) under
-                // remove_source=true, on a library this node can read, a file left at this track's index, language and format is named when its text is this
-                // stream's and another's too, and when it is no stream's it keeps the stream as (3)'s unrenamed file does (strayAtIndex).
-                const earlier = earlierSidecarNames(foldRetag(s), view, bundle, removeSource ? carryView(s) : null).filter((c) => c.name !== name);
+                const spelledCut = sidecarNameWithCut(view, bundle);
+                const { name: spelled, roleTokens: cutRoles, rolesLost: cutLost, budget: cutBytes, flagsLost } = spelledCut;
+                const cutSpelling = spelledCut.truncated ? spelled : null;
+                const earlier = earlierSidecarNames(foldRetag(s), view, bundle, removeSource ? carryView(s) : null).filter((c) => c.name !== spelled);
                 const claimed = new Set([...claimedBy].filter(([, i]) => i !== s.index).map(([n]) => n));
-                // On the API route the answer for the name kept is reused by the existence test below.
-                let remoteAnswer = null;
-                // The empty earlier spellings this node cannot delete (4), the files (3) finds that it cannot rename (and (6)'s edits, which keep the stream
-                // the same way), and what (6) finds.
-                const emptyLeft = []; const oldLeft = []; let stray = [];
                 // Whether the current name can be written at all: the refusals below keep the stream, so no earlier file is renamed for a name they refuse.
-                const writable = Buffer.byteLength(name, 'utf8') <= NAME_BYTE_CAP && pathIsPresetSafe(libPathOf(name));
-                // What the rule leaves: under remove_source=false a sidecar the user EDITED under a spelling no longer current matches no text, so one new
-                // sidecar is written beside it, and a stale file holding a text two streams share is taken by neither; and (1) has no content check, so after a
-                // renumbering a track whose new index is a neighbour's old one takes that file by name and its own text is written again. On the file API,
-                // which cannot list, a file under a title the track no longer has is not found, nor is an edit: under remove_source=true the stream goes, and
-                // the import folds that file with the current one (their flags joined, the first title by name).
-                if (!readViaApi()) {
-                    const current = entryAt(name);
-                    // Under remove_source=true (4) looks beside the current name too, every pass, so an empty file this node cannot delete keeps the stream
-                    // while it stands; and a read-only mount, which renames nothing, has (3) look there as well.
-                    const readOnly = removeSource && placeViaApi();
-                    for (const c of !current || removeSource ? earlier : []) {
-                        if (!emptyCopyAt(s, libPathOf(c.name), c.name, bundle, streams)) continue;
-                        if (!placeViaApi()) {
-                            try {
-                                fs.unlinkSync(libPathOf(c.name));
-                                response.infoLog += `☐${streamTag(s.index)} Replacing ${c.name} with ${name} - an earlier run left it empty\n`;
-                                continue;
-                            } catch (e) { /* it stays, reported below */ }
-                        }
-                        emptyLeft.push(c.name);
-                    }
-                    const own = current ? undefined : earlier.find((c) => c.own && !c.byText && !emptyLeft.includes(c.name)
-                        && fs.existsSync(libPathOf(c.name)) && !isSymlinkAt(libPathOf(c.name)))?.name;
-                    const found = own || (current && !readOnly) ? null : sidecarByText(s, name, earlier.map((c) => c.name), bundle, streams, claimed);
-                    // Under remove_source=true, where the route can delete, (2)'s file is replaced under the current name when an interrupted run left it
-                    // incomplete.
-                    if (own && removeSource && !placeViaApi() && leftIncomplete(existingSidecarVerdict(s, own, bundle, streams), own)) {
-                        try {
-                            fs.unlinkSync(libPathOf(own));
-                            response.infoLog += `☐${streamTag(s.index)}[remove_source=true] Replacing ${own} with ${name}`
-                                + ' - an earlier run left it incomplete\n';
-                        } catch (e) { name = own; }   // the check below meets it again, and says it could not be deleted
-                    } else if (own) name = own;
-                    else if (found && current) { if (!sameSpelledTrack(found, name)) oldLeft.push(found); }
-                    else if (found && (!removeSource || sameSpelledTrack(found, name))) name = found;
-                    else if (found && writable && !placeViaApi()) {
-                        try {
-                            fs.renameSync(libPathOf(found), libPathOf(name));
-                            response.infoLog += `☐${streamTag(s.index)}[remove_source=true] Renaming ${found} to ${name} - its text is this track's\n`;
-                        } catch (e) { oldLeft.push(found); }
-                    } else if (found && writable) oldLeft.push(found);
-                    if (removeSource) stray = strayAtIndex(s, name, bundle, streams, claimed);
-                } else if (serverDestFor(name)) {
-                    remoteAnswer = sidecarExistsRemote(serverDestFor(name));
-                    const absent = remoteAnswer.state === 'absent' && !remoteAnswer.empty;
-                    // (3)'s name at another subtitle index, where a renumbering (a reorder, a dropped stream) left the sidecar: tried only while the current
-                    // name is absent, so it costs at most one download per subtitle, and taken by its cue texts alone.
-                    const head = `${bundle ? '.' : ''}${videoBase}.s${s.index}.`;
-                    const moved = !absent ? [] : streams.filter((x) => codecTypeOf(x) === 'subtitle' && x.index !== s.index)
-                        .map((x) => ({ name: `${bundle ? '.' : ''}${videoBase}.s${x.index}.${name.slice(head.length)}`, byText: true, moved: true }))
-                        .filter((c) => !claimed.has(c.name) && !earlier.some((e) => e.name === c.name));
-                    let adopted = false;
-                    for (const c of absent || (removeSource && remoteAnswer.state !== 'unknown') ? earlier.concat(moved) : []) {
-                        if (adopted && !removeSource) break;
-                        const byText = !c.own || c.byText;
-                        const got = byText ? cueTextRemote(s, c.name, bundle, streams) : '';
-                        if (c.moved && got !== 'same') continue;
-                        const answer = byText ? null : ownSpellingRemote(s, c.name, bundle, streams);
-                        if (got === 'empty' || answer?.empty) { emptyLeft.push(c.name); continue; }
-                        if (got === 'same' && removeSource && !sameSpelledTrack(c.name, name)) { if (writable) oldLeft.push(c.name); adopted = true; continue; }
-                        if (adopted || !absent) continue;
-                        if (got === 'same') { name = c.name; remoteAnswer = { state: 'present', why: '' }; adopted = true; }
-                        // One holding a NUL beside other text is not trusted by name where the stream would go: it waits, as for any unconfirmed answer.
-                        else if (answer && answer.state !== 'absent' && answer.state !== 'over') {
-                            name = c.name; adopted = true;
-                            remoteAnswer = removeSource && answer.unreadable ? { state: 'unknown', unreadable: true } : answer;
-                        }
-                    }
-                }
+                const nameWritable = Buffer.byteLength(spelled, 'utf8') <= NAME_BYTE_CAP && pathIsPresetSafe(libPathOf(spelled));
+                const { name, remoteAnswer, remoteVerdict, emptyLeft, oldLeft, stray }
+                    = adoptExistingSidecar(s, spelled, bundle, earlier, claimed, nameWritable);
                 // A remove_source=true import restores the track from its sidecar's name and folds the files holding its text, so a file this node can neither
                 // rename nor delete keeps the stream while it stands (measured: an empty title-less spelling written over on the file API became the track's
                 // only copy, and the import brought it back with no title; an old spelling beside the current name brought back its title and flags).
@@ -5761,7 +5820,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const tokens = (list) => list.map((t) => `.${t}`).join(' and ');
                     if (cutRoles.length) {
                         response.infoLog += `☒${streamTag(s.index)} The title in ${name} ${room}, too few for its role words - ${tokens(cutRoles)} in the name`
-                            + ` keeps ${cutRoles.length > 1 ? 'those roles' : 'that role'}\n`;
+                            + ` ${cutRoles.length > 1 ? 'keep those roles' : 'keeps that role'}\n`;
                     }
                     if (cutLost.length) {
                         response.infoLog += `☒${streamTag(s.index)} The title in ${name} ${room}, too few for its role words, and the name has no room for`
@@ -5853,7 +5912,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         + 'anywhere; remove it and requeue, keeping the embedded subtitle\n';
                     continue;
                 }
-                let alreadyExtracted = remote ? remote.state === 'present'
+                // A file at the name over SIDECAR_HASH_MAX ('over') is there, never judged: it keeps the trust a file with bytes always had.
+                let alreadyExtracted = remote ? remote.state === 'present' || remote.state === 'over'
                     : (removeSource ? fileHasBytes(full) : fs.existsSync(full));
                 // A file here that holds no text while the stream has cues is replaced under remove_source=false too: it holds nothing to lose, and an import
                 // would take it for the stream (emptyCopyAt). A cue-less stream's own empty sidecar is its extract, and stays (or every pass would write it
@@ -5867,7 +5927,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // the whole run rather than overwrite an output, and uploaded over through a read-only mount or the file API - and one cut short or unreadable
                 // keeps the stream. Unjudged, when either side cannot be read, a file with bytes keeps the trust it always had.
                 if (removeSource && (remote ? remote.state === 'present' : fs.existsSync(full))) {
-                    const verdict = remote ? existingSidecarVerdictRemote(s, name, bundle, streams) : existingSidecarVerdict(s, name, bundle, streams);
+                    const verdict = !remote ? existingSidecarVerdict(s, name, bundle, streams)
+                        : remoteVerdict && remoteVerdict.name === name ? remoteVerdict.verdict : existingSidecarVerdictRemote(s, name, bundle, streams);
                     if (verdict.state === 'short') {
                         held += 1;
                         response.infoLog += `☒${streamTag(s.index)}[remove_source=true] ${name} already on disk stops at ${verdict.end.toFixed(1)} s but this `
@@ -5895,7 +5956,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // current name judged empty or incomplete above is still written over, the stream kept (keep): left as it was, every import would take it,
                 // empty or cut short, for the track (an empty one: emptyCopyAt).
                 else if (oldLeft.length && !(remote ? remote.empty : fs.existsSync(full))) { held += 1; continue; }
-                else if (!removeSource && !bundle && unreadable(s)) continue;
+                else if (!removeSource && refuseUnreadable(s)) continue;
+                else if (!removeSource && bundle && refuseCueless(s)) continue;
                 // API placement: the extraction is deferred to placeSidecars after the loop, so this stream's removedIndices entry and its bundled tally
                 // wait for the server's answer - nothing may be stripped until the sidecar is confirmed in the library.
                 else if (placeViaApi()) {
@@ -6024,16 +6086,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     failFile(deferred
                         ? `${wrote || skipped || held ? 'Not every' : 'No'} subtitle could be extracted - a sidecar in the library is unconfirmed or`
                             + ' unreadable, see the reasons above; requeue once they are resolved'
-                        : 'No subtitle could be extracted - every eligible subtitle was refused, see the reasons above');
+                        : `No subtitle could be extracted - ${blank || unsure ? 'the rest were' : 'every eligible subtitle was'} refused, see the reasons`
+                            + ' above');
                 }
                 // The tag reports the value IN EFFECT, which is not always false here: a caption read never enters removedIndices, so a run that placed only
                 // captions and could neither strip them nor record the request reaches this line with removal ON - one line under the ☒ that says why.
                 if (wrote) return skip(`☑[remove_source=${removeSource}] Sidecars placed in the library - nothing left to remux\n`);
-                if (held || unread) {
-                    const why = held ? 'a sidecar already on disk keeps the embedded subtitle' : 'ffmpeg cannot read every cue of a subtitle';
+                if (held || unread || unsure) {
+                    const why = held ? 'a sidecar already on disk keeps the embedded subtitle' : unread ? 'ffmpeg cannot read every cue of a subtitle'
+                        : 'whether a styled subtitle holds any text could not be read';
                     return skip(`☒Nothing extracted this pass - ${why}, see the reasons above\n`);
                 }
-                return skip('☑All eligible subtitles already extracted\n');
+                return skip(blank ? '☑Nothing left to extract - see the lines above\n' : '☑All eligible subtitles already extracted\n');
             }
 
             let out = `${ccInput}${sidecarOut} -map 0`;
@@ -6362,7 +6426,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const hasFontAttachment = streams.some((s) => codecTypeOf(s) === 'attachment' && isFontAttachment(s));
         // Duplicates the file already carries, removed here as well as on extract - they are a property of the file, not of a workflow. Every output index
         // below counts SURVIVING subtitle streams (see retagArgs); the unfiltered list silently retags or lands tracks one slot off for every stream removed.
-        const dupes = dedupeStreams ? dedupeEmbeddedSubs(embeddedSubs) : { dropIdx: [], retag: null, log: '' };
+        const dupes = dedupeEmbeddedSubs(embeddedSubs);
         response.infoLog += dupes.log;
         const removedIndices = new Set(dupes.dropIdx);
         const keptSubs = embeddedSubs.filter((s) => !removedIndices.has(s.index));
@@ -6442,7 +6506,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // guess, matched through metaMatchesStream.
         const stillEmbedded = (m) => m.index !== null && embeddedSubs.some((s) => s.index === m.index && metaMatchesStream(s, m, isMp4));
         // Only the unsafe-name check filters INDIVIDUAL sidecars here. The marker skip deliberately waits until they have been grouped by content, because
-        // it is a per-file test on a metadata match and would otherwise split a byte-identical group: with two copies of one subtitle under different names,
+        // it is a per-file test on a metadata match and would otherwise split an identical-text group: with two copies of one subtitle under different names,
         // whichever the marker happens to confirm drops out, leaving the OTHER to speak for the group - and which one that is flips every pass, so a retune
         // ping-pongs between their two titles forever. Grouping first gives the group one identity no matter which member is confirmed, and the retune then
         // finds the track already matching and does nothing. See the group-level skip below.
@@ -6452,8 +6516,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return false;
         });
 
-        // Group candidates by byte-identical file content (disabled => every file is its own group). A file whose bytes cannot be read - gone since the
-        // readdir, or too large to be a subtitle at all - gets a unique key, so it is imported on its own, never silently dropped or merged.
+        // Group candidates by identical text - the sha1 of their normalised cues (disabled => every file is its own group). A file whose bytes cannot be read
+        // - gone since the readdir, or too large to be a subtitle at all - gets a unique key, so it is imported on its own, never silently dropped or merged.
         const contentKey = (f) => sidecarContent(f)?.sha1 || `unreadable:${f.rel}`;
         const groups = []; const groupHash = new Map();
         if (!dedupeSidecars) { for (const f of candidates) groups.push([f]); }
@@ -6466,7 +6530,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
-        // A group imports as one track (an apart group, below, as one per sidecar): union the members' disposition tokens (byte-identical plain + SDH ->
+        // A group imports as one track (an apart group, below, as one per sidecar): union the members' disposition tokens (identical-text plain + SDH ->
         // SDH), and take the first non-"und" language. The physical file muxed is the member with the most-specific dispositions (deterministic tie-break by
         // name); its metadata is overridden by the merged values, so which identical copy we pick doesn't matter.
         let merged = groups.map((g) => {
@@ -6474,10 +6538,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const extraTokens = [...new Set(g.flatMap((m) => m.extraTokens || []))];   // unioned with the roles, so a merged group keeps every member's flags
             const lang = (g.find((m) => m.lang && m.lang !== 'und') || g[0]).lang;
             // The title is the first member's, in the group's order, with which the track as the next pass reads it (sidecarToStream: on an mp4-family
-            // target beside the handler written with it) gives every role the members' titles give (rolesIn) - dedupeEmbeddedSubs' rule for its keeper, so
-            // 'English' with 'English SDH' imports as 'English SDH'; a role a name's flag token gives is in the unioned flags. With no such title the group
-            // is apart: its sidecars go in as one track each (below), and its first title stands for it where its text is already in the file, beside
-            // firstTitle - every group's first title (see that comparison).
+            // target beside the handler written with it) gives every role the members' titles give (rolesIn) - dedupeEmbeddedSubs' rule for its
+            // keeper, so 'English' with 'English SDH' imports as 'English SDH'; a role a name's flag token gives is in the unioned flags. With no such
+            // title the group is apart: its sidecars go in as one track each (below), and its first title stands for it where its text is already in
+            // the file, beside firstTitle - every group's first title (see that comparison). On an mp4-family target the handler written is the title
+            // itself, so a pair whose roles need the two to differ ('English SDH' + 'English Forced') is apart, and deduplicate=enabled_checkmedia
+            // folds it on the next pass, whose fold keeps the keeper's handler beside the new title - one extra lossless remux, accepted.
             const readsAs = (t) => rolesIn(roleFieldsLower(sidecarToStream({ ...g[0], title: t }, isMp4)));
             const roles = new Set(g.flatMap((m) => readsAs(m.title)));
             const titles = g.map((m) => m.title).filter(Boolean);
@@ -6494,7 +6560,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The CONTENT half of the same rule (the marker is not cleared by anything but an extract - see metadataMatchesEmbedded). Specific to THIS site:
         // a sidecar the user EDITED keeps its name, so metadata still matches while the text no longer does - a group is settled only once its own bytes
         // are one of the surviving tracks, or that edit would be skipped as "already embedded". A bundle (archive, not comparable text) and a probe that
-        // could not run fall back to the marker's metadata match. Group-level by construction: every member is byte-identical. A sidecar with no CUES
+        // could not run fall back to the marker's metadata match. Group-level by construction: every member's text is identical. A sidecar with no CUES
         // can never be confirmed by content - importing it produces a track that decodes to nothing and gets no hash, so the marker skip could never
         // fire and the same empty subtitle would be muxed in again every cycle, one more dead track each time; the marker's metadata match decides there
         // too. An unreadable or oversized sidecar answers false and takes the ordinary content route, which imports - the recoverable direction.
@@ -6666,15 +6732,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 writes || 'no language or flags'})\n`;
         }
 
-        // Is there anything to write to the FILE at all: a sidecar to mux, a metadata retune, or a dedup drop. Named once because the two cleanup shortcuts
-        // below must be its EXACT negation and the mux branch its plain form - three hand-spelled copies of one five-term condition are three chances for
-        // them to stop agreeing. A sidecar this plugin imported, UNCHANGED since (its text still hashes to the one the marker recorded), whose content the
-        // file no longer holds, was removed by something else after the import - clean_and_remux's language_sub or remove_sub_sdh on the next cycle, or the
-        // user. Importing it again undoes that removal every cycle: the two plugins alternate import and drop, the presets alternate too, so Tdarr's
-        // identical-arguments guard never fires and the worker remuxes the file forever (measured with language_sub=eng and a French sidecar, and with
-        // remove_sub_sdh=all and the imported closed captions). So the removal stands, the sidecar stays on disk, and the line says how to bring it back.
-        // An EDITED sidecar hashes differently and is imported as usual, and an extract that takes a subtitle out drops it from the marker, so extract ->
-        // reimport still round-trips. Proof of absence is the content: a probe that cannot run proves nothing, and the import then goes ahead as before.
+        // A sidecar this plugin imported, UNCHANGED since (its text still hashes to the one the marker recorded), whose content the file no longer holds,
+        // was removed by something else after the import - clean_and_remux's language_sub or remove_sub_sdh on the next cycle, or the user. Importing it
+        // again undoes that removal every cycle: the two plugins alternate import and drop, the presets alternate too, so Tdarr's identical-arguments
+        // guard never fires and the worker remuxes the file forever (measured with language_sub=eng and a French sidecar, and with remove_sub_sdh=all and
+        // the imported closed captions). So the removal stands, the sidecar stays on disk, and the line says how to bring it back. An EDITED sidecar
+        // hashes differently and is imported as usual, and an extract that takes a subtitle out drops it from the marker, so extract -> reimport still
+        // round-trips. Proof of absence is the content: a probe that cannot run proves nothing, and the import then goes ahead as before.
         const goneSinceImport = (f) => {
             if (!f.members.every(unchangedSinceImport)) return false;
             const surviving = survivingTextHashes();
@@ -6682,7 +6746,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return f.bundle ? bundleInFile(f, surviving.values()) === false : !sidecarMatch(f, isMp4, surviving.values());
         };
         // The text tracks a group's earlier import here still matches by metadata (alreadyEmbedded's test, against the track written for it), or null when
-        // the marker records no such import of its text: a member listed with the hash its text still has, or - byte-identical copies being apart groups
+        // the marker records no such import of its text: a member listed with the hash its text still has, or - identical-text copies being apart groups
         // under deduplicate=disabled - any entry recorded with the group's text. An entry with no hash (a file version 3.46.0 imported) cannot tell an edit
         // from the original, so it records none; an edit is a real arrival.
         const importedTracks = (f) => {
@@ -6704,32 +6768,35 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // empty track and cut nothing. This version's own Matroska import leaves those cues out, so its track matches and never arrives here.
         const cutByEarlierImport = (f, tracks) => isMatroskaFamily(dstContainer) && sidecarContent(f)?.emptyVttCues > 0 && sidecarContent(f).cues > 0
             && !!tracks?.some((s) => codecNameOf(s) === 'webvtt');
+        // Takes out of toMux, last first, every group `test` answers for, and hands it to `report` with that answer.
+        const withdraw = (test, report) => {
+            for (let k = toMux.length - 1; k >= 0; k -= 1) {
+                const why = test(toMux[k]);
+                if (why) report(toMux.splice(k, 1)[0], why);
+            }
+        };
         // Said once the pass knows whether it remuxes anyway (nothingToMux), which would make the loss permanent itself.
         const cutGroups = [];
-        for (let k = toMux.length - 1; k >= 0; k -= 1) {
-            const f = toMux[k];
+        withdraw((f) => {
             const tracks = importedTracks(f);
             const other = otherFormat(f, tracks);
-            if (!other && !cutByEarlierImport(f, tracks)) continue;
-            toMux.splice(k, 1);
-            if (!other) { cutGroups.push(f); continue; }
+            return other || cutByEarlierImport(f, tracks) ? { tracks, other } : null;
+        }, (f, { tracks, other }) => {
+            if (!other) { cutGroups.push(f); return; }
             response.infoLog += `☒${logSafe(f.rel)} was imported by an earlier pass, and its track is in the file as ${[...new Set(tracks.map(codecNameOf))]
                 .join(' or ')} now, whose text cannot be compared with the sidecar's - not importing it again, and the sidecar stays on disk\n`;
-        }
+        });
         // The marker is written whole, so a removal the guard upholds survives only while its entry does: every marker rebuilt below carries goneRels, or
         // the first pass with other work to do (a new sidecar, a retune, a dedup drop) would erase it and the next pass would import the subtitle again.
         const goneRels = [];
-        for (let k = toMux.length - 1; k >= 0; k -= 1) {
-            const f = toMux[k];
-            if (!goneSinceImport(f)) continue;
-            toMux.splice(k, 1);
+        withdraw(goneSinceImport, (f) => {
             goneRels.push(...f.members.map((m) => m.rel));
             response.infoLog += isCcSidecar(f.rel)
                 ? `☒[embedded_cc=enabled] The closed captions imported from ${logSafe(f.rel)} have since been removed from the file (by another plugin's `
                     + 'subtitle filter, or by hand) - not importing them again; that hidden sidecar now holds the only copy\n'
                 : `☒${logSafe(f.rel)} was imported by an earlier pass and has since been removed from the file (by another plugin's subtitle filter, or by `
                     + 'hand) - not importing it again, which would undo that every cycle; the sidecar stays on disk - rename it to import it again\n';
-        }
+        });
         // A sidecar ffmpeg cannot read whole (sidecarContent's unreadable) is never muxed. Not UTF-8: the track would hold only the cues ffmpeg could
         // decode - into mp4 at once, into Matroska as raw bytes every later read drops - and with more than two thirds undecodable the job fails. A NUL:
         // the track ends at it, and UTF-16 without its mark fails the job (measured on 7.1.4, exit 183). Refused, never converted: no character set can be
@@ -6737,30 +6804,32 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Into mp4 the whole file must be UTF-8 (unreadableMp4): mov_text puts an ass font name into every cue it gives back, so a legacy byte in one is a
         // cue's (measured on 7.1.4: each cue extracted back as <font face="Fr\xe9d">, and that srt re-read loses all three, exit 69).
         let refusedText = 0;
-        for (let k = toMux.length - 1; k >= 0; k -= 1) {
-            const f = toMux[k];
-            const why = f.bundle ? '' : sidecarContent(f)?.[isMp4 ? 'unreadableMp4' : 'unreadable'];
-            if (!why) continue;
-            toMux.splice(k, 1);
+        withdraw((f) => (f.bundle ? '' : sidecarContent(f)?.[isMp4 ? 'unreadableMp4' : 'unreadable']), (f, why) => {
             refusedText += 1;
             response.infoLog += `☒Not importing ${f.members.map((m) => logSafe(m.rel)).join(', ')} - it ${why}, which ffmpeg cannot read whole; save it as`
                 + ' UTF-8 to import it\n';
-        }
-        // A sidecar ffmpeg will not mux (sidecarMuxRefused), or a bundle it cannot read out (bundleUnreadable), would fail the whole import run, every other
-        // sidecar with it, on every requeue. A loose sidecar with no cue (sidecarContent's noCues: a 0-byte or header-only .vtt or .ass, or a WebVTT whose
-        // cues are all empty) muxes, as a track with nothing in it that no content can ever confirm. Each is left out and named, and the others go in;
-        // nothing records it, so it stays on disk until it is fixed or deleted.
-        for (let k = toMux.length - 1; k >= 0; k -= 1) {
-            const f = toMux[k];
+        });
+        // A sidecar ffmpeg will not mux (sidecarMuxRefused), or a bundle it cannot open (bundleUnreadable: an empty, event-less or cut-short
+        // one - exit 183, 187 or 251 measured on 7.1.4), would fail the whole import run, every other sidecar with it, on every requeue. A
+        // bundle it opens but whose subtitle it cannot decode (not UTF-8) muxes, but every read of the track it makes fails (exit 0, then 69,
+        // measured on 7.1.4), so it is refused like a loose sidecar that is not UTF-8. A loose sidecar with no cue (sidecarContent's noCues: a
+        // 0-byte or header-only .vtt or .ass, or a WebVTT whose cues are all empty) muxes, as a track with nothing in it that no content can
+        // ever confirm. Each is left out and named, and the others go in; nothing records it, so it stays on disk until it is fixed or deleted.
+        withdraw((f) => {
             const refused = f.bundle ? bundleUnreadable(f) : sidecarMuxRefused(f, isMp4);
-            const empty = !refused && !f.bundle && sidecarContent(f)?.noCues === true;
-            if (!refused && !empty) continue;
-            toMux.splice(k, 1);
+            return refused ? 'refused' : !f.bundle && sidecarContent(f)?.noCues === true ? 'empty' : '';
+        }, (f, why) => {
             refusedText += 1;
-            response.infoLog += `☒Not importing ${f.members.map((m) => logSafe(m.rel)).join(', ')} - ${empty ? 'it holds no subtitle, and importing it would'
-                + ' add an empty track' : 'ffmpeg cannot read it as a subtitle file (an empty file, or an srt whose cues have no numbers?), and muxing it would'
-                + ' fail the whole import'}; fix or delete it\n`;
-        }
+            const what = why === 'empty' ? 'it holds no subtitle, and importing it would add an empty track; fix or delete it'
+                : !f.bundle ? 'ffmpeg cannot read it as a subtitle file (an empty file, or an srt whose cues have no numbers?), and muxing it would fail the'
+                    + ' whole import; fix or delete it'
+                    : bundleMemo.get(f.rel)?.opened ? 'the subtitle in this styled-subtitle bundle is not text ffmpeg can decode (not UTF-8?), so it is'
+                        + ' not imported; it and its fonts are still in the bundle - take them out with mkvextract and convert the subtitle to UTF-8 to'
+                        + ' import it'
+                        : 'ffmpeg cannot open this styled-subtitle bundle (a bundle of a subtitle with no events, or an export cut short), and muxing it would'
+                        + ' fail the whole import; mkvextract can still take out any fonts it holds - then delete it';
+            response.infoLog += `☒Not importing ${f.members.map((m) => logSafe(m.rel)).join(', ')} - ${what}\n`;
+        });
         // A group no one title covers (apart) goes in as one track per sidecar, each under its own name as deduplicate=disabled imports it, and each is
         // consumed as a merged group's members are.
         for (let k = toMux.length - 1; k >= 0; k -= 1) {
@@ -6768,21 +6837,23 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!f.apart) continue;
             toMux.splice(k, 1, ...f.members.map((m) => ({ ...m, members: [m] })));
             const named = [...new Set(f.members.map((m) => m.title).filter(Boolean))].map((t) => `'${logSafe(t)}'`).join(', ');
-            response.infoLog += `☒[deduplicate=${dedupeMode}] Importing ${f.members.length} byte-identical sidecars as ${f.members.length} tracks (${
+            response.infoLog += `☒[deduplicate=${dedupeMode}] Importing ${f.members.length} identical-text sidecars as ${f.members.length} tracks (${
                 f.members.map((m) => logSafe(m.rel)).join(', ')}) - no one of their titles (${named}) keeps every role their names give, and one track`
                 + ' would lose a role\n';
         }
+        // Is there anything to write to the FILE at all: a sidecar to mux, a metadata retune, or a dedup drop. Named once because the two cleanup
+        // shortcuts below must be its EXACT negation and the mux branch its plain form - hand-spelled copies are chances for them to stop agreeing.
         const nothingToMux = !toMux.length && !retuneMeta && !removedIndices.size;
         for (const f of cutGroups) {
             response.infoLog += `☒${logSafe(f.rel)} was imported into this file ${earlierCutWords(sidecarContent(f).emptyVttCues)} - not importing it again,`
                 + ` and the sidecar stays; ${nothingToMux ? cutRepairWords() : 'this pass remuxes the file for its other work, which makes that permanent'}\n`;
         }
 
-        // Sidecars that were only ever redundant, with nothing to mux alongside them. Both cleanup shortcuts below must be the EXACT negation of the mux
-        // branch's trigger (toMux || retuneMeta || removedIndices) - a queued embedded-dedup drop is work on the FILE, and returning here would discard it
-        // silently. A sidecar whose import stripped something stays whichever route would remove it (deletionLoss) - said once, here, for both, against every
-        // track holding its text (holdersOf). Each member of a byte-identical group is judged by its own name: judged by the group's tokens, a plain
-        // 'u.en.srt' beside 'u.en.sdh.srt' was kept forever, said to give the sdh role, so a group may lose some members and keep the rest.
+        // Sidecars that were only ever redundant, with nothing to mux alongside them. Both cleanup shortcuts below run on nothingToMux
+        // alone (see there), so a queued embedded-dedup drop is never discarded. A sidecar whose import stripped something stays
+        // whichever route would remove it (deletionLoss) - said once, here, for both, against every track holding its text (holdersOf).
+        // Each member of an identical-text group is judged by its own name: judged by the group's tokens, a plain 'u.en.srt' beside
+        // 'u.en.sdh.srt' was kept forever, said to give the sdh role, so a group may lose some members and keep the rest.
         // A name the import does not apply (unapplied) stays, said under method_import_metadata=embedded here and under 'sidecar' where the import passed it
         // over. `advise`: sidecar would write it, the member speaking for the track under the title it would write.
         const keptName = (f, m, holders) => {
@@ -6795,6 +6866,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const deletable = (nothingToMux && removeSource) ? alreadyInFile.map((f) => {
             f.holders = holdersOf(f);
             const members = f.members.filter((m) => {
+                // A hidden caption staging sidecar is the memo that stops ccPlan decoding the whole video for the captions again until awk_cc records
+                // their import or their removal, and this branch writes neither: deleted here, the next pass read them out again (measured: every second
+                // requeue). It stays only while the video may still hold captions (the A53 probe; one that cannot answer counts as may). A visible one,
+                // which extract writes and a media server lists beside the track holding its text, goes as before, at one more read into the hidden memo.
+                if ((m.rel === ccName || m.rel === ccName2) && !ccHas(CC_TOKENS.imported) && !ccHas(CC_TOKENS.removed) && ccProbeVerdict() !== false) {
+                    response.infoLog += `☑[remove_source=true] Keeping ${logSafe(m.rel)} although its text is already in the file - it is the memo that`
+                        + ' stops the captions being read out of the video again, so it stays until they are removed from the video\n';
+                    return false;
+                }
                 const u = keptName(f, m, f.holders);
                 const loss = deletionLoss(f, f.matchedBy, isMp4, f.holders, u.roles, m);
                 if (loss) response.infoLog += keepForLossLine(m.rel, loss, !rolesUnshown(m, f.holders).some((t) => !u.roles.includes(t)));
@@ -6914,7 +6994,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const origin = f.members.find(stillEmbedded);
                 if (origin) response.infoLog += `☒${streamTag(origin.index)} Importing ${f.rel} as a SECOND copy - the stream it was extracted from is still `
                     + `in the file${embeddedHashes && embeddedHashes.size ? ' and its text differs' : ''}, so both will be present\n`;
-                if (f.members.length > 1) response.infoLog += `☑[deduplicate=${dedupeMode}] Deduplicated ${f.members.length} byte-identical sidecars -> ${
+                if (f.members.length > 1) response.infoLog += `☑[deduplicate=${dedupeMode}] Deduplicated ${f.members.length} identical-text sidecars -> ${
                     f.rel} (${f.lang}${flagText})\n`;
                 response.infoLog += `☐Import ${f.rel} -> subtitle ${outIdx} (${langWritten(f.lang)}${flagText})`
                     + `${restoreFonts ? ' and its bundled font attachments' : ''}\n`;

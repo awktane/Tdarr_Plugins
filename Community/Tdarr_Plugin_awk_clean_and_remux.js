@@ -30,7 +30,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.91',
+    Version: '4.999.92',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -2060,17 +2060,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const key = apiAuthKey();
         return key ? `header = "x-api-key: ${key}"\nheader = "tdarrKey: ${key}"\nheader = "Authorization: Bearer ${key}"\n` : '';
     };
-    // Is a non-empty sidecar already at this server path? Download is the only read the API offers, so the test IS a fetch - discarded to the null device, or
-    // written to `saveTo` (a path in the caller's private staging directory) when the caller must judge the body - and measured with curl's own counters, never
-    // buffered through spawnSync (a large body silently exceeds maxBuffer and fakes a failure). Three answers, not two, because a caller's next step on
+    // Is a non-empty sidecar already at this server path? Download is the only read the API offers, so the test IS a fetch - discarded to the null device,
+    // or written to `saveTo` (a path in the caller's private staging directory) when the caller must judge the body - and measured with curl's own counters,
+    // never buffered through spawnSync (a large body silently exceeds maxBuffer and fakes a failure). Not a yes or a no, because a caller's next step on
     // 'absent' is an upload, and the upload endpoint REPLACES whatever is there - possibly a sidecar the user has OCR'd or edited. So 'absent' needs a
-    // completed request the server answered definitively: its File-not-found (HTTP 400), or a 200 with no body, which holds nothing to lose. Everything else -
-    // no URL, a spawn error, a non-zero curl exit (connection refused, the -m timeout, a dropped transfer), a 5xx, a 501 - is 'unknown': the sidecar may well
-    // be there, so the caller leaves it alone this pass instead of writing over it. Returns { state: 'present' | 'absent' | 'unknown', why, empty }: `why` is
-    // for the user's log line ('' unless 'unknown'); `empty` marks the 200 with no body - a file IS there, holding nothing, which no API route can delete (only
-    // DB-indexed media and cache paths are deletable), so a caller that writes under another name would leave it beside the new one. `maxBytes`, when given,
-    // has curl refuse a larger file before fetching any of it, answered 'over': a file there that is no sidecar of this stream, never fetched whole on every
-    // pass (measured: an 80 MiB file at an earlier spelling was downloaded in full).
+    // completed request the server answered definitively: its File-not-found (HTTP 400), or a 200 with no body, which holds nothing to lose. Everything else
+    // - no URL, a spawn error, a non-zero curl exit (connection refused, the -m timeout, a dropped transfer), a 5xx, a 501 - is 'unknown': the sidecar may
+    // well be there, so the caller leaves it alone this pass instead of writing over it. Returns { state: 'present' | 'absent' | 'unknown' | 'over', why,
+    // empty }: `why` is for the user's log line ('' unless 'unknown' or 'over'); `empty` marks the 200 with no body - a file IS there, holding nothing,
+    // which no API route can delete (only DB-indexed media and cache paths are deletable), so a caller that writes under another name would leave it beside
+    // the new one. `maxBytes`, when given, has curl refuse a larger file before fetching any of it, answered 'over': a file is there, never fetched whole on
+    // every pass, and each caller says what it makes of one (measured: an 80 MiB file at an earlier spelling was downloaded in full).
     const sidecarExistsRemote = (dest, saveTo = '', maxBytes = 0) => {
         const { spawnSync } = require('child_process');
         const url = serverApiUrl();
@@ -2195,12 +2195,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { cues, end };
     };
     // -=-=-= readBundleSubtitle  [clean_and_remux, sub_worker] =-=-=-
-    // The subtitle inside a styled .mks bundle, decoded to ASS by ffmpeg into a private temp dir, and the codec of each font attachment ffmpeg's input
-    // listing names ("Stream #0:1: Attachment: ttf", measured on 7.1.4). { state: 'ok', buf, fonts }, or { state: 'unreadable' } when ffmpeg RAN and could not
-    // decode it - what an interrupted export leaves: killed mid-write it ends "File ended prematurely", and a run whose OTHER output failed at
-    // write_header leaves a header with no cluster ("End of file"), both measured on 7.1.4 - or { state: 'unknown' } when it could not be judged (gone, or
-    // not a regular file - ffmpeg blocks on a FIFO's -i until the timeout -, no temp dir, a spawn error or timeout, a read-out over the cap), where every
-    // caller keeps the answer it had before it could look.
+    // The subtitle inside a styled .mks bundle, decoded to ASS by ffmpeg into a private temp dir, and the codec of each font attachment
+    // ffmpeg's input listing names ("Stream #0:1: Attachment: ttf", measured on 7.1.4). { state: 'ok', buf, fonts }, or { state: 'unreadable',
+    // opened } when ffmpeg RAN and could not decode it - opened when it got as far as listing the input ("Input #0"), as a bundle does whose
+    // subtitle is not UTF-8 (decode exit 69), and not for what an interrupted export leaves: killed mid-write it ends "File ended prematurely",
+    // and a run whose OTHER output failed at write_header leaves a header with no cluster ("End of file"), both measured on 7.1.4 - or { state:
+    // 'unknown' } when it could not be judged (gone, or not a regular file - ffmpeg blocks on a FIFO's -i until the timeout -, no temp dir, a
+    // spawn error or timeout, a read-out over the cap), where every caller keeps the answer it had before it could look.
     const readBundleSubtitle = (p) => {
         let dir = '';
         try { dir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_subbundle_')); } catch (e) { return { state: 'unknown' }; }
@@ -2211,7 +2212,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const r = fs.statSync(p).isFile() ? spawnSync(ffmpegPathOf(otherArguments), ['-hide_banner', '-y', '-loglevel', 'info', '-i', p, '-map', '0:s:0',
                 '-c:s', 'ass', '-fs', String(SIDECAR_HASH_MAX + 1), out],
             { encoding: 'utf8', timeout: SIDECAR_SPAWN_TIMEOUT_MS, maxBuffer: SIDECAR_SPAWN_MAX_OUTPUT_BYTES, killSignal: 'SIGKILL' }) : null;
-            if (r && !r.error && r.status !== 0) res = { state: 'unreadable' };
+            if (r && !r.error && r.status !== 0) res = { state: 'unreadable', opened: /^Input #0/m.test(String(r.stderr || '')) };
             else if (r && !r.error && fs.statSync(out).size <= SIDECAR_HASH_MAX) {
                 res = { state: 'ok', buf: fs.readFileSync(out), fonts: String(r.stderr || '').split('\n')
                     .filter((l) => l.trimStart().startsWith('Stream #') && l.includes(': Attachment:'))
