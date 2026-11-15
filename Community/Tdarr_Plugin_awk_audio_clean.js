@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.95',
+    Version: '4.999.96',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -2171,9 +2171,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Canonical audio-title machinery, shared so audio_clean's downmix titles come out already in clean_and_remux's tag_title form (no wasted remux).
     // Canonical form: "<channel/downmix base> - <role tags>", roles LAST ("5.1 -> 2.0 - Commentary"). canonicalAudioTitle is the entry point.
     // -=-=-= channel-label vocab: channelTitleLabels / bareChannelRegex / downmixChannelRegex  [audio_clean, clean_and_remux] =-=-=-
-    // The channel labels we recognise/replace for tag_title - 2.0 included so it can be overwritten with Stereo. Every label clean_and_remux's layoutLabel
-    // can write is listed (the 7.0 / 6.0 / 4.1 / 8.0 and height layouts included), so a title it wrote stays OWNED: its role suffix is normalised and a
-    // downmix base built on it is recognised, instead of being taken for a custom title on the next pass.
+    // The channel labels we recognise/replace for tag_title - 2.0 included so it can be overwritten with Stereo. Every ffprobe standard or named
+    // layout label clean_and_remux's layoutLabel can write is listed (the 7.0 / 6.0 / 4.1 / 8.0 and height layouts included), so a title it wrote
+    // stays OWNED: its role suffix is normalised and a downmix base built on it is recognised. A label it counts from a verbose listing (5.0.4,
+    // 2.0.2), or falls back to when a listing does not add up (16.0, 9.1), may not be listed, and then reads as a custom title on the next pass.
     const channelTitleLabels = ['22.2', '10.0.6', '9.1.4', '7.2.3', '7.1.4', '7.1.2', '5.1.4', '5.1.2', '4.0.4', '3.1.2', '8.0', '7.1', '7.0', '6.1', '6.0',
         '5.1', '5.0', '4.1', '4.0', '3.1', '3.0', '2.1', '2.0', 'stereo', 'mono'];
     const channelLabelAlternation = channelTitleLabels.map(l => l.replace(/\./g, '\\.')).join('|');

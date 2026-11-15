@@ -23,14 +23,14 @@ const details = () => ({
                          and imports title keywords into the real ffmpeg disposition flags\n\n
                      -Forcefully removes unsupported image based subtitles; optionally removes all image
                          based subtitles, or exports them to hidden OCR sidecars, via remove_imagesubs\n\n
-                     -Converts unsupported subtitles to a supported format. The exception is a STYLED ass/ssa subtitle on an mp4 target: mp4 can only
-                         store it as mov_text, which turns its positioning and drawing tags into literal on-screen text, so it is exported to a hidden
-                         .mks bundle carrying the subtitle plus the container's fonts and dropped from the video instead\n\n
+                     -Converts unsupported subtitles to a supported format. The exception is every ASS/SSA subtitle on an mp4 target, styled or plain:
+                         mp4 can only store it as mov_text, which turns its positioning and drawing tags into literal on-screen text, so it is exported to a
+                         hidden .mks bundle carrying the subtitle plus the container's fonts and dropped from the video instead\n\n
                      -Drops broadcast-only, image-based, and non-muxable subtitle formats as needed per container\n\n
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.92',
+    Version: '4.999.93',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -45,12 +45,14 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\nmkv (default): keeps almost everything. Removes ttml, xsub and dvb_teletext, plus any other subtitle format the mkv muxer cannot carry
-                and ffmpeg cannot read as text. mov_text becomes srt, and a closed-caption (eia_608) track becomes plain text.
-                \\nmp4: also removes hdmv_pgs_subtitle and dvb_subtitle, plus arib_caption and hdmv_text_subtitle. dvd_subtitle (VobSub) survives -
-                mp4 stores it as mp4s - so remove_imagesubs alone decides its fate.
-                Text subtitles (subrip, srt, ass, ssa, webvtt, text, eia_608) become mov_text - except a STYLED ass/ssa, which is
-                exported as a font bundle rather than flattened.
+                \\nmkv (default): keeps almost everything. Removes ttml, xsub and dvb_teletext. mov_text and the legacy text formats (MicroDVD, SAMI,
+                SubViewer, MPL2 ...) become srt, and a closed-caption (eia_608) track becomes plain text.
+                \\nmp4: removes xsub, dvb_teletext, hdmv_pgs_subtitle, dvb_subtitle, arib_caption and hdmv_text_subtitle; ttml is kept (as stpp).
+                dvd_subtitle (VobSub) survives - mp4 stores it as mp4s - so remove_imagesubs alone decides its fate.
+                Text subtitles (subrip, srt, webvtt, text, eia_608 and the legacy formats such as MicroDVD and SAMI) become mov_text. Every ASS/SSA
+                subtitle is instead exported to a hidden .mks bundle with the container's fonts and dropped, since mov_text would show its styling tags as
+                text; it becomes mov_text only when that bundle cannot be written (a name over the filesystem limit, an unsafe library path, or an
+                unmapped node with no path to the server).
                 HEVC video is tagged hvc1 - dvh1 for Dolby Vision Profile 5 - so Apple and QuickTime can play it.
                 A track name is kept in the track handler, the one place mp4 keeps it through a remux. mp4 stores no original flag, so an audio track
                 flagged original gets "Original" added to its name.`,
@@ -62,7 +64,8 @@ const details = () => ({
             inputUI: { type: 'text' },
             tooltip: `Force this language onto audio and subtitle tracks that carry no language tag, or are tagged "und". Blank (default) leaves them as
                 they are.
-                \\nTakes precedence over language_sub when a track's language is blank or und.
+                \\nTakes precedence over language_sub when a track's language is blank or und. When language_sub is set it must include this language, or
+                every file stops as a configuration error.
                 \\nOne form is enough - en, eng, English or a BCP-47 tag like pt-BR all work; the form written follows method_tag_language and the output
                 container (eng into mkv and mp4 by default). A region such as pt-BR is kept only with method_tag_language=bcp47, or with tag_language=disabled,
                 on mkv - otherwise it is written as the language alone (por). Codes: https://en.wikipedia.org/wiki/List_of_ISO_639-2_codes
@@ -98,7 +101,8 @@ const details = () => ({
             inputUI: { type: 'text' },
             tooltip: `Subtitle languages to KEEP, comma-separated. Blank (default) keeps every subtitle.
                 \\nOne form is enough - en, eng, or English all match the same language, region variants like en-US included.
-                \\nA track with no language tag counts as language_fill's value, or "und" when language_fill is blank.
+                \\nA track with no language tag counts as language_fill's value, or "und" when language_fill is blank. When language_fill is set, this list
+                must include its language, or every file stops as a configuration error.
                 \\nExample:\\neng,fra
                 \\nKeep English and French subtitles only.
                 \\nThe special codes und (undefined), mul (multiple languages) and mis (no language code) match literally - list them to keep those tracks.
@@ -118,10 +122,12 @@ const details = () => ({
                 \\n=====
                 \\nActions
                 \\n=====
-                \\ndisabled (default): leave dispositions alone.
+                \\ndisabled (default): adds no flag of its own - a role whose only carrier is a title, handler name or DESCRIPTION tag this run clears (or
+                mp4 does not keep) is still kept as its flag.
                 \\naudio: surface Commentary, Descriptive, Dub and Original on audio tracks. mp4 stores no Original flag, so there that role stays in the
                 title.
-                \\nsubtitle: surface Commentary, Descriptive, SDH, Forced and Lyrics on subtitle tracks.
+                \\nsubtitle: surface Commentary, Descriptive, SDH and Forced on subtitle tracks. Lyrics stays in the title: neither mkv nor mp4 stores the
+                flag.
                 \\nboth: apply to audio and subtitle tracks.
                 \\nPair it with tag_title so title-only keywords reach the flags before the title is rebuilt. The default flag is untouched here - track
                 order in the stream ordering plugin owns that.`,
@@ -160,9 +166,9 @@ const details = () => ({
                 \\nActions
                 \\n=====
                 \\ndisabled (default): leave titles alone.
-                \\naudio: build a channel-based title - 7.1, 6.1, 5.1, 5.0, 4.0, 3.1, 3.0, 2.1, Stereo or Mono - with any roles appended, e.g.
-                "5.1 - Commentary" or "5.1 -> 2.0 - Descriptive".
-                \\nsubtitle: set the title to its role tags, e.g. "SDH" or "Forced Commentary". Only titles this plugin owns are rewritten - an untitled
+                \\naudio: build a channel-based title from the track's layout - e.g. 7.1, 7.0, 5.1, 5.1.2, Stereo or Mono - with any roles appended,
+                such as "5.1 - Commentary" or "5.1 -> 2.0 - Descriptive".
+                \\nsubtitle: set the title to its role tags, e.g. "SDH" or "Commentary Forced". Only titles this plugin owns are rewritten - an untitled
                 one, or one that is already nothing but role words - so a custom subtitle title is left untouched.
                 \\nboth: apply to audio and subtitle tracks.
                 \\nRole tags come from the track's real disposition flags and title keywords (Commentary, Descriptive, SDH, Forced, Lyrics, Dub, Original).
@@ -176,10 +182,10 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['false','true'],
             },
-            tooltip: `Blank the title of any audio, subtitle or video track whose title holds more than 3 periods. That clears most of the junk titles some
-                sources write, which are usually the release filename rather than a description of the track. On mp4 a track's name lives in its track
-                handler, so a busy handler name is cleared too. A track whose busy title sits beside a plain handler name takes that name instead of going
-                blank - on mp4, and on an mkv converted from one, which keeps the handler name as a tag.
+            tooltip: `Blank the title of any audio, subtitle or video track - and the file's own title - whose title holds more than 3 periods. That clears
+                most of the junk titles some sources write, which are usually the release filename rather than a description of the track. On mp4 a
+                track's name lives in its track handler, so a busy handler name is cleared too. A track whose busy title sits beside a plain handler name
+                takes that name instead of going blank - on mp4, and on an mkv converted from one, which keeps the handler name as a tag.
                 \\nExample:\\nThis.Title.Has.Too.Many.Periods is blanked`,
         },
         {
@@ -190,7 +196,7 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['false','true'],
             },
-            tooltip: `Remove the comment tag from every stream. Players rarely show it and it usually carries nothing worth keeping.`,
+            tooltip: `Remove the comment tag from every stream, and from the file itself. Players rarely show it and it usually carries nothing worth keeping.`,
         },
         {
             name: 'remove_imagesubs',
@@ -259,12 +265,10 @@ const details = () => ({
                 for mkv, as MKVToolNix writes it, and 3-letter terminologic (eng, fra, deu) for mp4's mdhd box.
                 \\n639-2/t: terminologic 3-letter codes everywhere - fra, deu, zho.
                 \\n639-2/b ("mkv classic"): bibliographic 3-letter codes everywhere - fre, ger, chi.
-                \\nbcp47: like container on mp4, but on mkv writes the BCP-47 form - 2-letter (en, fr), keeping a region subtag such as pt-BR or es-419,
+                \\nbcp47: like container on mp4 (por), but on mkv writes the BCP-47 form - 2-letter (en, fr), keeping a region subtag such as pt-BR or es-419,
                 or a script subtag such as zh-Hans. ffmpeg stores it in mkv's ISO 639-2 language field, as it has no way to write the BCP-47 one, so
                 ffmpeg-based players such as Jellyfin, and MediaInfo, read pt-BR back, while MKVToolNix reads it as por. A region MKVToolNix stored in
-                its own BCP-47 field, which ffmpeg cannot carry through a remux, is written into the ISO 639-2 field too, under tag_language invalid and
-                strict.
-                mp4 cannot store a region, so there it still folds to 3-letter (por).
+                its own BCP-47 field, which ffmpeg cannot carry through a remux, is written into the ISO 639-2 field too, under tag_language invalid and strict.
                 \\nThis mainly affects the ~20 languages that have two 3-letter codes (French fre/fra, German ger/deu), plus the 2-vs-3-letter choice.`,
         },
         {
@@ -334,7 +338,8 @@ const details = () => ({
                 \\nlight (risk-free): -fflags +ignidx and -err_detect ignore_err. Ignores a broken or corrupt index (AVI idx1, MOV/MP4 sample tables) and
                 keeps reading past detected errors instead of failing. Drops no frames.
                 \\naggressive: also -fflags +discardcorrupt, which drops packets flagged corrupt. Expect small video or audio blips wherever the damage is.
-                \\nRecovery re-runs only when you change one of the recover_bad_* settings, then settles - it will not reprocess the file on every pass.
+                \\nRecovery re-runs only when you change one of the recover_bad_* settings, or when the file changes container, then settles - it will not
+                reprocess the file on every pass.
                 \\nOn an mp4, m4v or mov output the recovery stamp stays on the file for good, and keeping it makes every later remux write the file's tags
                 as QuickTime metadata keys, which taggers and Apple players cannot read. Recover into mkv to keep them readable.
                 \\nA repaired file can come out INCOMPLETE (a truncated source is salvaged to its true, shorter length), which stream_ordering accepts with a
@@ -360,9 +365,9 @@ const details = () => ({
                 Touches no frame data.
                 \\naggressive: also -fflags +igndts, which ignores the source DTS and rebuilds the timeline outright - this is what fixes "Non-monotonous
                 DTS". It can produce odd results, so only reach for it if light did not help.
-                \\nRe-runs only on a recover_bad_* change, as for recover_bad_data, and on an mp4-family output its stamp costs the file its readable tags the
-                same way. Container-forced timestamp fixes apply regardless, for the whole
-                MPEG-TS family (ts/m2ts/mts/m2t/tp/trp/tod), the whole MPEG-PS family (mpg/mpeg/vob/evo/m2p/vro/mod), and avi.
+                \\nRe-runs only on a recover_bad_* change or when the file changes container, as for recover_bad_data, and on an mp4-family output its stamp
+                costs the file its readable tags the same way. Container-forced timestamp fixes apply regardless, for the whole MPEG-TS family
+                (ts/m2ts/mts/m2t/tp/trp/tod), the whole MPEG-PS family (mpg/mpeg/vob/evo/m2p/vro/mod/dat), and avi.
                 \\nA repaired file can come out INCOMPLETE (a truncated source is salvaged to its true, shorter length), which stream_ordering accepts with a
                 warning in the job that repairs it, rather than failing it (a later job checks its length in full again). Review such a file in Tdarr and
                 confirm it plays through before approving - do not auto-approve a recovery queue, or an invisibly short result is kept silently.`,
@@ -1556,24 +1561,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Values outside the dropdown are rejected below (failFile) rather than silently no-op'd.
     const recoverTs = ddValue(inputs.recover_bad_timestamps, 'disabled');
     const recoverData = ddValue(inputs.recover_bad_data, 'disabled');
-    const tsOn = recoverTs === 'light' || recoverTs === 'aggressive';
-    const tsAgg = recoverTs === 'aggressive';
-    const dataOn = recoverData === 'light' || recoverData === 'aggressive';
-    const dataAgg = recoverData === 'aggressive';
     const tagDisposition = ddValue(inputs.tag_disposition, 'disabled');
     const tagTitle = ddValue(inputs.tag_title, 'disabled');
-    // Does a tag_disposition / tag_title mode (disabled|audio|subtitle|both) cover this stream type?
-    const appliesToType = (mode, type) => mode === 'both' || mode === type;
     const removeComments = String(inputs.remove_comments) === 'true';
     const removeBusytitle = String(inputs.remove_busytitle) === 'true';
     const removeImageSubs = ddValue(inputs.remove_imagesubs, 'unsupported');
     const methodUnmuxable = ddValue(inputs.method_unmuxable, 'error');
 
-    const fillLanguage = (inputs.language_fill ? inputs.language_fill.toLowerCase().trim() : '');
+    const fillLanguage = (inputs.language_fill ? inputs.language_fill.trim() : '');   // typed case kept for the echo: every consumer folds it (langKey)
     const subLanguages = splitList(inputs.language_sub);
     // Pre-normalise the user language list to comparison keys once (langMatchKey folds en/eng/english/en-US, 639-2/B vs /T and nb/nn -> no) - the filter
     // matches against these.
     const subLangKeys = subLanguages.map(langMatchKey);
+    // language_sub's keep rule, the one every site that asks it calls: a blank list keeps every subtitle, otherwise the language must be on it.
+    const subLangKept = (lang) => subLangKeys.length === 0 || langListMatch(lang, subLangKeys);
     const fillMode = ddValue(inputs.language_fill_mode, 'single-or-error');
     const removeSubSdh = ddValue(inputs.remove_sub_sdh, 'disabled');
     const tagLanguage = ddValue(inputs.tag_language, 'invalid');
@@ -1642,7 +1643,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     checkLangLists([['language_sub', subLanguages]]);
     // If fillLanguage is set it should be a subtitle that's kept. (There is no audio equivalent: audio_clean owns audio language, and it reads the tag
     // this plugin has already written rather than language_fill itself, so there is nothing here to cross-check against.)
-    if(fillLanguage && subLanguages.length > 0 && !subLangKeys.includes(langMatchKey(fillLanguage)))
+    if(fillLanguage && !subLangKept(fillLanguage))
         failFile(`[language_fill=${logSafe(fillLanguage)}] not in language_sub - untagged subtitle streams would be removed;`
             + ' add it to language_sub or clear language_fill');
     // Every dropdown's accepted set, as ONE table driving the shared checkDropdowns loop. The shape matters beyond the line count:
@@ -1965,6 +1966,29 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // exclusion is slightly conservative there.
     const subDroppedRegardlessOfLanguage = (codec) => subFormatDropped(codec) || imageSubDropped(codec) || styledSubExported(codec);
 
+    // remove_sub_sdh safety guard. A "plain" subtitle carries no commentary/descriptive/SDH/lyrics role and is not FORCED: a forced track holds only
+    // the foreign-language lines, so counting it as the survivor deleted the only full subtitle on the common SDH-plus-forced disc layout. A track
+    // titled just "Signs" is indistinguishable from a plain one and stays one. On if_plain_survives an SDH/CC subtitle goes only when its language
+    // still has a plain subtitle that SURVIVES every whole-file drop reason (subDroppedRegardlessOfLanguage), so extras go and the last usable track
+    // of that language stays; on `all` it goes regardless, and ending with no subtitles is an accepted outcome there. The language it filters on is
+    // resolveWorkLang's (beside fillApplies), so it cannot drift from the tag canonicalLangMeta writes. Audio has no equivalent: audio_clean's
+    // downmix_secondary owns audio-description removal. plainSubLangs is FILLED after the muxability gate below (the format-filter test reads
+    // dstContainer, which mkv_fallback can rewrite); sdhRemoved is the single predicate every site consults, so the tiers cannot drift across sites.
+    const plainSubLangs = new Set();
+    const isPlainTrack = (s) => !isCommentary(s) && !isDescriptive(s) && !isSdh(s) && !isLyrics(s) && !hasDisposition(s, 'forced');
+    const hasPlainSameLang = (set, workLang) => set.has(langKey(workLang));
+    const sdhRemoved = (s, workLang) => removeSubSdh !== 'disabled' && isSdh(s)
+        && (removeSubSdh === 'all' || hasPlainSameLang(plainSubLangs, workLang));
+    // The two filters that discard a subtitle on its own merits rather than because of its codec or the container - language_sub and remove_sub_sdh - as a
+    // predicate the export sites can consult BEFORE writing anything. It asks the stream loop's own predicates (subLangKept, sdhRemoved), so the answer
+    // here and the drop there cannot disagree. Only the export needs it: exporting is one-way, so a sidecar written for a track those filters were about
+    // to discard is a permanent file (and, on an unmapped node, an upload) giving the user an OCR job for a language they excluded.
+    const subFilterDrops = (s) => {
+        const workLang = resolveWorkLang(s);
+        if (!subLangKept(workLang)) return true;
+        return sdhRemoved(s, workLang);
+    };
+
     // #region SHARED helpers (2 sections: preset path safety … font attachment test)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: preset path safety =====
     // -=-=-= pathIsPresetSafe [all five] =-=-=-
@@ -2230,9 +2254,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Canonical audio-title machinery, shared so audio_clean's downmix titles come out already in clean_and_remux's tag_title form (no wasted remux).
     // Canonical form: "<channel/downmix base> - <role tags>", roles LAST ("5.1 -> 2.0 - Commentary"). canonicalAudioTitle is the entry point.
     // -=-=-= channel-label vocab: channelTitleLabels / bareChannelRegex / downmixChannelRegex  [audio_clean, clean_and_remux] =-=-=-
-    // The channel labels we recognise/replace for tag_title - 2.0 included so it can be overwritten with Stereo. Every label clean_and_remux's layoutLabel
-    // can write is listed (the 7.0 / 6.0 / 4.1 / 8.0 and height layouts included), so a title it wrote stays OWNED: its role suffix is normalised and a
-    // downmix base built on it is recognised, instead of being taken for a custom title on the next pass.
+    // The channel labels we recognise/replace for tag_title - 2.0 included so it can be overwritten with Stereo. Every ffprobe standard or named
+    // layout label clean_and_remux's layoutLabel can write is listed (the 7.0 / 6.0 / 4.1 / 8.0 and height layouts included), so a title it wrote
+    // stays OWNED: its role suffix is normalised and a downmix base built on it is recognised. A label it counts from a verbose listing (5.0.4,
+    // 2.0.2), or falls back to when a listing does not add up (16.0, 9.1), may not be listed, and then reads as a custom title on the next pass.
     const channelTitleLabels = ['22.2', '10.0.6', '9.1.4', '7.2.3', '7.1.4', '7.1.2', '5.1.4', '5.1.2', '4.0.4', '3.1.2', '8.0', '7.1', '7.0', '6.1', '6.0',
         '5.1', '5.0', '4.1', '4.0', '3.1', '3.0', '2.1', '2.0', 'stereo', 'mono'];
     const channelLabelAlternation = channelTitleLabels.map(l => l.replace(/\./g, '\\.')).join('|');
@@ -3159,7 +3184,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // audio_clean names downmix TARGETS with it, where a 6ch result is 5.1. Read in order:
     // - ffprobe's numeric names (7.0, 6.0(front), 4.1, 5.1(side), 5.1.2, 7.1.4, 7.2.3, 22.2) as-is, when their digits add up to the channel count;
     // - its other named layouts, mapped to the same form (NAMED_LAYOUT_LABEL, from `ffmpeg -layouts` on jellyfin-ffmpeg 7.1.4);
-    // - a verbose ffprobe/mediaInfo listing, counted: LFE/LFE2 are the LFE digit, T-prefixed (top) and Vh (vertical height) channels the height digit;
+    // - a verbose ffprobe/mediaInfo listing, counted: LFE/LFE2 are the LFE digit, T-prefixed (top) and Vh (vertical height) channels the height digit.
+    //   ffprobe wraps a custom layout as 'N channels (FL+FR+...)', so the wrapper is stripped first or its words count as channels (9.0 for a 5.0.4);
     // - with no layout at all 7.0 cannot be told from 6.1, so a title that already names a layout of the right size is kept, and only an unnamed track
     //   gets the conventional label - otherwise a correct "7.0" would be overwritten with "6.1".
     const NAMED_LAYOUT_LABEL = { quad: '4.0', 'quad(side)': '4.0', hexagonal: '6.0', octagonal: '8.0', cube: '4.0.4', hexadecagonal: '10.0.6' };
@@ -3173,7 +3199,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (named && labelChannelSum(named) === channels) return named;
         if (s) {
             let main = 0; let lfe = 0; let height = 0; let section = '';
-            for (const tok of s.split(/[\s+,/]+/).filter(Boolean)) {
+            for (const tok of s.replace(/^\d+ channels \((.*)\)$/, '$1').split(/[\s+,/]+/).filter(Boolean)) {
                 if (tok.endsWith(':')) { section = tok; continue; }
                 if (/^lfe\d?$/.test(tok)) lfe += 1;
                 else if (section === 'top:' || /^(t[fbs]?[lrc]|tc|vh[lrc])$/.test(tok)) height += 1;
@@ -3210,6 +3236,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return 'other';
     };
 
+    // Does a tag_disposition / tag_title mode (disabled|audio|subtitle|both) cover this stream type?
+    const appliesToType = (mode, type) => mode === 'both' || mode === type;
     // tag_disposition: the title keywords to promote into real +flags (audio and subtitle share the predicate). A promotion must PERSIST in the
     // destination container, or the flag never "takes" and the plugin re-promotes every pass - an infinite remux loop. Empirically (jellyfin-ffmpeg):
     // Matroska has no captions/lyrics flag, MP4/MOV no original/lyrics flag, and `-disposition +karaoke` reads back 0 from both - a +flag for those is
@@ -3277,29 +3305,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             viaDescription: roles.some((k) => described.some((t) => holds(t, k))), by };
     };
 
-    // remove_sub_sdh safety guard. A "plain" subtitle carries no commentary/descriptive/SDH/lyrics role and is not FORCED: a forced track holds only
-    // the foreign-language lines, so counting it as the survivor deleted the only full subtitle on the common SDH-plus-forced disc layout. A track
-    // titled just "Signs" is indistinguishable from a plain one and stays one. On if_plain_survives an SDH/CC subtitle goes only when its language
-    // still has a plain subtitle that SURVIVES every whole-file drop reason (subDroppedRegardlessOfLanguage), so extras go and the last usable track
-    // of that language stays; on `all` it goes regardless, and ending with no subtitles is an accepted outcome there. The language it filters on is
-    // resolveWorkLang's (beside fillApplies), so it cannot drift from the tag canonicalLangMeta writes. Audio has no equivalent: audio_clean's
-    // downmix_secondary owns audio-description removal. plainSubLangs is FILLED after the muxability gate below (the format-filter test reads
-    // dstContainer, which mkv_fallback can rewrite); sdhRemoved is the single predicate every site consults, so the tiers cannot drift across sites.
-    const plainSubLangs = new Set();
-    const isPlainTrack = (s) => !isCommentary(s) && !isDescriptive(s) && !isSdh(s) && !isLyrics(s) && !hasDisposition(s, 'forced');
-    const hasPlainSameLang = (set, workLang) => set.has(langKey(workLang));
-    const sdhRemoved = (s, workLang) => removeSubSdh !== 'disabled' && isSdh(s)
-        && (removeSubSdh === 'all' || hasPlainSameLang(plainSubLangs, workLang));
-    // The two filters that discard a subtitle on its own merits rather than because of its codec or the container - language_sub and remove_sub_sdh - as a
-    // predicate the remove_imagesubs=export sites can consult BEFORE writing anything. Mirrors the stream loop's own tests exactly, so the answer here and
-    // the drop it takes there can never disagree. Only the export needs it: exporting is one-way, so a sidecar written for a track those filters were about
-    // to discard is a permanent file (and, on an unmapped node, an upload) giving the user an OCR job for a language they excluded.
-    const subFilterDrops = (s) => {
-        const workLang = resolveWorkLang(s);
-        if (subLanguages.length > 0 && !langListMatch(workLang, subLangKeys)) return true;
-        return sdhRemoved(s, workLang);
-    };
-
     // Declared outside the try so the catch below can still reach it: workDone is buffered so the log reads as one block, but failFile/failUnexpected build
     // the quarantine message from response.infoLog ALONE - so a terminal that THROWS has to flush it itself, or the error-queue entry loses the per-stream
     // lines that say WHICH streams the abort is about. Any throw after a workDone write must go through failWithBuffers: an AwkFailFile captures infoLog
@@ -3312,10 +3317,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     };
     const failWithBuffers = (msg) => { flushBuffers(); failFile(msg); };
 
-    // One guard around all the per-file work (the input summary, the muxability / guard_audio_language / language_fill_mode pre-checks, the unmapped-node
-    // image-sub export, the per-stream loop and the font/metadata/preset build): a deliberate failFile abort (AwkFailFile) rethrows unchanged, and any
-    // UNEXPECTED error fails the file too — annotated and carrying the full infoLog — instead of silently skipping. The summary walk is inside it because it
-    // reads both probes for every stream, so it is real work that can throw. (Earlier input validation runs before this and fails via failFile directly.)
+    // One guard around all the per-file work (the input summary, the muxability / guard_audio_language / language_fill_mode / all-gone pre-checks, the
+    // unmapped-node sidecar exports, the per-stream loop and the font/metadata/preset build): a deliberate failFile abort (AwkFailFile) rethrows unchanged, and
+    // any UNEXPECTED error fails the file too — annotated and carrying the full infoLog — instead of silently skipping. The summary walk is inside it because
+    // it reads both probes for every stream, so it is real work that can throw. (Earlier input validation runs before this and fails via failFile directly.)
     try {
         // Summarise the input streams exactly as they arrived, before any removal/remux/quarantine. This plugin runs first, so it captures the file as
         // received; reading it alongside the stream-ordering plugin's output line shows where a file came from and where it ended up. Emitted ahead of the
@@ -3409,7 +3414,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (codecTypeOf(s) !== 'subtitle' || !isPlainTrack(s)) continue;
                 if (subDroppedRegardlessOfLanguage(codecNameOf(s))) continue;
                 const workLang = resolveWorkLang(s);
-                if (subLangKeys.length > 0 && !langListMatch(workLang, subLangKeys)) continue;
+                if (!subLangKept(workLang)) continue;
                 plainSubLangs.add(langKey(workLang));
             }
         }
@@ -3443,11 +3448,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // resolveLang, so a language only mediaInfo supplies is not treated as blank.
         if (fillMode === 'single-or-error' && fillLanguage) {
             const isUntagged = (s) => { const lang = resolveLang(s); return !lang || lang === 'und'; };
-            // Inside this block language_fill assigns fillLanguage to every untagged track, so "does it survive the subtitle filter" is one check: kept
-            // when the language list is empty (keep-all) or contains fillLanguage. Mirrors the main loop's own keep/drop decision.
-            const keptByLangFilter = (keys) => keys.length === 0 || langListMatch(fillLanguage, keys);
-            // An untagged SDH subtitle the remove_sub_sdh guard would drop is excluded too -
-            // mirrors the loop's own removal predicate (untagged tracks resolve to fillLanguage).
+            // Every untagged track resolves to fillLanguage here, so the loop's own predicates answer for all of them: subLangKept(fillLanguage) for
+            // language_sub, and sdhRemoved for an untagged SDH subtitle the remove_sub_sdh guard would drop.
             const removedBySdh = (s) => sdhRemoved(s, fillLanguage);
             // Both halves of the guard say the same thing about their own stream type, so they say it from one place - a user comparing two error-queue
             // entries from one feature should never find them worded differently, and the echoed fill value's logSafe cap is part of that wording.
@@ -3460,16 +3462,47 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const untaggedAudio = streams.filter((s) => codecTypeOf(s) === 'audio' && isUntagged(s) && !isSecondaryTrack(s) && !unmuxableDrops.has(s.index))
                 .length;
             if (untaggedAudio > 1) failUntagged(untaggedAudio, 'audio');
-            const untaggedSubs = keptByLangFilter(subLangKeys)
+            const untaggedSubs = subLangKept(fillLanguage)
                 ? streams.filter((s) => codecTypeOf(s) === 'subtitle'
                     && !subDroppedRegardlessOfLanguage(codecNameOf(s)) && isUntagged(s) && !removedBySdh(s)).length : 0;
             if (untaggedSubs > 1) failUntagged(untaggedSubs, 'subtitle');
         }
 
+        // The videos this remux maps: every one but cover art and a method_unmuxable=drop removal, the loop's only two video drops. Read before the loop,
+        // because the all-gone stop below and a tmcd's verdict (isMp4RebuiltTimecode) rest on them, and a video can follow its tmcd in the file.
+        const mappedVideos = streams.filter((s) => codecTypeOf(s) === 'video' && !unmuxableDrops.has(s.index) && !isCoverArt(s));
+        // The all-gone stops. Their facts are final once the muxability gate ends - only a method_unmuxable=drop removal and cover art take a video, and only
+        // the former takes audio (audio_clean owns every other audio keep/drop) - so they run here, before any sidecar is extracted or uploaded for a file
+        // they fail.
+        const hasType = (type) => streams.some((s) => codecTypeOf(s) === type);
+        // mkv_fallback is offered only where it keeps the file, matroska storing every codec in it - never on an mkv target, which drops what matroska refuses.
+        const fallbackKeeps = !streams.some((s) => [...UNMUXABLE_ANYWHERE, ...MKV_UNMUXABLE].includes(codecNameOf(s)));
+        // One spelling of the method_unmuxable=drop wording for both stream types, so a remedy fix cannot reach only one of them. Nothing is buffered in
+        // workDone yet, so it names the codecs it would drop itself.
+        const failUnmuxableDropAll = (type) => {
+            const codecs = [...new Set(streams.filter((s) => codecTypeOf(s) === type && unmuxableDrops.has(s.index)).map(codecNameOf))].join(', ');
+            failFile(`[method_unmuxable=drop] Dropping every ${type} stream ${dstContainer} cannot store (${codecs}) would leave the file with no ${type}`
+                + ` at all - set method_unmuxable=error to stop instead${fallbackKeeps ? ', or mkv_fallback to keep this file in a container that can hold'
+                + ' them' : ''}`);
+        };
+        // The video stop's first clause keeps "no video survives" from being VACUOUSLY true on a file with no video at all, which would fail a file nothing
+        // was taken from. It is structural, not a policy about audio-only files: the not-a-video skip far above lets only a file the scanner classified as
+        // video reach here.
+        if (hasType('video') && !mappedVideos.length) {
+            // Name the gate when it is the one that took the video: its own two escapes are the fix, where the generic wording sends the user to removal
+            // inputs that had nothing to do with it. A prores .mov bound for mp4 is the reachable case - prores is in MP4_UNMUXABLE and is the file's only
+            // video stream, so method_unmuxable=drop empties the file on its own.
+            if (streams.some((s) => codecTypeOf(s) === 'video' && unmuxableDrops.has(s.index))) failUnmuxableDropAll('video');
+            failFile('Removing the specified streams would leave the file with no video streams - check your removal settings');
+        }
+        // Gated on the file having had audio to begin with, so a genuinely silent file is untouched.
+        if (hasType('audio') && streams.every((s) => codecTypeOf(s) !== 'audio' || unmuxableDrops.has(s.index))) failUnmuxableDropAll('audio');
+
         let extraArguments = '';
         let nameCarryArgs = '';   // restatements that ride a remux this run makes anyway; never metadataCommand, whose work sets convert
-        let sidecarOut = '';   // remove_imagesubs=export: accumulates the per-image-sub sidecar outputs, prepended to the main output in the preset below.
-                               // Stays empty on an unmapped node, where placeSidecars below uploads the exports instead of riding them on the remux.
+        // The image-sub (remove_imagesubs=export) and styled-bundle (mp4) sidecar outputs, prepended to the main output in the preset below. Stays empty on
+        // an unmapped node, where preplaceUnmappedExports uploads them instead of riding them on the remux.
+        let sidecarOut = '';
         let convert = false;
         // What the queued writes that only rewrite a name would rewrite (handler names, titles, comments, and role flags that keep what a cleared name held):
         // they start a remux, but not one that would drop a Dolby Vision record (dvTidyHeld, after the stream loop).
@@ -3508,15 +3541,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const deferredFontIndices = [];
 
         let exportRefusedCount = 0;   // image-sub exports that could not be written this run - any at all fails the file, see the check after the stream loop
-        // Styled bundles a requeue can still export: one already on disk that could be neither trusted nor replaced (cut short, undeletable, a symbolic link),
-        // or an unmapped placement that did not complete (unconfirmedSidecars). Unlike the other styled refusals these clear, so the file fails with the styled
-        // original intact rather than flattening it to mov_text for good - see the check after the stream loop.
+        // Styled bundles a requeue can still export: one already on disk that could be neither trusted nor replaced (cut short, undeletable, a
+        // symbolic link), or an unmapped placement that did not complete (preplaced.unconfirmed). Unlike the other styled refusals these clear,
+        // so the file fails with the styled original intact rather than flattening it to mov_text for good - see the check after the stream loop.
         let bundleHeldCount = 0;
-        const placedSidecars = new Set(); const failedSidecars = new Map(); const emptySidecars = new Set();
-        // The subset of failedSidecars a requeue can clear: the server could not say whether the sidecar is already there, or the placement itself failed (an
-        // upload refused or timed out, a staging or extraction fault). A styled export never flattens over one (see the styled refusal); only a path no
-        // translator maps, a permanent gap, does.
-        const unconfirmedSidecars = new Set();
         // The font attachments a styled-subtitle bundle carries. Read once here: they are the same set for every styled subtitle in the file, and the
         // pre-scan below needs them before the stream loop runs.
         const styledFontIndices = streams
@@ -3543,13 +3571,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (span.cues && streamEnd && span.end < streamEnd - CUE_SPAN_SLACK_S) return { verdict: 'short', end: span.end, streamEnd };
             return { verdict: span.cues ? 'trust' : 'replace' };
         };
-        // The unmapped pre-scan's verdicts on bundles already on the server, for stageSidecar to answer from: trusted ones are 'exists', short ones are held.
-        const trustedRemoteBundles = new Set(); const shortRemoteBundles = new Map();
         // WHAT a sidecar export is called and WHICH ffmpeg selection produces it, for the two sites that need it: the unmapped pre-scan below (which hands the
         // tokens to placeSidecars as argv) and stageSidecar, which serves both in-loop branches and owns the single sidecarOut append. A divergence between
         // those two forms is invisible to every check here - one is an array and the other a template literal - and the unmapped copy is UPLOADED into the
         // user's library rather than being a discardable extra output, so the two must not be able to disagree. The REFUSAL paths stay at their call sites:
-        // they differ deliberately (an image refusal fails the file, a styled one falls through to mov_text, the pre-scan's just records into failedSidecars).
+        // they differ deliberately (an image refusal fails the file, a styled one falls through to mov_text, the pre-scan's just records into its failed map).
         const sidecarPlan = (ffstream, styled) => {
             const spec = styled ? STYLED_BUNDLE : IMAGE_SUB[codecNameOf(ffstream)];
             return {
@@ -3559,13 +3585,82 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     : ['-map', `0:${ffstream.index}`, '-c:s', 'copy', '-f', spec.fmt],
             };
         };
+        // Sidecar exports on an UNMAPPED node (remove_imagesubs=export image subs, and styled bundles bound for mp4): the sidecars cannot ride along as
+        // extra outputs of the remux (see the sidecar-placement section), so they are extracted and uploaded here, before the stream loop decides anything -
+        // the loop then drops a subtitle only when its export is placed, refusing the drop otherwise exactly as an unsafe path does. The pre-scan repeats the
+        // loop's own export test, so the two cannot select different streams. Returns the one record stageSidecar and refusalCause read - EMPTY on a mapped
+        // node, never null: refusalCause's table evaluates every entry on any refusal, its failed-map reads included.
+        const preplaceUnmappedExports = () => {
+            const record = {
+                placed: new Set(), empty: new Set(),   // uploaded, or the decode produced nothing
+                failed: new Map(),   // name -> why it could not be placed
+                // The subset of failed a requeue can clear: the server could not say whether the sidecar is already there, or the placement itself failed (an
+                // upload refused or timed out, a staging or extraction fault). A styled export never flattens over one (see the styled refusal); only a path
+                // no translator maps, a permanent gap, does.
+                unconfirmed: new Set(),
+                // Bundles already on the server, judged: trusted ones answer 'exists', short ones are held.
+                trusted: new Set(), short: new Map(),
+            };
+            if (!isUnmappedNode) return record;
+            const exportJobs = [];
+            for (const s of streams) {
+                const codec = codecNameOf(s);
+                if (codecTypeOf(s) !== 'subtitle' || subFilterDrops(s)) continue;
+                // Two kinds of export land here, differing only in what goes into the file: an image subtitle copied alone, or a styled subtitle bundled
+                // with the container's fonts. Both upload BEFORE the stream loop decides anything (see the header above).
+                const styled = styledSubExported(codec);
+                const image = imageSubDropped(codec) && removeImageSubs === 'export';
+                if (!styled && !image) continue;
+                const { name, mapTokens } = sidecarPlan(s, styled);
+                if (Buffer.byteLength(name, 'utf8') > NAME_BYTE_CAP) continue;   // refused in the loop (stageSidecar), with nothing probed or uploaded
+                const dest = serverSidePath(path.join(libDir, name));
+                if (!dest) { record.failed.set(name, 'no path translator maps this library directory back to the server'); continue; }
+                // An image .sup is always extracted again and uploaded over whatever is there, as the mapped route deletes and re-exports one: the source
+                // stream is still embedded, so a .sup already there is a run that died mid-write, and a raw bitmap .sup is never user-authored. Trusting
+                // it because it is non-empty would drop the stream with a truncated copy left as the only one.
+                if (image) { exportJobs.push({ name, dest, args: mapTokens }); continue; }
+                // A styled bundle may have been edited, so one already on the server is fetched to private staging and judged exactly as the mapped route
+                // judges one on disk (judgeBundle). An unconfirmed answer is a failed placement - an upload could replace a bundle that is there - so the
+                // stream is kept, as for any other.
+                let there;
+                let stageDir = '';
+                try {
+                    stageDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_bundlecheck_'));
+                    const local = path.join(stageDir, 'b.mks');
+                    // Fetched whole, with no byte cap, deliberately: a bundle's size is its fonts, which the Matroska muxer writes ahead of the first cue
+                    // (measured: a 72 MB font at byte 97, the subtitle after it), so no text cap bounds it - and a cap whose 'over' meant trust would hand
+                    // a truncated large bundle the only copy, where judged here it is 'short' and held (measured: a killed export kept 385 of 600 cues).
+                    there = sidecarExistsRemote(dest, local);
+                    if (there.state === 'present') {
+                        const judged = judgeBundle(local, s);
+                        if (judged.verdict === 'trust') { record.trusted.add(name); continue; }
+                        if (judged.verdict === 'short') { record.short.set(name, { end: judged.end, streamEnd: judged.streamEnd }); continue; }
+                    }
+                } catch (e) {
+                    there = { state: 'unknown', why: `could not stage it for a check (${e && e.message ? e.message : e})` };
+                } finally {
+                    if (stageDir) try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
+                }
+                if (there.state === 'unknown') {
+                    record.unconfirmed.add(name);
+                    record.failed.set(name, `could not confirm whether it is already there (${there.why}), so it was not exported over it`);
+                    continue;
+                }
+                exportJobs.push({ name, dest, args: mapTokens });
+            }
+            if (exportJobs.length) {
+                const outcome = placeSidecars(exportJobs);
+                for (const n of outcome.placed) record.placed.add(n);
+                for (const n of outcome.empty) record.empty.add(n);
+                for (const [n, why] of outcome.failed) { record.failed.set(n, why); record.unconfirmed.add(n); }
+            }
+            return record;
+        };
         // The mechanical half of an export, shared by the image-sub and the styled-bundle branches so the two cannot stage a file differently: the path join,
         // the unmapped-node lookups, the refusal tests, the already-exists probe, and the single sidecarOut append that rides the export on the remux.
         // Returns { status, name, why?, bytes?, end?, streamEnd? } - status 'placed' (unmapped, already uploaded), 'empty' (unmapped, the decode produced
-        // nothing), 'exists', 'queued' or 'refused'. A refusal names only the CAUSE in `why`: 'unmapped' and 'unconfirmed' (failedSidecars holds the
-        // detail), 'namecap' (with `bytes`), 'unsafe', 'symlink', 'leftover', and 'short' (with `end` and `streamEnd`; a styled bundle only). The two
-        // callers spell the CONSEQUENCE differently: an image refusal keeps the subtitle and fails the file, a styled one falls through to mov_text unless a
-        // requeue can clear it (bundleHeldCount).
+        // nothing), 'exists', 'queued' or 'refused'. A refusal names only the CAUSE in `why`: 'unmapped' and 'unconfirmed' (preplaced.failed holds the
+        // detail), 'namecap' (with `bytes`), 'unsafe', 'symlink', 'leftover', and 'short' (with `end` and `streamEnd`; a styled bundle only).
         const stageSidecar = (ffstream, styled) => {
             const { name, mapTokens } = sidecarPlan(ffstream, styled);
             const sidecarPath = path.join(libDir, name);
@@ -3577,11 +3672,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const bytes = Buffer.byteLength(name, 'utf8');
             if (bytes > NAME_BYTE_CAP) return { status: 'refused', name, why: 'namecap', bytes };
             if (isUnmappedNode) {
-                if (placedSidecars.has(name)) return { status: 'placed', name };
-                if (trustedRemoteBundles.has(name)) return { status: 'exists', name };
-                if (shortRemoteBundles.has(name)) return { status: 'refused', name, why: 'short', ...shortRemoteBundles.get(name) };
-                if (emptySidecars.has(name)) return { status: 'empty', name };
-                return { status: 'refused', name, why: unconfirmedSidecars.has(name) ? 'unconfirmed' : 'unmapped' };
+                if (preplaced.placed.has(name)) return { status: 'placed', name };
+                if (preplaced.trusted.has(name)) return { status: 'exists', name };
+                if (preplaced.short.has(name)) return { status: 'refused', name, why: 'short', ...preplaced.short.get(name) };
+                if (preplaced.empty.has(name)) return { status: 'empty', name };
+                return { status: 'refused', name, why: preplaced.unconfirmed.has(name) ? 'unconfirmed' : 'unmapped' };
             }
             if (!pathIsPresetSafe(sidecarPath)) return { status: 'refused', name, why: 'unsafe' };
             // A file an earlier pass left at this name. ffmpeg refuses to overwrite an existing output (no -y reaches the preset - it answers "Not overwriting
@@ -3604,68 +3699,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             sidecarOut += ` ${mapTokens.join(' ')} "${sidecarPath}"`;
             return { status: 'queued', name };
         };
-        // remove_imagesubs=export on an UNMAPPED node: the sidecars cannot ride along as extra outputs of the remux (see the sidecar-placement section), so
-        // they are extracted and uploaded HERE, before the stream loop decides anything - the loop then drops an image sub only when its export is in
-        // placedSidecars, refusing the drop otherwise exactly as an unsafe path does. The pre-scan repeats the loop's own export test, so the two cannot
-        // select different streams.
-        if (isUnmappedNode) {
-            const exportJobs = [];
-            for (const s of streams) {
-                const codec = codecNameOf(s);
-                if (codecTypeOf(s) !== 'subtitle' || subFilterDrops(s)) continue;
-                // Two kinds of export land here, differing only in what goes into the file: an image subtitle copied alone, or a styled subtitle bundled
-                // with the container's fonts. Both upload BEFORE the stream loop decides anything (see the pre-scan header above).
-                const styled = styledSubExported(codec);
-                const image = imageSubDropped(codec) && removeImageSubs === 'export';
-                if (!styled && !image) continue;
-                const { name, mapTokens } = sidecarPlan(s, styled);
-                if (Buffer.byteLength(name, 'utf8') > NAME_BYTE_CAP) continue;   // refused in the loop (stageSidecar), with nothing probed or uploaded
-                const dest = serverSidePath(path.join(libDir, name));
-                if (!dest) { failedSidecars.set(name, 'no path translator maps this library directory back to the server'); continue; }
-                // An image .sup is always extracted again and uploaded over whatever is there, as the mapped route deletes and re-exports one: the source
-                // stream is still embedded, so a .sup already there is a run that died mid-write, and a raw bitmap .sup is never user-authored. Trusting
-                // it because it is non-empty would drop the stream with a truncated copy left as the only one.
-                if (image) { exportJobs.push({ name, dest, args: mapTokens }); continue; }
-                // A styled bundle may have been edited, so one already on the server is fetched to private staging and judged exactly as the mapped route
-                // judges one on disk (judgeBundle). An unconfirmed answer is a failed placement - an upload could replace a bundle that is there - so the
-                // stream is kept, as for any other.
-                let there;
-                let stageDir = '';
-                try {
-                    stageDir = fs.mkdtempSync(path.join(require('os').tmpdir(), 'awk_bundlecheck_'));
-                    const local = path.join(stageDir, 'b.mks');
-                    // Fetched whole, with no byte cap, deliberately: a bundle's size is its fonts, which the Matroska muxer writes ahead of the first cue
-                    // (measured: a 72 MB font at byte 97, the subtitle after it), so no text cap bounds it - and a cap whose 'over' meant trust would hand
-                    // a truncated large bundle the only copy, where judged here it is 'short' and held (measured: a killed export kept 385 of 600 cues).
-                    there = sidecarExistsRemote(dest, local);
-                    if (there.state === 'present') {
-                        const judged = judgeBundle(local, s);
-                        if (judged.verdict === 'trust') { trustedRemoteBundles.add(name); continue; }
-                        if (judged.verdict === 'short') { shortRemoteBundles.set(name, { end: judged.end, streamEnd: judged.streamEnd }); continue; }
-                    }
-                } catch (e) {
-                    there = { state: 'unknown', why: `could not stage it for a check (${e && e.message ? e.message : e})` };
-                } finally {
-                    if (stageDir) try { fs.rmSync(stageDir, { recursive: true, force: true }); } catch (e) { /* best effort - a temp dir left behind is harmless */ }
-                }
-                if (there.state === 'unknown') {
-                    unconfirmedSidecars.add(name);
-                    failedSidecars.set(name, `could not confirm whether it is already there (${there.why}), so it was not exported over it`);
-                    continue;
-                }
-                exportJobs.push({ name, dest, args: mapTokens });
-            }
-            if (exportJobs.length) {
-                const { placed, failed, empty } = placeSidecars(exportJobs);
-                for (const n of placed) placedSidecars.add(n);
-                for (const n of empty) emptySidecars.add(n);
-                for (const [n, why] of failed) { failedSidecars.set(n, why); unconfirmedSidecars.add(n); }
-            }
-        }
+        // A refusal's CAUSE, worded once for both callers, which append the CONSEQUENCE their own way: an image refusal keeps the subtitle and fails the
+        // file, a styled one falls through to mov_text unless a requeue can clear it (bundleHeldCount). 'short' is a styled bundle's alone, worded there.
+        const refusalCause = (why, name, bytes) => ({
+            unmapped: `Could not place ${name} in the library - ${preplaced.failed.get(name)}`,
+            unconfirmed: `Could not place ${name} in the library - ${preplaced.failed.get(name)}`,
+            namecap: `Sidecar name would be ${bytes} bytes, over the ${NAME_BYTE_CAP}-byte filesystem limit`,
+            unsafe: `Library directory has a quote, control char or <io> - cannot write ${name} safely`,
+            leftover: `An incomplete ${name} from an earlier run could not be deleted to export it again - delete it and requeue`,
+            symlink: `${name} in the library is a symbolic link - not exporting through it, since it could point anywhere; remove it and requeue`,
+        }[why]);
+        const preplaced = preplaceUnmappedExports();
 
-        // The videos this remux maps, read before the loop because a tmcd's verdict rests on them (isMp4RebuiltTimecode) and a video can follow its tmcd in
-        // the file: every one but cover art and a method_unmuxable=drop removal, the loop's only two video drops (see the all-gone check after it).
-        const mappedVideos = streams.filter((s) => codecTypeOf(s) === 'video' && !unmuxableDrops.has(s.index) && !isCoverArt(s));
         for (let i = 0; i < streams.length; i++) {
             const ffstream = streams[i];
             const ffstreamCodec = codecNameOf(ffstream);
@@ -3813,7 +3858,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // not a plain name beside it, though the busy test alone passes it: a cut can hold three periods or fewer where its title holds more. '' if none.
             const busyFallback = () => {
                 const handler = handlerTextOf(getTagCI(ffstream.tags, 'handler_name'));
-                const ownCut = handlerNameFor(streamTitle, readContainer);
+                const ownCut = handlerNameFor(streamTitle, srcContainer);
                 return isGenericHandler(handler) || tooManyPeriods(handler) || [ownCut, escMeta(ownCut)].includes(handler) ? '' : handler;
             };
             // Busy-title removal (audio/subtitle; the video branch calls busyFallback itself): an over-dotted title becomes busyFallback's name, else a blank
@@ -3895,8 +3940,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // be safe (the sidecar is the only surviving copy): when the joined path can't be embedded in the quoted preset token (pathIsPresetSafe -
                 // the library directory has to stay literal) the export AND the drop are refused with a ☒, and the stream falls through to the container
                 // test, which still drops it on mp4 and keeps it on mkv. That ☒ goes straight to the infoLog rather than workDone: it warns about the
-                // ENVIRONMENT, not a queued change, so it belongs outside the decision block rather than buffered with it. workDone itself always reaches
-                // the log - on the convert path at the remux, and through flushBuffers on any quarantine - and a refused image export always quarantines.
+                // ENVIRONMENT, not a queued change, so it belongs outside the decision block rather than buffered with it. workDone reaches the log on the
+                // convert path and through flushBuffers on a quarantine - never on a benign skip, so a warning that must survive a no-op goes straight to
+                // infoLog - and a refused image export always quarantines.
                 const imageSubDrop = imageSubDropped(ffstreamCodec);
                 // language_sub / remove_sub_sdh discard this track on its own merits, so it must not be exported first: the sidecar is permanent (nothing
                 // here ever deletes one, and on an unmapped node it is uploaded into the library over the file API), it hands the user an OCR job for a
@@ -3921,19 +3967,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         workDone += `☑${inputTag} Nothing to export to ${sidecarName} - the subtitle stream carries no data (dropping it loses nothing)\n`;
                     } else {
                         // Every refusal keeps the subtitle, and any at all fails the file after the loop: the sidecar would have been its only copy.
-                        const refusal = {
-                            unmapped: `Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}, keeping the subtitle`,
-                            unconfirmed: `Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}, keeping the subtitle`,
-                            namecap: `Sidecar name would be ${bytes} bytes, over the ${NAME_BYTE_CAP}-byte filesystem limit`
-                                + ' - rename the video shorter and requeue, keeping the subtitle',
-                            unsafe: `Library directory has a quote, control char or <io> - cannot write ${sidecarName} safely, keeping the subtitle`,
-                            leftover: `An incomplete ${sidecarName} from an earlier run could not be deleted to export it again - delete it and requeue,`
-                                + ' keeping the subtitle',
-                            symlink: `${sidecarName} in the library is a symbolic link - not exporting through it, since it could point anywhere; remove it`
-                                + ' and requeue, keeping the subtitle',
-                        };
                         exportRefused = true; exportRefusedCount += 1;
-                        response.infoLog += `☒${inputTag} ${refusal[why]}\n`;
+                        const remedy = why === 'namecap' ? ' - rename the video shorter and requeue' : '';
+                        response.infoLog += `☒${inputTag} ${refusalCause(why, sidecarName, bytes)}${remedy}, keeping the subtitle\n`;
                     }
                 }
                 if (imageSubDrop && !exportRefused && !exportSuppressed) {
@@ -3956,15 +3992,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // keep/drop decision is unchanged - the tag write is just skipped for a stream about to be mapped out.
                     const workLang = resolveWorkLang(ffstream);
 
-                    //language_sub: drop a subtitle whose (possibly filled) language is not on the keep list. A blank list keeps every language.
-                    if(subLanguages.length > 0 && !langListMatch(workLang, subLangKeys)) {
-                        // Stop rather than lose the imported captions (isImportedCaptionTrack): the file is left untouched for the user to decide, and the
-                        // usual cause is the track's honest und tag - which is exactly what language_fill exists to fill.
+                    //language_sub: drop a subtitle whose (possibly filled) language it does not keep (subLangKept).
+                    if(!subLangKept(workLang)) {
+                        // Stop rather than lose the imported captions (isImportedCaptionTrack): the file is left untouched for the user to decide. The remedy
+                        // follows the track's language: an und one (language_fill is blank, or it would have been filled) is what language_fill exists to
+                        // fill, while one that already carries a language, which language_fill never changes, is kept only by listing that language.
                         if (isImportedCaptionTrack(ffstream)) {
+                            const remedy = workLang === 'und' ? 'set language_fill to a language on language_sub (or add und to language_sub)'
+                                : `add ${logSafe(workLang)} to language_sub (or remove the track yourself)`;
                             failWithBuffers(`${streamTag(ffstream.index)}[language_sub=${logSafe(inputs.language_sub)}] Would remove the closed-caption track `
                                 + `sub_worker imported (language ${logSafe(workLang)}) - the only copy of those captions left in the video, which sub_worker `
-                                + `will not read out again - set language_fill to a language on language_sub`
-                                + `${fillLanguage ? '' : ' (or add und to language_sub)'}, then requeue`);
+                                + `will not read out again - ${remedy}, then requeue`);
                         }
                         // logSafe's 200-char cap matters here: the whole language_sub list is echoed once PER dropped subtitle.
                         workDone += `☐${streamTag(ffstream.index)}[language_sub=${logSafe(inputs.language_sub)}] `
@@ -3983,7 +4021,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
 
                 if(shouldDrop === true) {
-                    //Deleting the stream so including metadataCommand will cause problems
                     dropStream(ffstream.index);
                     subtitleOutOrdinal--;
                     continue;
@@ -4008,29 +4045,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     } else if (status === 'exists') {
                         workDone += `☑${inputTag} Styled-subtitle bundle already exists, not overwriting: ${sidecarName}\n`;
                     } else {
-                        // Except a bundle already in the library that is cut short, undeletable or a symbolic link, or an unmapped placement that did not
-                        // complete (unconfirmedSidecars): those clear on a requeue, so the file fails with the styled original intact instead of flattening it
-                        // for good (bundleHeldCount). The bundle route has no 'empty' answer of its own and does not need one: placeSidecars files an empty
-                        // extraction under BOTH empty and failed, so the unmapped refusal already names it ('extraction produced no data') rather than reading
-                        // undefined.
-                        const refusal = {
-                            unmapped: `Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}; converting to mov_text instead,`
-                                + ' which loses the styling',
-                            namecap: `Sidecar name would be ${bytes} bytes, over the ${NAME_BYTE_CAP}-byte filesystem limit - converting to mov_text`
-                                + ' instead, which loses the styling; rename the video shorter to keep it',
-                            unsafe: `Library directory has a quote, control char or <io> - cannot write ${sidecarName} safely; converting to mov_text`
-                                + ' instead, which loses the styling',
-                            leftover: `An incomplete ${sidecarName} from an earlier run could not be deleted to export it again - delete it and requeue`,
-                            symlink: `${sidecarName} in the library is a symbolic link - not exporting through it, since it could point anywhere; remove it`
-                                + ' and requeue',
-                            unconfirmed: `Could not place ${sidecarName} in the library - ${failedSidecars.get(sidecarName)}; a fault a requeue can clear, so`
-                                + ' the styled subtitle is not flattened over it - requeue once it is resolved',
-                            short: `${sidecarName} already in the library stops at ${Number(staged.end).toFixed(1)} s but this subtitle runs to `
-                                + `${Number(staged.streamEnd).toFixed(1)} s - a run that failed partway, or an edit that cut the end, so it cannot be `
-                                + 'trusted with the only copy - delete it and requeue to export the whole subtitle',
+                        // Except a bundle already in the library that is cut short, undeletable or a symbolic link, or an unmapped
+                        // placement that did not complete (preplaced.unconfirmed): those clear on a requeue, so the file fails with the
+                        // styled original intact instead of flattening it for good (bundleHeldCount). The bundle route has no 'empty'
+                        // answer of its own and does not need one: placeSidecars files an empty extraction under BOTH empty and failed,
+                        // so the unmapped refusal already names it ('extraction produced no data') rather than reading undefined.
+                        const cause = why || 'unmapped';
+                        const flattened = '; converting to mov_text instead, which loses the styling';
+                        const consequence = {
+                            unmapped: flattened, unsafe: flattened, leftover: '', symlink: '',
+                            namecap: ' - converting to mov_text instead, which loses the styling; rename the video shorter to keep it',
+                            unconfirmed: '; a fault a requeue can clear, so the styled subtitle is not flattened over it - requeue once it is resolved',
                         };
+                        const line = cause === 'short' ? `${sidecarName} already in the library stops at ${Number(staged.end).toFixed(1)} s but this subtitle `
+                            + `runs to ${Number(staged.streamEnd).toFixed(1)} s - a run that failed partway, or an edit that cut the end, so it cannot be `
+                            + 'trusted with the only copy - delete it and requeue to export the whole subtitle'
+                            : `${refusalCause(cause, sidecarName, bytes)}${consequence[cause]}`;
                         if (why === 'short' || why === 'leftover' || why === 'symlink' || why === 'unconfirmed') bundleHeldCount += 1;
-                        response.infoLog += `☒${inputTag} ${refusal[why || 'unmapped']}\n`;
+                        response.infoLog += `☒${inputTag} ${line}\n`;
                     }
                     if (exported) { dropStream(ffstream.index); subtitleOutOrdinal--; continue; }
                 }
@@ -4251,9 +4283,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     deferredFontIndices.push(ffstream.index);
                     continue;
                 }
-                // 'other' - unidentifiable attachment. mkv carries anything, so the "never remove what we can't identify" policy holds there (see
-                // attachmentKind). It has to yield for mp4: the mp4/mov muxer has NO attachment stream support at all, so leaving one in -map 0 doesn't just
-                // lose it - the whole remux fails.
+                // 'other' - unidentifiable attachment. mkv carries anything, so the "never remove what we can't identify" policy holds
+                // there (see attachmentKind) - remove one with a separate plugin if needed. It has to yield for mp4: the mp4/mov muxer
+                // has NO attachment stream support at all, so leaving one in -map 0 doesn't just lose it - the whole remux fails.
                 if (dstContainer === 'mp4') {
                     workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Remove attachment mp4 can't carry`
                         + ` (${ffstreamType}-${ffstreamCodec})\n`;
@@ -4294,8 +4326,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (metadataCommand !== tidyText) convert = true;
             }
             nameCarryArgs += carryCommand;
-
-            //An unrecognised attachment classified as 'other' is left untouched in mkv - remove it with a separate plugin if needed.
         }
         if (handlerRolesLost.length) {
             workDone += `☒[container=${dstContainer}] handler_name is being ${dstContainer === 'mkv' ? 'cleared' : 'replaced'} and was the only place these `
@@ -4333,30 +4363,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
         }
 
-        // One spelling of the all-gone test and of the method_unmuxable=drop wording for both stream types, so a remedy fix cannot reach only one of them.
-        // mkv_fallback is offered only where it keeps the file, matroska storing every codec in it - never on an mkv target, which drops what matroska refuses.
-        const allGone = (type) => streams.some((s) => codecTypeOf(s) === type) && !streams.some((s) => codecTypeOf(s) === type && !removedIndices.has(s.index));
-        const fallbackKeeps = !streams.some((s) => [...UNMUXABLE_ANYWHERE, ...MKV_UNMUXABLE].includes(codecNameOf(s)));
-        const failUnmuxableDropAll = (type) => failWithBuffers(`[method_unmuxable=drop] Dropping every ${type} stream ${dstContainer} cannot store would `
-            + `leave the file with no ${type} at all - set method_unmuxable=error to stop instead${fallbackKeeps ? ', or mkv_fallback to keep this file in a'
-            + ' container that can hold them' : ''}`);
-
-        // Every path that can drop a video stream (method_unmuxable=drop above, cover art in the video branch, the pair mappedVideos reads) records it in
-        // removedIndices, so the survivors are read from there. The first clause exists to stop the second being VACUOUSLY true: with no video stream at all,
-        // "no video stream survives" holds trivially and would fail a file nothing was taken from. It is structural, not a policy about audio-only files - the
-        // not-a-video skip far above means only a file the scanner classified as video reaches here, so an audio-only file never arrives to be protected.
-        if (allGone('video')) {
-            // Name the gate when it is the one that took the video, mirroring the audio guard below: its own two escapes are the fix, where the generic
-            // wording sends the user to removal inputs that had nothing to do with it. A prores .mov bound for mp4 is the reachable case - prores is in
-            // MP4_UNMUXABLE and is the file's only video stream, so method_unmuxable=drop empties the file on its own.
-            if (streams.some((s) => codecTypeOf(s) === 'video' && unmuxableDrops.has(s.index))) failUnmuxableDropAll('video');
-            failWithBuffers('Removing the specified streams would leave the file with no video streams - check your removal settings');
-        }
-
-        // method_unmuxable=drop is the ONLY path here that removes an audio stream (audio_clean owns every other audio keep/drop), so it needs its own
-        // all-gone guard - the video one above does not cover audio. Gated on the file having had audio to begin with, so a genuinely silent file is untouched.
-        if (unmuxableDrops.size > 0 && allGone('audio')) failUnmuxableDropAll('audio');
-
         // Post-loop file-level state: the container-global -metadata writes (for mp4TagPlan), and the recovery flags that go on the input side.
         const globalWrites = {};
         let fflags = '';
@@ -4391,10 +4397,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // the file forever - to prevent that we stamp the requested recover_bad_* MODE SIGNATURE into a format-level awk_recovered tag and only recover when
         // it differs from the stamped one (a changed mode, or no tag yet), then re-stamp. That converges (matching tag = skip), so changing a mode re-runs
         // recovery exactly once and settles - no separate "run again" toggle is needed since the two recover_bad_* dropdowns are themselves the intent.
-        const recoverRequested = recoverTs !== 'disabled' || recoverData !== 'disabled';
+        const tsOn = recoverTs === 'light' || recoverTs === 'aggressive';
+        const tsAgg = recoverTs === 'aggressive';
+        const dataOn = recoverData === 'light' || recoverData === 'aggressive';
+        const dataAgg = recoverData === 'aggressive';
+        const recoverRequested = tsOn || dataOn;
         // Order-stable signature of the recovery modes requested this run (e.g. "ts-light+data-aggressive"). escMeta is a no-op here (alphanumeric + '-' + '+')
         // but keeps the compared value byte-identical to what gets written to awk_recovered below.
-        const recoverSig = [recoverTs !== 'disabled' && `ts-${recoverTs}`, recoverData !== 'disabled' && `data-${recoverData}`].filter(Boolean).join('+');
+        const recoverSig = [tsOn && `ts-${recoverTs}`, dataOn && `data-${recoverData}`].filter(Boolean).join('+');
         const recoverIntent = escMeta(recoverSig);
         const recoveredTag = getTagCI(file.ffProbeData.format?.tags || {}, RECOVERED_TAG).trim();
         const intentMatches = recoveredTag !== '' && recoveredTag === recoverIntent;
