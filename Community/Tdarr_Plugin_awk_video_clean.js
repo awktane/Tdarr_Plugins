@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.93',
+    Version: '3.999.94',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -743,13 +743,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const c = String(container || '').toLowerCase();
         return isMp4Family(c) && (c === 'mov' || plan.flag) ? kept.filter(isMp4Cover) : [];
     };
-    // -=-=-= mp4TagPlanLog [all five] =-=-=-
+    // -=-=-= mp4TagPlanLog (+ TAG_KEY_LOG_MAX) [all five] =-=-=-
+    const TAG_KEY_LOG_MAX = 40;   // several keys share one line, and a key is a name rather than free text, so each echo is kept short
     // What the plan costs, as log lines: the native tags the flag rewrites, the custom keys a flagless mux leaves behind, and each cover mp4CoversLost
     // names (same `kept` argument). The rewrite is said on every mux that keeps a marker: nothing else names it, so a library recovered into mp4 lost
     // its readable tags in silence, and the marker is permanent.
     const mp4TagPlanLog = (plan, container, kept = []) => {
         const c = String(container || '').toLowerCase();
-        const TAG_KEY_LOG_MAX = 40;   // several keys share one line, and a key is a name rather than free text, so each echo is kept short
         const names = (keys) => keys.map((k) => logSafe(k, TAG_KEY_LOG_MAX)).join(', ');
         let log = '';
         if (plan.flag) {
@@ -774,10 +774,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // mp4/m4v/m4a write the copy as a second, junk 'gpmd' data track (one more each pass), and mov refuses it ("Tag text incompatible with output codec id",
     // exit 183) - measured for both fourccs on jellyfin 7.1.4, 2026-10-22. Every plugin writing an mp4-family output leaves it unmapped, and clean_and_remux
     // never counts that as work (a removal the muxer undoes emits the same preset every pass, which Tdarr errors); its remux into Matroska removes it like any
-    // data stream, Matroska carrying the chapters natively. The fourcc list stays closed: every other data track is copied (a GoPro 'gpmd' telemetry track in a
-    // chaptered file survives), and a 'tx3g' track no chapter reference names is demuxed as a mov_text subtitle, not as data. The demuxer is read from
-    // format_name, never the extension. Tdarr probes without -show_chapters, so chapters are known from mediaInfo's Menu tracks or from the track's own
-    // nb_frames, the chapter count ffmpeg reads (equal at 1, 3, 4, 7 and 20 chapters), which still answers when mediaInfo did not scan the file; a
+    // data stream, Matroska carrying the chapters natively. The fourcc list stays closed: every other data track is left to the plugin's data rule (the other
+    // four copy it; clean_and_remux removes it), and a 'tx3g' track no chapter reference names is demuxed as a mov_text subtitle, not as data. The demuxer is
+    // read from format_name, never the extension. Tdarr probes without -show_chapters, so chapters are known from mediaInfo's Menu tracks or from the track's
+    // own nb_frames, the chapter count ffmpeg reads (equal at 1, 3, 4, 7 and 20 chapters), which still answers when mediaInfo did not scan the file; a
     // chapter-fourcc track with neither holds no chapter to rebuild and is removed like any other. awk-ffmpeg-test's fmtprobe rebuild:* rows re-measure it.
     const isMp4ChapterTrack = (s) => String(file?.ffProbeData?.format?.format_name || '').split(',').some(isMp4Family)
         && codecTypeOf(s) === 'data' && ['text', 'tx3g'].includes(String(s.codec_tag_string || '').toLowerCase())
@@ -851,7 +851,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }).join('');
     // -=-=-= isMp4RebuiltTimecode (+ mp4TimecodeCount, mp4RebuiltTimecodes) [all five] =-=-=-
     // How many tmcds the muxer writes for `kept`, the streams as the output writes them: one per mp4TimedVideo stream the output maps, none beside a copied
-    // tmcd (mov) - each written from its video's mp4VideoTimecode, never from a source track.
+    // tmcd (mov) - each written from its video's mp4VideoTimecode, never from a source track. A copied tmcd (mov) is kept, and listed so, whatever its timecode
+    // or reference (fmtprobe create:tmcd-copied) - bar a zero-duration one whose sample sits first in the file, which the mov demuxer drops on the next read
+    // and no probe tells from one that survives.
     const mp4TimecodeCount = (kept) => (kept.some(isTmcdTrack) ? 0 : kept.filter(mp4TimedVideo).length);
     // The source tmcds left out of the map that come back: one per kept timed video, a tmcd whose own timecode tag is the one that video is written with, then
     // the first left in file order for each video none matches; the rest are lost. A PNG-codec video stored first at 05:00:00:00 beside an h264 at 01:00:00:00,
@@ -1073,11 +1075,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             + ' remux it to mkv or mp4 first (clean_and_remux does that)\n' : '';
     };
     // -=-=-= movDvLossLine  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
-    // One warning per video stream a write into `container` takes a Dolby Vision box from (movLosesDvBox), '' when none does, on the pass that writes
-    // it; `act` names a write that is not a remux. `streams` is the list the output maps, each written stream as the caller reads it.
-    const movDvLossLine = (container, streams, act = 'remux') => streams.filter((s) => movLosesDvBox(container, s))
-        .map((s) => `☒${streamTag(s.index)} Dolby Vision is lost in this ${act} - ffmpeg cannot write its box into a .mov; run clean_and_remux first to move`
-            + ' the file to mp4 or mkv\n').join('');
+    // One line per video stream movLosesDvBox flags in a write into `container`, '' when it flags none, on the pass that writes it; `act` names a write
+    // that is not a remux. `streams` is the list the output maps, each written stream as the caller reads it. clean_and_remux's move to mp4 or mkv is
+    // advised only where it helps. A stream whose only Dolby Vision signal is its fourcc has no box to lose, so its line says that instead, and a dvhe one
+    // reads honestly once moved (hvc1 in mp4, no fourcc in Matroska). A record no copy keeps (dvRecordSurvivesCopy) is lost by any remux, so its line
+    // is dvCopyLossLine's.
+    const movDvLossLine = (container, streams, act = 'remux') => streams.filter((s) => movLosesDvBox(container, s)).map((s) => {
+        const tag = String(s.codec_tag_string || '').toLowerCase().trim();
+        if (!isDolbyVisionVideo({ ...s, codec_tag_string: '' }, mediaInfoFor(s))) {
+            return `☒${streamTag(s.index)} The video is tagged ${tag} but holds no Dolby Vision box${tag === 'dvhe' ? ' - run clean_and_remux first to move the'
+                + ' file to mp4 or mkv, which drops the stale tag' : ''}\n`;
+        }
+        return `☒${streamTag(s.index)} Dolby Vision is lost in this ${act} - ${dvRecordSurvivesCopy(s) ? 'ffmpeg cannot write its box into a .mov; run'
+            + ' clean_and_remux first to move the file to mp4 or mkv' : 'its record does not match the video\'s colour, so no ffmpeg copy keeps it'}\n`;
+    }).join('');
     // -=-=-= ROLE_LOSS_WHY / roleLossLine  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // One warning per stream a write takes role flags from (MOV_UNSTORED_ROLES names them all), worded as movDvLossLine: those readBackDispositions
     // reads back 0 on the output. Only two outputs store fewer than a source of their own kind can hold: a .mov the mp4 muxer wrote (-f mp4) holds
@@ -2055,12 +2066,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // misses the table instead of resolving an inherited function.
     const MOV_LANG = Object.assign(Object.create(null), { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
         deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel', fre: 'fra', cze: 'ces', rum: 'ron', slo: 'slk',
-        // Rows of another kind: the table holds Norwegian only as the macrolanguage nor, not its two written forms, so Bokmål and Nynorsk (nob and nno,
-        // which land 0x7fff) are written as nor - the language kept, the written form lost, and a .mov holds the two as one language. Every other
-        // language the muxer drops still reads back with none: the table holds Swedish and Irish only as Mac codes ffmpeg spells sve and iri, which no
-        // plugin reads as a language.
+        // Rows of another kind: the table holds Norwegian only as the macrolanguage nor, not its two written forms, so Bokmål and Nynorsk (nob and nno, which
+        // land 0x7fff) are written as nor - the language kept, the written form lost, and a .mov holds the two as one language. Every other language the muxer
+        // drops still reads back with none: the table holds Swedish and Irish only as Mac codes ffmpeg spells sve and iri, which no plugin reads as a language.
         nob: 'nor', nno: 'nor' });
-    // -=-=-= movLangRespellArgs (+ movLangRespelled, movLangRespellLog, movLangReadBack)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // -=-=-= MOV_LANG_STORED  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Every code the mov muxer's table holds: written into a .mov, these 97 read back as written and every other code reads back with no language - a census
+    // of all 17,576 lower-case three-letter codes (and ENG, Eng, und and en, none stored) on jellyfin-ffmpeg 7.1.4, 2026-11-15. Swedish and Irish are there
+    // only as the Mac codes sve and iri, so swe, gle, hrv, srp and fil, among others, land 0x7fff; MOV_LANG respells the ones the table holds another way.
+    const MOV_LANG_STORED = new Set(['alb', 'amh', 'ara', 'arm', 'asm', 'aym', 'aze', 'baq', 'bel', 'ben', 'bul', 'bur', 'cat', 'ces', 'chi', 'dan', 'dut',
+        'dzo', 'eng', 'epo', 'est', 'fin', 'fra', 'geo', 'ger', 'gre', 'grn', 'guj', 'heb', 'hin', 'hun', 'ice', 'ind', 'iri', 'ita', 'jav', 'jpn', 'kan',
+        'kas', 'kaz', 'khm', 'kin', 'kir', 'kor', 'kur', 'lao', 'lat', 'lav', 'lit', 'mac', 'mal', 'mar', 'may', 'mlg', 'mlt', 'mol', 'mon', 'nep', 'nor',
+        'nya', 'ori', 'orm', 'per', 'pol', 'por', 'pus', 'que', 'ron', 'run', 'rus', 'san', 'sin', 'slk', 'slv', 'smi', 'snd', 'som', 'spa', 'sve', 'swa',
+        'tam', 'tat', 'tel', 'tgk', 'tgl', 'tha', 'tib', 'tir', 'tuk', 'tur', 'uig', 'ukr', 'urd', 'uzb', 'vie', 'wel', 'yid']);
+    // -=-=-= movLangRespellArgs (+ movLangRespelled, movLangRespellLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // The language writes a remux into .mov owes the tracks it copies or re-encodes: a .mov another tool wrote can hold a spelling the table lacks
     // (AVFoundation stores deu and nld), which the copy would lose, so each such language goes back in MOV_LANG's spelling and nothing else is touched (a
     // census of 400 spellings on jellyfin-ffmpeg 7.1.4: the muxer drops every key and stores every value). Matched by the language itself - the output stream
@@ -2073,10 +2092,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Nynorsk (nob, nno) say that they merge.
     const movLangRespellLog = (container, streams) => movLangRespelled(container, streams).map((l) => `☐Writing ${l} as ${MOV_LANG[l]} - a .mov stores no`
         + ` ${l}${MOV_LANG[l] === 'nor' ? ', so Bokmål and Nynorsk both become Norwegian and can no longer be told apart' : ''}\n`).join('');
-    // Stream s as the next pass reads its language after a .mov write, for an Expected results line.
+    // -=-=-= movLangReadBack  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Stream s as the next pass reads its language after a .mov write, for an Expected results line: in MOV_LANG's spelling, or as und where the table
+    // stores the code under none (MOV_LANG_STORED) - und, not no tag, so the source's own mediaInfo language does not stand in for it.
     const movLangReadBack = (container, s) => {
         const l = getTagCI(s?.tags, 'language');
-        return container === 'mov' && MOV_LANG[l] ? { ...s, tags: { ...(s.tags || {}), language: MOV_LANG[l] } } : s;
+        const back = container !== 'mov' || !l ? l : MOV_LANG_STORED.has(MOV_LANG[l] || l) ? MOV_LANG[l] || l : 'und';
+        return back === l ? s : { ...s, tags: { ...(s.tags || {}), language: back } };
     };
     // ===== END SHARED: mov language table =====
 
@@ -2167,7 +2189,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Whether a write into `container` takes this video stream's Dolby Vision box away. The mov muxer (MODE_MOV) writes no dvcC/dvvC box under any fourcc
     // (0 of 96 readable .mov outputs, jellyfin 7.1.4), so -strict unofficial does not help: an iPhone Profile 8.4 .mov remuxed into .mov reads back as
     // plain HLG HEVC. `-f mp4` is no escape, as the mp4 muxer refuses that file's mebx tracks. clean_and_remux writes only mkv or mp4, so the box survives
-    // when it runs first. A fourcc-only signal (a dvhe .mov) counts too: its record is gone either way. Cover art is never the subject.
+    // when it runs first. A fourcc-only signal (a dvhe .mov whose box is gone) counts too, as the stream still reads as Dolby Vision; movDvLossLine says
+    // it holds no box. Cover art is never the subject.
     // awk-ffmpeg-test's dvbox:p5-fourcc row measures it (its mov-annexb-hvc1 cell): that cell turning present means .mov can carry the box and this is stale.
     const movLosesDvBox = (container, s) => container === 'mov' && codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s));
     // Stream s as the next pass reads it once a write has dropped its Dolby Vision record, for an Expected results token: the record gone and mediaInfo
@@ -4222,6 +4245,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // survivor set is right. On the transcode path it must sit AFTER buildVideoArgs' own -strict: the last one on the command wins, so appending keeps the
         // escalation to experimental, while placing it earlier would let a plain unofficial override it and the TrueHD mux would fail.
         const strictArg = mp4StrictArg(dstContainer, file.ffProbeData.streams);
+        // The tag-only remux of the caption-withdraw and verdict-keep passes: this file copied as it is, with one global tag written. The two passes write
+        // different tags, so their arguments differ from each other's and from every encode's and restore's.
+        const tagOnlyRemux = (tag, value) => {
+            sealPreset('', `${mapAll} -c copy${outputDrops}${strictArg} -metadata "${tag}=${value}"`, { [tag]: value }, primary, { copied: true });
+            response.infoLog += expectedResultsLine(summariseStream(dvCopyReadBack(dstContainer, enrichStream(primary))));
+            return response;
+        };
         // ====== END EMIT HELPERS ======
 
         // ====== LOSSLESS STRIP EMIT ======
@@ -4670,7 +4700,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 + `set hdr_mode=strip_dynamic (keep the HDR10 base) or hdr_mode=tonemap_sdr (flatten to SDR)\n`);
         }
 
-        // ====== TRANSCODE EMIT ======
+        // ====== RUN STATE (captions, library original) ======
         // Embedded closed captions. They live in the video bitstream, so this is the only plugin that can lose them and the only one that can
         // remove them deliberately. Two jobs: carry out the removal sub_worker asked for, and (guard_captions) notice captions the encoder this node is
         // about to choose would destroy. Neither is in the awk_video fingerprint, deliberately: neither can FIRE a transcode, they only change how one
@@ -4712,13 +4742,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const origFormat = String(origProbe?.format?.format_name || '');
         // A recover_bad_* repair in this job rewrote the video stream: the working file's stamp differs from the original's.
         const recoveredHere = !!origProbe && getTagCI(fmtTags, RECOVERED_TAG).trim() !== getTagCI(origProbe.format?.tags, RECOVERED_TAG).trim();
+        // sub_worker's caption removal happened in this job: `removed` on this file and not on the library original.
+        const origCcTokens = ccTokensOf(origProbe?.format?.tags);
+        const ccRemovedHere = ccAlreadyGone && !origCcTokens.includes(CC_TOKENS.removed);
         // Why an encode is not a pure size pass, worded for its line ('' when it is one). The encode decides this itself, from its own triggers: on the next
         // pass every transform re-reads as done (already capped, SDR, progressive, static), and a restore would put back the original bitstream - the
         // captions sub_worker asked to have removed, or removed itself earlier in this job (`removed` here and not on the original), or what a recovery
         // repaired, included.
         const sizeExemptWhy = () => (willDownscale ? `downscales to ${outHeight}p` : tonemap ? 'tonemaps to SDR' : deinterlaceNeeded() ? 'deinterlaces'
             : effHdrMode === 'strip_dynamic' && isDynamicHdr ? 'strips the dynamic HDR' : ccExported ? 'removes the closed captions sub_worker asked for'
-                : ccAlreadyGone && !ccTokensOf(origProbe?.format?.tags).includes(CC_TOKENS.removed) ? 'follows sub_worker\'s caption removal'
+                : ccRemovedHere ? 'follows sub_worker\'s caption removal'
                     : recoveredHere ? 'follows clean_and_remux\'s recovery' : '');
         // The restore refusals the two probes and the original's path decide alone ('' when none applies). The encode's own pass reads them too: an encode
         // whose original can never be put back is not judged at all, and the verdict re-checks them as a backstop.
@@ -4736,7 +4769,39 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return `a .${dstContainer} file cannot hold the original's ${codecNameOf(origPrimary)} video`;
             return '';
         };
+        // The ffprobe the verdict's reads and the fence's fingerprint check use, located once and only when one of them runs ('' under the harness, whose
+        // reads are injected).
+        let ffprobeMemo = null;
+        const savingsFfprobe = () => {
+            if (ffprobeMemo === null) ffprobeMemo = injectedCap ? '' : deriveFfprobePath(ffmpegPathOf(otherArguments));
+            return ffprobeMemo;
+        };
+        // videoDigest, read at most once per file and stream, so a pass that checks a fence and a caption request pays one spawn.
+        const digestMemo = new Map();
+        const digestOf = (filePath, absIndex) => {
+            const key = `${absIndex}|${filePath}`;
+            if (!digestMemo.has(key)) digestMemo.set(key, videoDigest(filePath, savingsFfprobe(), absIndex, FINGERPRINT_TIMEOUT_MS));
+            return digestMemo.get(key);
+        };
+        // Why sub_worker's pending `strip` may belong to another video ('' when it is honoured), memoised: asked once, right before the encode that would
+        // serve it (after every skip and refusal, before the test encodes). A request beside the caption track sub_worker imported is honoured with no read
+        // - the captions are in this file as that track. Otherwise the read's inherited fingerprint is checked against the primary (ccFpStaleWhy, where a
+        // failed read counts as stale). An mp4-family file keeps no track tag, so there any hearing-impaired mov_text track is that track whatever its
+        // language - language_fill gives the imported one a language, as clean_and_remux's language_sub stop advises. The cost: an unrelated SDH track left
+        // after the real one was removed by hand has a stale request honoured with no read.
+        let ccStaleMemo = null;
+        const ccStripStaleWhy = () => {
+            if (ccStaleMemo !== null) return ccStaleMemo;
+            const mp4Track = isMp4Family(dstContainer)
+                && file.ffProbeData.streams.some((s) => codecNameOf(s) === 'mov_text' && s.disposition?.hearing_impaired === 1);
+            ccStaleMemo = !ccExported ? ''
+                : ccTokens.includes(CC_TOKENS.imported) && (mp4Track || importedCaptionTracks(file.ffProbeData.streams, ccTokens, () => false).length) ? ''
+                    : ccFpStaleWhy(ccTokens, origCcTokens, primary, () => digestOf(file.file, primary.index));
+            return ccStaleMemo;
+        };
+        // ====== END RUN STATE ======
 
+        // ====== TRANSCODE EMIT ======
         // What scale=-2 will emit beside outHeight, in the same DISPLAY orientation (ffmpeg autorotates ahead of the filter chain): the operating point
         // a test-encode line names, and the predicted output stream's width (an odd one less the column the crop takes, as outHeight).
         const outWidth = willDownscale && dispHeight > 0 ? Math.max(2, Math.round(dispWidth * outHeight / dispHeight / 2) * 2) : dispWidth - (dispWidth % 2);
@@ -5279,18 +5344,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
         // The pass that withdraws a caption request whose read may belong to another video (ccStripStaleWhy): a tag-only remux keeping only the stale
         // fingerprint - the `strip`, both read tokens and `imported` all go - which is the "withdrawn" shape sub_worker reads to move the old sidecar aside
-        // and read the captions of the video that is there. Nothing is encoded and no awk_vq or awk_video is written; its arguments differ from every
-        // encode, restore and keep pass.
+        // and read the captions of the video that is there. Nothing is encoded and no awk_vq or awk_video is written (tagOnlyRemux).
         const emitCcClear = (why) => {
             response.infoLog += `☒${pTag} awk_cc asks to drop the closed captions sub_worker exported, but the caption read behind it may belong to another`
                 + ` video (${why}) - withdrawing the request so the captions are read again before any encode\n`;
-            const v = escMeta(`${CC_FP_PREFIX}${ccFpOf(ccTokens)}`);
-            sealPreset('', `${mapAll} -c copy${outputDrops}${strictArg} -metadata "${CC_TAG}=${v}"`, { [CC_TAG]: v }, primary, { copied: true });
-            response.infoLog += expectedResultsLine(summariseStream(dvCopyReadBack(dstContainer, enrichStream(primary))));
-            return response;
+            return tagOnlyRemux(CC_TAG, escMeta(`${CC_FP_PREFIX}${ccFpOf(ccTokens)}`));
         };
         // ====== END TRANSCODE EMIT ======
 
+        // ====== AWK_VIDEO FENCE ======
         // Idempotency fence: a settings fingerprint in the container-global awk_video tag. Essential for shrink, whose constant-quality same-codec re-encode
         // would otherwise re-shrink every pass (a generational death spiral); never load-bearing for normalize, which only fires on a mismatch its own encode
         // removes, so normalize skips it where storing it costs something (mp4 family; writeFence). action is in the core so a normalize-tagged file isn't
@@ -5350,36 +5412,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
         const vqRetry = !!vqNow && vqNow.state === 'reject' && coreHolds(vqNow.core) && vqNow.t !== savingsText && vqNow.pct !== null
             && guardShrinkSavings < vqNow.pct + 1 && !(Number(vqNow.t) <= guardShrinkSavings);
-        // The ffprobe the verdict's reads and the fence's fingerprint check use, located once and only when one of them runs ('' under the harness, whose
-        // reads are injected).
-        let ffprobeMemo = null;
-        const savingsFfprobe = () => {
-            if (ffprobeMemo === null) ffprobeMemo = injectedCap ? '' : deriveFfprobePath(ffmpegPathOf(otherArguments));
-            return ffprobeMemo;
-        };
-        // videoDigest, read at most once per file and stream, so a pass that checks a fence and a caption request pays one spawn.
-        const digestMemo = new Map();
-        const digestOf = (filePath, absIndex) => {
-            const key = `${absIndex}|${filePath}`;
-            if (!digestMemo.has(key)) digestMemo.set(key, videoDigest(filePath, savingsFfprobe(), absIndex, FINGERPRINT_TIMEOUT_MS));
-            return digestMemo.get(key);
-        };
-        // Why sub_worker's pending `strip` may belong to another video ('' when it is honoured), memoised: asked once, right before the encode that would
-        // serve it (after every skip and refusal, before the test encodes). A request beside the caption track sub_worker imported is honoured with no read
-        // - the captions are in this file as that track. Otherwise the read's inherited fingerprint is checked against the primary (ccFpStaleWhy, where a
-        // failed read counts as stale). An mp4-family file keeps no track tag, so there any hearing-impaired mov_text track is that track whatever its
-        // language - language_fill gives the imported one a language, as clean_and_remux's language_sub stop advises. The cost: an unrelated SDH track left
-        // after the real one was removed by hand has a stale request honoured with no read.
-        let ccStaleMemo = null;
-        const ccStripStaleWhy = () => {
-            if (ccStaleMemo !== null) return ccStaleMemo;
-            const mp4Track = isMp4Family(dstContainer)
-                && file.ffProbeData.streams.some((s) => codecNameOf(s) === 'mov_text' && s.disposition?.hearing_impaired === 1);
-            ccStaleMemo = !ccExported ? ''
-                : ccTokens.includes(CC_TOKENS.imported) && (mp4Track || importedCaptionTracks(file.ffProbeData.streams, ccTokens, () => false).length) ? ''
-                    : ccFpStaleWhy(ccTokens, ccTokensOf(origProbe?.format?.tags), primary, () => digestOf(file.file, primary.index));
-            return ccStaleMemo;
-        };
 
         // Validating a fence that matches this run's settings. The awk tags survive an outside tool's re-encode (plain ffmpeg keeps every global tag, and
         // mkvmerge keeps them through a track swap), so a fence can describe a video stream that is no longer there. Only an INHERITED fence is checked - the
@@ -5445,6 +5477,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const c = fenceContradiction();
             return c ? `${VIDEO_FENCE_TAG} says this file was encoded to ${c[0]}, but the video is ${c[1]}` : '';
         };
+        // ====== END AWK_VIDEO FENCE ======
 
         // ====== SHRINK SAVINGS VERDICT ======
         // guard_shrink_savings, on the pass after this job's size-pass encode (its awk_vq=encoded:<core>:<T>). It sits ahead of realTranscode(), which can
@@ -5452,19 +5485,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // match: a sibling that changed the video BITSTREAM in this job, a restore that cannot be done safely, or a bitrate that cannot be read keeps the
         // encode unjudged (keep:na); otherwise the measured saving keeps it or restores the original video stream. Every verdict pass replaces encoded:, so
         // the next pass reaches the fence and skips.
-        // Only a marker THIS job wrote is pending: its fence carries this job's token, or - with no token on either side - the library original does not
-        // carry the same marker. A Tdarr Flow runs a classic plugin once per job (pluginCycle 0, then the next flow node), so its encode reaches the library
-        // still marked, and a later job would compare that file with itself and restore it onto itself as a reject:0. Such an encode stays as it is: one
-        // line, no measurement, no stamp (a tag-only remux would only record "unjudged", and its fingerprint would vouch for whatever video the file then
-        // held), and the fence below treats the marker as no verdict.
-        const vqPending = savingsLive && !!vqNow && vqNow.state === 'encoded' && coreHolds(vqNow.core);
-        const ownMarker = vqPending && (fenceJob && jobToken ? fenceJob === jobToken
-            : getTagCI(fmtTags, VQ_TAG).trim() !== getTagCI(origProbe?.format?.tags, VQ_TAG).trim());
-        if (vqPending && !ownMarker) {
-            response.infoLog += `☒${pTag}${savingsTag} The re-encode in this file was never judged on size - the pass after it did not run in the job that`
-                + ' made it (a Tdarr Flow runs a classic plugin once); left as it is\n';
-        }
-        if (vqPending && ownMarker) {
+        const emitSavingsVerdict = () => {
             // The original's own mediaInfo, joined by mediaInfoFor's rule (StreamOrder = the stream's index, never Menu): mediaInfoFor reads THIS file's.
             const origTracks = Array.isArray(origLib.mediaInfo?.track) ? origLib.mediaInfo.track : [];
             const origMi = origPrimary && origTracks.find((t) => t['@type'] !== 'Menu' && Number(t.StreamOrder) === origPrimary.index);
@@ -5489,15 +5510,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // a setting nothing was encoded at, beside the fence the encode wrote.
             const stamp = (state, pct, fp) => escMeta(`${state}:${pct}:${vqNow.core}:${savingsText}:${fp}`);
             const line = (sym, text) => `${sym}${pTag}${savingsTag} ${text}\n`;
-            // The KEEP pass: a tag-only remux of this file, whose arguments differ from every encode's and every restore's, so Tdarr's identical-arguments
-            // guard cannot trip. reason is the verdict's own line.
+            // The KEEP pass, a tag-only remux (tagOnlyRemux); reason is the verdict's own line.
             const keepPass = (pct, reason) => {
                 const value = stamp('keep', pct, fingerprintOf(primary, file.file));
                 response.infoLog += reason
                     + line('☐', `Recording the verdict in ${VQ_TAG} with a tag-only remux, so later passes read it instead of measuring`);
-                sealPreset('', `${mapAll} -c copy${outputDrops}${strictArg} -metadata "${VQ_TAG}=${value}"`, { [VQ_TAG]: value }, primary, { copied: true });
-                response.infoLog += expectedResultsLine(summariseStream(dvCopyReadBack(dstContainer, enrichStream(primary))));
-                return response;
+                return tagOnlyRemux(VQ_TAG, value);
             };
 
             // A sibling that rewrote the video bitstream in this job: sub_worker's caption removal (filter_units, stamped `removed`) or a recovery. A restore
@@ -5505,7 +5523,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // carrying captions were original 4, this file 0, restored 4, under AWK_CC=removed - and nothing re-checks, so the captions would show twice for
             // good. A size verdict never undoes a transform the user asked for. The encode's own pass already exempts one that came before it (sizeExemptWhy),
             // so this is the backstop for one between the encode and its verdict, worded without claiming which came first.
-            const ccRemovedHere = ccTokens.includes(CC_TOKENS.removed) && !ccTokensOf(origProbe.format?.tags).includes(CC_TOKENS.removed);
             if (ccRemovedHere || recoveredHere) {
                 return keepPass('na', line('☑', `${ccRemovedHere ? 'sub_worker\'s caption removal' : 'clean_and_remux\'s recovery'} changed the video in this`
                     + ' job - not judged on size'));
@@ -5641,9 +5658,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             sealPreset('', `-i "${origPath}" -map 1:${origPrimary.index} -map 0 -map -0:${primary.index}${outputDrops} -map_chapters 0 -c copy`
                 + `${restoreTag}${restoreStrict} -metadata "${VQ_TAG}=${value}"`, { [VQ_TAG]: value }, restored);
             // sealPreset's .mov loss line reads the restored stream through THIS file's mediaInfo (see restoreStrict above), so a Dolby Vision signal only
-            // the original's own track carries is warned of here, by a stand-in that carries it as a fourcc.
+            // the original's own track carries is warned of here, by a stand-in that carries it as a record of no stated compatibility.
             if (isDolbyVisionVideo(origPrimary, origMi) && !movLosesDvBox(dstContainer, restored))
-                response.infoLog += movDvLossLine(dstContainer, [{ ...restored, codec_tag_string: 'dvhe' }]);
+                response.infoLog += movDvLossLine(dstContainer, [{ ...restored, side_data_list: [{ side_data_type: 'DOVI configuration record' }] }]);
             // The restored stream maps first, and its token is summarised detached (index -1): summariseStream joins mediaInfo by index, and THIS file's
             // track at the original's index can be another stream entirely (the audio, on a cover-art-first original). It reads back under the fourcc the
             // restore writes - the plan's (a stuck stream's keep, else its want), or the QuickTime table's - else its own.
@@ -5655,7 +5672,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 .filter((s) => !isPrimary(s)).map((s) => summariseStream(movLangReadBack(dstContainer, dvCopyReadBack(dstContainer, enrichStream(carried(s))))))
                 .join('')}\n`;
             return response;
+        };
+        // Only a marker THIS job wrote is pending: its fence carries this job's token, or - with no token on either side - the library original does not
+        // carry the same marker. A Tdarr Flow runs a classic plugin once per job (pluginCycle 0, then the next flow node), so its encode reaches the library
+        // still marked, and a later job would compare that file with itself and restore it onto itself as a reject:0. Such an encode stays as it is: one
+        // line, no measurement, no stamp (a tag-only remux would only record "unjudged", and its fingerprint would vouch for whatever video the file then
+        // held), and the fence below treats the marker as no verdict.
+        const vqPending = savingsLive && !!vqNow && vqNow.state === 'encoded' && coreHolds(vqNow.core);
+        const ownMarker = vqPending && (fenceJob && jobToken ? fenceJob === jobToken
+            : getTagCI(fmtTags, VQ_TAG).trim() !== getTagCI(origProbe?.format?.tags, VQ_TAG).trim());
+        if (vqPending && !ownMarker) {
+            response.infoLog += `☒${pTag}${savingsTag} The re-encode in this file was never judged on size - the pass after it did not run in the job that`
+                + ' made it (a Tdarr Flow runs a classic plugin once); left as it is\n';
         }
+        if (vqPending && ownMarker) return emitSavingsVerdict();
         // A verdict this file already carries at this setting, said only where the fence below then skips the file - never ahead of a stale line. The
         // threshold is named only where it differs from today's (a keep, or a reject the new value could not pass). The fence's retry says its own line.
         const vqReadLine = (() => {

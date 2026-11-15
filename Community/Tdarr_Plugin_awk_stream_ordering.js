@@ -13,20 +13,21 @@ const details = () => ({
         default, SDH or descriptive. The first MAIN audio track is marked the sole default (in containers that can store the flag - Matroska and mp4/mov; ts/avi
         are left as they are): a commentary, audio-description, M&E or karaoke track never takes it while the file has a main track, unless
         audio_first=descriptive_tagged leads with the description. Can also strip junk metadata tags (remove_junk_tags: encoder/provenance, or the fuller
-        metadata set, which leaves an audio-only file's music tags alone - rides the reorder remux, so no extra pass) and front-load the mp4 moov atom for
-        instant remote playback (method_mp4_faststart - every mp4 the other awk plugins write is front-loaded, so force adds one extra lossless remux only
-        on a file none of them remuxed; under strip, a remux this plugin makes comes out back-loaded). Cover art in a Matroska file stays an attachment
-        through a reorder remux, listed after every track and attachment, and a cover-art video track an earlier plain copy left is turned back into one;
-        .webm stores no attachments, so there the remux leaves the cover out and the log says so. A file with nothing else to change keeps it untouched, and
-        a .mov carrying cover art, which a .mov remux cannot write back, is not remuxed only to front-load it or strip its tags.\n\nBecause it runs last
-        it also checks the finished file's duration against the library original, and FAILS (rather than accepts) a file that has come out
-        more than 1% and more than a second SHORT, or that reports no duration at all where the original had one - the
-        signature of an out-of-memory-killed or unfinalised encode from an earlier stage. A longer output is accepted, and so is a file clean_and_remux's
-        recover_bad_* repaired in the same job: a repaired file legitimately reports its true, shorter duration, so it is flagged with a warning for manual
-        review rather than failed. The same goes for a broadcast .ts or .mpg capture remuxed to mkv or mp4 in the same job with its video copied, not
-        re-encoded: a capture whose timestamps jump or reset states a longer length than it holds. A later job on that file is checked in full again. This
-        check is always on and has no setting.\n`,
-    Version: '4.999.67',
+        metadata set, which leaves an audio-only file's music tags alone - rides any remux this plugin makes, and otherwise forces one lossless remux the first
+        time a junk tag is present) and front-load the mp4 moov atom for instant remote playback (method_mp4_faststart - every mp4 the other awk plugins write
+        is front-loaded, so force adds one extra lossless remux only on a file none of them remuxed; under strip, a remux this plugin makes comes out
+        back-loaded). Cover art in a Matroska file stays an attachment through a reorder remux, listed after every track and attachment, and a cover-art video
+        track an earlier plain copy left is turned back into one; .webm stores no attachments, so there the remux leaves the cover out and the log says so. A
+        file with nothing else to change keeps it untouched, and a file whose remux would drop its cover art (any .mov, whose muxer stores none, or an mp4, m4v
+        or m4a carrying another awk plugin's marker tag, which a remux keeps only at the cost of the cover) or its Dolby Vision record (one no ffmpeg copy
+        keeps, or any Dolby Vision .mov) is not remuxed only to front-load it or strip its tags.\n\nBecause it runs last it also checks the finished file's
+        duration against the library original, and FAILS (rather than accepts) a file that has come out more than 1% and more than a second SHORT, or that
+        reports no duration at all where the original had one - the signature of an out-of-memory-killed or unfinalised encode from an earlier stage. A longer
+        output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same job: a repaired file legitimately reports its true, shorter
+        duration, so it is flagged with a warning for manual review rather than failed. The same goes for a broadcast .ts or .mpg capture remuxed to mkv or mp4
+        in the same job with its video copied, not re-encoded: a capture whose timestamps jump or reset states a longer length than it holds. A later job on
+        that file is checked in full again. This check has no setting.\n`,
+    Version: '4.999.68',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -157,8 +158,9 @@ const details = () => ({
                 type: 'dropdown',
                 options: ['disabled', 'encoder', 'metadata'],
             },
-            tooltip: `Strip junk metadata tags the file carries, both container-global and per-stream, riding this plugin's reorder remux so no extra pass
-                is needed. Only tags actually present are cleared, so a file without them is untouched.
+            tooltip: `Strip junk metadata tags the file carries, both container-global and per-stream. It rides any remux this plugin makes, and otherwise
+                forces ONE lossless -c copy remux the first time a junk tag is present; only tags actually present are cleared, so a file without them is
+                untouched.
                 \\n=====
                 \\nActions
                 \\n=====
@@ -176,9 +178,10 @@ const details = () => ({
                 \\nBefore choosing metadata: a media server set to read local or in-file metadata DOES read some mp4 descriptive tags - genre, date,
                 description, show and so on. That means Plex with local media assets enabled, and Jellyfin or Emby with an nfo or in-file metadata reader.
                 Use it only if you do not rely on in-file metadata.
-                \\nA file whose cover art a remux cannot keep - any .mov, since the .mov muxer stores none - is not remuxed only to remove tags: the tags
-                stay rather than the cover going. The same goes for a Dolby Vision record a remux would drop - one no ffmpeg copy keeps, or any Dolby Vision
-                .mov, whose box a .mov cannot store (clean_and_remux moves the file to mp4 or mkv, which keep it).`,
+                \\nA file whose cover art a remux cannot keep - any .mov, since the .mov muxer stores none, or an mp4, m4v or m4a carrying another awk
+                plugin's marker tag, which a remux keeps only at the cost of the cover - is not remuxed only to remove tags: the tags stay rather than the
+                cover going. The same goes for a Dolby Vision record a remux would drop - one no ffmpeg copy keeps, or any Dolby Vision .mov, whose box a
+                .mov cannot store (clean_and_remux moves the file to mp4 or mkv, which keep it).`,
         },
         {
             name: 'method_mp4_faststart',
@@ -190,7 +193,9 @@ const details = () => ({
             },
             tooltip: `mp4, m4v, m4a and mov only: where the moov atom, the file's index, sits. At the FRONT, players start and seek instantly on progressive
                 download and remote direct-play; at the end, they have to fetch the tail first. mkv is unaffected. Every mp4-family file another awk plugin
-                writes comes out front-loaded whatever this is set to, so it decides only what this plugin does.
+                writes comes out front-loaded whatever this is set to, so it decides only what this plugin does. A front-loading write ends by writing the
+                whole file once more, and Tdarr's progress stands still while it does: with the Worker Stall Detector on, set its interval to 30 minutes or
+                more.
                 \\n=====
                 \\nActions
                 \\n=====
@@ -198,8 +203,9 @@ const details = () => ({
                 first time a file arrives back-loaded (detected without decoding) - in a full awk stack, only a file no plugin before it remuxed. An
                 already-fronted file is left untouched, so this settles after one pass and never loops. A file whose Dolby Vision record no ffmpeg copy
                 keeps (one whose colour does not match its compatibility id, or an AV1 Profile 10.0 record), any Dolby Vision .mov (a .mov cannot store
-                its box - clean_and_remux moves the file to mp4 or mkv), or a file whose cover art a remux would drop (any .mov - its muxer stores none)
-                stays back-loaded rather than be remuxed for this alone.
+                its box - clean_and_remux moves the file to mp4 or mkv), or a file whose cover art a remux would drop (any .mov - its muxer stores none
+                - or an mp4, m4v or m4a carrying another awk plugin's marker tag, which a remux keeps only at the cost of the cover) stays back-loaded
+                rather than be remuxed for this alone.
                 \\nstrip: never front-load. A remux this plugin makes for another reason - reordering, the default flag or remove_junk_tags - writes the
                 moov atom at the END, the mov muxer's default, so a front-loaded file it remuxes comes out back-loaded; it never remuxes for this alone.
                 Only pick this if you never stream this library remotely.`,
@@ -656,13 +662,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const c = String(container || '').toLowerCase();
         return isMp4Family(c) && (c === 'mov' || plan.flag) ? kept.filter(isMp4Cover) : [];
     };
-    // -=-=-= mp4TagPlanLog [all five] =-=-=-
+    // -=-=-= mp4TagPlanLog (+ TAG_KEY_LOG_MAX) [all five] =-=-=-
+    const TAG_KEY_LOG_MAX = 40;   // several keys share one line, and a key is a name rather than free text, so each echo is kept short
     // What the plan costs, as log lines: the native tags the flag rewrites, the custom keys a flagless mux leaves behind, and each cover mp4CoversLost
     // names (same `kept` argument). The rewrite is said on every mux that keeps a marker: nothing else names it, so a library recovered into mp4 lost
     // its readable tags in silence, and the marker is permanent.
     const mp4TagPlanLog = (plan, container, kept = []) => {
         const c = String(container || '').toLowerCase();
-        const TAG_KEY_LOG_MAX = 40;   // several keys share one line, and a key is a name rather than free text, so each echo is kept short
         const names = (keys) => keys.map((k) => logSafe(k, TAG_KEY_LOG_MAX)).join(', ');
         let log = '';
         if (plan.flag) {
@@ -687,10 +693,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // mp4/m4v/m4a write the copy as a second, junk 'gpmd' data track (one more each pass), and mov refuses it ("Tag text incompatible with output codec id",
     // exit 183) - measured for both fourccs on jellyfin 7.1.4, 2026-10-22. Every plugin writing an mp4-family output leaves it unmapped, and clean_and_remux
     // never counts that as work (a removal the muxer undoes emits the same preset every pass, which Tdarr errors); its remux into Matroska removes it like any
-    // data stream, Matroska carrying the chapters natively. The fourcc list stays closed: every other data track is copied (a GoPro 'gpmd' telemetry track in a
-    // chaptered file survives), and a 'tx3g' track no chapter reference names is demuxed as a mov_text subtitle, not as data. The demuxer is read from
-    // format_name, never the extension. Tdarr probes without -show_chapters, so chapters are known from mediaInfo's Menu tracks or from the track's own
-    // nb_frames, the chapter count ffmpeg reads (equal at 1, 3, 4, 7 and 20 chapters), which still answers when mediaInfo did not scan the file; a
+    // data stream, Matroska carrying the chapters natively. The fourcc list stays closed: every other data track is left to the plugin's data rule (the other
+    // four copy it; clean_and_remux removes it), and a 'tx3g' track no chapter reference names is demuxed as a mov_text subtitle, not as data. The demuxer is
+    // read from format_name, never the extension. Tdarr probes without -show_chapters, so chapters are known from mediaInfo's Menu tracks or from the track's
+    // own nb_frames, the chapter count ffmpeg reads (equal at 1, 3, 4, 7 and 20 chapters), which still answers when mediaInfo did not scan the file; a
     // chapter-fourcc track with neither holds no chapter to rebuild and is removed like any other. awk-ffmpeg-test's fmtprobe rebuild:* rows re-measure it.
     const isMp4ChapterTrack = (s) => String(file?.ffProbeData?.format?.format_name || '').split(',').some(isMp4Family)
         && codecTypeOf(s) === 'data' && ['text', 'tx3g'].includes(String(s.codec_tag_string || '').toLowerCase())
@@ -764,7 +770,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }).join('');
     // -=-=-= isMp4RebuiltTimecode (+ mp4TimecodeCount, mp4RebuiltTimecodes) [all five] =-=-=-
     // How many tmcds the muxer writes for `kept`, the streams as the output writes them: one per mp4TimedVideo stream the output maps, none beside a copied
-    // tmcd (mov) - each written from its video's mp4VideoTimecode, never from a source track.
+    // tmcd (mov) - each written from its video's mp4VideoTimecode, never from a source track. A copied tmcd (mov) is kept, and listed so, whatever its timecode
+    // or reference (fmtprobe create:tmcd-copied) - bar a zero-duration one whose sample sits first in the file, which the mov demuxer drops on the next read
+    // and no probe tells from one that survives.
     const mp4TimecodeCount = (kept) => (kept.some(isTmcdTrack) ? 0 : kept.filter(mp4TimedVideo).length);
     // The source tmcds left out of the map that come back: one per kept timed video, a tmcd whose own timecode tag is the one that video is written with, then
     // the first left in file order for each video none matches; the rest are lost. A PNG-codec video stored first at 05:00:00:00 beside an h264 at 01:00:00:00,
@@ -1178,11 +1186,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             + ' remux it to mkv or mp4 first (clean_and_remux does that)\n' : '';
     };
     // -=-=-= movDvLossLine  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
-    // One warning per video stream a write into `container` takes a Dolby Vision box from (movLosesDvBox), '' when none does, on the pass that writes
-    // it; `act` names a write that is not a remux. `streams` is the list the output maps, each written stream as the caller reads it.
-    const movDvLossLine = (container, streams, act = 'remux') => streams.filter((s) => movLosesDvBox(container, s))
-        .map((s) => `☒${streamTag(s.index)} Dolby Vision is lost in this ${act} - ffmpeg cannot write its box into a .mov; run clean_and_remux first to move`
-            + ' the file to mp4 or mkv\n').join('');
+    // One line per video stream movLosesDvBox flags in a write into `container`, '' when it flags none, on the pass that writes it; `act` names a write
+    // that is not a remux. `streams` is the list the output maps, each written stream as the caller reads it. clean_and_remux's move to mp4 or mkv is
+    // advised only where it helps. A stream whose only Dolby Vision signal is its fourcc has no box to lose, so its line says that instead, and a dvhe one
+    // reads honestly once moved (hvc1 in mp4, no fourcc in Matroska). A record no copy keeps (dvRecordSurvivesCopy) is lost by any remux, so its line
+    // is dvCopyLossLine's.
+    const movDvLossLine = (container, streams, act = 'remux') => streams.filter((s) => movLosesDvBox(container, s)).map((s) => {
+        const tag = String(s.codec_tag_string || '').toLowerCase().trim();
+        if (!isDolbyVisionVideo({ ...s, codec_tag_string: '' }, mediaInfoFor(s))) {
+            return `☒${streamTag(s.index)} The video is tagged ${tag} but holds no Dolby Vision box${tag === 'dvhe' ? ' - run clean_and_remux first to move the'
+                + ' file to mp4 or mkv, which drops the stale tag' : ''}\n`;
+        }
+        return `☒${streamTag(s.index)} Dolby Vision is lost in this ${act} - ${dvRecordSurvivesCopy(s) ? 'ffmpeg cannot write its box into a .mov; run'
+            + ' clean_and_remux first to move the file to mp4 or mkv' : 'its record does not match the video\'s colour, so no ffmpeg copy keeps it'}\n`;
+    }).join('');
     // -=-=-= ROLE_LOSS_WHY / roleLossLine  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // One warning per stream a write takes role flags from (MOV_UNSTORED_ROLES names them all), worded as movDvLossLine: those readBackDispositions
     // reads back 0 on the output. Only two outputs store fewer than a source of their own kind can hold: a .mov the mp4 muxer wrote (-f mp4) holds
@@ -2327,12 +2344,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // misses the table instead of resolving an inherited function.
     const MOV_LANG = Object.assign(Object.create(null), { sqi: 'alb', hye: 'arm', eus: 'baq', bod: 'tib', mya: 'bur', zho: 'chi', nld: 'dut', kat: 'geo',
         deu: 'ger', ell: 'gre', isl: 'ice', mkd: 'mac', msa: 'may', fas: 'per', cym: 'wel', fre: 'fra', cze: 'ces', rum: 'ron', slo: 'slk',
-        // Rows of another kind: the table holds Norwegian only as the macrolanguage nor, not its two written forms, so Bokmål and Nynorsk (nob and nno,
-        // which land 0x7fff) are written as nor - the language kept, the written form lost, and a .mov holds the two as one language. Every other
-        // language the muxer drops still reads back with none: the table holds Swedish and Irish only as Mac codes ffmpeg spells sve and iri, which no
-        // plugin reads as a language.
+        // Rows of another kind: the table holds Norwegian only as the macrolanguage nor, not its two written forms, so Bokmål and Nynorsk (nob and nno, which
+        // land 0x7fff) are written as nor - the language kept, the written form lost, and a .mov holds the two as one language. Every other language the muxer
+        // drops still reads back with none: the table holds Swedish and Irish only as Mac codes ffmpeg spells sve and iri, which no plugin reads as a language.
         nob: 'nor', nno: 'nor' });
-    // -=-=-= movLangRespellArgs (+ movLangRespelled, movLangRespellLog, movLangReadBack)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // -=-=-= MOV_LANG_STORED  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Every code the mov muxer's table holds: written into a .mov, these 97 read back as written and every other code reads back with no language - a census
+    // of all 17,576 lower-case three-letter codes (and ENG, Eng, und and en, none stored) on jellyfin-ffmpeg 7.1.4, 2026-11-15. Swedish and Irish are there
+    // only as the Mac codes sve and iri, so swe, gle, hrv, srp and fil, among others, land 0x7fff; MOV_LANG respells the ones the table holds another way.
+    const MOV_LANG_STORED = new Set(['alb', 'amh', 'ara', 'arm', 'asm', 'aym', 'aze', 'baq', 'bel', 'ben', 'bul', 'bur', 'cat', 'ces', 'chi', 'dan', 'dut',
+        'dzo', 'eng', 'epo', 'est', 'fin', 'fra', 'geo', 'ger', 'gre', 'grn', 'guj', 'heb', 'hin', 'hun', 'ice', 'ind', 'iri', 'ita', 'jav', 'jpn', 'kan',
+        'kas', 'kaz', 'khm', 'kin', 'kir', 'kor', 'kur', 'lao', 'lat', 'lav', 'lit', 'mac', 'mal', 'mar', 'may', 'mlg', 'mlt', 'mol', 'mon', 'nep', 'nor',
+        'nya', 'ori', 'orm', 'per', 'pol', 'por', 'pus', 'que', 'ron', 'run', 'rus', 'san', 'sin', 'slk', 'slv', 'smi', 'snd', 'som', 'spa', 'sve', 'swa',
+        'tam', 'tat', 'tel', 'tgk', 'tgl', 'tha', 'tib', 'tir', 'tuk', 'tur', 'uig', 'ukr', 'urd', 'uzb', 'vie', 'wel', 'yid']);
+    // -=-=-= movLangRespellArgs (+ movLangRespelled, movLangRespellLog)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // The language writes a remux into .mov owes the tracks it copies or re-encodes: a .mov another tool wrote can hold a spelling the table lacks
     // (AVFoundation stores deu and nld), which the copy would lose, so each such language goes back in MOV_LANG's spelling and nothing else is touched (a
     // census of 400 spellings on jellyfin-ffmpeg 7.1.4: the muxer drops every key and stores every value). Matched by the language itself - the output stream
@@ -2345,10 +2370,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Nynorsk (nob, nno) say that they merge.
     const movLangRespellLog = (container, streams) => movLangRespelled(container, streams).map((l) => `☐Writing ${l} as ${MOV_LANG[l]} - a .mov stores no`
         + ` ${l}${MOV_LANG[l] === 'nor' ? ', so Bokmål and Nynorsk both become Norwegian and can no longer be told apart' : ''}\n`).join('');
-    // Stream s as the next pass reads its language after a .mov write, for an Expected results line.
+    // -=-=-= movLangReadBack  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
+    // Stream s as the next pass reads its language after a .mov write, for an Expected results line: in MOV_LANG's spelling, or as und where the table
+    // stores the code under none (MOV_LANG_STORED) - und, not no tag, so the source's own mediaInfo language does not stand in for it.
     const movLangReadBack = (container, s) => {
         const l = getTagCI(s?.tags, 'language');
-        return container === 'mov' && MOV_LANG[l] ? { ...s, tags: { ...(s.tags || {}), language: MOV_LANG[l] } } : s;
+        const back = container !== 'mov' || !l ? l : MOV_LANG_STORED.has(MOV_LANG[l] || l) ? MOV_LANG[l] || l : 'und';
+        return back === l ? s : { ...s, tags: { ...(s.tags || {}), language: back } };
     };
     // ===== END SHARED: mov language table =====
 
@@ -2433,7 +2461,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Whether a write into `container` takes this video stream's Dolby Vision box away. The mov muxer (MODE_MOV) writes no dvcC/dvvC box under any fourcc
     // (0 of 96 readable .mov outputs, jellyfin 7.1.4), so -strict unofficial does not help: an iPhone Profile 8.4 .mov remuxed into .mov reads back as
     // plain HLG HEVC. `-f mp4` is no escape, as the mp4 muxer refuses that file's mebx tracks. clean_and_remux writes only mkv or mp4, so the box survives
-    // when it runs first. A fourcc-only signal (a dvhe .mov) counts too: its record is gone either way. Cover art is never the subject.
+    // when it runs first. A fourcc-only signal (a dvhe .mov whose box is gone) counts too, as the stream still reads as Dolby Vision; movDvLossLine says
+    // it holds no box. Cover art is never the subject.
     // awk-ffmpeg-test's dvbox:p5-fourcc row measures it (its mov-annexb-hvc1 cell): that cell turning present means .mov can carry the box and this is stale.
     const movLosesDvBox = (container, s) => container === 'mov' && codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s));
     // Stream s as the next pass reads it once a write has dropped its Dolby Vision record, for an Expected results token: the record gone and mediaInfo
@@ -2962,7 +2991,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         });
         // ====== END STREAM TABLE + SORT ======
 
-        // ====== JUNK TAG STRIP: KEYS + PER-STREAM ======
+        // ====== JUNK TAG STRIP ======
 
         // remove_junk_tags: strip encoder/muxer-provenance (+ optional descriptive) tags on the reorder remux. 'encoder' = pure provenance
         // (global encoded_by; per-stream encoder/encoded_by); 'metadata' (superset) also drops iTunes/movie-TV container tags. Always kept:
@@ -3000,10 +3029,33 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (JUNK_PERSTREAM.has(k.toLowerCase()) && !muxerRegenerates(ffstream, k)) meta += ` -metadata:s:${outIdx} "${escMeta(k)}="`;
             return meta;
         };
-        // The strip's two accumulators: the per-stream clears are added in the output-map loop below, the global ones after it.
+        // The per-stream clears are added in the output-map loop below, and the global ones (globalJunkArgs/globalJunkLog) follow them.
         let junkArgs = '';
         let junkLog = '';
-        // ====== END JUNK TAG STRIP: KEYS + PER-STREAM ======
+        // remove_junk_tags (global): clear the provenance / descriptive container tags present, matched case-insensitively. escMeta guards the key. Each
+        // clear is also recorded in globalWrites, for mp4TagPlan - keyed by a name read off the media, hence no prototype for one to collide with.
+        const globalWrites = Object.create(null);
+        const keptMusicTags = [];   // the metadata-tier keys an audio-only file keeps (metadataTier)
+        const KEPT_TAGS_LISTED = 5;   // how many of them the line names
+        let globalJunkArgs = '';
+        let globalJunkLog = '';
+        if (removeJunkTags !== 'disabled')
+            for (const k of Object.keys(file.ffProbeData.format?.tags || {})) {
+                const lk = k.toLowerCase();
+                if (lk === 'title' || lk === 'comment' || lk === 'creation_time' || lk.startsWith('awk_')) continue;
+                if (isGlobalJunkKey(lk)) {
+                    globalJunkArgs += ` -metadata "${escMeta(k)}="`;
+                    globalWrites[k] = '';
+                    globalJunkLog += `☐[remove_junk_tags=${removeJunkTags}] Remove ${k} tag from file\n`;
+                } else if (removeJunkTags === 'metadata' && JUNK_DESCRIPTIVE.has(lk)) keptMusicTags.push(logSafe(k, TAG_KEY_LOG_MAX));
+            }
+        // Said whether or not the pass remuxes, so a user who picked metadata sees why a music file's tags are still there.
+        if (keptMusicTags.length) {
+            const more = keptMusicTags.length - KEPT_TAGS_LISTED;
+            response.infoLog += `☑[remove_junk_tags=metadata] Audio-only file - keeping its music tags (${keptMusicTags.slice(0, KEPT_TAGS_LISTED).join(', ')}`
+                + `${more > 0 ? ` and ${more} more` : ''}), which a music library is organised by\n`;
+        }
+        // ====== END JUNK TAG STRIP ======
 
         // ====== OUTPUT MAP + SOLE-DEFAULT FLAG ======
         // Set orderChanged if the sort moved a stream, and build the map; also normalise the audio default flag so exactly one audio track — the first
@@ -3020,7 +3072,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // audio default flags untouched (the same container-unstorable-flag skip clean_and_remux's tag_disposition already applies to captions/original).
         // .3gp and .3g2 store it too, both ways (measured 2026-11-13).
         const canPersistDefault = isMatroskaFamily(dstContainer) || isMp4Family(dstContainer) || ['3gp', '3g2'].includes(dstContainer);
-        let defaultFlagSkipped = false;
 
         // Two kinds of stream are left out of the map, so outIdx - the output position the per-stream -metadata writes key on - counts only the streams
         // actually mapped: a stream the container cannot copy (mp4UncopyableStreams: one ffmpeg cannot identify at all, in any container, or a data track the
@@ -3062,10 +3113,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (row.type === 'audio') {
                 audioIndex++;
                 const wantDefault = row === defaultRow;
-                if (!canPersistDefault) {
-                    // Container can't keep the flag - suppress the write (else it loops); remember one skip so the ☒ note below fires exactly once.
-                    if (row.default !== wantDefault) defaultFlagSkipped = true;
-                } else {
+                if (canPersistDefault) {
                     if (wantDefault && !row.default)
                         dispositionArgs += ` -disposition:a:${audioIndex} +default`;
                     else if (!wantDefault && row.default)
@@ -3077,47 +3125,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
             }
         }
-        // ffmpeg flags a stream default ON ITS OWN when an output carries no -disposition at all: the first stream of every type with two or more streams
-        // and none flagged default (fftools set_dispositions; a single manual -disposition anywhere switches the rule off for the whole file). A reorder
-        // that only moved streams therefore made a French forced subtitle the default subtitle of an English show - default on none of its four
-        // subtitles before, on the first sorted one after (jellyfin-ffmpeg 7.1.4). So where that rule would fire and nothing above wrote a disposition,
-        // the preset restates output stream 0's own flags: an exact no-op that makes the dispositions manual. It rides only on a remux this plugin emits
-        // for its own reasons - it never enters the skip test below, or every in-order file with undefaulted subtitles would be remuxed on every pass. `rows`
-        // is every mapped row in output order, a cover track mapped after everything included.
-        const autoDefaultPinFor = (rows) => {
-            const typeCount = {};
-            const typeHasDefault = {};
-            for (const r of rows) {
-                typeCount[r.type] = (typeCount[r.type] || 0) + 1;
-                if (r.stream?.disposition?.default === 1) typeHasDefault[r.type] = true;
-            }
-            if (!canPersistDefault || dispositionArgs !== '' || !rows.length || !Object.keys(typeCount).some((t) => typeCount[t] > 1 && !typeHasDefault[t]))
-                return '';
-            const flags = Object.entries(rows[0].stream?.disposition || {}).filter(([, v]) => v === 1).map(([k]) => k).join('+');
-            return ` -disposition:0 ${flags || '0'}`;
-        };
+        // The global junk clears follow the per-stream ones the loop added (JUNK TAG STRIP).
+        junkArgs += globalJunkArgs;
+        junkLog += globalJunkLog;
+        // Container can't store a default-track flag (ts/avi): the loop above left dispositionArgs empty rather than looping. Say so once, whether
+        // the pass otherwise remuxes (a reorder) or skips - so a user never wonders why the sole-default flag was left alone. ☒, not ☑: a
+        // normalisation WAS wanted here and was declined, which is the warning case, and it is the only way a user learns it did not happen - nothing
+        // configures this behaviour, so there is no setting to inspect instead. Same symbol the sibling plugins use for the same class of message
+        // (video_clean declining a shrink, sub_worker declining the awk_cc request and the marker) whenever the destination container cannot store
+        // what this pass wanted to write. On ts/avi ffprobe always reads default=0, so this fires on every pass over such a file that has audio.
+        if (!canPersistDefault && mappedAudio.some((r) => r.default !== (r === defaultRow)))
+            response.infoLog += `☒${dstContainer} cannot store a default-track flag, so audio default flags are left as they are\n`;
         // ====== END OUTPUT MAP + SOLE-DEFAULT FLAG ======
-
-        // ====== JUNK TAG STRIP: GLOBAL ======
-        // remove_junk_tags (global): clear the provenance / descriptive container tags present, matched case-insensitively. escMeta guards the key. Each
-        // clear is also recorded in globalWrites, for mp4TagPlan - keyed by a name read off the media, hence no prototype for one to collide with.
-        const globalWrites = Object.create(null);
-        const keptMusicTags = [];   // the metadata-tier keys an audio-only file keeps (metadataTier)
-        if (removeJunkTags !== 'disabled')
-            for (const k of Object.keys(file.ffProbeData.format?.tags || {})) {
-                const lk = k.toLowerCase();
-                if (lk === 'title' || lk === 'comment' || lk === 'creation_time' || lk.startsWith('awk_')) continue;
-                if (isGlobalJunkKey(lk)) {
-                    junkArgs += ` -metadata "${escMeta(k)}="`;
-                    globalWrites[k] = '';
-                    junkLog += `☐[remove_junk_tags=${removeJunkTags}] Remove ${k} tag from file\n`;
-                } else if (removeJunkTags === 'metadata' && JUNK_DESCRIPTIVE.has(lk)) keptMusicTags.push(logSafe(k, 40));
-            }
-        // Said whether or not the pass remuxes, so a user who picked metadata sees why a music file's tags are still there.
-        if (keptMusicTags.length)
-            response.infoLog += `☑[remove_junk_tags=metadata] Audio-only file - keeping its music tags (${keptMusicTags.slice(0, 5).join(', ')}`
-                + `${keptMusicTags.length > 5 ? ` and ${keptMusicTags.length - 5} more` : ''}), which a music library is organised by\n`;
-        // ====== END JUNK TAG STRIP: GLOBAL ======
 
         // Why a remux made only for optional work (the front-load, remove_junk_tags) leaves video s alone, for the hold and its line, or '' when it does not:
         // a record the copy loses (dvCopyDropsRecord), or any Dolby Vision box in a .mov, which every .mov write loses (movLosesDvBox) and clean_and_remux's
@@ -3164,8 +3183,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // method_mp4_faststart=force front-loads the mp4 moov atom. +faststart rides every remux this plugin emits (mp4MovflagsArg), but a file already in
         // order is skipped, so a back-loaded one (moovBeforeMdat, fail-safe, defined just above) forces a one-time remux of its own - it settles after one
         // pass and never loops. Not on a video dvHeldWhy holds (dvHeld), for which a remux made only to move the moov is not worth its record:
-        // clean_and_remux holds such a record back only from a remux its fourcc alone would start, so the file can arrive here back-loaded. A remux made
-        // for anything else still front-loads it.
+        // clean_and_remux holds such a record back only from a remux its fourcc or a name tidy alone would start, so the file can arrive here back-loaded.
+        // A remux made for anything else still front-loads it.
         const faststartOn = methodMp4Faststart === 'force';
         const backLoaded = faststartOn && isMp4Family(dstContainer) && !moovBeforeMdat(file.file, otherArguments);
         const dvHeld = file.ffProbeData.streams.filter((s) => dvHeldWhy(s) !== '');
@@ -3173,15 +3192,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // ====== END MOOV / FASTSTART PROBE ======
 
         // ====== DECIDE + REPORT ======
-
-        // Container can't store a default-track flag (ts/avi): the block above left dispositionArgs empty rather than looping. Say so once, whether
-        // the pass otherwise remuxes (a reorder) or skips - so a user never wonders why the sole-default flag was left alone. ☒, not ☑: a
-        // normalisation WAS wanted here and was declined, which is the warning case, and it is the only way a user learns it did not happen - nothing
-        // configures this behaviour, so there is no setting to inspect instead. Same symbol the sibling plugins use for the same class of message
-        // (video_clean declining a shrink, sub_worker declining the awk_cc request and the marker) whenever the destination container cannot store
-        // what this pass wanted to write. On ts/avi ffprobe always reads default=0, so this fires on every pass over such a file that has audio.
-        if (defaultFlagSkipped)
-            response.infoLog += `☒${dstContainer} cannot store a default-track flag, so audio default flags are left as they are\n`;
 
         if (!orderChanged && dispositionArgs === '' && !backLoaded && junkArgs === '') return skip('☑Streams already in desired order\n');
         // Keeps a sibling's awk_* marker under use_metadata_tags (mp4TagPlan).
@@ -3195,7 +3205,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const why = [backLoaded && 'front-load the moov atom', junkArgs !== '' && 'remove junk tags'].filter(Boolean).join(' and ');
             const lost = [...dvHeld.map((s) => `${dvHeld.length > 1 ? `the Dolby Vision record of video ${s.index}` : 'this video\'s Dolby Vision record'}, ${
                 dvHeldWhy(s)}`), ...(coversAtRisk.length ? [`the cover art, which .${dstContainer} cannot store${dstContainer === 'mov' ? ''
-                : ` beside the ${tagPlan.markers.map((m) => logSafe(m, 40)).join(', ')} marker`}`] : [])];
+                : ` beside the ${tagPlan.markers.map((m) => logSafe(m, TAG_KEY_LOG_MAX)).join(', ')} marker`}`] : [])];
             return skip(`☑${dvHeld.length === 1 ? streamTag(dvHeld[0].index) : ''}${backLoaded ? `[method_mp4_faststart=${methodMp4Faststart}]` : ''}`
                 + `${junkArgs !== '' ? `[remove_junk_tags=${removeJunkTags}]` : ''} Left as it is - a remux to ${why} would drop ${lost.join(', and ')}\n`);
         }
@@ -3250,6 +3260,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const staged = stageMatroskaCovers(dstContainer, mkvCoverStreams, file.file, otherArguments, file.ffProbeData.streams);
         const asTrackRows = staged.asTrack.map((d) => sortRows.find((r) => r.index === d.s.index));
         for (const r of asTrackRows) ffmpegMap += ` -map 0:${r.index}`;
+        // ffmpeg flags a stream default ON ITS OWN when an output carries no -disposition at all: the first stream of every type with two or more streams
+        // and none flagged default (fftools set_dispositions; a single manual -disposition anywhere switches the rule off for the whole file). A reorder
+        // that only moved streams therefore made a French forced subtitle the default subtitle of an English show - default on none of its four
+        // subtitles before, on the first sorted one after (jellyfin-ffmpeg 7.1.4). So where that rule would fire and nothing above wrote a disposition,
+        // the preset restates output stream 0's own flags: an exact no-op that makes the dispositions manual. It rides only on a remux this plugin emits
+        // for its own reasons - it is not part of the skip test above, or every in-order file with undefaulted subtitles would be remuxed on every pass. `rows`
+        // is every mapped row in output order, a cover track mapped after everything included.
+        const autoDefaultPinFor = (rows) => {
+            const typeCount = {};
+            const typeHasDefault = {};
+            for (const r of rows) {
+                typeCount[r.type] = (typeCount[r.type] || 0) + 1;
+                if (r.stream?.disposition?.default === 1) typeHasDefault[r.type] = true;
+            }
+            if (!canPersistDefault || dispositionArgs !== '' || !rows.length || !Object.keys(typeCount).some((t) => typeCount[t] > 1 && !typeHasDefault[t]))
+                return '';
+            const flags = Object.entries(rows[0].stream?.disposition || {}).filter(([, v]) => v === 1).map(([k]) => k).join('+');
+            return ` -disposition:0 ${flags || '0'}`;
+        };
         const autoDefaultPin = autoDefaultPinFor([...mappedRows, ...asTrackRows]);
 
         // The -strict level this mp4/mov -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses

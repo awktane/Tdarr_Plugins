@@ -30,7 +30,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.90',
+    Version: '4.999.91',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -818,13 +818,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const c = String(container || '').toLowerCase();
         return isMp4Family(c) && (c === 'mov' || plan.flag) ? kept.filter(isMp4Cover) : [];
     };
-    // -=-=-= mp4TagPlanLog [all five] =-=-=-
+    // -=-=-= mp4TagPlanLog (+ TAG_KEY_LOG_MAX) [all five] =-=-=-
+    const TAG_KEY_LOG_MAX = 40;   // several keys share one line, and a key is a name rather than free text, so each echo is kept short
     // What the plan costs, as log lines: the native tags the flag rewrites, the custom keys a flagless mux leaves behind, and each cover mp4CoversLost
     // names (same `kept` argument). The rewrite is said on every mux that keeps a marker: nothing else names it, so a library recovered into mp4 lost
     // its readable tags in silence, and the marker is permanent.
     const mp4TagPlanLog = (plan, container, kept = []) => {
         const c = String(container || '').toLowerCase();
-        const TAG_KEY_LOG_MAX = 40;   // several keys share one line, and a key is a name rather than free text, so each echo is kept short
         const names = (keys) => keys.map((k) => logSafe(k, TAG_KEY_LOG_MAX)).join(', ');
         let log = '';
         if (plan.flag) {
@@ -849,10 +849,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // mp4/m4v/m4a write the copy as a second, junk 'gpmd' data track (one more each pass), and mov refuses it ("Tag text incompatible with output codec id",
     // exit 183) - measured for both fourccs on jellyfin 7.1.4, 2026-10-22. Every plugin writing an mp4-family output leaves it unmapped, and clean_and_remux
     // never counts that as work (a removal the muxer undoes emits the same preset every pass, which Tdarr errors); its remux into Matroska removes it like any
-    // data stream, Matroska carrying the chapters natively. The fourcc list stays closed: every other data track is copied (a GoPro 'gpmd' telemetry track in a
-    // chaptered file survives), and a 'tx3g' track no chapter reference names is demuxed as a mov_text subtitle, not as data. The demuxer is read from
-    // format_name, never the extension. Tdarr probes without -show_chapters, so chapters are known from mediaInfo's Menu tracks or from the track's own
-    // nb_frames, the chapter count ffmpeg reads (equal at 1, 3, 4, 7 and 20 chapters), which still answers when mediaInfo did not scan the file; a
+    // data stream, Matroska carrying the chapters natively. The fourcc list stays closed: every other data track is left to the plugin's data rule (the other
+    // four copy it; clean_and_remux removes it), and a 'tx3g' track no chapter reference names is demuxed as a mov_text subtitle, not as data. The demuxer is
+    // read from format_name, never the extension. Tdarr probes without -show_chapters, so chapters are known from mediaInfo's Menu tracks or from the track's
+    // own nb_frames, the chapter count ffmpeg reads (equal at 1, 3, 4, 7 and 20 chapters), which still answers when mediaInfo did not scan the file; a
     // chapter-fourcc track with neither holds no chapter to rebuild and is removed like any other. awk-ffmpeg-test's fmtprobe rebuild:* rows re-measure it.
     const isMp4ChapterTrack = (s) => String(file?.ffProbeData?.format?.format_name || '').split(',').some(isMp4Family)
         && codecTypeOf(s) === 'data' && ['text', 'tx3g'].includes(String(s.codec_tag_string || '').toLowerCase())
@@ -926,7 +926,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     }).join('');
     // -=-=-= isMp4RebuiltTimecode (+ mp4TimecodeCount, mp4RebuiltTimecodes) [all five] =-=-=-
     // How many tmcds the muxer writes for `kept`, the streams as the output writes them: one per mp4TimedVideo stream the output maps, none beside a copied
-    // tmcd (mov) - each written from its video's mp4VideoTimecode, never from a source track.
+    // tmcd (mov) - each written from its video's mp4VideoTimecode, never from a source track. A copied tmcd (mov) is kept, and listed so, whatever its timecode
+    // or reference (fmtprobe create:tmcd-copied) - bar a zero-duration one whose sample sits first in the file, which the mov demuxer drops on the next read
+    // and no probe tells from one that survives.
     const mp4TimecodeCount = (kept) => (kept.some(isTmcdTrack) ? 0 : kept.filter(mp4TimedVideo).length);
     // The source tmcds left out of the map that come back: one per kept timed video, a tmcd whose own timecode tag is the one that video is written with, then
     // the first left in file order for each video none matches; the rest are lost. A PNG-codec video stored first at 05:00:00:00 beside an h264 at 01:00:00:00,
@@ -1362,7 +1364,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Whether a write into `container` takes this video stream's Dolby Vision box away. The mov muxer (MODE_MOV) writes no dvcC/dvvC box under any fourcc
     // (0 of 96 readable .mov outputs, jellyfin 7.1.4), so -strict unofficial does not help: an iPhone Profile 8.4 .mov remuxed into .mov reads back as
     // plain HLG HEVC. `-f mp4` is no escape, as the mp4 muxer refuses that file's mebx tracks. clean_and_remux writes only mkv or mp4, so the box survives
-    // when it runs first. A fourcc-only signal (a dvhe .mov) counts too: its record is gone either way. Cover art is never the subject.
+    // when it runs first. A fourcc-only signal (a dvhe .mov whose box is gone) counts too, as the stream still reads as Dolby Vision; movDvLossLine says
+    // it holds no box. Cover art is never the subject.
     // awk-ffmpeg-test's dvbox:p5-fourcc row measures it (its mov-annexb-hvc1 cell): that cell turning present means .mov can carry the box and this is stale.
     const movLosesDvBox = (container, s) => container === 'mov' && codecTypeOf(s) === 'video' && !isCoverArt(s) && isDolbyVisionVideo(s, mediaInfoFor(s));
     // Stream s as the next pass reads it once a write has dropped its Dolby Vision record, for an Expected results token: the record gone and mediaInfo
@@ -1691,11 +1694,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // ===== END SHARED: iso639-1 to iso639-2 map =====
     // #endregion
     // ====== LANGUAGE TAG CANONICALIZATION ======
-    // Write-side helpers: this is the only plugin that WRITES container language tags via tag_language/language_fill; langKey/langListMatch
-    // (matching) are shared, the ISO639_2_B/toCanonicalTag write-side logic below is clean_and_remux-only. Verified on this build: mp4's
-    // mdhd stores only a lowercase 3-letter ISO 639-2 code (2-letter / uppercase / region are silently dropped, so a plain mkv->mp4 remux
-    // of an "en"-tagged stream loses its language), mkv stores any code verbatim in its ISO 639-2 Language element (see toCanonicalTag); und/mul/zxx/mis
-    // are never rewritten.
+    // Write-side helpers: this is the only plugin that WRITES container language tags via tag_language/language_fill; langKey/langListMatch (matching) are
+    // shared, the ISO639_2_B/toCanonicalTag write-side logic below is clean_and_remux-only. Verified on this build: mp4's mdhd stores only a lowercase 3-letter
+    // ISO 639-2 code (2-letter / uppercase / region are silently dropped, so a plain mkv->mp4 remux of an "en"-tagged stream loses its language), mkv stores
+    // any code verbatim in its ISO 639-2 Language element (see toCanonicalTag); und/mul/zxx/mis are never rewritten.
     // The 20 languages whose 639-2/B (bibliographic) code differs from /T above, keyed by 639-1. method_tag_language=639-2/b uses these; /t uses the table.
     const ISO639_2_B = {
         sq:'alb',hy:'arm',eu:'baq',bo:'tib',my:'bur',zh:'chi',cs:'cze',nl:'dut',ka:'geo',de:'ger',el:'gre',is:'ice',mk:'mac',mi:'mao',ms:'may',
@@ -1797,8 +1799,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             ? `☐${st}[language_fill=${logSafe(fillLanguage)}] Language blank on ${typeWord} stream - setting to "${logSafe(desired)}"\n`
             : (rawTag
                 ? `☐${st}[tag_language=${tagLanguage}] Standardise ${typeWord} language - "${logSafe(rawTag)}" to "${logSafe(desired)}"\n`
-                : `☐${st}[tag_language=${tagLanguage}] Set language (${typeWord}) from mediaInfo "${logSafe(streamLang)}" to "${logSafe(desired)}"`
-                    + ' (no ffprobe language tag)\n');
+                : `☐${st}[tag_language=${tagLanguage}] Write language (${typeWord}) "${logSafe(desired)}" - only mediaInfo reads it ("${logSafe(streamLang)}"),`
+                    + ' with no ffprobe tag, so a remux would drop it\n');
         return { workLang, desired, meta: ` -metadata:s:${typeLetter}:${idx} "language=${escMeta(desired)}"`, log };
     };
     // ====== END LANGUAGE TAG CANONICALIZATION ======
@@ -3464,10 +3466,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }
 
         let extraArguments = '';
-        let nameCarryArgs = '';   // restatements that ride a remux this run makes anyway; never metadataCommand, which sets convert
+        let nameCarryArgs = '';   // restatements that ride a remux this run makes anyway; never metadataCommand, whose work sets convert
         let sidecarOut = '';   // remove_imagesubs=export: accumulates the per-image-sub sidecar outputs, prepended to the main output in the preset below.
                                // Stays empty on an unmapped node, where placeSidecars below uploads the exports instead of riding them on the remux.
         let convert = false;
+        // What the queued writes that only rewrite a name would rewrite (handler names, titles, comments, and role flags that keep what a cleared name held):
+        // they start a remux, but not one that would drop a Dolby Vision record (dvTidyHeld, after the stream loop).
+        const tidied = new Set();
         // The N in -metadata:s:<t>:N, -c:s:N and -bsf:v:N/-tag:v:N. Start at -1 so the increment in each branch yields 0 for the first stream of that type.
         // subtitle and video are decremented again when their stream is dropped, so the survivors stay contiguous; audio needs no decrement, because the one
         // path that drops audio (method_unmuxable=drop) removes the stream BEFORE the type branches increment anything.
@@ -3691,9 +3696,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
             //Metadata edits for this stream, accumulated by the emitters below and flushed onto the command at the end of the iteration.
             let metadataCommand = '';
+            let tidyText = '';   // the part of metadataCommand tidyMeta queued, so the flush can tell a stream whose writes only rewrite names
             let carryCommand = '';   // see nameCarryArgs
             let nameWritten = false;   // a title or handler write for this stream is queued, so the carry has nothing to restate
             let shouldDrop = false;
+            const tidyMeta = (args, what) => { metadataCommand += args; tidyText += args; tidied.add(what); };
             // Keep a role whose only copies are a handler and/or a busy title this command clears: promote its real flag on this same command even with
             // tag_disposition off - it preserves what the file already says rather than adding anything. Where tag_disposition covers the type it has
             // promoted every role already, and a second -disposition for one stream would override the first. A role no flag in the target can hold is lost
@@ -3715,7 +3722,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const cause = [titleCause, (viaHandler || viaDescription) && `container=${dstContainer}`].filter(Boolean).join('][');
                     workDone += `☐${streamTag(ffstream.index)}${cause ? `[${cause}]` : ''} Set disposition (${typeWord}) from ${from} - `
                         + `${promoted.map((k) => dispositionTypes[k].tag).join(' ')}\n`;
-                    metadataCommand += ` -disposition:${typeLetter}:${idx} ${promoted.map((k) => `+${k}`).join('')}`;
+                    tidyMeta(` -disposition:${typeLetter}:${idx} ${promoted.map((k) => `+${k}`).join('')}`, 'role flags');
                 }
                 const lost = [...new Set(roles.map(promoteTarget))].filter((k) => !promoted.includes(k));
                 for (const via of ['title', 'handler', 'description']) {
@@ -3726,6 +3733,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     else (via === 'handler' ? handlerRolesLost : descriptionRolesLost).push(entry);
                 }
                 clearedRolePrediction.set(ffstream.index, { adds: promoted, roleFields: survivingRoleFields(ffstream, newTitle) });
+            };
+            // Expected results read the role from the written title alone, with the flags tag_disposition promotes, where nothing above predicted the stream.
+            const predictFromTitle = (typeWord, title) => {
+                if (!clearedRolePrediction.has(ffstream.index)) {
+                    clearedRolePrediction.set(ffstream.index, { adds: appliesToType(tagDisposition, typeWord) ? dispositionsToPromote(ffstream, typeWord) : [],
+                        roleFields: survivingRoleFields(ffstream, title) });
+                }
             };
             // Per-stream handler_name canonicalisation, common to the subtitle/audio/video branches. mkv wipes it (it can confuse mkv title display). mp4
             // carries the track's title in it (handlerNameFor), or the per-type name when the track has none or its name reads as boilerplate - except that a
@@ -3753,18 +3767,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (dstContainer === 'mkv' && curHandler) {
                     workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Wiping handler_name tag${wipeReason} (${typeWord})`
                         + ` "${logSafe(curHandler)}"\n`;
-                    metadataCommand += ` -metadata:s:${typeLetter}:${idx} "handler_name="`;
+                    tidyMeta(` -metadata:s:${typeLetter}:${idx} "handler_name="`, 'handler names');
                 } else if (dstContainer === 'mp4' && !holds) {
                     workDone += `☐${streamTag(ffstream.index)}[container=${dstContainer}] Setting handler_name tag (${typeWord}) to `
                         + `${named ? `the track title ${quotedName(want)} - the only place mp4 keeps a track name`
                             : (keep ? `the name it holds, ${quotedName(want)}` : genericName)}`
                         + `${curHandler ? ` (was "${logShown(curHandler)}")` : ''}\n`;
-                    metadataCommand += ` -metadata:s:${typeLetter}:${idx} "handler_name=${escMeta(want)}"`;
+                    tidyMeta(` -metadata:s:${typeLetter}:${idx} "handler_name=${escMeta(want)}"`, 'handler names');
                     // The remux drops the udta title box, so unless a title write is queued already the name goes there too, in escMeta's form as mp4NameCarry
                     // writes it: the name the handler now holds, or a name that reads as boilerplate (that box is its only mp4 home) when no source title tag
                     // rides -map 0 into the box.
                     if (title && !titleQueued && (named || !ffstream.tags?.title)) {
-                        metadataCommand += ` -metadata:s:${typeLetter}:${idx} "title=${escMeta(title)}"`;
+                        tidyMeta(` -metadata:s:${typeLetter}:${idx} "title=${escMeta(title)}"`, 'titles');
                     }
                     nameWritten = true;
                 }
@@ -3824,7 +3838,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if ((getTagCI(ffstream.tags, 'title') && !named) || !title || mediaTitleClean === '' || dstContainer === 'mp4') return;
                 const from = mediaTitleClean === titleBesideHandler(ffstream) ? 'mediaInfo' : 'handler_name';
                 if (!named) workDone += `☐${streamTag(ffstream.index)} Set title (${typeWord}) from ${from} ${quotedName(title)} (no title tag)\n`;
-                metadataCommand += ` -metadata:s:${typeLetter}:${idx} "title=${escMeta(title)}"`;
+                tidyMeta(` -metadata:s:${typeLetter}:${idx} "title=${escMeta(title)}"`, 'titles');
                 nameWritten = true;
             };
             // The TITLE SimpleTag beside a Name, which no remux keeps beside the title it writes where it sits in the Name's place, and no mp4 keeps at all -
@@ -3839,17 +3853,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         + ` TITLE tag "${logShown(titleTagText(ffstream))}" beside it is dropped - ffmpeg keeps one title, and players show the`
                         + ' name\n';
                 }
-                if (!clearedRolePrediction.has(ffstream.index)) {
-                    const adds = appliesToType(tagDisposition, typeWord) ? dispositionsToPromote(ffstream, typeWord) : [];
-                    clearedRolePrediction.set(ffstream.index, { adds, roleFields: survivingRoleFields(ffstream, written) });
-                }
+                predictFromTitle(typeWord, written);
             };
             const emitTitleMeta = (typeLetter, idx, typeWord, streamTitle, newStreamTitle, titleCauses) => {
                 if (newStreamTitle !== streamTitle) {
                     const written = nameTextOf(newStreamTitle);   // see nameTextOf: a control byte at the edge would come back as a space
                     workDone += `☐${streamTag(ffstream.index)}${titleCauses.length ? `[${titleCauses.join('][')}]` : ''} Change title (${typeWord})`
                         + ` "${logShown(streamTitle)}" -> ${quotedName(written)}\n`;
-                    metadataCommand += ` -metadata:s:${typeLetter}:${idx} "title=${escMeta(written)}"`;
+                    tidyMeta(` -metadata:s:${typeLetter}:${idx} "title=${escMeta(written)}"`, 'titles');
                     nameWritten = true;
                 } else emitTitleReconcile(typeLetter, idx, typeWord, newStreamTitle);
                 noteTitleTagDropped(newStreamTitle, typeWord);
@@ -3862,7 +3873,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const curComment = getTagCI(ffstream.tags, 'comment');
                 if (removeComments === true && curComment) {
                     workDone += `☐${streamTag(ffstream.index)}[remove_comments=true] Remove comment (${typeWord}) "${logSafe(curComment)}"\n`;
-                    metadataCommand += ` -metadata:s:${typeLetter}:${idx} "comment="`;
+                    tidyMeta(` -metadata:s:${typeLetter}:${idx} "comment="`, 'comments');
                 }
             };
             // language_fill / tag_language: write the canonical language tag for a kept stream. canonicalLangMeta decides it; this records the decision the
@@ -4129,10 +4140,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
                 preserveClearedRoles('a', audioOutOrdinal, 'audio', newStreamTitle, titleCauses,
                     emitHandlerMeta('a', audioOutOrdinal, 'audio', 'SoundHandler', newStreamTitle));
-                if (originalByTitle && !clearedRolePrediction.has(ffstream.index)) {
-                    clearedRolePrediction.set(ffstream.index, { adds: appliesToType(tagDisposition, 'audio') ? dispositionsToPromote(ffstream, 'audio') : [],
-                        roleFields: survivingRoleFields(ffstream, newStreamTitle) });
-                }
+                if (originalByTitle) predictFromTitle('audio', newStreamTitle);
 
                 emitCommentRemoval('a', audioOutOrdinal, 'audio');
 
@@ -4166,40 +4174,45 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (isMatroskaFamily(dstContainer)) overlay(ffstream.index, { codec_tag_string: '' });
 
                 // HEVC takes hevcCopyPlan's fourcc. A stream no remux can fix says so straight to the log, since a file with nothing else to do never flushes
-                // workDone. A record no copy keeps (dvRecordSurvivesCopy) is lost by any remux, so the fourcc alone never starts one for it: its args ride a
-                // remux something else starts, which says the loss (dvCopyLossLine), and otherwise the file keeps its Dolby Vision as it is.
+                // workDone. A record no copy keeps (dvRecordSurvivesCopy) is lost by any remux, so the fourcc alone never starts one for it, nor does a name
+                // tidy (dvTidyHeld): its args ride a remux something else starts, which says the loss (dvCopyLossLine), and otherwise the file keeps its Dolby
+                // Vision as it is.
                 if (ffstreamCodec === 'hevc') {
                     const plan = hevcCopyPlan(ffstream, isMp4Family(srcContainer) ? ffstream.codec_tag_string : '', videoOutOrdinal,
                         ffmpegPathOf(otherArguments), String(file._id || file.file || ''), dstContainer);
-                    const at = `${streamTag(ffstream.index)}[container=${dstContainer}]`;
+                    const inputTag = `${streamTag(ffstream.index)}[container=${dstContainer}]`;
                     // Matroska refuses dvh1 (exit 183) and the plan gives this one no other tag, its record being Profile 20 or one no copy keeps, so a remux
-                    // could only fail in ffmpeg on every requeue: the file stops here, before any remux, with the reason, and keeps its Dolby Vision.
+                    // could only fail in ffmpeg on every requeue: the file stops here, before any remux, with the reason, and keeps its Dolby Vision. Where
+                    // method_unmuxable=mkv_fallback moved the file out of the mp4 the container setting asks for, that setting is the one to change.
                     if (isMatroskaFamily(dstContainer) && plan.have === 'dvh1' && plan.state === 'ok') {
                         const why20 = Number(doviRecord(ffstream)?.dv_profile) > 10 ? 'Matroska stores no Profile 20 record'
                             : 'its record does not match the video\'s colour, so the only fourcc Matroska takes would lose it';
-                        failWithBuffers(`${at} This dvh1 Dolby Vision stream cannot be copied into Matroska - the muxer refuses the dvh1 fourcc, and ${why20};`
-                            + ' set container=mp4 to keep its Dolby Vision, or re-encode it with video_clean');
+                        const fellBack = methodUnmuxable === 'mkv_fallback' && ddValue(inputs.container, 'mkv') !== dstContainer;
+                        const fix = fellBack ? 'set method_unmuxable=drop to keep the file in mp4 without the stream mp4 cannot store'
+                            : 'set container=mp4 to keep its Dolby Vision';
+                        failWithBuffers(`${fellBack ? `${streamTag(ffstream.index)}[method_unmuxable=mkv_fallback]` : inputTag} This dvh1 Dolby Vision stream`
+                            + ` cannot be copied into Matroska - the muxer refuses the dvh1 fourcc, and ${why20}; ${fix}, or re-encode it with video_clean`);
                     }
                     const why = plan.want === 'dvhe' ? 'Matroska stores no fourcc but refuses dvh1, and keeps a Profile 5 Dolby Vision box only under a'
                         + ' Dolby Vision fourcc' : plan.want === 'dvh1' ? 'Dolby Vision with no compatible base keeps its Dolby Vision box in mp4 only as'
                         + ' dvh1, the fourcc Apple/QuickTime play it under' : 'HEVC-in-mp4 needs the hvc1 fourcc for Apple/QuickTime playback';
-                    if (plan.state === 'retag') workDone += `☐${at} Tag video as ${plan.want} - ${why}\n`;
+                    if (plan.state === 'retag') workDone += `☐${inputTag} Tag video as ${plan.want} - ${why}\n`;
                     // Without extradata_size the plan cannot tell parameter sets in-band from a complete hvcC, so the line says only what the rebuild does.
                     if (plan.state === 'rebuild') {
                         const how = Number(ffstream.extradata_size) > 0 ? 'move its in-band parameter sets into the hvcC box'
                             : 'rebuild its hvcC box from the first keyframe';
-                        workDone += `☐${at} Tag video as ${plan.want} and ${how} - ${why}, with the parameter sets in that box\n`;
+                        workDone += `☐${inputTag} Tag video as ${plan.want} and ${how} - ${why}, with the parameter sets in that box\n`;
                     }
                     if (plan.state === 'stuck' && plan.args) {
                         const read = plan.ps === false ? 'carries no parameter sets' : 'could not be read on this pass';
-                        workDone += `☐${at} Tag video as dvhe - its first keyframe ${read}, so it cannot take the dvh1 Apple/QuickTime need; dvhe keeps its`
-                            + ' Dolby Vision box\n';
+                        workDone += `☐${inputTag} Tag video as dvhe - its first keyframe ${read}, so it cannot take the dvh1 Apple/QuickTime need; dvhe`
+                            + ' keeps its Dolby Vision box\n';
                     } else if (plan.state === 'stuck') {
                         const verb = plan.keep === plan.have ? 'stays' : 'gets';
                         response.infoLog += plan.ps === false
-                            ? `☒${at} Video ${verb} ${plan.keep} - its first keyframe carries no parameter sets, so no remux can build the complete hvcC`
+                            ? `☒${inputTag} Video ${verb} ${plan.keep} - its first keyframe carries no parameter sets, so no remux can build the complete hvcC`
                                 + ` box Apple/QuickTime need under ${plan.want}; other players are unaffected\n`
-                            : `☒${at} Video ${verb} ${plan.keep} for now - its first keyframe could not be read; a later pass reads it again\n`;
+                            : `☒${inputTag} Video ${verb} ${plan.keep} for now - its first keyframe could not be read; a later pass reads it again\n`;
                     }
                     if (plan.args) { extraArguments += plan.args; if (dvRecordSurvivesCopy(ffstream)) convert = true; }
                     // The fourcc the copy writes into mp4 - a stuck stream's keep, else the plan's want - is the one the next pass reads.
@@ -4218,7 +4231,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     workDone += newVideoTitle
                         ? `☐${streamTag(ffstream.index)}[remove_busytitle=true] Change title (video) "${logSafe(videoTitle)}" -> ${quotedName(newVideoTitle)}\n`
                         : `☐${streamTag(ffstream.index)}[remove_busytitle=true] Remove title (video) "${logSafe(videoTitle)}"\n`;
-                    metadataCommand += ` -metadata:s:v:${videoOutOrdinal} "title=${escMeta(newVideoTitle)}"`;
+                    tidyMeta(` -metadata:s:v:${videoOutOrdinal} "title=${escMeta(newVideoTitle)}"`, 'titles');
                     nameWritten = true;
                 } else emitTitleReconcile('v', videoOutOrdinal, 'video', videoTitle);
                 noteTitleTagDropped(newVideoTitle, 'video');
@@ -4277,7 +4290,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // conversion that emits its own -c:s alongside the metadata, a removal - has already `continue`d past this point.
             if (metadataCommand !== '') {
                 extraArguments += metadataCommand;
-                convert = true;
+                if (metadataCommand !== tidyText) convert = true;
             }
             nameCarryArgs += carryCommand;
 
@@ -4354,7 +4367,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             workDone += `☐[remove_comments=true] Remove comment from file "${logSafe(fileComment)}"\n`;
             extraArguments += ` -metadata "comment="`;
             globalWrites.comment = '';
-            convert = true;
+            tidied.add('comments');
         }
 
         // Case-insensitive for the same reason: a global title held in a matroska Tags element arrives as TITLE, and it replaces the Segment Info title in
@@ -4364,7 +4377,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             workDone += `☐[remove_busytitle=true] Remove title from file "${logSafe(String(fileTitle).trim())}"\n`;
             extraArguments += ` -metadata "title="`;
             globalWrites.title = '';
-            convert = true;
+            tidied.add('titles');
         }
 
         if (srcContainer !== dstContainer) {
@@ -4435,6 +4448,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // A recover-only run has no other queued work, so runRecover alone must force the remux.
         if (runRecover)
             convert = true;
+
+        // A remux whose only work is rewriting names (tidied) is not worth a Dolby Vision record its copy would drop (dvCopyDropsRecord) - the rule the HEVC
+        // branch follows for a fourcc alone, and stream_ordering for its optional remuxes - so the file is left as it is, one line saying what the remux would
+        // drop and why it was wanted. Any other work still remuxes, and dvCopyLossLine says the loss.
+        const dvTidyHeld = !convert && tidied.size ? mappedVideos.map(asWritten).filter((s) => dvCopyDropsRecord(dstContainer, s)) : [];
+        if (tidied.size && !dvTidyHeld.length) convert = true;
 
         // Re-stamp the recover intent on every remux while recover is requested, even when it already matches
         // (e.g. across mkv->mp4), so awk_recovered is refreshed and recovery doesn't re-trigger next pass.
@@ -4511,6 +4530,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (recoverRequested && intentMatches)
                 response.infoLog += `☑Already recovered with these options (${RECOVERED_TAG}=${recoveredTag}) - skipping to avoid reprocessing;`
                     + ' change a recover_bad_* mode to run again\n';
+            if (dvTidyHeld.length) {
+                const why = ['handler names', 'titles', 'comments', 'role flags'].filter((w) => tidied.has(w));
+                const whose = (s) => (dvTidyHeld.length > 1 ? `the Dolby Vision record of video ${s.index}` : 'this video\'s Dolby Vision record');
+                const lost = dvTidyHeld.map((s) => `${whose(s)}, ${dvRecordSurvivesCopy(s) ? `which no fourcc an ${dstContainer} copy can give the video keeps`
+                    : 'which does not match the video\'s colour, so no ffmpeg copy keeps it'}`);
+                return skip(`☑${dvTidyHeld.length === 1 ? streamTag(dvTidyHeld[0].index) : ''} Left as it is - a remux only to rewrite its ${
+                    why.length > 1 ? `${why.slice(0, -1).join(', ')} and ${why[why.length - 1]}` : why[0]} would drop ${lost.join(', and ')}\n`);
+            }
             return skip(`☑File is already ${dstContainer} and contains no streams requiring removal or conversion\n`);
         }
         return response;
