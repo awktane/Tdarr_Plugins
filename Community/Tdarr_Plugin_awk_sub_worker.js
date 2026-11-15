@@ -42,9 +42,9 @@ const details = () => ({
                 transcode, which is when import deletes the sidecars it embedded; a second copy would run in both stages too, each with its own settings. A
                 Flow has no such pass (see remove_source). Runs standalone, or in the awk stack after clean_and_remux (first) / audio_clean and before
                 stream_ordering (last). If the file has embedded closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that
-                destroys them. Extract with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since
+                can destroy them. Extract with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since
                 the sidecars would land beside the source, where the output never sees them.`,
-    Version: '3.999.115',
+    Version: '3.999.116',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -57,7 +57,9 @@ const details = () => ({
             tooltip: `Which direction to run. Either way remove_source decides whether the source copy is deleted once the content is confirmed at the
                 other end - it defaults to on, so by default a subtitle MOVES rather than being copied. Either way a file holding a subtitle track ffmpeg
                 names no codec for (a WebVTT track mkvmerge wrote) stops with a line naming it when the pass has something to write, since ffmpeg cannot
-                copy that track; a pass with nothing to write leaves the file alone.
+                copy that track; a pass with nothing to write leaves the file alone. On an mp4, m4v or mov file the record an import keeps, and the
+                caption-read verdict embedded_cc keeps, stay on the file for good, and keeping them makes every later remux write the file's tags as
+                QuickTime metadata keys, which taggers and Apple players cannot read, and drop the cover art of an mp4 or m4v; Matroska keeps both.
                 \\n=====
                 \\nActions
                 \\n=====
@@ -118,7 +120,7 @@ const details = () => ({
             },
             tooltip: `Turn EMBEDDED CLOSED CAPTIONS into real subtitles. These are not a subtitle track - they are caption data carried inside the video
                 picture itself (EIA-608/708, standard on North American broadcast recordings), which is why no player lists them alongside the subtitles and
-                why re-encoding the video destroys them.
+                why re-encoding the video can destroy them.
                 \\n=====
                 \\nActions
                 \\n=====
@@ -5114,14 +5116,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             return ccStaleMemo;
         };
-        // SW-07's gate. Filtering the SEI out also removes the recovery-point SEI that marks an open-GOP or intra-refresh H.264 keyframe: the stripped file's
-        // own index survives, but the next remux re-derives keyframes from IDR or recovery points and keeps only the IDRs (a real ATSC capture went from 56 to
-        // 14 keyframe packets and Matroska cues after one more -c copy). So the copy strip runs only where every key packet among the first CC_GOP_PACKETS is
-        // an IDR, and at least two were seen. One ffmpeg spawn traces the NAL headers (30-176 ms on the corpus). Two traps, both measured and load-bearing:
-        // the filler NALs (type 12) are removed FIRST - a Blu-ray stream's filler is traced one byte per line (2.4 GB of stderr for 400 packets on
-        // pcm_5.1.m2ts) - and the non-IDR slices are NOT (remove_types=1 drops whole packets, so -frames:v no longer bounds the read: 268 MB, exit 255). The
-        // trace grows with the slices per picture (0.6 / 4.2 / 16.7 / 35.3 MB at 1 / 8 / 32 / 68), hence the 128 MiB ceiling, and an overflow is named as
-        // such. The harness answers from __awkCap.gop ({ stderr, status, error }, through the same parse) and never spawns; with no gop key the check passes.
+        // The copy strip's keyframe gate. Filtering the SEI out also removes the recovery-point SEI that marks an open-GOP or intra-refresh H.264 keyframe: the
+        // stripped file's own index survives, but the next remux re-derives keyframes from IDR or recovery points and keeps only the IDRs (a real ATSC capture
+        // went from 56 to 14 keyframe packets and Matroska cues after one more -c copy). So the copy strip runs only where every key packet among the first
+        // CC_GOP_PACKETS is an IDR, and at least two were seen. One ffmpeg spawn traces the NAL headers (30-176 ms on the corpus). Two traps, both measured and
+        // load-bearing: the filler NALs (type 12) are removed FIRST - a Blu-ray stream's filler is traced one byte per line (2.4 GB of stderr for 400 packets
+        // on pcm_5.1.m2ts) - and the non-IDR slices are NOT (remove_types=1 drops whole packets, so -frames:v no longer bounds the read: 268 MB, exit 255). The
+        // trace grows with the slices per picture (0.6 / 4.2 / 16.7 / 35.3 MB at 1 / 8 / 32 / 68), hence the 128 MiB ceiling, and an overflow is named as such.
+        // The harness answers from __awkCap.gop ({ stderr, status, error }, through the same parse) and never spawns; with no gop key the check passes.
         const CC_GOP_PACKETS = 400;
         const CC_GOP_MAX_BYTES = 128 * 1024 * 1024;
         const CC_GOP_TIMEOUT_MS = 60000;

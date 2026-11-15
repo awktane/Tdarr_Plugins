@@ -2,18 +2,19 @@
 const details = () => ({
     id: 'Tdarr_Plugin_awk_video_clean',
     Stage: 'Pre-processing',
-    Name: 'Clean / transcode video - action-gated (codec, resolution, bit-depth, HDR), auto-selecting the best encoder per node.',
+    Name: 'Clean / transcode video - action-gated (codec, resolution, bit-depth, HDR), auto-selecting an encoder per node.',
     Type: 'Video',
     Operation: 'Transcode',
     Description: `Cleans and re-encodes the video stream. Audio and subtitles are copied unchanged (embedded cover-art video is dropped).
                      Pick a top-level ACTION first (see its tooltip for full details) - the plugin does nothing until you choose a goal:
                      hdr_cleanup_only (default, harmless HDR-only pass), normalize (compatibility conversion), shrink (space savings).\n\n
-                     -Auto-selects the best available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one
+                     -Auto-selects an available encoder on EACH node at runtime (ffmpeg build + a cheap hardware-presence check), so one
                      plugin works across a mixed Mac/Windows/Linux + dGPU/iGPU/CPU-only fleet. Constant-quality (CRF/CQ) tiered by resolution
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
-                     embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.94',
+                     embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that can destroy them (see
+                     guard_captions).\n\n`,
+    Version: '3.999.95',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -31,13 +32,16 @@ const details = () => ({
                 \\n=====
                 \\nhdr_cleanup_only (default, harmless): only hdr_mode is live, and only where it can act losslessly - strip_dynamic drops the Dolby
                 Vision / HDR10+ dynamic layer with a plain -c:v copy, keeping the base HDR10, and anything that cannot be done losslessly is skipped.
-                codec, downscale, deinterlace, bit depth, quality and encoder are all inert. A safe do-nothing default.
+                codec, downscale, deinterlace, bit depth, quality and encoder are all inert, though a malformed number in them still fails the file. A safe
+                do-nothing default.
                 \\nnormalize: compatibility conversion. Re-encodes whenever the source does not match your codec, downscale or hdr_mode target, in
                 EITHER direction - AV1 to HEVC for an old TV, or 4K down to 1080p. method_bitdepth rides along on whatever else fires but never triggers
                 a re-encode by itself.
                 \\nshrink: save space. Re-encodes toward a more efficient codec (AV1 > HEVC > H.264) and never downgrades efficiency - a request that
                 would, such as HEVC on an AV1 source, falls back to a same-codec re-encode gated by guard_shrink_bitrate. Anything it cannot make smaller
-                is skipped for that file and logged, not failed.`,
+                is skipped for that file and logged, not failed. On an mp4, m4v or mov file the marker shrink leaves stays for good, and keeping it makes
+                every later remux write the file's tags as QuickTime metadata keys, which taggers and Apple players cannot read, and drop the cover art of
+                an mp4 or m4v; Matroska keeps both.`,
         },
         {
             name: 'codec',
@@ -108,7 +112,7 @@ const details = () => ({
                 \\n1080 fits anything larger into 1920x1080 - the classic "shrink 4K to 1080p to save space". 720 does the same at 1280x720, while 2160
                 and 1440 only shrink sources larger than their own frame. Cinema geometry is fitted by WIDTH too, so a 4096x1716 scope master lands
                 1920x804 instead of staying 2578 wide, and a 2048x858 DCI 2K master is fitted too - it overflows the 1920x1080 box by width, though
-                858 <= 1080.`,
+                858 <= 1080. Portrait video is fitted into the same landscape frame, so a 1080x1920 phone clip at 1080 lands 608x1080.`,
         },
         {
             name: 'hdr_mode',
@@ -127,7 +131,8 @@ const details = () => ({
                 protected - with guard_dv enabled, DV survives a transcode via libx265, and under hdr_cleanup_only nothing is touched at all.
                 \\nstrip_dynamic: drop just the dynamic layer and keep the base HDR10. When that is the ONLY thing to do, with no codec or resolution
                 change, it is LOSSLESS - a -c:v copy with a bitstream filter, at no quality cost - and it folds into a real transcode if codec or
-                downscale also fire. Overridden per file by guard_dv, which preserves the DV instead.
+                downscale also fire. Under normalize and shrink it is overridden per file by guard_dv, which preserves the DV instead; under
+                hdr_cleanup_only a strip_dynamic you set is honoured.
                 \\ntonemap_sdr: tonemap ALL HDR, static and dynamic, down to SDR (bt709). Always a real re-encode, being a pixel operation, so it is NOT
                 valid under hdr_cleanup_only. Use it for SDR-only playback: correct colour on non-HDR displays, and no per-play tonemapping by the server.
                 It runs GPU-accelerated on the node's encoder hardware, for one consistent look across NVIDIA, Intel, AMD and Apple, falling back to the
@@ -275,7 +280,8 @@ const details = () => ({
                 \\n=====
                 \\nenabled (default): carry the DV RPU through a re-encode so the output stays Dolby Vision. To manage that it forces the libx265 software
                 encoder, the HEVC codec (overriding your codec choice) and 10-bit, and it overrides hdr_mode=strip_dynamic or tonemap_sdr on DV files,
-                preserving the DV with a warning.
+                preserving the DV with a warning. That is under normalize and shrink: under hdr_cleanup_only guard_dv is inert, and a strip_dynamic you set
+                is honoured.
                 \\ndisabled: do not protect DV. A transcode that would destroy it is still skipped under hdr_mode=preserve, but strip_dynamic and tonemap_sdr
                 are honoured, and the DV layer is dropped or flattened as asked.
                 \\nOnly an HEVC source qualifies: libx265 is the sole encoder that carries the RPU, and only from HEVC, so DV in any other codec (AV1,
@@ -289,7 +295,7 @@ const details = () => ({
             defaultValue: '12',
             inputUI: { type: 'text' },
             tooltip: `Skip an encoder that would take longer than this many hours to transcode the file on this node, and ERROR the file when every encoder
-                would. 0 means no limit; a cleared field means the default of 12.
+                would. Any number of hours from 0 to 168, fractions allowed: 0 means no limit, and a cleared field means the default of 12.
                 \\nThe estimate comes from the test encode each candidate encoder gets before the transcode (see method_encoder): samples of 10 s on a GPU
                 encoder and of up to a minute on the CPU, one sample when the estimate is far from this limit and up to five when it is close - so up to
                 about five minutes on the CPU. At 0 the test still runs, one sample per encoder (30 s on the CPU). The estimate is checked ONCE, before the
@@ -326,7 +332,8 @@ const details = () => ({
                 resolution and bit depth on top of the compression - exactly the detail an intermediate format exists to keep, and no later pass can bring
                 it back.
                 \\nWith an mp4 TARGET this rarely comes up: most of these codecs cannot be stored in mp4 at all, so clean_and_remux, which runs first,
-                stops the file before video_clean ever sees it.`,
+                stops the file before video_clean ever sees it - unless its method_unmuxable=mkv_fallback keeps the file in mkv, or clean_and_remux is not
+                in the stack.`,
         },
         {
             name: 'guard_shrink_bitrate',
@@ -2379,8 +2386,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // Read a table by a key that came from a PROBE or a user string, never from a validated dropdown. `TABLE[key] || fallback` cannot tell an ABSENT key from
     // one inherited off Object.prototype, and every prototype member is truthy, so the fallback never fires for it - a stream whose codec_name is 'constructor'
-    // would read as a real row. Every probe-keyed lookup in this file goes through here, bar selectEncoder's ENCODER_NAME reads, which only ever see an
-    // ENCODABLE_CODECS target (the canEncodeTarget skip runs before the only path to them); a dropdown-keyed one does not need it.
+    // would read as a real row. Every lookup keyed by a codec NAME or a user string goes through here, bar encoderPlan's ENCODER_NAME reads, which only ever
+    // see an ENCODABLE_CODECS target (the canEncodeTarget skip runs before every path to them). A dropdown-keyed one does not need it, and nor does a shared
+    // section's codec_type-keyed literal: ffprobe's codec_type is a fixed enum.
     const tableGet = (table, key, dflt) => (Object.prototype.hasOwnProperty.call(table, key) ? table[key] : dflt);
 
     // ====== ENCODER CAPABILITY + SELECTION ======
@@ -2399,7 +2407,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Priority order of hardware families to try per OS (best/most-common first); CPU is the fallback behind them, except under node_strict on a GPU worker.
     // Mac is videotoolbox-only by design: on macOS ALL hardware encoding (Apple Silicon media engine, Intel Quick Sync, an AMD dGPU/eGPU) is routed through
     // VideoToolbox - there is no working nvenc/qsv/vaapi/amf path on macOS and the darwin ffmpeg build ships none of them - and it is used only on Apple
-    // Silicon (encoderPlan says why). (rkmpp is a valid node hardware type but Rockchip ARM only, so it is unsupported here; see selectEncoder's `families`
+    // Silicon (encoderPlan says why). (rkmpp is a valid node hardware type but Rockchip ARM only, so it is unsupported here; see encoderPlan's `families`
     // comment for what such a node lands on.)
     const HW_FAMILIES = {
         darwin: ['videotoolbox'],
@@ -2465,14 +2473,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         } catch (e) { return []; }
     };
     // Which render nodes each Linux family may drive: vaapi any Intel or AMD node, qsv an Intel one (FFmpeg opens the first Intel node itself, so it is
-    // offered once, with no device). An unreadable vendor stays a candidate - the confirm and the test encode decide - and an NVIDIA node never is.
+    // offered once, with no device), amf an AMD one. An unreadable vendor stays a candidate - the confirm and the test encode decide - and an NVIDIA node
+    // never is.
     const VAAPI_VENDORS = ['0x8086', '0x1002', ''];
     const QSV_VENDORS = ['0x8086', ''];
+    const AMF_VENDORS = ['0x1002', ''];
     const nodesFor = (cap, vendors) => (cap.renderNodes || []).filter((n) => vendors.includes(n.vendor));
 
     // Query the ffmpeg build's encoder list + hardware presence for this node: encoders from `-encoders`, NVIDIA from nvidia-smi, VAAPI/QSV from the
-    // render nodes. Tdarr reloads each classic plugin fresh per file, and guard_dv's memory counterfactual makes a second call; the probe runs even on a
-    // forced-CPU pick because cap is computed above the forceCpu early return.
+    // render nodes. Tdarr reloads each classic plugin fresh per file, and each firstHardwareEncoder counterfactual makes another call; the probe runs even on
+    // a forced-CPU pick because cap is computed above the forceCpu early return.
     const queryCapabilities = (ffmpegPath) => {
         const cap = { encoders: new Set(), nvidia: false, dri: false, renderNodes: [] };
         try {
@@ -2513,8 +2523,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Cheap zero-encode presence verdict for a family on this platform: 'yes' (usable), 'no' (definitely not), or 'probe' (can't tell cheaply - confirm
     // with one encode). videotoolbox = Mac only; nvenc = nvidia-smi. VAAPI, QSV and AMF can never be confirmed cheaply: Windows offers no signal at all,
     // and on Linux a render node only proves a GPU exists - not one that can encode this codec (no HEVC encoder on an AMD GPU before Polaris or an Intel
-    // iGPU before Skylake: an A8-7410's VCE 2.0 exposes renderD128 and fails every hevc_vaapi encode), so both stay 'probe' wherever a node of their vendor
-    // is present (nodesFor).
+    // iGPU before Skylake: an A8-7410's VCE 2.0 exposes renderD128 and fails every hevc_vaapi encode), so each stays 'probe' wherever a node of its vendor
+    // is present (nodesFor), and is 'no' on a Linux node with none - an Intel- or NVIDIA-only node never pays a confirm encode for AMF.
     const presenceOf = (family, cap, platform) => {
         switch (family) {
             case 'cpu': return 'yes';
@@ -2522,7 +2532,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             case 'nvenc': return cap.nvidia ? 'yes' : 'no';
             case 'vaapi': return nodesFor(cap, VAAPI_VENDORS).length ? 'probe' : 'no';
             case 'qsv': return platform === 'linux' ? (nodesFor(cap, QSV_VENDORS).length ? 'probe' : 'no') : 'probe';
-            case 'amf': return 'probe';
+            case 'amf': return platform !== 'linux' || nodesFor(cap, AMF_VENDORS).length ? 'probe' : 'no';
             default: return 'no';
         }
     };
@@ -2530,10 +2540,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // The encoders THIS node may use for a file, in the order they are tried. method_encoder picks the list - see the comment on `families` below. Returns
     // the node facts and a LAZY generator, hardware(), yielding { family, encoderName, device, label } for each hardware candidate that passes the cheap
     // filters (in this build, detected, an encoder for this codec, and the one-frame confirm where presence is ambiguous), pushing the node-pinned
-    // family's fallback reason as it goes. Lazy, because a caller that needs only the first candidate (guard_dv's counterfactual) must not pay every
-    // later family's confirm encode. Tests inject a capability object + platform via otherArguments.__awkCap (workerType and nodeHardwareType sit on
+    // family's fallback reason as it goes. Lazy, because a caller that needs only the first candidate (firstHardwareEncoder) must not pay every later
+    // family's confirm encode. Tests inject a capability object + platform via otherArguments.__awkCap (workerType and nodeHardwareType sit on
     // otherArguments itself) to avoid any real ffmpeg/nvidia-smi spawn.
-    const encoderPlan = ({ targetCodec, encoderOpt, otherArguments, forceCpu, forceCpuWhy }) => {
+    const encoderPlan = ({ targetCodec, encoderOpt, otherArguments, forceCpu }) => {
         const platform = (injectedCap && injectedCap.platform) || os.platform();
         const workerType = String((otherArguments && otherArguments.workerType) || '').toLowerCase();
         const isGpuWorker = workerType.includes('gpu');
@@ -2549,6 +2559,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             ? !!(injectedCap.confirm && (injectedCap.confirm[c.label] ?? injectedCap.confirm[c.encoderName]))
             : confirmEncode(ffmpegPath, c.encoderName, inputSide, filter));
         const notes = [];
+        const unconfirmed = [];   // the candidates whose one-frame confirm failed, in the order tried (the Encoder line names them under true auto)
         const cpuName = ENCODER_NAME[targetCodec].cpu;
 
         // Candidate families to try in order, ending at 'cpu' unless node_strict forbids it. method_encoder picks the list:
@@ -2565,8 +2576,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // VideoToolbox test encode would fail, and under node_strict every file would error. Read from the source, not measured - the fleet has no Intel
         // Mac; the arm64 build does not even carry the refusal's message. A synthetic node (injectedCap) is Apple Silicon unless it names an arch.
         const vtUnusable = platform === 'darwin' && (injectedCap ? injectedCap.arch || 'arm64' : os.arch()) !== 'arm64';
-        const hwList = (HW_FAMILIES[platform] || []).filter((f) => !(f === 'videotoolbox' && vtUnusable));
-        if (vtUnusable && isGpuWorker && encoderOpt !== 'cpu' && !forceCpu)
+        const platformHw = HW_FAMILIES[platform] || [];
+        const hwList = platformHw.filter((f) => !(f === 'videotoolbox' && vtUnusable));
+        if (vtUnusable && isGpuWorker && encoderOpt !== 'cpu' && !forceCpu && ENCODER_NAME[targetCodec].videotoolbox)
             notes.push(`☒[method_encoder=${encoderOpt}] VideoToolbox is not used on an Intel Mac - its quality mode needs Apple Silicon\n`);
         const nodeHw = isNodeMode ? String((otherArguments && otherArguments.nodeHardwareType) || '').toLowerCase().trim() : '';
         const nodeIsSpecific = !!nodeHw && nodeHw !== '-';
@@ -2591,15 +2603,16 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             families = ['cpu'];                                                          // encoderOpt === 'cpu' - the only value left, and it forces software
         }
         // Why there is no GPU candidate, worded for the refusal node_strict issues and for the Encoder line of a CPU fallback. The cpuWhy ladder is
-        // exhaustive over the four values encoderOpt can hold, so its trailing '' is a default that no accepted value reaches.
+        // exhaustive over the four values encoderOpt can hold, so its trailing '' is a default that no accepted value reaches. A family this platform has
+        // reads as one this node could not use, never as unsupported, even where it is filtered out above (VideoToolbox on an Intel Mac: the note says why).
         const strictWhy = !nodeIsSpecific ? 'no usable GPU encoder on this node'
-            : hwList.includes(nodeHw) ? `node hardware '${nodeHw}' could not encode ${targetCodec} on this node`
+            : platformHw.includes(nodeHw) ? `node hardware '${nodeHw}' could not encode ${targetCodec} on this node`
                 : `node hardware '${nodeHw}' is not supported by this plugin`;
         const cpuWhy = !isGpuWorker && (encoderOpt === 'auto' || isNodeMode) ? 'CPU worker'
             : encoderOpt === 'auto' ? 'no usable GPU encoder on this node'
                 : encoderOpt === 'cpu' ? nodeLabel
                     : isNodeMode ? `${nodeIsSpecific
-                        ? `node hardware '${nodeHw}' ${hwList.includes(nodeHw) ? 'unavailable' : 'unsupported'}`
+                        ? `node hardware '${nodeHw}' ${platformHw.includes(nodeHw) ? 'unavailable' : 'unsupported'}`
                         : 'no usable GPU encoder'} on this node`
                         : '';
         function* hardware() {
@@ -2630,6 +2643,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                         const probeIn = family === 'vaapi' ? `-vaapi_device ${device}` : '';
                         const probeFilter = family === 'vaapi' ? 'format=nv12,hwupload' : '';
                         if (!confirm(c, probeIn, probeFilter)) {
+                            unconfirmed.push(label);
                             pushFallbackNote(family, `${label} did not initialise on this node`, i < devices.length - 1);
                             continue;
                         }
@@ -2638,33 +2652,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
             }
         }
-        return { notes, strict, isGpuWorker, nodeLabel, cpuName, cpuWhy, strictWhy, hardware,
+        return { notes, strict, isGpuWorker, nodeLabel, cpuName, cpuWhy, strictWhy, hardware, unconfirmed,
             trueAuto: isGpuWorker && (encoderOpt === 'auto' || (isNodeMode && !nodeIsSpecific)),
             pinned: isNodeMode && nodeIsSpecific,
             cpuReachable: !!forceCpu || families.includes('cpu') };
     };
 
-    // The node's FIRST usable encoder with no test encode - { family, encoderName, notes:[infoLog lines] }, or { strictFail, notes } when node_strict
-    // forbids the CPU fallback. Only guard_dv's memory counterfactual asks this question; the transcode itself walks the whole plan (resolveEncodeEncoder).
-    const selectEncoder = ({ targetCodec, encoderOpt, otherArguments, forceCpu, forceCpuWhy }) => {
-        const plan = encoderPlan({ targetCodec, encoderOpt, otherArguments, forceCpu, forceCpuWhy });
-        const { notes } = plan;
-        // Data the hardware encoders cannot carry (a Dolby Vision RPU) leaves the software encoder as the only option regardless of node or pin.
-        // forceCpuWhy names which, so the log says what the slower encode bought.
-        if (forceCpu) {
-            notes.push(`☐[method_encoder=${encoderOpt}] Encoder: ${plan.cpuName} (forced ${forceCpuWhy})\n`);
-            return { family: 'cpu', encoderName: plan.cpuName, notes };
-        }
-        const first = plan.hardware().next();
-        if (!first.done) {
-            notes.push(`☐[method_encoder=${encoderOpt}] Encoder: ${first.value.encoderName} (${plan.nodeLabel})\n`);
-            return { family: first.value.family, encoderName: first.value.encoderName, notes };
-        }
-        // Fell through without a usable hardware encoder. node_strict on a GPU worker forbids the CPU fallback; every other case lands on CPU.
-        if (plan.strict && plan.isGpuWorker)
-            return { strictFail: `[method_encoder=${encoderOpt}] ${plan.strictWhy}; node_strict forbids the CPU fallback`, notes };
-        if (plan.cpuWhy) notes.push(`☐[method_encoder=${encoderOpt}] Encoder: ${plan.cpuName} (${plan.cpuWhy})\n`);
-        return { family: 'cpu', encoderName: plan.cpuName, notes };
+    // The hardware encoder this node would take first, with no test encode and no log line - { family, encoderName, device, label }, or { family: 'cpu' }
+    // when it has none. Asked only for a counterfactual: guard_dv's memory trade-off (memoryCheckInner) and the failure endings' hint (untried) for guard_dv
+    // and for a CPU worker. The transcode itself walks the whole plan (resolveEncodeEncoder).
+    const firstHardwareEncoder = ({ targetCodec, encoderOpt, otherArguments }) => {
+        const first = encoderPlan({ targetCodec, encoderOpt, otherArguments, forceCpu: false }).hardware().next();
+        return first.done ? { family: 'cpu' } : first.value;
     };
 
     // ====== TONEMAP BACKEND ROUTING ======
@@ -2726,6 +2725,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // frame threads (measured <= 18 frames on the J4125, <= 22 on the M1), so 40 can only over-state the wait - the safe direction.
     const TEST_D_MAX = 40;
     const TEST_STARTUP_SLACK_S = 5;
+    // A capped CPU window's budget runs this far past the no-output drop point, leaving room for steady readings once the window has passed it.
+    const TEST_CPU_AFTER_DROP_S = 10;
     // When one window decides. Hardware: its single-window estimates on the J4125 ran 0.64-1.28x the true time, so one window decides only outside that
     // band; libx265's one-window error is wider (0.64-1.43x at 10 s), so a CPU candidate decides early only under half or over twice the cap. Otherwise
     // windows are added, up to five, and pooled.
@@ -2735,6 +2736,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // exactly a keyframe lands on the PREVIOUS one and decodes a whole GOP first (measured 5.10 s against 0.64 s for one frame of 4K HEVC). Seeking 0.131 s
     // past the keyframe lands on it in every container.
     const TEST_SEEK_PAD_S = 0.131;
+    // How far seekFor looks for a keyframe before and after a window's position. The look-ahead is both the forward probe's interval and the span every
+    // probe's packets are tested against, so the two can never disagree about whether a window has content.
+    const TEST_SEEK_LOOKBACK_S = 20;
+    const TEST_SEEK_LOOKAHEAD_S = 3;
     const KEYFRAME_PROBE_TIMEOUT_MS = 5000;
     const DECODE_CHECK_TIMEOUT_MS = 60000;
     // stderr at -v error still reaches ~200 KB per 10 s on a damaged source, and Node applies maxBuffer to stdout and stderr separately.
@@ -2836,18 +2841,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const cap = Number(o.capH) > 0 ? Number(o.capH) : 0;
         const [accept, drop] = o.isCpu ? TEST_EDGES.cpu : TEST_EDGES.hw;
         const est = (speed) => (dur > 0 && speed > 0 ? dur / speed / 3600 : null);
+        // The frame rate an encode of a file at frame rate f must keep to finish within the cap; 0 where any of the three is unknown.
+        const fpsNeeded = (f) => (cap > 0 && dur > 0 && f > 0 ? (f * dur) / (cap * 3600) : 0);
         // A corroborated frame rate bounds how long a CPU candidate may show no output and still keep the pace the cap needs.
-        const reqFps = cap > 0 && dur > 0 && o.declaredFps > 0 ? (o.declaredFps * dur) / (cap * 3600) : 0;
+        const reqFps = fpsNeeded(o.declaredFps);
         const tDrop = reqFps > 0 ? TEST_D_MAX / reqFps + TEST_STARTUP_SLACK_S : 0;
         const codecAt = o.videoArgv.findIndex((a) => /^-c:v/.test(a));
         const encoderName = codecAt < 0 ? '' : String(o.videoArgv[codecAt + 1] || '');
         const budgetFor = () => (!o.isCpu ? TEST_HW_BUDGET_S : cap === 0 ? TEST_CPU_NOCAP_S
-            : tDrop > 0 ? Math.min(TEST_CPU_MAX_S, Math.ceil(tDrop + 10)) : TEST_CPU_MAX_S);
+            : tDrop > 0 ? Math.min(TEST_CPU_MAX_S, Math.ceil(tDrop + TEST_CPU_AFTER_DROP_S)) : TEST_CPU_MAX_S);
 
-        // The seek for a window at relative time T: one packet at T (indexed containers seek it back to the keyframe), else the last keyframe in the 20 s
-        // before T (mpegts and other unindexed inputs), else the first in the 3 s after, else T itself. null S = no -ss (the start of the file). When the
-        // look-back and the look-ahead both ran and the stream has NO packet in that span, the stated timeline has no content at T - a timestamp jump in
-        // the middle of an mpegts (two recordings joined), or a stated duration past the video's end - so the window is empty without an encode
+        // The seek for a window at relative time T: one packet at T (indexed containers seek it back to the keyframe), else the last keyframe in the look-back
+        // before T (mpegts and other unindexed inputs), else the first in the look-ahead after it, else T itself. null S = no -ss (the start of the file).
+        // When the look-back and the look-ahead both ran and the stream has NO packet in that span, the stated timeline has no content at T - a timestamp
+        // jump in the middle of an mpegts (two recordings joined), or a stated duration past the video's end - so the window is empty without an encode
         // (ffprobe answers such a span with the last packet before the gap, which the span test discards).
         const seekFor = (T) => {
             if (o.memo.keyframes.has(T)) return o.memo.keyframes.get(T);
@@ -2863,15 +2870,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 };
                 const keys = (rows) => rows.filter((r) => r.key).map((r) => r.t);
                 const one = probe(`${sec6(at)}%+#1`);
-                const lo = Math.max(start, at - 20);
+                const lo = Math.max(start, at - TEST_SEEK_LOOKBACK_S);
                 // The first probe's keyframe counts only inside the look-back span. A keyframe further back is what an index snaps back to on a long-GOP file,
                 // and also the last packet before a timestamp gap, which ffprobe echoes; it is kept as a fallback and the spans decide.
                 const kOne = one ? keys(one).find((t) => t <= at + 1e-6) : undefined;
                 let K = kOne !== undefined && kOne >= lo - 1e-6 ? kOne : undefined;
                 let failed = one === null;
                 let looked = 0;
-                // A packet of the stream inside [T - 20 s, T + 3 s], from any of the three probes.
-                let near = !!one && one.some((r) => r.t >= lo - 1e-6 && r.t <= at + 3 + 1e-6);
+                // A packet of the stream inside the look-back and look-ahead span, from any of the three probes.
+                let near = !!one && one.some((r) => r.t >= lo - 1e-6 && r.t <= at + TEST_SEEK_LOOKAHEAD_S + 1e-6);
                 if (!failed && K === undefined) {
                     const back = probe(`${sec6(lo)}%${sec6(at)}`);
                     failed = back === null;
@@ -2883,11 +2890,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     }
                 }
                 if (!failed && K === undefined) {
-                    const fwd = probe(`${sec6(at)}%+3`);
+                    const fwd = probe(`${sec6(at)}%+${TEST_SEEK_LOOKAHEAD_S}`);
                     failed = fwd === null;
                     if (fwd) {
                         looked++;
-                        const inSpan = fwd.filter((r) => r.t >= at - 1e-6 && r.t <= at + 3 + 1e-6);
+                        const inSpan = fwd.filter((r) => r.t >= at - 1e-6 && r.t <= at + TEST_SEEK_LOOKAHEAD_S + 1e-6);
                         near = near || inSpan.length > 0;
                         K = keys(fwd).find((t) => t >= at - 1e-6);
                     }
@@ -2911,8 +2918,18 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // A start-up-inclusive reading only ever under-states the speed, so it may pass a candidate but never drop one: it is used only where it passes the
         // candidate at once (lbPasses: on its own, or pooled with the windows read so far), and never enters a pool that goes on to the drop edges.
         const lowerBound = (lb, p) => ({ speed: lb, fps: null, fpsMedia: p.outTime > 0 ? p.frames / p.outTime : null });
+        // Frames but too few readings: the fastest this encoder can be is its output plus a full pipeline, over the time since its first output. Both times
+        // are ffmpeg's own (out_time / speed at the last and the first output block): our wall budget also counts the spawn, the input open and the stats
+        // period after the last block, which would under-state that bound and could drop a candidate that keeps the pace.
+        const ubVerdict = (p) => {
+            const fpsMedia = p.outTime > 0 ? p.frames / p.outTime : 0;
+            const denom = (p.lastElapsed !== null ? p.lastElapsed : 0) - (p.firstOutput !== null ? p.firstOutput : TEST_STARTUP_SLACK_S);
+            const ub = fpsMedia > 0 && denom > 0 ? (p.outTime + TEST_D_MAX / fpsMedia) / denom : 0;
+            if (cap > 0 && ub > 0 && est(ub) > cap) return { slow: true, speed: ub, fpsMedia };
+            return { noEstimate: 'no-steady' };
+        };
         // Decide one window from its run(s). Returns { speed } | { noEstimate: why } | { fail: run, stall } | { slow: true, noFrameS }.
-        const judge = (T, S, lbPasses = (lb) => est(lb) < accept * cap) => {
+        const judgeWindow = (T, S, lbPasses = (lb) => est(lb) < accept * cap) => {
             const budgetS = budgetFor();
             const r = encode(S, budgetS);
             if (r.kind === 'noexec') return { noexec: r };
@@ -2947,16 +2964,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (p.steady) return { speed: p.steady.speed, fps: p.steady.fps, fpsMedia: p.steady.fpsMedia };
             return ubVerdict(p);
         };
-        // Frames but too few readings: the fastest this encoder can be is its output plus a full pipeline, over the time since its first output. Both times
-        // are ffmpeg's own (out_time / speed at the last and the first output block): our wall budget also counts the spawn, the input open and the stats
-        // period after the last block, which would under-state that bound and could drop a candidate that keeps the pace.
-        const ubVerdict = (p) => {
-            const fpsMedia = p.outTime > 0 ? p.frames / p.outTime : 0;
-            const denom = (p.lastElapsed !== null ? p.lastElapsed : 0) - (p.firstOutput !== null ? p.firstOutput : TEST_STARTUP_SLACK_S);
-            const ub = fpsMedia > 0 && denom > 0 ? (p.outTime + TEST_D_MAX / fpsMedia) / denom : 0;
-            if (cap > 0 && ub > 0 && est(ub) > cap) return { slow: true, speed: ub, fpsMedia };
-            return { noEstimate: 'no-steady' };
-        };
         // The software decode of the window a candidate failed on: does the SOURCE decode there? Once per window per file, shared by every candidate, and
         // never for a window some candidate has already encoded (that proves it decodes). Only a clean non-zero exit convicts the source; our timeout, a
         // flood or a signal is inconclusive and leaves the fault with the encoder.
@@ -2987,6 +2994,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const speeds = [];
         const fpsList = [];
         let fpsMedia = null;
+        // The verdict of the windows read so far, pooled: h is the pooled estimate.
+        const pooled = (outcome, h) => ({ outcome, estimateH: h, windows: speeds.length, fps: fpsList.length ? poolSpeeds(fpsList) : null,
+            needFps: fpsNeeded(fpsMedia) || null });
         const unknownDuration = !(dur > 0);
         // A log-only candidate takes one window: the verdict below decides it on that one window.
         const positions = unknownDuration ? [null] : (cap === 0 ? [TEST_POSITIONS[0]] : TEST_POSITIONS);
@@ -2995,7 +3005,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             let T = positions[i] === null ? null : positions[i] * dur;
             let seek = T === null ? { S: null } : seekFor(T);
             if (seek.unknown) { T = null; seek = { S: null, unknown: true }; }
-            let w = seek.empty ? { empty: true } : judge(T, seek.S, lbPooled);
+            let w = seek.empty ? { empty: true } : judgeWindow(T, seek.S, lbPooled);
             // ffmpeg's Matroska writer (and a fragmented mp4) states the duration as the absolute END, not the span from the start (a 10 s mkv written from
             // 1.0 s probes start 1.0, duration 11.0 on 7.1.4), so on a file starting after zero a window lands past the content, or so near its end that it
             // ends early (a segment part at 42.0-60.0 s seeked to 16.1 s of its 18 s). The span reading goes first, since MKVToolNix and a plain mp4 state
@@ -3015,7 +3025,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const s2 = T2 === null ? { S: null } : seekFor(T2);
                     T = s2.unknown ? null : T2;
                     seek = s2.unknown ? { S: null, unknown: true } : s2;
-                    w = seek.empty ? { empty: true } : judge(T, seek.S, lbPooled);
+                    w = seek.empty ? { empty: true } : judgeWindow(T, seek.S, lbPooled);
                     if (!w.empty) break;
                 }
             }
@@ -3029,8 +3039,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // The last candidate standing gets one retry from the start of the file before it fails on one mid-file window: a Dolby Vision RPU that
                 // refers back to an earlier one, say, cannot be decoded after a seek, while the full encode starts at frame 0. The failed window rides along
                 // (firstFail), so the log still says what a seek into this file does.
-                const w0 = judge(null, null);
-                // A retry the system killed still counts: the failure is worded as before, plus that kill and the requeue hint (O3).
+                const w0 = judgeWindow(null, null);
+                // A retry the system killed still counts: the failure is worded as before, plus that kill and the requeue hint.
                 if (w0.fail && w0.fail.kind === 'killed') return { ...f, busy: true, retryKilled: true };
                 if (w0.fail) return { ...f, retryFailed: true };
                 if (w0.noexec || w0.slow) return f;
@@ -3060,21 +3070,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (w.noEstimate && speeds.length) {
                 if (i < positions.length - 1) continue;
                 const hp = est(poolSpeeds(speeds));
-                return { outcome: cap > 0 && hp > cap ? 'slow' : 'pass', estimateH: hp, windows: speeds.length,
-                    fps: fpsList.length ? poolSpeeds(fpsList) : null, needFps: cap > 0 && fpsMedia > 0 ? (fpsMedia * dur) / (cap * 3600) : null };
+                return pooled(cap > 0 && hp > cap ? 'slow' : 'pass', hp);
             }
             if (w.noEstimate) return { outcome: 'pass', estimateH: null, why: w.noEstimate, noFrameS: w.noFrameS || null };
             if (w.slow) {
                 return { outcome: 'slow', estimateH: w.speed ? est(w.speed) : null, windows: 1, fps: null, noFrameS: w.noFrameS || null,
-                    needFps: reqFps > 0 ? reqFps : (w.fpsMedia > 0 && cap > 0 ? (w.fpsMedia * dur) / (cap * 3600) : null) };
+                    needFps: reqFps || fpsNeeded(w.fpsMedia) || null };
             }
             o.memo.encoded.add(T === null ? 'start' : T);
             speeds.push(w.speed);
             if (w.fps > 0) fpsList.push(w.fps);
             if (w.fpsMedia > 0) fpsMedia = w.fpsMedia;
             const h = est(poolSpeeds(speeds));
-            const done = (outcome) => ({ outcome, estimateH: h, windows: speeds.length, fps: fpsList.length ? poolSpeeds(fpsList) : null,
-                needFps: cap > 0 && fpsMedia > 0 ? (fpsMedia * dur) / (cap * 3600) : null });
+            const done = (outcome) => pooled(outcome, h);
             if (cap === 0 || h < accept * cap) return done('pass');
             // A candidate tested only for the log has one window, read straight against the cap - its line never calls a run over the limit ok.
             if (o.logOnly) return done(h > cap ? 'slow' : 'pass');
@@ -4019,10 +4027,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // The free-text NUMERIC inputs (the four quality_* tiers, guard_shrink_bitrate, guard_shrink_savings and guard_encode_hours) are the only user-typed
     // values this plugin echoes back, so they go through logSafe like every free-text echo (see its header): failFile's message becomes the file's stored
-    // error, and loadDefaultValues only trims.
+    // error, and loadDefaultValues only trims. Each takes a plain decimal only - an optional '+', leading zeros and a bare fraction ('+25', '025', '25.0',
+    // '.5') - because Number() also reads hex, binary, octal and exponent spellings, so a typo such as 0x17 or 2e1 would encode at a plausible value.
+    const PLAIN_DECIMAL_RE = /^\+?(\d+\.?\d*|\.\d+)$/;
     const parseNumber = (name, max, phrase) => {
         const v = inputs[name];
-        const n = Number(String(v).trim());
+        const text = String(v).trim();
+        const n = PLAIN_DECIMAL_RE.test(text) ? Number(text) : NaN;
         if (!Number.isFinite(n) || n < 0 || n > max) failFile(`[${name}=${logSafe(v)}] must be ${phrase}, check your settings`);
         return n;
     };
@@ -4090,7 +4101,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!primary) {
             return skip('☑No encodable video stream found (cover-art / still images only)\n');
         }
-        const pTag = streamTag(primary.index);   // every per-stream line below concerns the primary video stream
+        const pTag = streamTag(primary.index);   // the primary video's [s N], for every line about it below (cover-art and muxer lines tag their own streams)
 
         // ====== SOURCE CLASSIFICATION ======
         // Source properties (both probes).
@@ -4469,14 +4480,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const [rn, rd] = String(primary.r_frame_rate || '').split('/').map(Number);
             return ['h264', 'mpeg1video', 'mpeg2video', 'vc1'].includes(srcCodecName) && Math.abs(1 - (an * rd) / (ad * rn)) > 0.1;
         };
-        // The two verdict REPORTS - "I looked and there was no combing", "I could not read one at all". They claim no work, so unlike the ☐ repair lines they
-        // are safe to emit on a file nothing else happens to; the setting costs a decode, so what it found is information the user paid for. Reads the MEMO,
-        // never idet(), so asking for the line can never itself provoke the decode: where a guard settled the file without the verdict there is nothing to
-        // report, because nothing was paid for. Emitted at the two points where the decision is final - inside emitTranscode, and past the transcode branch.
         // How idet's counts are shown wherever they are reported: a whole percent, or '?' when nothing was sampled, so the two log sites cannot
         // disagree about the rounding or about what an empty sample looks like.
         const idetPct = (n, v) => (v.total ? `${Math.round((n / v.total) * 100)}%` : '?');
         const idetUnreadTail = (v) => (v.why ? ` (the probe did not finish: ${v.why})` : '');   // the reason no verdict was read, for both lines that say so
+        // The two verdict REPORTS - "I looked and there was no combing", "I could not read one at all". They claim no work, so unlike the ☐ repair lines they
+        // are safe to emit on a file nothing else happens to; the setting costs a decode, so what it found is information the user paid for. Reads the MEMO,
+        // never idet(), so asking for the line can never itself provoke the decode: where a guard settled the file without the verdict there is nothing to
+        // report, because nothing was paid for. Emitted where the decision is final - inside emitTranscode, at the awk_video fence skip, and in noTranscode.
         const deintVerdictLine = () => {
             if (!idetMemo || ['disabled', 'interlaced', 'telecine'].includes(idetMemo.kind)) return '';
             const combedPct = idetPct(idetMemo.combed, idetMemo);
@@ -4511,6 +4522,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const outHeight = willDownscale ? capHeight : dispHeight - (dispHeight % 2);
         const qualityForHeight = (h) => ({ sd: qualitySd, p720: quality720, p1080: quality1080, p4k: quality4k }[heightTier(h)]);
         const qNorm = qualityForHeight(outHeight);
+        const qualityInput = { sd: 'quality_sd', p720: 'quality_720p', p1080: 'quality_1080p', p4k: 'quality_4k' }[heightTier(outHeight)];   // qNorm's input
 
         // tonemap_sdr flattens ALL HDR -> SDR (a real re-encode). effHdrMode is never tonemap_sdr for a guard-protected DV file. The tonemap_* filters
         // self-tag bt709 (verified), so no explicit colour flags; where it runs: see resolveTonemapBackend.
@@ -4714,7 +4726,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // has its captions - would drop them on every encoder. guard_captions treats such a file as untagged, and says so where its probe finds captions.
         const ccAlreadyGone = ccTokens.includes(CC_TOKENS.removed);
         // `none` is not read here: it is sub_worker's memo that no CEA-608 text was found, and a CEA-708 service reads exactly so (the handoff section).
-        const dropCaptions = ccExported;
         // Only `true` is information. Tdarr's optional caption scan reads false both for a file that genuinely has none and for one its bundled CCExtractor
         // could not parse (measured: every mp4, and MPEG-2 inside Matroska), so a false still has to be probed. Memoized to at most one probe per file - that
         // cost is the whole reason the check is skipped wherever the answer could not change the outcome.
@@ -4806,6 +4817,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // a test-encode line names, and the predicted output stream's width (an odd one less the column the crop takes, as outHeight).
         const outWidth = willDownscale && dispHeight > 0 ? Math.max(2, Math.round(dispWidth * outHeight / dispHeight / 2) * 2) : dispWidth - (dispWidth % 2);
 
+        // Neither the node's budget nor the NVDEC answer depends on the candidate, so each is read once per file, by the first check that needs it: the
+        // budget is a sysctl spawn on macOS and a set of cgroup and mountinfo reads on Linux. A read that throws leaves its memo unset, so the next
+        // candidate's check reads it again.
+        let memBudget;
+        const nodeBudget = () => (memBudget === undefined ? (memBudget = memNodeBudget(otherArguments)) : memBudget);
+        // Whether an nvenc encode of this file decodes on NVDEC, by the same call buildVideoArgs makes (nvencDecodeArgs); false for any other family, the only
+        // one memoryEstimate reads it for. A tonemap run is costed as the software decode its GPU island runs (the backend is resolved after this check); for
+        // hevc10, the HDR codec with an NVDEC figure, that is the larger.
+        let nvdecMemo;
+        const nvdecSourceFor = (family) => family === 'nvenc'
+            && (nvdecMemo === undefined ? (nvdecMemo = !tonemap && nvencDecodeArgs(file, srcCodecName) !== '') : nvdecMemo);
         // Say what an encode will cost the node BEFORE ffmpeg is ever spawned: a refusal where it provably cannot fit, a warning where it will fit only by
         // swapping. See the ENCODE MEMORY MODEL block for the coefficients, and for why the refusal reads a single-frame-thread FLOOR rather than the expected
         // figure. It decides nothing itself: resolveEncodeEncoder drops a refused candidate and tries the next, and emits the warnings of the one it uses, so
@@ -4813,14 +4835,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // `displaced` is the hardware encoder guard_captions moved this encode off, for the trade-off lines.
         const memoryCheckInner = (sel, displaced, sliceOn) => {
             const none = { refuse: null, lines: [] };
-            const budget = memNodeBudget(otherArguments);
+            const budget = nodeBudget();
             if (!budget || budget.scope === 'unknown') return none;
-            // Whether an nvenc encode of this file decodes on NVDEC, by the same call buildVideoArgs makes (nvencDecodeArgs). A tonemap run is costed as
-            // the software decode its GPU island runs (the backend is resolved after this check); for hevc10, the HDR codec with an NVDEC figure, that is
-            // the larger.
-            const nvdecSource = !tonemap && nvencDecodeArgs(file, srcCodecName) !== '';
             const common = { family: sel.family, encoderName: sel.encoderName, srcCodec: srcCodecName, srcIs10, srcW: srcWidth, srcH: srcHeight,
-                dispH: dispHeight, outH: outHeight, want10: want10Bit, speedName: speed, cores: budget.cores, sliceOn, nvdecSource };
+                dispH: dispHeight, outH: outHeight, want10: want10Bit, speedName: speed, cores: budget.cores, sliceOn,
+                nvdecSource: nvdecSourceFor(sel.family) };
             const expectOf = (over) => memoryEstimate({ ...common, ...over, tonemapOn: tonemap, deintOn: !!resolveDeintFilter() });
             const floorMb = memoryEstimate({ ...common, floor: true });
             const expectMb = expectOf({});
@@ -4840,10 +4859,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (sel.family === 'cpu' && (refuse || tight)) {
                 if (displaced) { hwAlt = displaced; forcedBy = 'guard_captions=enabled'; }
                 else if (preserveDv) {
-                    const alt = selectEncoder({ targetCodec: targetCodecName, encoderOpt, otherArguments, forceCpu: false });
-                    if (alt.family && alt.family !== 'cpu') { hwAlt = alt; forcedBy = 'guard_dv=enabled'; }   // its notes are discarded - it never ran
+                    const alt = firstHardwareEncoder({ targetCodec: targetCodecName, encoderOpt, otherArguments });
+                    if (alt.family && alt.family !== 'cpu') { hwAlt = alt; forcedBy = 'guard_dv=enabled'; }   // a re-pick: it never ran
                 }
             }
+            const altOver = hwAlt && { family: hwAlt.family, encoderName: hwAlt.encoderName, nvdecSource: nvdecSourceFor(hwAlt.family) };
             const label = `${outHeight}p ${want10Bit ? '10-bit' : '8-bit'} ${sel.encoderName}`;
             const out = { refuse: null, floor: memGbFromMb(floorMb), allows: memGbFromBytes(limit + budget.swapBytes), lines: [] };
             if (refuse) {
@@ -4860,7 +4880,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (m !== null) trades.push({ text: `method_bitdepth=8 (~${memGbFromMb(m)})`, mb: m });
                 }
                 if (hwAlt) {
-                    const m = altFloor({ family: hwAlt.family, encoderName: hwAlt.encoderName });
+                    const m = altFloor(altOver);
                     if (m !== null) {
                         trades.push({ text: `${forcedBy.split('=')[0]}=disabled to allow ${hwAlt.encoderName}`
                             + ` (~${memGbFromMb(m)}, at a real bitrate-efficiency cost)`, mb: m });
@@ -4891,7 +4911,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     + ` on this node - it should still`
                     + ` finish, but by swapping, which is far slower than giving the node more memory\n`);
             if (hwAlt) {
-                const m = expectOf({ family: hwAlt.family, encoderName: hwAlt.encoderName });
+                const m = expectOf(altOver);
                 if (m !== null) out.lines.push(`☒${pTag}[${forcedBy}] that forces the CPU encoder - about ${memGbFromMb(expectMb)}`
                     + ` against ${memGbFromMb(m)} for`
                     + ` ${hwAlt.encoderName}, which this node could otherwise have used\n`);
@@ -4931,9 +4951,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
 
         // The caption-removal line, ahead of the encoder notes.
-        const ccDropLine = () => (dropCaptions ? `☐${pTag} Dropping the embedded closed captions - sub_worker exported them to a subtitle, and keeping both`
+        const ccDropLine = () => (ccExported ? `☐${pTag} Dropping the embedded closed captions - sub_worker exported them to a subtitle, and keeping both`
             + ' would show them twice\n' : '');
 
+        // The two agreements corroboratedFps accepts: avg_frame_rate equal to r_frame_rate up to FPS_CORROBORATE_MAX, or an mp4's own frame count within
+        // NB_FRAMES_TOLERANCE of what that rate predicts. Both are conservative choices, not measurements; the cap keeps a high declared rate (a screen
+        // capture's 100/1, below) from counting on its own.
+        const FPS_CORROBORATE_MAX = 60;
+        const NB_FRAMES_TOLERANCE = 0.05;
         // The source frame rate where two readings agree, times what the interlace repair does to it; 0 otherwise. It bounds only how long a CPU test
         // encode may show no output before it is too slow for guard_encode_hours - the estimate itself is read from media time, because a declared rate can
         // be far off (a screen capture declaring 100/1 measured 12.2 fps, which would make every slow encoder look hopeless). It counts frames, so it reads
@@ -4943,8 +4968,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (!(avg > 0)) return 0;
             const dur = Number(file.ffProbeData.format?.duration) || 0;
             const nb = Number(primary.nb_frames);
-            const agree = (String(primary.avg_frame_rate) === String(primary.r_frame_rate) && avg <= 60)
-                || (isMp4Family(dstContainer) && nb > 0 && dur > 0 && Math.abs(nb - dur * avg) <= 0.05 * dur * avg);
+            const agree = (String(primary.avg_frame_rate) === String(primary.r_frame_rate) && avg <= FPS_CORROBORATE_MAX)
+                || (isMp4Family(dstContainer) && nb > 0 && dur > 0 && Math.abs(nb - dur * avg) <= NB_FRAMES_TOLERANCE * dur * avg);
             if (!agree) return 0;
             const [times, over] = deintRateScale();
             return avg * (times / over);
@@ -4957,8 +4982,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // when it is forced or no hardware candidate passed, and never under node_strict on a GPU worker. Returns { sel, enc, tonemapBackend, tmWhy,
         // captionForced, captionLines, notes, memLines }, or fails the file.
         const resolveEncodeEncoder = () => {
-            const plan = encoderPlan({ targetCodec: targetCodecName, encoderOpt, otherArguments, forceCpu: preserveDv,
-                forceCpuWhy: 'for Dolby Vision - hardware encoders drop the RPU' });
+            const plan = encoderPlan({ targetCodec: targetCodecName, encoderOpt, otherArguments, forceCpu: preserveDv });
             const { notes } = plan;
             const canTest = !injectedCap || !!injectedCap.testEncode;
             const encTag = `[method_encoder=${encoderOpt}]`;
@@ -4992,7 +5016,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return tmMemo.get(base);
             };
             const captionLines = [];
-            let captionGate = guardCaptionsOn && !dropCaptions ? 'open' : 'off';   // open -> not probed yet; survive -> skip every dropper
+            let captionGate = guardCaptionsOn && !ccExported ? 'open' : 'off';   // open -> not probed yet; survive -> skip every dropper
             let ccContradicted = false;   // awk_cc says `removed`, and the probe found the captions this encode now keeps
             let ccVia = '';
             let displaced = null;   // the dropper guard_captions skipped first
@@ -5008,7 +5032,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const flush = () => { response.infoLog += captionLines.join('') + ccDropLine() + notes.join('') + aheadNotes.join(''); };
             const slowDrops = [];
             const fmtFps = (f) => (f >= 10 ? String(Math.round(f)) : f.toFixed(1));
-            const fmtH = (h) => (h < 1 ? `about ${Math.max(1, Math.round(h * 60))} min` : `about ${h.toFixed(1)} h`);
+            const fmtH = (h) => (h * 60 < 1 ? 'under 1 min' : h < 1 ? `about ${Math.round(h * 60)} min` : `about ${h.toFixed(1)} h`);
             // What an estimate can be off by, given how many windows it pooled. A libx265 window's error is where in the film it sits (one window read
             // 0.64-1.43x the true time on the M1), which pooling averages away: five read within ~15%. Hardware's is the load, which every window shares: a
             // loaded J4125 under-stated the time by up to 36% on one window (so ~55% over) and 22% pooled (~30% over).
@@ -5054,9 +5078,36 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     + `${t.needFps ? ` (it needs ${fmtFps(t.needFps)} fps)` : ''}${tail}\n`;
             };
 
+            const dropsCaptions = (c) => ['drop', 'error', 'unreliable'].includes(a53ClassOf(targetCodecName, c.family));
+            // guard_captions, at the first candidate that would drop the captions: probe once, and if they are there skip every dropper from here on - the
+            // later candidates that keep them are still tried, ending at the CPU. AV1 has no caption-keeping CPU encoder, so it warns and continues. Returns
+            // true when the captions displace c.
+            const settleCaptions = (c) => {
+                const cc = detectCaptions();
+                if (cc.unknown) {
+                    captionGate = 'off';
+                    captionLines.push(`☒${pTag}[guard_captions=enabled] Could not check for closed captions on this node (no ffprobe`
+                        + ` beside ffmpeg) - continuing without the protection\n`);
+                } else if (cc.present && targetCodecName === 'av1') {
+                    captionGate = 'off';
+                    captionLines.push(`☒${pTag}[codec=${codec}][guard_captions=enabled] Closed captions found by ${cc.via}, and no AV1`
+                        + ` encoder left on this node can carry them - they will be lost; extract them with sub_worker's embedded_cc first to keep them\n`);
+                } else if (cc.present) {
+                    captionGate = 'survive';
+                    ccVia = cc.via;
+                    displaced = c;
+                    if (ccAlreadyGone) {
+                        ccContradicted = true;
+                        captionLines.push(`☒${pTag}[guard_captions=enabled] ${CC_TAG} says sub_worker removed the closed captions, but the video still carries`
+                            + ' them - keeping them\n');
+                    }
+                    return true;
+                } else captionGate = 'off';
+                return false;
+            };
             // One candidate. Returns { ok, enc, tm, tmWhy, mem, untested } or { drop: 'memory'|'captions'|'test'|'slow', ... }; pushes its own lines.
             // isLast() is asked only once the candidate is failing, since it may pull the next candidate (see the loop).
-            const judge = (c, { logOnly, isLast }) => {
+            const judgeCandidate = (c, { logOnly, isLast }) => {
                 const isCpu = c.family === 'cpu';
                 if (!isCpu) reachedHw++;
                 const sliceDecode = isCpu && MEM_SLICE_CODECS.includes(srcCodecName);
@@ -5071,7 +5122,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const tm0 = tonemap ? tonemapBackendFor(c.family) : null;
                 const build = (tonemapBackend) => buildVideoArgs({ family: c.family, encoderName: c.encoderName, device: c.device, targetCodec: targetCodecName,
                     qNorm, speed, want10Bit, willDownscale, outHeight, dstContainer, file, srcCodec: srcCodecName, tonemap, tonemapBackend, tonemapSetparams,
-                    preserveDv, preserveDvNoBase, deintFilter: resolveDeintFilter(), dropCaptions, sliceDecode,
+                    preserveDv, preserveDvNoBase, deintFilter: resolveDeintFilter(), dropCaptions: ccExported, sliceDecode,
                     oddSize: srcWidth % 2 === 1 || srcHeight % 2 === 1 });
                 let enc = build(tm0);
                 if (!canTest) return { ok: true, enc, tm: tm0, tmWhy: '', mem };
@@ -5105,33 +5156,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 return { drop: 'test' };
             };
 
-            const dropsCaptions = (c) => ['drop', 'error', 'unreliable'].includes(a53ClassOf(targetCodecName, c.family));
-            // guard_captions, at the first candidate that would drop the captions: probe once, and if they are there skip every dropper from here on (O1:
-            // the later candidates that keep them are still tried, ending at the CPU). AV1 has no caption-keeping CPU encoder, so it warns and continues.
-            // Returns true when the captions displace c.
-            const settleCaptions = (c) => {
-                const cc = detectCaptions();
-                if (cc.unknown) {
-                    captionGate = 'off';
-                    captionLines.push(`☒${pTag}[guard_captions=enabled] Could not check for closed captions on this node (no ffprobe`
-                        + ` beside ffmpeg) - continuing without the protection\n`);
-                } else if (cc.present && targetCodecName === 'av1') {
-                    captionGate = 'off';
-                    captionLines.push(`☒${pTag}[codec=${codec}][guard_captions=enabled] Closed captions found by ${cc.via}, and no AV1`
-                        + ` encoder left on this node can carry them - they will be lost; extract them with sub_worker's embedded_cc first to keep them\n`);
-                } else if (cc.present) {
-                    captionGate = 'survive';
-                    ccVia = cc.via;
-                    displaced = c;
-                    if (ccAlreadyGone) {
-                        ccContradicted = true;
-                        captionLines.push(`☒${pTag}[guard_captions=enabled] ${CC_TAG} says sub_worker removed the closed captions, but the video still carries`
-                            + ' them - keeping them\n');
-                    }
-                    return true;
-                } else captionGate = 'off';
-                return false;
-            };
             const hw = plan.hardware();
             // The next candidate to judge. Once captions must survive, a dropper is passed over unjudged, so it is no "next encoder" either.
             const pull = () => {
@@ -5144,7 +5168,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Otherwise the next candidate is pulled to see - which runs its confirm encode, so this is asked only of a failing candidate, and a pinned node
             // never confirms a render node it will not use.
             // A dropper pulled while the captions are still unprobed settles them first - the one probe judging it would run if this candidate fails - so a
-            // caption keeper ahead of every dropper is still last standing when the captions turn out to be there (O1, R19).
+            // caption keeper ahead of every dropper is still last standing when the captions turn out to be there.
             const isLast = () => {
                 if (plan.cpuReachable) return false;
                 if (!ahead) {
@@ -5161,7 +5185,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 if (next.done) break;
                 const c = next.value;
                 const logOnly = !!chosen;
-                const r = judge(c, { logOnly, isLast });
+                const r = judgeCandidate(c, { logOnly, isLast });
                 notes.push(...aheadNotes.splice(0));
                 if (logOnly) continue;
                 if (r.ok) chosen = { c, ...r };
@@ -5169,19 +5193,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             if (!chosen && plan.cpuReachable) {
                 const c = { family: 'cpu', encoderName: plan.cpuName, device: null, label: plan.cpuName };
-                const r = judge(c, { logOnly: false, isLast: () => true });
+                const r = judgeCandidate(c, { logOnly: false, isLast: () => true });
                 if (r.ok) chosen = { c, ...r };
                 else last = { c, ...r };
             }
+            // Under true auto, the hardware candidates whose one-frame confirm failed: no other line names them there (pushFallbackNote speaks only for a
+            // pinned family), so a user asking why one went unused would otherwise read that it was never tried.
+            const initFailed = () => (plan.trueAuto && plan.unconfirmed.length ? `${plan.unconfirmed.join(', ')} did not initialise` : '');
             const cpuReason = () => (preserveDv ? 'forced for Dolby Vision - hardware encoders drop the RPU'
                 : displaced ? 'forced to keep the embedded closed captions on the CPU encoder'
-                    : reachedHw > 0 ? 'no hardware encoder on this node passed its checks for this file' : plan.cpuWhy);
-            // The suffix counts only verdicts read, and is left off an encoder that is itself used untested (its test line says so).
+                    : [reachedHw > 0 ? 'no hardware encoder on this node passed its checks for this file' : plan.cpuWhy, initFailed()]
+                        .filter(Boolean).join('; '));
+            // The test count counts only verdicts read, and is left off an encoder that is itself used untested (its test line says so).
             const encoderLine = (c, untested) => {
                 if (c.family !== 'cpu') {
-                    const suffix = !plan.trueAuto || untested || tested === 0 ? ''
-                        : tested === 1 ? ' - the only encoder tested' : ` - the first of ${tested} tested that passed, in this node's order`;
-                    return `☐${encTag} Encoder: ${c.label} (${plan.nodeLabel})${suffix}\n`;
+                    const tests = !plan.trueAuto || untested || tested === 0 ? ''
+                        : tested === 1 ? 'the only encoder tested' : `the first of ${tested} tested that passed, in this node's order`;
+                    const suffix = [tests, initFailed()].filter(Boolean).join('; ');
+                    return `☐${encTag} Encoder: ${c.label} (${plan.nodeLabel})${suffix ? ` - ${suffix}` : ''}\n`;
                 }
                 const why = cpuReason();
                 return why ? `☐${encTag} Encoder: ${c.label} (${why})\n` : '';
@@ -5206,8 +5235,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // names the smallest raise that lets ANY refused candidate run: the last is usually the CPU, the most expensive, so its own figure would
             // over-state the fix (a pinned nvenc needing 2 GB, then libx264 needing 3). Once guard_captions has found captions it skips every dropper, so a
             // raise only a dropper needed is left out.
-            const memFix = !displaced ? memDrops
-                : memDrops.filter(({ c }) => !['drop', 'error', 'unreliable'].includes(a53ClassOf(targetCodecName, c.family)));
+            const memFix = !displaced ? memDrops : memDrops.filter(({ c }) => !dropsCaptions(c));
             const lastMem = memFix[memFix.length - 1];
             const easiest = lastMem && memFix.reduce((a, b) => (b.mem.suggestGb < a.mem.suggestGb ? b : a), lastMem);
             const memRefusal = !lastMem ? '' : easiest === lastMem ? lastMem.mem.refuse
@@ -5233,12 +5261,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 failFile(memRefusal);
             }
             // An encoder this node has that a guard or the worker type kept out of the run, so a user can tell a node that cannot encode the file from one
-            // that was not allowed to. guard_dv's and the CPU worker's are re-picks with no test encode (selectEncoder: the -encoders/nvidia-smi query and
-            // any one-frame confirm), bought only for a file that is already failing, and named only where one exists - never a setting that changes nothing.
+            // that was not allowed to. guard_dv's and the CPU worker's are re-picks with no test encode (firstHardwareEncoder: the -encoders/nvidia-smi
+            // query and any one-frame confirm), bought only for a failing file, and named only where one exists - never a setting that changes nothing.
             const untried = () => {
                 if (displaced) return `; guard_captions=disabled would allow ${displaced.label}, which was not tested`;
                 const altOn = (oa) => {
-                    const alt = selectEncoder({ targetCodec: targetCodecName, encoderOpt, otherArguments: oa, forceCpu: false });
+                    const alt = firstHardwareEncoder({ targetCodec: targetCodecName, encoderOpt, otherArguments: oa });
                     return alt.family && alt.family !== 'cpu' ? alt.encoderName : '';
                 };
                 if (preserveDv) {
@@ -5264,7 +5292,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return null;
         };
         // Build the transcode preset (encoder resolved per node), ending on the predicted output summary.
-        const emitTranscode = (encodeTag, { videoSig, videoSigCore, priorSig }) => {
+        const emitTranscode = (encodeTag, { videoSig, videoSigCore, priorSig, cpuCrf }) => {
             if (preserveDv)
                 response.infoLog += `☐${pTag}[guard_dv=enabled] ${dvLabel} - keeping the DV RPU through the re-encode (libx265)\n`;
             // libx265 carries only the RPU through a re-encode; any other dynamic layer on the same file is lost, and every other path that loses one says so.
@@ -5296,10 +5324,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // The encoded primary is output v:0 (cover art and uncopyable streams are mapped out, as -filter:v:0 relies on) - see staleStatsArgs.
             const clearStats = isMatroskaFamily(dstContainer);
             if (clearStats) out += staleStatsArgs('v:0', primary);
-            // Retire the request this encode just served. ccExported implies dropCaptions, and buildVideoArgs suppresses A53 on every encoder that can emit it
-            // under dropCaptions ('keep', 'unreliable' and 'optin' in A53_CAP) while the rest drop it unaided, so the output provably carries no captions -
-            // `removed` is the accurate successor to `strip`, and it is the token that stops any later pass paying a caption probe. The read's fingerprint goes
-            // with the request: it describes a video this encode replaces. Only fires when a request was actually present.
+            // Retire the request this encode just served. ccExported is the dropCaptions buildVideoArgs was given, and it suppresses A53 on every encoder that
+            // can emit it under dropCaptions ('keep', 'unreliable' and 'optin' in A53_CAP) while the rest drop it unaided, so the output provably carries no
+            // captions - `removed` is the accurate successor to `strip`, and it is the token that stops any later pass paying a caption probe. The read's
+            // fingerprint goes with the request: it describes a video this encode replaces. Only fires when a request was actually present.
             if (ccExported) {
                 const retired = [...new Set(ccTokens.filter((t) => !t.startsWith(CC_FP_PREFIX)).map((t) => (t === CC_TOKENS.strip ? CC_TOKENS.removed : t)))];
                 globalWrites[CC_TAG] = escMeta(retired.join(','));
@@ -5338,7 +5366,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.infoLog += `☐${pTag}${savingsTag} This encode is not judged on size - the original video stream cannot be put back`
                     + ` (${unrestorable})\n`;
             }
-            response.infoLog += `☐${pTag}${encodeTag} Transcoding video @ ${sel.encoderName} q${Math.round(qNorm)}\n`;
+            // A quality past the target's scale encodes at the scale's end (nativeQuality's clamp), so the line then names what is encoded beside the setting.
+            const clamped = cpuCrf !== Math.round(qNorm) + (targetCodecName === 'av1' ? AV1_Q_OFFSET : 0) ? ` (crf ${cpuCrf} for ${targetCodecName})` : '';
+            response.infoLog += `☐${pTag}${encodeTag} Transcoding video @ ${sel.encoderName} q${Math.round(qNorm)}${clamped}\n`;
             response.infoLog += expectedResultsLine(predictTranscodedVideoToken(), encoded);
             return response;
         };
@@ -5376,24 +5406,27 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // never unfences - the library file IS the kept encode, and re-encoding it would be generational.
         const vqNow = parseVq(getTagCI(fmtTags, VQ_TAG));
         // The box and speed tokens, spelled from downscale's and method_speed's options (h0 is downscale=disabled), so the codec token h264 never reads as a
-        // box. One missing here fails safe, as a re-encode.
+        // box. One missing here fails safe, as a re-encode. q<N> is the quality token.
         const FENCE_BOX_RE = /^h(?:0|2160|1440|1080|720)$/;
         const FENCE_SPEED_RE = /^s(?:slow|medium|fast)$/;
+        const FENCE_Q_RE = /^q\d+$/;
         // A fence or verdict written at OTHER settings still holds when every token that differs is a no-op on this file: an encode for it would only add a
         // lossy generation to a kept file, or repeat the encode a reverted one rejected. h<N> passes where neither box scales the file, a stored one judged by
-        // the meaning it was written with (heightOnly: a fence older than 3.28.0 capped the height alone - fenceBoxed below). sdr, strip and deint
-        // pass when their setting is now off, or when it is on and the file gives it nothing to do: no HDR to tonemap, no dynamic layer to strip, idet reading
-        // the file progressive (a decode, spent only when deint differs). Dropping one is a no-op over a reverted original too, because sizeExemptWhy never
-        // judges - so never reverts - an encode that tonemapped, stripped or deinterlaced: a reject's core can carry sdr, strip or deint only where it did
-        // nothing. The speed shapes only a new encode, so it passes except over a reverted original, where a new speed is a new try. dv passes on a file that
-        // reads no Dolby Vision, which has no RPU to keep: a preserved encode written into .mov reads so (the fence comment above), and holding dv there would
-        // encode it a second time before the shrink verdict. action, codec, q and bit depth never pass: a new action asks for different work, and the other
-        // three re-read as what produced them (the fence comment above). Nothing is rewritten, so the stored fence keeps its own tokens and every later pass
-        // decides the same way. A per-file fence (tokens only for what applied) would not converge: a repaired, tonemapped or downscaled output re-reads as
-        // progressive, SDR or inside the box.
+        // the meaning it was written with (heightOnly: a fence older than 3.28.0 capped the height alone - fenceBoxed below). sdr, strip and deint pass when
+        // their setting is now off, or when it is on and the file gives it nothing to do: no HDR to tonemap, no dynamic layer to strip, idet reading the file
+        // progressive (a decode, spent only when deint differs). Dropping one is a no-op over a reverted original too, because sizeExemptWhy never judges - so
+        // never reverts - an encode that tonemapped, stripped or deinterlaced: a reject's core can carry sdr, strip or deint only where it did nothing. The
+        // speed shapes only a new encode, so it passes except over a reverted original, where a new speed is a new try. dv passes on a file that reads no Dolby
+        // Vision, which has no RPU to keep: a preserved encode written into .mov reads so (the fence comment above), and holding dv there would encode it a
+        // second time before the shrink verdict. q passes where both values encode at the same crf: a quality past the encoder's scale is clamped
+        // (nativeQuality), so on an HEVC target 52 and 55 both encode at crf 51, and every family shares the CPU's clamp. action, codec and bit depth never
+        // pass: a new action asks for different work, and the other two re-read as what produced them (the fence comment above). Nothing is rewritten, so the
+        // stored fence keeps its own tokens and every later pass decides the same way. A per-file fence (tokens only for what applied) would not converge: a
+        // repaired, tonemapped or downscaled output re-reads as progressive, SDR or inside the box.
         const tokenIsNoop = (t, heightOnly = false) => (FENCE_BOX_RE.test(t)
             ? !(heightOnly ? Number(t.slice(1)) > 0 && Number(t.slice(1)) < dispHeight : scalesInto(Number(t.slice(1))))
             : FENCE_SPEED_RE.test(t) ? vqNow?.state !== 'reject'
+                : FENCE_Q_RE.test(t) ? nativeQuality(targetCodecName, 'cpu', Number(t.slice(1))) === nativeQuality(targetCodecName, 'cpu', qNorm)
                 : t === 'sdr' ? !tonemap
                     : t === 'strip' ? !(effHdrMode === 'strip_dynamic' && isDynamicHdr)
                         : t === 'dv' ? !dvSignal
@@ -5431,13 +5464,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const cpuCrf = Number(/-crf (\d+)/.exec(nativeQuality(targetCodecName, 'cpu', qNorm))[1]);
         // The crf an x264/x265 encode recorded in its settings line (mediaInfo Encoded_Library_Settings), when its library is the target codec's CPU encoder,
         // else null: libsvtav1 and every hardware encoder write no line (VideoToolbox measured), so their output is unknown, never contradicting. Measured: our
-        // libx265 encode at q24 reads crf=24.0, an outside crf-30 x265 re-encode crf=30.0, an x264 one crf=20.0.
+        // libx265 encode at q24 reads crf=24.0, an outside crf-30 x265 re-encode crf=30.0, an x264 one crf=20.0. atCrf: whether that crf is this run's, within
+        // 0.5 since x26x records crf to one decimal and cpuCrf is whole - the one test both the fence's free check and the implicit fence read, so a file can
+        // never count as both matched and contradicted.
         const X26X_LIBRARY = { hevc: 'x265', h264: 'x264' };
         const x26xSettings = () => {
             const lib = tableGet(X26X_LIBRARY, targetCodecName, '');
             const m = /(?:^|[ /])crf=([\d.]+)/.exec(String(mi?.Encoded_Library_Settings || ''));
             const name = String(mi?.Encoded_Library_Name || String(mi?.Encoded_Library || '').trim().split(/\s+/)[0]).trim().toLowerCase();
-            return lib && m && name === lib && Number.isFinite(Number(m[1])) ? { lib, crf: Number(m[1]) } : null;
+            if (!(lib && m && name === lib && Number.isFinite(Number(m[1])))) return null;
+            const crf = Number(m[1]);
+            return { lib, crf, atCrf: Math.abs(crf - cpuCrf) <= 0.5 };
         };
         // A keep or reject stamped at this setting vouches for the stream its pass left behind (SHRINK SAVINGS MEASUREMENT has the fingerprint), and
         // outranks the free checks: a restore puts the original under the fence on purpose, and its codec or height can contradict the fence's tokens.
@@ -5453,8 +5490,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return dig !== null && dig !== fp[2] ? 'its content' : '';
         };
         // The free checks, for a fence no stamp vouches for (normalize and exempt encodes, guard_shrink_savings=0, every fence older than awk_vq): each reads
-        // a fact the fence claims and the stream contradicts, with zero spawns, and an absent fact is unknown, never stale. Not checked: interlace (a decode
-        // verdict, not metadata) and sdr (no real tonemap encode has yet been read as SDR on both probes). Returns [claimed, found] or null.
+        // a fact the fence claims and the stream contradicts, with zero spawns, and an absent fact is unknown, never stale. Returns [claimed, found] or null.
+        // Not checked: interlace (a decode verdict, not metadata) and sdr. Tonemap output does read SDR on both production probes where it was measured (CPU
+        // tonemapx and the videotoolbox island, 2026-11-13; build-facts.md), but the cuda and opencl islands are not measured, and a tonemap fence rests on
+        // these checks alone (tonemap_sdr is size-exempt, so no awk_vq stamp vouches for it): one island whose output read HDR on either probe would re-encode
+        // every tonemapped file on every pass. An sdr check would add only an HDR stream of the same codec and box, with no x26x settings line, swapped in.
         // The height check reads only a fence 3.28.0 or later wrote: h<N> has meant "fits a 16:9 box N tall, in display orientation" only since then (before,
         // the cap was on the height alone, and before 3.12.0 on the coded height), and older fences were left to stand on purpose - a 2592x1080 scope film
         // fenced h1080 by 3.27.0 fails today's box without anything having touched it. A fence with no version that parses is not height-checked.
@@ -5465,7 +5505,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (srcCodecName && srcCodecName !== targetCodecName) return [targetCodecName, found];
             if (willDownscale && fenceBoxed) return [`${targetCodecName} within ${maxH}p`, found];   // no longer inside the fence's own h<N> box
             const x = x26xSettings();
-            return x && Math.abs(x.crf - cpuCrf) > 0.5 ? [`${targetCodecName} at crf ${cpuCrf}`, `an ${x.lib} encode at crf ${x.crf}`] : null;
+            return x && !x.atCrf ? [`${targetCodecName} at crf ${cpuCrf}`, `an ${x.lib} encode at crf ${x.crf}`] : null;
         };
         // '' when the fence holds, else what contradicts it, worded for the stale line (and for the implicit fence's line, where that still skips).
         const fenceStaleWhy = () => {
@@ -5535,9 +5575,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // ffmpeg rebases each input on its OWN format start, so once the job has dropped the original's earliest-starting stream (audio_clean first,
                 // a timed poster track) this file was re-zeroed and the original was not, and the restored video lands off this file's other streams by
                 // exactly that rebasing. Read on a stream both files share (sharedAudio), it leaves the encode's own start delay out, and anything past
-                // ANCHOR_TOLERANCE_S is refused: an mkv whose dropped audio led the kept streams by 70 ms restored 70 ms out of step at 24 fps, inside the
-                // two frames the video's own delta used to allow. With no stream to share, the video's delta stands in, within one frame (an encode's
-                // own reorder delay measured ~21 ms at 24 fps).
+                // ANCHOR_TOLERANCE_S is refused: an mkv whose dropped audio led the kept streams by 70 ms restored 70 ms out of step at 24 fps - inside two
+                // frames, so a tolerance of two frames of the video's own delta would have passed it. With no stream to share, the video's delta stands in,
+                // within one frame (an encode's own reorder delay measured ~21 ms at 24 fps).
                 const startOf = (v) => (v === undefined || v === null || String(v).trim() === '' ? NaN : Number(v));
                 const sinceStart = (s, format) => startOf(s.start_time) - startOf(format?.start_time);
                 const offMs = (d) => `the video would land ${Math.round(Math.abs(d) * 1000)} ms off the other streams' timing`;
@@ -5739,8 +5779,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     // The inputs behind the tokens coreHolds let pass, named as the user set them, so the line says what changed and was not acted on.
                     const diff = coreDiff(priorCore);
                     const passed = [...new Set([...diff.mine, ...diff.theirs].map((t) => (FENCE_BOX_RE.test(t) ? `downscale=${downscaleOpt}`
-                        : FENCE_SPEED_RE.test(t) ? `method_speed=${speed}` : t === 'deint' ? `deinterlace=${deinterlaceOpt}`
-                            : t === 'dv' ? `guard_dv=${guardDv}` : `hdr_mode=${hdrMode}`)))];
+                        : FENCE_SPEED_RE.test(t) ? `method_speed=${speed}` : FENCE_Q_RE.test(t) ? `${qualityInput}=${qNorm}`
+                            : t === 'deint' ? `deinterlace=${deinterlaceOpt}` : t === 'dv' ? `guard_dv=${guardDv}` : `hdr_mode=${hdrMode}`)))];
                     const shown = logSafe(priorSig.replace(/\+j[0-9a-f]{8}$/, ''), 120);
                     const only = vqNow?.state === 'reject' ? 'repeat the encode that was put back' : 'add a lossy generation';
                     // A box token both cores share, which today's box would scale into, on a fence older than that box: an encode would downscale too.
@@ -5788,7 +5828,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (reasonTags.length === 0 && (priorSig === '' || staleWhy) && action === 'shrink' && !ccExported
                 && !(effHdrMode === 'strip_dynamic' && isDynamicHdr)) {
                 const x = x26xSettings();
-                if (x && Math.abs(x.crf - cpuCrf) <= 0.5) {
+                if (x && x.atCrf) {
                     return skip(staleWhy ? `☑${pTag}[action=shrink] ${staleWhy}, but it is already an ${x.lib} encode at crf ${x.crf} - the quality this run`
                         + ' would use; left untouched\n'
                         : `☑${pTag}[action=shrink] Already an ${x.lib} encode at crf ${x.crf} - the quality this run would use - with no ${VIDEO_FENCE_TAG}`
@@ -5799,7 +5839,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const ccStale = ccStripStaleWhy();
             if (ccStale) return emitCcClear(ccStale);
             response.infoLog += staleLine;
-            return emitTranscode(`[${reasonTags.join('][')}]`, { videoSig, videoSigCore, priorSig });
+            return emitTranscode(`[${reasonTags.join('][')}]`, { videoSig, videoSigCore, priorSig, cpuCrf });
         }
 
         return noTranscode();
