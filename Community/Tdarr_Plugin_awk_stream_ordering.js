@@ -26,7 +26,7 @@ const details = () => ({
         review rather than failed. The same goes for a broadcast .ts or .mpg capture remuxed to mkv or mp4 in the same job with its video copied, not
         re-encoded: a capture whose timestamps jump or reset states a longer length than it holds. A later job on that file is checked in full again. This
         check is always on and has no setting.\n`,
-    Version: '4.999.65',
+    Version: '4.999.66',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -266,7 +266,7 @@ const langKey = (x) => {
 // -=-=-= langMatchKey  [audio_clean, clean_and_remux, stream_ordering, sub_worker] =-=-=-
 // The key a user's language LIST is matched on, list side and track side alike: langKey plus the one macrolanguage fold ICU does not make. ICU keeps
 // Norwegian Bokmål (nb, nob) and Nynorsk (nn, nno) apart from Norwegian (no, nor) - measured on Tdarr's bundled Node 24.22.1, ICU 78.3 - so a list naming
-// Norwegian missed both, and nb-NO is the common streaming tag. List matching only: a tag WRITTEN, and one track compared with another (dedup, the
+// Norwegian would miss both, and nb-NO is the common streaming tag. List matching only: a tag WRITTEN, and one track compared with another (dedup, the
 // one-downmix-per-language sets, sidecar identity, language counts), stay on langKey and keep the two written standards apart - folded into langKey,
 // tag_language rewrote nob and nno to nor on an mkv -> mp4 conversion (measured).
 const langMatchKey = (x) => { const k = langKey(x); return (k === 'nb' || k === 'nn') ? 'no' : k; };
@@ -1247,8 +1247,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         tak:         { score: 100, lossless: true },
         tta:         { score: 100, lossless: true },
         wmalossless: { score: 100, lossless: true },
-        als:         { score: 100, lossless: true },   // MPEG-4 ALS (ffprobe 'als'; the mp4-wrapped 'mp4als' folds here via codecAlias) — lossless, so guard_lossless must protect it
-        dsd:         { score: 100, lossless: true },   // DSD / SACD 1-bit (ffprobe dsd_lsbf/dsd_msbf[_planar], folded via codecAlias) — lossless, so guard_lossless must protect it
+        als:         { score: 100, lossless: true },   // MPEG-4 ALS (ffprobe 'als'; the mp4-wrapped 'mp4als' folds here via foldCodecAlias) — lossless, so guard_lossless must protect it
+        dsd:         { score: 100, lossless: true },   // DSD / SACD 1-bit (ffprobe dsd_lsbf/dsd_msbf[_planar], folded via foldCodecAlias) — lossless, so guard_lossless must protect it
         // Decode-only lossless: no ffmpeg encoder, so each can only ever arrive as a SOURCE. All four carry ffmpeg's lossless flag (the trailing S of D.AI.S
         // in `ffprobe -codecs`), and without a row here they'd fall to UNKNOWN_CODEC_SCORE (70, no lossless flag) - below aac and mp3, leaving them unguarded.
         dst:         { score: 100, lossless: true },   // DST (Direct Stream Transfer) — the COMPRESSED form of DSD carried by every SACD ISO rip; dsd above is the raw form
@@ -1349,7 +1349,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { minimum: transparent * MIN_RATIO, transparent };
     };
     // -=-=-= audioQuality  [audio_clean, stream_ordering] =-=-=-
-    // Scores a stream's quality (codec + bitrate vs transparent bitrate) to identify the "best" track. Declared after response so infoLog is available.
+    // Scores a stream's quality (codec + bitrate vs transparent bitrate) to identify the "best" track.
     const audioQuality = (stream) => {
         const codec = resolveCodecName(stream);
 
