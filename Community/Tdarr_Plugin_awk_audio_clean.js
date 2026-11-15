@@ -13,7 +13,7 @@ const details = () => ({
                   high-quality, and original-language tracks from destructive changes.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.87',
+    Version: '4.999.88',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -316,10 +316,10 @@ const details = () => ({
                 the true-peak limit), the correction is measured once more before it is applied - a second full pass, two to two and a half times as long
                 as the first. A correction that would widen the loudness range is not applied. One that lands off target is followed by a level trim onto
                 it - measured once more when the trim needs a limiter - and is not applied if it still misses the target by more than 1 LU. A correction
-                not applied leaves the track at its loudness, to be measured again on later runs.
+                not applied leaves the track at its loudness.
                 \\nOn a Matroska container (mkv, webm, mka) a track untouched by anything else this run is stamped with an awk_loudnorm tag once it is
-                corrected or found already on target (a correction left out is not stamped), and a later run trusts that tag and skips re-measuring while
-                this setting stays the same; changing the setting forces a fresh measurement.
+                corrected, found already on target or has its correction left out, and a later run trusts that tag and skips re-measuring while this
+                setting stays the same; changing the setting forces a fresh measurement.
                 The stamp records the track's codec and channel count (and, for a track left as it was, a fingerprint of its opening audio), so a track
                 another tool has since converted, downmixed or changed is measured again; another tool's same-codec, same-channel re-encode of a track
                 this plugin re-encoded is not noticed. The mp4-family muxers (mp4, m4v, m4a, mov) drop custom tags, so there loudnorm re-measures on every
@@ -4114,7 +4114,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
         // Measure, then decide the correction filter comma-chained onto preFilter, or return unchanged (changed:false) when already within
         // LOUDNORM_TOLERANCE_LU of target or when the correction's trial declines it (declined:true). `measured` gates the awk_loudnorm cache stamp: the
-        // track-cap branch and a declined correction also return changed:false WITHOUT it, and stamping either would cache a claim nothing checked.
+        // track-cap branch and a declined correction also return changed:false WITHOUT it, and stamping the first would cache a claim nothing checked;
+        // a decline is stamped only where the caller asks (recordDecline, `recorded`).
         // measured_thresh has NO uppercase alias (unlike measured_I/_LRA/_TP) - keep it exactly lowercase. Pass-1's JSON field names
         // (input_i/input_lra/input_tp/target_offset) are NOT pass-2's filter option names (measured_I/measured_LRA/measured_TP/offset) - same numbers,
         // different names per side. The per-file analysis cap exists because each pass is a synchronous full-duration spawn - a crafted file declaring many
@@ -4129,7 +4130,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // A sample rate read off either probe, as a plain integer in a real audio range - it is spliced into the filter string, so nothing else passes.
         const sampleRateOf = (v) => { const n = Number(v); return Number.isInteger(n) && n >= 8000 && n <= 768000 ? n : 0; };
         // `trial` false measures only: a track the caller will leave as it is anyway (pceUnnamed) needs the analysis for an on-target stamp, never a trial.
-        const buildLoudnormFilter = (streamIndex, srcAudioIdx, preFilter, preset, trial = true) => {
+        // `recordDecline`: the caller copy-stamps a declined track it leaves as it was (the leftovers, on Matroska), so the decline line says so.
+        const buildLoudnormFilter = (streamIndex, srcAudioIdx, preFilter, preset, trial = true, recordDecline = false) => {
             if (loudnormMeasureCount >= LOUDNORM_MAX_TRACKS) {
                 if (!loudnormCapWarned) {
                     response.infoLog += `☒[method_loudnorm=${methodLoudnorm}] More than ${LOUDNORM_MAX_TRACKS} audio tracks to normalize - measuring `
@@ -4236,9 +4238,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 t.off ? `lands at ${t.i.toFixed(2)} LUFS against the ${preset.I} LUFS target` : ''].filter(Boolean).join(' and ');
                 const after = c && checked ? `, and ${c.wider ? `widens its loudness range to ${c.lra.toFixed(1)} LU` : `at ${c.i.toFixed(2)} LUFS`} `
                     + `trimmed by ${trim > 0 ? '+' : ''}${trim.toFixed(2)} dB` : '';
+                // A verdict resting on a trim check that failed to run is not recorded: the next pass weighs it afresh, when the check may run.
+                const recorded = recordDecline && !checked?.error;
                 skipDone += `☒${streamTag(streamIndex)}[method_loudnorm=${methodLoudnorm}] Not correcting the loudness - a trial of the correction ${why}`
-                    + `${after}; its loudness is left as is\n`;
-                return { filter: preFilter, changed: false, measured: false, declined: true };
+                    + `${after}; its loudness is left as is${recorded ? `, and ${LOUDNORM_TAG} records that verdict - future runs skip re-measuring while `
+                        + `loudnorm stays "${methodLoudnorm}"` : ''}\n`;
+                return { filter: preFilter, changed: false, measured: false, declined: true, recorded };
             }
             // What is written still differs from target by the limiter's own cost (0.17-0.24 LU on synthetic edge and dense tracks, at most 0.02 on real
             // film) and encoder drift: on the film track above, native aac wrote 0.11 LU louder and 0.5 LU wider than its trial at 256k (0.45 / 1.4 at
@@ -4261,7 +4266,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // The stamp grammar; the version is forensic and is never compared:
         //   <preset>[-<version>]                     legacy: trusted as before
         //   <preset>-<version>-e.<codec>.<ch>        an encode this plugin made: codec family and the channels the encoder WRITES
-        //   <preset>-<version>-c.<codec>.<ch>.<dig>  a track measured and left as it was; dig = audioDigest, or x when none was read
+        //   <preset>-<version>-c.<codec>.<ch>.<dig>  a track measured and left as it was (on target, or its correction declined); dig = audioDigest, or
+        //                                            x when none was read
         const LOUDNORM_STAMP_RE = /^([a-z_]+)(?:-[0-9][0-9.]*(?:-e\.([a-z0-9_]+)\.(\d+)|-c\.([a-z0-9_]+)\.(\d+)\.([0-9a-f]{8}|x))?)?$/;
         // The current preset's stamp on a stream as { kind: 'e' | 'c' | '' (legacy), codec, channels, dig }, or null: no stamp, another preset's, or a value
         // the grammar does not read - each measured like an unstamped track, with no line.
@@ -4359,7 +4365,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // is the ONLY change, so it would remux the file on every single pass forever (a non-idempotent loop). So the stamp is emitted only when it
         // will actually survive; on other containers a within-tolerance track is left a true no-op (re-measured on the next stack cycle, but never
         // remuxed). A track that genuinely needs correction re-encodes once regardless of container, then measures within tolerance next run (the trial and
-        // the trim, buildLoudnormFilter). A correction the trial declined is declined again each pass, at the cost of two analyses and no encode.
+        // the trim, buildLoudnormFilter). There a correction the trial declined is declined again each pass, at the cost of two analyses and no encode.
         // DECLINED: a GLOBAL awk_loudnorm marker, which the mov muxer does keep. It would force -movflags use_metadata_tags on every such file for good
         // (mp4TagPlan), turning its native iTunes tags into mdta keys that taggers and Apple players cannot read and costing its covr cover art - a worse
         // trade than one analysis per eligible track per stack cycle.
@@ -4389,13 +4395,15 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // tag at all.
         const loudnormRideStamp = (idx, measured, src, record) => (measured ? loudnormEncodeStamp(idx, record)
             : (loudnormTagPersists && readLoudnormTag(src || {}) ? ` -metadata:s:a:${idx} "${LOUDNORM_TAG}="` : ''));
-        // The within-tolerance no-op: no re-encode is needed, but the measurement is still worth caching, as a copy stamp recording the track's codec family,
-        // channel count and opening-audio digest. The caller keeps the loudnormTagPersists/measured gate that decides whether this runs at all - the
-        // reasoning for it is at the main-path call site.
+        // The copy stamp, for a track measured and left as it was: recording its codec family, channel count and opening-audio digest. The caller keeps the
+        // loudnormTagPersists gate that decides whether it is written at all - the reasoning for it is at the main-path call site.
+        const copyStampArg = (stream, idx) => loudnormStampArg(idx,
+            `c.${stampCodec(codecFamilyOf(stream))}.${stream.awkChannels}.${audioDigest(stream.index) || 'x'}`);
+        // The within-tolerance no-op: no re-encode is needed, but the measurement is still worth caching.
         const stampWithinTolerance = (stream, idx) => {
             workDone += `☐${streamTag(stream.index)}[method_loudnorm=${methodLoudnorm}] Stamping ${LOUDNORM_TAG}=${methodLoudnorm} (already within tolerance)`
                 + ` - future runs skip re-measuring while loudnorm stays "${methodLoudnorm}"\n`;
-            extraArguments += loudnormStampArg(idx, `c.${stampCodec(codecFamilyOf(stream))}.${stream.awkChannels}.${audioDigest(stream.index) || 'x'}`);
+            extraArguments += copyStampArg(stream, idx);
         };
         // ====== END LOUDNORM ======
 
@@ -5161,16 +5169,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 const srcBitrate = Number(ffstream.bit_rate || 0);
                 const preFilter = loudnormRelabel || ac3RematrixFilter(targetCodec, ffstream);
                 const unnamed = pceUnnamed(ffstream) && !opusInPlace(ffstream, targetCodec);
-                const { filter, changed, measured } = buildLoudnormFilter(ffstream.index, srcAudioIdx, preFilter, preset, !unnamed);
+                const { filter, changed, measured, recorded } = buildLoudnormFilter(ffstream.index, srcAudioIdx, preFilter, preset, !unnamed,
+                    loudnormTagPersists);
                 if (!changed) {
                     // Already within tolerance. On a tag-persisting container, stamp it (a metadata-only remux) so a FUTURE run can skip re-measuring while
                     // the preset stays the same. On a container that would drop the tag, do NOTHING (a true no-op) - stamping there would just remux every
                     // reprocess forever without ever caching (see loudnormTagPersists above). A track the analysis cap left unmeasured also lands here with
                     // changed:false, and must NOT be stamped: the cache would claim a loudness nothing ever read, and every future run would trust it and
-                    // skip the track for good. It is simply left at source loudness, as the cap warning says, for a later pass to pick up. So is a correction
-                    // its trial declined (buildLoudnormFilter), which the next pass weighs afresh.
+                    // skip the track for good. It is simply left at source loudness, as the cap warning says, for a later pass to pick up. A correction its
+                    // trial declined is stamped the same way, its line saying so (`recorded`): reaching the same verdict again costs an analysis and a trial
+                    // on every pass (about 35 min for a 2 h 5.1 track on an M1), and the stamp's preset, codec, channels and digest re-open it when any of
+                    // them changes, as they do an on-target track's.
                     if (loudnormTagPersists && measured) {
                         stampWithinTolerance(ffstream, outputAudioIdx);
+                        convert = true;
+                    } else if (recorded) {
+                        extraArguments += copyStampArg(ffstream, outputAudioIdx);
                         convert = true;
                     }
                     continue;

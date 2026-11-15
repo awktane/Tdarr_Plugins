@@ -43,7 +43,7 @@ const details = () => ({
                 stream_ordering (last). If the file has embedded closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that
                 destroys them. Extract with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since
                 the sidecars would land beside the source, where the output never sees them.`,
-    Version: '3.999.104',
+    Version: '3.999.105',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -4839,14 +4839,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const ccWithdrawn = !!ccFpOf(ccTokens) && !ccHas(CC_TOKENS.decoded) && !ccHas(CC_TOKENS.decoded2);
         // The A53 caption probe as every caption site spells it - the __awkCap test-injection contract plus the ffprobe-path derivation, defined once so a
         // hardening of either cannot land at one site and not the other - memoised, since the plan, the judge and both strip blocks may each ask. An injected
-        // 'unknown' stands for a probe that could not run.
+        // 'unknown' stands for a probe that could not run, and 'probe' lets it run, the harness answering its spawn.
         let ccProbeMemo;
         const ccProbeVerdict = () => {
             if (ccProbeMemo !== undefined) return ccProbeMemo;
             const inj = otherArguments && otherArguments.__awkCap;
             ccProbeMemo = inj && inj.captions === 'unknown' ? 'unknown'
                 : probeA53Captions(file.file, deriveFfprobePath(ffmpegPathOf(otherArguments)), ccVideo ? ccVideo.index : undefined,
-                    inj ? inj.captions === true : undefined);
+                    inj && inj.captions !== 'probe' ? inj.captions === true : undefined);
             return ccProbeMemo;
         };
         // The digest of the video this pass reads (the video fingerprint section), read at most once: the fp token a field-1 read writes, and what a stale

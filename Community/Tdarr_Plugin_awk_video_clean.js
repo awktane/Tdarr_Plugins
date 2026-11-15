@@ -13,7 +13,7 @@ const details = () => ({
                      and normalized across encoders. Adds -tag:v hvc1 for HEVC-in-mp4. An awk_video tag fences re-encode loops.\n\n
                      -Designed to run after clean_and_remux and before/around audio_clean; leave stream ordering to the ordering plugin. If the file carries
                      embedded closed captions, run sub_worker BEFORE this plugin - re-encoding is the one thing that destroys them (see guard_captions).\n\n`,
-    Version: '3.999.88',
+    Version: '3.999.89',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -3495,8 +3495,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (a53cap === 'error') parts.push('-a53cc 0');
         else if ((a53cap === 'keep' || a53cap === 'unreliable') && dropCaptions) parts.push(family === 'vaapi' ? '-sei -a53_cc' : '-a53cc 0');
         else if (a53cap === 'optin') parts.push(dropCaptions ? '-a53cc 0' : '-a53cc 1');
-        // hvc1 = Apple/QuickTime HEVC-in-mp4 (primary only); a no-base DV (e.g. profile 5) needs dvh1 or the DV box is dropped. The encode path tags hevc
-        // ONLY - see QT_VIDEO_TAG for why it and the copy path differ
+        // hvc1 = Apple/QuickTime HEVC-in-mp4 (primary only); a no-base DV (e.g. profile 5) needs dvh1 or the DV box is dropped, so such an encode never
+        // reaches a .mov (skipped where preserveDvNoBase is set). The encode path tags hevc ONLY - see QT_VIDEO_TAG for why it and the copy path differ
         if (targetCodec === 'hevc' && isQtVideoContainer(dstContainer)) parts.push(preserveDvNoBase ? '-tag:v:0 dvh1' : '-tag:v:0 hvc1');
         // Slice-threaded DECODING, which costs 55-163 MB less at 4K than the default frame threading (see MEM_SLICE_CODECS for the per-codec figures). It rides
         // the INPUT side and must never move across the <io> marker: before -i the flag configures the DECODER, and decoding is normative, so it cannot alter
@@ -4591,6 +4591,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Interlace repair forces a real encode exactly as a downscale or a tonemap does.
         const realTranscode = () => cheapTrigger || deinterlaceNeeded();
         const canEncodeTarget = ENCODABLE_CODECS.includes(targetCodecName);
+        // No cross-compatible base (compat id 0 / no surviving HDR transfer, e.g. profile 5): the mp4 output needs the dvh1 tag - hvc1 drops the DV box
+        // entirely; a stream WITH a base keeps hvc1.
+        const preserveDvNoBase = preserveDv && (dvNoBaseLayer || (!!dovi && dovi.compatId === 0));
 
         // Skips that a pending real transcode would otherwise turn destructive. guard_lossless leads the block: it is the one that says
         // "don't touch this file at all", so it should answer for a lossless source whatever else also applies. It keys on realTranscode,
@@ -4607,6 +4610,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (preserveDv && srcIsIptC2 && realTranscode()) {
             return skip(`☒${pTag}[guard_dv=enabled] ${dvLabel} uses the IPT-C2 colour matrix that libx265 cannot re-encode`
                 + ` - left untouched; set guard_dv=disabled and hdr_mode=tonemap_sdr to flatten it to SDR\n`);
+        }
+        // A .mov cannot hold such an encode: its muxer refuses dvh1 (exit 183 at header write, after the test encodes, on every requeue), and under hvc1
+        // the picture is written with no Dolby Vision box and reads mis-coloured (both measured on jellyfin-ffmpeg 7.1.4 with a real Profile 5 sample).
+        if (preserveDvNoBase && dstContainer === 'mov' && realTranscode()) {
+            return skip(`☒${pTag}[guard_dv=enabled] ${dvLabel} has no compatible base layer, so its re-encode needs a Dolby Vision box a .mov cannot hold`
+                + ` - left untouched; run clean_and_remux first to move the file to mp4 or mkv\n`);
         }
         if (effHdrMode === 'strip_dynamic' && dvNoBaseLayer && realTranscode()) {
             return skip(`☒${pTag}[hdr_mode=strip_dynamic] ${dvLabel} has no HDR10 base layer - a re-encode would leave a mis-coloured`
@@ -4693,9 +4702,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // What scale=-2 will emit beside outHeight, in the same DISPLAY orientation (ffmpeg autorotates ahead of the filter chain): the operating point
         // a test-encode line names, and the predicted output stream's width (an odd one less the column the crop takes, as outHeight).
         const outWidth = willDownscale && dispHeight > 0 ? Math.max(2, Math.round(dispWidth * outHeight / dispHeight / 2) * 2) : dispWidth - (dispWidth % 2);
-        // No cross-compatible base (compat id 0 / no surviving HDR transfer, e.g. profile 5): the mp4 output needs the dvh1 tag - hvc1 drops the DV box
-        // entirely; a stream WITH a base keeps hvc1.
-        const preserveDvNoBase = preserveDv && (dvNoBaseLayer || (!!dovi && dovi.compatId === 0));
 
         // Say what an encode will cost the node BEFORE ffmpeg is ever spawned: a refusal where it provably cannot fit, a warning where it will fit only by
         // swapping. See the ENCODE MEMORY MODEL block for the coefficients, and for why the refusal reads a single-frame-thread FLOOR rather than the expected
