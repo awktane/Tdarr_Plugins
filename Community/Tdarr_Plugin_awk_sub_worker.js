@@ -44,7 +44,7 @@ const details = () => ({
                 stream_ordering (last). If the file has embedded closed captions, run this BEFORE video_clean - re-encoding the video is the one thing that
                 can destroy them. Extract with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since
                 the sidecars would land beside the source, where the output never sees them.`,
-    Version: '3.999.117',
+    Version: '3.999.118',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -3490,7 +3490,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // confined to the library folder: '..', an absolute path and a UNC path are all rejected outright, and the joined result is then resolved and
     // re-checked to stay under the directory, so anything that slips the syntactic tests fails on the outcome instead.
     const readSubtitleList = (text) => {
-        const ok = []; const bad = [];
+        const ok = []; const bad = []; const seen = new Set();
         for (const line of String(text || '').replace(/^\uFEFF/, '').split(/\r?\n/)) {
             const entry = line.trimEnd();
             if (!entry || /^#(\s|$)/.test(entry)) continue;
@@ -3503,8 +3503,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (full !== path.resolve(workLibDir()) && !full.startsWith(path.resolve(workLibDir()) + path.sep)) {
                 bad.push([entry, 'resolves outside the video\'s folder']); continue;
             }
-            // In the one spelling every name test compares (the caption stop, isCcSidecar, the marker): './x' and 'subs//x' as 'x' and 'subs/x'.
-            ok.push(path.posix.normalize(norm));
+            // In the one spelling every name test compares (the caption stop, isCcSidecar, the marker): './x' and 'subs//x' as 'x' and 'subs/x'. A name
+            // listed twice is one file, fetched and imported once (a Set: a list may hold a million bytes of names).
+            const name = path.posix.normalize(norm);
+            if (!seen.has(name)) { seen.add(name); ok.push(name); }
         }
         return { ok, bad };
     };
@@ -3739,13 +3741,44 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return { any, mp4 };
     };
 
+    // An srt timing line's two stamps as srt_probe's sscanf reads them: h:m:s, then ',' or '.' and the milliseconds, each number optionally signed and led
+    // by spaces.
+    const SRT_PROBE_NUM = '[ \\t\\v\\f]*[+-]?\\d+';
+    const SRT_PROBE_STAMP = `${SRT_PROBE_NUM}:${SRT_PROBE_NUM}:${SRT_PROBE_NUM}[,.]${SRT_PROBE_NUM}`;
+    const SRT_PROBE_STAMPS = new RegExp(`^${SRT_PROBE_STAMP}[ \\t\\v\\f]*-->${SRT_PROBE_STAMP}`);
+    // The format ffmpeg reads a loose sidecar as, by its CONTENT whatever its name, as its probes decide (libavformat 7.1): 'vtt' for WEBVTT after an
+    // optional UTF-8 BOM, then a space, tab, line break, NUL or the end (webvtt_probe, on the raw bytes); on the text as ffmpegText decodes it, after any
+    // line breaks, 'ass' for '[Script Info]' (ass_probe), and 'srt' for a line strtol reads as a number not below 0 and then one that starts with a digit
+    // (after one optional '-') and holds ' --> ' between two stamps (srt_probe, reading a line at a time of at most 63 bytes, ff_subtitles_read_line); else
+    // the extension's. Measured on 7.1.4, every shape ffmpeg opens agreeing but those another reader claims: an srt named .ass, .ssa or .vtt is read as
+    // subrip, an ASS named .srt or .vtt as ass, a WebVTT named .ass as webvtt; an ASS led by [V4+ Styles], or a bare '[Script Info', went to the lrc reader,
+    // whose probe and the other text formats' this leaves out.
+    const sidecarKind = (buf, ext) => {
+        if (/^(?:\xef\xbb\xbf)?WEBVTT(?:[ \t\r\n\0]|$)/.test(buf.toString('latin1', 0, 10))) return 'vtt';
+        const b = Buffer.from(ffmpegText(buf, 'srt').text, 'utf8');
+        let at = 0;
+        while (b[at] === 0x0d || b[at] === 0x0a) at += 1;
+        if (b.toString('latin1', at, at + 13) === '[Script Info]') return 'ass';
+        const line = () => {
+            const start = at;
+            while (at - start < 63 && at < b.length && b[at] !== 0x0d && b[at] !== 0x0a) at += 1;
+            const out = b.toString('latin1', start, at);
+            if (at - start < 63 && at < b.length) at += 1;
+            while (b[at] === 0x0d) at += 1;
+            if (b[at] === 0x0a) at += 1;
+            return out;
+        };
+        const num = /^[ \t\v\f]*([+-]?)0*(\d+)/.exec(line());
+        const stamps = line();
+        return num && !(num[1] === '-' && num[2] !== '0') && /^-?\d/.test(stamps) && stamps.includes(' --> ') && SRT_PROBE_STAMPS.test(stamps) ? 'srt' : ext;
+    };
     // One read per sidecar answers every content question - hash identity (contentKey), its text apart from its timing (shiftedTrack), cue emptiness
-    // (groupHasNoCues), what importing it would drop (importLosses), its text-cue count (deletionLoss), whether ffmpeg reads it as WebVTT, and why ffmpeg
-    // cannot read it whole, '' when it can (ffmpegText, unreadableText) - every text verdict taken from the text as ffmpeg decodes it, so a UTF-16 sidecar is
-    // judged by its words - mirroring embeddedTextHashes, whose one ffmpeg pass answers the first two for the embedded side. Memoised per rel. null =
-    // unreadable or over the cap; each caller keeps its own failure direction (contentKey -> a unique never-merged key, groupHasNoCues -> false = not provably
-    // empty). The size is checked FIRST: a name that merely parses as a sidecar says nothing about what is behind it, and a runaway OCR dump or a
-    // mis-renamed file left as <video>.eng.srt would otherwise be pulled into the worker whole (the cap's why is at embeddedTextHashes).
+    // (groupHasNoCues), what importing it would drop (importLosses), its text-cue count (deletionLoss), the format ffmpeg reads it as (sidecarKind), and
+    // why ffmpeg cannot read it whole, '' when it can (ffmpegText, unreadableText) - every text verdict taken from the text as ffmpeg decodes it, so a
+    // UTF-16 sidecar is judged by its words - mirroring embeddedTextHashes, whose one ffmpeg pass answers the first two for the embedded side. Memoised
+    // per rel. null = unreadable or over the cap; each caller keeps its own failure direction (contentKey -> a unique never-merged key, groupHasNoCues ->
+    // false = not provably empty). The size is checked FIRST: a name that merely parses as a sidecar says nothing about what is behind it, and a runaway
+    // OCR dump or a mis-renamed file left as <video>.eng.srt would otherwise be pulled into the worker whole (the cap's why is at embeddedTextHashes).
     const sidecarContentMemo = new Map();
     const sidecarContent = (f) => {
         if (sidecarContentMemo.has(f.rel)) return sidecarContentMemo.get(f.rel);
@@ -3755,30 +3788,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const st = fs.statSync(p);
             if (st.isFile() && st.size <= SIDECAR_HASH_MAX) {
                 const buf = fs.readFileSync(p);
-                const text = buf.toString('utf8');
+                // Every verdict below reads the sidecar as the format ffmpeg reads it as, whatever its name: a WebVTT saved as .srt is read, counted and
+                // round-tripped as one, an srt saved as .ass as an srt.
+                const kind = f.bundle ? f.ext : sidecarKind(buf, f.ext);
                 // A bundle is a container, not text: neither count means anything for it, and nothing reads them.
-                const read = f.bundle ? { text: '', readable: true, whole: true } : ffmpegText(buf, f.ext);
+                const read = f.bundle ? { text: '', readable: true, whole: true } : ffmpegText(buf, kind);
                 const legacy = 'is not UTF-8 text (a legacy character set such as Windows-1252?)';
-                // Only a .vtt reaches this with a UTF-16 mark (ffmpegText decodes any other's).
+                // Only a WebVTT reaches this with a UTF-16 mark (ffmpegText decodes any other's).
                 const utf16 = (buf[0] === 0xff && buf[1] === 0xfe) || (buf[0] === 0xfe && buf[1] === 0xff);
                 let unreadable = read.readable ? '' : (utf16 ? 'is UTF-16 text (ffmpeg reads a WebVTT file as UTF-8 alone)' : legacy);
                 if (!unreadable && unreadableText(read.text)) {
                     unreadable = 'holds a NUL character (UTF-16 saved without its byte-order mark, or a damaged file?)';
                 }
-                // ffmpeg picks its WebVTT reader by CONTENT, whatever the name: WEBVTT after an optional UTF-8 BOM, then a space, tab, line break or the end
-                // of the file (webvtt_probe, 7.1, on the raw bytes) - so a WebVTT saved as .srt is read, counted and round-tripped as one.
-                const vtt = !f.bundle && /^WEBVTT(?:[ \t\r\n]|$)/.test(text.slice(text.charCodeAt(0) === 0xfeff ? 1 : 0, 8));
-                const cues = textCueCount(read.text, f.ext);
+                const cues = textCueCount(read.text, kind);
                 out = {
-                    sha1: subTextHash(buf, path.extname(f.rel)),
-                    timing: f.bundle ? null : timingApart(buf, path.extname(f.rel)),
-                    // ffmpeg reads by content, so an .ass holding srt timing lines has cues. A WebVTT with no cue that shows text holds nothing: its empty
-                    // cues go in as a track with nothing in it.
-                    noCues: (hasNoCues(read.text, f.ext) && hasNoCues(read.text, 'srt')) || (vtt && !cues),
-                    loss: importLosses(read.text, vtt ? 'vtt' : f.ext),
+                    sha1: subTextHash(buf, kind),
+                    timing: f.bundle ? null : timingApart(buf, kind),
+                    // A WebVTT with no cue that shows text holds nothing: its empty cues go in as a track with nothing in it.
+                    noCues: hasNoCues(read.text, kind) || (kind === 'vtt' && !cues),
+                    loss: importLosses(read.text, kind),
                     cues,
-                    vtt,
-                    emptyVttCues: vtt ? emptyVttCueCount(read.text) : 0,
+                    kind,
+                    emptyVttCues: kind === 'vtt' ? emptyVttCueCount(read.text) : 0,
                     unreadable,
                     // What an mp4-family import refuses: the whole file must be UTF-8 there (the import's refusal has the why).
                     unreadableMp4: unreadable || (read.whole ? '' : legacy),
@@ -3788,9 +3819,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         sidecarContentMemo.set(f.rel, out);
         return out;
     };
-    // The codec ffmpeg imports a loose sidecar as: WebVTT by its content, else the one its extension names. parseSidecar reports every ext it admits as one
-    // of TEXT_EXTS (see IMPORT_ONLY_EXTS), so the webvtt fallback only guards a future caller that reads a sidecar without going through it.
-    const sidecarCodec = (f) => (sidecarContent(f)?.vtt || !TEXT_EXTS.includes(f.ext) ? 'webvtt' : EXT_TO_CODEC[f.ext]);
+    // The codec ffmpeg imports a loose sidecar as: the one its content reads as (sidecarKind), or its extension's when it cannot be read. parseSidecar
+    // reports every ext it admits as one of TEXT_EXTS (see IMPORT_ONLY_EXTS), so the webvtt fallback only guards a future caller that reads a sidecar
+    // without going through it.
+    const sidecarCodec = (f) => EXT_TO_CODEC[sidecarContent(f)?.kind || f.ext] || 'webvtt';
 
     // Source indices whose text decoded to no cues at all, filled in by embeddedTextHashes on the one pass it already makes. Only meaningful
     // once that call has returned, and every reader calls it first, so an unrun probe can never be mistaken for "no empty tracks".
@@ -3974,8 +4006,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return roundTripMemo.get(key);
     };
     // Whether ffmpeg ran the round trip's mux - the import's own mux of this sidecar, alone - and refused it, so importing it would fail the whole run: a
-    // file none of ffmpeg's subtitle readers opens (measured on 7.1.4, exit 183: a 0-byte or blank srt, a 0-byte ass, an srt whose cues have no numbers). A
-    // round trip that could not be made (no temp dir, a spawn error or timeout, a bundle) refuses nothing.
+    // file none of ffmpeg's subtitle readers opens (measured on 7.1.4, exit 183: a 0-byte or blank srt, a 0-byte ass, an srt whose cues have no numbers),
+    // or into mp4 a cue that ends before it starts - alone, last, or before one that starts earlier (exit 234; one mid-file muxes, as into Matroska any
+    // does). A round trip that could not be made (no temp dir, a spawn error or timeout, a bundle) refuses nothing.
     const sidecarMuxRefused = (f, mp4) => {
         sidecarRoundTripHash(f, mp4);
         return roundTripRefused.has(`${mp4 ? 'mp4' : 'mkv'}|${f.rel}`);
@@ -4079,31 +4112,49 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // has made it permanent - said where the import finds that sidecar (cutByEarlierImport) and where a deletion would take it (deletionLoss).
     const earlierCutWords = (n) => `by an earlier sub_worker version with ${n} empty WebVTT cue${n === 1 ? '' : 's'}, after each of which ffmpeg 7.1 skips`
         + ' a few seconds of the video and audio, and any remux makes that permanent';
-    const cutRepairWords = () => "while Tdarr's ffprobe (7.1), with -count_packets, reads fewer video packets with every stream than with -select_streams v:0"
-        + ` alone, FFmpeg 8 or later still repairs it losslessly, until anything remuxes the file: ffmpeg -i FILE -map 0 -c copy -bsf:s 'noise=drop=not(size)'`
-        + ` FIXED.${dstContainer}`;
+    // The repair: beside a gap avGap measured, as a fact; on the import's line, which reads no packets, on the condition that shows the gap, with the way to
+    // end that line for `rel`, the sidecar it names - once a remux has made the cut permanent, nothing repairs it, and the sidecar alone holds the cues the
+    // cut took from the track.
+    const cutRepairWords = (rel) => {
+        const fix = `FFmpeg 8 or later repairs it losslessly: ffmpeg -i FILE -map 0 -c copy -bsf:s 'noise=drop=not(size)' FIXED.${dstContainer}`;
+        return rel === undefined ? `no remux has made it permanent yet, and ${fix}` : "if Tdarr's ffprobe (7.1), with -count_packets, still reads fewer"
+            + ` video packets with every stream than with -select_streams v:0 alone, no remux has made it permanent yet and ${fix}; delete ${logSafe(rel)}`
+            + ' once it is repaired, or delete it to accept the cut, which ends this line and loses the cues the cut took from the track';
+    };
     // Whether this file still shows that gap: Tdarr's ffprobe (7.1) reads fewer of the video's packets with every stream than with the video alone, which
-    // reads around the refused blocks. { all, alone } when the two differ; null when they agree, the file has no video, or a read cannot be made (no ffprobe,
-    // an error, the timeout) - nothing then shows a gap, and the sidecar goes as it would have: the repair needs the video alone. Two whole-file reads
-    // (measured on 7.1.4: about 550 MB/s from local disk and 190 MB/s cold over SMB, the second from the page cache when the file fits it), made once a
-    // pass and only for a WebVTT with empty cues that a Matroska file would otherwise see deleted.
+    // reads around the refused blocks. { all, alone } when the two differ; null when they agree or the file has no video; { failed: why } when a read
+    // cannot be made (no ffprobe, an error, the timeout) - nothing then shows a gap and the sidecar goes as it would have, said (gapUncheckedLine): the
+    // repair needs the video alone. Two whole-file reads (measured on 7.1.4: about 550 MB/s from local disk and 190 MB/s cold over SMB, the second from the
+    // page cache when the file fits it), made once a pass and only for a WebVTT with empty cues that a Matroska file would otherwise see deleted (gapApplies).
+    const gapApplies = (f, mp4) => !mp4 && isMatroskaFamily(dstContainer) && sidecarContent(f)?.emptyVttCues > 0;
     let avGapMemo;
     const avGap = () => {
         if (avGapMemo !== undefined) return avGapMemo;
         avGapMemo = null;
         const probeBin = deriveFfprobePath(ffmpegPathOf(otherArguments));
         const target = String(file._id || file.file || libFilePath || '');
-        const read = (args) => (probeBin && target ? spawnSync(probeBin, ['-v', 'error', ...args, '-count_packets', target],
-            { encoding: 'utf8', timeout: SUB_EXTRACT_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES, killSignal: 'SIGKILL' }) : null);
-        const ok = (r) => r && !r.error && r.status === 0;
+        if (!probeBin || !target) { avGapMemo = { failed: 'there was no ffprobe or file path to read' }; return avGapMemo; }
+        const read = (args) => spawnSync(probeBin, ['-v', 'error', ...args, '-count_packets', target],
+            { encoding: 'utf8', timeout: SUB_EXTRACT_TIMEOUT_MS, maxBuffer: SPAWN_MAX_OUTPUT_BYTES, killSignal: 'SIGKILL' });
+        const failure = (r) => (r.error ? (r.error.code === 'ETIMEDOUT' ? `a read ran past ${SUB_EXTRACT_TIMEOUT_MS / 60000} minutes`
+            : `ffprobe could not start (${r.error.code || r.error.message})`) : r.status !== 0 ? `ffprobe ${r.status === null ? `was stopped by ${r.signal}`
+            : `exited ${r.status}`}` : '');
         const every = read(['-show_entries', 'stream=index,codec_type,nb_read_packets:stream_disposition=attached_pic', '-of', 'json']);
         let v = null;
-        try { v = ok(every) && JSON.parse(every.stdout).streams.find((x) => x.codec_type === 'video' && x.disposition?.attached_pic !== 1); }
-        catch (e) { v = null; }
+        try { v = !failure(every) && JSON.parse(every.stdout).streams.find((x) => x.codec_type === 'video' && x.disposition?.attached_pic !== 1); }
+        catch (e) { avGapMemo = { failed: "ffprobe's answer could not be read" }; return avGapMemo; }
         const alone = v && read(['-select_streams', String(v.index), '-show_entries', 'stream=nb_read_packets', '-of', 'csv=p=0']);
-        const [all, one] = [Number(v?.nb_read_packets), Number(String(ok(alone) ? alone.stdout : '').replace(/[\s,]+$/, ''))];
+        const failed = failure(every) || (alone && failure(alone));
+        if (failed) { avGapMemo = { failed }; return avGapMemo; }
+        const [all, one] = [Number(v?.nb_read_packets), Number(String(alone ? alone.stdout : '').replace(/[\s,]+$/, ''))];
         if (Number.isInteger(all) && Number.isInteger(one) && all !== one) avGapMemo = { all, alone: one };
         return avGapMemo;
+    };
+    // The line a deletion adds for a sidecar whose gap check applied and could not run (avGap's failed); `named`, as deletionLoss's.
+    const gapUncheckedLine = (f, mp4, named = f) => {
+        const failed = gapApplies(f, mp4) && avGap()?.failed;
+        return failed ? `☒[remove_source=true] ${logSafe(named.rel)} went without the check for seconds of video and audio that an earlier sub_worker`
+            + ` version's import of its empty WebVTT cues can cut from this file - ${failed}\n` : '';
     };
     // `settled`: roles said by a line of their own (keptByEmbeddedLine), left out here; `named`: the sidecar whose own name the roles are read from, one
     // member of an identical-text group (the cues are the group's). A WebVTT with empty cues is checked last, and only on Matroska, for the gap an earlier
@@ -4122,9 +4173,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (own?.loss?.[mp4 ? 'mp4' : 'any']) return own.loss[mp4 ? 'mp4' : 'any'];
             if (own && kept < own.cues) return `${own.cues - kept} of its ${own.cues} cues`;
         }
-        const gap = !mp4 && isMatroskaFamily(dstContainer) && own?.emptyVttCues > 0 ? avGap() : null;
-        return gap ? `seconds of the video and audio - it was imported into this file ${earlierCutWords(own.emptyVttCues)} (${gap.all} video packets read with`
-            + ` every stream, ${gap.alone} with the video alone); ${cutRepairWords()}` : '';
+        const gap = gapApplies(f, mp4) ? avGap() : null;
+        return gap && !gap.failed ? `seconds of the video and audio - its text was imported into this file ${earlierCutWords(own.emptyVttCues)} (${gap.all}`
+            + ` video packets read with every stream, ${gap.alone} with the video alone); ${cutRepairWords()}` : '';
     };
     // `imported`: false for a role a sidecar already in the file names, which the track may never have had (a flag cleared after the extract, a
     // sidecar named by hand), so no import lost it.
@@ -4808,7 +4859,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (loss) { log += keepForLossLine(f.rel, loss, !taken); continue; }
             try {
                 fs.unlinkSync(libPathOf(f.rel)); deleted += 1;
-                log += `☑[${delReason}] Deleted sidecar (${why}): ${logSafe(f.rel)}\n${originalLostLine(f, holders)}`;
+                log += `☑[${delReason}] Deleted sidecar (${why}): ${logSafe(f.rel)}\n${originalLostLine(f, holders)}${gapUncheckedLine(f, mp4Target)}`;
             }
             catch (e) { log += `☒[${delReason}] Could not delete sidecar ${logSafe(f.rel)}: ${logPath(e && e.message ? e.message : e)}\n`; }
         }
@@ -6641,9 +6692,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return false;
         });
 
-        // Group candidates by identical text - the sha1 of their normalised cues (disabled => every file is its own group). A file whose bytes cannot be read
-        // - gone since the readdir, or too large to be a subtitle at all - gets a unique key, so it is imported on its own, never silently dropped or merged.
-        const contentKey = (f) => sidecarContent(f)?.sha1 || `unreadable:${f.rel}`;
+        // Group candidates by identical text - the sha1 of their normalised cues, in the format ffmpeg reads (sidecarKind), so a 0-byte bundle and a 0-byte
+        // .vtt are two (disabled => every file is its own group). A file whose bytes cannot be read - gone since the readdir, or too large to be a subtitle
+        // at all - gets a unique key, so it is imported on its own, never silently dropped or merged.
+        const contentKey = (f) => { const c = sidecarContent(f); return c?.sha1 ? `${c.kind}:${c.sha1}` : `unreadable:${f.rel}`; };
         const groups = []; const groupHash = new Map();
         if (!dedupeSidecars) { for (const f of candidates) groups.push([f]); }
         else {
@@ -6658,6 +6710,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // A group imports as one track (an apart group, below, as one per sidecar): union the members' disposition tokens (identical-text plain + SDH ->
         // SDH), and take the first non-"und" language. The physical file muxed is the member with the most-specific dispositions (deterministic tie-break by
         // name); its metadata is overridden by the merged values, so which identical copy we pick doesn't matter.
+        const srcOf = (g) => g.slice().sort((a, b) => b.dispTokens.length - a.dispTokens.length || (a.name < b.name ? -1 : 1))[0];
         let merged = groups.map((g) => {
             const dispTokens = [...new Set(g.flatMap((m) => m.dispTokens))];
             const extraTokens = [...new Set(g.flatMap((m) => m.extraTokens || []))];   // unioned with the roles, so a merged group keeps every member's flags
@@ -6665,17 +6718,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // The title is the first member's, in the group's order, with which the track as the next pass reads it (sidecarToStream: on an mp4-family
             // target beside the handler written with it) gives every role the members' titles give (rolesIn) - dedupeEmbeddedSubs' rule for its
             // keeper, so 'English' with 'English SDH' imports as 'English SDH'; a role a name's flag token gives is in the unioned flags. With no such
-            // title the group is apart: its sidecars go in as one track each (below), and its first title stands for it where its text is already in
-            // the file, beside firstTitle - every group's first title (see that comparison). On an mp4-family target the handler written is the title
-            // itself, so a pair whose roles need the two to differ ('English SDH' + 'English Forced') is apart, and deduplicate=enabled_checkmedia
-            // folds it on the next pass, whose fold keeps the keeper's handler beside the new title - one extra lossless remux, accepted.
+            // title the group is apart: its sidecars go in as one track each (below), and where its text is already in the file each member speaks for
+            // the track it names (splitByTrack). On an mp4-family target the handler written is the title itself, so a pair whose roles need the two to
+            // differ ('English SDH' + 'English Forced') is apart, and deduplicate=enabled_checkmedia folds it on the next pass, whose fold keeps the
+            // keeper's handler beside the new title - one extra lossless remux, accepted.
             const readsAs = (t) => rolesIn(roleFieldsLower(sidecarToStream({ ...g[0], title: t }, isMp4)));
             const roles = new Set(g.flatMap((m) => readsAs(m.title)));
             const titles = g.map((m) => m.title).filter(Boolean);
             const title = (titles.length ? titles : ['']).find((t) => { const got = readsAs(t); return [...roles].every((r) => got.includes(r)); });
-            const src = g.slice().sort((a, b) => b.dispTokens.length - a.dispTokens.length || (a.name < b.name ? -1 : 1))[0];
+            const src = srcOf(g);
             const entry = {
-                members: g, name: src.name, rel: src.rel, ext: src.ext, bundle: src.bundle, lang, title: title ?? titles[0], firstTitle: titles[0] || '',
+                members: g, name: src.name, rel: src.rel, ext: src.ext, bundle: src.bundle, lang, title: title ?? titles[0],
                 apart: title === undefined, dispTokens, extraTokens, disp: [...new Set(dispTokens.concat(extraTokens).map(dispFfOf).filter(Boolean))],
             };
             if (!entry.apart) for (const m of g) writtenAs.set(m.rel, entry);
@@ -6719,15 +6772,84 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // above reads, from the same single ffmpeg pass. The sidecar still counts as consumed: its content is demonstrably in the file, and preserving the
         // information is the test, not which container it ends up living in.
         const embeddedHashes = (dedupeSidecars && merged.some((f) => !f.bundle)) ? survivingTextHashes() : new Map();
+        // Whether track s carries member m's title, as m's name gives it or cut to fit the name (titleCutFrom).
+        const carries = (s, m) => !!s && !!nameTextOf(m.title) && (titleAgrees(s, m.title) || titleCutFrom(s, m));
+        // What the names that speak for track cur (`said`, below) ask of it under method_import_metadata=sidecar: the title, language and flags they want,
+        // and `same` when the track already has them, so no retune is due. `title`: the group's, the one a merged group's import writes.
+        const retuneFor = (cur, said, title) => {
+            // A name with no title token is no opinion on the title, as its 'und' is none on the language (below): read as an instruction it would erase
+            // the title clean_and_remux's tag_title gives the track, and the two plugins would re-title it on every cycle - different presets, so Tdarr's
+            // repeat guard never stops them. A name can set or change a title, never erase one, and a title cut to fit the name is none either
+            // (titleCutFrom). The name here is whichever speaking title the track carries, else the one the import writes (a merged group's covering
+            // title), else the first: the file named that track itself, and holding a plain 'English' track to an 'English' + 'English SDH' group's
+            // 'English SDH' would rename it.
+            const titled = said.filter((m) => nameTextOf(m.title));
+            const lead = titled.find((m) => carries(cur, m)) || titled.find((m) => m.title === title) || titled[0];
+            const wantTitle = isMp4 || !lead || (!!cur && titleCutFrom(cur, lead)) ? null : lead.title;
+            // A role the track gives through a field a sidecar cannot hold - a handler, a description, a TITLE tag beside its one name - is the one the
+            // name's token stands for (handlerOnlyDisp), so it counts as the track's: compared with its flags alone, an extract -> import round trip of a
+            // DESCRIPTION-only commentary disagreed on every pass.
+            const curDisp = new Set(activeDispositions(cur));
+            if (cur) for (const d of DISPOSITIONS) if (handlerOnlyDisp(d, cur, lead?.title || '')) curDisp.add(d.ff);
+            // `default` is muxer-managed rather than a role, so no sidecar name can carry it (see DISPOSITIONS) and a name's flags never hold it. The
+            // track's own flag joins the wanted set instead, which both cancels it out of the comparison and stops the whole-set write below from
+            // stripping it. Without that a default-flagged track never matches its sidecar: one wasted retune remux under 'sidecar', a disagreement line
+            // under 'embedded' on every pass that leaves the sidecar in place, and on mkv the flag silently gone. Same rule as dedupeEmbeddedSubs, which
+            // keeps its own keeper's default for the same reason. So is a flag the track has whose role the title it keeps gives: extract writes no token
+            // for a role a title gives (dispTokensOf), and clean_and_remux's tag_disposition makes that flag from the title, so judged by the name's tokens
+            // the two plugins took it off and put it back on every cycle (measured). A name can set a flag, never erase one its kept title gives.
+            const nameDisp = [...new Set(said.flatMap((m) => tokensOf(m).map(dispFfOf)).filter(Boolean))];
+            const wantDisp = new Set(nameDisp);
+            if (cur?.disposition?.default === 1) wantDisp.add('default');
+            for (const d of cur ? DISPOSITIONS.filter((x) => titleGives(wantTitle ?? mediaTitleFor(cur), x)) : []) {
+                d.flags.filter((fl) => cur.disposition?.[fl] === 1).forEach((fl) => wantDisp.add(fl));
+            }
+            // A name's 'und' is no opinion either: it only says the track had no language tag when extract named the sidecar. Read as an instruction it
+            // took back the language clean_and_remux's language_fill had since given the track, and the two plugins re-tagged it back and forth on every
+            // cycle - different presets, so Tdarr's repeat guard never stopped it. A name can set or change a real language, never erase one; zxx and mul
+            // stay instructions, since a user renames to those on purpose.
+            const sayLang = (said.find((m) => langKey(m.lang || 'und') !== 'und') || said[0]).lang;
+            const nameLang = langKey(sayLang || 'und') === 'und' ? '' : sayLang;
+            const wantLang = nameLang || resolveLang(cur) || 'und';
+            const same = (wantTitle === null || (!!cur && titleAgrees(cur, wantTitle))) && langAgrees(resolveLang(cur), wantLang)
+                && sameDispositions(curDisp, wantDisp);
+            return { wantTitle, nameDisp, wantDisp, nameLang, wantLang, same };
+        };
+        // The name extract gives the track at source index idx now, null where no text track is.
+        const currentName = (idx) => { const s = keptSubs.find((x) => x.index === idx); return s && isTextSub(s) ? sidecarBasename(s, false) : null; };
         // A bundle is an archive, not comparable text, so it is never matched this way; a null map means the probe could not run (see embeddedTextHashes).
-        // f.matchedBy records which identity matched (sidecarMatch), so the deletion below can keep a sidecar the import stripped.
-        const embeddedAt = (f) => {
+        // f.matchedBy records which identity matched (sidecarMatch), so the deletion below can keep a sidecar the import stripped. Of the tracks holding the
+        // text, the one members `by` name, by the first test one passes - of several, the one at a member's own name index, else the first: one that
+        // already has a member's whole name (retuneFor's same - a pick that changes nothing); one whose language and title a TITLED name gives
+        // (metaMatchesStream, the title compared on the mp4 family too, where the handler carries it - this only chooses among tracks holding the text; a
+        // name with no title says nothing of one, so it never picks an untitled twin); then any. The first holder alone gave an 'English Forced' sidecar
+        // its byte-identical 'English SDH' twin, and a retune took that track's title and SDH flag. A sidecar renamed to neither twin's title after a
+        // reorder swapped them takes its stale index; one renamed to read as its twin is read as the twin's, and changes nothing.
+        const embeddedAt = (f, by = f.members) => {
             if (f.bundle || !embeddedHashes || !embeddedHashes.size || !groupHash.has(f.members)) return null;
             f.matchedBy = sidecarMatch(f, isMp4, embeddedHashes.values());
             if (!f.matchedBy) return null;
             const h = f.matchedBy === 'text' ? sidecarContent(f)?.sha1 : sidecarRoundTripHash(f, isMp4);
-            for (const [idx, eh] of embeddedHashes) if (eh === h) return idx;
-            return null;
+            const holding = keptSubs.filter((s) => embeddedHashes.get(s.index) === h);
+            const pick = (list) => list.find((s) => by.some((m) => m.index === s.index)) || list[0];
+            return (pick(holding.filter((s) => by.some((m) => retuneFor(s, [m], m.title).same)))
+                || pick(holding.filter((s) => by.some((m) => nameTextOf(m.title) && metaMatchesStream(s, m, false)))) || pick(holding))?.index ?? null;
+        };
+        // An apart group goes in as one track per member (toMux, below), so where its text is already in the file each member speaks for the track it
+        // names: members naming different tracks are split into one entry per track (embeddedAt set). A member at the index whose current name another
+        // member holds is an earlier name of that track and goes where that one goes, so it still says nothing (voice): routed by its own title it spoke
+        // for the twin that title names. One entry for the group spoke for the first track alone.
+        const splitByTrack = (f) => {
+            if (!f.apart) return [f];
+            const at = new Map(f.members.map((m) => [m, embeddedAt(f, [m])]));
+            for (const m of f.members) {
+                const current = f.members.find((x) => x.index !== null && x.index === m.index && x.name === currentName(x.index));
+                if (current) at.set(m, at.get(current));
+            }
+            const byTrack = new Map();
+            for (const m of f.members) byTrack.set(at.get(m), [...(byTrack.get(at.get(m)) || []), m]);
+            if (byTrack.size < 2) return [f];
+            return [...byTrack].map(([idx, members]) => ({ ...f, members, name: srcOf(members).name, rel: srcOf(members).rel, embeddedAt: idx }));
         };
         // On a miss, the same tracks holding the sidecar with every cue moved by one small shift (shiftedTrack) - what a container conversion leaves of a
         // sidecar extracted with remove_source=false. That sidecar is not imported, and it is never deleted on this match, which is no proof the file holds
@@ -6771,8 +6893,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
         const isUnapplied = (u) => u.roles.length > 0 || !!u.title || !!u.lang;
         const alreadyInFile = []; const toMux = []; let retuneMeta = ''; const retunes = [];
-        for (const f of merged) {
-            let at = embeddedAt(f);
+        for (const f of merged.flatMap((g) => splitByTrack(g))) {
+            let at = f.embeddedAt ?? embeddedAt(f);
             // A sidecar found with its timing moved (shiftedAt) is that track here too, so its name's metadata is weighed below like any other.
             const moved = at === null ? shiftedAt(f) : null;
             if (moved) {
@@ -6791,46 +6913,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // undid a user's retitle (measured: 'Notes' {} retagged 'Director Notes' {forced}). An apart group goes in as one track per member, so the track
             // speaks for the member whose title it carries (or cut, titleCutFrom), else for the first titled one - the group's union put both of an SDH and
             // Forced pair's flags on one track; a merged group's members speak together.
-            const current = cur && isTextSub(cur) ? sidecarBasename(cur, false) : null;
+            const current = currentName(at);
             const voice = f.members.some((m) => m.name === current) ? f.members.filter((m) => m.index !== at || m.name === current) : f.members;
-            const carried = (m) => !!cur && !!nameTextOf(m.title) && (titleAgrees(cur, m.title) || titleCutFrom(cur, m));
-            const said = !f.apart ? voice : [voice.find(carried) || voice.find((m) => nameTextOf(m.title)) || voice[0]];
-            // A name with no title token is no opinion on the title, as its 'und' is none on the language (below): read as an instruction it would erase the
-            // title clean_and_remux's tag_title gives the track, and the two plugins would re-title it on every cycle - different presets, so Tdarr's repeat
-            // guard never stops them. A name can set or change a title, never erase one, and a title cut to fit the name is none either (titleCutFrom). The
-            // name here is whichever speaking title the track carries, else the one the import writes (a merged group's covering title), else the first:
-            // the file named that track itself, and holding a plain 'English' track to an 'English' + 'English SDH' group's 'English SDH' would rename it.
-            const titled = said.filter((m) => nameTextOf(m.title));
-            const held = titled.find(carried);
-            const lead = held || titled.find((m) => m.title === f.title) || titled[0];
-            const wantTitle = isMp4 || !lead || (!!cur && titleCutFrom(cur, lead)) ? null : lead.title;
-            const sameTitle = wantTitle === null || (!!cur && titleAgrees(cur, wantTitle));
-            // A role the track gives through a field a sidecar cannot hold - a handler, a description, a TITLE tag beside its one name - is the one the name's
-            // token stands for (handlerOnlyDisp), so it counts as the track's: compared with its flags alone, an extract -> import round trip of a
-            // DESCRIPTION-only commentary disagreed on every pass.
-            const curDisp = new Set(activeDispositions(cur));
-            if (cur) for (const d of DISPOSITIONS) if (handlerOnlyDisp(d, cur, lead?.title || '')) curDisp.add(d.ff);
-            // `default` is muxer-managed rather than a role, so no sidecar name can carry it (see DISPOSITIONS) and a name's flags never hold it. The track's
-            // own flag joins the wanted set instead, which both cancels it out of the comparison and stops the whole-set write below from stripping it.
-            // Without that a default-flagged track never matches its sidecar: one wasted retune remux under 'sidecar', a disagreement line under 'embedded'
-            // on every pass that leaves the sidecar in place, and on mkv the flag silently gone. Same rule as dedupeEmbeddedSubs, which keeps its own
-            // keeper's default for the same reason. So is a flag the track has whose role the title it keeps gives: extract writes no token for a role a
-            // title gives (dispTokensOf), and clean_and_remux's tag_disposition makes that flag from the title, so judged by the name's tokens the two
-            // plugins took it off and put it back on every cycle (measured). A name can set a flag, never erase one its kept title gives.
-            const nameDisp = [...new Set(said.flatMap((m) => tokensOf(m).map(dispFfOf)).filter(Boolean))];
-            const wantDisp = new Set(nameDisp);
-            if (cur?.disposition?.default === 1) wantDisp.add('default');
-            for (const d of cur ? DISPOSITIONS.filter((x) => titleGives(wantTitle ?? mediaTitleFor(cur), x)) : []) {
-                d.flags.filter((fl) => cur.disposition?.[fl] === 1).forEach((fl) => wantDisp.add(fl));
-            }
-            const sameDisp = sameDispositions(curDisp, wantDisp);
-            // A name's 'und' is no opinion either: it only says the track had no language tag when extract named the sidecar. Read as an instruction it
-            // took back the language clean_and_remux's language_fill had since given the track, and the two plugins re-tagged it back and forth on every
-            // cycle - different presets, so Tdarr's repeat guard never stopped it. A name can set or change a real language, never erase one; zxx and mul
-            // stay instructions, since a user renames to those on purpose.
-            const sayLang = (said.find((m) => langKey(m.lang || 'und') !== 'und') || said[0]).lang;
-            const nameLang = langKey(sayLang || 'und') === 'und' ? '' : sayLang;
-            const wantLang = nameLang || resolveLang(cur) || 'und';
+            const said = !f.apart ? voice : [voice.find((m) => carries(cur, m)) || voice.find((m) => nameTextOf(m.title)) || voice[0]];
+            const { wantTitle, nameDisp, wantDisp, nameLang, wantLang, same } = retuneFor(cur, said, f.title);
             // What the deletion and the marker below weigh each member by (unapplied).
             Object.assign(f, { said, wantTitle });
             if (metadataMode === 'sidecar') {
@@ -6840,7 +6926,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     if (isUnapplied(u)) response.infoLog += unspokenLine(at, m.rel, u, said.map((x) => x.rel));
                 }
             }
-            if (sameTitle && langAgrees(resolveLang(cur), wantLang) && sameDisp) continue;
+            if (same) continue;
             const named = [logSafe(nameLang), wantTitle === null ? '' : logSafe(wantTitle), ...nameDisp].filter(Boolean).join(' ');
             if (metadataMode !== 'sidecar') {
                 response.infoLog += `☑${streamTag(at)}[method_import_metadata=${metadataMode}] The sidecar name and the embedded track disagree on metadata `
@@ -6946,8 +7032,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         }, (f, why) => {
             refusedText += 1;
             const what = why === 'empty' ? 'it holds no subtitle, and importing it would add an empty track; fix or delete it'
-                : !f.bundle ? 'ffmpeg cannot read it as a subtitle file (an empty file, or an srt whose cues have no numbers?), and muxing it would fail the'
-                    + ' whole import; fix or delete it'
+                : !f.bundle ? `ffmpeg cannot read it as a subtitle file${isMp4 ? `, or the ${dstContainer} muxer refuses it (an empty file, an srt whose`
+                    + ' cues have no numbers, or a cue that ends before it starts' : ' (an empty file, or an srt whose cues have no numbers'}?), and muxing it`
+                    + ' would fail the whole import; fix or delete it'
                     : bundleMemo.get(f.rel)?.opened ? 'the subtitle in this styled-subtitle bundle is not text ffmpeg can decode (not UTF-8?), so it is'
                         + ' not imported; it and its fonts are still in the bundle - take them out with mkvextract and convert the subtitle to UTF-8 to'
                         + ' import it'
@@ -6970,8 +7057,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // shortcuts below must be its EXACT negation and the mux branch its plain form - hand-spelled copies are chances for them to stop agreeing.
         const nothingToMux = !toMux.length && !retuneMeta && !removedIndices.size;
         for (const f of cutGroups) {
-            response.infoLog += `☒${logSafe(f.rel)} was imported into this file ${earlierCutWords(sidecarContent(f).emptyVttCues)} - not importing it again,`
-                + ` and the sidecar stays; ${nothingToMux ? cutRepairWords() : 'this pass remuxes the file for its other work, which makes that permanent'}\n`;
+            response.infoLog += `☒${logSafe(f.rel)}'s text was imported into this file ${earlierCutWords(sidecarContent(f).emptyVttCues)} - not importing it`
+                + ` again, and the sidecar stays; ${nothingToMux ? cutRepairWords(f.rel) : 'this pass remuxes the file for its other work, which makes that'
+                + ' permanent'}\n`;
         }
 
         // Sidecars that were only ever redundant, with nothing to mux alongside them. Both cleanup shortcuts below run on nothingToMux
@@ -7067,7 +7155,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 try {
                     fs.unlinkSync(libPathOf(rel)); gone += 1; removedRels.add(rel);
                     response.infoLog += `☑[remove_source=true] Deleted sidecar (its content is already in the file): ${rel}\n`
-                        + originalLostLine(m, f.holders || []);
+                        + originalLostLine(m, f.holders || []) + gapUncheckedLine(f, isMp4, m);
                 }
                 catch (e) { response.infoLog += `☒[remove_source=true] Could not delete sidecar ${rel}: ${e && e.message ? e.message : e}\n`; }
             }
