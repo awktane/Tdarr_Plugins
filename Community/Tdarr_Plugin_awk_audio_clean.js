@@ -15,7 +15,7 @@ const details = () => ({
                   closed captions); stream_ordering last.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.100',
+    Version: '4.999.101',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -256,10 +256,12 @@ const details = () => ({
                 that one key and two untagged tracks of genuinely different languages would otherwise look alike. An und track can neither be removed nor
                 be the survivor that removes another.
                 \\nA surround track the stereo tier (language_stereo, language_unlisted=stereo) folds to stereo in the same run is judged as the
-                codec_stereo stereo it becomes, before it is transcoded: in an mp4, m4v, m4a or mov file at the bitrate its encode writes, elsewhere with no
-                measured bitrate, so there a stereo of its language whose bitrate is known outranks it. Two folds that tie are ranked by the tracks they are
-                made from, a fold never displaces a track guard_original keeps (the fold is removed instead), and a surround of the stereo tier that cannot
-                be folded is removed beside a fold of its language that survives. An -error mode aborts before any encode.
+                codec_stereo stereo it becomes, before it is transcoded: at the bitrate its encode writes when codec_stereo is ac3 or eac3 or the file is an
+                mp4, m4v, m4a or mov, otherwise with no measured bitrate, so there a stereo of its language whose bitrate is known outranks it. A fold
+                replaces a stereo already in the file only when it is better: beside one that scores as well, the fold is removed instead and nothing is
+                encoded. Two folds that tie are ranked by the tracks they are made from, a fold never displaces a track guard_original keeps (the fold is
+                removed instead), and a surround of the stereo tier that cannot be folded is removed beside a fold of its language that survives. An -error
+                mode aborts before any encode.
                 \\nA stream newly created by downmix_to_six or downmix_to_stereo is always kept. While downmix_to_six is enabled the 5.1/5.0 band (5-6
                 channels) forms its own role rather than folding into "surround", so a downmix-created 6 channel track is never dropped in favour of a
                 7.1; while downmix_to_stereo is enabled, exactly-2-channel tracks likewise form their own role rather than folding into "stereo", so a
@@ -3585,6 +3587,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const mi = mediaInfoFor(s);
             return AAC_PCE_LAYOUTS.get(`${mi?.ChannelLayout} / ${mi?.ChannelPositions}`) || '';
         };
+        // Above 8 channels, the layout ffmpeg decodes a track with no stored layout as, by channel count (measured on PCM in Matroska).
+        const PREFOLD_COUNT_DEFAULT = new Map([[10, '5.1.4'], [12, '7.1.4'], [14, '9.1.4'], [16, 'hexadecagonal'], [24, '22.2']]);
         // A non-aac track with no ffprobe layout whose decode no encoder or fold can place: an opus above two channels (mapping family 255, whose channels
         // carry no meaning at all - measured on jellyfin-ffmpeg 7.1.4, a 6ch one to native aac exits 234 'Unsupported channel layout "6 channels"', and a 3ch
         // one to ac3 behind loudnorm comes out with its third channel silent), and any codec at 3 or 7 channels, whose count default puts an LFE where a
@@ -3593,10 +3597,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // and 8 channels the default (4.0, 5.0, 5.1, 7.1) is the common real layout, so those still convert. Matroska keeps no PCM layout at all, so a PCM
         // written from another layout of that count is converted on the default - an accepted upstream residual: a quad's back pair lands on the centre and
         // back centre (moved, none dropped), and a 6.0's back centre, a 6.0(front)'s right-of-centre and a hexagonal's or octagonal's back left land on the
-        // LFE, which a stereo fold drops and ac3 band-limits away. Above 8 channels the count default is a height layout (10 5.1.4, 12 7.1.4, 14 9.1.4,
-        // 16 hexadecagonal, 24 22.2), and a fold takes the track as that layout (speakerPrefold).
-        const noLayoutGuess = (s) => codecFamilyOf(s) !== 'aac' && noLayout(s)
-            && (codecFamilyOf(s) === 'opus' ? s.awkChannels > 2 : [3, 7].includes(s.awkChannels));
+        // LFE, which a stereo fold drops and ac3 band-limits away. Above 8 channels a count with a default decodes as a height layout (PREFOLD_COUNT_DEFAULT),
+        // and a fold takes the track as that layout (speakerPrefold); every other count above 8 (9, 11, 13, 15, 17 to 23, 25 and up) has none, and
+        // swresample refuses both folds ('Rematrix is needed between 9 channels and stereo but there is not enough information', exit 234 on every requeue -
+        // measured on PCM in Matroska at every such count to 26, and at 28 and 32), so those are not guessed either.
+        const noLayoutGuess = (s) => codecFamilyOf(s) !== 'aac' && noLayout(s) && (codecFamilyOf(s) === 'opus' ? s.awkChannels > 2
+            : [3, 7].includes(s.awkChannels) || (s.awkChannels > 8 && !PREFOLD_COUNT_DEFAULT.has(s.awkChannels)));
         // A decode no encoder or fold can place by its layout: a PCE MediaInfo does not identify, a no-layout guess above, and an ambisonic layout, which
         // swresample refuses outright ("Input channel layout 'ambisonic 1' is not supported", exit 234).
         const layoutUnplaceable = (s) => (unlabelledPce(s) && !pceLayoutOf(s)) || noLayoutGuess(s) || /^ambisonic\b/i.test(String(s.channel_layout || ''));
@@ -3731,15 +3737,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // when guard_lossless is disabled). hasKnownRate still gates the rate DISPLAY below (a lossless track with no bitrate simply shows no "@ N kb/s").
             const trustedRate = (s) => hasKnownRate(s) || s.awkLossless;
             // A surround the stereo tier folds this pass (stereoTierFolds) is grouped and ranked as the stereo the next pass reads back: codec_stereo's
-            // family at 2 channels, with none of the source's lossless, object-audio or Dolby Surround EX flags. On an mp4-family output it carries the rate
-            // its encode asks for, which that muxer stores for the next pass to read (native aac at 256k reads back about its target on program content - 257k
-            // measured on jellyfin-ffmpeg 7.1.4 - and less on near-tonal content, 219k on a sine 5.1; aac_vbr is predicted as guardBlocks predicts it);
-            // elsewhere it has none. So the stereo the next pass would keep survives here: a fold that duplicates a stereo of its language is removed instead
-            // of encoded, or keeps the fold and removes that stereo, and an -error mode stops the file before any encode. It is scored as a bare stream no
-            // probe joins to, so the source's own MediaInfo cannot refine the fold's codec (an eac3 fold of an Atmos track is plain eac3); foldOf keeps the
-            // source for the log, foldsBy the setting that folds it.
+            // family at 2 channels, with none of the source's lossless, object-audio or Dolby Surround EX flags. It carries the rate its encode asks for
+            // wherever the next pass reads that back: on an mp4-family output, whose muxer stores it (native aac at 256k reads back about its target on program
+            // content - 257k measured on jellyfin-ffmpeg 7.1.4 - and less on near-tonal content, 219k on a sine 5.1; aac_vbr is predicted as guardBlocks
+            // predicts it), and for an ac3 or eac3 fold on every container, whose frame headers carry it (a 224k fold read back at 224k by ffprobe from each
+            // container that holds it - mkv, mka, ts, avi, mpg, asf, wtv and mp4 - and by mediainfo.js 0.2.0 from all but wtv, measured on 7.1.4). An aac or
+            // opus fold elsewhere has none, as Matroska and Ogg read it back, and MPEG-TS an opus one; avi, asf, flv, 3gp and MPEG-TS do store an aac fold's
+            // rate (the nominal one: aac_vbr under aac_at reads back 128k from avi), which is left unpriced. So a fold that duplicates a stereo of its language
+            // is removed instead of encoded, or is kept and that stereo removed when the fold is strictly better (the survivor rule in the loop below), and an
+            // -error mode stops the file before any encode. It is scored as a bare stream no probe joins to, so the source's own MediaInfo cannot refine the
+            // fold's codec (an eac3 fold of an Atmos track is plain eac3); foldOf keeps the source for the log, foldsBy the setting that folds it.
             const foldCodec = aacFamily(codecStereo);
-            const foldBps = isMp4Family(dstContainer) ? (codecStereo === 'aac_vbr' ? aacVbrPredictedBps(0) : resolveBitrate(codecStereo, 2)) : 0;
+            const foldBps = isMp4Family(dstContainer) || foldCodec === 'ac3' || foldCodec === 'eac3'
+                ? (codecStereo === 'aac_vbr' ? aacVbrPredictedBps(0) : resolveBitrate(codecStereo, 2)) : 0;
             const asDeduped = (s) => (stereoTierFolds(s) ? { ...s, codec_name: foldCodec, channels: 2, awkChannels: 2, bit_rate: foldBps, awkLossless: false,
                 awkObjectAudio: false, awkMatrixSurround: false, awkQuality: audioQuality({ codec_name: foldCodec, channels: 2, bit_rate: foldBps }), foldOf: s,
                 foldsBy: tierTagOf(s) } : s);
@@ -3764,7 +3774,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // Ties go by file order, except that a language's main folds trade places among themselves by their sources (foldSlot): the best-sourced fold takes
             // the first fold's place, so the stereo kept is the one made from the better track (an ac3 5.1 @ 640k over an aac 7.1 @ 172k ahead of it) while a
             // stereo of the same rank keeps its place against the folds. One total order: comparing two folds by source but a fold and a stereo by index went
-            // round in a cycle when the stereo sat between the folds, and kept the worse fold.
+            // round in a cycle when the stereo sat between the folds, and kept the worse fold. Which entry of a group survives is decided in the loop below.
             const views = audioStreams.map(asDeduped);
             const foldSlot = new Map();
             const foldsByLang = new Map();
@@ -3797,6 +3807,37 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 workDone += `☐${streamTag(s.index)}[method_deduplicate=${methodDeduplicate}]${tag} Removing duplicate (${why}: ${rmTok}) - keeping stream `
                     + `${kept.index} (${keptTok})\n`;
             };
+            // A removal decided by the ranking, and its line. A fold's reason is the fold's, not that of the source the line names; two folds that tie were
+            // ordered by their sources; a fold that only ties a stereo already in the file gives way to it, so one that keeps its group over such a stereo
+            // scores strictly better, which is the reason given even where a measured rate sorted it first (the survivor rule in the loop below).
+            const dropRanked = (s, kept) => {
+                const why = kept.foldOf && !s.foldOf ? 'lower quality' : whyRanked(s, kept);
+                const whySrc = !why && s.foldOf && kept.foldOf ? whyRanked(s.foldOf, kept.foldOf) : '';
+                dropDuplicate(s, kept, why ? `${why}${s.foldOf ? ' once folded' : ''}` : (whySrc ? `equal once folded; the source has ${whySrc}`
+                    : (s.foldOf && !kept.foldOf ? 'equal once folded, keeping the stereo already in the file' : 'equal, keeping the earlier track')));
+            };
+            // The dedup BAND - which tracks are candidates to be duplicates of each other. Deliberately not `tier`: the per-track tier assigned above is
+            // the language/role verdict (surround/stereo/delete) and shares two of its four spellings with this, so one name for both read as one concept.
+            // 'channel' groups by exact channel count, so a 7.1, a 5.1 and a 2.0 all survive. 'multi-stereo' keeps one best surround and one best stereo
+            // per language, except that while downmix_to_six / downmix_to_stereo is enabled the 5-6ch / exactly-2ch band is a group of its own (inSixBand /
+            // inStereoBand), so a 5.1 or 2.0 - pre-existing or downmix-created - is never removed in favour of a 7.1 or mono. Only a MAIN, language-tagged
+            // track with a channel count has a group ('' for the rest, which the loop below exempts): the region-grouping key + band then fully identifies
+            // it (region-distinct only when method_dedup_region=distinct).
+            const dedupKeyOf = (s) => {
+                const ch = s.awkChannels;
+                if (s.awkSecondaryTrack || s.awkLangKey === 'und' || !(ch > 0)) return '';
+                let dedupBand;
+                if (methodDeduplicateGroupBy === 'channel') {
+                    dedupBand = ch;
+                } else if (downmixToSix !== 'disabled' && inSixBand(ch)) {
+                    dedupBand = 'six';
+                } else if (downmixToStereo !== 'disabled' && inStereoBand(ch)) {
+                    dedupBand = 'stereo2';
+                } else {
+                    dedupBand = ch > 2 ? 'surround' : 'stereo';
+                }
+                return `${s.awkRegionKey}|${dedupBand}`;
+            };
             // Only worth reporting the und exemption below when two or more untagged MAIN tracks are present: a lone untagged track has nothing it could be
             // a duplicate of, so the exemption changes nothing there and a line about it would be noise on a very common file.
             const undMainCount = byQuality.filter((s) => !s.awkSecondaryTrack && s.awkLangKey === 'und').length;
@@ -3821,31 +3862,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // reads false - the tier test would file a surround track under 'stereo' and dedupeGuardBlock's channel clause could not intervene, so a
                 // real 2.0 track (or the surround master itself) would be deleted as its duplicate. `continue` rather than a seen entry, so it can be
                 // neither removed nor the survivor that removes something else.
-                const ch = s.awkChannels;
-                if (!(ch > 0)) {
+                if (!(s.awkChannels > 0)) {
                     skipDone += noChannelCountSkip(s.index, `method_deduplicate=${methodDeduplicate}`, "can't tell which tracks it would duplicate");
                     continue;
                 }
-                // The dedup BAND - which tracks are candidates to be duplicates of each other. Deliberately not `tier`: the per-track tier assigned above is
-                // the language/role verdict (surround/stereo/delete) and shares two of its four spellings with this, so one name for both read as one concept.
-                // 'channel' groups by exact channel count, so a 7.1, a 5.1 and a 2.0 all survive. 'multi-stereo' keeps one best surround and one best stereo
-                // per language, except that while downmix_to_six / downmix_to_stereo is enabled the 5-6ch / exactly-2ch band is a group of its own (inSixBand /
-                // inStereoBand), so a 5.1 or 2.0 - pre-existing or downmix-created - is never removed in favour of a 7.1 or mono.
-                let dedupBand;
-                if (methodDeduplicateGroupBy === 'channel') {
-                    dedupBand = ch;
-                } else if (downmixToSix !== 'disabled' && inSixBand(ch)) {
-                    dedupBand = 'six';
-                } else if (downmixToStereo !== 'disabled' && inStereoBand(ch)) {
-                    dedupBand = 'stereo2';
-                } else {
-                    dedupBand = ch > 2 ? 'surround' : 'stereo';
-                }
-                // Only MAIN tracks reach here (secondaries skipped above), so the region-grouping key + channel
-                // band fully identifies a duplicate group (region-distinct only when method_dedup_region=distinct).
-                const key = `${s.awkRegionKey}|${dedupBand}`;
+                const key = dedupKeyOf(s);
                 if (seen.has(key)) {
                     const kept = seen.get(key);
+                    if (kept === s) continue;   // a stereo already in the file that took its group from a fold (below)
                     // A guard-blocked duplicate SURVIVES (documented in the method_deduplicate tooltip) - but say so, or a user with two obvious duplicates
                     // watches dedup do nothing and cannot tell an exemption from a bug. Same reasoning as the und and no-channel-count exemptions above, and
                     // it also has to precede the -error abort: a duplicate a guard is protecting is not a duplicate the user is being asked to resolve.
@@ -3863,15 +3887,21 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             + `removing it would lose detail stream ${kept.index} (${dedupTok(kept, false)}) can't hold\n`;
                         continue;
                     }
-                    // A fold's reason is the fold's, not that of the source the line names. Two folds that tie were ordered by their sources, and the
-                    // best-sourced fold can take a fold's place ahead of a stereo that ties it (foldSlot), which file order alone does not explain.
-                    const why = whyRanked(s, kept);
-                    const whySrc = !why && s.foldOf && kept.foldOf ? whyRanked(s.foldOf, kept.foldOf) : '';
-                    const slotted = !why && !s.foldOf && kept.foldOf && kept.index > s.index;
-                    dropDuplicate(s, kept, why ? `${why}${s.foldOf ? ' once folded' : ''}` : (whySrc ? `equal once folded; the source has ${whySrc}`
-                        : (slotted ? "equal, keeping the best-sourced fold in the first fold's place" : 'equal, keeping the earlier track')));
-                } else
-                    seen.set(key, s);
+                    dropRanked(s, kept);
+                } else {
+                    // A fold displaces a stereo already in the file only when it is strictly better: one that merely ties it (ac3 and eac3 score every
+                    // rate from 224k up alike, so a 224k fold ties a 448k 2.0), wins on file order, or wins only on its measured rate (a priced fold over a
+                    // rate-less aac 2.0) would trade a dedicated stereo mix for a fresh downmix. So when a fold heads its group, the first stereo of the group
+                    // that scores at least as well keeps it instead, and the fold is removed before anything is encoded; the next pass then sees that stereo
+                    // alone. The order itself stays total (a fold-versus-stereo comparator that is quality-only next to rankOrder would cycle); a
+                    // guard_original track keeps its own line.
+                    const held = s.foldOf ? byQuality.find((x) => !x.foldOf && x.awkQuality >= s.awkQuality && dedupKeyOf(x) === key) : undefined;
+                    if (held) {
+                        const guard = dedupeGuardBlock(held, s);
+                        if (guard) dropDuplicate(s, held, 'the track it duplicates is protected', `[${guard}]`); else dropRanked(s, held);
+                    }
+                    seen.set(key, held || s);
+                }
             }
             // A stereo-tier surround the fold cannot reach (stereoTierFolds: a codec_stereo the container refuses, or a decode no layout places) holds the
             // content a fold of its language carries, so beside one that survives it is removed as that fold's duplicate rather than kept at surround in a
@@ -4817,8 +4847,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // first of its PREFOLD_INTO list the track has): a left or right speaker into the ear-level one beneath or beside it at -3 dB, a centred one into
         // the centre beneath it at -3 dB or into each side of a pair at -6 dB, LFE2 into the LFE. Measured: every tone kept, to stereo and to 5.1, on
         // cube, 5.1.4, 7.1.4, 7.2.3, 9.1.4, hexadecagonal and 22.2, named and with no stored layout, and on custom orders in and out of libavutil's order.
-        // A track with no dropped speaker, or one holding DL or DR (a stereo downmix carried beside the mix, which has no row), takes the plain fold:
-        // that drops DL and DR, and swresample refuses it out of libavutil's order.
+        // A custom order that drops nothing but sits out of libavutil's order (a film-order .mov PCM, '6 channels (FL+FC+FR+SL+SR+LFE)') is only reordered:
+        // channelmap moves its channels into PREFOLD_KEPT's order without mixing (measured: every tone kept, to stereo and to 5.1, from 6 and 8 channels,
+        // where the plain fold exits 234). A track holding DL or DR (a stereo downmix carried beside the mix, which has no row) takes the plain fold: that
+        // drops DL and DR, and swresample refuses it out of libavutil's order.
         const PREFOLD_KEPT = ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'FLC', 'FRC', 'BC', 'SL', 'SR', 'TFL', 'TFR'];
         // A Map, so a custom order's spelling never reads a prototype member.
         const PREFOLD_INTO = new Map([
@@ -4828,18 +4860,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             ['BFR', [['FR'], 0.707]], ['TFC', [['FC'], 0.707]], ['BFC', [['FC'], 0.707]], ['TBC', [['BL', 'SL'], 0.5, ['BR', 'SR']]],
             ['TC', [['SL', 'BL'], 0.5, ['SR', 'BR']]], ['LFE2', [['LFE'], 1]],
         ]);
-        // The layout ffmpeg decodes a track with no stored layout as, by channel count (measured on a PCM in Matroska; no other count has one).
-        const PREFOLD_COUNT_DEFAULT = new Map([[10, '5.1.4'], [12, '7.1.4'], [14, '9.1.4'], [16, 'hexadecagonal'], [24, '22.2']]);
         // The track's speakers by index - its CANON_LAYOUTS list, the speakers ffprobe spells a custom order by, or its count default when no layout is
-        // stored - then the pan. '' (the plain fold) when nothing is dropped, the count disagrees with the list, a speaker is in neither table, or a
-        // dropped one has nowhere listed to go.
+        // stored (PREFOLD_COUNT_DEFAULT) - then the pan, or the reorder alone when nothing is dropped. '' (the plain fold) when nothing is dropped and the
+        // list is in libavutil's order or repeats a speaker, the count disagrees with the list, a speaker is in neither table, or a dropped one has nowhere
+        // listed to go.
         const speakerPrefold = (src) => {
             const spelled = customOrder(src) ? /^\d+ channels \((.+)\)$/.exec(String(src.channel_layout).trim())?.[1].split('+') : undefined;
             const counted = noLayout(src) ? CANON_LAYOUTS[PREFOLD_COUNT_DEFAULT.get(Number(src.channels))] : undefined;
             const list = CANON_LAYOUTS[layoutKeyOf(src)] || spelled || counted;
-            if (!list || Number(src?.channels) !== list.length || !list.some((c) => PREFOLD_INTO.has(c))
-                || !list.every((c) => PREFOLD_INTO.has(c) || PREFOLD_KEPT.includes(c))) return '';
+            if (!list || Number(src?.channels) !== list.length || !list.every((c) => PREFOLD_INTO.has(c) || PREFOLD_KEPT.includes(c))) return '';
             const keep = PREFOLD_KEPT.filter((c) => list.includes(c));
+            if (!list.some((c) => PREFOLD_INTO.has(c))) {
+                return keep.length === list.length && keep.some((c, k) => c !== list[k])
+                    ? `channelmap=map=${keep.map((c) => list.indexOf(c)).join('|')}:channel_layout=${keep.join('+')}` : '';
+            }
             const terms = Object.fromEntries(keep.map((c) => [c, [`c${list.indexOf(c)}`]]));
             for (const c of list.filter((x) => PREFOLD_INTO.has(x))) {
                 const [first, gain, second] = PREFOLD_INTO.get(c);
