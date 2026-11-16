@@ -15,7 +15,7 @@ const details = () => ({
                   closed captions); stream_ordering last.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.102',
+    Version: '4.999.103',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -256,8 +256,9 @@ const details = () => ({
                 that one key and two untagged tracks of genuinely different languages would otherwise look alike. An und track can neither be removed nor
                 be the survivor that removes another.
                 \\nA surround track the stereo tier (language_stereo, language_unlisted=stereo) folds to stereo in the same run is judged as the
-                codec_stereo stereo it becomes, before it is transcoded: at the bitrate its encode writes when codec_stereo is ac3 or eac3 or the file is an
-                mp4, m4v, m4a or mov, otherwise with no measured bitrate, so there a stereo of its language whose bitrate is known outranks it. A fold
+                codec_stereo stereo it becomes, before it is transcoded: at the bitrate its encode writes when codec_stereo is ac3 or eac3, when the file is
+                an mp4, m4v, m4a or mov, or when codec_stereo is aac and the file is an avi, divx, wmv or asf, otherwise with no measured bitrate, so there a
+                stereo of its language whose bitrate is known outranks it. A fold
                 replaces a stereo already in the file only when it is better: beside one that scores as well, the fold is removed instead and nothing is
                 encoded. Two folds that tie are ranked by the tracks they are made from, a fold never displaces a track guard_original keeps (the fold is
                 removed instead), and a surround of the stereo tier that cannot be folded is removed beside a fold of its language that survives. An -error
@@ -3766,19 +3767,28 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // so a lossless master whose bitrate neither probe reports is never sorted below a lossy duplicate and picked for removal (a silent-master-loss bug
             // when guard_lossless is disabled). hasKnownRate still gates the rate DISPLAY below (a lossless track with no bitrate simply shows no "@ N kb/s").
             const trustedRate = (s) => hasKnownRate(s) || s.awkLossless;
-            // A surround the stereo tier folds this pass (stereoTierFolds) is grouped and ranked as the stereo the next pass reads back: codec_stereo's
-            // family at 2 channels, with none of the source's lossless, object-audio or Dolby Surround EX flags. It carries the rate its encode asks for
-            // wherever the next pass reads that back: on an mp4-family output, whose muxer stores it (native aac at 256k reads back about its target on program
-            // content - 257k measured on jellyfin-ffmpeg 7.1.4 - and less on near-tonal content, 219k on a sine 5.1; aac_vbr is predicted as guardBlocks
-            // predicts it), and for an ac3 or eac3 fold on every container, whose frame headers carry it (a 224k fold read back at 224k by ffprobe from each
-            // container that holds it - mkv, mka, ts, avi, mpg, asf, wtv and mp4 - and by mediainfo.js 0.2.0 from all but wtv, measured on 7.1.4). An aac or
-            // opus fold elsewhere has none, as Matroska and Ogg read it back, and MPEG-TS an opus one; avi, asf, flv, 3gp and MPEG-TS do store an aac fold's
-            // rate (the nominal one: aac_vbr under aac_at reads back 128k from avi), which is left unpriced. So a fold that duplicates a stereo of its language
-            // is removed instead of encoded, or is kept and that stereo removed when the fold is strictly better (the survivor rule in the loop below), and an
-            // -error mode stops the file before any encode. It is scored as a bare stream no probe joins to, so the source's own MediaInfo cannot refine the
-            // fold's codec (an eac3 fold of an Atmos track is plain eac3); foldOf keeps the source for the log, foldsBy the setting that folds it.
+            // The containers beside the mp4 family whose header stores a native aac fold's nominal rate, which the next pass reads back exactly: a 256k fold
+            // read back at 256000 (a 320k one at 320000) from avi, divx, wmv and asf on every source measured on jellyfin-ffmpeg 7.1.4. MPEG-TS and 3gp/3g2
+            // store none: ffprobe reads a probe-window parser average from MPEG-TS and a whole-file average from 3gp, which for a 256k encode of real program
+            // content read 69349-254178 from MPEG-TS (six sources) and 133916-230725 from 3gp (three; 256909 and 256006 on pink noise only), so priced at 256k
+            // there a fold replaced a dedicated 320k stereo MPEG-TS read at 233342, and itself read back at 227971; they stay unpriced. flv holds one
+            // audio track (its muxer refuses a second, exit 234), so a fold never meets a stereo there. aac_vbr stays unpriced on these too, since what reads
+            // back is not the rate it is predicted at (aac_at reads a nominal 128k from avi and asf; libfdk_aac is unmeasured); none of them holds opus.
+            const AAC_FOLD_RATED = ['avi', 'divx', 'wmv', 'asf'];
+            // A surround the stereo tier folds this pass (stereoTierFolds) is grouped and ranked as the stereo the next pass reads back: codec_stereo's family
+            // at 2 channels, with none of the source's lossless, object-audio or Dolby Surround EX flags. It carries the rate its encode asks for wherever the
+            // next pass reads that back: on an mp4-family output, whose muxer stores it (native aac at 256k read back at 124937-256504 on six real program
+            // sources, 257k on pink noise and 219k on a sine 5.1, measured on jellyfin-ffmpeg 7.1.4; aac_vbr is predicted as guardBlocks predicts it), for an
+            // ac3 or eac3 fold on every container, whose frame headers carry it (a 224k fold read back at 224k by ffprobe from each container that holds it -
+            // mkv, mka, ts, avi, mpg, asf, wtv and mp4 - and by mediainfo.js 0.2.0 from all but wtv, measured on 7.1.4), and for a native aac fold on
+            // AAC_FOLD_RATED. Every other fold is judged with none: Matroska and Ogg read an aac or opus fold back with none, and AAC_FOLD_RATED says why
+            // MPEG-TS, 3gp and flv stay unpriced, and aac_vbr with them. So a fold that duplicates a stereo of its language is removed instead of encoded, or
+            // is kept and that stereo removed when the fold is strictly better (the survivor rule in the loop below), and an -error mode stops the file before
+            // any encode. It is scored as a bare stream no probe joins to, so the source's own MediaInfo cannot refine the fold's codec (an eac3 fold of an
+            // Atmos track is plain eac3); foldOf keeps the source for the log, foldsBy the setting that folds it.
             const foldCodec = aacFamily(codecStereo);
             const foldBps = isMp4Family(dstContainer) || foldCodec === 'ac3' || foldCodec === 'eac3'
+                || (codecStereo === 'aac' && AAC_FOLD_RATED.includes(dstContainer))
                 ? (codecStereo === 'aac_vbr' ? aacVbrPredictedBps(0) : resolveBitrate(codecStereo, 2)) : 0;
             const asDeduped = (s) => (stereoTierFolds(s) ? { ...s, codec_name: foldCodec, channels: 2, awkChannels: 2, bit_rate: foldBps, awkLossless: false,
                 awkObjectAudio: false, awkMatrixSurround: false, awkQuality: audioQuality({ codec_name: foldCodec, channels: 2, bit_rate: foldBps }), foldOf: s,
@@ -3838,10 +3848,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     + `${kept.index} (${keptTok})\n`;
             };
             // A removal decided by the ranking, and its line. A fold's reason is the fold's, not that of the source the line names; two folds that tie were
-            // ordered by their sources; a fold that only ties a stereo already in the file gives way to it, so one that keeps its group over such a stereo
-            // scores strictly better, which is the reason given even where a measured rate sorted it first (the survivor rule in the loop below).
+            // ordered by their sources; a fold that only ties a stereo already in the file gives way to it, so one that keeps its group over a stereo it
+            // outscores says so even where a measured rate sorted it first (the survivor rule in the loop below), while a rate-less stereo ranked below a
+            // measured one is removed for its missing rate whatever it scores.
             const dropRanked = (s, kept) => {
-                const why = kept.foldOf && !s.foldOf ? 'lower quality' : whyRanked(s, kept);
+                const why = kept.foldOf && !s.foldOf && s.awkQuality < kept.awkQuality ? 'lower quality' : whyRanked(s, kept);
                 const whySrc = !why && s.foldOf && kept.foldOf ? whyRanked(s.foldOf, kept.foldOf) : '';
                 dropDuplicate(s, kept, why ? `${why}${s.foldOf ? ' once folded' : ''}` : (whySrc ? `equal once folded; the source has ${whySrc}`
                     : (s.foldOf && !kept.foldOf ? 'equal once folded, keeping the stereo already in the file' : 'equal, keeping the earlier track')));
@@ -3921,11 +3932,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 } else {
                     // A fold displaces a stereo already in the file only when it is strictly better: one that merely ties it (ac3 and eac3 score every
                     // rate from 224k up alike, so a 224k fold ties a 448k 2.0), wins on file order, or wins only on its measured rate (a priced fold over a
-                    // rate-less aac 2.0) would trade a dedicated stereo mix for a fresh downmix. So when a fold heads its group, the first stereo of the group
-                    // that scores at least as well keeps it instead, and the fold is removed before anything is encoded; the next pass then sees that stereo
-                    // alone. The order itself stays total (a fold-versus-stereo comparator that is quality-only next to rankOrder would cycle); a
-                    // guard_original track keeps its own line.
-                    const held = s.foldOf ? byQuality.find((x) => !x.foldOf && x.awkQuality >= s.awkQuality && dedupKeyOf(x) === key) : undefined;
+                    // rate-less aac 2.0) would trade a dedicated stereo mix for a fresh downmix. So when a fold heads its group, the group's best-ranked stereo
+                    // keeps it instead if it scores at least as well, and the fold is removed before anything is encoded; the next pass then sees that stereo
+                    // alone. Only the best-ranked one: a rate-less stereo ranked below a measured one holds nothing, or its estimated score would remove the
+                    // measured stereo beside it. The order itself stays total (a fold-versus-stereo comparator that is quality-only next to rankOrder would
+                    // cycle); a guard_original track keeps its own line.
+                    const top = s.foldOf ? byQuality.find((x) => !x.foldOf && dedupKeyOf(x) === key) : undefined;
+                    const held = top && top.awkQuality >= s.awkQuality ? top : undefined;
                     if (held) {
                         const guard = dedupeGuardBlock(held, s);
                         if (guard) dropDuplicate(s, held, 'the track it duplicates is protected', `[${guard}]`); else dropRanked(s, held);
@@ -4879,9 +4892,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // cube, 5.1.4, 7.1.4, 7.2.3, 9.1.4, hexadecagonal and 22.2, named and with no stored layout, and on custom orders in and out of libavutil's order.
         // A custom order that drops nothing but sits out of libavutil's order (a film-order .mov PCM, '6 channels (FL+FC+FR+SL+SR+LFE)') is only reordered:
         // channelmap moves its channels into PREFOLD_KEPT's order without mixing (measured: every tone kept, to stereo and to 5.1, from 6 and 8 channels,
-        // where the plain fold exits 234). A track holding DL or DR (a stereo downmix carried beside the mix, which has no row) takes the plain fold: that
-        // drops DL and DR, and swresample refuses it out of libavutil's order.
+        // where the plain fold exits 234).
         const PREFOLD_KEPT = ['FL', 'FR', 'FC', 'LFE', 'BL', 'BR', 'FLC', 'FRC', 'BC', 'SL', 'SR', 'TFL', 'TFR'];
+        // DL and DR, a stereo downmix carried beside the mix: no speaker the track keeps is theirs to fold into, so a prefold drops them as the fold drops
+        // them from a list in libavutil's order - a reorder carries them after every kept speaker, which is their place in that order, and a pan writes
+        // nothing of them. Measured on jellyfin-ffmpeg 7.1.4 with one tone per speaker: the plain folds of '8 channels (FL+FC+FR+SL+SR+LFE+DL+DR)',
+        // '6 channels (DL+DR+FL+FR+FC+LFE)' and '10 channels (FL+FC+FR+SL+SR+LFE+TBL+TBR+DL+DR)' exit 234; behind the reorder, or the pan, every fold runs
+        // and loses only DL and DR, as the plain folds of '8 channels (FL+FR+FC+LFE+SL+SR+DL+DR)' do.
+        const PREFOLD_DROPPED = ['DL', 'DR'];
         // A Map, so a custom order's spelling never reads a prototype member.
         const PREFOLD_INTO = new Map([
             ['TBL', [['BL', 'SL'], 0.707]], ['TBR', [['BR', 'SR'], 0.707]], ['TSL', [['SL', 'BL'], 0.707]], ['TSR', [['SR', 'BR'], 0.707]],
@@ -4891,18 +4909,20 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             ['TC', [['SL', 'BL'], 0.5, ['SR', 'BR']]], ['LFE2', [['LFE'], 1]],
         ]);
         // The track's speakers by index - its CANON_LAYOUTS list, the speakers ffprobe spells a custom order by, or its count default when no layout is
-        // stored (PREFOLD_COUNT_DEFAULT) - then the pan, or the reorder alone when nothing is dropped. '' (the plain fold) when nothing is dropped and the
-        // list is in libavutil's order or repeats a speaker, the count disagrees with the list, a speaker is in neither table, or a dropped one has nowhere
-        // listed to go.
+        // stored (PREFOLD_COUNT_DEFAULT) - then the pan, or the reorder alone when no speaker is sent into another. '' (the plain fold) when none is and
+        // the list is in libavutil's order or repeats a speaker, the count disagrees with the list, a speaker is in none of the three tables, or one to be
+        // sent has nowhere listed to go.
         const speakerPrefold = (src) => {
             const spelled = customOrder(src) ? /^\d+ channels \((.+)\)$/.exec(String(src.channel_layout).trim())?.[1].split('+') : undefined;
             const counted = noLayout(src) ? CANON_LAYOUTS[PREFOLD_COUNT_DEFAULT.get(Number(src.channels))] : undefined;
             const list = CANON_LAYOUTS[layoutKeyOf(src)] || spelled || counted;
-            if (!list || Number(src?.channels) !== list.length || !list.every((c) => PREFOLD_INTO.has(c) || PREFOLD_KEPT.includes(c))) return '';
+            if (!list || Number(src?.channels) !== list.length
+                || !list.every((c) => PREFOLD_INTO.has(c) || PREFOLD_KEPT.includes(c) || PREFOLD_DROPPED.includes(c))) return '';
             const keep = PREFOLD_KEPT.filter((c) => list.includes(c));
             if (!list.some((c) => PREFOLD_INTO.has(c))) {
-                return keep.length === list.length && keep.some((c, k) => c !== list[k])
-                    ? `channelmap=map=${keep.map((c) => list.indexOf(c)).join('|')}:channel_layout=${keep.join('+')}` : '';
+                const order = [...keep, ...PREFOLD_DROPPED.filter((c) => list.includes(c))];
+                return order.length === list.length && order.some((c, k) => c !== list[k])
+                    ? `channelmap=map=${order.map((c) => list.indexOf(c)).join('|')}:channel_layout=${order.join('+')}` : '';
             }
             const terms = Object.fromEntries(keep.map((c) => [c, [`c${list.indexOf(c)}`]]));
             for (const c of list.filter((x) => PREFOLD_INTO.has(x))) {
