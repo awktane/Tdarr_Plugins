@@ -32,7 +32,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.95',
+    Version: '4.999.96',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -2358,10 +2358,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Single-word keywords stripped when recovering the channel/base portion of a title (multi-word
     // keywords like "hearing impaired" can't appear as a lone channel token, so they are skipped).
     const stripWords = new Set(Object.values(dispositionTypes).flatMap(d => d.keywords).filter(w => !w.includes(' ')));
-    // Trim a token's non-word edges by index, for the reason cleanStreamTitle's quote strip does: /^[^\w]+|[^\w]+$/ backtracks from every offset inside a
-    // long interior non-word run. \w is ASCII-only, so every non-Latin LETTER counts as non-word and an ordinary whitespace-free CJK/Cyrillic title is one
-    // token long enough to trigger it (60k characters measured 5.7 s of blocked worker) - no crafted punctuation needed. Output is identical.
-    const WORD_CHAR = /\w/;
+    // Trim a token to keywordRegex's letter/digit edge, so the stripper drops each single-word keyword the role reader reads (a lone 'Forcé' as
+    // 'Forcés'; '_' is an edge to both). By index, for the reason cleanStreamTitle's quote strip does: /^[^\w]+|[^\w]+$/ backtracks from every offset
+    // inside a long interior non-word run (a 60k-character whitespace-free Cyrillic title, all non-word to ASCII \w, measured 5.7 s of blocked worker).
+    const WORD_CHAR = /[\p{L}\p{N}]/u;
     const trimNonWord = (tok) => {
         const s = String(tok);
         let a = 0; let b = s.length;

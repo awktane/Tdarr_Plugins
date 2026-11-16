@@ -20,14 +20,14 @@ const details = () => ({
         track an earlier plain copy left is turned back into one; .webm stores no attachments, so there the remux leaves the cover out and the log says so. A
         file with nothing else to change keeps it untouched, and a file whose remux would drop its cover art (any .mov, whose muxer stores none, or an mp4, m4v
         or m4a carrying another awk plugin's marker tag, which a remux keeps only at the cost of the cover) or its Dolby Vision record (one no ffmpeg copy
-        keeps, or any Dolby Vision .mov) is not remuxed only to front-load it or strip its tags.\n\nBecause it runs last it also checks the finished file's
+        keeps, or a .mov's Dolby Vision box) is not remuxed only to front-load it or strip its tags.\n\nBecause it runs last it also checks the finished file's
         duration against the library original, and FAILS (rather than accepts) a file that has come out more than 1% and more than a second SHORT, or that
         reports no duration at all where the original had one - the signature of an out-of-memory-killed or unfinalised encode from an earlier stage. A longer
         output is accepted, and so is a file clean_and_remux's recover_bad_* repaired in the same job: a repaired file legitimately reports its true, shorter
         duration, so it is flagged with a warning for manual review rather than failed. The same goes for a broadcast .ts or .mpg capture remuxed to mkv or mp4
         in the same job with its video copied, not re-encoded: a capture whose timestamps jump or reset states a longer length than it holds. A later job on
         that file is checked in full again. This check has no setting.\n`,
-    Version: '4.999.69',
+    Version: '4.999.70',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -180,8 +180,9 @@ const details = () => ({
                 Use it only if you do not rely on in-file metadata.
                 \\nA file whose cover art a remux cannot keep - any .mov, since the .mov muxer stores none, or an mp4, m4v or m4a carrying another awk
                 plugin's marker tag, which a remux keeps only at the cost of the cover - is not remuxed only to remove tags: the tags stay rather than the
-                cover going. The same goes for a Dolby Vision record a remux would drop - one no ffmpeg copy keeps, or any Dolby Vision .mov, whose box a
-                .mov cannot store (clean_and_remux moves the file to mp4 or mkv, which keep it).`,
+                cover going. The same goes for a Dolby Vision record a remux would drop - one no ffmpeg copy keeps, or the Dolby Vision box of a .mov, which no
+                .mov write keeps (clean_and_remux moves the file to mp4 or mkv, which keep it); a .mov only tagged dvhe or dvh1, with no box, has none to
+                lose.`,
         },
         {
             name: 'method_mp4_faststart',
@@ -202,10 +203,10 @@ const details = () => ({
                 \\nforce (default): front-load the moov atom. It rides any remux this plugin makes, and otherwise forces ONE lossless -c copy remux the
                 first time a file arrives back-loaded (detected without decoding) - in a full awk stack, only a file no plugin before it remuxed. An
                 already-fronted file is left untouched, so this settles after one pass and never loops. A file whose Dolby Vision record no ffmpeg copy
-                keeps (one whose colour does not match its compatibility id, or an AV1 Profile 10.0 record), any Dolby Vision .mov (a .mov cannot store
-                its box - clean_and_remux moves the file to mp4 or mkv), or a file whose cover art a remux would drop (any .mov - its muxer stores none
-                - or an mp4, m4v or m4a carrying another awk plugin's marker tag, which a remux keeps only at the cost of the cover) stays back-loaded
-                rather than be remuxed for this alone.
+                keeps (one whose colour does not match its compatibility id, or an AV1 Profile 10.0 record), a .mov holding a Dolby Vision box (no .mov write
+                keeps it - clean_and_remux moves the file to mp4 or mkv; a .mov only tagged dvhe or dvh1 has none to lose), or a file whose cover art a remux
+                would drop (any .mov - its muxer stores none - or an mp4, m4v or m4a carrying another awk plugin's marker tag, which a remux keeps only at the
+                cost of the cover) stays back-loaded rather than be remuxed for this alone.
                 \\nstrip: never front-load. A remux this plugin makes for another reason - reordering, the default flag or remove_junk_tags - writes the
                 moov atom at the END, the mov muxer's default, so a front-loaded file it remuxes comes out back-loaded; it never remuxes for this alone.
                 Only pick this if you never stream this library remotely.`,
@@ -1072,7 +1073,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const keptCoverStream = (it) => ({ ...it.s, disposition: { attached_pic: 1 },
         tags: { filename: escMeta(it.name), mimetype: escMeta(it.mime), ...(it.title ? { title: escMeta(it.title) } : {}) } });
     const COVER_LOST_WHY = {
-        webm: '.webm stores no attachments',
+        webm: '.webm stores no attachments, and its muxer refuses an image track',
         nowork: 'Tdarr\'s cache path is not inside a tdarr-workDir2- job folder, so there is nowhere to stage it for -attach',
         unsafe: 'the work directory\'s path holds a character a preset cannot carry',
         name: 'its staging name is already an attachment\'s in this file',
@@ -1162,7 +1163,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return OUTPUT_MUXER_BY_EXT[c] ? ` -f ${OUTPUT_MUXER_BY_EXT[c]}` : null;
     };
     const noMuxerSkipLine = (container) => `☒A .${container} file has no ffmpeg muxer that can write it back - left untouched; remux it to mkv or mp4 first`
-        + ' (clean_and_remux does that)\n';
+        + ' (clean_and_remux does that, or names any codec neither container stores)\n';
     // -=-=-= CONTAINER_REFUSES_COPY (+ containerRefusesCopy, copyRefusedSkipLine)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // The cells where even a STREAM COPY back into the same container is refused: the muxer has no way to store the codec at all, so it refuses at header
     // write whatever tag the stream carries (measured on jellyfin-ffmpeg 7.1.4, 2026-10-12; .wtv and .mxf 2026-11-14). Only another tool writes such a
@@ -3153,10 +3154,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // ====== END OUTPUT MAP + SOLE-DEFAULT FLAG ======
 
         // Why a remux made only for optional work (the front-load, remove_junk_tags) leaves video s alone, for the hold and its line, or '' when it does not:
-        // a record the copy loses (dvCopyDropsRecord), or any Dolby Vision box in a .mov, which every .mov write loses (movLosesDvBox) and clean_and_remux's
+        // a record the copy loses (dvCopyDropsRecord), or a Dolby Vision box in a .mov, which every .mov write loses (movLosesDvBox) and clean_and_remux's
         // move to mp4 or mkv keeps. A box a .mov write has dropped is gone for good, even where its HDR10/HLG base still plays (an iPhone Profile 8.4 HLG
-        // recording), so that work is not worth it.
-        const dvHeldWhy = (s) => (movLosesDvBox(dstContainer, s) && !dvCopyDropsRecord('mp4', s)
+        // recording), so that work is not worth it. A stream whose only Dolby Vision signal is its fourcc (a box-less dvhe or dvh1 .mov) has no box to lose,
+        // so it is not held: the .mov write keeps dvhe and writes dvh1 as hev1 (movDvReadBack), and movDvLossLine names the tag.
+        const dvHeldWhy = (s) => (movLosesDvBox(dstContainer, s) && isDolbyVisionVideo({ ...s, codec_tag_string: '' }, mediaInfoFor(s))
+            && !dvCopyDropsRecord('mp4', s)
             ? 'which a .mov cannot store - clean_and_remux moves the file to mp4 or mkv'
             : dvCopyDropsRecord(dstContainer, s) ? 'which no ffmpeg remux keeps' : '');
 
@@ -3216,20 +3219,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const coversAtRisk = mp4CoversLost(tagPlan, dstContainer, file.ffProbeData.streams.filter((s) => !uncopyable.includes(s)));
         if (!orderChanged && dispositionArgs === '' && (dvHeld.length || coversAtRisk.length)) {
             const why = [backLoaded && 'front-load the moov atom', junkArgs !== '' && 'remove junk tags'].filter(Boolean).join(' and ');
-            // A stream whose only Dolby Vision signal is its fourcc holds no record to drop, so it is named as movDvLossLine names it: a tag with no box.
-            const tagOnly = dvHeld.filter((s) => !isDolbyVisionVideo({ ...s, codec_tag_string: '' }, mediaInfoFor(s)));
-            const lost = [...dvHeld.filter((s) => !tagOnly.includes(s)).map((s) => `${dvHeld.length > 1 ? `the Dolby Vision record of video ${s.index}`
-                : 'this video\'s Dolby Vision record'}, ${dvHeldWhy(s)}`), ...(coversAtRisk.length ? [`the cover art, which .${dstContainer} cannot store${
-                dstContainer === 'mov' ? '' : ` beside the ${tagPlan.markers.map((m) => logSafe(m, TAG_KEY_LOG_MAX)).join(', ')} marker`}`] : [])];
-            const stale = tagOnly.map((s) => {
-                const tag = String(s.codec_tag_string || '').toLowerCase().trim();
-                return `${dvHeld.length > 1 ? `video ${s.index}` : 'the video'} is tagged ${tag} but holds no Dolby Vision box${tag === 'dvhe'
-                    ? ' - run clean_and_remux first to move the file to mp4 or mkv, which drops the stale tag' : ''}`;
-            });
-            const said = lost.length ? [`a remux to ${why} would drop ${lost.join(', and ')}`, ...stale].join(', and ')
-                : `no remux to ${why} while ${stale.join(', and ')}`;
+            const lost = [...dvHeld.map((s) => `${dvHeld.length > 1 ? `the Dolby Vision record of video ${s.index}` : 'this video\'s Dolby Vision record'}, ${
+                dvHeldWhy(s)}`), ...(coversAtRisk.length ? [`the cover art, which .${dstContainer} cannot store${dstContainer === 'mov' ? ''
+                : ` beside the ${tagPlan.markers.map((m) => logSafe(m, TAG_KEY_LOG_MAX)).join(', ')} marker`}`] : [])];
             return skip(`☑${dvHeld.length === 1 ? streamTag(dvHeld[0].index) : ''}${backLoaded ? `[method_mp4_faststart=${methodMp4Faststart}]` : ''}`
-                + `${junkArgs !== '' ? `[remove_junk_tags=${removeJunkTags}]` : ''} Left as it is - ${said}\n`);
+                + `${junkArgs !== '' ? `[remove_junk_tags=${removeJunkTags}]` : ''} Left as it is - a remux to ${why} would drop ${lost.join(', and ')}\n`);
         }
 
         // A subtitle ffprobe names no codec for cannot be copied (sub_worker's commitPreset has the measurement), so the remux is stopped, naming it.

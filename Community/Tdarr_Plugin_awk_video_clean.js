@@ -14,7 +14,7 @@ const details = () => ({
                      -Stack order: clean_and_remux first; video_clean / audio_clean / sub_worker in any order (sub_worker before video_clean when the video
                      carries closed captions); stream_ordering last. Embedded closed captions are why sub_worker goes first: re-encoding is the one thing that
                      can destroy them (see guard_captions).\n\n`,
-    Version: '3.999.97',
+    Version: '3.999.98',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -1058,7 +1058,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return OUTPUT_MUXER_BY_EXT[c] ? ` -f ${OUTPUT_MUXER_BY_EXT[c]}` : null;
     };
     const noMuxerSkipLine = (container) => `☒A .${container} file has no ffmpeg muxer that can write it back - left untouched; remux it to mkv or mp4 first`
-        + ' (clean_and_remux does that)\n';
+        + ' (clean_and_remux does that, or names any codec neither container stores)\n';
     // -=-=-= CONTAINER_REFUSES_COPY (+ containerRefusesCopy, copyRefusedSkipLine)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // The cells where even a STREAM COPY back into the same container is refused: the muxer has no way to store the codec at all, so it refuses at header
     // write whatever tag the stream carries (measured on jellyfin-ffmpeg 7.1.4, 2026-10-12; .wtv and .mxf 2026-11-14). Only another tool writes such a

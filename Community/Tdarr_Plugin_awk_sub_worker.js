@@ -45,7 +45,7 @@ const details = () => ({
                 Embedded closed captions are why this plugin goes before video_clean: re-encoding the video is the one thing that can destroy them. Extract
                 with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since the sidecars would land
                 beside the source, where the output never sees them.`,
-    Version: '3.999.119',
+    Version: '3.999.120',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -1072,7 +1072,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const keptCoverStream = (it) => ({ ...it.s, disposition: { attached_pic: 1 },
         tags: { filename: escMeta(it.name), mimetype: escMeta(it.mime), ...(it.title ? { title: escMeta(it.title) } : {}) } });
     const COVER_LOST_WHY = {
-        webm: '.webm stores no attachments',
+        webm: '.webm stores no attachments, and its muxer refuses an image track',
         nowork: 'Tdarr\'s cache path is not inside a tdarr-workDir2- job folder, so there is nowhere to stage it for -attach',
         unsafe: 'the work directory\'s path holds a character a preset cannot carry',
         name: 'its staging name is already an attachment\'s in this file',
@@ -1162,7 +1162,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return OUTPUT_MUXER_BY_EXT[c] ? ` -f ${OUTPUT_MUXER_BY_EXT[c]}` : null;
     };
     const noMuxerSkipLine = (container) => `☒A .${container} file has no ffmpeg muxer that can write it back - left untouched; remux it to mkv or mp4 first`
-        + ' (clean_and_remux does that)\n';
+        + ' (clean_and_remux does that, or names any codec neither container stores)\n';
     // -=-=-= CONTAINER_REFUSES_COPY (+ containerRefusesCopy, copyRefusedSkipLine)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // The cells where even a STREAM COPY back into the same container is refused: the muxer has no way to store the codec at all, so it refuses at header
     // write whatever tag the stream carries (measured on jellyfin-ffmpeg 7.1.4, 2026-10-12; .wtv and .mxf 2026-11-14). Only another tool writes such a

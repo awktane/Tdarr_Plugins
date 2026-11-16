@@ -15,7 +15,7 @@ const details = () => ({
                   closed captions); stream_ordering last.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.99',
+    Version: '4.999.100',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -1306,7 +1306,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     const keptCoverStream = (it) => ({ ...it.s, disposition: { attached_pic: 1 },
         tags: { filename: escMeta(it.name), mimetype: escMeta(it.mime), ...(it.title ? { title: escMeta(it.title) } : {}) } });
     const COVER_LOST_WHY = {
-        webm: '.webm stores no attachments',
+        webm: '.webm stores no attachments, and its muxer refuses an image track',
         nowork: 'Tdarr\'s cache path is not inside a tdarr-workDir2- job folder, so there is nowhere to stage it for -attach',
         unsafe: 'the work directory\'s path holds a character a preset cannot carry',
         name: 'its staging name is already an attachment\'s in this file',
@@ -1396,7 +1396,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         return OUTPUT_MUXER_BY_EXT[c] ? ` -f ${OUTPUT_MUXER_BY_EXT[c]}` : null;
     };
     const noMuxerSkipLine = (container) => `☒A .${container} file has no ffmpeg muxer that can write it back - left untouched; remux it to mkv or mp4 first`
-        + ' (clean_and_remux does that)\n';
+        + ' (clean_and_remux does that, or names any codec neither container stores)\n';
     // -=-=-= CONTAINER_REFUSES_COPY (+ containerRefusesCopy, copyRefusedSkipLine)  [audio_clean, stream_ordering, sub_worker, video_clean] =-=-=-
     // The cells where even a STREAM COPY back into the same container is refused: the muxer has no way to store the codec at all, so it refuses at header
     // write whatever tag the stream carries (measured on jellyfin-ffmpeg 7.1.4, 2026-10-12; .wtv and .mxf 2026-11-14). Only another tool writes such a
@@ -2249,10 +2249,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // Single-word keywords stripped when recovering the channel/base portion of a title (multi-word
     // keywords like "hearing impaired" can't appear as a lone channel token, so they are skipped).
     const stripWords = new Set(Object.values(dispositionTypes).flatMap(d => d.keywords).filter(w => !w.includes(' ')));
-    // Trim a token's non-word edges by index, for the reason cleanStreamTitle's quote strip does: /^[^\w]+|[^\w]+$/ backtracks from every offset inside a
-    // long interior non-word run. \w is ASCII-only, so every non-Latin LETTER counts as non-word and an ordinary whitespace-free CJK/Cyrillic title is one
-    // token long enough to trigger it (60k characters measured 5.7 s of blocked worker) - no crafted punctuation needed. Output is identical.
-    const WORD_CHAR = /\w/;
+    // Trim a token to keywordRegex's letter/digit edge, so the stripper drops each single-word keyword the role reader reads (a lone 'Forcé' as
+    // 'Forcés'; '_' is an edge to both). By index, for the reason cleanStreamTitle's quote strip does: /^[^\w]+|[^\w]+$/ backtracks from every offset
+    // inside a long interior non-word run (a 60k-character whitespace-free Cyrillic title, all non-word to ASCII \w, measured 5.7 s of blocked worker).
+    const WORD_CHAR = /[\p{L}\p{N}]/u;
     const trimNonWord = (tok) => {
         const s = String(tok);
         let a = 0; let b = s.length;
