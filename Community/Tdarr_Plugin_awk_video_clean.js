@@ -14,7 +14,7 @@ const details = () => ({
                      -Stack order: clean_and_remux first; video_clean / audio_clean / sub_worker in any order (sub_worker before video_clean when the video
                      carries closed captions); stream_ordering last. Embedded closed captions are why sub_worker goes first: re-encoding is the one thing that
                      can destroy them (see guard_captions).\n\n`,
-    Version: '3.999.96',
+    Version: '3.999.97',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -164,14 +164,14 @@ const details = () => ({
             type: 'string',
             defaultValue: '23',
             inputUI: { type: 'text' },
-            tooltip: `Constant-quality target for 1080p output (height 721-1080). HEVC-CRF scale, lower = better. See quality_sd.`,
+            tooltip: `Constant-quality target for 1080p output (height 721-1088, 1080 with its coding pad). HEVC-CRF scale, lower = better. See quality_sd.`,
         },
         {
             name: 'quality_4k',
             type: 'string',
             defaultValue: '25',
             inputUI: { type: 'text' },
-            tooltip: `Constant-quality target for UHD output (height > 1080, i.e. 1440p/4K). HEVC-CRF scale, lower = better. See quality_sd.`,
+            tooltip: `Constant-quality target for UHD output (height > 1088, i.e. 1440p/4K). HEVC-CRF scale, lower = better. See quality_sd.`,
         },
         {
             name: 'method_bitdepth',
@@ -2844,11 +2844,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // One candidate's test encode. o = { spawn(cmd, argv, opts) -> spawnSync-shaped result, ffmpeg, ffprobe ('' = none), file, streamIndex (the primary's
     // absolute index), inputArgv, videoArgv, isCpu, durationS, startS, capH (0 = no cap), declaredFps (a corroborated output frame rate, or 0), logOnly
-    // (one window, no re-run, no decode check), lastResort() (true for the last candidate standing: one retry from the start of the file; asked only once
-    // a mid-file window has failed), endRead (set only by the end-reading retry below: durationS is already the span from startS), memo: { keyframes: Map,
-    // decodes: Map, encoded: Set } shared by every candidate of one file }. Returns { outcome: 'pass' | 'fail' | 'stall' | 'slow' | 'source' | 'noexec',
-    // estimateH, windows (how many the estimate pooled), fps, needFps, why, tail, busy, dv, inconclusive, noFrameS, stallFrames, sourceAtS, fromStart,
-    // firstFail (the failed window a retry from the start replaced) }.
+    // (one window, no re-run, no decode check - bar the end-reading retry below, which replaces only a window that read nothing or under half its content,
+    // so a log-only candidate spends at most one short window more and logs a real estimate), lastResort() (true for the last candidate standing: one retry
+    // from the start of the file; asked only once a mid-file window has failed), endRead (set only by the end-reading retry below: durationS is already the
+    // span from startS), memo: { keyframes: Map, decodes: Map, encoded: Set } shared by every candidate of one file }. Returns { outcome: 'pass' | 'fail' |
+    // 'stall' | 'slow' | 'source' | 'noexec', estimateH, windows (how many the estimate pooled), fps, needFps, why, tail, busy, dv, inconclusive, noFrameS,
+    // stallFrames, sourceAtS, fromStart, firstFail (the failed window a retry from the start replaced) }.
     const runTestEncode = (o) => {
         const dur = Number(o.durationS) > 0 ? Number(o.durationS) : 0;
         const start = Number(o.startS) > 0 ? Number(o.startS) : 0;
@@ -3023,7 +3024,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // ffmpeg's Matroska writer (and a fragmented mp4) states the duration as the absolute END, not the span from the start (a 10 s mkv written from
             // 1.0 s probes start 1.0, duration 11.0 on 7.1.4), so on a file starting after zero a window lands past the content, or so near its end that it
             // ends early (a segment part at 42.0-60.0 s seeked to 16.1 s of its 18 s). The span reading goes first, since MKVToolNix and a plain mp4 state
-            // the span and the end reading would under-state theirs; such a window retries once over [start, dur].
+            // the span and the end reading would under-state theirs; such a window retries once over [start, dur], a log-only candidate's too (see logOnly).
             if ((w.empty || w.noEstimate === 'eof-early') && T !== null && !o.endRead && start > 0 && start < dur) {
                 return runTestEncode({ ...o, durationS: dur - start, endRead: true });
             }
@@ -3154,9 +3155,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
 
     // ====== OUTPUT TIER + CONTAINER ======
 
-    // Map an output height to its resolution tier (SD/720p/1080p/4K, boundaries 576/720/1080), so the CRF ladder (qualityForHeight)
+    // Map an output height to its resolution tier (SD/720p/1080p/4K, boundaries 576/720/1088), so the CRF ladder (qualityForHeight)
     // and the Dolby-Vision VBV ladder (DV_VBV_KBPS_BY_TIER) share one set of breakpoints instead of repeating them.
-    const heightTier = (h) => (h <= 576 ? 'sd' : h <= 720 ? 'p720' : h <= 1080 ? 'p1080' : 'p4k');
+    // 1088 is 1080 plus the 16-row coding pad, which a 1080p stream written with no crop window reports as its height.
+    const heightTier = (h) => (h <= 576 ? 'sd' : h <= 720 ? 'p720' : h <= 1088 ? 'p1080' : 'p4k');
     // A Dolby Vision encode's -maxrate per output tier, in kb/s - why one is needed at all is at its use in buildVideoArgs.
     const DV_VBV_KBPS_BY_TIER = { sd: 10000, p720: 20000, p1080: 40000, p4k: 100000 };
 
@@ -4600,7 +4602,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // the user asked for in their own right (the repair is the one that CAN still grow the file: a shot-on-video source comes back at double frame rate).
         // floorRate is the rate the floor would decline the re-encode at, read from the probes alone; whether it does is decided late, where the floor is the
         // last word (shrinkDeclined, in the transcode branch): guard_lossless, the Dolby Vision and HDR refusals, the awk_video fence and a lossless strip all
-        // answer for the file ahead of it, so theirs is the line shown, and the timeline read is spent only where the floor's verdict decides the file.
+        // answer for the file ahead of it, so theirs is the line shown (the refusals answer ahead of the unstorable-fence decline below the same way), and the
+        // timeline read is spent only where the floor's verdict decides the file.
         let floorRate = null;
         if (action === 'shrink' && codecTrigger && guardShrinkKbps > 0) {
             // ffprobe's file rate is size over the stated duration. A file that starts well after zero may have kept another recording's clock (a -copyts
@@ -4661,29 +4664,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         const shrinkDeclined = () => !!floorRate && !willDownscale && !tonemap && !deinterlaceNeeded() && floorDeclines();
         // A same-codec size pass has ONE stop - the awk_video fence below - and a container that cannot store the tag has nowhere to keep it: the next pass
         // recomputes the identical fingerprint, finds nothing, and re-emits a byte-identical preset, which Tdarr refuses as an infinite transcode loop and
-        // ERRORS the file (across separate library scans, where that guard does not apply, it is generational re-encoding instead). Drop the codec trigger
-        // rather than the file: a downscale, tonemap or deinterlace pass converges on its own evidence and still runs. normalize needs no fence at all - it
-        // fires only on a codec mismatch, which the encode itself removes. A file under the floor is the floor's to decline: no timeline read runs on such a
-        // container, so its verdict there is already final, and its line the accurate one.
-        let fenceUnstorable = false;
-        if (action === 'shrink' && codecTrigger && !floorRate && !markerPersists(dstContainer)) {
-            codecTrigger = false;
-            fenceUnstorable = true;
-            response.infoLog += `☒${pTag}[action=shrink][container=${dstContainer}] A size pass records what it did in an `
-                + `${VIDEO_FENCE_TAG} tag and ${dstContainer} cannot store one, so every later pass would re-encode this file again - declining the shrink;`
-                + ' remux to mkv or mp4 first (clean_and_remux does that) to enable it\n';
-        }
+        // ERRORS the file (across separate library scans, where that guard does not apply, it is generational re-encoding instead). So such a size pass is
+        // declined, by dropping the codec trigger rather than the file: a downscale, tonemap or deinterlace pass converges on its own evidence and still runs.
+        // normalize needs no fence at all - it fires only on a codec mismatch, which the encode itself removes. A file under the floor is the floor's to
+        // decline: no timeline read runs on such a container, so its verdict there is already final, and its line the accurate one. The decline waits until
+        // after the refusals below, so a file guard_lossless or a Dolby Vision or HDR refusal protects gets that refusal, not advice to remux it first.
+        const fenceUnstorable = action === 'shrink' && codecTrigger && !floorRate && !markerPersists(dstContainer);
         // Three of the four triggers are pure stream metadata; the fourth is the idet DECODE. Split so the cheap ones are tried first: deciding WHETHER to
         // encode needs the decode only when interlace repair would be the sole reason, and once an encode is happening with deinterlace live the verdict is
         // read anyway, because it picks the repair filter. Every consumer below therefore calls realTranscode() with its own cheap metadata test to the LEFT of
         // it, so a file that guard_lossless or the DV and HDR refusals were always going to settle never spawns ffmpeg to be told something it does not use.
         // The awk_video fence is the deliberate exception: it is tested INSIDE the realTranscode() branch, so a fenced file whose only live trigger is
         // deinterlace does pay one idet decode per re-cycle. Hoisting it left would pre-empt the strip_dynamic lossless path below and re-label every fenced
-        // no-trigger skip with the fence line instead of its accurate reason. codecTrigger still holds a re-encode under the floor (floorRate): the refusals
-        // below and the fence answer for such a file first, and the floor decides it inside that branch (shrinkDeclined).
-        const cheapTrigger = codecTrigger || willDownscale || tonemap;
-        // Interlace repair forces a real encode exactly as a downscale or a tonemap does.
-        const realTranscode = () => cheapTrigger || deinterlaceNeeded();
+        // no-trigger skip with the fence line instead of its accurate reason. codecTrigger is read live: the refusals see a size pass the unstorable fence
+        // declines after them, and a re-encode under the floor (floorRate), which the refusals and the fence answer for first and the floor decides inside
+        // that branch (shrinkDeclined). Interlace repair forces a real encode exactly as a downscale or a tonemap does.
+        const realTranscode = () => codecTrigger || willDownscale || tonemap || deinterlaceNeeded();
         const canEncodeTarget = ENCODABLE_CODECS.includes(targetCodecName);
         // No cross-compatible base (compat id 0 / no surviving HDR transfer, e.g. profile 5): the mp4 output needs the dvh1 tag - hvc1 drops the DV box
         // entirely; a stream WITH a base keeps hvc1.
@@ -4724,6 +4720,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return skip(`☒${pTag}[hdr_mode=preserve] ${dynLabel} can't survive a re-encode - left untouched to protect it; `
                 + `${guardDvWouldHelp ? 'enable guard_dv to carry the Dolby Vision through, or ' : ''}`
                 + `set hdr_mode=strip_dynamic (keep the HDR10 base) or hdr_mode=tonemap_sdr (flatten to SDR)\n`);
+        }
+        // No refusal answered for the file, so a size pass the awk_video fence cannot record is declined here (see fenceUnstorable).
+        if (fenceUnstorable) {
+            codecTrigger = false;
+            response.infoLog += `☒${pTag}[action=shrink][container=${dstContainer}] A size pass records what it did in an `
+                + `${VIDEO_FENCE_TAG} tag and ${dstContainer} cannot store one, so every later pass would re-encode this file again - declining the shrink;`
+                + ' remux to mkv or mp4 first (clean_and_remux does that) to enable it\n';
         }
 
         // ====== RUN STATE (captions, library original) ======
@@ -4809,11 +4812,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return digestMemo.get(key);
         };
         // Why sub_worker's pending `strip` may belong to another video ('' when it is honoured), memoised: asked once, right before the encode that would
-        // serve it (after every skip and refusal, before the test encodes). A request beside the caption track sub_worker imported is honoured with no read
-        // - the captions are in this file as that track. Otherwise the read's inherited fingerprint is checked against the primary (ccFpStaleWhy, where a
-        // failed read counts as stale). An mp4-family file keeps no track tag, so there any hearing-impaired mov_text track is that track whatever its
-        // language - language_fill gives the imported one a language, as clean_and_remux's language_sub stop advises. The cost: an unrelated SDH track left
-        // after the real one was removed by hand has a stale request honoured with no read.
+        // serve it (after every skip and refusal, before the test encodes): a refused file serves no strip, so a stale request there waits, with nothing
+        // stripped, until the refusal clears. A request beside the caption track sub_worker imported is honoured with no read - the captions are in this
+        // file as that track. Otherwise the read's inherited fingerprint is checked against the primary (ccFpStaleWhy, where a failed read counts as stale).
+        // An mp4-family file keeps no track tag, so there any hearing-impaired mov_text track is that track whatever its language - language_fill gives the
+        // imported one a language, as clean_and_remux's language_sub stop advises. The cost: an unrelated SDH track left after the real one was removed by
+        // hand has a stale request honoured with no read.
         let ccStaleMemo = null;
         const ccStripStaleWhy = () => {
             if (ccStaleMemo !== null) return ccStaleMemo;
@@ -4885,7 +4889,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // that was just named instead of comparing two differently-derived figures.
                 const altFloor = (over) => memoryEstimate({ ...common, ...over, floor: true });
                 const trades = [];   // { text, mb }: mb is the trade's own floor
-                if (outHeight > 1080) {
+                if (outHeight > 1088) {   // a 1088-line output is already 1080p (heightTier)
                     const m = altFloor({ outH: 1080 });
                     if (m !== null) trades.push({ text: `downscale=1080 (~${memGbFromMb(m)})`, mb: m });
                 }
@@ -5380,8 +5384,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.infoLog += `☐${pTag}${savingsTag} This encode is not judged on size - the original video stream cannot be put back`
                     + ` (${unrestorable})\n`;
             }
-            // A quality past the target's scale encodes at the scale's end (nativeQuality's clamp), so the line then names what is encoded beside the setting.
-            const clamped = cpuCrf !== Math.round(qNorm) + (targetCodecName === 'av1' ? AV1_Q_OFFSET : 0) ? ` (crf ${cpuCrf} for ${targetCodecName})` : '';
+            // A quality past the target's scale encodes at the scale's end (nativeQuality's clamp), so the line then names what is encoded beside the setting,
+            // in words every encoder family shares: only the CPU encoders take it as a crf.
+            const clamped = cpuCrf !== Math.round(qNorm) + (targetCodecName === 'av1' ? AV1_Q_OFFSET : 0)
+                ? ` (clamped to ${cpuCrf} for ${targetCodecName})` : '';
             response.infoLog += `☐${pTag}${encodeTag} Transcoding video @ ${sel.encoderName} q${Math.round(qNorm)}${clamped}\n`;
             response.infoLog += expectedResultsLine(predictTranscodedVideoToken(), encoded);
             return response;
@@ -5782,7 +5788,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const priorCore = priorSig.replace(/-v[^-]*$/, '');
             const fenceMatches = priorSig !== '' && coreHolds(priorCore, fenceBoxed);
             // The floor decides a re-encode nothing else forces once the fence has not settled the file, so a fenced file never pays its timeline read - but
-            // ahead of the fence where a dynamic-HDR strip is asked for: noTranscode strips losslessly, which the fence never pre-empts (see cheapTrigger).
+            // ahead of the fence where a dynamic-HDR strip is asked for: noTranscode strips losslessly, which the fence never pre-empts (see realTranscode).
             if (effHdrMode === 'strip_dynamic' && isDynamicHdr && shrinkDeclined()) return noTranscode();
             // An inherited fence that no longer describes the video counts as absent - here, and for the implicit fence below - and the encode below writes a
             // fresh one. Its line is held until the run knows it encodes, so the implicit fence can say the same fact without "processing it again".
