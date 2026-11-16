@@ -45,7 +45,7 @@ const details = () => ({
                 Embedded closed captions are why this plugin goes before video_clean: re-encoding the video is the one thing that can destroy them. Extract
                 with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since the sidecars would land
                 beside the source, where the output never sees them.`,
-    Version: '3.999.122',
+    Version: '3.999.123',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -4247,7 +4247,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             advise ? ` set method_import_metadata=sidecar to put ${them} on the track, or` : ''} rename or delete the sidecar to drop ${them}\n`;
     };
     // Under method_import_metadata=sidecar, a sidecar of the track whose name does not speak for it (`speakers` do): an earlier name beside the current one,
-    // or an apart group's other member. What its name gives lives only there, and it stays.
+    // one whose own track has left the file, or an apart group's other member. What its name gives lives only there, and it stays.
     const unspokenLine = (at, rel, u, speakers) => {
         const { what, lives, them } = unappliedWords(u); const by = speakers.map((x) => logSafe(x)).join(', ');
         return `☑${streamTag(at)}[method_import_metadata=sidecar] Not retagging the track from ${logSafe(rel)}: it takes its name from ${by}, so ${what} that`
@@ -6889,28 +6889,38 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             const sayLang = (said.find((m) => langKey(m.lang || 'und') !== 'und') || said[0]).lang;
             const nameLang = langKey(sayLang || 'und') === 'und' ? '' : sayLang;
             const wantLang = nameLang || resolveLang(cur) || 'und';
-            const same = (wantTitle === null || (!!cur && titleAgrees(cur, wantTitle))) && langAgrees(resolveLang(cur), wantLang)
-                && sameDispositions(curDisp, wantDisp);
-            return { wantTitle, nameDisp, wantDisp, nameLang, wantLang, same };
+            // `role`: the track already has the language and flags the names ask for, whatever its title (embeddedAt's role tier).
+            const role = langAgrees(resolveLang(cur), wantLang) && sameDispositions(curDisp, wantDisp);
+            const same = (wantTitle === null || (!!cur && titleAgrees(cur, wantTitle))) && role;
+            return { wantTitle, nameDisp, wantDisp, nameLang, wantLang, same, role };
         };
         // The name extract gives the track at source index idx now, null where no text track is.
         const currentName = (idx) => { const s = keptSubs.find((x) => x.index === idx); return s && isTextSub(s) ? sidecarBasename(s, false) : null; };
-        // A bundle is an archive, not comparable text, so it is never matched this way; a null map means the probe could not run (see embeddedTextHashes).
-        // f.matchedBy records which identity matched (sidecarMatch), so the deletion below can keep a sidecar the import stripped. Of the tracks holding the
-        // text, the one members `by` name, by the first test one passes - of several, the one at a member's own name index, else the first: one that
-        // already has a member's whole name (retuneFor's same - a pick that changes nothing); one whose language and title a TITLED name gives
-        // (metaMatchesStream, the title compared on the mp4 family too, where the handler carries it - this only chooses among tracks holding the text; a
-        // name with no title says nothing of one, so it never picks an untitled twin); then any. The first holder alone gave an 'English Forced' sidecar
-        // its byte-identical 'English SDH' twin, and a retune took that track's title and SDH flag. A sidecar renamed to neither twin's title after a
-        // reorder swapped them takes its stale index; one renamed to read as its twin is read as the twin's, and changes nothing.
-        const embeddedAt = (f, by = f.members) => {
+        // The tracks holding group f's text, null where none can be told. A bundle is an archive, not comparable text, so it is never matched this way; a
+        // null map means the probe could not run (see embeddedTextHashes). f.matchedBy records which identity matched (sidecarMatch), so the deletion below
+        // can keep a sidecar the import stripped.
+        const holdingOf = (f) => {
             if (f.bundle || !embeddedHashes || !embeddedHashes.size || !groupHash.has(f.members)) return null;
             f.matchedBy = sidecarMatch(f, isMp4, embeddedHashes.values());
             if (!f.matchedBy) return null;
             const h = f.matchedBy === 'text' ? sidecarContent(f)?.sha1 : sidecarRoundTripHash(f, isMp4);
-            const holding = keptSubs.filter((s) => embeddedHashes.get(s.index) === h);
+            return keptSubs.filter((s) => embeddedHashes.get(s.index) === h);
+        };
+        // Of those tracks, the one members `by` name, by the first test one passes - of several, the one at a member's own name index, else the first: one
+        // that already has a member's whole name (retuneFor's same - a pick that changes nothing); one that has a member's language and flags, whatever its
+        // title (retuneFor's role); one whose language and title a TITLED name gives (metaMatchesStream, the title compared on the mp4 family too, where
+        // the handler carries it - this only chooses among tracks holding the text; a name with no title says nothing of one, so it never picks an untitled
+        // twin); then any. The first holder alone gave an 'English Forced' sidecar its byte-identical 'English SDH' twin, and a retune took that track's
+        // title and SDH flag. The title before the role gave an SDH track's 'English' sidecar, the track retitled 'English SDH' since (tag_title), to its
+        // plain 'English' twin, which took the SDH flag; after a reorder, a sidecar whose title neither twin carries took its stale index, now the twin. A
+        // sidecar renamed to read as its twin - its whole name, or its language and flags under a title that gives none of them ('Alt' renamed from
+        // '.forced' to plain beside a plain 'Main') - is read as the twin's: the first changes nothing, the second retitles the twin.
+        const embeddedAt = (f, by = f.members) => {
+            const holding = holdingOf(f);
+            if (!holding) return null;
             const pick = (list) => list.find((s) => by.some((m) => m.index === s.index)) || list[0];
-            return (pick(holding.filter((s) => by.some((m) => retuneFor(s, [m], m.title).same)))
+            const agreeing = (part) => pick(holding.filter((s) => by.some((m) => retuneFor(s, [m], m.title)[part])));
+            return (agreeing('same') || agreeing('role')
                 || pick(holding.filter((s) => by.some((m) => nameTextOf(m.title) && metaMatchesStream(s, m, false)))) || pick(holding))?.index ?? null;
         };
         // Where a group's text is already in the file, each member speaks for the track it names, as an apart group goes in as one track per member
@@ -6920,6 +6930,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // that title names. One entry for the group spoke for one track with every member's flags: under method_import_metadata=sidecar a plain 'English'
         // track took the SDH flag of its same-text 'English' SDH twin's sidecar. Members all naming one track take that track: picked by all of them at
         // once, one name's own index won among the tracks any of them agreed with (a title-less name agrees with every title), and the twin was retitled.
+        // A member whose own index holds none of the text and whose language and flags no holder has - its track removed since - says nothing for a track
+        // another member names, as an earlier name says nothing (unheard): speaking, an SDH name whose track clean_and_remux's remove_sub_sdh=all took
+        // flagged the plain twin SDH, the same filter took that one too, and the file kept no subtitle of the text. Alone it speaks, as an earlier name
+        // alone does - also once remove_source=true has deleted the sidecar that named the track, so there its role reaches the twin a pass later.
+        const unheard = new Set();
         const splitByTrack = (f) => {
             const at = new Map(f.members.map((m) => [m, embeddedAt(f, [m])]));
             for (const m of f.members) {
@@ -6928,6 +6943,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             const byTrack = new Map();
             for (const m of f.members) byTrack.set(at.get(m), [...(byTrack.get(at.get(m)) || []), m]);
+            const holding = holdingOf(f) || [];
+            const left = (m) => m.index !== null && !holding.some((s) => s.index === m.index || retuneFor(s, [m], m.title).role);
+            for (const [idx, members] of byTrack) if (idx !== null && members.some((m) => !left(m))) members.filter(left).forEach((m) => unheard.add(m));
             if (byTrack.size < 2) {
                 const [only] = byTrack.keys();
                 if (only !== null) f.embeddedAt = only;
@@ -6993,13 +7011,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 response.infoLog += `☑${streamTag(at)}[deduplicate=${dedupeMode}] ${f.rel} is already in the file - not importing a second copy\n`;
             }
             const cur = keptSubs.find((s) => s.index === at);
-            // The members that speak for the track (said). Where one is at the track's current name, as extract spells it now, another at the track's own
-            // index is an earlier name of it - one extract left beside the current one on a node that cannot rename - and says nothing: its title and flags
-            // undid a user's retitle (measured: 'Notes' {} retagged 'Director Notes' {forced}). An apart group goes in as one track per member, so the track
-            // speaks for the member whose title it carries (or cut, titleCutFrom), else for the first titled one - the group's union put both of an SDH and
-            // Forced pair's flags on one track; a merged group's members naming this track (splitByTrack) speak together.
+            // The members that speak for the track (said); one unheard (splitByTrack) never does. Where one is at the track's current name, as extract spells
+            // it now, another at the track's own index is an earlier name of it - one extract left beside the current one on a node that cannot rename - and
+            // says nothing: its title and flags undid a user's retitle (measured: 'Notes' {} retagged 'Director Notes' {forced}). An apart group goes in as
+            // one track per member, so the track speaks for the member whose title it carries (or cut, titleCutFrom), else for the first titled one - the
+            // group's union put both of an SDH and Forced pair's flags on one track; a merged group's members naming this track (splitByTrack) speak together.
             const current = currentName(at);
-            const voice = f.members.some((m) => m.name === current) ? f.members.filter((m) => m.index !== at || m.name === current) : f.members;
+            const heard = f.members.filter((m) => !unheard.has(m));
+            const voice = heard.some((m) => m.name === current) ? heard.filter((m) => m.index !== at || m.name === current) : heard;
             const said = !f.apart ? voice : [voice.find((m) => carries(cur, m)) || voice.find((m) => nameTextOf(m.title)) || voice[0]];
             const { wantTitle, nameDisp, wantDisp, nameLang, wantLang, same } = retuneFor(cur, said, f.title);
             // What the deletion and the marker below weigh each member by (unapplied).
