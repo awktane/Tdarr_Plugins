@@ -32,7 +32,7 @@ const details = () => ({
                      -Includes option to attempt to recover damaged or corrupted files by removing corrupt frames and fixing timestamps\n\n
                      -Embedded fonts are kept while a styled subtitle that uses them (ASS/SSA) survives, and removed once orphaned. Unidentifiable
                          attachments are left untouched on mkv, and dropped for an mp4 target (which cannot carry any attachment).\n\n`,
-    Version: '4.999.96',
+    Version: '4.999.97',
     Tags: 'pre-processing,ffmpeg,configurable',
     Inputs: [
         {
@@ -302,7 +302,8 @@ const details = () => ({
                 DVD, signed 8-bit, unsigned and planar PCM, which neither stores as they are, are instead repacked as plain PCM without losing a sample, as
                 are big-endian float and 64-bit PCM bound for mkv.
                 \\nA subtitle ffmpeg cannot name (a WebVTT track mkvmerge wrote, or a USF or Kate one) is governed the same way, but stops the file only when
-                this run would remux it anyway - a file with nothing else to change is left as it is. drop removes it; mkv_fallback stops as error does.`,
+                this run would remux it anyway - a file with nothing else to change is left as it is. drop deletes the subtitle; mkv_fallback stops as error
+                does. Converting it outside Tdarr keeps it: extract it with mkvextract, convert it (to srt, say) and mux the result back with mkvmerge.`,
         },
         {
             name: 'guard_audio_language',
@@ -502,7 +503,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (18 sections: stream codec type … ffmpeg metadata escaping)
+    // #region SHARED helpers (19 sections: stream codec type … ffmpeg metadata escaping)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -1314,6 +1315,33 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // source stream - whole-file summaries, and brand-new/appended streams that have no source index of their own.
     const streamTag = (index) => `[s${String(index).padStart(2, ' ')}]`;
     // ===== END SHARED: stream / language / preset helpers =====
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: unnamed subtitle codec =====
+    // -=-=-= UNNAMED_CODECS / unnamedSub  [all five] =-=-=-
+    // A subtitle stream ffmpeg cannot name: a Matroska CodecID this build maps to no codec - mkvmerge's WebVTT (S_TEXT/WEBVTT, common in web-sourced files,
+    // which neither jellyfin-ffmpeg 7.1.4 nor mainline 9.0.2 reads) above all, and S_TEXT/USF, S_KATE and S_IMAGE/BMP measured - which ffprobe's JSON gives
+    // no codec_name ('' here; other writers print 'unknown' or 'none'). Both muxers refuse a copy of one - matroska "Subtitle codec 0 is not supported"
+    // (exit 178), mp4 "Could not find tag for codec none" (exit 234) - and the refusal takes the whole run down, sidecar outputs included, so every write of
+    // the file fails in ffmpeg on every requeue. Each plugin therefore stops a pass that would copy one, naming it, and leaves a file it has nothing to write
+    // alone. mp4 and mov give an unknown subtitle sample entry no subtitle type at all (it probes as data).
+    const UNNAMED_CODECS = ['', 'unknown', 'none'];
+    const unnamedSub = (s) => codecTypeOf(s) === 'subtitle' && UNNAMED_CODECS.includes(codecNameOf(s));
+    // -=-=-= codecIdNote  [all five] =-=-=-
+    // mediaInfo still reads the CodecID ffmpeg cannot map, which tells the user which format such a subtitle is: ' (S_TEXT/USF)', or '' unread.
+    const codecIdNote = (s) => { const id = mediaInfoFor(s)?.CodecID; return id ? ` (${logSafe(id)})` : ''; };
+    // -=-=-= unnamedSubStop  [all five] =-=-=-
+    // The line a pass that would copy the unnamed subtitles `subs` stops on, after its ☒: one is named in the [s N] field, several in the text, each with
+    // the CodecID mediaInfo reads for it. mkvmerge cannot convert a subtitle, so keeping one means extracting, converting and muxing it back (measured on
+    // jellyfin-ffmpeg 7.1.4: an S_TEXT/WEBVTT track taken out with mkvextract, made an srt by ffmpeg and muxed back with mkvmerge reads as subrip, and the
+    // copy that failed runs). setting is clean_and_remux's [input=value] tag, and remove words a plugin's own way to delete the track.
+    const unnamedSubStop = (subs, setting = '', remove = (it) => `remove ${it} with mkvmerge`) => {
+        const one = subs.length === 1;
+        const it = one ? 'it' : 'them';
+        const lead = `${one ? streamTag(subs[0].index) : ''}${setting}`;
+        return `${lead}${lead ? ' ' : ''}ffmpeg names no codec for ${one ? `this subtitle${codecIdNote(subs[0])}`
+            : `subtitles ${subs.map((s) => `s${s.index}${codecIdNote(s)}`).join(', ')}`} and cannot copy ${it}, so this file cannot be written back - to keep `
+            + `${it}, extract ${it} with mkvextract, convert ${it} (to srt, say) and mux the result back with mkvmerge; or ${remove(it)}; then requeue`;
+    };
+    // ===== END SHARED: unnamed subtitle codec =====
 
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: free-text list split =====
@@ -1838,24 +1866,25 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // Flash ADPCM: mp4 has no tag for it, but matroska does carry it (its sibling adpcm_ima_qt does not) - so mkv_fallback CAN rescue this one.
         'adpcm_swf',
     ];
-    // Refused by BOTH muxers, so mkv_fallback cannot rescue these - there is nothing to fall back TO; the gate degrades them to error/drop and says so. The
-    // wording differs by family: matroska answers "No wav codec tag found for codec X" for the audio rows and "The Matroska muxer does not yet support muxing
-    // X" for RealVideo 1-3 and the RealAudio codecs bar 14.4 (cook, ra_288, sipr, atrac3 measured by retagging a 14.4 track's CodecID). (s302m occurs naturally
-    // only in MPEG-TS and the Real codecs in RealMedia, which is how a file can be carrying a codec neither of our two output containers accepts. Blu-ray and
-    // DVD LPCM are converted instead, see PCM_LOSSLESS_REMAP. rv40 is deliberately NOT here: it is the one RealVideo generation matroska implements, so it sits
-    // in the mp4-only list above, where mkv_fallback genuinely rescues it.) dfpwm, ComputerCraft's 1-bit audio, is the one whose matroska copy does not fail:
-    // it writes a track that reads back with no packets from an mkv, nut or mov source (measured on 7.1.4; an AVI source carries it at the AVI demuxer's wrong
-    // rate). A write-back plugin's -c copy of an mkv already holding dfpwm empties that track just as silently - accepted, as no video tool writes it.
+    // Refused by BOTH muxers, so mkv_fallback cannot rescue these - there is nothing to fall back TO; the gate degrades them to error/drop and says so.
+    // The wording differs by family: matroska answers "No wav codec tag found for codec X" for the audio rows and "The Matroska muxer does not yet support
+    // muxing X" for RealVideo 1-3 and the RealAudio codecs bar 14.4 (cook, ra_288, sipr, atrac3 measured by retagging a 14.4 track's CodecID). (s302m
+    // occurs naturally only in MPEG-TS and the Real codecs in RealMedia, which is how a file can be carrying a codec neither of our two output containers
+    // accepts. Blu-ray and DVD LPCM are converted instead, see PCM_LOSSLESS_REMAP. rv40 is deliberately NOT here: it is the one RealVideo generation
+    // matroska implements, so it sits in the mp4-only list above, where mkv_fallback genuinely rescues it.) dfpwm, ComputerCraft's 1-bit audio, is the one
+    // whose matroska copy does not fail: from an mkv, nut or mov source with video it writes a track that reads back with no packets, and from an
+    // audio-only one a file ffprobe cannot open at all ("End of file"; both measured on 7.1.4; an AVI source carries it at the AVI demuxer's wrong rate).
+    // A write-back plugin's -c copy of an mkv already holding dfpwm empties that track just as silently - accepted, as no video tool writes it.
     const UNMUXABLE_ANYWHERE = ['ac4', 'adpcm_ima_qt', 'atrac3', 'cook', 'dfpwm', 'nellymoser', 'ra_288', 'rv10', 'rv20', 'rv30', 's302m', 'sipr'];
     // Refused by MATROSKA but muxable into mp4 - the mirror of MP4_UNMUXABLE, measured the same way. Deliberately SHORTER than the mp4 half: only a codec
     // this build can encode, or that exists as a real sample, is testable at all, and matroska accepted nearly everything offered (every lossless video
     // codec, wmav1/wmav2, the adpcm family bar the two above, aac_latm, VVC, DTS, TrueHD). rawvideo is judged by its pixel format instead (below).
     const MKV_UNMUXABLE = ['mpegh_3d_audio'];
-    // The pixel formats matroska stores rawvideo in: a census of all 185 this build can output, each copied into mkv on 7.1.4, kept these 14 and refused
-    // the rest "No wav codec tag" - not just RGB (rgba is kept), but 4:4:4, every high-bit-depth format, gray16 and pal8 too. So rawvideo counts as refused by
-    // matroska only when its pix_fmt is read and is not one of these: listing the codec would refuse every storable file (a wrong row costs the user their
-    // file, a missing one only a diagnosis). Not -allow_raw_vfw: that mode round-trips bgr24 alone (170 other formats read back as bgr24), and a track it
-    // writes does not copy back without the flag (exit 234), so every write-back plugin would need it.
+    // The pixel formats matroska stores rawvideo in: a census of all 185 this build can output, each copied into mkv on 7.1.4, kept these 14 and refused the
+    // other 171 with "Raw RGB is not supported Natively in Matroska" (exit 234) - not just RGB (rgba is kept), but 4:4:4, every high-bit-depth format, gray16
+    // and pal8 too. So rawvideo counts as refused by matroska only when its pix_fmt is read and is not one of these: listing the codec would refuse every
+    // storable file (a wrong row costs the user their file, a missing one only a diagnosis). Not -allow_raw_vfw: that mode round-trips bgr24 alone (170 other
+    // formats read back as bgr24), and a track it writes does not copy back without the flag (exit 234), so every write-back plugin would need it.
     const MKV_RAWVIDEO_PIX_FMTS = ['yuv420p', 'yuvj420p', 'yuv422p', 'yuvj422p', 'yuv410p', 'yuv411p', 'yuyv422', 'uyvy422', 'yvyu422', 'nv12', 'nv21', 'gray',
         'rgba', 'vuya'];
     // The one codec mp4 gates rather than refuses: it answers "truehd in MP4 support is experimental, add '-strict -2'" (rc 88), and an OUTPUT-side -strict
@@ -1883,15 +1912,6 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         if (!Object.prototype.hasOwnProperty.call(PCM_LOSSLESS_REMAP, codec) || (dstContainer === 'mp4' && codec.startsWith('pcm_f'))) return '';
         return PCM_LOSSLESS_REMAP[codec] === 'pcm_s16le' && !/^(s16|u8)p?$/.test(String(s.sample_fmt || '')) ? 'pcm_s24le' : PCM_LOSSLESS_REMAP[codec];
     };
-    // A subtitle stream ffmpeg cannot name: a Matroska CodecID this build maps to no codec - mkvmerge's WebVTT (S_TEXT/WEBVTT) above all, and S_TEXT/USF,
-    // S_KATE and S_IMAGE/BMP measured - which ffprobe's JSON gives no codec_name ('' here; other writers print 'unknown' or 'none'). sub_worker and
-    // stream_ordering refuse their own write-back of one the same way. Both muxers refuse a copy of one - matroska "Subtitle codec 0 is not supported" (exit
-    // 178), mp4 "Could not find tag for codec none" (exit 234) - so any remux of the file fails in ffmpeg, on every requeue. mp4 and mov give an unknown
-    // subtitle sample entry no subtitle type at all (it probes as data, which the data rule removes).
-    const UNNAMED_CODECS = ['', 'unknown', 'none'];
-    const unnamedSub = (s) => codecTypeOf(s) === 'subtitle' && UNNAMED_CODECS.includes(codecNameOf(s));
-    // mediaInfo still reads the CodecID ffmpeg cannot map, which tells the user which format such a subtitle is: ' (S_TEXT/USF)', or '' unread.
-    const codecIdNote = (s) => { const id = mediaInfoFor(s)?.CodecID; return id ? ` (${logSafe(id)})` : ''; };
     // Whether `container` refuses stream s on a -c copy: the one answer the gate's class, its remedy, the mkv_fallback fold and fallbackKeeps all read.
     const refusedBy = (container, s) => {
         const codec = codecNameOf(s);
@@ -2359,15 +2379,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // keywords like "hearing impaired" can't appear as a lone channel token, so they are skipped).
     const stripWords = new Set(Object.values(dispositionTypes).flatMap(d => d.keywords).filter(w => !w.includes(' ')));
     // Trim a token to keywordRegex's letter/digit edge, so the stripper drops each single-word keyword the role reader reads (a lone 'Forcé' as
-    // 'Forcés'; '_' is an edge to both). By index, for the reason cleanStreamTitle's quote strip does: /^[^\w]+|[^\w]+$/ backtracks from every offset
+    // 'Forcés'; '_' is an edge to both). By position, for the reason cleanStreamTitle's quote strip is: /^[^\w]+|[^\w]+$/ backtracks from every offset
     // inside a long interior non-word run (a 60k-character whitespace-free Cyrillic title, all non-word to ASCII \w, measured 5.7 s of blocked worker).
+    // The positions are code points, as the role reader's /u regex reads them: a letter or digit outside the BMP is two UTF-16 units, neither of them a
+    // letter alone, so a scan of units would trim one at a word edge that the role reader keeps.
     const WORD_CHAR = /[\p{L}\p{N}]/u;
     const trimNonWord = (tok) => {
-        const s = String(tok);
+        const s = [...String(tok)];
         let a = 0; let b = s.length;
         while (a < b && !WORD_CHAR.test(s[a])) a += 1;
         while (b > a && !WORD_CHAR.test(s[b - 1])) b -= 1;
-        return s.slice(a, b);
+        return s.slice(a, b).join('');
     };
     // Drop disposition keywords and stray separators from a title, leaving the channel/downmix base.
     // Splits on whitespace, keeps the "->" downmix arrow, drops lone separators and any keyword token.
@@ -3380,6 +3402,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 .filter((o) => o.cls);
             if (offenders.length) {
                 const names = [...new Set(offenders.map((o) => o.codec))].join(', ');
+                // Whether dropping the streams `gone` leaves the file no video (cover art aside) or no audio: method_unmuxable=drop would then only meet
+                // the all-gone stop below, so no advice offers it there - a codec stored nowhere that is the file's only video (a bgr24 AVI) above all.
+                const dropEmpties = (gone) => ['video', 'audio'].some((t) => {
+                    const own = avStreams.filter((s) => codecTypeOf(s) === t && !(t === 'video' && isCoverArt(s)));
+                    return own.length > 0 && own.every((s) => gone.includes(s));
+                });
+                const dropHere = dropEmpties(offenders.map((o) => o.s));
                 // A codec the fallback container cannot store either has nowhere to go, so mkv_fallback degrades to error and says why - silently doing
                 // nothing, or silently dropping a track the user asked to keep, would both be worse than stopping. Two ways to end up there: no container
                 // accepts the codec ('anywhere'), or MATROSKA is the one refusing it ('mkv'), where falling back to mkv is no answer at all.
@@ -3396,10 +3425,9 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     }
                 }
                 if (methodUnmuxable === 'mkv_fallback' && stuck.length) {
+                    const dropRoute = dropHere ? '' : `set method_unmuxable=drop to remove ${stuck.length > 1 ? 'those streams' : 'that stream'}, or `;
                     failFile(`[method_unmuxable=mkv_fallback] ${[...new Set(stuck.map((o) => o.codec))].join(', ')} cannot be stored in mkv either,`
-                        + ' so there is no container to fall back to - set method_unmuxable=drop to remove '
-                        + `${stuck.length > 1 ? 'those streams' : 'that stream'},`
-                        + ' or remux this file outside Tdarr');
+                        + ` so there is no container to fall back to - ${dropRoute}remux this file outside Tdarr`);
                 }
                 if (methodUnmuxable === 'error') {
                     // Offer only the remedies that would clear it. Switching container helps only when the OTHER container stores every audio/video stream
@@ -3409,18 +3437,24 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                     const stuckInOther = [...new Set(avStreams.filter((s) => refusedBy(other, s)).map(codecNameOf))];
                     const keepable = [...new Set(offenders.filter((o) => !refusedBy(other, o.s)).map((o) => o.codec))];
                     const streamWord = offenders.length > 1 ? 'those streams' : 'that stream';
+                    // drop with container=other as well removes what that container refuses instead, so it is offered only where that keeps both kinds.
+                    const dropThere = keepable.length > 0 && !dropEmpties(avStreams.filter((s) => refusedBy(other, s)));
+                    const keepsThere = `keeps ${keepable.join(', ')} and drops only ${stuckInOther.join(', ')}`;
                     let advice;
                     if (!stuckInOther.length) {
-                        advice = `${names} cannot be stored in ${dstContainer} - set container=${other}, or method_unmuxable=drop to remove `
-                            + `${streamWord}`
-                            + `${dstContainer === 'mp4' ? ' / mkv_fallback to keep just this file in mkv' : ''}`;
+                        const routes = [...(dropHere ? [] : [`drop to remove ${streamWord}`]),
+                            ...(dstContainer === 'mp4' ? ['mkv_fallback to keep just this file in mkv'] : [])];
+                        advice = `${names} cannot be stored in ${dstContainer} - set container=${other}`
+                            + `${routes.length ? `, or method_unmuxable=${routes.join(' / ')}` : ''}`;
                     } else if (!keepable.length && offenders.every((o) => o.cls === 'anywhere')) {
-                        advice = `${names} cannot be stored in mkv or mp4 - set method_unmuxable=drop to remove ${streamWord}, or remux this file `
-                            + 'outside Tdarr';
+                        const dropRoute = dropHere ? '' : `set method_unmuxable=drop to remove ${streamWord}, or `;
+                        advice = `${names} cannot be stored in mkv or mp4 - ${dropRoute}remux this file outside Tdarr`;
                     } else {
-                        advice = `${names} cannot be stored in ${dstContainer}, and ${other} cannot store ${stuckInOther.join(', ')} - set method_unmuxable=drop to`
-                            + ` remove ${streamWord}${keepable.length ? ` (with container=${other} as well it keeps ${keepable.join(', ')} and drops only`
-                            + ` ${stuckInOther.join(', ')})` : ''}, or remux this file outside Tdarr`;
+                        const withOther = dropThere ? ` (with container=${other} as well it ${keepsThere})` : '';
+                        const dropRoute = !dropHere ? `set method_unmuxable=drop to remove ${streamWord}${withOther}, or `
+                            : (dropThere ? `set container=${other} with method_unmuxable=drop, which ${keepsThere}, or ` : '');
+                        advice = `${names} cannot be stored in ${dstContainer}, and ${other} cannot store ${stuckInOther.join(', ')} - ${dropRoute}remux this`
+                            + ' file outside Tdarr';
                     }
                     failFile(`[method_unmuxable=error][container=${dstContainer}] ${advice}`);
                 }
@@ -3587,19 +3621,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // pre-scan below needs them before the stream loop runs.
         const styledFontIndices = streams
             .filter((s) => codecTypeOf(s) === 'attachment' && isFontAttachment(s)).map((s) => s.index);
-        // Where a subtitle stream ENDS, in seconds, or 0 when no probe says: ffprobe's own duration (mp4), else Matroska's per-track DURATION statistics
-        // tag (written by both ffmpeg and mkvmerge, as H:MM:SS.nnnnnnnnn), else mediaInfo's. The yardstick an existing bundle's last cue is held to.
-        const subtitleEndSec = (ffstream) => {
-            for (const v of [ffstream.duration, hmsSeconds(getTagCI(ffstream.tags || {}, 'DURATION')), mediaInfoFor(ffstream)?.Duration]) {
-                const n = Number(v);
-                if (Number.isFinite(n) && n > 0) return n;
-            }
-            return 0;
-        };
         // A Matroska statistics tag of stream s, or '' when it carries none. An older mkvmerge suffixes the key with its tag language (NUMBER_OF_FRAMES-eng).
         const statisticsTag = (s, key) => {
             const hit = Object.keys(s.tags || {}).find((k) => new RegExp(`^${key}(-[a-z]+)?$`, 'i').test(k));
             return hit === undefined ? '' : String(s.tags[hit] ?? '').trim();
+        };
+        // Where a subtitle stream ENDS, in seconds, or 0 when no probe says: ffprobe's own duration (mp4), else Matroska's per-track DURATION statistics
+        // tag (written by both ffmpeg and mkvmerge, as H:MM:SS.nnnnnnnnn), else mediaInfo's. The yardstick an existing bundle's last cue is held to.
+        const subtitleEndSec = (ffstream) => {
+            for (const v of [ffstream.duration, hmsSeconds(statisticsTag(ffstream, 'DURATION')), mediaInfoFor(ffstream)?.Duration]) {
+                const n = Number(v);
+                if (Number.isFinite(n) && n > 0) return n;
+            }
+            return 0;
         };
         // Whether a subtitle track holds no event, by its statistics tags: a NUMBER_OF_FRAMES of 0 (mkvmerge, mkvpropedit), or where none is written a zero
         // DURATION (ffmpeg writes DURATION alone, afresh on every mux). Asked before the export because no placement answers it for a bundle: the Matroska
@@ -4391,6 +4425,22 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             nameCarryArgs += carryCommand;
         }
+        // remove_imagesubs=export asked for a sidecar that could not be written, so the export did not happen and neither did the drop it protects. Fail
+        // rather than remux around it: every cause counted here is environmental (a quote in the library directory, no path translator, a rejected upload)
+        // and recurs on every future run, or transient (a server that could not say whether the sidecar is already there), and either way a remux around it
+        // would leave the export setting quietly doing nothing while each run reported success. Failing costs nothing - the file is untouched and the image
+        // subtitle is still embedded - and the error clears once the environment is fixed or the server answers, and the file is requeued. That last clause
+        // is why an EMPTY extraction is diverted above rather than counted: nothing about it is fixable, so it would never clear. Both holds are checked as
+        // the stream loop ends, so the decisions they flush are the loop's own: the post-loop ones never run - among them an orphaned font removal, which
+        // a held styled subtitle would make wrongly, since its fonts stay in the file with it.
+        if (exportRefusedCount) {
+            failWithBuffers(`[remove_imagesubs=export] ${exportRefusedCount} image subtitle${exportRefusedCount === 1 ? '' : 's'} could not be exported,`
+                + ' see the reasons above - nothing was removed from the file');
+        }
+        if (bundleHeldCount) {
+            failWithBuffers(`[container=mp4] ${bundleHeldCount} styled subtitle${bundleHeldCount === 1 ? '' : 's'} could not be exported to a bundle, see the `
+                + 'reasons above - nothing was flattened or removed');
+        }
         if (handlerRolesLost.length) {
             workDone += `☒[container=${dstContainer}] handler_name is being ${dstContainer === 'mkv' ? 'cleared' : 'replaced'} and was the only place these `
                 + `roles lived, with no ${dstContainer} flag to hold them - lost: ${handlerRolesLost.join(', ')}\n`;
@@ -4539,30 +4589,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             globalWrites[RECOVERED_TAG] = recoverIntent;
         }
 
-        // remove_imagesubs=export asked for a sidecar that could not be written, so the export did not happen and neither did the drop it protects. Fail
-        // rather than remux around it: every cause counted here is environmental (a quote in the library directory, no path translator, a rejected upload)
-        // and recurs on every future run, or transient (a server that could not say whether the sidecar is already there), and either way a remux around it
-        // would leave the export setting quietly doing nothing while each run reported success. Failing costs nothing - the file is untouched and the image
-        // subtitle is still embedded - and the error clears once the environment is fixed or the server answers, and the file is requeued. That last clause
-        // is why an EMPTY extraction is diverted above rather than counted: nothing about it is fixable, so it would never clear.
-        if (exportRefusedCount) {
-            failWithBuffers(`[remove_imagesubs=export] ${exportRefusedCount} image subtitle${exportRefusedCount === 1 ? '' : 's'} could not be exported,`
-                + ' see the reasons above - nothing was removed from the file');
-        }
-        if (bundleHeldCount) {
-            failWithBuffers(`[container=mp4] ${bundleHeldCount} styled subtitle${bundleHeldCount === 1 ? '' : 's'} could not be exported to a bundle, see the `
-                + 'reasons above - nothing was flattened or removed');
-        }
         // A subtitle ffmpeg cannot name (unnamedSub) that is still mapped fails this run's remux inside ffmpeg on every requeue, so the run stops here with it
         // named and the file untouched - under error, and under mkv_fallback, which has nowhere to fall back to. A run with nothing to remux leaves the file
         // as it is. method_unmuxable=drop removed it in the loop, and language_sub or remove_sub_sdh may have.
         const unnamedKept = streams.filter((s) => unnamedSub(s) && !removedIndices.has(s.index));
         if (convert && unnamedKept.length) {
-            const one = unnamedKept.length === 1;
-            failWithBuffers(`${one ? streamTag(unnamedKept[0].index) : ''}[method_unmuxable=${methodUnmuxable}] ffmpeg cannot name the codec of `
-                + `${one ? `this subtitle${codecIdNote(unnamedKept[0])}` : `subtitles ${unnamedKept.map((s) => `s${s.index}${codecIdNote(s)}`).join(', ')}`},`
-                + ` so this run's remux cannot copy ${one ? 'it' : 'them'} into mkv or mp4 - set method_unmuxable=drop to remove ${one ? 'it' : 'them'},`
-                + ' or remux this file outside Tdarr');
+            failWithBuffers(unnamedSubStop(unnamedKept, `[method_unmuxable=${methodUnmuxable}]`, (it) => `set method_unmuxable=drop, which deletes ${it}`));
         }
 
         if (convert === true) {

@@ -27,7 +27,7 @@ const details = () => ({
         duration, so it is flagged with a warning for manual review rather than failed. The same goes for a broadcast .ts or .mpg capture remuxed to mkv or mp4
         in the same job with its video copied, not re-encoded: a capture whose timestamps jump or reset states a longer length than it holds. A later job on
         that file is checked in full again. This check has no setting.\n`,
-    Version: '4.999.70',
+    Version: '4.999.71',
     Tags: 'pre-processing,ffmpeg,stream-order',
     Inputs: [
         {
@@ -336,7 +336,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (28 sections: stream codec type … mp4 strict compliance arg)
+    // #region SHARED helpers (29 sections: stream codec type … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -1633,6 +1633,33 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // source stream - whole-file summaries, and brand-new/appended streams that have no source index of their own.
     const streamTag = (index) => `[s${String(index).padStart(2, ' ')}]`;
     // ===== END SHARED: stream / language / preset helpers =====
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: unnamed subtitle codec =====
+    // -=-=-= UNNAMED_CODECS / unnamedSub  [all five] =-=-=-
+    // A subtitle stream ffmpeg cannot name: a Matroska CodecID this build maps to no codec - mkvmerge's WebVTT (S_TEXT/WEBVTT, common in web-sourced files,
+    // which neither jellyfin-ffmpeg 7.1.4 nor mainline 9.0.2 reads) above all, and S_TEXT/USF, S_KATE and S_IMAGE/BMP measured - which ffprobe's JSON gives
+    // no codec_name ('' here; other writers print 'unknown' or 'none'). Both muxers refuse a copy of one - matroska "Subtitle codec 0 is not supported"
+    // (exit 178), mp4 "Could not find tag for codec none" (exit 234) - and the refusal takes the whole run down, sidecar outputs included, so every write of
+    // the file fails in ffmpeg on every requeue. Each plugin therefore stops a pass that would copy one, naming it, and leaves a file it has nothing to write
+    // alone. mp4 and mov give an unknown subtitle sample entry no subtitle type at all (it probes as data).
+    const UNNAMED_CODECS = ['', 'unknown', 'none'];
+    const unnamedSub = (s) => codecTypeOf(s) === 'subtitle' && UNNAMED_CODECS.includes(codecNameOf(s));
+    // -=-=-= codecIdNote  [all five] =-=-=-
+    // mediaInfo still reads the CodecID ffmpeg cannot map, which tells the user which format such a subtitle is: ' (S_TEXT/USF)', or '' unread.
+    const codecIdNote = (s) => { const id = mediaInfoFor(s)?.CodecID; return id ? ` (${logSafe(id)})` : ''; };
+    // -=-=-= unnamedSubStop  [all five] =-=-=-
+    // The line a pass that would copy the unnamed subtitles `subs` stops on, after its ☒: one is named in the [s N] field, several in the text, each with
+    // the CodecID mediaInfo reads for it. mkvmerge cannot convert a subtitle, so keeping one means extracting, converting and muxing it back (measured on
+    // jellyfin-ffmpeg 7.1.4: an S_TEXT/WEBVTT track taken out with mkvextract, made an srt by ffmpeg and muxed back with mkvmerge reads as subrip, and the
+    // copy that failed runs). setting is clean_and_remux's [input=value] tag, and remove words a plugin's own way to delete the track.
+    const unnamedSubStop = (subs, setting = '', remove = (it) => `remove ${it} with mkvmerge`) => {
+        const one = subs.length === 1;
+        const it = one ? 'it' : 'them';
+        const lead = `${one ? streamTag(subs[0].index) : ''}${setting}`;
+        return `${lead}${lead ? ' ' : ''}ffmpeg names no codec for ${one ? `this subtitle${codecIdNote(subs[0])}`
+            : `subtitles ${subs.map((s) => `s${s.index}${codecIdNote(s)}`).join(', ')}`} and cannot copy ${it}, so this file cannot be written back - to keep `
+            + `${it}, extract ${it} with mkvextract, convert ${it} (to srt, say) and mux the result back with mkvmerge; or ${remove(it)}; then requeue`;
+    };
+    // ===== END SHARED: unnamed subtitle codec =====
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: ffmpeg metadata escaping =====
     // -=-=-= escMeta [all five] =-=-=-
@@ -3226,11 +3253,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 + `${junkArgs !== '' ? `[remove_junk_tags=${removeJunkTags}]` : ''} Left as it is - a remux to ${why} would drop ${lost.join(', and ')}\n`);
         }
 
-        // A subtitle ffprobe names no codec for cannot be copied (sub_worker's commitPreset has the measurement), so the remux is stopped, naming it.
-        const noCodecSubs = mappedRows.filter((r) => r.type === 'subtitle' && ['', 'unknown', 'none'].includes(codecNameOf(r.stream)));
+        // A subtitle ffmpeg cannot name (unnamedSub) cannot be copied, so the remux is stopped, naming it.
+        const noCodecSubs = mappedRows.filter((r) => unnamedSub(r.stream));
         if (noCodecSubs.length) {
-            failFile(`${noCodecSubs.map((r) => streamTag(r.index)).join('')} ffmpeg names no codec for this subtitle stream (a WebVTT track mkvmerge wrote`
-                + ' reads so), and it cannot copy one, so this file cannot be written back - convert or remove that track with mkvmerge, then requeue');
+            failFile(unnamedSubStop(noCodecSubs.map((r) => r.stream)));
         }
         response.processFile = true;
         // Describe the reorder itself - this plugin's headline change, and the only one that would otherwise leave no trace in the log: without these lines a

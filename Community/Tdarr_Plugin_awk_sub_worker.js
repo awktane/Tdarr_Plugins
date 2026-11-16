@@ -45,7 +45,7 @@ const details = () => ({
                 Embedded closed captions are why this plugin goes before video_clean: re-encoding the video is the one thing that can destroy them. Extract
                 with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since the sidecars would land
                 beside the source, where the output never sees them.`,
-    Version: '3.999.121',
+    Version: '3.999.122',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -343,7 +343,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (20 sections: file-failure helpers … ffmpeg metadata escaping)
+    // #region SHARED helpers (21 sections: file-failure helpers … ffmpeg metadata escaping)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: file-failure helpers =====
     // -=-=-= AwkFailFile / failFile / failUnexpected [all five] =-=-=-
     // Fail the whole file (Tdarr's error queue) carrying the full infoLog: a returned processFile:false is Tdarr's "no work / skip" signal, NOT a failure -
@@ -1463,6 +1463,33 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // source stream - whole-file summaries, and brand-new/appended streams that have no source index of their own.
     const streamTag = (index) => `[s${String(index).padStart(2, ' ')}]`;
     // ===== END SHARED: stream / language / preset helpers =====
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: unnamed subtitle codec =====
+    // -=-=-= UNNAMED_CODECS / unnamedSub  [all five] =-=-=-
+    // A subtitle stream ffmpeg cannot name: a Matroska CodecID this build maps to no codec - mkvmerge's WebVTT (S_TEXT/WEBVTT, common in web-sourced files,
+    // which neither jellyfin-ffmpeg 7.1.4 nor mainline 9.0.2 reads) above all, and S_TEXT/USF, S_KATE and S_IMAGE/BMP measured - which ffprobe's JSON gives
+    // no codec_name ('' here; other writers print 'unknown' or 'none'). Both muxers refuse a copy of one - matroska "Subtitle codec 0 is not supported"
+    // (exit 178), mp4 "Could not find tag for codec none" (exit 234) - and the refusal takes the whole run down, sidecar outputs included, so every write of
+    // the file fails in ffmpeg on every requeue. Each plugin therefore stops a pass that would copy one, naming it, and leaves a file it has nothing to write
+    // alone. mp4 and mov give an unknown subtitle sample entry no subtitle type at all (it probes as data).
+    const UNNAMED_CODECS = ['', 'unknown', 'none'];
+    const unnamedSub = (s) => codecTypeOf(s) === 'subtitle' && UNNAMED_CODECS.includes(codecNameOf(s));
+    // -=-=-= codecIdNote  [all five] =-=-=-
+    // mediaInfo still reads the CodecID ffmpeg cannot map, which tells the user which format such a subtitle is: ' (S_TEXT/USF)', or '' unread.
+    const codecIdNote = (s) => { const id = mediaInfoFor(s)?.CodecID; return id ? ` (${logSafe(id)})` : ''; };
+    // -=-=-= unnamedSubStop  [all five] =-=-=-
+    // The line a pass that would copy the unnamed subtitles `subs` stops on, after its ☒: one is named in the [s N] field, several in the text, each with
+    // the CodecID mediaInfo reads for it. mkvmerge cannot convert a subtitle, so keeping one means extracting, converting and muxing it back (measured on
+    // jellyfin-ffmpeg 7.1.4: an S_TEXT/WEBVTT track taken out with mkvextract, made an srt by ffmpeg and muxed back with mkvmerge reads as subrip, and the
+    // copy that failed runs). setting is clean_and_remux's [input=value] tag, and remove words a plugin's own way to delete the track.
+    const unnamedSubStop = (subs, setting = '', remove = (it) => `remove ${it} with mkvmerge`) => {
+        const one = subs.length === 1;
+        const it = one ? 'it' : 'them';
+        const lead = `${one ? streamTag(subs[0].index) : ''}${setting}`;
+        return `${lead}${lead ? ' ' : ''}ffmpeg names no codec for ${one ? `this subtitle${codecIdNote(subs[0])}`
+            : `subtitles ${subs.map((s) => `s${s.index}${codecIdNote(s)}`).join(', ')}`} and cannot copy ${it}, so this file cannot be written back - to keep `
+            + `${it}, extract ${it} with mkvextract, convert ${it} (to srt, say) and mux the result back with mkvmerge; or ${remove(it)}; then requeue`;
+    };
+    // ===== END SHARED: unnamed subtitle codec =====
 
 
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker]: free-text list split =====
@@ -5070,14 +5097,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // it should have skipped. list is the main output's stream list in its order (source streams less every removal, imports appended), which the name
     // carry reads.
     const commitPreset = (out, list = streams) => {
-        // A subtitle stream ffprobe names no codec for cannot be copied: a WebVTT track mkvmerge wrote (S_TEXT/WEBVTT, which neither jellyfin-ffmpeg 7.1.4
-        // nor mainline 9.0.2 reads) fails a copy at the Matroska header (measured on 7.1.4: exit 178), taking the whole run down and leaving each sidecar
-        // output of it at 0 bytes. Every preset here copies the stream, so none is emitted.
-        const noCodec = list.filter((s) => codecTypeOf(s) === 'subtitle' && ['', 'unknown', 'none'].includes(codecNameOf(s)));
+        // Every preset here copies the subtitles, and one ffmpeg cannot name (unnamedSub) takes the whole run down, each sidecar output of it left at 0
+        // bytes, so none is emitted.
+        const noCodec = list.filter(unnamedSub);
         if (noCodec.length) {
-            failFile(`${noCodec.map((s) => streamTag(s.index)).join('')} ffmpeg names no codec for this subtitle stream (a WebVTT track mkvmerge wrote reads`
-                + ' so), and it cannot copy one, so this file cannot be written back - convert or remove that track with mkvmerge, then requeue;'
-                + ' nothing was extracted or imported');
+            failFile(`${unnamedSubStop(noCodec)}; nothing was extracted or imported`);
         }
         // The -strict level either -c copy remux needs (see mp4StrictArg): Dolby Vision's dvcC/dvvC boxes, or a TrueHD track the mp4 muxer refuses without it.
         // Only subtitle streams - and, on a bundled extract, their font attachments - are ever added or dropped here, so every audio/video stream is copied

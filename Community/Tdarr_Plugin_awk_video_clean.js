@@ -14,7 +14,7 @@ const details = () => ({
                      -Stack order: clean_and_remux first; video_clean / audio_clean / sub_worker in any order (sub_worker before video_clean when the video
                      carries closed captions); stream_ordering last. Embedded closed captions are why sub_worker goes first: re-encoding is the one thing that
                      can destroy them (see guard_captions).\n\n`,
-    Version: '3.999.98',
+    Version: '3.999.99',
     Tags: 'pre-processing,ffmpeg,video only,hevc,h265,h264,av1,configurable',
     Inputs: [
         {
@@ -435,7 +435,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (12 sections: stream codec type … stream / language / preset helpers)
+    // #region SHARED helpers (13 sections: stream codec type … unnamed subtitle codec)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -1359,6 +1359,33 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // source stream - whole-file summaries, and brand-new/appended streams that have no source index of their own.
     const streamTag = (index) => `[s${String(index).padStart(2, ' ')}]`;
     // ===== END SHARED: stream / language / preset helpers =====
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: unnamed subtitle codec =====
+    // -=-=-= UNNAMED_CODECS / unnamedSub  [all five] =-=-=-
+    // A subtitle stream ffmpeg cannot name: a Matroska CodecID this build maps to no codec - mkvmerge's WebVTT (S_TEXT/WEBVTT, common in web-sourced files,
+    // which neither jellyfin-ffmpeg 7.1.4 nor mainline 9.0.2 reads) above all, and S_TEXT/USF, S_KATE and S_IMAGE/BMP measured - which ffprobe's JSON gives
+    // no codec_name ('' here; other writers print 'unknown' or 'none'). Both muxers refuse a copy of one - matroska "Subtitle codec 0 is not supported"
+    // (exit 178), mp4 "Could not find tag for codec none" (exit 234) - and the refusal takes the whole run down, sidecar outputs included, so every write of
+    // the file fails in ffmpeg on every requeue. Each plugin therefore stops a pass that would copy one, naming it, and leaves a file it has nothing to write
+    // alone. mp4 and mov give an unknown subtitle sample entry no subtitle type at all (it probes as data).
+    const UNNAMED_CODECS = ['', 'unknown', 'none'];
+    const unnamedSub = (s) => codecTypeOf(s) === 'subtitle' && UNNAMED_CODECS.includes(codecNameOf(s));
+    // -=-=-= codecIdNote  [all five] =-=-=-
+    // mediaInfo still reads the CodecID ffmpeg cannot map, which tells the user which format such a subtitle is: ' (S_TEXT/USF)', or '' unread.
+    const codecIdNote = (s) => { const id = mediaInfoFor(s)?.CodecID; return id ? ` (${logSafe(id)})` : ''; };
+    // -=-=-= unnamedSubStop  [all five] =-=-=-
+    // The line a pass that would copy the unnamed subtitles `subs` stops on, after its ☒: one is named in the [s N] field, several in the text, each with
+    // the CodecID mediaInfo reads for it. mkvmerge cannot convert a subtitle, so keeping one means extracting, converting and muxing it back (measured on
+    // jellyfin-ffmpeg 7.1.4: an S_TEXT/WEBVTT track taken out with mkvextract, made an srt by ffmpeg and muxed back with mkvmerge reads as subrip, and the
+    // copy that failed runs). setting is clean_and_remux's [input=value] tag, and remove words a plugin's own way to delete the track.
+    const unnamedSubStop = (subs, setting = '', remove = (it) => `remove ${it} with mkvmerge`) => {
+        const one = subs.length === 1;
+        const it = one ? 'it' : 'them';
+        const lead = `${one ? streamTag(subs[0].index) : ''}${setting}`;
+        return `${lead}${lead ? ' ' : ''}ffmpeg names no codec for ${one ? `this subtitle${codecIdNote(subs[0])}`
+            : `subtitles ${subs.map((s) => `s${s.index}${codecIdNote(s)}`).join(', ')}`} and cannot copy ${it}, so this file cannot be written back - to keep `
+            + `${it}, extract ${it} with mkvextract, convert ${it} (to srt, say) and mux the result back with mkvmerge; or ${remove(it)}; then requeue`;
+    };
+    // ===== END SHARED: unnamed subtitle codec =====
     // #endregion
 
     // #region SHARED helpers (10 sections: ffmpeg metadata escaping … hevc copy fourcc)
@@ -4251,6 +4278,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // under its own fourcc, so a stand-in keeps its output ordinal, and the restore says its copied original's own loss beside its Expected results.
         // On an encode the copied streams' loss line names the encode's copy.
         const sealPreset = (inputSide, out, writes, written = primary, { dropsDv = false, act = 'remux', copied = false } = {}) => {
+            // Every exit copies the subtitles, and a copy of one ffmpeg cannot name fails the write (the unnamed subtitle codec section), so the file
+            // stops here, before any preset is set, rather than in ffmpeg on every requeue.
+            const unnamed = keptFor(written).filter(unnamedSub);
+            if (unnamed.length) failFile(unnamedSubStop(unnamed));
             const tagPlan = mp4TagPlan(dstContainer, file.ffProbeData.format?.tags, writes);
             const kept = keptFor(written);
             const copies = copied ? kept : kept.map((s) => (s === written ? { codec_type: 'video' } : s));

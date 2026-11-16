@@ -15,7 +15,7 @@ const details = () => ({
                   closed captions); stream_ordering last.\n\n
                   Because it can delete and re-encode audio, set the options deliberately - this can be destructive, especially with incorrectly
                   tagged audio tracks`,
-    Version: '4.999.101',
+    Version: '4.999.102',
     Tags: 'pre-processing,ffmpeg,audio_only,configurable',
     Inputs: [
         {
@@ -589,7 +589,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // (order is free). Verify any edit with awk-shared-block-check. User-tunable tables (dispositionTypes, codecInfo) lead their section.
     // =====================================================================
 
-    // #region SHARED helpers (25 sections: stream codec type … mp4 strict compliance arg)
+    // #region SHARED helpers (26 sections: stream codec type … mp4 strict compliance arg)
     // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: stream codec type =====
     // -=-=-= codecTypeOf [all five] =-=-=-
     // The stream's kind - video / audio / subtitle / attachment / data - normalised once; the single most repeated test in the suite. jellyfin-ffprobe emits
@@ -1867,6 +1867,33 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // source stream - whole-file summaries, and brand-new/appended streams that have no source index of their own.
     const streamTag = (index) => `[s${String(index).padStart(2, ' ')}]`;
     // ===== END SHARED: stream / language / preset helpers =====
+    // ===== SHARED [audio_clean, clean_and_remux, stream_ordering, sub_worker, video_clean]: unnamed subtitle codec =====
+    // -=-=-= UNNAMED_CODECS / unnamedSub  [all five] =-=-=-
+    // A subtitle stream ffmpeg cannot name: a Matroska CodecID this build maps to no codec - mkvmerge's WebVTT (S_TEXT/WEBVTT, common in web-sourced files,
+    // which neither jellyfin-ffmpeg 7.1.4 nor mainline 9.0.2 reads) above all, and S_TEXT/USF, S_KATE and S_IMAGE/BMP measured - which ffprobe's JSON gives
+    // no codec_name ('' here; other writers print 'unknown' or 'none'). Both muxers refuse a copy of one - matroska "Subtitle codec 0 is not supported"
+    // (exit 178), mp4 "Could not find tag for codec none" (exit 234) - and the refusal takes the whole run down, sidecar outputs included, so every write of
+    // the file fails in ffmpeg on every requeue. Each plugin therefore stops a pass that would copy one, naming it, and leaves a file it has nothing to write
+    // alone. mp4 and mov give an unknown subtitle sample entry no subtitle type at all (it probes as data).
+    const UNNAMED_CODECS = ['', 'unknown', 'none'];
+    const unnamedSub = (s) => codecTypeOf(s) === 'subtitle' && UNNAMED_CODECS.includes(codecNameOf(s));
+    // -=-=-= codecIdNote  [all five] =-=-=-
+    // mediaInfo still reads the CodecID ffmpeg cannot map, which tells the user which format such a subtitle is: ' (S_TEXT/USF)', or '' unread.
+    const codecIdNote = (s) => { const id = mediaInfoFor(s)?.CodecID; return id ? ` (${logSafe(id)})` : ''; };
+    // -=-=-= unnamedSubStop  [all five] =-=-=-
+    // The line a pass that would copy the unnamed subtitles `subs` stops on, after its ☒: one is named in the [s N] field, several in the text, each with
+    // the CodecID mediaInfo reads for it. mkvmerge cannot convert a subtitle, so keeping one means extracting, converting and muxing it back (measured on
+    // jellyfin-ffmpeg 7.1.4: an S_TEXT/WEBVTT track taken out with mkvextract, made an srt by ffmpeg and muxed back with mkvmerge reads as subrip, and the
+    // copy that failed runs). setting is clean_and_remux's [input=value] tag, and remove words a plugin's own way to delete the track.
+    const unnamedSubStop = (subs, setting = '', remove = (it) => `remove ${it} with mkvmerge`) => {
+        const one = subs.length === 1;
+        const it = one ? 'it' : 'them';
+        const lead = `${one ? streamTag(subs[0].index) : ''}${setting}`;
+        return `${lead}${lead ? ' ' : ''}ffmpeg names no codec for ${one ? `this subtitle${codecIdNote(subs[0])}`
+            : `subtitles ${subs.map((s) => `s${s.index}${codecIdNote(s)}`).join(', ')}`} and cannot copy ${it}, so this file cannot be written back - to keep `
+            + `${it}, extract ${it} with mkvextract, convert ${it} (to srt, say) and mux the result back with mkvmerge; or ${remove(it)}; then requeue`;
+    };
+    // ===== END SHARED: unnamed subtitle codec =====
 
 
     // ===== SHARED [audio_clean, clean_and_remux, sub_worker]: iso639-1 to iso639-2 map =====
@@ -2252,15 +2279,17 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // keywords like "hearing impaired" can't appear as a lone channel token, so they are skipped).
     const stripWords = new Set(Object.values(dispositionTypes).flatMap(d => d.keywords).filter(w => !w.includes(' ')));
     // Trim a token to keywordRegex's letter/digit edge, so the stripper drops each single-word keyword the role reader reads (a lone 'Forcé' as
-    // 'Forcés'; '_' is an edge to both). By index, for the reason cleanStreamTitle's quote strip does: /^[^\w]+|[^\w]+$/ backtracks from every offset
+    // 'Forcés'; '_' is an edge to both). By position, for the reason cleanStreamTitle's quote strip is: /^[^\w]+|[^\w]+$/ backtracks from every offset
     // inside a long interior non-word run (a 60k-character whitespace-free Cyrillic title, all non-word to ASCII \w, measured 5.7 s of blocked worker).
+    // The positions are code points, as the role reader's /u regex reads them: a letter or digit outside the BMP is two UTF-16 units, neither of them a
+    // letter alone, so a scan of units would trim one at a word edge that the role reader keeps.
     const WORD_CHAR = /[\p{L}\p{N}]/u;
     const trimNonWord = (tok) => {
-        const s = String(tok);
+        const s = [...String(tok)];
         let a = 0; let b = s.length;
         while (a < b && !WORD_CHAR.test(s[a])) a += 1;
         while (b > a && !WORD_CHAR.test(s[b - 1])) b -= 1;
-        return s.slice(a, b);
+        return s.slice(a, b).join('');
     };
     // Drop disposition keywords and stray separators from a title, leaving the channel/downmix base.
     // Splits on whitespace, keeps the "->" downmix arrow, drops lone separators and any keyword token.
@@ -3658,8 +3687,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
         // The reason a log line gives for this wall, from the layout that hits it: libopus moves the speakers of a 5.0 or 6.1 (the defaults a track with no
         // layout takes at 5 and 7 channels) and refuses every other. Phrased 'its <layout> layout', which reads right whatever the layout is called.
-        const opusLayoutWhy = (lay, channels) => ((lay ? ['5.0', '6.1'].includes(lay) : [5, 7].includes(channels))
-            ? `libopus would move the speakers of its ${lay || `${channels}ch`} layout` : `libopus can't encode its ${lay || `${channels}ch`} layout`);
+        const opusLayoutWhy = (lay, channels, shown) => ((lay ? ['5.0', '6.1'].includes(lay) : [5, 7].includes(channels))
+            ? `libopus would move the speakers of its ${shown || `${channels}ch`} layout` : `libopus can't encode its ${shown || `${channels}ch`} layout`);
         // Layouts that map LOSSLESSLY to an opus-accepted layout at the SAME channel count by pure relabel (side↔back position equivalence) - emitted via
         // channelmap (a permutation matrix, never a mix). A layout not listed here has no lossless relabel, so it falls to method_layout_err (keep/drop/remix).
         // 5.0(side) and 6.1(back) are not listed: their relabels lead to 5.0 and 6.1, which libopus moves.
@@ -3675,9 +3704,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         // layout its relabel gives the decode (pceLayoutOf), and its relabel filter starts with that one. An absent layout takes opusAcceptsLayout's
         // count-based default, and the count itself comes from resolveChannels.
         const opusLayoutFor = (stream, channels) => {
-            const lay = (pceLayoutOf(stream) || stream.channel_layout || '').toLowerCase().trim();
+            const raw = String(pceLayoutOf(stream) || stream.channel_layout || '').trim();
+            const lay = raw.toLowerCase();
             const relabel = OPUS_RELABEL[lay] || null;
-            return { lay, ok: opusAcceptsLayout(channels, lay), relabel,
+            return { lay, ok: opusAcceptsLayout(channels, lay), relabel, why: opusLayoutWhy(lay, channels, logSafe(raw, LAYOUT_LOG_MAX)),
                 relabelFilter: relabel ? pceRelabel(stream, `channelmap=map=${relabel.map}:channel_layout=${relabel.layout}`) : '' };
         };
         // ====== END CHANNEL-LAYOUT VERDICTS ======
@@ -4006,7 +4036,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 }
                 removedIndices.add(s.index);
                 // this IS a queued change (a removal), so it takes the change symbol like every other removal line, not the warning symbol
-                workDone += `☐${streamTag(s.index)}[method_layout_err=${methodLayoutErr}] Dropping - ${opusLayoutWhy(opusLayout.lay, ch)}\n`;
+                workDone += `☐${streamTag(s.index)}[method_layout_err=${methodLayoutErr}] Dropping - ${opusLayout.why}\n`;
                 // Remember a dropped source a downmix ('add' mode) would derive from, so its stereo/5.1 still gets created even though the source itself is
                 // gone (see the post-loop pass below). 'replace' modes already deferred above (they convert the source in place), so only 'add' reaches here.
                 // Only a genuine surround track derives: a 'stereo'-tier track is converted in place, never derived from.
@@ -5192,13 +5222,13 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                                 : ' (kept - no downmix converted it to an opus-safe layout)';
                             else why = ', enable a downmix option or set method_layout_err to drop/remix';
                             skipDone += `☒${streamTag(ffstream.index)}[codec_force=${codecForce}] Not forcing opus - `
-                                + `${opusLayoutWhy(srcLayout, forceChannels)}; left as ${ffstreamCodec}${why}\n`;
+                                + `${opusLayout.why}; left as ${ffstreamCodec}${why}\n`;
                         } else if (folds && guardBlocks(ffstream, codecStereo, 2, forceChannels)) {
                             // The remix drops channels, so it is judged against the stereo it emits, not the opus it can't: a track guard_quality protects
                             // keeps its channels and source codec, and the codec_stereo stereo is ADDED beside it - a downmix 'replace' becoming 'add'. The
                             // added stereo takes the language's stereo slot, so the next run's remix defers to it and the file settles.
                             appendStereo(ffstream, srcAudioIdx, ffstreamCodec, srcRateStr, ffstreamRegionKey,
-                                ` (${opusLayoutWhy(srcLayout, forceChannels)}; the source is kept as ${ffstreamCodec})`,
+                                ` (${opusLayout.why}; the source is kept as ${ffstreamCodec})`,
                                 { tag: `[method_layout_err=${methodLayoutErr}][guard_quality=${guardQuality}]` });
                             forced = true;
                         } else if (folds) {
@@ -5208,7 +5238,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             const enc = stereoEnc(outputAudioIdx);
                             const two = stereoArg(outputAudioIdx, ffstream);
                             workDone += `☐${streamTag(ffstream.index)}[method_layout_err=${methodLayoutErr}]${loudnormRideTag(two.changed)} Remixing `
-                                + `${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} (${opusLayoutWhy(srcLayout, forceChannels)}) → ${enc.logCodec} stereo @ `
+                                + `${ffstreamCodec} ${forceChannels}ch @ ${srcRateStr} (${opusLayout.why}) → ${enc.logCodec} stereo @ `
                                 + `${enc.rate}${enc.label ? ` (${enc.label})` : ''}\n`;
                             replaceStereo(ffstream, outputAudioIdx, enc, two, ffstream.awkSecondaryTrack ? '' : ffstreamRegionKey);
                             forced = true;
@@ -5267,7 +5297,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             if (srcAudioIdx === undefined) continue;
             const srcRateStr = srcRateToken(s);
             const srcCodec = codecNameOf(s) || 'unknown';
-            const dropped = ` (source dropped - ${opusLayoutWhy(opusLayoutFor(s, s.awkChannels).lay, s.awkChannels)})`;
+            const dropped = ` (source dropped - ${opusLayoutFor(s, s.awkChannels).why})`;
             if (s.channels > 6 && downmixToSix !== 'disabled' && !hasSixForLang(regionKey)) {
                 appendSix(s, srcAudioIdx, srcCodec, srcRateStr, regionKey, dropped);
             }
@@ -5408,7 +5438,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 // one decode no layout places that gets here, bypasses the wall: it keeps mapping family 255, which libopus takes at any count.
                 let loudnormRelabel = '';
                 if (targetCodecFamily === 'opus' && channels > 2 && !opusInPlace(ffstream, targetCodec)) {
-                    const { lay, ok, relabel, relabelFilter } = opusLayoutFor(ffstream, channels);
+                    const { ok, relabel, relabelFilter, why: wallWhy } = opusLayoutFor(ffstream, channels);
                     if (!ok) {
                         if (relabel) {
                             // lossless relabel to an opus-safe layout, chained ahead of loudnorm
@@ -5445,19 +5475,19 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                             // encodes never gets here (leftoverTarget hands it the correction, or the codec_force remix has already run on it).
                             if (guarded) {
                                 appendStereo(ffstream, srcAudioIdx, ffstreamCodec, srcRateToken(ffstream), ffstream.awkRegionKey,
-                                    ` (${opusLayoutWhy(lay, channels)}; the source is kept un-normalized as ${ffstreamCodec})`,
+                                    ` (${wallWhy}; the source is kept un-normalized as ${ffstreamCodec})`,
                                     { tag: `[method_layout_err=${methodLayoutErr}][guard_quality=${guardQuality}]`, measuredTwo: two });
                                 continue;
                             }
                             const enc = stereoEnc(outputAudioIdx);
                             workDone += `☐${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Normalizing ${ffstreamCodec} ${channels}ch → `
-                                + `${enc.logCodec} stereo @ ${enc.rate} (${enc.label ? `${enc.label}; ` : ''}remixed - ${opusLayoutWhy(lay, channels)})\n`;
+                                + `${enc.logCodec} stereo @ ${enc.rate} (${enc.label ? `${enc.label}; ` : ''}remixed - ${wallWhy})\n`;
                             replaceStereo(ffstream, outputAudioIdx, enc, two, ffstream.awkSecondaryTrack ? '' : ffstream.awkRegionKey);
                             convert = true;
                             continue;
                         } else {
                             const why = remixStandDown(ffstream, relabel) || `method_layout_err=${methodLayoutErr}`;
-                            skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - ${opusLayoutWhy(lay, channels)}; `
+                            skipDone += `☒${streamTag(ffstream.index)}[method_loudnorm=${methodLoudnorm}] Not normalizing - ${wallWhy}; `
                                 + `left as ${ffstreamCodec} (${why})\n`;
                             continue;
                         }
@@ -5586,6 +5616,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
                 .map((t) => summariseStream(movLangReadBack(dstContainer, dvCopyReadBack(dstContainer, t.stream)), t.out)).join('');
         };
 
+        // Every preset here copies the subtitles, and a copy of one ffmpeg cannot name fails the write (the unnamed subtitle codec section): a run that
+        // would write stops here instead, its decisions flushed, while one with nothing to write skips as before.
+        const unnamedKept = convert === true ? file.ffProbeData.streams.filter(unnamedSub) : [];
+        if (unnamedKept.length) failWithBuffers(unnamedSubStop(unnamedKept));
         response.infoLog += workDone + skipDone;
         if (convert === true) {
             // Dispositions (default flag) are intentionally untouched: ffmpeg copies the source disposition onto mapped/transcoded outputs, so a downmix from a
