@@ -45,7 +45,7 @@ const details = () => ({
                 Embedded closed captions are why this plugin goes before video_clean: re-encoding the video is the one thing that can destroy them. Extract
                 with remove_source stops the file in a library that writes its output to another folder (folder-to-folder), since the sidecars would land
                 beside the source, where the output never sees them.`,
-    Version: '3.999.120',
+    Version: '3.999.121',
     Tags: 'pre-processing,post-processing,ffmpeg,subtitle only,configurable',
     Inputs: [
         {
@@ -2908,6 +2908,11 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
     // already considers identical. Optional-chained so a null stream yields an empty set rather than throwing.
     const activeDispositions = (s) => Object.keys(s?.disposition || {}).filter((k) => s.disposition[k] === 1);
     const sameDispositions = (a, b) => a.size === b.size && [...b].every((k) => a.has(k));
+    // The flags an mp4-family file stores as one: a subtitle written with either of a pair reads back with both - hearing_impaired with captions,
+    // descriptions with visual_impaired - after the write and after a -c copy rewrite; Matroska keeps the other three apart and stores no captions flag
+    // (measured 2026-11-15 on jellyfin 7.1.4). The comparison above stays raw: a sidecar name wants the partner its track carries (retuneFor), as the
+    // fold's union of same-text tracks already holds both.
+    const MP4_PAIRED_FLAGS = [['hearing_impaired', 'captions'], ['descriptions', 'visual_impaired']];
 
     // One reversible percent-codec behind both filename-ish tokens this plugin writes. A char in the caller's `safe` set passes through; every other char's
     // UTF-8 bytes become uppercase %XX. pctDecode is the exact inverse, and validates the two hex digits so malformed input (a hand-edited or foreign marker)
@@ -6697,7 +6702,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
         };
         // The track the import writes for each sidecar of a merged group (merged, below): the group's entry, whose title can be another member's ('English'
         // goes in as 'English SDH'). The marker's metadata match holds such a sidecar to that track, so a merged group settles as a single sidecar does; any
-        // other sidecar - one of an apart group, a bundle - is held to its own name.
+        // other sidecar - one of an apart group, a bundle - is held to its own name. So is one of a merged group split across the tracks already holding its
+        // text (splitByTrack), from the track pick on: the marker skip (settled) runs before the split and still reads the group's title.
         const writtenAs = new Map();
         // A sidecar whose text still hashes to the one the marker recorded for it - imported here, unchanged since.
         const unchangedSinceImport = (m) => {
@@ -6760,10 +6766,10 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // The title is the first member's, in the group's order, with which the track as the next pass reads it (sidecarToStream: on an mp4-family
             // target beside the handler written with it) gives every role the members' titles give (rolesIn) - dedupeEmbeddedSubs' rule for its
             // keeper, so 'English' with 'English SDH' imports as 'English SDH'; a role a name's flag token gives is in the unioned flags. With no such
-            // title the group is apart: its sidecars go in as one track each (below), and where its text is already in the file each member speaks for
-            // the track it names (splitByTrack). On an mp4-family target the handler written is the title itself, so a pair whose roles need the two to
-            // differ ('English SDH' + 'English Forced') is apart, and deduplicate=enabled_checkmedia folds it on the next pass, whose fold keeps the
-            // keeper's handler beside the new title - one extra lossless remux, accepted.
+            // title the group is apart: its sidecars go in as one track each (below). Where its text is already in the file, either kind speaks member
+            // by member for the track each names (splitByTrack). On an mp4-family target the handler written is the title itself, so a pair whose roles
+            // need the two to differ ('English SDH' + 'English Forced') is apart, and deduplicate=enabled_checkmedia folds it on the next pass, whose
+            // fold keeps the keeper's handler beside the new title - one extra lossless remux, accepted.
             const readsAs = (t) => rolesIn(roleFieldsLower(sidecarToStream({ ...g[0], title: t }, isMp4)));
             const roles = new Set(g.flatMap((m) => readsAs(m.title)));
             const titles = g.map((m) => m.title).filter(Boolean);
@@ -6846,6 +6852,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             for (const d of cur ? DISPOSITIONS.filter((x) => titleGives(wantTitle ?? mediaTitleFor(cur), x)) : []) {
                 d.flags.filter((fl) => cur.disposition?.[fl] === 1).forEach((fl) => wantDisp.add(fl));
             }
+            // So is a flag the track has that an mp4-family file stores as one with a wanted flag (MP4_PAIRED_FLAGS): compared raw, an mp4 SDH track's
+            // hearing_impaired + captions never matched its .sdh name, so every round trip was retagged or said to disagree, and a group whose other name
+            // stays out of the marker was retagged identically on every pass, which Tdarr errors (measured on 7.1.4).
+            for (const pair of cur && isMp4 ? MP4_PAIRED_FLAGS : []) {
+                if (pair.some((fl) => wantDisp.has(fl))) pair.filter((fl) => cur.disposition?.[fl] === 1).forEach((fl) => wantDisp.add(fl));
+            }
             // A name's 'und' is no opinion either: it only says the track had no language tag when extract named the sidecar. Read as an instruction it
             // took back the language clean_and_remux's language_fill had since given the track, and the two plugins re-tagged it back and forth on every
             // cycle - different presets, so Tdarr's repeat guard never stopped it. A name can set or change a real language, never erase one; zxx and mul
@@ -6877,12 +6889,14 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             return (pick(holding.filter((s) => by.some((m) => retuneFor(s, [m], m.title).same)))
                 || pick(holding.filter((s) => by.some((m) => nameTextOf(m.title) && metaMatchesStream(s, m, false)))) || pick(holding))?.index ?? null;
         };
-        // An apart group goes in as one track per member (toMux, below), so where its text is already in the file each member speaks for the track it
-        // names: members naming different tracks are split into one entry per track (embeddedAt set). A member at the index whose current name another
-        // member holds is an earlier name of that track and goes where that one goes, so it still says nothing (voice): routed by its own title it spoke
-        // for the twin that title names. One entry for the group spoke for the first track alone.
+        // Where a group's text is already in the file, each member speaks for the track it names, as an apart group goes in as one track per member
+        // (toMux, below): members naming different tracks are split into one entry per track (embeddedAt set). A merged group split so is no longer one
+        // track written under one title, so each member is held to its own name (writtenAs). A member at the index whose current name another member holds
+        // is an earlier name of that track and goes where that one goes, so it still says nothing (voice): routed by its own title it spoke for the twin
+        // that title names. One entry for the group spoke for one track with every member's flags: under method_import_metadata=sidecar a plain 'English'
+        // track took the SDH flag of its same-text 'English' SDH twin's sidecar. Members all naming one track take that track: picked by all of them at
+        // once, one name's own index won among the tracks any of them agreed with (a title-less name agrees with every title), and the twin was retitled.
         const splitByTrack = (f) => {
-            if (!f.apart) return [f];
             const at = new Map(f.members.map((m) => [m, embeddedAt(f, [m])]));
             for (const m of f.members) {
                 const current = f.members.find((x) => x.index !== null && x.index === m.index && x.name === currentName(x.index));
@@ -6890,7 +6904,12 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             }
             const byTrack = new Map();
             for (const m of f.members) byTrack.set(at.get(m), [...(byTrack.get(at.get(m)) || []), m]);
-            if (byTrack.size < 2) return [f];
+            if (byTrack.size < 2) {
+                const [only] = byTrack.keys();
+                if (only !== null) f.embeddedAt = only;
+                return [f];
+            }
+            for (const m of f.members) writtenAs.delete(m.rel);
             return [...byTrack].map(([idx, members]) => ({ ...f, members, name: srcOf(members).name, rel: srcOf(members).rel, embeddedAt: idx }));
         };
         // On a miss, the same tracks holding the sidecar with every cue moved by one small shift (shiftedTrack) - what a container conversion leaves of a
@@ -6954,7 +6973,7 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             // index is an earlier name of it - one extract left beside the current one on a node that cannot rename - and says nothing: its title and flags
             // undid a user's retitle (measured: 'Notes' {} retagged 'Director Notes' {forced}). An apart group goes in as one track per member, so the track
             // speaks for the member whose title it carries (or cut, titleCutFrom), else for the first titled one - the group's union put both of an SDH and
-            // Forced pair's flags on one track; a merged group's members speak together.
+            // Forced pair's flags on one track; a merged group's members naming this track (splitByTrack) speak together.
             const current = currentName(at);
             const voice = f.members.some((m) => m.name === current) ? f.members.filter((m) => m.index !== at || m.name === current) : f.members;
             const said = !f.apart ? voice : [voice.find((m) => carries(cur, m)) || voice.find((m) => nameTextOf(m.title)) || voice[0]];
@@ -6981,8 +7000,8 @@ const plugin = (file, librarySettings, inputs, otherArguments) => {
             retuneMeta += retagOne(outIdx, wantLang, wantTitle, [...wantDisp]);
             retunes.push({ index: at, lang: wantLang, title: wantTitle ?? getTagCI(cur?.tags, 'title'), disp: [...wantDisp] });
             const writes = [logSafe(nameLang && langWritten(nameLang)), wantTitle === null ? '' : logSafe(wantTitle), ...nameDisp].filter(Boolean).join(' ');
-            response.infoLog += `☐${streamTag(at)}[method_import_metadata=sidecar] Retagging the track already in the file from ${f.rel} (${
-                writes || 'no language or flags'})\n`;
+            response.infoLog += `☐${streamTag(at)}[method_import_metadata=sidecar] Retagging the track already in the file from ${
+                said.map((m) => logSafe(m.rel)).join(', ')} (${writes || 'no language or flags'})\n`;
         }
 
         // A sidecar this plugin imported, UNCHANGED since (its text still hashes to the one the marker recorded), whose content the file no longer holds,
